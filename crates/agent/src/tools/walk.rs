@@ -102,10 +102,8 @@ pub(crate) fn walk_files(
                     return Ok(ControlFlow::Break(()));
                 }
             } else if file_type.is_file() {
-                let relative = path
-                    .strip_prefix(root)
-                    .expect("walked files are below the search root")
-                    .to_path_buf();
+                let relative =
+                    path.strip_prefix(root).expect("walked files are below the search root").to_path_buf();
                 if on_file(relative).is_break() {
                     return Ok(ControlFlow::Break(()));
                 }

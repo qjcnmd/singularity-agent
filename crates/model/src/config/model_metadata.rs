@@ -35,10 +35,7 @@ pub(super) fn supplement(models: &mut [DiscoveredModel], base_url: &str, directo
         return;
     };
     for model in models {
-        if let Some(entry) = provider
-            .get("models")
-            .and_then(|models| models.get(&model.model_id))
-        {
+        if let Some(entry) = provider.get("models").and_then(|models| models.get(&model.model_id)) {
             fill(model, metadata(&model.model_id, entry));
         }
     }
@@ -46,11 +43,9 @@ pub(super) fn supplement(models: &mut [DiscoveredModel], base_url: &str, directo
 
 pub(super) fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
     let capacity = |paths: &[&str]| {
-        paths.iter().find_map(|path| {
-            u32::try_from(entry.pointer(path)?.as_u64()?)
-                .ok()
-                .filter(|value| *value > 0)
-        })
+        paths
+            .iter()
+            .find_map(|path| u32::try_from(entry.pointer(path)?.as_u64()?).ok().filter(|value| *value > 0))
     };
     let mut efforts = Vec::new();
     if let Some(options) = entry.get("reasoning_options").and_then(Value::as_array) {
@@ -67,9 +62,7 @@ pub(super) fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
         // default 只是占位值，off 是本仓约定的关闭档位，两者都不作为可选档位。
         if !matches!(effort, "default" | "off")
             && validate_identifier(effort, "reasoning effort").is_ok()
-            && !reasoning_variants
-                .iter()
-                .any(|variant: &ReasoningVariant| variant.id == effort)
+            && !reasoning_variants.iter().any(|variant: &ReasoningVariant| variant.id == effort)
         {
             reasoning_variants.push(ReasoningVariant {
                 id: effort.to_string(),

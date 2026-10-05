@@ -20,8 +20,7 @@ impl ModelUsage {
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
         if let Some(cached) = other.cached_input_tokens {
-            self.cached_input_tokens =
-                Some(self.cached_input_tokens.unwrap_or(0).saturating_add(cached));
+            self.cached_input_tokens = Some(self.cached_input_tokens.unwrap_or(0).saturating_add(cached));
         }
         self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
         self.usage_present |= other.usage_present;

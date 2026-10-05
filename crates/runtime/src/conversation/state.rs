@@ -56,11 +56,7 @@ pub(crate) struct TurnControls {
 }
 
 impl TurnControls {
-    pub fn new(
-        turn_id: impl Into<String>,
-        inbox: SteeringInboxHandle,
-        writer: SessionWriter,
-    ) -> Self {
+    pub fn new(turn_id: impl Into<String>, inbox: SteeringInboxHandle, writer: SessionWriter) -> Self {
         Self {
             turn_id: turn_id.into(),
             window: CancelWindow::new(),
@@ -118,9 +114,7 @@ impl TurnControls {
     }
 
     pub(super) fn lock_inbox(&self) -> std::sync::MutexGuard<'_, SteeringInbox> {
-        self.inbox
-            .lock()
-            .expect("turn inbox lock poisoned (fail-stop)")
+        self.inbox.lock().expect("turn inbox lock poisoned (fail-stop)")
     }
 }
 
@@ -149,9 +143,7 @@ impl ConversationState {
             .ok_or(ConversationControlError::ControlNotFound)?;
         match self.turn {
             TurnLifecycle::Reserved => Err(ConversationControlError::NotRunning),
-            TurnLifecycle::Idle | TurnLifecycle::Running(_) | TurnLifecycle::Compacting { .. } => {
-                Ok(input)
-            }
+            TurnLifecycle::Idle | TurnLifecycle::Running(_) | TurnLifecycle::Compacting { .. } => Ok(input),
         }
     }
 
@@ -186,10 +178,7 @@ impl ConversationState {
     }
 
     /// 排队一条后续 turn 的输入，保留它的身份和接受序号；排队本身不需要写者。
-    pub(super) fn queue_follow_up(
-        &mut self,
-        input: UserInput,
-    ) -> Result<(), ConversationControlError> {
+    pub(super) fn queue_follow_up(&mut self, input: UserInput) -> Result<(), ConversationControlError> {
         if self.turn.active().is_none() {
             return Err(ConversationControlError::NotRunning);
         }
@@ -223,13 +212,9 @@ impl TurnLifecycle {
         match self {
             Self::Idle => SessionPhase::Idle,
             Self::Reserved => SessionPhase::Reserved,
-            Self::Running(controls) if controls.cancellation().is_cancelled() => {
-                SessionPhase::Stopping
-            }
+            Self::Running(controls) if controls.cancellation().is_cancelled() => SessionPhase::Stopping,
             Self::Running(_) => SessionPhase::Running,
-            Self::Compacting { window, .. } if window.cancellation.is_cancelled() => {
-                SessionPhase::Stopping
-            }
+            Self::Compacting { window, .. } if window.cancellation.is_cancelled() => SessionPhase::Stopping,
             Self::Compacting { .. } => SessionPhase::Compacting,
         }
     }

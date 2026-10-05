@@ -42,9 +42,7 @@ pub struct McpTool {
 
 impl std::fmt::Debug for McpTool {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        out.debug_struct("McpTool")
-            .field("name", &self.name)
-            .finish_non_exhaustive()
+        out.debug_struct("McpTool").field("name", &self.name).finish_non_exhaustive()
     }
 }
 
@@ -55,10 +53,7 @@ impl McpTool {
         arguments: serde_json::Map<String, serde_json::Value>,
         signal: &CancellationToken,
     ) -> Result<McpToolResult, String> {
-        let result = self
-            .connection
-            .call(&self.original_name, arguments, signal)
-            .await?;
+        let result = self.connection.call(&self.original_name, arguments, signal).await?;
         Ok(result::convert(result))
     }
 }
@@ -81,9 +76,7 @@ impl McpManager {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connections> {
-        self.connections
-            .lock()
-            .expect("MCP connection lock poisoned")
+        self.connections.lock().expect("MCP connection lock poisoned")
     }
 
     /// 返回设置编辑所需的配置；只走私有桌面 RPC，不进入会话与模型请求。
@@ -149,10 +142,7 @@ impl McpManager {
         }
         // 磁盘是配置事实来源；已更改或停用的连接只从后续操作中移除，回合快照仍可收尾。
         connections.retain(|(_, id), (previous, _)| {
-            config
-                .servers
-                .get(id)
-                .is_some_and(|current| current.enabled && current == previous)
+            config.servers.get(id).is_some_and(|current| current.enabled && current == previous)
         });
         let mut entries = Vec::new();
         for (id, config) in config.servers {
@@ -163,9 +153,8 @@ impl McpManager {
             if reconnect {
                 connections.remove(&key);
             }
-            let (_, cell) = connections
-                .entry(key)
-                .or_insert_with(|| (config.clone(), Arc::new(OnceCell::new())));
+            let (_, cell) =
+                connections.entry(key).or_insert_with(|| (config.clone(), Arc::new(OnceCell::new())));
             let cell = Arc::clone(cell);
             entries.push((id, config, cell));
         }
@@ -216,9 +205,7 @@ impl McpManager {
             match found {
                 Ok((connection, mut tools)) => {
                     if let Some(instructions) = connection.instructions() {
-                        result
-                            .instructions
-                            .push(format!("MCP server {id}:\n{instructions}"));
+                        result.instructions.push(format!("MCP server {id}:\n{instructions}"));
                     }
                     tools.sort_by(|a, b| a.name.cmp(&b.name));
                     for tool in tools {
@@ -242,12 +229,7 @@ impl McpManager {
     }
 
     /// 设置中的连接测试使用同一连接和发现路径；重连显式丢弃该项目中的旧连接。
-    pub async fn inspect(
-        &self,
-        id: &str,
-        cwd: &Path,
-        reconnect: bool,
-    ) -> Result<McpInspection, String> {
+    pub async fn inspect(&self, id: &str, cwd: &Path, reconnect: bool) -> Result<McpInspection, String> {
         let mut entries = self.entries(cwd, Some(id), reconnect)?;
         let Some((_, config, cell)) = entries.pop() else {
             return Ok(McpInspection {

@@ -32,9 +32,9 @@ pub(crate) fn validate_identifier(value: &str, label: &str) -> Result<(), Provid
 
 pub(crate) fn validate_model_id(value: &str, label: &str) -> Result<(), ProviderError> {
     if value.is_empty()
-        || value.chars().any(|character| {
-            character.is_whitespace() || character.is_control() || character == '#'
-        })
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control() || character == '#')
     {
         return Err(configuration_error(
             format!("invalid model configuration: {label} is malformed"),
@@ -45,15 +45,13 @@ pub(crate) fn validate_model_id(value: &str, label: &str) -> Result<(), Provider
 }
 
 pub(crate) fn parse_catalog_protocol(value: &str) -> Result<ProviderApiProtocol, ProviderError> {
-    ProviderApiProtocol::deserialize(
-        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(value),
-    )
-    .map_err(|error| {
-        configuration_error(
-            format!("invalid model configuration: api_protocol: {error}"),
-            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
-        )
-    })
+    ProviderApiProtocol::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(value))
+        .map_err(|error| {
+            configuration_error(
+                format!("invalid model configuration: api_protocol: {error}"),
+                crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
+            )
+        })
 }
 
 pub(crate) fn parse_thinking_wire_format(
@@ -64,10 +62,7 @@ pub(crate) fn parse_thinking_wire_format(
         None => ThinkingWireFormat::DEFAULT,
         Some(value) => ThinkingWireFormat::from_wire_name(value).ok_or_else(|| {
             configuration_error(
-                format!(
-                    "thinking_wire_format must be one of: {}",
-                    ThinkingWireFormat::names()
-                ),
+                format!("thinking_wire_format must be one of: {}", ThinkingWireFormat::names()),
                 crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
             )
         })?,
@@ -156,18 +151,13 @@ pub(crate) fn validate_reasoning_variants(
         }
         if variant != "off" && descriptor.wire_effort.is_none() {
             let message = match protocol {
-                ProviderApiProtocol::Responses => {
-                    "Responses enabled reasoning variants require wire_effort"
-                }
+                ProviderApiProtocol::Responses => "Responses enabled reasoning variants require wire_effort",
                 ProviderApiProtocol::Chat if variant != "on" => {
                     "Chat no-wire reasoning is only the single on variant"
                 }
                 ProviderApiProtocol::Chat => continue,
             };
-            return Err(configuration_error(
-                message,
-                crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
-            ));
+            return Err(configuration_error(message, crate::error::PROVIDER_CONFIGURATION_INVALID_CODE));
         }
     }
     Ok(())

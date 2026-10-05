@@ -8,8 +8,7 @@ pub(crate) async fn read_responses_sse_stream(
     config: &OpenAiProviderConfig,
     selection: &SelectedModel,
 ) -> Result<ModelTurnResponse, ProviderError> {
-    let payload =
-        read_sse_stream(cancellation, response, ResponsesSseDecoder::new(on_event)).await?;
+    let payload = read_sse_stream(cancellation, response, ResponsesSseDecoder::new(on_event)).await?;
     parse_openai_responses_response(config, payload, &selection.model_name)
 }
 
@@ -37,26 +36,19 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
         let completed = payload_type == "response.completed";
         match payload_type {
             "response.function_call_arguments.delta" => {
-                if payload
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty())
-                {
+                if payload.get("delta").and_then(Value::as_str).is_some_and(|text| !text.is_empty()) {
                     (self.on_event)(ProviderStreamEvent::ToolCallDelta);
                 }
             }
             "response.output_text.delta" | "response.reasoning_summary_text.delta" => {
                 let reasoning = payload_type == "response.reasoning_summary_text.delta";
-                let delta = payload
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        provider_responses_stream_malformed_error(if reasoning {
-                            "reasoning_summary_delta_missing"
-                        } else {
-                            "output_text_delta_missing"
-                        })
-                    })?;
+                let delta = payload.get("delta").and_then(Value::as_str).ok_or_else(|| {
+                    provider_responses_stream_malformed_error(if reasoning {
+                        "reasoning_summary_delta_missing"
+                    } else {
+                        "output_text_delta_missing"
+                    })
+                })?;
                 if !delta.is_empty() {
                     let delta = delta.to_string();
                     (self.on_event)(if reasoning {
@@ -67,25 +59,18 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                 }
             }
             "response.completed" | "response.incomplete" => {
-                let response =
-                    payload
-                        .get_mut("response")
-                        .map(std::mem::take)
-                        .ok_or_else(|| {
-                            provider_responses_stream_malformed_error(if completed {
-                                "completed_response_missing"
-                            } else {
-                                "incomplete_response_missing"
-                            })
-                        })?;
+                let response = payload.get_mut("response").map(std::mem::take).ok_or_else(|| {
+                    provider_responses_stream_malformed_error(if completed {
+                        "completed_response_missing"
+                    } else {
+                        "incomplete_response_missing"
+                    })
+                })?;
                 self.terminal_response = Some(response);
             }
             "error" => {
                 let fields = provider_error_fields(
-                    payload
-                        .get("error")
-                        .filter(|error| error.is_object())
-                        .unwrap_or(&payload),
+                    payload.get("error").filter(|error| error.is_object()).unwrap_or(&payload),
                 );
                 return Err(provider_embedded_error(
                     &fields,
@@ -112,8 +97,7 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
     }
 
     fn materialize_terminal(self) -> Result<Self::Terminal, ProviderError> {
-        self.terminal_response
-            .ok_or_else(provider_responses_stream_terminal_missing_error)
+        self.terminal_response.ok_or_else(provider_responses_stream_terminal_missing_error)
     }
 
     fn protocol_complete(&self) -> bool {
@@ -124,10 +108,7 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
 
 impl<'a> ResponsesSseDecoder<'a> {
     fn new(on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send)) -> Self {
-        Self {
-            terminal_response: None,
-            on_event,
-        }
+        Self { terminal_response: None, on_event }
     }
 }
 

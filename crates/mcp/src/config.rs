@@ -60,17 +60,9 @@ impl ServerConfig {
             startup_timeout_sec: input.startup_timeout_sec,
             tool_timeout_sec: input.tool_timeout_sec,
             transport: match input.transport {
-                McpTransportInput::Stdio {
-                    command,
-                    args,
-                    cwd,
-                    env,
-                } => TransportConfig::Stdio {
-                    command,
-                    args,
-                    cwd,
-                    env,
-                },
+                McpTransportInput::Stdio { command, args, cwd, env } => {
+                    TransportConfig::Stdio { command, args, cwd, env }
+                }
                 McpTransportInput::Http { url, headers } => TransportConfig::Http { url, headers },
             },
         }
@@ -83,12 +75,7 @@ impl ServerConfig {
             startup_timeout_sec: self.startup_timeout_sec,
             tool_timeout_sec: self.tool_timeout_sec,
             transport: match &self.transport {
-                TransportConfig::Stdio {
-                    command,
-                    args,
-                    cwd,
-                    env,
-                } => McpTransportInput::Stdio {
+                TransportConfig::Stdio { command, args, cwd, env } => McpTransportInput::Stdio {
                     command: command.clone(),
                     args: args.clone(),
                     cwd: cwd.clone(),
@@ -104,9 +91,7 @@ impl ServerConfig {
 
     pub fn validate(&self, id: &str) -> Result<(), String> {
         if id.is_empty()
-            || !id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            || !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
         {
             return Err("MCP 名称只能包含英文字母、数字、下划线和连字符。".into());
         }
@@ -114,41 +99,32 @@ impl ServerConfig {
             return Err("MCP 超时必须大于零秒。".into());
         }
         match &self.transport {
-            TransportConfig::Stdio {
-                command,
-                args,
-                cwd,
-                env,
-            } => {
+            TransportConfig::Stdio { command, args, cwd, env } => {
                 if command.trim().is_empty()
                     || command.contains('\0')
                     || args.iter().any(|arg| arg.contains('\0'))
                 {
                     return Err("MCP 启动命令或参数无效。".into());
                 }
-                if cwd
-                    .as_ref()
-                    .is_some_and(|cwd| cwd.trim().is_empty() || cwd.contains('\0'))
-                {
+                if cwd.as_ref().is_some_and(|cwd| cwd.trim().is_empty() || cwd.contains('\0')) {
                     return Err("MCP 工作目录无效。".into());
                 }
-                if env.iter().any(|(key, value)| {
-                    key.is_empty() || key.contains(['=', '\0']) || value.contains('\0')
-                }) {
+                if env
+                    .iter()
+                    .any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0'))
+                {
                     return Err("MCP 环境变量无效。".into());
                 }
             }
             TransportConfig::Http { url, headers } => {
-                let parsed =
-                    url::Url::parse(url).map_err(|_| "MCP 地址必须是有效的 HTTP 或 HTTPS URL。")?;
+                let parsed = url::Url::parse(url).map_err(|_| "MCP 地址必须是有效的 HTTP 或 HTTPS URL。")?;
                 if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
                     return Err("MCP 地址必须是有效的 HTTP 或 HTTPS URL。".into());
                 }
                 for (key, value) in headers {
                     reqwest::header::HeaderName::from_bytes(key.as_bytes())
                         .map_err(|_| "MCP 请求头名称无效。")?;
-                    reqwest::header::HeaderValue::from_str(value)
-                        .map_err(|_| "MCP 请求头值无效。")?;
+                    reqwest::header::HeaderValue::from_str(value).map_err(|_| "MCP 请求头值无效。")?;
                 }
             }
         }
@@ -192,11 +168,7 @@ pub(crate) fn read(home: &Path) -> Result<Configuration, String> {
         Err(error) => return Err(format!("无法读取 {}：{error}", path.display())),
     };
     let config: Configuration = serde_json::from_slice(&bytes).map_err(|error| {
-        format!(
-            "mcp.json 格式无效（第 {} 行，第 {} 列）。",
-            error.line(),
-            error.column()
-        )
+        format!("mcp.json 格式无效（第 {} 行，第 {} 列）。", error.line(), error.column())
     })?;
     for (id, server) in &config.servers {
         server.validate(id)?;
@@ -206,8 +178,7 @@ pub(crate) fn read(home: &Path) -> Result<Configuration, String> {
 
 pub(crate) fn write(home: &Path, config: &Configuration) -> Result<(), String> {
     singularity_core::create_data_dir(home)?;
-    let mut bytes =
-        serde_json::to_vec_pretty(config).expect("MCP configuration is JSON serializable");
+    let mut bytes = serde_json::to_vec_pretty(config).expect("MCP configuration is JSON serializable");
     bytes.push(b'\n');
     singularity_core::atomic_replace_bytes(&home.join("mcp.json"), &bytes)
         .map_err(|error| format!("无法保存 mcp.json：{error}"))

@@ -38,10 +38,7 @@ pub fn resolve_home() -> Result<ResolvedHome, String> {
         let base = Path::new(&value);
         let path = validated_root(base)
             .map_err(|reason| format!("{SINGULARITY_HOME} {reason}: {}", base.display()))?;
-        return Ok(ResolvedHome {
-            path,
-            origin: HomeOrigin::Explicit,
-        });
+        return Ok(ResolvedHome { path, origin: HomeOrigin::Explicit });
     }
     let base = std::env::home_dir().ok_or_else(|| {
         "cannot resolve the default data directory: system user profile is unavailable".to_string()

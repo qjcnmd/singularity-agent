@@ -65,16 +65,10 @@ impl WorkspaceStore {
                 .map_err(|error| format!("workspace registry is invalid: {error}"))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => RegistryFile::default(),
             Err(error) => {
-                return Err(format!(
-                    "failed to read workspace registry {}: {error}",
-                    path.display()
-                ));
+                return Err(format!("failed to read workspace registry {}: {error}", path.display()));
             }
         };
-        Ok(Self {
-            path,
-            state: Mutex::new(state),
-        })
+        Ok(Self { path, state: Mutex::new(state) })
     }
 
     /// 将当前登记记录转换为工作台可用的独立快照。
@@ -97,9 +91,8 @@ impl WorkspaceStore {
             singularity_core::canonicalize_workspace(root).map_err(WorkspaceError::InvalidInput)?;
         self.update(|registry| {
             for workspace in &registry.workspaces {
-                let existing =
-                    singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
-                        .map_err(WorkspaceError::InvalidInput)?;
+                let existing = singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
+                    .map_err(WorkspaceError::InvalidInput)?;
                 if existing == canonical {
                     return Err(WorkspaceError::InvalidInput("此项目已经添加。".into()));
                 }
@@ -162,22 +155,15 @@ impl WorkspaceStore {
         let mut registry = self.lock();
         let mut next = registry.clone();
         let result = edit(&mut next)?;
-        let mut bytes =
-            serde_json::to_vec_pretty(&next).expect("workspace registry is serializable");
+        let mut bytes = serde_json::to_vec_pretty(&next).expect("workspace registry is serializable");
         bytes.push(b'\n');
-        singularity_core::atomic_replace_bytes(&self.path, &bytes).map_err(|source| {
-            WorkspaceError::Storage {
-                path: self.path.clone(),
-                source,
-            }
-        })?;
+        singularity_core::atomic_replace_bytes(&self.path, &bytes)
+            .map_err(|source| WorkspaceError::Storage { path: self.path.clone(), source })?;
         *registry = next;
         Ok(result)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RegistryFile> {
-        self.state
-            .lock()
-            .expect("workspace registry lock poisoned (fail-stop)")
+        self.state.lock().expect("workspace registry lock poisoned (fail-stop)")
     }
 }

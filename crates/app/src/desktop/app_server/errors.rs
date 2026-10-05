@@ -24,26 +24,16 @@ pub(crate) fn invalid_request(message: impl Into<String>) -> RpcError {
 }
 
 pub(super) fn internal_error(message: impl Into<String>) -> RpcError {
-    RpcError::new(
-        RpcErrorCode::Internal,
-        message,
-        "刷新工作台；若问题持续，检查启动终端中的错误。",
-    )
+    RpcError::new(RpcErrorCode::Internal, message, "刷新工作台；若问题持续，检查启动终端中的错误。")
 }
 
 pub(super) fn configuration_error(message: impl Into<String>) -> RpcError {
-    RpcError::new(
-        RpcErrorCode::ConfigurationInvalid,
-        message,
-        "打开模型设置并修正配置。",
-    )
+    RpcError::new(RpcErrorCode::ConfigurationInvalid, message, "打开模型设置并修正配置。")
 }
 
 pub(super) fn model_error(error: singularity_model::ProviderError) -> RpcError {
     match error.code.as_deref() {
-        Some(singularity_model::CREDENTIAL_SAVE_FAILED_CODE) => {
-            partially_saved(error, "重试保存 API 密钥。")
-        }
+        Some(singularity_model::CREDENTIAL_SAVE_FAILED_CODE) => partially_saved(error, "重试保存 API 密钥。"),
         Some(singularity_model::CREDENTIAL_DELETE_FAILED_CODE) => {
             partially_saved(error, "重试删除 API 密钥。")
         }
@@ -53,11 +43,7 @@ pub(super) fn model_error(error: singularity_model::ProviderError) -> RpcError {
 
 /// 配置已经部分生效、剩下凭据没写成功：界面按同一分类提示重试这次操作。
 pub(super) fn partially_saved(error: singularity_model::ProviderError, recovery: &str) -> RpcError {
-    RpcError::new(
-        RpcErrorCode::ConfigurationPartiallySaved,
-        error.to_string(),
-        recovery,
-    )
+    RpcError::new(RpcErrorCode::ConfigurationPartiallySaved, error.to_string(), recovery)
 }
 
 pub(super) fn model_discovery_error(error: singularity_model::ProviderError) -> RpcError {
@@ -98,11 +84,9 @@ pub(super) fn conversation_error(error: ConversationError) -> RpcError {
 
 pub(super) fn catalog_error(error: CatalogError) -> RpcError {
     match error {
-        CatalogError::NotFound(_) => RpcError::new(
-            RpcErrorCode::SessionNotFound,
-            "任务不存在或已归档。",
-            "刷新项目的任务列表。",
-        ),
+        CatalogError::NotFound(_) => {
+            RpcError::new(RpcErrorCode::SessionNotFound, "任务不存在或已归档。", "刷新项目的任务列表。")
+        }
         CatalogError::InvalidModel(_) => invalid_request(error.to_string()),
         CatalogError::AnchorNotFound(_) => invalid_request("历史分页位置已失效，请重新加载任务。"),
         other => internal_error(other.to_string()),
@@ -132,11 +116,9 @@ pub(super) fn session_busy() -> RpcError {
 pub(super) fn control_error(error: ConversationControlError) -> RpcError {
     match error {
         ConversationControlError::NotRunning => session_busy(),
-        ConversationControlError::PendingInputExists => RpcError::new(
-            RpcErrorCode::SessionBusy,
-            error.to_string(),
-            "编辑、删除或发送排队消息后再输入。",
-        ),
+        ConversationControlError::PendingInputExists => {
+            RpcError::new(RpcErrorCode::SessionBusy, error.to_string(), "编辑、删除或发送排队消息后再输入。")
+        }
         ConversationControlError::InvalidInput => invalid_request("输入不能为空。"),
         ConversationControlError::ControlNotFound => RpcError::new(
             RpcErrorCode::ControlNotFound,

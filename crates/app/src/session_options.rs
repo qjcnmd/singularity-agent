@@ -22,10 +22,9 @@ pub fn lock_data_directory() -> Result<(PathBuf, std::fs::File), String> {
         .open(home.join("instance.lock"))
         .map_err(|e| e.to_string())?;
     file.try_lock().map_err(|e| match e {
-        std::fs::TryLockError::WouldBlock => format!(
-            "数据目录已被另一个 Singularity 程序使用：{}",
-            home.display()
-        ),
+        std::fs::TryLockError::WouldBlock => {
+            format!("数据目录已被另一个 Singularity 程序使用：{}", home.display())
+        }
         std::fs::TryLockError::Error(e) => {
             format!("cannot lock data directory {}: {e}", home.display())
         }
@@ -56,13 +55,7 @@ pub struct DesktopSetup {
 }
 
 pub fn prepare_desktop(home: &Path) -> Result<DesktopSetup, String> {
-    let RuntimeParts {
-        runtime,
-        models,
-        runner,
-        catalog,
-        mcp,
-    } = prepare_runtime(home, true)?;
+    let RuntimeParts { runtime, models, runner, catalog, mcp } = prepare_runtime(home, true)?;
     let workspaces = WorkspaceStore::open(home)?;
     Ok(DesktopSetup {
         runtime,
@@ -76,30 +69,18 @@ pub fn prepare_desktop(home: &Path) -> Result<DesktopSetup, String> {
 }
 
 pub fn prepare(home: &Path, model: Option<&str>) -> Result<SessionSetup, String> {
-    let RuntimeParts {
-        runtime,
-        models,
-        runner,
-        catalog,
-        mcp,
-    } = prepare_runtime(home, false)?;
+    let RuntimeParts { runtime, models, runner, catalog, mcp } = prepare_runtime(home, false)?;
     let default_selector = models.snapshot().resolved_default_selector();
 
-    let current = std::env::current_dir()
-        .map_err(|error| format!("failed to read current directory: {error}"))?;
-    let cwd = current
-        .to_str()
-        .ok_or_else(|| "thread cwd is not valid UTF-8".to_string())?;
+    let current =
+        std::env::current_dir().map_err(|error| format!("failed to read current directory: {error}"))?;
+    let cwd = current.to_str().ok_or_else(|| "thread cwd is not valid UTF-8".to_string())?;
     let thread = catalog
         .create_thread(cwd, model.map(str::to_string).or(default_selector))
         .map_err(|error| error.to_string())?;
 
     let conversation = Conversation::new(runner, thread);
-    Ok(SessionSetup {
-        conversation,
-        runtime,
-        mcp,
-    })
+    Ok(SessionSetup { conversation, runtime, mcp })
 }
 
 /// 两个入口共用的进程级装配：tokio runtime、模型配置持有者、runner 及其目录。
@@ -127,11 +108,5 @@ fn prepare_runtime(home: &Path, user_questions: bool) -> Result<RuntimeParts, St
         runner
     });
     let catalog = ThreadCatalog::new(sessions_dir);
-    Ok(RuntimeParts {
-        runtime,
-        models,
-        runner,
-        catalog,
-        mcp,
-    })
+    Ok(RuntimeParts { runtime, models, runner, catalog, mcp })
 }

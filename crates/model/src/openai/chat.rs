@@ -12,9 +12,7 @@ use crate::error::{ModelErrorKind, ProviderError};
 use crate::openai::wire::ThinkingWireFormat;
 use crate::provider::contract::{provider_content_filter_error, provider_finish_network_error};
 use crate::provider::telemetry::ProviderStreamEvent;
-use crate::transport::stream::{
-    SseStreamDecoder, provider_stream_malformed_error, read_sse_stream,
-};
+use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
 use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelToolSchema, ModelTurnRequest,
     ModelTurnResponse, ProviderReasoningReplay,
@@ -46,13 +44,7 @@ pub(crate) fn openai_chat_stream_request_payload(
         }
     }
     if !request.tools.is_empty() {
-        payload["tools"] = json!(
-            request
-                .tools
-                .iter()
-                .map(openai_tool_payload)
-                .collect::<Vec<_>>()
-        );
+        payload["tools"] = json!(request.tools.iter().map(openai_tool_payload).collect::<Vec<_>>());
         if selection.supports_tool_choice {
             payload["tool_choice"] = serde_json::json!("auto");
         }
@@ -79,15 +71,13 @@ fn apply_thinking_wire(payload: &mut Value, enabled: bool, wire_format: Thinking
 
 /// 在已知的兼容字段里只取第一个非空值，避免同一段增量被显示两次。
 fn chat_reasoning_text(message: &serde_json::Map<String, Value>) -> Option<(&'static str, &str)> {
-    crate::types::CHAT_REASONING_FIELDS
-        .iter()
-        .find_map(|field| {
-            message
-                .get(*field)
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .map(|text| (*field, text))
-        })
+    crate::types::CHAT_REASONING_FIELDS.iter().find_map(|field| {
+        message
+            .get(*field)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| (*field, text))
+    })
 }
 
 fn chat_reasoning_detail_text(detail: &serde_json::Map<String, Value>) -> Option<&str> {
@@ -97,9 +87,7 @@ fn chat_reasoning_detail_text(detail: &serde_json::Map<String, Value>) -> Option
         .filter(|text| !text.is_empty())
 }
 
-fn chat_reasoning_detail_text_field(
-    detail: &serde_json::Map<String, Value>,
-) -> Option<&'static str> {
+fn chat_reasoning_detail_text_field(detail: &serde_json::Map<String, Value>) -> Option<&'static str> {
     match detail.get("type").and_then(Value::as_str)? {
         "reasoning.text" => Some("text"),
         "reasoning.summary" => Some("summary"),
@@ -144,13 +132,8 @@ fn openai_message_payload_with_reasoning(
         payload["tool_call_id"] = json!(tool_call_id);
     }
     if !message.tool_calls.is_empty() {
-        payload["tool_calls"] = json!(
-            message
-                .tool_calls
-                .iter()
-                .map(openai_tool_call_payload)
-                .collect::<Vec<_>>()
-        );
+        payload["tool_calls"] =
+            json!(message.tool_calls.iter().map(openai_tool_call_payload).collect::<Vec<_>>());
     }
     if let Some(ProviderReasoningReplay::Chat {
         reasoning_content,
@@ -187,22 +170,14 @@ fn openai_message_content(message: &ModelMessage) -> Value {
 }
 
 // Chat 只接受文本工具结果；整批结果闭合后才发送视觉消息，避免拆开并行调用的配对。
-fn openai_messages(
-    messages: &[ModelMessage],
-    selection: &SelectedModel,
-    provider_name: &str,
-) -> Vec<Value> {
+fn openai_messages(messages: &[ModelMessage], selection: &SelectedModel, provider_name: &str) -> Vec<Value> {
     let mut result = Vec::new();
     let mut images = Vec::new();
     for message in messages {
         if message.role != ModelRole::Tool && !images.is_empty() {
             result.push(json!({"role": "user", "content": std::mem::take(&mut images)}));
         }
-        result.push(openai_message_payload_with_reasoning(
-            message,
-            selection,
-            provider_name,
-        ));
+        result.push(openai_message_payload_with_reasoning(message, selection, provider_name));
         if message.role == ModelRole::Tool {
             for image in &message.images {
                 images.push(json!({"type": "text", "text": format!("Image from tool call {}:", message.tool_call_id.as_deref().expect("tool result has its call ID"))}));

@@ -34,10 +34,7 @@ impl ProjectInstructions {
 }
 
 /// 从用户数据目录、以及项目根到 cwd 的各层目录加载指令；文件读取与总预算两处共用同一实现。
-pub fn load_agent_instructions(
-    cwd: &Path,
-    home: &Path,
-) -> Result<Option<ProjectInstructions>, String> {
+pub fn load_agent_instructions(cwd: &Path, home: &Path) -> Result<Option<ProjectInstructions>, String> {
     let canonical = crate::canonicalize_workspace(cwd)?;
     let cwd = canonical.as_path();
     let root = crate::workspace::project_root(cwd)?;
@@ -46,10 +43,7 @@ pub fn load_agent_instructions(
         // 数据目录可能尚未创建：沿用原路径继续加载。
         Err(error) if error.kind() == io::ErrorKind::NotFound => home.to_path_buf(),
         Err(error) => {
-            return Err(format!(
-                "project_instruction_directory_read_failed:{}:{error}",
-                home.display()
-            ));
+            return Err(format!("project_instruction_directory_read_failed:{}:{error}", home.display()));
         }
     };
     let home_identity = crate::CanonicalWorkspacePath::from_saved(canonical_home)?;
@@ -98,8 +92,7 @@ fn load_instruction_directories(
             PROJECT_INSTRUCTIONS_SEPARATOR.len()
         };
         if byte_len + separator_len > remaining {
-            let (take, _) =
-                crate::utf8_prefix(&source_text, remaining.saturating_sub(separator_len));
+            let (take, _) = crate::utf8_prefix(&source_text, remaining.saturating_sub(separator_len));
             if !take.trim().is_empty() {
                 if !content.is_empty() {
                     content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
@@ -137,11 +130,7 @@ fn instruction_directories(workspace_root: &Path, cwd: &Path) -> Vec<PathBuf> {
         .expect("cwd 必在 workspace root 之下")
         .components()
         .count();
-    let mut directories = cwd
-        .ancestors()
-        .take(depth + 1)
-        .map(Path::to_path_buf)
-        .collect::<Vec<_>>();
+    let mut directories = cwd.ancestors().take(depth + 1).map(Path::to_path_buf).collect::<Vec<_>>();
     directories.reverse();
     directories
 }
@@ -152,17 +141,13 @@ fn read_project_instruction_file(
 ) -> Result<Option<ProjectInstructionFile>, String> {
     let path = directory.join(PROJECT_INSTRUCTIONS_FILE_NAME);
     let mut bytes = Vec::new();
-    match std::fs::File::open(&path).and_then(|file| {
-        file.take((PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-    }) {
+    match std::fs::File::open(&path)
+        .and_then(|file| file.take((PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1) as u64).read_to_end(&mut bytes))
+    {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(format!(
-                "project_instruction_file_read_failed:{}:{error}",
-                relative_path.display()
-            ));
+            return Err(format!("project_instruction_file_read_failed:{}:{error}", relative_path.display()));
         }
     }
     let truncated = bytes.len() > PROJECT_INSTRUCTIONS_MAX_FILE_BYTES;
@@ -175,14 +160,8 @@ fn read_project_instruction_file(
                 .expect("valid_up_to must describe valid UTF-8")
         }
         Err(_) => {
-            return Err(format!(
-                "project_instruction_invalid_utf8:{}",
-                relative_path.display()
-            ));
+            return Err(format!("project_instruction_invalid_utf8:{}", relative_path.display()));
         }
     };
-    Ok(Some(ProjectInstructionFile {
-        text: text.to_string(),
-        truncated,
-    }))
+    Ok(Some(ProjectInstructionFile { text: text.to_string(), truncated }))
 }

@@ -5,10 +5,9 @@ use super::*;
 pub(super) fn classify_agent_error(error: &AgentError) -> (TurnFailureCause, Option<&'static str>) {
     match error {
         AgentError::Provider(error) => (provider_turn_cause(error.kind), None),
-        AgentError::Session(_) | AgentError::FailureRecording { .. } => (
-            TurnFailureCause::Store,
-            Some(diagnostic_code::STORAGE_FATAL),
-        ),
+        AgentError::Session(_) | AgentError::FailureRecording { .. } => {
+            (TurnFailureCause::Store, Some(diagnostic_code::STORAGE_FATAL))
+        }
         AgentError::Instructions(_) => (TurnFailureCause::ProjectInstructions, None),
         AgentError::Aborted | AgentError::InvalidSummary(_) => (TurnFailureCause::Internal, None),
     }
@@ -24,13 +23,7 @@ pub(super) fn fail_stop_terminalization(
     storage_error: String,
     sink: &mut dyn FnMut(TurnEvent),
 ) -> TurnRunError {
-    publish_fatal(
-        thread_id,
-        turn_id,
-        diagnostic_code::STORAGE_FATAL,
-        &storage_error,
-        sink,
-    );
+    publish_fatal(thread_id, turn_id, diagnostic_code::STORAGE_FATAL, &storage_error, sink);
     TurnRunError::Terminalization {
         execution: execution.cloned(),
         storage: storage_error,

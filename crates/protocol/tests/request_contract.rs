@@ -20,12 +20,7 @@ fn terminal_summary_wire_goldens() {
     let cases: Vec<(&str, TerminalSummary, Value)> = vec![
         (
             "completed with thread and usage",
-            TerminalSummary::new(
-                Some("thread-1"),
-                TurnStatus::Completed,
-                Some(usage.clone()),
-                false,
-            ),
+            TerminalSummary::new(Some("thread-1"), TurnStatus::Completed, Some(usage.clone()), false),
             json!({"summary":{"turn":{"status":"completed","threadId":"thread-1","usage":{"cachedInputTokens":0,"inputTokens":10,"outputTokens":20,"reasoningTokens":0,"totalTokens":30,"usagePresent":true}}}}),
         ),
         (

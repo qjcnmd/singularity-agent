@@ -22,9 +22,7 @@ mod request;
 
 use std::sync::Arc;
 
-use singularity_model::{
-    ModelConfigurationSnapshot, ModelMessage, ModelUsage, Provider, ProviderError,
-};
+use singularity_model::{ModelConfigurationSnapshot, ModelMessage, ModelUsage, Provider, ProviderError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -126,8 +124,7 @@ impl Agent {
         let context = ContextView::derive(&lock_writer(&session));
         let cwd = lock_writer(&session).cwd().to_path_buf();
         let registry = ToolRegistrySnapshot::default();
-        let skills =
-            singularity_core::skills::SkillCatalog::discover(&cwd, &config.instruction_home);
+        let skills = singularity_core::skills::SkillCatalog::discover(&cwd, &config.instruction_home);
         Self {
             session,
             registry,
@@ -205,10 +202,8 @@ impl Agent {
             // 工具调用既要随消息持久化、又要交给执行器：落盘前先取出执行侧的副本。
             let tool_calls = assistant.tool_calls().cloned().collect::<Vec<_>>();
             // 实时完成事件只需要正文与思考；工具的生命周期由工具自己的事件表达。
-            let public_items =
-                assistant.public_items(&assistant_result_entry_id, ItemScope::Completion);
-            self.append_message(Some(&assistant_result_entry_id), assistant)
-                .await?;
+            let public_items = assistant.public_items(&assistant_result_entry_id, ItemScope::Completion);
+            self.append_message(Some(&assistant_result_entry_id), assistant).await?;
             on_event(AgentEvent::MessageFinished {
                 message_id: assistant_result_entry_id.clone(),
                 items: public_items,
@@ -257,24 +252,12 @@ impl Agent {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
         self.save_images(&input.images).await?;
-        let images: Vec<_> = input
-            .images
-            .iter()
-            .map(|image| image.attachment.clone())
-            .collect();
+        let images: Vec<_> = input.images.iter().map(|image| image.attachment.clone()).collect();
         let model_text = input.model_text();
         let display_text = (model_text != input.text).then(|| input.text.clone());
         let mut content = vec![crate::message::ContentBlock::Text { text: model_text }];
-        content.extend(
-            images
-                .iter()
-                .cloned()
-                .map(crate::message::ContentBlock::Image),
-        );
-        let message = AgentMessage::User {
-            content,
-            display_text,
-        };
+        content.extend(images.iter().cloned().map(crate::message::ContentBlock::Image));
+        let message = AgentMessage::User { content, display_text };
         let entry_id = self.append_message(None, message).await?;
         on_event(AgentEvent::UserMessage {
             entry_id,
@@ -316,9 +299,7 @@ impl Agent {
     async fn append_to_context(
         session: &SessionWriter,
         context: &mut ContextView,
-        append: impl FnOnce(
-            &mut crate::session::SessionManager,
-        ) -> std::result::Result<String, SessionError>
+        append: impl FnOnce(&mut crate::session::SessionManager) -> std::result::Result<String, SessionError>
         + Send
         + 'static,
     ) -> Result<String> {

@@ -26,9 +26,10 @@ pub(crate) fn reasoning_replay_for<'a>(
     selection: &SelectedModel,
     provider_name: &str,
 ) -> Option<&'a ProviderReasoningReplay> {
-    message.provider_reasoning_replay.as_ref().filter(|replay| {
-        replay.is_for_model(provider_name, &selection.model_name, selection.api_protocol)
-    })
+    message
+        .provider_reasoning_replay
+        .as_ref()
+        .filter(|replay| replay.is_for_model(provider_name, &selection.model_name, selection.api_protocol))
 }
 
 pub(crate) struct ReasoningWireDecision<'a> {
@@ -38,10 +39,7 @@ pub(crate) struct ReasoningWireDecision<'a> {
 
 pub(crate) fn reasoning_wire_decision(selection: &SelectedModel) -> ReasoningWireDecision<'_> {
     ReasoningWireDecision {
-        enabled: selection
-            .reasoning_variant
-            .as_ref()
-            .map(|variant| variant != "off"),
+        enabled: selection.reasoning_variant.as_ref().map(|variant| variant != "off"),
         effort: selection.wire_reasoning_effort.as_deref(),
     }
 }

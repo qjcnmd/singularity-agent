@@ -22,25 +22,15 @@ impl InputImage {
         if !header.starts_with("data:") || !header.ends_with(";base64") {
             return Err("图片必须使用 Base64 data URL。".into());
         }
-        let bytes = STANDARD
-            .decode(data)
-            .map_err(|_| "图片 Base64 数据无效。")?;
+        let bytes = STANDARD.decode(data).map_err(|_| "图片 Base64 数据无效。")?;
         Self::prepare(upload.name, bytes)
     }
 
     /// 读取一次文件内容，后续保存和模型请求使用这份快照。
     pub(crate) fn read(path: &Path, mut reader: impl Read) -> Result<Self, String> {
         let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|error| format!("无法读取图片：{error}"))?;
-        Self::prepare(
-            path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-            bytes,
-        )
+        reader.read_to_end(&mut bytes).map_err(|error| format!("无法读取图片：{error}"))?;
+        Self::prepare(path.file_name().unwrap_or_default().to_string_lossy().into_owned(), bytes)
     }
 
     fn prepare(name: String, mut bytes: Vec<u8>) -> Result<Self, String> {
@@ -63,9 +53,7 @@ impl InputImage {
         };
         if matches!(format, ImageFormat::Gif | ImageFormat::Bmp) {
             let mut encoded = Cursor::new(Vec::new());
-            decoded
-                .write_to(&mut encoded, ImageFormat::Png)
-                .map_err(|error| error.to_string())?;
+            decoded.write_to(&mut encoded, ImageFormat::Png).map_err(|error| error.to_string())?;
             bytes = encoded.into_inner();
         }
         Ok(Self {
@@ -97,21 +85,14 @@ fn data_url(mime: &str, bytes: &[u8]) -> String {
 }
 
 /// 从持久快照构造视觉输入；源文件后续的变化不会改变历史。
-pub(crate) fn load_image(
-    directory: &Path,
-    attachment: &ImageAttachment,
-) -> std::io::Result<String> {
+pub(crate) fn load_image(directory: &Path, attachment: &ImageAttachment) -> std::io::Result<String> {
     uuid::Uuid::parse_str(&attachment.id)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let path = directory.join(&attachment.id);
     let bytes = std::fs::read(&path).map_err(|error| {
         std::io::Error::new(
             error.kind(),
-            format!(
-                "无法读取图片 {}（{}）：{error}",
-                attachment.name,
-                path.display()
-            ),
+            format!("无法读取图片 {}（{}）：{error}", attachment.name, path.display()),
         )
     })?;
     Ok(data_url(&attachment.mime_type, &bytes))

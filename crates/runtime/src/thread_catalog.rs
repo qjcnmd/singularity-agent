@@ -40,13 +40,11 @@ impl ThreadCatalog {
     /// 初始化设置写入失败时清理新文件，清理失败一并报告。
     pub fn create_thread(&self, cwd: &str, model: Option<String>) -> Result<Thread, CatalogError> {
         if let Some(selector) = model.as_deref() {
-            parse_model_selector(selector)
-                .map_err(|error| CatalogError::InvalidModel(error.to_string()))?;
+            parse_model_selector(selector).map_err(|error| CatalogError::InvalidModel(error.to_string()))?;
         }
         let thread_id = Uuid::now_v7().to_string();
-        let mut session =
-            SessionManager::create_with_id(Path::new(cwd), &self.sessions_dir, &thread_id)
-                .map_err(|error| self.session_error(&thread_id, error))?;
+        let mut session = SessionManager::create_with_id(Path::new(cwd), &self.sessions_dir, &thread_id)
+            .map_err(|error| self.session_error(&thread_id, error))?;
         let thread = Thread {
             thread_id,
             cwd: session.cwd_string(),
@@ -98,22 +96,13 @@ impl ThreadCatalog {
         let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
         let model = session.entries().iter().rev().find_map(|entry| {
             let singularity_agent::session::SessionEntry::Metadata {
-                metadata:
-                    SessionMetadata::ThreadSettings {
-                        provider,
-                        model,
-                        reasoning,
-                    },
+                metadata: SessionMetadata::ThreadSettings { provider, model, reasoning },
                 ..
             } = entry
             else {
                 return None;
             };
-            Some(singularity_model::compose_model_selector(
-                provider,
-                model,
-                reasoning.as_deref(),
-            ))
+            Some(singularity_model::compose_model_selector(provider, model, reasoning.as_deref()))
         });
         Ok(Thread {
             thread_id: thread_id.to_string(),
@@ -130,18 +119,13 @@ impl ThreadCatalog {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(source) => {
-                return Err(CatalogError::Io {
-                    path: self.sessions_dir.clone(),
-                    source,
-                });
+                return Err(CatalogError::Io { path: self.sessions_dir.clone(), source });
             }
         };
         let mut threads = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|source| CatalogError::Io {
-                path: self.sessions_dir.clone(),
-                source,
-            })?;
+            let entry =
+                entry.map_err(|source| CatalogError::Io { path: self.sessions_dir.clone(), source })?;
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                 continue;
@@ -159,10 +143,7 @@ impl ThreadCatalog {
         }
         // 目录顺序只在这里产生：按最近更新时间降序；时间相同时按任务 ID 升序。
         threads.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then_with(|| left.thread_id.cmp(&right.thread_id))
+            right.updated_at.cmp(&left.updated_at).then_with(|| left.thread_id.cmp(&right.thread_id))
         });
         Ok(threads)
     }
@@ -178,9 +159,8 @@ impl ThreadCatalog {
     ) -> Result<Vec<String>, CatalogError> {
         let mut matching = Vec::new();
         for id in candidates {
-            Uuid::parse_str(id).map_err(|error| {
-                self.session_error(id, SessionError::InvalidSession(error.to_string()))
-            })?;
+            Uuid::parse_str(id)
+                .map_err(|error| self.session_error(id, SessionError::InvalidSession(error.to_string())))?;
             let session = match open_thread_read_only(&self.sessions_dir, id) {
                 Err(CatalogError::NotFound(_)) => {
                     open_thread_read_only(&self.sessions_dir.join(ARCHIVED_SESSIONS_DIR_NAME), id)
@@ -202,13 +182,9 @@ impl ThreadCatalog {
     }
 }
 
-fn open_thread_read_only(
-    sessions_dir: &Path,
-    thread_id: &str,
-) -> Result<SessionData, CatalogError> {
+fn open_thread_read_only(sessions_dir: &Path, thread_id: &str) -> Result<SessionData, CatalogError> {
     let path = thread_session_path(sessions_dir, thread_id);
-    let session =
-        SessionData::open(&path).map_err(|error| CatalogError::session(thread_id, &path, error))?;
+    let session = SessionData::open(&path).map_err(|error| CatalogError::session(thread_id, &path, error))?;
     session
         .verify_session_id(thread_id)
         .map_err(|error| CatalogError::session(thread_id, &path, error))?;
@@ -253,10 +229,7 @@ impl CatalogError {
             SessionError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Self::NotFound(thread_id.to_string())
             }
-            source => Self::Session {
-                path: path.to_path_buf(),
-                source,
-            },
+            source => Self::Session { path: path.to_path_buf(), source },
         }
     }
 }
@@ -271,11 +244,7 @@ pub struct ThreadSnapshot {
 impl ThreadSnapshot {
     /// 读取锚点之前的一页轮次：`before_turn` 是按轮的 cursor（`turn:{turnId}`，
     /// 前导组是 `turn:leading`），不是 item id；只展开请求范围内的条目。
-    pub fn page(
-        &self,
-        limit: usize,
-        before_turn: Option<&str>,
-    ) -> Result<ThreadReadPage, CatalogError> {
+    pub fn page(&self, limit: usize, before_turn: Option<&str>) -> Result<ThreadReadPage, CatalogError> {
         let end = match before_turn {
             None => self.turns.len(),
             Some(anchor) => self
@@ -285,10 +254,7 @@ impl ThreadSnapshot {
                 .ok_or_else(|| CatalogError::AnchorNotFound(anchor.to_string()))?,
         };
         let start = end.saturating_sub(limit);
-        let turns = self.turns[start..end]
-            .iter()
-            .map(|turn| turn.project(&self.session))
-            .collect();
+        let turns = self.turns[start..end].iter().map(|turn| turn.project(&self.session)).collect();
         Ok(ThreadReadPage {
             summary: self.summary.clone(),
             turns,
@@ -299,11 +265,7 @@ impl ThreadSnapshot {
 
 impl ThreadCatalog {
     fn session_error(&self, thread_id: &str, source: SessionError) -> CatalogError {
-        CatalogError::session(
-            thread_id,
-            &thread_session_path(&self.sessions_dir, thread_id),
-            source,
-        )
+        CatalogError::session(thread_id, &thread_session_path(&self.sessions_dir, thread_id), source)
     }
 
     /// 从当前持久历史读取图片，只接受任务实际引用的身份。
@@ -321,11 +283,7 @@ impl ThreadCatalog {
     pub fn read_snapshot(&self, thread_id: &str) -> Result<Arc<ThreadSnapshot>, CatalogError> {
         let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
         let (summary, turns) = thread_facts(&session);
-        Ok(Arc::new(ThreadSnapshot {
-            summary,
-            session,
-            turns,
-        }))
+        Ok(Arc::new(ThreadSnapshot { summary, session, turns }))
     }
 }
 
@@ -349,15 +307,13 @@ impl ThreadCatalog {
         })?;
         let path = thread_session_path(&self.sessions_dir, thread_id);
         let archived_dir = self.sessions_dir.join(ARCHIVED_SESSIONS_DIR_NAME);
-        std::fs::create_dir_all(&archived_dir).map_err(|source| CatalogError::Io {
-            path: archived_dir.clone(),
-            source,
-        })?;
+        std::fs::create_dir_all(&archived_dir)
+            .map_err(|source| CatalogError::Io { path: archived_dir.clone(), source })?;
         let archived = archived_dir.join(singularity_agent::session::session_file_name(thread_id));
-        if archived.try_exists().map_err(|source| CatalogError::Io {
-            path: archived.clone(),
-            source,
-        })? {
+        if archived
+            .try_exists()
+            .map_err(|source| CatalogError::Io { path: archived.clone(), source })?
+        {
             return Err(CatalogError::NotFound(thread_id.to_string()));
         }
         std::fs::rename(&path, &archived)

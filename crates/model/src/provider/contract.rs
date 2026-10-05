@@ -6,10 +6,7 @@ use std::collections::HashSet;
 use crate::error::{ModelErrorKind, ProviderError};
 use crate::types::ModelTurnResponse;
 
-pub(crate) fn provider_response_validation_error(
-    message: &str,
-    errors: Vec<String>,
-) -> ProviderError {
+pub(crate) fn provider_response_validation_error(message: &str, errors: Vec<String>) -> ProviderError {
     ProviderError::diagnostic(
         ModelErrorKind::JsonSchemaViolation,
         message,
@@ -55,9 +52,6 @@ pub(crate) fn finalize_provider_response(
     if errors.is_empty() {
         Ok(response)
     } else {
-        Err(provider_response_validation_error(
-            "provider response structure was invalid",
-            errors,
-        ))
+        Err(provider_response_validation_error("provider response structure was invalid", errors))
     }
 }

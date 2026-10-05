@@ -6,9 +6,7 @@ use std::sync::Arc;
 
 use crate::Conversation;
 use crate::ThreadCatalog;
-use crate::test_support::{
-    GatedProvider, SessionsFixture, conversation_with, seed_compaction_history,
-};
+use crate::test_support::{GatedProvider, SessionsFixture, conversation_with, seed_compaction_history};
 use singularity_agent::session::{SessionData, SessionEntry, SessionMetadata};
 use singularity_model::{
     ModelErrorKind, Provider, ProviderError,
@@ -25,9 +23,7 @@ fn new_conversation(
     conversation_with(fixture, provider, model).0
 }
 
-fn run_compaction(
-    reservation: &mut crate::OperationReservation,
-) -> Result<(), crate::ConversationError> {
+fn run_compaction(reservation: &mut crate::OperationReservation) -> Result<(), crate::ConversationError> {
     match crate::test_support::run_async(reservation.execute(&mut |_| {})) {
         crate::OperationResult::Compaction(result) => result,
         crate::OperationResult::Turn(_) => panic!("expected the reserved compaction"),
@@ -61,12 +57,7 @@ fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option
         .rev()
         .find_map(|entry| match entry {
             SessionEntry::Metadata {
-                metadata:
-                    SessionMetadata::ThreadSettings {
-                        provider,
-                        model,
-                        reasoning,
-                    },
+                metadata: SessionMetadata::ThreadSettings { provider, model, reasoning },
                 ..
             } => Some(singularity_model::compose_model_selector(
                 provider,
@@ -98,25 +89,15 @@ fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
     let mut sink = |_event: TurnEvent| {};
     let worker = {
         let conversation = Arc::clone(&conversation);
-        std::thread::spawn(move || {
-            crate::test_support::run_async(conversation.run_turn("first", &mut sink))
-        })
+        std::thread::spawn(move || crate::test_support::run_async(conversation.run_turn("first", &mut sink)))
     };
     started_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("turn reaches the provider");
 
-    conversation
-        .rename("  running task  ")
-        .expect("mid-turn rename");
+    conversation.rename("  running task  ").expect("mid-turn rename");
     assert_eq!(
-        fixture
-            .catalog()
-            .read_snapshot(&thread_id)
-            .unwrap()
-            .summary
-            .title
-            .as_deref(),
+        fixture.catalog().read_snapshot(&thread_id).unwrap().summary.title.as_deref(),
         Some("running task"),
         "the trimmed name is durable before the running turn completes"
     );
@@ -146,8 +127,7 @@ fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
 
     let mut sink = |_event: TurnEvent| {};
-    let outcome =
-        crate::test_support::run_async(conversation.run_turn("second", &mut sink)).expect("runs");
+    let outcome = crate::test_support::run_async(conversation.run_turn("second", &mut sink)).expect("runs");
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
     assert_eq!(
         thread_settings_count(&sessions, &thread_id),
@@ -176,11 +156,7 @@ fn failed_compaction_closes_its_durable_operation() {
     };
     let conversation = new_conversation(
         &fixture,
-        Arc::new(ScriptedProvider::new([
-            summary_failure(),
-            summary_failure(),
-            summary_failure(),
-        ])),
+        Arc::new(ScriptedProvider::new([summary_failure(), summary_failure(), summary_failure()])),
         None,
     );
     let thread_id = conversation.thread().thread_id;
@@ -188,19 +164,11 @@ fn failed_compaction_closes_its_durable_operation() {
 
     {
         let mut reservation = conversation.reserve_compaction().unwrap();
-        conversation
-            .rename("compacting task")
-            .expect("compaction writer accepts rename");
+        conversation.rename("compacting task").expect("compaction writer accepts rename");
         run_compaction(&mut reservation).expect("failure terminal is persisted");
     }
     assert_eq!(
-        fixture
-            .catalog()
-            .read_snapshot(&thread_id)
-            .unwrap()
-            .summary
-            .title
-            .as_deref(),
+        fixture.catalog().read_snapshot(&thread_id).unwrap().summary.title.as_deref(),
         Some("compacting task")
     );
 
@@ -213,10 +181,7 @@ fn failed_compaction_closes_its_durable_operation() {
                 error,
                 ..
             } => {
-                assert_eq!(
-                    error.unwrap().cause,
-                    crate::TurnFailureCause::ProviderNetwork
-                );
+                assert_eq!(error.unwrap().cause, crate::TurnFailureCause::ProviderNetwork);
                 Some(outcome)
             }
             _ => None,
@@ -229,11 +194,8 @@ fn failed_compaction_closes_its_durable_operation() {
 fn invalid_compaction_response_preserves_its_validation_source() {
     let fixture = SessionsFixture::new();
     let sessions = fixture.dir.clone();
-    let conversation = new_conversation(
-        &fixture,
-        Arc::new(ScriptedProvider::new([ScriptedAttempt::success("")])),
-        None,
-    );
+    let conversation =
+        new_conversation(&fixture, Arc::new(ScriptedProvider::new([ScriptedAttempt::success("")])), None);
     let thread_id = conversation.thread().thread_id;
     seed_compaction_history(&fixture, &thread_id);
 
@@ -244,32 +206,28 @@ fn invalid_compaction_response_preserves_its_validation_source() {
 
     // 失败原因随同一份 operation 终态落盘：重新打开 JSONL 仍能定位这次压缩
     // 为什么失败，而不是只看到一次 provider 请求与无原因 Failed。
-    let durable = SessionData::open(
-        &sessions.join(singularity_agent::session::session_file_name(&thread_id)),
-    )
-    .expect("reopen the session file")
-    .entries()
-    .iter()
-    .find_map(|entry| match entry {
-        SessionEntry::Record {
-            record:
-                singularity_agent::session::LedgerRecord::OperationFinished {
-                    turn_id: None,
-                    outcome,
-                    error,
+    let durable =
+        SessionData::open(&sessions.join(singularity_agent::session::session_file_name(&thread_id)))
+            .expect("reopen the session file")
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                SessionEntry::Record {
+                    record:
+                        singularity_agent::session::LedgerRecord::OperationFinished {
+                            turn_id: None,
+                            outcome,
+                            error,
+                            ..
+                        },
                     ..
-                },
-            ..
-        } => Some((*outcome, error.clone())),
-        _ => None,
-    })
-    .expect("one compaction terminal");
+                } => Some((*outcome, error.clone())),
+                _ => None,
+            })
+            .expect("one compaction terminal");
     assert_eq!(durable.0, TurnStatus::Failed);
     let detail = durable.1.expect("a failed compaction keeps its reason");
-    assert!(
-        detail.message.contains("summary contains no text"),
-        "{detail:?}"
-    );
+    assert!(detail.message.contains("summary contains no text"), "{detail:?}");
 }
 
 #[test]
@@ -299,14 +257,8 @@ fn compaction_summary_append_failure_stops_execution() {
     std::fs::create_dir(&path).expect("replace session file with a directory");
     release_tx.send(()).expect("release provider");
 
-    let error = worker
-        .join()
-        .expect("compaction thread")
-        .expect_err("the summary cannot be persisted");
-    assert!(matches!(
-        error,
-        crate::ConversationError::Turn(crate::TurnRunError::Execution(_))
-    ));
+    let error = worker.join().expect("compaction thread").expect_err("the summary cannot be persisted");
+    assert!(matches!(error, crate::ConversationError::Turn(crate::TurnRunError::Execution(_))));
 }
 
 fn ledger_of(sessions: &Path, thread_id: &str) -> Vec<singularity_agent::session::LedgerRecord> {

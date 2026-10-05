@@ -62,22 +62,15 @@ pub(crate) fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecutio
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => {
-            return error_result(format!(
-                "Could not read file before writing: {path}. {error}"
-            ));
+            return error_result(format!("Could not read file before writing: {path}. {error}"));
         }
     };
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
     }
-    if let Err(error) =
-        singularity_core::atomic_replace_workspace_file(&full_path, content.as_bytes())
-    {
+    if let Err(error) = singularity_core::atomic_replace_workspace_file(&full_path, content.as_bytes()) {
         return error_result(format!("Could not write file: {path}. {error}"));
     }
-    ToolExecution::text(format!(
-        "Successfully wrote {} bytes to {path}",
-        content.len()
-    ))
-    .with_diff(super::mutation::unified_diff(path, &before, content))
+    ToolExecution::text(format!("Successfully wrote {} bytes to {path}", content.len()))
+        .with_diff(super::mutation::unified_diff(path, &before, content))
 }

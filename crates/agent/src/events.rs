@@ -61,10 +61,7 @@ pub enum AgentEvent {
         arguments: Value,
     },
     /// 工具执行过程中产生的流式增量输出；工具本身的事实由 Started 建立，这里只按 item_id 更新累计进度。
-    ToolExecutionUpdate {
-        item_id: String,
-        partial_result: String,
-    },
+    ToolExecutionUpdate { item_id: String, partial_result: String },
     /// 工具执行完成；工具名称与参数已在 Started 发布，这里不再重复。
     ToolExecutionEnded {
         item_id: String,

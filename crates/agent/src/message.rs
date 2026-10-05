@@ -80,11 +80,7 @@ impl AgentMessage {
     /// 工具结果必须由历史归约去绑定对应的调用，不在这里投影。
     ///
     /// 筛选在块映射之前完成，所以被排除的块不会产生任何临时对象。
-    pub fn public_items(
-        &self,
-        entry_id: &str,
-        scope: ItemScope,
-    ) -> Vec<singularity_protocol::HistoryItem> {
+    pub fn public_items(&self, entry_id: &str, scope: ItemScope) -> Vec<singularity_protocol::HistoryItem> {
         use singularity_protocol::HistoryItem;
         let role = match self {
             Self::User { .. } => "user",
@@ -117,10 +113,7 @@ impl AgentMessage {
                     ContentBlock::Thinking { thinking } if !thinking.is_empty() => {
                         let id = crate::session::thinking_item_id(entry_id, thinking_index);
                         thinking_index += 1;
-                        HistoryItem::Thinking {
-                            id,
-                            text: thinking.clone(),
-                        }
+                        HistoryItem::Thinking { id, text: thinking.clone() }
                     }
                     ContentBlock::ToolCall(_) if !include_tool_calls => return None,
                     ContentBlock::ToolCall(call) => {
@@ -149,10 +142,7 @@ impl AgentMessage {
     /// 用户消息和任务标题共用的展示内容；模型仍消费原始 content。
     pub fn display_content(&self) -> Cow<'_, [ContentBlock]> {
         match self {
-            Self::User {
-                content,
-                display_text: Some(text),
-            } => {
+            Self::User { content, display_text: Some(text) } => {
                 // displayText 只随输入交付保存；该消息的首块就是用户文字。
                 let mut displayed = content.clone();
                 displayed[0] = ContentBlock::Text { text: text.clone() };
@@ -193,10 +183,7 @@ impl AgentMessage {
     /// provider 的推理重放数据；只有 assistant 消息会带。
     pub fn provider_reasoning_replay(&self) -> Option<&ProviderReasoningReplay> {
         match self {
-            Self::Assistant {
-                provider_reasoning_replay,
-                ..
-            } => provider_reasoning_replay.as_ref(),
+            Self::Assistant { provider_reasoning_replay, .. } => provider_reasoning_replay.as_ref(),
             _ => None,
         }
     }
@@ -228,11 +215,7 @@ pub(crate) fn public_thinking_text_blocks(thinking: String, text: String) -> Vec
 /// 响应按值交接；停止原因由执行循环消费，不属于持久化内容。
 /// usage 由请求观测和 operation 终态统计链记录，不算会话内容。
 pub(crate) fn assistant_response_message(response: ModelTurnResponse) -> AgentMessage {
-    let ModelTurnResponse {
-        assistant_message,
-        thinking,
-        ..
-    } = response;
+    let ModelTurnResponse { assistant_message, thinking, .. } = response;
     let ModelMessage {
         content: text,
         tool_calls,
@@ -241,22 +224,12 @@ pub(crate) fn assistant_response_message(response: ModelTurnResponse) -> AgentMe
     } = assistant_message;
     let mut content = public_thinking_text_blocks(thinking, text);
     content.extend(tool_calls.into_iter().map(ContentBlock::ToolCall));
-    AgentMessage::Assistant {
-        content,
-        provider_reasoning_replay,
-    }
+    AgentMessage::Assistant { content, provider_reasoning_replay }
 }
 
 pub(crate) fn tool_result_message(tool_call_id: &str, execution: &ToolExecution) -> AgentMessage {
-    let mut content = vec![ContentBlock::Text {
-        text: execution.content.clone(),
-    }];
-    content.extend(
-        execution
-            .images
-            .iter()
-            .map(|image| ContentBlock::Image(image.attachment.clone())),
-    );
+    let mut content = vec![ContentBlock::Text { text: execution.content.clone() }];
+    content.extend(execution.images.iter().map(|image| ContentBlock::Image(image.attachment.clone())));
     AgentMessage::ToolResult {
         content,
         tool_call_id: tool_call_id.to_string(),

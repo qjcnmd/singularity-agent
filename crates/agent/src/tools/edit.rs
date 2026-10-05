@@ -81,8 +81,7 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
     }
-    if let Err(error) =
-        singularity_core::atomic_replace_workspace_file(&full_path, projected_text.as_bytes())
+    if let Err(error) = singularity_core::atomic_replace_workspace_file(&full_path, projected_text.as_bytes())
     {
         return error_result(format!("Could not edit file: {path}. {error}"));
     }
@@ -110,9 +109,7 @@ fn prepare_edit(path: &str, content: &str, args: &EditArgs) -> Result<(String, u
     }
     // read 逐行输出用的是 LF；这里只把行尾统一后再匹配，不放宽其他空白或唯一性要求。
     let normalized_content = content.replace("\r\n", "\n");
-    let matches: Vec<_> = normalized_content
-        .match_indices(old_string.as_str())
-        .collect();
+    let matches: Vec<_> = normalized_content.match_indices(old_string.as_str()).collect();
     if matches.is_empty() {
         return Err(format!(
             "Could not find the exact text in {path}. The old text must match exactly including whitespace; LF and CRLF line endings are equivalent."
@@ -136,8 +133,7 @@ fn prepare_edit(path: &str, content: &str, args: &EditArgs) -> Result<(String, u
         .enumerate()
         .map(|(removed, (offset, _))| offset - removed)
         .collect();
-    let original_offset =
-        |offset| offset + crlf_positions.partition_point(|position| *position < offset);
+    let original_offset = |offset| offset + crlf_positions.partition_point(|position| *position < offset);
     // 文件级兜底行尾在循环外只算一次；每个命中块各自取自己的行尾，混合行尾按块保留。
     let file_ending = line_ending(content);
     let mut projected_text = String::with_capacity(content.len());
@@ -148,9 +144,7 @@ fn prepare_edit(path: &str, content: &str, args: &EditArgs) -> Result<(String, u
         let start = original_offset(offset);
         let end = original_offset(offset + matched.len());
         projected_text.push_str(&content[previous_end..start]);
-        let ending = line_ending(&content[start..end])
-            .or(file_ending)
-            .unwrap_or("\n");
+        let ending = line_ending(&content[start..end]).or(file_ending).unwrap_or("\n");
         if ending == "\r\n" {
             projected_text.push_str(&crlf_new_string);
         } else {

@@ -27,12 +27,7 @@ pub(super) const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
     "[output truncated: a background process is still writing]";
 
 pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
-    let ExecuteContext {
-        cwd,
-        signal,
-        mut on_update,
-        ..
-    } = ctx;
+    let ExecuteContext { cwd, signal, mut on_update, .. } = ctx;
     let command = args.command.as_str();
     let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     let shell = match bash_path() {
@@ -140,10 +135,8 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
 
     let (mut content, spill_note) = state.finish();
     // 附加失败信息（输出读取错误与回收失败）排在结束原因之后，只补充事实。
-    let mut auxiliary_failures: Vec<String> = output_errors
-        .into_iter()
-        .map(|error| error.to_string())
-        .collect();
+    let mut auxiliary_failures: Vec<String> =
+        output_errors.into_iter().map(|error| error.to_string()).collect();
     auxiliary_failures.extend(cleanup_failures);
     let is_error = append_outcome(&mut content, outcome, &auxiliary_failures);
     if output_truncated_by_background {
@@ -160,11 +153,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
 }
 
 /// 把结束原因和附加失败信息写进结果文本；返回本次调用是不是失败结果。
-fn append_outcome(
-    content: &mut String,
-    outcome: BashOutcome,
-    auxiliary_failures: &[String],
-) -> bool {
+fn append_outcome(content: &mut String, outcome: BashOutcome, auxiliary_failures: &[String]) -> bool {
     let mut is_error = false;
     match outcome {
         BashOutcome::OutputFailed(error) => {
@@ -172,10 +161,7 @@ fn append_outcome(
             is_error = true;
         }
         BashOutcome::WaitFailed(error) => {
-            append_status(
-                content,
-                &format!("failed to wait for the command process: {error}"),
-            );
+            append_status(content, &format!("failed to wait for the command process: {error}"));
             is_error = true;
         }
         BashOutcome::Aborted => {

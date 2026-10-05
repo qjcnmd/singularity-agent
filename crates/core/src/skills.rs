@@ -65,13 +65,9 @@ fn discover_skill(path: &Path) -> Result<Skill, String> {
     if !closed {
         return Err(format!("{}: unclosed YAML frontmatter", path.display()));
     }
-    let meta: Metadata =
-        serde_yaml_ng::from_str(&yaml).map_err(|e| format!("{}: {e}", path.display()))?;
+    let meta: Metadata = serde_yaml_ng::from_str(&yaml).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.name.is_empty()
-        || meta
-            .name
-            .chars()
-            .any(|c| c.is_whitespace() || matches!(c, '/' | '\\' | '<' | '>'))
+        || meta.name.chars().any(|c| c.is_whitespace() || matches!(c, '/' | '\\' | '<' | '>'))
         || meta.description.trim().is_empty()
     {
         return Err(format!(
@@ -98,8 +94,7 @@ impl SkillCatalog {
             Err(error) => (cwd.to_path_buf(), Some(error)),
         };
         let mut roots = vec![
-            root.join(crate::user_home::SINGULARITY_DIR_NAME)
-                .join("skills"),
+            root.join(crate::user_home::SINGULARITY_DIR_NAME).join("skills"),
             root.join(".agents/skills"),
             home.join("skills"),
         ];
@@ -149,10 +144,7 @@ impl SkillCatalog {
                                 }
                             }
                             Ok(_) => {
-                                if path
-                                    .extension()
-                                    .is_some_and(|e| e.eq_ignore_ascii_case("md"))
-                                {
+                                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("md")) {
                                     paths.push(path);
                                 }
                             }
@@ -184,14 +176,7 @@ impl SkillCatalog {
             .skills
             .iter()
             .filter(|skill| !skill.disable_model_invocation)
-            .map(|s| {
-                format!(
-                    "- {}: {} (path: {})",
-                    s.name,
-                    s.description,
-                    s.path.display()
-                )
-            })
+            .map(|s| format!("- {}: {} (path: {})", s.name, s.description, s.path.display()))
             .collect();
         if !lines.is_empty() {
             lines.insert(0, "Available skills: when a skill matches the user's task, use the read tool on its path to load the complete instructions. Relative resources in a skill are resolved from that skill file's directory.".into());

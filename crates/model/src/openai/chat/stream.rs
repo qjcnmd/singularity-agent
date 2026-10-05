@@ -9,12 +9,8 @@ pub(crate) async fn read_chat_sse_stream(
     config: &OpenAiProviderConfig,
     selection: &SelectedModel,
 ) -> Result<ModelTurnResponse, ProviderError> {
-    read_sse_stream(
-        cancellation,
-        response,
-        ChatSseDecoder::new(on_event, config, &selection.model_name),
-    )
-    .await
+    read_sse_stream(cancellation, response, ChatSseDecoder::new(on_event, config, &selection.model_name))
+        .await
 }
 
 #[derive(Default)]
@@ -75,9 +71,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             return Ok(());
         };
         if choices.len() > 1 {
-            return Err(provider_chat_stream_malformed_error(
-                "multiple_choices_unsupported",
-            ));
+            return Err(provider_chat_stream_malformed_error("multiple_choices_unsupported"));
         }
         for choice in choices {
             if !choice.is_object() {
@@ -85,9 +79,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             }
             let index = stream_index(choice.get("index"), "choice_index_invalid")?;
             if index != 0 {
-                return Err(provider_chat_stream_malformed_error(
-                    "multiple_choices_unsupported",
-                ));
+                return Err(provider_chat_stream_malformed_error("multiple_choices_unsupported"));
             }
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
                 self.finish_reason = Some(reason.to_string());
@@ -103,55 +95,36 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             {
                 return Err(provider_chat_stream_malformed_error("role_invalid"));
             }
-            if delta
-                .get("content")
-                .is_some_and(|content| !content.is_null() && !content.is_string())
-            {
+            if delta.get("content").is_some_and(|content| !content.is_null() && !content.is_string()) {
                 return Err(provider_chat_stream_malformed_error("content_invalid"));
             }
-            if delta
-                .get("tool_calls")
-                .is_some_and(|calls| !calls.is_null() && !calls.is_array())
-            {
+            if delta.get("tool_calls").is_some_and(|calls| !calls.is_null() && !calls.is_array()) {
                 return Err(provider_chat_stream_malformed_error("tool_calls_invalid"));
             }
             // 兼容端点可能在同一块里用多个键携带同一段 reasoning（实测双键同文），故只取第一个非空键。
             if let Some((field, reasoning)) = chat_reasoning_text(delta) {
-                self.reasoning_field
-                    .get_or_insert_with(|| field.to_string());
+                self.reasoning_field.get_or_insert_with(|| field.to_string());
                 self.reasoning_content.push_str(reasoning);
-                (self.on_event)(ProviderStreamEvent::ReasoningTextDelta {
-                    delta: reasoning.to_string(),
-                });
+                (self.on_event)(ProviderStreamEvent::ReasoningTextDelta { delta: reasoning.to_string() });
             }
-            if let Some(details) = delta
-                .get("reasoning_details")
-                .filter(|value| !value.is_null())
-            {
-                let details = details.as_array().ok_or_else(|| {
-                    provider_chat_stream_malformed_error("reasoning_details_not_array")
-                })?;
+            if let Some(details) = delta.get("reasoning_details").filter(|value| !value.is_null()) {
+                let details = details
+                    .as_array()
+                    .ok_or_else(|| provider_chat_stream_malformed_error("reasoning_details_not_array"))?;
                 self.receive_reasoning_details(details)?;
             }
             if let Some(text) = delta.get("content").and_then(Value::as_str)
                 && !text.is_empty()
             {
                 self.content.push_str(text);
-                (self.on_event)(ProviderStreamEvent::OutputTextDelta {
-                    delta: text.to_string(),
-                });
+                (self.on_event)(ProviderStreamEvent::OutputTextDelta { delta: text.to_string() });
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
                     self.receive_tool_call_fragment(call)?;
-                    if ["/function/name", "/function/arguments"]
-                        .iter()
-                        .any(|path| {
-                            call.pointer(path)
-                                .and_then(Value::as_str)
-                                .is_some_and(|text| !text.is_empty())
-                        })
-                    {
+                    if ["/function/name", "/function/arguments"].iter().any(|path| {
+                        call.pointer(path).and_then(Value::as_str).is_some_and(|text| !text.is_empty())
+                    }) {
                         (self.on_event)(ProviderStreamEvent::ToolCallDelta);
                     }
                 }
@@ -162,9 +135,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
 
     fn materialize_terminal(self) -> Result<Self::Terminal, ProviderError> {
         if !self.done {
-            return Err(provider_chat_stream_malformed_error(
-                "terminal_done_missing",
-            ));
+            return Err(provider_chat_stream_malformed_error("terminal_done_missing"));
         }
         let finish_reason = self
             .finish_reason
@@ -206,9 +177,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             ));
         }
         if finish_reason == "network_error" {
-            return Err(provider_finish_network_error(
-                "provider Chat response reported a network error",
-            ));
+            return Err(provider_finish_network_error("provider Chat response reported a network error"));
         }
         let thinking = if !reasoning_content.is_empty() {
             reasoning_content.clone()
@@ -281,16 +250,12 @@ impl<'a> ChatSseDecoder<'a> {
     fn receive_reasoning_details(&mut self, details: &[Value]) -> Result<(), ProviderError> {
         for detail in details {
             let Some(detail) = detail.as_object() else {
-                return Err(provider_chat_stream_malformed_error(
-                    "reasoning_detail_not_object",
-                ));
+                return Err(provider_chat_stream_malformed_error("reasoning_detail_not_object"));
             };
             if self.reasoning_field.is_none()
                 && let Some(text) = chat_reasoning_detail_text(detail)
             {
-                (self.on_event)(ProviderStreamEvent::ReasoningTextDelta {
-                    delta: text.to_string(),
-                });
+                (self.on_event)(ProviderStreamEvent::ReasoningTextDelta { delta: text.to_string() });
             }
             append_reasoning_detail(&mut self.reasoning_details, detail);
         }
@@ -302,32 +267,19 @@ impl<'a> ChatSseDecoder<'a> {
         // 空串等同于「本分片没有声明类型」：部分提供方只在第一个分片声明 function，
         // 后续参数分片重复该字段但留空。不是字符串的仍然拒绝。
         if !call.is_object()
-            || call
-                .get("type")
-                .is_some_and(|kind| !matches!(kind.as_str(), Some("") | Some("function")))
+            || call.get("type").is_some_and(|kind| !matches!(kind.as_str(), Some("") | Some("function")))
         {
-            return Err(provider_chat_stream_malformed_error(
-                "tool_call_type_invalid",
-            ));
+            return Err(provider_chat_stream_malformed_error("tool_call_type_invalid"));
         }
-        if call
-            .get("function")
-            .is_some_and(|function| !function.is_null() && !function.is_object())
-        {
-            return Err(provider_chat_stream_malformed_error(
-                "tool_function_invalid",
-            ));
+        if call.get("function").is_some_and(|function| !function.is_null() && !function.is_object()) {
+            return Err(provider_chat_stream_malformed_error("tool_function_invalid"));
         }
         if let Some(function) = call.get("function").and_then(Value::as_object)
-            && ["name", "arguments"].iter().any(|key| {
-                function
-                    .get(*key)
-                    .is_some_and(|value| !value.is_null() && !value.is_string())
-            })
+            && ["name", "arguments"]
+                .iter()
+                .any(|key| function.get(*key).is_some_and(|value| !value.is_null() && !value.is_string()))
         {
-            return Err(provider_chat_stream_malformed_error(
-                "tool_function_field_invalid",
-            ));
+            return Err(provider_chat_stream_malformed_error("tool_function_field_invalid"));
         }
         // 工具分片归到哪个调用必须没有歧义：省略 index 的单个调用按兼容保留，非法
         // 索引直接拒绝，绝不把不同调用拼进同一个聚合槽。
@@ -365,10 +317,8 @@ fn append_reasoning_detail(details: &mut Vec<Value>, incoming: &serde_json::Map<
                 }
             });
         if same_segment
-            && let (Some(Value::String(existing)), Some(delta)) = (
-                previous.get_mut(key),
-                incoming.get(key).and_then(Value::as_str),
-            )
+            && let (Some(Value::String(existing)), Some(delta)) =
+                (previous.get_mut(key), incoming.get(key).and_then(Value::as_str))
         {
             existing.push_str(delta);
             for (field, value) in incoming {
@@ -386,11 +336,7 @@ fn append_reasoning_detail(details: &mut Vec<Value>, incoming: &serde_json::Map<
 }
 
 fn provider_chat_stream_malformed_error(reason: &'static str) -> ProviderError {
-    provider_stream_malformed_error(
-        "provider Chat stream was malformed",
-        "chat_stream_malformed",
-        reason,
-    )
+    provider_stream_malformed_error("provider Chat stream was malformed", "chat_stream_malformed", reason)
 }
 
 /// 流里 index 字段的唯一解释：省略 index 的单个 choice / 工具调用按兼容保留为 0；
@@ -398,8 +344,6 @@ fn provider_chat_stream_malformed_error(reason: &'static str) -> ProviderError {
 fn stream_index(value: Option<&Value>, malformed: &'static str) -> Result<u64, ProviderError> {
     match value {
         None => Ok(0),
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| provider_chat_stream_malformed_error(malformed)),
+        Some(value) => value.as_u64().ok_or_else(|| provider_chat_stream_malformed_error(malformed)),
     }
 }

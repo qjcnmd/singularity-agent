@@ -29,8 +29,7 @@ use crate::assistant_items::AssistantItemEvents;
 use crate::conversation::CancelWindow;
 use crate::error::{TurnFailureCause, TurnRunError, provider_turn_cause};
 use singularity_protocol::{
-    DiagnosticSeverity, Thread, Turn, TurnErrorDetail, TurnEvent, TurnModelUsage, TurnStatus,
-    diagnostic_code,
+    DiagnosticSeverity, Thread, Turn, TurnErrorDetail, TurnEvent, TurnModelUsage, TurnStatus, diagnostic_code,
 };
 
 /// 一次收敛到可信终态的 turn 结果（completed/failed/interrupted 都是可信终态；
@@ -84,10 +83,7 @@ impl TurnRunner {
 
     /// 测试注入：覆写模型执行的 provider；设置修改仍校验磁盘配置中的 selector。
     #[cfg(test)]
-    pub(crate) fn with_provider_override(
-        mut self,
-        provider: Arc<dyn Provider + Send + Sync>,
-    ) -> Self {
+    pub(crate) fn with_provider_override(mut self, provider: Arc<dyn Provider + Send + Sync>) -> Self {
         self.provider_override = Some(provider);
         self
     }
@@ -104,8 +100,7 @@ impl TurnRunner {
     /// 在 Conversation 的写入窗口内打开本轮会话写者，承担随后的 operation 与终态落盘。
     /// 控制队列不落盘。
     pub(crate) fn open_turn_writer(&self, thread: &Thread) -> Result<SessionWriter, TurnRunError> {
-        let path =
-            crate::thread_catalog::thread_session_path(&self.sessions_dir, &thread.thread_id);
+        let path = crate::thread_catalog::thread_session_path(&self.sessions_dir, &thread.thread_id);
         let session = SessionManager::open_existing(&path, &thread.thread_id)
             .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
         Ok(Arc::new(std::sync::Mutex::new(session)))
@@ -144,9 +139,7 @@ impl TurnRunner {
                 }
                 event => item_events.project(sink, event),
             };
-            agent
-                .run(&input, &mut on_event, controls.cancellation())
-                .await
+            agent.run(&input, &mut on_event, controls.cancellation()).await
         };
         controls.close_inbox();
         let cancel_accepted = controls.finish_cancel();
@@ -165,18 +158,9 @@ impl TurnRunner {
             // 链条到此停止。
             Err(error) => {
                 let (cause, code) = classify_agent_error(&error);
-                let detail = TurnErrorDetail {
-                    cause,
-                    message: error.to_string(),
-                };
+                let detail = TurnErrorDetail { cause, message: error.to_string() };
                 if let Some(code) = code {
-                    return Err(fail_stop_execution(
-                        &thread.thread_id,
-                        &turn_id,
-                        detail,
-                        code,
-                        sink,
-                    ));
+                    return Err(fail_stop_execution(&thread.thread_id, &turn_id, detail, code, sink));
                 }
                 (TurnStatus::Failed, false, Some(detail))
             }
@@ -195,12 +179,7 @@ impl TurnRunner {
         };
         let finished_at = match with_writer_async(&writer, move |writer| {
             writer.append_record(record)?;
-            Ok(writer
-                .entries()
-                .last()
-                .expect("successful append has an entry")
-                .timestamp()
-                .to_owned())
+            Ok(writer.entries().last().expect("successful append has an entry").timestamp().to_owned())
         })
         .await
         {
@@ -254,13 +233,8 @@ impl TurnRunner {
         let (provider, config) = self.resolve_agent_runtime(thread)?;
         // OperationStarted 记录 turn 身份。输入消息由 Agent 单独落盘；
         // 这些追加不是一个原子事务。
-        let agent = Agent::new(
-            controls.inbox_handle(),
-            provider,
-            config,
-            writer.clone(),
-            Arc::clone(&self.mcp),
-        );
+        let agent =
+            Agent::new(controls.inbox_handle(), provider, config, writer.clone(), Arc::clone(&self.mcp));
         let agent = if self.user_questions {
             agent.with_user_questions(Arc::clone(&controls.questions))
         } else {
@@ -269,16 +243,10 @@ impl TurnRunner {
         controls.record_context_window(agent.context_window());
         let mut writer = lock_writer(&writer);
         writer
-            .append_record(LedgerRecord::OperationStarted {
-                turn_id: Some(controls.turn_id.clone()),
-            })
+            .append_record(LedgerRecord::OperationStarted { turn_id: Some(controls.turn_id.clone()) })
             .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
-        let started_at = writer
-            .entries()
-            .last()
-            .expect("successful append has an entry")
-            .timestamp()
-            .to_owned();
+        let started_at =
+            writer.entries().last().expect("successful append has an entry").timestamp().to_owned();
         Ok((agent, started_at))
     }
 
@@ -291,16 +259,11 @@ impl TurnRunner {
         let provider = self.resolve_provider(thread)?;
         let config = agent_config_for_thread(
             thread,
-            self.sessions_dir
-                .parent()
-                .expect("sessions directory is inside the data directory"),
+            self.sessions_dir.parent().expect("sessions directory is inside the data directory"),
         )?;
         Ok((provider, config))
     }
-    fn resolve_provider(
-        &self,
-        thread: &Thread,
-    ) -> Result<Arc<dyn Provider + Send + Sync>, TurnRunError> {
+    fn resolve_provider(&self, thread: &Thread) -> Result<Arc<dyn Provider + Send + Sync>, TurnRunError> {
         let provider: Arc<dyn Provider + Send + Sync> = {
             #[cfg(test)]
             let overridden = self.provider_override.clone();
@@ -311,11 +274,8 @@ impl TurnRunner {
                 None => {
                     let snapshot = self.models.snapshot();
                     Arc::new(
-                        singularity_model::OpenAiProvider::from_snapshot(
-                            &snapshot,
-                            thread.model.as_deref(),
-                        )
-                        .map_err(|error| TurnRunError::Preparation(error.to_string()))?,
+                        singularity_model::OpenAiProvider::from_snapshot(&snapshot, thread.model.as_deref())
+                            .map_err(|error| TurnRunError::Preparation(error.to_string()))?,
                     )
                 }
             }

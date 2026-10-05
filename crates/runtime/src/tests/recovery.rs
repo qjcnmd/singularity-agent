@@ -16,16 +16,10 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
 
     let fixture = SessionsFixture::new();
     let sessions = fixture.dir.clone();
-    let runner = fixture.runner(Some(Arc::new(
-        singularity_model::test_support::ScriptedProvider::ok("finished work"),
-    )));
-    let thread = fixture
-        .catalog()
-        .create_thread(fixture.home().to_str().unwrap(), None)
-        .unwrap();
-    let path = sessions.join(singularity_agent::session::session_file_name(
-        &thread.thread_id,
-    ));
+    let runner = fixture
+        .runner(Some(Arc::new(singularity_model::test_support::ScriptedProvider::ok("finished work"))));
+    let thread = fixture.catalog().create_thread(fixture.home().to_str().unwrap(), None).unwrap();
+    let path = sessions.join(singularity_agent::session::session_file_name(&thread.thread_id));
     let permissions = std::fs::metadata(&path).unwrap().permissions();
     let conversation = Conversation::new(Arc::clone(&runner), thread);
     let mut events = Vec::new();
@@ -43,16 +37,12 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
     std::fs::set_permissions(&path, permissions).unwrap();
 
     assert!(blocked_terminal);
-    assert!(matches!(
-        result,
-        Err(ConversationError::Turn(
-            TurnRunError::Terminalization { .. }
-        ))
-    ));
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. }
-    )));
+    assert!(matches!(result, Err(ConversationError::Turn(TurnRunError::Terminalization { .. }))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. }))
+    );
     assert_eq!(
         events
             .iter()
@@ -125,10 +115,11 @@ fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_
         ),
         "an execution-time session failure must not be reported as a trusted terminal: {result:?}"
     );
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. }
-    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. }))
+    );
     assert_eq!(
         events
             .iter()
@@ -142,10 +133,7 @@ fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_
     // 链条停止：没有第二次模型请求，后续输入原样留队。
     assert_eq!(provider.requests().len(), 1);
     let pending = conversation.snapshot().pending_input.unwrap();
-    assert_eq!(
-        pending.control_id,
-        queued.lock().unwrap().as_ref().unwrap().control_id
-    );
+    assert_eq!(pending.control_id, queued.lock().unwrap().as_ref().unwrap().control_id);
 
     let saved = SessionData::open(&path).unwrap();
     assert!(
@@ -200,11 +188,7 @@ fn terminal_write_failure_keeps_the_execution_failure_and_the_storage_failure() 
     let Err(ConversationError::Turn(error)) = &result else {
         panic!("terminalization must fail without a trusted terminal: {result:?}");
     };
-    let TurnRunError::Terminalization {
-        execution: Some(execution),
-        storage,
-    } = error
-    else {
+    let TurnRunError::Terminalization { execution: Some(execution), storage } = error else {
         panic!("both the execution failure and the storage failure are preserved: {error:?}");
     };
     assert_eq!(execution.cause, TurnFailureCause::ProviderAuth);
@@ -215,10 +199,11 @@ fn terminal_write_failure_keeps_the_execution_failure_and_the_storage_failure() 
         reported.contains("invalid api key") && reported.contains("terminal record"),
         "the host report keeps both causes: {reported}"
     );
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. }
-    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. }))
+    );
     assert_eq!(
         events
             .iter()
@@ -262,12 +247,8 @@ fn an_accepted_stop_survives_a_fatal_session_failure() {
             if matches!(event, TurnEvent::ToolExecutionStart { .. }) && !blocked {
                 // 停止窗口内先接受一条 steer，再接受停止；随后把会话文件置为
                 // 只读，使工具结果的提交本身失败（副作用已发生、结果无法落盘）。
-                conversation
-                    .steer("cancelled steer")
-                    .expect("steer is accepted");
-                conversation
-                    .submit_follow_up("must stay queued")
-                    .expect("a queued follow-up is accepted");
+                conversation.steer("cancelled steer").expect("steer is accepted");
+                conversation.submit_follow_up("must stay queued").expect("a queued follow-up is accepted");
                 *queued.lock().unwrap() = conversation.snapshot().pending_input;
                 conversation.abort().expect("the stop is accepted");
                 let mut readonly = permissions.clone();
@@ -289,10 +270,7 @@ fn an_accepted_stop_survives_a_fatal_session_failure() {
         "the storage failure still stops the chain without a trusted terminal: {result:?}"
     );
     let pending = conversation.snapshot().pending_input.unwrap();
-    assert_eq!(
-        pending.control_id,
-        queued.lock().unwrap().as_ref().unwrap().control_id
-    );
+    assert_eq!(pending.control_id, queued.lock().unwrap().as_ref().unwrap().control_id);
 }
 
 mod stop_and_replay;

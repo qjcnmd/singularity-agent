@@ -93,16 +93,13 @@ pub(crate) fn read_user_config_data_from_directory(
 }
 
 /// 只读 config.json；文件不存在时返回 None，不依赖密钥文件。
-pub(crate) fn read_user_config_file(
-    directory: &Path,
-) -> Result<Option<UserConfigFile>, ProviderError> {
+pub(crate) fn read_user_config_file(directory: &Path) -> Result<Option<UserConfigFile>, ProviderError> {
     let path = directory.join(USER_CONFIG_FILE_NAME);
     let Some(config_text) = read_optional_config_text(&path)? else {
         return Ok(None);
     };
-    let config: UserConfigFile = serde_json::from_str(&config_text).map_err(|error| {
-        user_config_error(format!("invalid JSON in {}: {error}", path.display()))
-    })?;
+    let config: UserConfigFile = serde_json::from_str(&config_text)
+        .map_err(|error| user_config_error(format!("invalid JSON in {}: {error}", path.display())))?;
     Ok(Some(config))
 }
 
@@ -113,15 +110,11 @@ pub(super) fn read_optional_config_text(path: &Path) -> Result<Option<String>, P
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(user_config_error(format!(
-                "could not open {}: {error}",
-                path.display()
-            )));
+            return Err(user_config_error(format!("could not open {}: {error}", path.display())));
         }
     };
     let mut text = String::new();
-    file.read_to_string(&mut text).map_err(|error| {
-        user_config_error(format!("could not read {}: {error}", path.display()))
-    })?;
+    file.read_to_string(&mut text)
+        .map_err(|error| user_config_error(format!("could not read {}: {error}", path.display())))?;
     Ok(Some(text))
 }

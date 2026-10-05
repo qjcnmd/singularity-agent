@@ -20,8 +20,7 @@ use singularity_core::now_iso;
 use singularity_model::{ModelConfigManager, ModelConfigUpdate};
 use singularity_protocol::{
     AppBootstrap, ProviderConfigurationInput, RpcError, RpcErrorCode, SessionReadResult,
-    SessionTerminalSnapshot, SessionTerminalSource, StreamEnvelope, StreamEvent, TurnEvent,
-    TurnStatus,
+    SessionTerminalSnapshot, SessionTerminalSource, StreamEnvelope, StreamEvent, TurnEvent, TurnStatus,
 };
 use singularity_runtime::UserInput;
 use singularity_runtime::{
@@ -87,10 +86,7 @@ impl AppServer {
         *self.revision.lock().expect("stream revision lock poisoned")
     }
 
-    pub(super) fn mcp_directory(
-        &self,
-        workspace: Option<&str>,
-    ) -> Result<std::path::PathBuf, RpcError> {
+    pub(super) fn mcp_directory(&self, workspace: Option<&str>) -> Result<std::path::PathBuf, RpcError> {
         workspace
             .map(|id| self.workspace(id).map(|workspace| workspace.root.into()))
             .unwrap_or_else(|| Ok(self.home.clone()))
@@ -101,10 +97,7 @@ impl AppServer {
     }
 
     pub fn frame(&self, event: StreamEvent) -> StreamEnvelope {
-        StreamEnvelope {
-            revision: self.revision(),
-            event,
-        }
+        StreamEnvelope { revision: self.revision(), event }
     }
 
     pub fn save_provider(
@@ -137,10 +130,8 @@ impl AppServer {
         api_protocol: &str,
     ) -> Result<Vec<singularity_protocol::DiscoveredModel>, RpcError> {
         // 配置入口返回本次查询使用的凭据，网络等待不占配置的临界区。
-        let api_key = self
-            .models
-            .discovery_credential(provider_id, api_key)
-            .map_err(model_discovery_error)?;
+        let api_key =
+            self.models.discovery_credential(provider_id, api_key).map_err(model_discovery_error)?;
         singularity_model::discover_models(base_url, &api_key, api_protocol)
             .await
             .map_err(model_discovery_error)
@@ -153,10 +144,7 @@ impl AppServer {
         let lifecycle = self.lock_lifecycle();
         let workspace = self.workspace(workspace_id)?;
         let selector = self.models.snapshot().resolved_default_selector();
-        let thread = self
-            .catalog
-            .create_thread(&workspace.root, selector)
-            .map_err(catalog_error)?;
+        let thread = self.catalog.create_thread(&workspace.root, selector).map_err(catalog_error)?;
         let slot = self.insert_slot(thread);
         let result = self.read_from_slot(&slot, 100, None)?;
         drop(lifecycle);
@@ -185,10 +173,7 @@ impl AppServer {
             return Ok(slot);
         }
         // 首次打开恢复未结束的操作，并登记会话。
-        let thread = self
-            .catalog
-            .resume_thread(session_id)
-            .map_err(catalog_error)?;
+        let thread = self.catalog.resume_thread(session_id).map_err(catalog_error)?;
         Ok(self.insert_slot(thread))
     }
 
@@ -223,11 +208,7 @@ impl AppServer {
         let active_events = state.active_events().to_vec();
         drop(state);
         let history = history.page(limit, before_turn).map_err(catalog_error)?;
-        Ok(SessionReadResult {
-            history,
-            runtime,
-            active_events,
-        })
+        Ok(SessionReadResult { history, runtime, active_events })
     }
 
     /// 读取最新的持久化 history。启动路径在 slot 锁外调用：预订成立时上一个
@@ -236,9 +217,7 @@ impl AppServer {
         &self,
         slot: &ConversationSlot,
     ) -> Result<Arc<singularity_runtime::ThreadSnapshot>, RpcError> {
-        self.catalog
-            .read_snapshot(&slot.conversation().thread().thread_id)
-            .map_err(catalog_error)
+        self.catalog.read_snapshot(&slot.conversation().thread().thread_id).map_err(catalog_error)
     }
 
     fn on_turn_event(&self, session_id: &str, slot: &ConversationSlot, event: TurnEvent) {
@@ -331,17 +310,13 @@ impl AppServer {
     /// payload 可能在更新的快照之后拿到更高的 revision。这把锁不参与会话事件
     /// 发布，免得形成「全局发布锁 → SlotState」的反向锁序。
     fn lock_app_publication(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.app_publication
-            .lock()
-            .expect("app_server publication lock poisoned")
+        self.app_publication.lock().expect("app_server publication lock poisoned")
     }
 
     /// 会话生命周期临界区。锁序是 lifecycle → publication → sessions →
     /// SlotState；调用方只在本文件公开入口的最外层拿它。
     fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.lifecycle
-            .lock()
-            .expect("app_server lifecycle lock poisoned")
+        self.lifecycle.lock().expect("app_server lifecycle lock poisoned")
     }
 
     /// 发布一个流事件：全局流序号在这里推进，随 StreamEnvelope 一起交给消费者，
@@ -349,15 +324,10 @@ impl AppServer {
     fn emit(&self, event: StreamEvent) {
         let mut order = self.revision.lock().expect("stream revision lock poisoned");
         *order += 1;
-        let _ = self.stream.send(StreamEnvelope {
-            revision: *order,
-            event,
-        });
+        let _ = self.stream.send(StreamEnvelope { revision: *order, event });
     }
 
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<ConversationSlot>>> {
-        self.sessions
-            .lock()
-            .expect("app_server session map lock poisoned (fail-stop)")
+        self.sessions.lock().expect("app_server session map lock poisoned (fail-stop)")
     }
 }

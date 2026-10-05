@@ -3,10 +3,7 @@
 use crate::tools::ToolRegistrySnapshot;
 
 /// 文件指令与 Skill 目录提示由 Agent 请求装配。
-pub(crate) fn assemble_developer_instructions(
-    cwd: &str,
-    registry: &ToolRegistrySnapshot,
-) -> String {
+pub(crate) fn assemble_developer_instructions(cwd: &str, registry: &ToolRegistrySnapshot) -> String {
     let mut prompt = base_prompt(&registry.prompt_lines());
     // 平台和命令 shell 是稳定事实，必须写清楚：不说明时模型会自己猜方言（比如在 Git Bash
     // 上写 cmd 的 `cd /d`、`2>nul`），猜错的代价是输出被重定向吞掉，模型还查不出来。

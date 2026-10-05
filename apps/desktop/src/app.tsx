@@ -64,7 +64,20 @@ export function App() {
         if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
       }}>
-        <SidebarToggle side="right" expanded={state.trajectoryOpen} controls="trajectory-panel" buttonRef={trajectoryToggle} className="trajectory-toggle" onClick={() => { if (state.trajectoryOpen) closeTrajectory(); else { setRightPanelView('choices'); appStore.setTrajectoryOpen(true) } }} />
+        <SidebarToggle
+          side="right"
+          expanded={state.trajectoryOpen}
+          controls="trajectory-panel"
+          buttonRef={trajectoryToggle}
+          className="trajectory-toggle"
+          onClick={() => {
+            if (state.trajectoryOpen) closeTrajectory()
+            else {
+              setRightPanelView('choices')
+              appStore.setTrajectoryOpen(true)
+            }
+          }}
+        />
       <MainContent compactViewport={compactViewport} />
       <aside id="trajectory-panel" className={`trajectory-panel${state.trajectoryOpen ? ' is-open' : ''}`} aria-label="右侧栏" aria-hidden={!state.trajectoryOpen} inert={!state.trajectoryOpen} ref={trajectoryPanel}>
         <ResizeSeparator side="right" value={state.sidebarWidth} onChange={(value) => appStore.setSidebarWidth(value)} />
@@ -72,14 +85,57 @@ export function App() {
           {rightPanelView === 'trajectory' ? <button type="button" className="quiet-button" aria-label="返回侧栏选择" onClick={() => setRightPanelView('choices')}>← 轨迹</button> : <span />}
         </header>
         <AnimatePresence initial={false} mode="wait">
-          {state.trajectoryOpen && (rightPanelView === 'choices' ? <motion.div key="choices" className="right-panel-choices" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={panelTransition} onAnimationComplete={definition => { if (state.trajectoryOpen && typeof definition === 'object' && 'opacity' in definition && definition.opacity === 1) trajectoryPanel.current?.querySelector<HTMLButtonElement>('.right-panel-choice')?.focus() }}>
-            <button type="button" className="right-panel-choice" onClick={() => setRightPanelView('trajectory')}>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12" /><circle cx="3" cy="6" r="1" /><circle cx="3" cy="12" r="1" /><circle cx="3" cy="18" r="1" /></svg>
-              <span>轨迹</span>
-            </button>
-          </motion.div> : <motion.div key="trajectory" className="right-panel-content" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={panelTransition} onAnimationComplete={definition => { if (state.trajectoryOpen && typeof definition === 'object' && 'opacity' in definition && definition.opacity === 1) trajectoryPanel.current?.querySelector<HTMLButtonElement>('[aria-label="返回侧栏选择"]')?.focus() }}>
-            <Trajectory key={state.selectedSessionId} />
-          </motion.div>)}
+          {state.trajectoryOpen && (
+            rightPanelView === 'choices' ? (
+              <motion.div
+                key="choices"
+                className="right-panel-choices"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={panelTransition}
+                onAnimationComplete={definition => {
+                  if (state.trajectoryOpen && typeof definition === 'object' && 'opacity' in definition && definition.opacity === 1) {
+                    trajectoryPanel.current?.querySelector<HTMLButtonElement>('.right-panel-choice')?.focus()
+                  }
+                }}
+              >
+                <button type="button" className="right-panel-choice" onClick={() => setRightPanelView('trajectory')}>
+                  <svg
+                    width="18"
+                    height="18"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.6"
+                    aria-hidden="true"
+                  >
+                    <path d="M8 6h12M8 12h12M8 18h12" />
+                    <circle cx="3" cy="6" r="1" />
+                    <circle cx="3" cy="12" r="1" />
+                    <circle cx="3" cy="18" r="1" />
+                  </svg>
+                  <span>轨迹</span>
+                </button>
+              </motion.div>
+            ) : (
+              <motion.div
+                key="trajectory"
+                className="right-panel-content"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={panelTransition}
+                onAnimationComplete={definition => {
+                  if (state.trajectoryOpen && typeof definition === 'object' && 'opacity' in definition && definition.opacity === 1) {
+                    trajectoryPanel.current?.querySelector<HTMLButtonElement>('[aria-label="返回侧栏选择"]')?.focus()
+                  }
+                }}
+              >
+                <Trajectory key={state.selectedSessionId} />
+              </motion.div>
+            )
+          )}
         </AnimatePresence>
       </aside>
       </div>

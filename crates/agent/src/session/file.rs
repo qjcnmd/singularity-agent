@@ -86,11 +86,10 @@ pub(super) fn parse_session_file(file: &Path, tail_policy: TailPolicy) -> Result
         if header.is_none() {
             header = Some(SessionHeader::parse(value)?);
         } else {
-            let entry =
-                serde_json::from_value(value).map_err(|error| SessionError::InvalidEntry {
-                    line: line_number,
-                    cause: error.to_string(),
-                })?;
+            let entry = serde_json::from_value(value).map_err(|error| SessionError::InvalidEntry {
+                line: line_number,
+                cause: error.to_string(),
+            })?;
             entries.push(entry);
         }
         // 末行没有换行符，后续追加会与它粘成一行，需要修复。
@@ -101,25 +100,13 @@ pub(super) fn parse_session_file(file: &Path, tail_policy: TailPolicy) -> Result
         line_number += 1;
     }
     let header = header.ok_or_else(|| {
-        SessionError::InvalidSession(format!(
-            "Session file is not a valid session: {}",
-            file.display()
-        ))
+        SessionError::InvalidSession(format!("Session file is not a valid session: {}", file.display()))
     })?;
     let cwd = header.canonical_cwd()?;
-    Ok(ParsedSession {
-        header,
-        cwd,
-        entries,
-        needs_repair,
-    })
+    Ok(ParsedSession { header, cwd, entries, needs_repair })
 }
 
-pub(super) fn rewrite_file(
-    file: &Path,
-    header: &SessionHeader,
-    entries: &[SessionEntry],
-) -> Result<()> {
+pub(super) fn rewrite_file(file: &Path, header: &SessionHeader, entries: &[SessionEntry]) -> Result<()> {
     // 序列化完成后交给共享的原子替换原语：与工具层（edit/write）走同一条安全管道。
     let mut bytes = Vec::new();
     serde_json::to_writer(&mut bytes, header)?;
@@ -131,10 +118,7 @@ pub(super) fn rewrite_file(
     singularity_core::atomic_replace_bytes(file, &bytes).map_err(|error| {
         SessionError::Io(std::io::Error::new(
             error.kind(),
-            format!(
-                "could not atomically replace session file {}: {error}",
-                file.display()
-            ),
+            format!("could not atomically replace session file {}: {error}", file.display()),
         ))
     })
 }

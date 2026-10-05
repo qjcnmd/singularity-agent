@@ -12,13 +12,7 @@ pub(super) fn resolve_context_entries(session: &SessionData) -> Vec<ContextPosit
                     })
                     .expect("compaction retains an active context entry");
                 context.drain(..index);
-                context.insert(
-                    0,
-                    ContextPosition {
-                        index: entry_index,
-                        pruned_index: None,
-                    },
-                );
+                context.insert(0, ContextPosition { index: entry_index, pruned_index: None });
             }
             SessionEntry::Record {
                 record: LedgerRecord::ToolResultPruned { entry_id, .. },
@@ -33,10 +27,7 @@ pub(super) fn resolve_context_entries(session: &SessionData) -> Vec<ContextPosit
             _ if is_context_entry(entry) => {
                 push_context_entry(
                     &mut context,
-                    ContextPosition {
-                        index: entry_index,
-                        pruned_index: None,
-                    },
+                    ContextPosition { index: entry_index, pruned_index: None },
                     session,
                 );
             }
@@ -63,20 +54,12 @@ pub(super) fn push_context_entry(
             ..
         }
     ) && context.last().is_some_and(|last| {
-        matches!(
-            last.entry(session),
-            SessionEntry::Message {
-                message: AgentMessage::User { .. },
-                ..
-            }
-        )
+        matches!(last.entry(session), SessionEntry::Message { message: AgentMessage::User { .. }, .. })
     }) {
         context.insert(context.len() - 1, position);
         return;
     }
-    if let Some(insert_at) =
-        context_insertion_index(context, &session.entries()[position.index], session)
-    {
+    if let Some(insert_at) = context_insertion_index(context, &session.entries()[position.index], session) {
         context.insert(insert_at, position);
     } else {
         context.push(position);
@@ -95,34 +78,24 @@ fn context_insertion_index(
     // 声明这个调用的 assistant 就是顺序来源：借用它的工具列表，一次查找同时得到
     // 该调用在其中的序号，不必另建 ID 数组。
     let (assistant_index, assistant, ordinal) =
-        context
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, candidate)| {
-                let SessionEntry::Message { message, .. } = &session.entries()[candidate.index]
-                else {
-                    return None;
-                };
-                let ordinal = message
-                    .tool_calls()
-                    .position(|call| call.tool_call_id == *call_id)?;
-                Some((index, message, ordinal))
-            })?;
+        context.iter().enumerate().rev().find_map(|(index, candidate)| {
+            let SessionEntry::Message { message, .. } = &session.entries()[candidate.index] else {
+                return None;
+            };
+            let ordinal = message.tool_calls().position(|call| call.tool_call_id == *call_id)?;
+            Some((index, message, ordinal))
+        })?;
     Some(
         context
             .iter()
             .enumerate()
             .skip(assistant_index + 1)
             .find_map(|(index, candidate)| {
-                let SessionEntry::Message { message, .. } = &session.entries()[candidate.index]
-                else {
+                let SessionEntry::Message { message, .. } = &session.entries()[candidate.index] else {
                     return None;
                 };
                 let id = message.tool_call_id()?;
-                let existing = assistant
-                    .tool_calls()
-                    .position(|call| call.tool_call_id == *id)?;
+                let existing = assistant.tool_calls().position(|call| call.tool_call_id == *id)?;
                 (existing > ordinal).then_some(index)
             })
             .unwrap_or(context.len()),

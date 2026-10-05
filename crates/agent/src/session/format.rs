@@ -217,12 +217,10 @@ impl SessionHeader {
     /// 表达的语义校验：type 取值、非空 UUID、版本必须是当前版本、创建时间非空。
     pub(super) fn parse(value: Value) -> Result<Self> {
         if value.get("type").and_then(Value::as_str) != Some(SESSION_HEADER_TYPE) {
-            return Err(SessionError::InvalidHeader(
-                "first entry is not a session header".into(),
-            ));
+            return Err(SessionError::InvalidHeader("first entry is not a session header".into()));
         }
-        let header: Self = serde_json::from_value(value)
-            .map_err(|error| SessionError::InvalidHeader(error.to_string()))?;
+        let header: Self =
+            serde_json::from_value(value).map_err(|error| SessionError::InvalidHeader(error.to_string()))?;
         Uuid::parse_str(&header.id).map_err(|_| {
             SessionError::InvalidHeader(format!("header id must be a valid UUID: {}", header.id))
         })?;
@@ -232,9 +230,7 @@ impl SessionHeader {
             )));
         }
         if header.timestamp.trim().is_empty() {
-            return Err(SessionError::InvalidHeader(
-                "header timestamp is required".into(),
-            ));
+            return Err(SessionError::InvalidHeader("header timestamp is required".into()));
         }
         Ok(header)
     }

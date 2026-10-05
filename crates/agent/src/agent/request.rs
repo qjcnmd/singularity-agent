@@ -6,9 +6,7 @@ use super::{Agent, AgentError, Result};
 use crate::events::{AgentDiagnostic, AgentEvent};
 use crate::request_execution::{execute_request, output_budget_tokens};
 use crate::session::{RequestDefinitions, lock_writer};
-use singularity_model::{
-    ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnResponse,
-};
+use singularity_model::{ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnResponse};
 use tokio_util::sync::CancellationToken;
 
 /// Harness 指令使用 Developer 角色；不支持 developer 的端点由 Provider 降级。
@@ -58,10 +56,8 @@ impl Agent {
                 .push_str(&format!("\n\n{}", discovered.instructions.join("\n\n")));
         }
         if !discovered.errors.is_empty() {
-            self.developer_instructions.push_str(&format!(
-                "\n\nUnavailable MCP servers:\n{}",
-                discovered.errors.join("\n")
-            ));
+            self.developer_instructions
+                .push_str(&format!("\n\nUnavailable MCP servers:\n{}", discovered.errors.join("\n")));
         }
     }
 
@@ -95,10 +91,7 @@ impl Agent {
             .map(singularity_core::ProjectInstructions::content)
             .and_then(file_instruction_message);
         self.context.reset_usage_correction();
-        if loaded
-            .as_ref()
-            .is_some_and(singularity_core::ProjectInstructions::truncated)
-        {
+        if loaded.as_ref().is_some_and(singularity_core::ProjectInstructions::truncated) {
             on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
                 singularity_protocol::diagnostic_code::PROJECT_INSTRUCTIONS_TRUNCATED,
                 "project instructions were truncated because they exceeded the size budget",
@@ -128,19 +121,16 @@ impl Agent {
         let prefix = self.instruction_prefix();
         let tools = self.registry.provider_schemas();
         let definitions = RequestDefinitions::new(&prefix, tools.clone());
-        let messages =
-            Self::with_context(&self.session, &mut self.context, move |session, context| {
-                let mut messages = prefix;
-                let (materials, directory) = {
-                    let writer = lock_writer(session);
-                    (context.messages(&writer), writer.image_directory())
-                };
-                messages.extend(crate::session::context::load_messages(
-                    materials, &directory,
-                )?);
-                Ok(messages)
-            })
-            .await?;
+        let messages = Self::with_context(&self.session, &mut self.context, move |session, context| {
+            let mut messages = prefix;
+            let (materials, directory) = {
+                let writer = lock_writer(session);
+                (context.messages(&writer), writer.image_directory())
+            };
+            messages.extend(crate::session::context::load_messages(materials, &directory)?);
+            Ok(messages)
+        })
+        .await?;
         let request = ModelTurnRequest {
             messages,
             tools,
@@ -190,8 +180,7 @@ impl Agent {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<(ModelTurnResponse, String)> {
-        self.reduce_context_if_needed(on_event, cancellation)
-            .await?;
+        self.reduce_context_if_needed(on_event, cancellation).await?;
         let overflow = match self.request_response(on_event, cancellation).await {
             Err(AgentError::Provider(error)) if error.is_context_overflow() => error,
             result => return result,

@@ -35,9 +35,7 @@ fn request_observation(
         duration_ms,
         ttft_ms: None,
         decode_ms: (duration_ms > 0).then_some(duration_ms / 2),
-        total_tokens: input_tokens
-            .zip(output_tokens)
-            .map(|(input, output)| input + output),
+        total_tokens: input_tokens.zip(output_tokens).map(|(input, output)| input + output),
         input_tokens,
         output_tokens,
         cached_input_tokens,
@@ -83,9 +81,7 @@ fn turn_event_wire_goldens() {
                 images: Vec::new(),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                item: ItemRef {
-                    item_id: "entry-1:text:0".to_string(),
-                },
+                item: ItemRef { item_id: "entry-1:text:0".to_string() },
                 text: "task".to_string(),
             },
             r#"{"item":{"itemId":"entry-1:text:0"},"text":"task","threadId":"thread-1","turnId":"turn-1"}"#,
@@ -96,9 +92,7 @@ fn turn_event_wire_goldens() {
             TurnEvent::ItemStarted {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                item: ItemRef {
-                    item_id: "item-1".to_string(),
-                },
+                item: ItemRef { item_id: "item-1".to_string() },
             },
             r#"{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
@@ -107,9 +101,7 @@ fn turn_event_wire_goldens() {
             TurnEvent::AssistantDelta {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                item: ItemRef {
-                    item_id: "item-1".to_string(),
-                },
+                item: ItemRef { item_id: "item-1".to_string() },
                 delta: "hel".to_string(),
             },
             r#"{"delta":"hel","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
@@ -119,9 +111,7 @@ fn turn_event_wire_goldens() {
             TurnEvent::ToolExecutionStart {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                item: ItemRef {
-                    item_id: "call-1".to_string(),
-                },
+                item: ItemRef { item_id: "call-1".to_string() },
                 tool_name: "edit".to_string(),
                 args,
                 started_at: "2026-09-08T00:00:00Z".into(),
@@ -133,9 +123,7 @@ fn turn_event_wire_goldens() {
             TurnEvent::ToolExecutionUpdate {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                item: ItemRef {
-                    item_id: "call-1".to_string(),
-                },
+                item: ItemRef { item_id: "call-1".to_string() },
                 partial_result: "chunk".to_string(),
             },
             r#"{"item":{"itemId":"call-1"},"partialResult":"chunk","threadId":"thread-1","turnId":"turn-1"}"#,
@@ -146,9 +134,7 @@ fn turn_event_wire_goldens() {
                 images: Vec::new(),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                item: ItemRef {
-                    item_id: "call-1".to_string(),
-                },
+                item: ItemRef { item_id: "call-1".to_string() },
                 output: "done".to_string(),
                 is_error: false,
                 diff: None,
@@ -163,17 +149,12 @@ fn turn_event_wire_goldens() {
                 images: Vec::new(),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                item: ItemRef {
-                    item_id: "call-2".to_string(),
-                },
+                item: ItemRef { item_id: "call-2".to_string() },
                 output: "line".to_string(),
                 is_error: false,
                 diff: None,
                 duration_ms: Some(3),
-                read_source: Some(singularity_protocol::ReadSource {
-                    start_line: 1,
-                    line_count: 1,
-                }),
+                read_source: Some(singularity_protocol::ReadSource { start_line: 1, line_count: 1 }),
             },
             r#"{"durationMs":3,"isError":false,"item":{"itemId":"call-2"},"output":"line","readSource":{"lineCount":1,"startLine":1},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
@@ -182,9 +163,7 @@ fn turn_event_wire_goldens() {
             TurnEvent::ItemDiscarded {
                 thread_id: "thread-1".into(),
                 turn_id: "turn-1".into(),
-                item: ItemRef {
-                    item_id: "item-1".into(),
-                },
+                item: ItemRef { item_id: "item-1".into() },
             },
             r#"{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
@@ -199,9 +178,7 @@ fn turn_event_wire_goldens() {
                 }),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                item: ItemRef {
-                    item_id: "item-1".to_string(),
-                },
+                item: ItemRef { item_id: "item-1".to_string() },
             },
             r#"{"content":{"id":"item-1","role":"assistant","text":"done","type":"message"},"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
@@ -214,9 +191,7 @@ fn turn_event_wire_goldens() {
                 }),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                item: ItemRef {
-                    item_id: "item-1".to_string(),
-                },
+                item: ItemRef { item_id: "item-1".to_string() },
                 error: "boom".to_string(),
             },
             r#"{"content":{"id":"item-1","text":"partial","type":"thinking"},"error":"boom","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
@@ -292,8 +267,7 @@ fn turn_event_wire_goldens() {
         ),
     ];
     for (method, event, jsonl_params) in &cases {
-        let expected_params: Value =
-            serde_json::from_str(jsonl_params).expect("jsonl golden parses");
+        let expected_params: Value = serde_json::from_str(jsonl_params).expect("jsonl golden parses");
         // JSONL 事件行就是事件自身的 tagged 序列化，此处直接按该形状比对
         // （成员顺序由 serde 决定，不构成 schema）。
         assert_eq!(

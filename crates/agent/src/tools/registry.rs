@@ -72,9 +72,7 @@ impl PreparedTool {
     pub(crate) fn supports_parallel(&self) -> bool {
         match self {
             Self::Read(_) | Self::Glob(_) | Self::Grep(_) => true,
-            Self::Bash(_) | Self::Edit(_) | Self::Write(_) | Self::Mcp(..) | Self::Question(_) => {
-                false
-            }
+            Self::Bash(_) | Self::Edit(_) | Self::Write(_) | Self::Mcp(..) | Self::Question(_) => false,
         }
     }
 
@@ -130,9 +128,7 @@ impl ExecuteContext<'_> {
     /// 取消信号已触发时返回模型可见的 abort 失败结果，未触发则返回 None。
     /// 各工具在入口和耗时步骤之后统一调用它检查取消，不必自己判断。
     pub(crate) fn abort_if_cancelled(&self) -> Option<ToolExecution> {
-        self.signal
-            .is_cancelled()
-            .then(|| error_result(ABORTED_MESSAGE))
+        self.signal.is_cancelled().then(|| error_result(ABORTED_MESSAGE))
     }
 }
 
@@ -167,24 +163,12 @@ impl Default for ToolRegistrySnapshot {
         Self {
             mcp: Vec::new(),
             tools: vec![
-                (bash::spec(), |args| {
-                    deserialize_args_or_error(args).map(PreparedTool::Bash)
-                }),
-                (edit::spec(), |args| {
-                    deserialize_args_or_error(args).map(PreparedTool::Edit)
-                }),
-                (glob::spec(), |args| {
-                    deserialize_args_or_error(args).map(PreparedTool::Glob)
-                }),
-                (grep::spec(), |args| {
-                    deserialize_args_or_error(args).map(PreparedTool::Grep)
-                }),
-                (read::spec(), |args| {
-                    deserialize_args_or_error(args).map(PreparedTool::Read)
-                }),
-                (write::spec(), |args| {
-                    deserialize_args_or_error(args).map(PreparedTool::Write)
-                }),
+                (bash::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Bash)),
+                (edit::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Edit)),
+                (glob::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Glob)),
+                (grep::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Grep)),
+                (read::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Read)),
+                (write::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Write)),
             ],
         }
     }
@@ -205,11 +189,7 @@ impl ToolRegistrySnapshot {
         self.tools
             .iter()
             .map(|(spec, _)| (spec.name, spec.snippet))
-            .chain(
-                self.mcp
-                    .iter()
-                    .map(|tool| (tool.name.as_str(), "MCP server tool")),
-            )
+            .chain(self.mcp.iter().map(|tool| (tool.name.as_str(), "MCP server tool")))
             .collect()
     }
 
@@ -233,15 +213,10 @@ impl ToolRegistrySnapshot {
     /// 只查找并解析调用，不执行。Agent 在派发任务之前，按模型给出的
     /// source order 逐项调用它；带类型的反序列化在这里只做一次。未知工具名和
     /// 参数解析失败，都以模型可见的拒绝收尾。
-    pub(crate) fn preflight(
-        &self,
-        name: &str,
-        args: &Value,
-    ) -> Result<PreparedTool, ToolExecution> {
+    pub(crate) fn preflight(&self, name: &str, args: &Value) -> Result<PreparedTool, ToolExecution> {
         if let Some(tool) = self.mcp.iter().find(|tool| tool.name == name) {
-            let args = args
-                .as_object()
-                .ok_or_else(|| error_result("MCP tool arguments must be a JSON object"))?;
+            let args =
+                args.as_object().ok_or_else(|| error_result("MCP tool arguments must be a JSON object"))?;
             return Ok(PreparedTool::Mcp(tool.clone(), args.clone()));
         }
         let (_, parse) = self
@@ -266,8 +241,6 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
 
 /// 反序列化工具参数；失败时把错误文本包成模型可见的 is_error 结果，调用方把它当作
 /// 工具执行结果直接透传。直接用借来的 JSON 作 Deserializer，不复制中间的 Value。
-pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(
-    args: &Value,
-) -> Result<T, ToolExecution> {
+pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(args: &Value) -> Result<T, ToolExecution> {
     T::deserialize(args).map_err(|error| error_result(format!("invalid tool arguments: {error}")))
 }

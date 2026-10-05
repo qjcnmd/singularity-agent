@@ -10,30 +10,18 @@ fn archive_hides_the_thread_and_preserves_its_file() {
 
     catalog.archive(&thread_id).expect("archive");
     assert!(
-        sessions
-            .join(ARCHIVED_SESSIONS_DIR_NAME)
-            .join(session_file_name(&thread_id))
-            .exists(),
+        sessions.join(ARCHIVED_SESSIONS_DIR_NAME).join(session_file_name(&thread_id)).exists(),
         "the archived session file is preserved"
     );
     assert!(
-        !catalog
-            .list_threads()
-            .expect("list")
-            .iter()
-            .any(|entry| entry.thread_id == thread_id),
+        !catalog.list_threads().expect("list").iter().any(|entry| entry.thread_id == thread_id),
         "an archived thread leaves the active listing"
     );
     assert!(matches!(
-        catalog
-            .read_snapshot(&thread_id)
-            .map(|snapshot| snapshot.summary.clone()),
+        catalog.read_snapshot(&thread_id).map(|snapshot| snapshot.summary.clone()),
         Err(CatalogError::NotFound(_))
     ));
-    assert!(matches!(
-        catalog.archive(&thread_id),
-        Err(CatalogError::NotFound(_))
-    ));
+    assert!(matches!(catalog.archive(&thread_id), Err(CatalogError::NotFound(_))));
 }
 
 /// Thread 的工作目录是一个事实：它必须在创建、恢复、列表与会话头四个表面上呈现
@@ -45,12 +33,8 @@ fn assert_thread_cwd_shape(
     catalog: &ThreadCatalog,
     spelled: &std::path::Path,
 ) -> Thread {
-    let thread = catalog
-        .create_thread(spelled.to_str().expect("utf-8 workspace"), None)
-        .expect("create");
-    let resumed = catalog
-        .resume_thread(&thread.thread_id)
-        .expect("resume thread");
+    let thread = catalog.create_thread(spelled.to_str().expect("utf-8 workspace"), None).expect("create");
+    let resumed = catalog.resume_thread(&thread.thread_id).expect("resume thread");
     let listed = catalog
         .list_threads()
         .expect("list")
@@ -61,17 +45,13 @@ fn assert_thread_cwd_shape(
     assert_eq!(thread.cwd, resumed.cwd, "resume rewrites the cwd");
     assert_eq!(thread.cwd, listed.cwd, "listing rewrites the cwd");
 
-    let header =
-        std::fs::read_to_string(session_path(fixture, &thread.thread_id)).expect("session file");
+    let header = std::fs::read_to_string(session_path(fixture, &thread.thread_id)).expect("session file");
     let stored = header
         .split_once("\"cwd\":\"")
         .and_then(|(_, rest)| rest.split_once('"'))
         .map(|(value, _)| value.to_owned())
         .expect("header cwd");
-    assert_eq!(
-        thread.cwd, stored,
-        "the durable cwd differs from the projected one"
-    );
+    assert_eq!(thread.cwd, stored, "the durable cwd differs from the projected one");
 
     assert!(
         std::path::Path::new(&thread.cwd).is_absolute(),
@@ -86,18 +66,13 @@ fn assert_thread_cwd_shape(
 
     let provider = Arc::new(ScriptedProvider::ok("answer"));
     let conversation = Conversation::new(fixture.runner(Some(provider.clone())), thread.clone());
-    crate::test_support::run_async(conversation.run_turn("check cwd", &mut |_| {}))
-        .expect("run turn");
+    crate::test_support::run_async(conversation.run_turn("check cwd", &mut |_| {})).expect("run turn");
     assert!(
         provider.requests()[0]
             .messages
             .iter()
-            .any(
-                |message| message.role == singularity_model::ModelRole::Developer
-                    && message
-                        .content
-                        .ends_with(&format!("\n\nCurrent working directory: {}", thread.cwd))
-            ),
+            .any(|message| message.role == singularity_model::ModelRole::Developer
+                && message.content.ends_with(&format!("\n\nCurrent working directory: {}", thread.cwd))),
         "the prompt does not carry the thread cwd verbatim"
     );
     thread
@@ -119,32 +94,19 @@ fn thread_cwd_projects_one_usable_shape_across_every_surface() {
     if cfg!(windows) {
         let file = session_path(&fixture, &seeded.thread_id);
         let text = std::fs::read_to_string(&file).expect("session file");
-        let patched = text.replace(
-            &format!("\"cwd\":\"{}\"", seeded.cwd),
-            &format!("\"cwd\":\"//?/{}\"", seeded.cwd),
-        );
-        assert_ne!(
-            patched, text,
-            "the fixture does not store the projected cwd"
-        );
+        let patched =
+            text.replace(&format!("\"cwd\":\"{}\"", seeded.cwd), &format!("\"cwd\":\"//?/{}\"", seeded.cwd));
+        assert_ne!(patched, text, "the fixture does not store the projected cwd");
         std::fs::write(&file, patched).expect("write legacy-shaped header");
-        let resumed = catalog
-            .resume_thread(&seeded.thread_id)
-            .expect("resume legacy-shaped session");
-        assert_eq!(
-            resumed.cwd, seeded.cwd,
-            "a stored verbatim cwd reaches the Thread projection unchanged"
-        );
+        let resumed = catalog.resume_thread(&seeded.thread_id).expect("resume legacy-shaped session");
+        assert_eq!(resumed.cwd, seeded.cwd, "a stored verbatim cwd reaches the Thread projection unchanged");
         let listed = catalog
             .list_threads()
             .expect("list")
             .into_iter()
             .find(|entry| entry.thread_id == seeded.thread_id)
             .expect("listed thread");
-        assert_eq!(
-            listed.cwd, seeded.cwd,
-            "a stored verbatim cwd reaches the listing"
-        );
+        assert_eq!(listed.cwd, seeded.cwd, "a stored verbatim cwd reaches the listing");
     }
 }
 
@@ -185,10 +147,8 @@ fn summary_usage_sums_usage_bearing_requests_and_skips_the_rest() {
     let conversation = Conversation::new(runner, thread.clone());
     let mut sink = |_event| {};
     for index in 0..3 {
-        crate::test_support::run_async(
-            conversation.run_turn(&format!("question {index}"), &mut sink),
-        )
-        .expect("turn completes");
+        crate::test_support::run_async(conversation.run_turn(&format!("question {index}"), &mut sink))
+            .expect("turn completes");
     }
 
     let snapshot = catalog.read_snapshot(&thread.thread_id).unwrap();
@@ -197,10 +157,7 @@ fn summary_usage_sums_usage_bearing_requests_and_skips_the_rest() {
     assert_eq!(usage.cached_input_tokens, 4);
     assert_eq!(usage.output_tokens, 8);
     assert_eq!(usage.total_tokens, 28, "采用已记录的供应商总量");
-    assert!(
-        !usage.cache_usage_complete,
-        "计入合计的请求缺缓存明细时命中率不可计算，不能展示成零命中"
-    );
+    assert!(!usage.cache_usage_complete, "计入合计的请求缺缓存明细时命中率不可计算，不能展示成零命中");
     assert_eq!(usage.decode_ms, 0, "没有生成计时的记录不进入 TPS 样本");
     assert_eq!(usage.decode_tokens, 0);
     assert!(usage.usage_present);

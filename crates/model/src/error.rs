@@ -180,29 +180,16 @@ pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
 /// 服务端原始协议事实的有限条目：HTTP 状态和线上 code/type 都留下，不改变 kind/code 的分类
 /// 结果；空字段不产生条目，正文只取长度有限的诊断，绝不保存原始响应体或凭据。HTTP 和 SSE
 /// 两条入口共用这一套保留规则。
-pub(crate) fn provider_wire_facts(
-    status: Option<u16>,
-    fields: &ProviderErrorBodyFields,
-) -> Vec<String> {
+pub(crate) fn provider_wire_facts(status: Option<u16>, fields: &ProviderErrorBodyFields) -> Vec<String> {
     let mut facts = Vec::new();
     if let Some(status) = status {
         facts.push(format!("HTTP {status}"));
     }
     if let Some(code) = fields.code.as_deref().filter(|code| !code.is_empty()) {
-        facts.push(format!(
-            "provider_error_code={}",
-            bounded_provider_error_diagnostic(code)
-        ));
+        facts.push(format!("provider_error_code={}", bounded_provider_error_diagnostic(code)));
     }
-    if let Some(wire_type) = fields
-        .wire_type
-        .as_deref()
-        .filter(|wire_type| !wire_type.is_empty())
-    {
-        facts.push(format!(
-            "provider_error_type={}",
-            bounded_provider_error_diagnostic(wire_type)
-        ));
+    if let Some(wire_type) = fields.wire_type.as_deref().filter(|wire_type| !wire_type.is_empty()) {
+        facts.push(format!("provider_error_type={}", bounded_provider_error_diagnostic(wire_type)));
     }
     facts
 }
@@ -293,8 +280,8 @@ pub(crate) fn provider_embedded_error(
     fallback_message: &str,
     diagnostic_code: &'static str,
 ) -> ProviderError {
-    let kind = provider_error_kind_for_code(fields.code.as_deref())
-        .unwrap_or(ModelErrorKind::UnknownProviderError);
+    let kind =
+        provider_error_kind_for_code(fields.code.as_deref()).unwrap_or(ModelErrorKind::UnknownProviderError);
     let message = bounded_wire_detail(fields).unwrap_or_else(|| fallback_message.to_string());
     let details = provider_wire_facts(None, fields);
     ProviderError::diagnostic(kind, message, diagnostic_code, details)

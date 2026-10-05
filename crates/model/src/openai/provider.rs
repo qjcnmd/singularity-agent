@@ -11,13 +11,11 @@ use tokio_util::sync::CancellationToken;
 use crate::config::selection::{OpenAiProviderConfig, SelectedModel};
 use crate::config::{ModelConfigurationSnapshot, ProviderConfigSnapshot};
 use crate::error::{
-    ProviderError, bounded_provider_error_diagnostic, parse_provider_error_body,
-    provider_error_kind_for_code,
+    ProviderError, bounded_provider_error_diagnostic, parse_provider_error_body, provider_error_kind_for_code,
 };
 use crate::openai::{
-    chat_completions_endpoint, openai_chat_stream_request_payload,
-    openai_responses_stream_request_payload, read_chat_sse_stream, read_responses_sse_stream,
-    responses_endpoint,
+    chat_completions_endpoint, openai_chat_stream_request_payload, openai_responses_stream_request_payload,
+    read_chat_sse_stream, read_responses_sse_stream, responses_endpoint,
 };
 use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::{
@@ -90,9 +88,7 @@ impl OpenAiProvider {
             provider_name: self.config.provider_name.clone(),
             model_name: model_name.to_string(),
         };
-        observer
-            .record_attempt(ProviderAttemptEvent::Started(started.clone()))
-            .await?;
+        observer.record_attempt(ProviderAttemptEvent::Started(started.clone())).await?;
         let mut first_token_at = None;
         let completion = {
             let mut timed_event = |event| {
@@ -102,17 +98,12 @@ impl OpenAiProvider {
             match provider_future(
                 cancellation,
                 "provider_request_send_failed",
-                self.client
-                    .post(endpoint)
-                    .bearer_auth(&self.config.api_key)
-                    .json(&request_payload)
-                    .send(),
+                self.client.post(endpoint).bearer_auth(&self.config.api_key).json(&request_payload).send(),
             )
             .await
             {
                 Ok(response) if response.status().is_success() => {
-                    self.read_streamed_response(cancellation, response, &mut timed_event)
-                        .await
+                    self.read_streamed_response(cancellation, response, &mut timed_event).await
                 }
                 Ok(response) => Err(self.read_http_failure(response, cancellation).await),
                 Err(error) => Err(error),
@@ -127,10 +118,7 @@ impl OpenAiProvider {
             .filter(|usage| usage.usage_present)
             .cloned();
         let completion = completion.and_then(|response| {
-            validate_response_reasoning(
-                &response,
-                selection.requires_reasoning_content_for_tool_calls,
-            )?;
+            validate_response_reasoning(&response, selection.requires_reasoning_content_for_tool_calls)?;
             Ok(response)
         });
         let finished_at = std::time::Instant::now();
@@ -140,10 +128,8 @@ impl OpenAiProvider {
             usage,
             completion.as_ref().err(),
         );
-        occurrence.ttft_ms =
-            first_token_at.map(|first| duration_millis(first.duration_since(started_at)));
-        occurrence.decode_ms =
-            first_token_at.map(|first| duration_millis(finished_at.duration_since(first)));
+        occurrence.ttft_ms = first_token_at.map(|first| duration_millis(first.duration_since(started_at)));
+        occurrence.decode_ms = first_token_at.map(|first| duration_millis(finished_at.duration_since(first)));
         observer
             .record_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence)))
             .await
@@ -164,12 +150,10 @@ impl OpenAiProvider {
         let selection = &self.selected_model;
         match selection.api_protocol {
             ProviderApiProtocol::Chat => {
-                read_chat_sse_stream(cancellation, response, on_event, &self.config, selection)
-                    .await
+                read_chat_sse_stream(cancellation, response, on_event, &self.config, selection).await
             }
             ProviderApiProtocol::Responses => {
-                read_responses_sse_stream(cancellation, response, on_event, &self.config, selection)
-                    .await
+                read_responses_sse_stream(cancellation, response, on_event, &self.config, selection).await
             }
         }
     }
@@ -181,25 +165,20 @@ impl OpenAiProvider {
     ) -> ProviderError {
         let status_code = response.status().as_u16();
         let retry_after = retry_after_delay(response.headers());
-        let error_body = match provider_future(
-            cancellation,
-            "provider_response_body_read_failed",
-            response.bytes(),
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) if error.kind == crate::ModelErrorKind::Cancelled => return error,
-            Err(error) => {
-                let mut failure =
-                    provider_error_from_http_status(status_code).with_retry_after(retry_after);
-                failure.message.push_str(&format!(
-                    " Could not read provider error response: {}",
-                    error.message
-                ));
-                return failure;
-            }
-        };
+        let error_body =
+            match provider_future(cancellation, "provider_response_body_read_failed", response.bytes()).await
+            {
+                Ok(body) => body,
+                Err(error) if error.kind == crate::ModelErrorKind::Cancelled => return error,
+                Err(error) => {
+                    let mut failure =
+                        provider_error_from_http_status(status_code).with_retry_after(retry_after);
+                    failure
+                        .message
+                        .push_str(&format!(" Could not read provider error response: {}", error.message));
+                    return failure;
+                }
+            };
         let error_fields = parse_provider_error_body(&error_body);
         let coded_kind = provider_error_kind_for_code(error_fields.code.as_deref());
         let model_error = match coded_kind {
@@ -220,11 +199,7 @@ impl OpenAiProvider {
                 .message
                 .as_deref()
                 .map(bounded_provider_error_diagnostic)
-                .or_else(|| {
-                    Some(bounded_provider_error_diagnostic(&String::from_utf8_lossy(
-                        &error_body,
-                    )))
-                })
+                .or_else(|| Some(bounded_provider_error_diagnostic(&String::from_utf8_lossy(&error_body))))
                 .filter(|diagnostic| !diagnostic.is_empty())
         };
         let mut error = model_error.with_retry_after(retry_after);

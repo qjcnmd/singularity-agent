@@ -85,9 +85,8 @@ fn execute_reader(
 ) -> ToolExecution {
     let start_line = offset.map_or(0, |offset| (offset as usize).saturating_sub(1));
     let start_line_display = start_line + 1;
-    let user_line_limit = limit.map_or(DEFAULT_MAX_LINES, |limit| {
-        limit.min(DEFAULT_MAX_LINES as u64) as usize
-    });
+    let user_line_limit =
+        limit.map_or(DEFAULT_MAX_LINES, |limit| limit.min(DEFAULT_MAX_LINES as u64) as usize);
     let mut state = ReadState {
         selected: Vec::new(),
         selected_bytes: 0,
@@ -129,8 +128,7 @@ fn execute_reader(
         // 展示预算按实际发回的文本来算：非法 UTF-8 字节被替换成 U+FFFD 后会变长，
         // 若按原始字节数计算，就可能发出超过预算的正文。
         let text = String::from_utf8_lossy(&line);
-        let next_bytes =
-            state.selected_bytes + text.len() + usize::from(!state.selected.is_empty());
+        let next_bytes = state.selected_bytes + text.len() + usize::from(!state.selected.is_empty());
         if next_bytes > DEFAULT_MAX_BYTES {
             // 已有完整行留待下一页；首行本身超预算时展示不完整的前缀。
             if state.selected.is_empty() {
@@ -154,8 +152,7 @@ fn execute_reader(
     }
 
     if line_number == 0 && start_line_display == 1 {
-        return ToolExecution::text(String::new())
-            .with_read_source(read_source(start_line_display, &state));
+        return ToolExecution::text(String::new()).with_read_source(read_source(start_line_display, &state));
     }
 
     if start_line >= line_number {

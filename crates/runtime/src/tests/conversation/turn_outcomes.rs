@@ -24,9 +24,7 @@ fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
     assert_eq!(completed.len(), 2);
     assert_ne!(completed[0].0, completed[1].0);
     let catalog = ThreadCatalog::new(sessions);
-    let snapshot = catalog
-        .read_snapshot(&conversation.thread().thread_id)
-        .unwrap();
+    let snapshot = catalog.read_snapshot(&conversation.thread().thread_id).unwrap();
     let page = snapshot.page(40, None).unwrap();
     let results = page
         .turns
@@ -53,11 +51,7 @@ fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
         .iter()
         .filter_map(|message| message.tool_call_id.as_deref())
         .collect::<Vec<_>>();
-    assert_eq!(
-        raw_ids,
-        vec!["reused", "reused"],
-        "provider replay keeps its original wire IDs"
-    );
+    assert_eq!(raw_ids, vec!["reused", "reused"], "provider replay keeps its original wire IDs");
 }
 
 /// model_configuration 可变的 scripted provider：模拟配置刷新只改变后续
@@ -69,17 +63,14 @@ struct MutableLimitsProvider {
 
 impl MutableLimitsProvider {
     fn set_context_tokens(&self, tokens: u32) {
-        self.context_tokens
-            .store(tokens, std::sync::atomic::Ordering::SeqCst);
+        self.context_tokens.store(tokens, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 impl Provider for MutableLimitsProvider {
     fn model_configuration(&self) -> singularity_model::ModelConfigurationSnapshot {
         singularity_model::ModelConfigurationSnapshot {
-            max_context_tokens: self
-                .context_tokens
-                .load(std::sync::atomic::Ordering::SeqCst),
+            max_context_tokens: self.context_tokens.load(std::sync::atomic::Ordering::SeqCst),
             max_output_tokens: 4_096,
         }
     }
@@ -142,8 +133,7 @@ fn running_turn_keeps_its_frozen_window_across_configuration_refresh() {
         Some(100_000),
         "the latest executed turn's window stays observable while idle"
     );
-    crate::test_support::run_async(conversation.run_turn("second", &mut |_event: TurnEvent| {}))
-        .unwrap();
+    crate::test_support::run_async(conversation.run_turn("second", &mut |_event: TurnEvent| {})).unwrap();
     assert_eq!(
         conversation.snapshot().model_context_window,
         Some(200_000),
@@ -188,9 +178,7 @@ fn failed_turn_reports_usage_recorded_before_the_failure() {
         .then_some(&outcome.usage)
         .expect("the failed outcome carries the usage recorded before the failure");
     assert_eq!(usage.total_tokens, 42);
-    let error = outcome
-        .error
-        .expect("failed terminal carries protocol error detail");
+    let error = outcome.error.expect("failed terminal carries protocol error detail");
     assert_eq!(
         error.cause,
         crate::TurnFailureCause::ProviderNetwork,
@@ -224,18 +212,15 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
         let conversation = Arc::clone(&conversation);
         std::thread::spawn(move || {
             let mut sink = move |event: TurnEvent| {
-                if let TurnEvent::ToolExecutionUpdate {
-                    ref partial_result, ..
-                } = event
+                if let TurnEvent::ToolExecutionUpdate { ref partial_result, .. } = event
                     && partial_result.contains("ready")
                     && let Some(sender) = ready_tx.lock().expect("ready lock").take()
                 {
                     let _ = sender.send(());
                 }
             };
-            let outcome = crate::test_support::run_async(
-                conversation.run_turn("run a long command", &mut sink),
-            );
+            let outcome =
+                crate::test_support::run_async(conversation.run_turn("run a long command", &mut sink));
             (conversation, outcome)
         })
     };
@@ -248,10 +233,9 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
     let outcome = outcome.expect("tool-boundary interruption converges as interrupted");
     assert_eq!(outcome.turn_status, TurnStatus::Interrupted);
 
-    let session = SessionData::open(
-        &sessions.join(singularity_agent::session::session_file_name(&thread_id)),
-    )
-    .expect("reopen");
+    let session =
+        SessionData::open(&sessions.join(singularity_agent::session::session_file_name(&thread_id)))
+            .expect("reopen");
     let records = session.ledger_records();
     let aborted_results = session
         .entries()
@@ -263,26 +247,15 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
                         && message.content_text().contains("Operation aborted"))
         })
         .count();
-    assert_eq!(
-        aborted_results, 1,
-        "the interrupted tool closes with exactly one model-visible failure"
-    );
+    assert_eq!(aborted_results, 1, "the interrupted tool closes with exactly one model-visible failure");
     let terminals: Vec<_> = records
         .iter()
-        .filter(|record| {
-            matches!(
-                record,
-                singularity_agent::session::LedgerRecord::OperationFinished { .. }
-            )
-        })
+        .filter(|record| matches!(record, singularity_agent::session::LedgerRecord::OperationFinished { .. }))
         .collect();
     assert_eq!(terminals.len(), 1, "exactly one durable terminal outcome");
     assert!(matches!(
         terminals[0],
-        singularity_agent::session::LedgerRecord::OperationFinished {
-            outcome: TurnStatus::Interrupted,
-            ..
-        }
+        singularity_agent::session::LedgerRecord::OperationFinished { outcome: TurnStatus::Interrupted, .. }
     ));
 
     // 中断不破坏协调器：下一条输入作为新 turn 正常完成。
@@ -290,10 +263,9 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
     let next = crate::test_support::run_async(conversation.run_turn("continue", &mut sink))
         .expect("next input runs after a tool-boundary interruption");
     assert_eq!(next.turn_status, TurnStatus::Completed);
-    let completed = SessionData::open(
-        &sessions.join(singularity_agent::session::session_file_name(&thread_id)),
-    )
-    .expect("reopen completed turn");
+    let completed =
+        SessionData::open(&sessions.join(singularity_agent::session::session_file_name(&thread_id)))
+            .expect("reopen completed turn");
     assert!(completed.entries().iter().any(|entry| matches!(entry,
         singularity_agent::session::SessionEntry::Message { message, .. }
         if message.content_text() == "next turn done"
@@ -312,24 +284,16 @@ fn settings_survive_reopen_without_a_turn() {
     let id = conversation.thread().thread_id;
     let reservation = conversation.reserve_start("not executed").unwrap();
     conversation.rename("reserved task").unwrap();
-    conversation
-        .update_settings("openai_compatible/base-model-2")
-        .unwrap();
+    conversation.update_settings("openai_compatible/base-model-2").unwrap();
     drop(reservation);
     conversation.rename("idle task").unwrap();
-    assert!(matches!(
-        conversation.rename("  "),
-        Err(crate::ConversationError::InvalidName)
-    ));
+    assert!(matches!(conversation.rename("  "), Err(crate::ConversationError::InvalidName)));
     let catalog = ThreadCatalog::new(sessions);
     assert_eq!(
         catalog.resume_thread(&id).unwrap().model.as_deref(),
         Some("openai_compatible/base-model-2")
     );
-    assert_eq!(
-        catalog.read_snapshot(&id).unwrap().summary.title.as_deref(),
-        Some("idle task")
-    );
+    assert_eq!(catalog.read_snapshot(&id).unwrap().summary.title.as_deref(), Some("idle task"));
 }
 
 #[test]
@@ -343,20 +307,14 @@ fn interrupted_output_reloads_for_display_without_entering_the_next_request() {
         ScriptedAttempt::success("next answer"),
     ]));
     let conversation = new_conversation(&fixture, provider.clone(), None);
-    let outcome =
-        crate::test_support::run_async(conversation.run_turn("first", &mut |_| {})).unwrap();
+    let outcome = crate::test_support::run_async(conversation.run_turn("first", &mut |_| {})).unwrap();
     assert_eq!(outcome.turn_status, TurnStatus::Failed);
     let thread_id = conversation.thread().thread_id;
     let snapshot = fixture.catalog().read_snapshot(&thread_id).unwrap();
     let page = snapshot.page(10, None).unwrap();
-    assert!(
-        page.turns
-            .iter()
-            .flat_map(|turn| &turn.items)
-            .any(|item| matches!(item,
+    assert!(page.turns.iter().flat_map(|turn| &turn.items).any(|item| matches!(item,
         singularity_protocol::HistoryItem::Message { role, text, .. }
-        if role == "assistant" && text == "interrupted output"))
-    );
+        if role == "assistant" && text == "interrupted output")));
     crate::test_support::run_async(conversation.run_turn("continue", &mut |_| {})).unwrap();
     assert!(
         !provider.requests()[1]

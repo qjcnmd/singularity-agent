@@ -42,14 +42,9 @@ fn a_torn_tail_keeps_complete_records_readable() {
     let mut bytes = std::fs::read(&path).expect("session file");
     bytes.extend_from_slice(br#"{"id":"half-written","timestamp":"#);
     std::fs::write(&path, bytes).expect("torn tail");
-    assert!(
-        catalog.read_snapshot(&thread_id).is_ok(),
-        "complete records remain readable"
-    );
+    assert!(catalog.read_snapshot(&thread_id).is_ok(), "complete records remain readable");
 
-    let listed = catalog
-        .list_threads()
-        .expect("listing keeps the known thread");
+    let listed = catalog.list_threads().expect("listing keeps the known thread");
     let entry = listed
         .iter()
         .find(|entry| entry.thread_id == thread_id)
@@ -62,11 +57,7 @@ fn a_torn_tail_keeps_complete_records_readable() {
     // 真正离开目录的会话仍然不再出现：归档把文件移出顶层。
     catalog.archive(&thread_id).expect("archive");
     assert!(
-        !catalog
-            .list_threads()
-            .expect("list")
-            .iter()
-            .any(|entry| entry.thread_id == thread_id),
+        !catalog.list_threads().expect("list").iter().any(|entry| entry.thread_id == thread_id),
         "an archived thread leaves the active listing"
     );
 }

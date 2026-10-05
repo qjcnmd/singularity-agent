@@ -6,9 +6,7 @@ impl AppServer {
         if let Some(image) = slot.and_then(|slot| slot.conversation().pending_image(image_id)) {
             return Ok(image.data_url());
         }
-        self.catalog
-            .image_data(session_id, image_id)
-            .map_err(catalog_error)
+        self.catalog.image_data(session_id, image_id).map_err(catalog_error)
     }
 
     /// 接受输入并启动后台执行；返回成功表示已接受，终态通过会话事件发布。
@@ -18,10 +16,7 @@ impl AppServer {
         let (slot, reservation) = {
             let _lifecycle = self.lock_lifecycle();
             let slot = self.open_slot(session_id)?;
-            let reservation = slot
-                .conversation()
-                .reserve_start(input)
-                .map_err(conversation_error)?;
+            let reservation = slot.conversation().reserve_start(input).map_err(conversation_error)?;
             (slot, reservation)
         };
         self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
@@ -38,9 +33,7 @@ impl AppServer {
         let _lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(session_id)?;
         let mut state = slot.lock_state();
-        slot.conversation()
-            .answer_question(item_id, answers)
-            .map_err(invalid_request)?;
+        slot.conversation().answer_question(item_id, answers).map_err(invalid_request)?;
         self.publish_session_locked(session_id, &slot, &mut state);
         Ok(())
     }
@@ -50,15 +43,11 @@ impl AppServer {
     }
 
     pub fn follow_up(&self, session_id: &str, input: UserInput) -> Result<(), RpcError> {
-        self.apply_control(session_id, move |conversation| {
-            conversation.submit_follow_up(input)
-        })
+        self.apply_control(session_id, move |conversation| conversation.submit_follow_up(input))
     }
 
     pub fn queue_withdraw(&self, session_id: &str, control_id: &str) -> Result<(), RpcError> {
-        self.apply_control(session_id, |conversation| {
-            conversation.withdraw_follow_up(control_id)
-        })
+        self.apply_control(session_id, |conversation| conversation.withdraw_follow_up(control_id))
     }
 
     pub fn queue_edit(
@@ -66,9 +55,7 @@ impl AppServer {
         session_id: &str,
         control_id: &str,
     ) -> Result<singularity_protocol::QueuedInputDraft, RpcError> {
-        let input = self.apply_control(session_id, |conversation| {
-            conversation.take_follow_up(control_id)
-        })?;
+        let input = self.apply_control(session_id, |conversation| conversation.take_follow_up(control_id))?;
         Ok(singularity_protocol::QueuedInputDraft {
             text: input.text,
             skills: input.skills,
@@ -84,20 +71,13 @@ impl AppServer {
     }
 
     /// 发送指定排队消息，运行时插话，空闲时开始下一轮。
-    pub fn queue_send_now(
-        self: &Arc<Self>,
-        session_id: &str,
-        control_id: &str,
-    ) -> Result<(), RpcError> {
+    pub fn queue_send_now(self: &Arc<Self>, session_id: &str, control_id: &str) -> Result<(), RpcError> {
         let lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(session_id)?;
         // 和 worker 的事件、结算共用同一把 SlotState 锁：控制从 Conversation
         // 转到公开投影并发布完之前，结算不能插进来把旧回执盖掉。
         let mut state = slot.lock_state();
-        let promoted = slot
-            .conversation()
-            .promote_pending(control_id)
-            .map_err(control_error)?;
+        let promoted = slot.conversation().promote_pending(control_id).map_err(control_error)?;
         match promoted {
             FollowUpPromotion::Injected => {
                 self.publish_session_locked(session_id, &slot, &mut state);
@@ -165,10 +145,7 @@ impl AppServer {
         let (slot, reservation) = {
             let _lifecycle = self.lock_lifecycle();
             let slot = self.open_slot(session_id)?;
-            let reservation = slot
-                .conversation()
-                .reserve_compaction()
-                .map_err(conversation_error)?;
+            let reservation = slot.conversation().reserve_compaction().map_err(conversation_error)?;
             (slot, reservation)
         };
         self.begin_operation(session_id, &slot, |state, history| {
@@ -182,9 +159,7 @@ impl AppServer {
     pub fn rename_session(&self, session_id: &str, name: &str) -> Result<(), RpcError> {
         let lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(session_id)?;
-        slot.conversation()
-            .rename(name)
-            .map_err(conversation_error)?;
+        slot.conversation().rename(name).map_err(conversation_error)?;
         drop(lifecycle);
         self.publish_app_snapshot();
         Ok(())
@@ -218,9 +193,7 @@ impl AppServer {
             let _lifecycle = self.lock_lifecycle();
             self.open_slot(session_id)?
         };
-        slot.conversation()
-            .update_settings(selector)
-            .map_err(conversation_error)?;
+        slot.conversation().update_settings(selector).map_err(conversation_error)?;
         self.bump_and_emit_session(session_id, &slot);
         Ok(())
     }

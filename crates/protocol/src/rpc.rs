@@ -105,10 +105,7 @@ pub struct SessionTextParams {
     )]
     pub skills: std::collections::BTreeMap<String, String>,
     #[serde(default)]
-    #[cfg_attr(
-        feature = "typescript",
-        ts(as = "Option<Vec<crate::ImageUpload>>", optional)
-    )]
+    #[cfg_attr(feature = "typescript", ts(as = "Option<Vec<crate::ImageUpload>>", optional))]
     pub images: Vec<crate::ImageUpload>,
 }
 

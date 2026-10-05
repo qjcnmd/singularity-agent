@@ -95,12 +95,42 @@ function SidebarView() {
               const expanded = !collapsed.has(item.workspaceId)
               const visible = showAll.has(item.workspaceId) ? sessions : sessions.slice(0, 5)
               return <section key={item.workspaceId}>
-                <WorkspaceButton workspace={item} selected={item.workspaceId === state.selectedWorkspaceId} expanded={expanded} appearance={state.workspaceAppearance[item.workspaceId] ?? defaultWorkspaceAppearance}
-                  onToggle={() => { const next = new Set(collapsed); if (next.has(item.workspaceId)) { next.delete(item.workspaceId); setShowAll(previous => { const reset = new Set(previous); reset.delete(item.workspaceId); return reset }) } else next.add(item.workspaceId); appStore.setSidebarView({ collapsed: [...next] }) }}
-                  onRename={() => setDialog({ kind: 'workspace-rename', workspace: item })} onRemove={() => setDialog({ kind: 'remove', workspace: item })} />
+                <WorkspaceButton
+                  workspace={item}
+                  selected={item.workspaceId === state.selectedWorkspaceId}
+                  expanded={expanded}
+                  appearance={state.workspaceAppearance[item.workspaceId] ?? defaultWorkspaceAppearance}
+                  onToggle={() => {
+                    const next = new Set(collapsed)
+                    if (next.has(item.workspaceId)) {
+                      next.delete(item.workspaceId)
+                      setShowAll(previous => {
+                        const reset = new Set(previous)
+                        reset.delete(item.workspaceId)
+                        return reset
+                      })
+                    } else next.add(item.workspaceId)
+                    appStore.setSidebarView({ collapsed: [...next] })
+                  }}
+                  onRename={() => setDialog({ kind: 'workspace-rename', workspace: item })}
+                  onRemove={() => setDialog({ kind: 'remove', workspace: item })}
+                />
                 <Disclosure open={expanded}><div className="session-list">
                   {visible.map(session => sessionRow(session, titleOf(session)))}
-                  {sessions.length > 5 && <button type="button" className="quiet-button" onClick={() => setShowAll((previous) => { const next = new Set(previous); if (next.has(item.workspaceId)) next.delete(item.workspaceId); else next.add(item.workspaceId); return next })}>{showAll.has(item.workspaceId) ? '收起' : `显示更多 (${sessions.length - 5})`}</button>}
+                  {sessions.length > 5 && (
+                    <button
+                      type="button"
+                      className="quiet-button"
+                      onClick={() => setShowAll(previous => {
+                        const next = new Set(previous)
+                        if (next.has(item.workspaceId)) next.delete(item.workspaceId)
+                        else next.add(item.workspaceId)
+                        return next
+                      })}
+                    >
+                      {showAll.has(item.workspaceId) ? '收起' : `显示更多 (${sessions.length - 5})`}
+                    </button>
+                  )}
                 </div></Disclosure>
               </section>
             })}

@@ -91,15 +91,9 @@ async fn execute_headless(
     goal: &str,
     mut renderer: JsonlRenderer,
 ) -> Result<(), String> {
-    let result = conversation
-        .run_turn(goal, &mut |event| renderer.on_event(&event))
-        .await;
+    let result = conversation.run_turn(goal, &mut |event| renderer.on_event(&event)).await;
     let (status, usage, truncated) = match &result {
-        Ok(outcome) => (
-            outcome.turn_status,
-            Some(outcome.usage.clone()),
-            outcome.truncated,
-        ),
+        Ok(outcome) => (outcome.turn_status, Some(outcome.usage.clone()), outcome.truncated),
         Err(_) => (TurnStatus::Failed, None, false),
     };
     renderer.emit_summary(status, usage, truncated);

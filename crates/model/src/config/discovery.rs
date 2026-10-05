@@ -26,10 +26,7 @@ pub async fn discover(
         .build()
         .map_err(|error| {
             // 客户端构造失败和请求失败是两回事：保留底层原因方便定位。
-            user_config_error(format!(
-                "模型查询客户端无法启动（{}）。",
-                transport_error_source(error)
-            ))
+            user_config_error(format!("模型查询客户端无法启动（{}）。", transport_error_source(error)))
         })?;
     let request = client.get(crate::openai::models_endpoint(base_url));
     // 未保存的密钥是这次查询的纯输入；没提供时用已存的密钥（可能为空）。
@@ -94,28 +91,18 @@ fn discovery_transport_error(error: reqwest::Error) -> ProviderError {
 }
 
 fn read_listing(body: &Value) -> Result<Vec<DiscoveredModel>, ProviderError> {
-    let entries: Vec<(&str, &Value)> =
-        if let Some(data) = body.get("data").and_then(Value::as_array) {
-            data.iter()
-                .filter_map(|entry| Some((entry.get("id")?.as_str()?, entry)))
-                .collect()
-        } else if let Some(models) = body.get("models").and_then(Value::as_object) {
-            models
-                .iter()
-                .map(|(id, entry)| (id.as_str(), entry))
-                .collect()
-        } else {
-            return Err(discovery_response_error(
-                "提供方未返回 data 模型列表或 models 目录。仍可手动添加模型。",
-            ));
-        };
+    let entries: Vec<(&str, &Value)> = if let Some(data) = body.get("data").and_then(Value::as_array) {
+        data.iter().filter_map(|entry| Some((entry.get("id")?.as_str()?, entry))).collect()
+    } else if let Some(models) = body.get("models").and_then(Value::as_object) {
+        models.iter().map(|(id, entry)| (id.as_str(), entry)).collect()
+    } else {
+        return Err(discovery_response_error("提供方未返回 data 模型列表或 models 目录。仍可手动添加模型。"));
+    };
     let mut models = BTreeMap::new();
     for (id, entry) in entries {
         // 形状不对或 id 不合法的条目直接跳过，不让整次发现因此失败。
         if entry.is_object() && validate_model_id(id, "model id").is_ok() {
-            models
-                .entry(id.to_string())
-                .or_insert_with(|| metadata(id, entry));
+            models.entry(id.to_string()).or_insert_with(|| metadata(id, entry));
         }
     }
     Ok(models.into_values().collect())

@@ -44,10 +44,7 @@ fn run_with_control_window(
     inject(&control_conversation);
     let _ = release_tx.send(());
     let (outcome, events) = worker.join().expect("worker");
-    (
-        outcome.expect("every control run converges to a trusted terminal outcome"),
-        events,
-    )
+    (outcome.expect("every control run converges to a trusted terminal outcome"), events)
 }
 
 /// 单条排队输入可撤回；多次 steer 按接受顺序进入下一份模型请求。
@@ -61,33 +58,29 @@ fn controls_preserve_input_order_and_withdrawal() {
     ]));
     let (gate, started_rx) = GatedProvider::new(script.clone() as Arc<dyn Provider + Send + Sync>);
     let (conversation, path) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
-    let (outcome, _) =
-        run_with_control_window(&gate, started_rx, &conversation, "initial goal", |c| {
-            c.steer("steer left").unwrap();
-            c.submit_follow_up("withdrawn").unwrap();
-            c.steer("steer right").unwrap();
-            assert!(matches!(
-                c.submit_follow_up("f2"),
-                Err(ConversationControlError::PendingInputExists)
-            ));
-            let queued = c.snapshot().pending_input.unwrap();
-            assert!(
-                c.withdraw_follow_up(&queued.control_id).is_ok(),
-                "the queued input is withdrawable before start"
-            );
-            c.submit_follow_up("f1").unwrap();
-        });
+    let (outcome, _) = run_with_control_window(&gate, started_rx, &conversation, "initial goal", |c| {
+        c.steer("steer left").unwrap();
+        c.submit_follow_up("withdrawn").unwrap();
+        c.steer("steer right").unwrap();
+        assert!(matches!(c.submit_follow_up("f2"), Err(ConversationControlError::PendingInputExists)));
+        let queued = c.snapshot().pending_input.unwrap();
+        assert!(
+            c.withdraw_follow_up(&queued.control_id).is_ok(),
+            "the queued input is withdrawable before start"
+        );
+        c.submit_follow_up("f1").unwrap();
+    });
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
 
     assert!(conversation.snapshot().pending_input.is_none());
-    assert!(!SessionData::open(&path).unwrap().entries().iter().any(|entry| matches!(entry, SessionEntry::Message { message, .. } if message.content_text() == "withdrawn")));
+    assert!(
+        !SessionData::open(&path).unwrap().entries().iter().any(
+            |entry| matches!(entry, SessionEntry::Message { message, .. } if message.content_text() == "withdrawn")
+        )
+    );
     let requests = script.requests();
     assert_eq!(requests.len(), 3, "two model steps + one queued turn");
-    assert_eq!(
-        input_sequence(&requests[2..]),
-        ["f1"],
-        "the queued input runs as its own turn"
-    );
+    assert_eq!(input_sequence(&requests[2..]), ["f1"], "the queued input runs as its own turn");
     let second_request_users: Vec<String> = requests[1]
         .messages
         .iter()
@@ -116,11 +109,8 @@ fn an_accepted_stop_stops_the_chain_even_when_the_turn_fails() {
         ModelErrorKind::AuthError,
         "invalid api key",
     )]));
-    let (conversation, path) = conversation_with(
-        &fixture,
-        Arc::clone(&script) as Arc<dyn Provider + Send + Sync>,
-        None,
-    );
+    let (conversation, path) =
+        conversation_with(&fixture, Arc::clone(&script) as Arc<dyn Provider + Send + Sync>, None);
     let queued = std::sync::Mutex::new(None);
     let outcome = {
         let conversation = Arc::clone(&conversation);
@@ -141,28 +131,20 @@ fn an_accepted_stop_stops_the_chain_even_when_the_turn_fails() {
 
     assert_eq!(outcome.turn_status, TurnStatus::Failed);
     let session = SessionData::open(&path).expect("reopen stopped turn");
-    assert!(session.ledger_records().iter().any(|record| matches!(
-        record,
-        LedgerRecord::OperationFinished {
-            user_stopped: true,
-            ..
-        }
-    )));
+    assert!(
+        session
+            .ledger_records()
+            .iter()
+            .any(|record| matches!(record, LedgerRecord::OperationFinished { user_stopped: true, .. }))
+    );
     assert_eq!(
         outcome.error.as_ref().map(|error| error.cause),
         Some(TurnFailureCause::ProviderAuth),
         "the real failure reason is preserved"
     );
-    assert_eq!(
-        script.requests().len(),
-        1,
-        "an accepted stop never starts the next queued turn"
-    );
+    assert_eq!(script.requests().len(), 1, "an accepted stop never starts the next queued turn");
     let pending = conversation.snapshot().pending_input.unwrap();
-    assert_eq!(
-        pending.control_id,
-        queued.lock().unwrap().as_ref().unwrap().control_id
-    );
+    assert_eq!(pending.control_id, queued.lock().unwrap().as_ref().unwrap().control_id);
 }
 
 /// 接受停止同时关闭本轮注入窗口：其后的 steer 与 send-now 都被拒绝，
@@ -173,8 +155,7 @@ fn an_accepted_stop_closes_the_injection_window_without_losing_queued_input() {
     let (gate, started_rx) = GatedProvider::new(Arc::new(ScriptedProvider::ok("done")));
     let (release_tx, release_rx) = channel();
     gate.with_release(release_rx);
-    let (conversation, path) =
-        conversation_with(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
+    let (conversation, path) = conversation_with(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
     let worker = {
         let conversation = Arc::clone(&conversation);
         std::thread::spawn(move || {
@@ -185,41 +166,29 @@ fn an_accepted_stop_closes_the_injection_window_without_losing_queued_input() {
     started_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the turn reaches the provider");
-    conversation
-        .submit_follow_up("kept for the next turn")
-        .expect("queue a follow-up");
+    conversation.submit_follow_up("kept for the next turn").expect("queue a follow-up");
     let queued = conversation.snapshot().pending_input.unwrap();
     conversation.abort().expect("stop the running turn");
 
-    assert!(matches!(
-        conversation.steer("late steer"),
-        Err(ConversationControlError::NotRunning)
-    ));
+    assert!(matches!(conversation.steer("late steer"), Err(ConversationControlError::NotRunning)));
     assert!(matches!(
         conversation.promote_pending(&queued.control_id),
         Err(ConversationControlError::NotRunning)
     ));
     let pending = conversation.snapshot().pending_input.unwrap();
     assert_eq!(pending.control_id, queued.control_id);
-    assert_eq!(
-        conversation.phase(),
-        singularity_protocol::SessionPhase::Stopping
-    );
+    assert_eq!(conversation.phase(), singularity_protocol::SessionPhase::Stopping);
 
     let _ = release_tx.send(());
-    let outcome = worker
-        .join()
-        .expect("worker")
-        .expect("interruption converges durably");
+    let outcome = worker.join().expect("worker").expect("interruption converges durably");
     assert_eq!(outcome.turn_status, TurnStatus::Interrupted);
     let session = SessionData::open(&path).expect("reopen stopped turn");
-    assert!(session.ledger_records().iter().any(|record| matches!(
-        record,
-        LedgerRecord::OperationFinished {
-            user_stopped: true,
-            ..
-        }
-    )));
+    assert!(
+        session
+            .ledger_records()
+            .iter()
+            .any(|record| matches!(record, LedgerRecord::OperationFinished { user_stopped: true, .. }))
+    );
     assert!(
         conversation.snapshot().pending_input.is_some(),
         "the stopped turn leaves the queued follow-up for the next explicit input"
@@ -237,8 +206,7 @@ fn a_failed_turn_leaves_only_the_explicitly_queued_input() {
     let (gate, started_rx) = GatedProvider::new(script.clone() as Arc<dyn Provider + Send + Sync>);
     let (release_tx, release_rx) = channel();
     gate.with_release(release_rx);
-    let (conversation, _path) =
-        conversation_with(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
+    let (conversation, _path) = conversation_with(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
     let worker = {
         let conversation = Arc::clone(&conversation);
         std::thread::spawn(move || {
@@ -249,26 +217,17 @@ fn a_failed_turn_leaves_only_the_explicitly_queued_input() {
     started_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the turn reaches the provider");
-    conversation
-        .submit_follow_up("first accepted")
-        .expect("queue the follow-up first");
+    conversation.submit_follow_up("first accepted").expect("queue the follow-up first");
     let follow_up = conversation.snapshot().pending_input.unwrap();
     conversation.steer("second accepted").expect("steer second");
     let _ = release_tx.send(());
-    let outcome = worker
-        .join()
-        .expect("worker")
-        .expect("a model error has a saved terminal");
+    let outcome = worker.join().expect("worker").expect("a model error has a saved terminal");
     assert_eq!(outcome.turn_status, TurnStatus::Failed);
 
     let pending = conversation.snapshot().pending_input.unwrap();
     assert_eq!(pending.text, "first accepted");
     assert_eq!(pending.control_id, follow_up.control_id);
-    assert_eq!(
-        script.requests().len(),
-        1,
-        "failure stops the current execution"
-    );
+    assert_eq!(script.requests().len(), 1, "failure stops the current execution");
 
     let compaction = conversation.reserve_compaction().unwrap();
     let edited = conversation.take_follow_up(&pending.control_id).unwrap();
@@ -283,13 +242,7 @@ fn a_failed_turn_leaves_only_the_explicitly_queued_input() {
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>();
     assert!(users.ends_with(&["initial", "second accepted", "continue"]));
-    assert_eq!(
-        users
-            .iter()
-            .filter(|text| **text == "second accepted")
-            .count(),
-        1
-    );
+    assert_eq!(users.iter().filter(|text| **text == "second accepted").count(), 1);
 }
 
 /// 失败 turn 的细节随 operation 终态落盘，历史重读直接带同一错误概念：
@@ -303,24 +256,18 @@ fn a_failed_turn_keeps_its_detail_across_reload_and_a_later_success() {
         ScriptedAttempt::success("second response"),
     ]));
     let (conversation, path) = conversation_with(&fixture, script as _, None);
-    let failed =
-        crate::test_support::run_async(conversation.run_turn("initial goal", &mut |_| {})).unwrap();
+    let failed = crate::test_support::run_async(conversation.run_turn("initial goal", &mut |_| {})).unwrap();
     assert_eq!(failed.turn_status, TurnStatus::Failed);
     let detail = failed.error.expect("a failed turn reports its detail");
 
     // 持久终态记录携带同一份细节。
-    let durable =
-        SessionData::open(&path)
-            .unwrap()
-            .entries()
-            .iter()
-            .find_map(|entry| match entry {
-                SessionEntry::Record {
-                    record: LedgerRecord::OperationFinished { error, .. },
-                    ..
-                } => error.clone(),
-                _ => None,
-            });
+    let durable = SessionData::open(&path).unwrap().entries().iter().find_map(|entry| match entry {
+        SessionEntry::Record {
+            record: LedgerRecord::OperationFinished { error, .. },
+            ..
+        } => error.clone(),
+        _ => None,
+    });
     assert_eq!(durable.as_ref(), Some(&detail));
 
     let thread_id = conversation.thread().thread_id;
@@ -343,8 +290,5 @@ fn a_failed_turn_keeps_its_detail_across_reload_and_a_later_success() {
     assert_eq!(after.len(), 2);
     assert_eq!(after[0].2.as_ref(), Some(&detail));
     assert_eq!(after[1].1, Some(TurnStatus::Completed));
-    assert_eq!(
-        after[1].2, None,
-        "a successful turn carries no failure detail"
-    );
+    assert_eq!(after[1].2, None, "a successful turn carries no failure detail");
 }

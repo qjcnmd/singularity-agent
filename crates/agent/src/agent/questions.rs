@@ -41,10 +41,7 @@ impl UserQuestions {
             return Err("请回答所有问题。".into());
         }
         for question in &waiting.request.questions {
-            let matching: Vec<_> = answers
-                .iter()
-                .filter(|answer| answer.id == question.id)
-                .collect();
+            let matching: Vec<_> = answers.iter().filter(|answer| answer.id == question.id).collect();
             if matching.len() != 1 {
                 return Err("答案与问题不匹配。".into());
             }
@@ -58,8 +55,7 @@ impl UserQuestions {
             let mut selected = std::collections::HashSet::new();
             if (!question.multi_select && answer.selected.len() > 1)
                 || answer.selected.iter().any(|label| {
-                    !selected.insert(label)
-                        || !question.options.iter().any(|option| &option.label == label)
+                    !selected.insert(label) || !question.options.iter().any(|option| &option.label == label)
                 })
                 || (answer.selected.is_empty() && answer.text.trim().is_empty())
             {
@@ -80,8 +76,7 @@ impl UserQuestions {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> ToolExecution {
         let (reply, receive) = oneshot::channel();
-        *self.waiting.lock().expect("question lock poisoned") =
-            Some(WaitingQuestion { request, reply });
+        *self.waiting.lock().expect("question lock poisoned") = Some(WaitingQuestion { request, reply });
         on_event(AgentEvent::ControlChanged);
         let result = tokio::select! {
             biased;

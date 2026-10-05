@@ -28,11 +28,7 @@ use singularity_model::{
 
 /// 测试工作目录：线程注册的 cwd 用当前进程目录即可，各测试共用一处。
 pub fn cwd() -> String {
-    std::env::current_dir()
-        .expect("current dir")
-        .to_str()
-        .expect("utf-8 cwd")
-        .to_string()
+    std::env::current_dir().expect("current dir").to_str().expect("utf-8 cwd").to_string()
 }
 
 /// 测试装配：夹具自己持有隔离 home（含 sessions 目录与模型配置）。
@@ -67,9 +63,7 @@ impl SessionsFixture {
     pub fn runner(&self, provider: Option<Arc<dyn Provider + Send + Sync>>) -> Arc<TurnRunner> {
         let runner = TurnRunner::new(
             self.dir.clone(),
-            Arc::new(singularity_model::ModelConfigManager::open(
-                self.home().to_path_buf(),
-            )),
+            Arc::new(singularity_model::ModelConfigManager::open(self.home().to_path_buf())),
             Arc::new(singularity_mcp::McpManager::open(self.home().to_path_buf())),
         );
         Arc::new(match provider {
@@ -143,16 +137,9 @@ pub fn conversation_with(
     let runner = fixture.runner(Some(provider));
     let thread = fixture
         .catalog()
-        .create_thread(
-            std::env::current_dir().unwrap().to_str().unwrap(),
-            model.map(str::to_string),
-        )
+        .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), model.map(str::to_string))
         .expect("create thread");
-    let path = fixture
-        .dir
-        .join(singularity_agent::session::session_file_name(
-            &thread.thread_id,
-        ));
+    let path = fixture.dir.join(singularity_agent::session::session_file_name(&thread.thread_id));
     (Conversation::new(runner, thread), path)
 }
 
@@ -168,9 +155,7 @@ pub struct GatedProvider {
 
 impl GatedProvider {
     /// 包装 inner 新建门控替身，返回替身与「首个请求已到达」的接收端。
-    pub fn new(
-        inner: Arc<dyn Provider + Send + Sync>,
-    ) -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
+    pub fn new(inner: Arc<dyn Provider + Send + Sync>) -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
         let (sender, receiver) = std::sync::mpsc::channel();
         (
             Arc::new(Self {
@@ -206,15 +191,9 @@ impl Provider for GatedProvider {
                 let _ = tokio::task::spawn_blocking(move || release.recv()).await;
             }
             if cancellation.is_cancelled() {
-                return Err(ProviderError::new(
-                    ModelErrorKind::Cancelled,
-                    "cancelled at stop gate",
-                )
-                .into());
+                return Err(ProviderError::new(ModelErrorKind::Cancelled, "cancelled at stop gate").into());
             }
-            self.inner
-                .complete_stream(request, cancellation, observer)
-                .await
+            self.inner.complete_stream(request, cancellation, observer).await
         })
     }
 }
@@ -224,9 +203,7 @@ pub fn seed_compaction_history(fixture: &SessionsFixture, thread_id: &str) {
     use singularity_agent::message::{AgentMessage, ContentBlock};
     use singularity_agent::session::SessionManager;
 
-    let path = fixture
-        .dir
-        .join(singularity_agent::session::session_file_name(thread_id));
+    let path = fixture.dir.join(singularity_agent::session::session_file_name(thread_id));
     let mut session = SessionManager::open_existing(&path, thread_id).expect("open session");
     for (user, text) in [
         (true, "first user ".repeat(5_000)),
@@ -236,15 +213,9 @@ pub fn seed_compaction_history(fixture: &SessionsFixture, thread_id: &str) {
     ] {
         let content = vec![ContentBlock::Text { text }];
         let message = if user {
-            AgentMessage::User {
-                content,
-                display_text: None,
-            }
+            AgentMessage::User { content, display_text: None }
         } else {
-            AgentMessage::Assistant {
-                content,
-                provider_reasoning_replay: None,
-            }
+            AgentMessage::Assistant { content, provider_reasoning_replay: None }
         };
         session.append_message(message).expect("append history");
     }

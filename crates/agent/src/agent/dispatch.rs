@@ -113,8 +113,7 @@ impl Agent {
                             on_event,
                         )
                         .await;
-                    execution.duration_ms =
-                        Some(singularity_core::duration_millis(started.elapsed()));
+                    execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
                     execution
                 }
                 Ok(prepared) => {
@@ -134,8 +133,7 @@ impl Agent {
                                 });
                             })
                             .await;
-                        execution.duration_ms =
-                            Some(singularity_core::duration_millis(started.elapsed()));
+                        execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
                         let event = WorkerEvent::Ended {
                             item_id,
                             tool_call_id: call.tool_call_id,
@@ -147,20 +145,14 @@ impl Agent {
                     continue;
                 }
             };
-            if let Err(error) = self
-                .finish_tool(&item_id, &call.tool_call_id, execution, on_event)
-                .await
-            {
+            if let Err(error) = self.finish_tool(&item_id, &call.tool_call_id, execution, on_event).await {
                 failure = Some(error);
                 break;
             }
         }
         drop(sender);
         while active > 0 {
-            let event = receiver
-                .recv()
-                .await
-                .expect("active tool retains its result sender");
+            let event = receiver.recv().await.expect("active tool retains its result sender");
             let ended = matches!(event, WorkerEvent::Ended { .. });
             if failure.is_none()
                 && let Err(error) = self.process_tool_event(event, on_event).await
@@ -178,18 +170,16 @@ impl Agent {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
         match event {
-            WorkerEvent::Update { item_id, text } => on_event(AgentEvent::ToolExecutionUpdate {
-                item_id,
-                partial_result: text,
-            }),
+            WorkerEvent::Update { item_id, text } => {
+                on_event(AgentEvent::ToolExecutionUpdate { item_id, partial_result: text })
+            }
             WorkerEvent::Ended {
                 item_id,
                 tool_call_id,
                 execution,
                 _admission: _guard,
             } => {
-                self.finish_tool(&item_id, &tool_call_id, execution, on_event)
-                    .await?;
+                self.finish_tool(&item_id, &tool_call_id, execution, on_event).await?;
             }
         }
         Ok(())
@@ -203,12 +193,8 @@ impl Agent {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
         self.save_images(&execution.images).await?;
-        self.append_message(Some(item_id), tool_result_message(tool_call_id, &execution))
-            .await?;
-        on_event(AgentEvent::ToolExecutionEnded {
-            item_id: item_id.to_string(),
-            execution,
-        });
+        self.append_message(Some(item_id), tool_result_message(tool_call_id, &execution)).await?;
+        on_event(AgentEvent::ToolExecutionEnded { item_id: item_id.to_string(), execution });
         Ok(())
     }
 }

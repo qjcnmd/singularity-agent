@@ -85,16 +85,11 @@ impl OperationReservation {
         }
     }
 
-    async fn compact(
-        &self,
-        sink: &mut (dyn FnMut(TurnEvent) + Send),
-    ) -> Result<(), ConversationError> {
+    async fn compact(&self, sink: &mut (dyn FnMut(TurnEvent) + Send)) -> Result<(), ConversationError> {
         let (thread, writer, window) = match &self.conversation.lock_state().turn {
-            TurnLifecycle::Compacting {
-                thread,
-                writer,
-                window,
-            } => (thread.clone(), Arc::clone(writer), Arc::clone(window)),
+            TurnLifecycle::Compacting { thread, writer, window } => {
+                (thread.clone(), Arc::clone(writer), Arc::clone(window))
+            }
             _ => unreachable!("compaction reservation owns its execution window"),
         };
         self.conversation
@@ -216,13 +211,7 @@ impl Conversation {
             .flat_map(|request| &request.input.images)
             .find(|image| image.attachment.id == image_id)
             .cloned()
-            .or_else(|| {
-                state
-                    .steering_inbox
-                    .lock()
-                    .expect("steering inbox lock poisoned")
-                    .image(image_id)
-            })
+            .or_else(|| state.steering_inbox.lock().expect("steering inbox lock poisoned").image(image_id))
     }
 
     /// 当前 Thread 的投影快照。
@@ -247,10 +236,7 @@ impl Conversation {
     }
 
     /// 排队一条输入，在活动回合正常完成后执行；空闲时应当直接开始回合。
-    pub fn submit_follow_up(
-        &self,
-        input: impl Into<UserInput>,
-    ) -> Result<(), ConversationControlError> {
+    pub fn submit_follow_up(&self, input: impl Into<UserInput>) -> Result<(), ConversationControlError> {
         self.lock_state().queue_follow_up(input.into())
     }
 
@@ -258,11 +244,7 @@ impl Conversation {
     pub fn take_follow_up(&self, control_id: &str) -> Result<UserInput, ConversationControlError> {
         let mut state = self.lock_state();
         state.editable_pending_input(control_id)?;
-        Ok(state
-            .pending_input
-            .take()
-            .expect("located pending input exists")
-            .input)
+        Ok(state.pending_input.take().expect("located pending input exists").input)
     }
 
     /// 发送排队输入：运行时原子交给当前 turn 的 steer 输入箱，空闲时预订下一轮。
@@ -383,9 +365,7 @@ impl Conversation {
         }
         let _window = self.lock_writer_window();
         let writer = self.metadata_writer()?;
-        lock_writer(&writer).append_metadata(SessionMetadata::ThreadName {
-            name: name.to_string(),
-        })?;
+        lock_writer(&writer).append_metadata(SessionMetadata::ThreadName { name: name.to_string() })?;
         Ok(())
     }
 
@@ -394,9 +374,7 @@ impl Conversation {
     /// 打开和写盘串行化，状态锁只用来读取阶段和提交选择；临时开的写者在本函数返回前释放，
     /// 后续预订在同一个窗口里看到的是已经释放的写者。
     pub fn update_settings(&self, selector: &str) -> Result<(), ConversationError> {
-        self.runner
-            .validate_model_selector(selector)
-            .map_err(ConversationError::Configuration)?;
+        self.runner.validate_model_selector(selector).map_err(ConversationError::Configuration)?;
         let _window = self.lock_writer_window();
         let updated = {
             let state = self.lock_state();
@@ -427,16 +405,12 @@ impl Conversation {
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, ConversationState> {
-        self.state
-            .lock()
-            .expect("conversation state lock poisoned (fail-stop)")
+        self.state.lock().expect("conversation state lock poisoned (fail-stop)")
     }
 
     /// 写者窗口：打开写者、交接写者和写盘都在这里串行。持有本窗口时只取状态锁做
     /// 短暂的读写，绝不反向等待状态锁的持有者，见模块文档「锁」。
     fn lock_writer_window(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.writer_window
-            .lock()
-            .expect("conversation writer window poisoned (fail-stop)")
+        self.writer_window.lock().expect("conversation writer window poisoned (fail-stop)")
     }
 }

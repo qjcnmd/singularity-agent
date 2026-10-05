@@ -123,10 +123,8 @@ impl ModelConfigManager {
         if data.auth.providers.remove(provider_id).is_some() {
             write_json_file(&self.directory, crate::USER_AUTH_FILE_NAME, &data.auth).map_err(
                 |mut error| {
-                    error.message = format!(
-                        "提供方配置已删除，但 API 密钥删除失败；请重试删除：{}",
-                        error.message
-                    );
+                    error.message =
+                        format!("提供方配置已删除，但 API 密钥删除失败；请重试删除：{}", error.message);
                     // 与保存失败一样标成半成品状态：界面据此提示重试这一步，而不是笼统的配置错误。
                     error.with_code(crate::CREDENTIAL_DELETE_FAILED_CODE)
                 },
@@ -158,10 +156,7 @@ impl ModelConfigManager {
 
     /// 绑定数据目录；构造时不读取或创建配置文件。
     pub fn open(directory: PathBuf) -> Self {
-        Self {
-            directory,
-            access: Mutex::new(()),
-        }
+        Self { directory, access: Mutex::new(()) }
     }
 
     /// 冻结当前配置与凭据；读取失败保留在快照中，解析选择时返回原错误。
@@ -194,9 +189,7 @@ impl ModelConfigManager {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.access
-            .lock()
-            .expect("model configuration lock poisoned")
+        self.access.lock().expect("model configuration lock poisoned")
     }
 
     fn write_provider(
@@ -219,10 +212,7 @@ impl ModelConfigManager {
         let models = model_definitions(
             input.models,
             input.api_protocol.as_deref(),
-            config
-                .providers
-                .get(&input.provider_id)
-                .map(|provider| &provider.models),
+            config.providers.get(&input.provider_id).map(|provider| &provider.models),
         )?;
         config.providers.insert(
             input.provider_id.clone(),
@@ -237,26 +227,19 @@ impl ModelConfigManager {
         write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &config)?;
         // 输入已经验证完毕；配置和密钥分别提交，保留第二个文件写入失败的反馈。
         if let Some(key) = api_key {
-            self.write_api_key(&input.provider_id, key)
-                .map_err(|mut error| {
-                    error.message = format!(
-                        "提供方配置已保存，但 API 密钥保存失败；请重试保存：{}",
-                        error.message
-                    );
-                    error.with_code(crate::CREDENTIAL_SAVE_FAILED_CODE)
-                })?;
+            self.write_api_key(&input.provider_id, key).map_err(|mut error| {
+                error.message =
+                    format!("提供方配置已保存，但 API 密钥保存失败；请重试保存：{}", error.message);
+                error.with_code(crate::CREDENTIAL_SAVE_FAILED_CODE)
+            })?;
         }
         Ok(())
     }
 
     fn write_api_key(&self, provider_id: &str, api_key: &str) -> Result<(), ProviderError> {
         let mut auth = read_user_auth_file(&self.directory)?;
-        auth.providers.insert(
-            provider_id.to_string(),
-            UserAuthProvider {
-                api_key: api_key.to_string(),
-            },
-        );
+        auth.providers
+            .insert(provider_id.to_string(), UserAuthProvider { api_key: api_key.to_string() });
         write_json_file(&self.directory, crate::USER_AUTH_FILE_NAME, &auth)?;
         Ok(())
     }
@@ -291,12 +274,7 @@ fn model_definitions(
         let mut variants = BTreeMap::new();
         for variant in model.reasoning_variants.into_iter().flatten() {
             if variants
-                .insert(
-                    variant.id,
-                    ModelsFileReasoningVariant {
-                        wire_effort: variant.wire_effort,
-                    },
-                )
+                .insert(variant.id, ModelsFileReasoningVariant { wire_effort: variant.wire_effort })
                 .is_some()
             {
                 return Err(user_config_error("reasoning variant ids must be unique"));
@@ -318,14 +296,11 @@ fn model_definitions(
             default_variant: model.default_variant,
             supports_developer_role: previous.and_then(|model| model.supports_developer_role),
             supports_tool_choice: previous.and_then(|model| model.supports_tool_choice),
-            requires_reasoning_content_for_tool_calls: model
-                .requires_reasoning_content_for_tool_calls,
+            requires_reasoning_content_for_tool_calls: model.requires_reasoning_content_for_tool_calls,
             requires_assistant_content_for_tool_calls: previous
                 .is_some_and(|previous| previous.requires_assistant_content_for_tool_calls)
                 && is_chat,
-            chat_output_tokens_field: model
-                .chat_output_tokens_field
-                .filter(|field| !field.is_empty()),
+            chat_output_tokens_field: model.chat_output_tokens_field.filter(|field| !field.is_empty()),
             thinking_wire_format: model.thinking_wire_format,
         };
         resolve_model_definition(&configured, protocol, &model.model_id, None)?;
@@ -348,10 +323,7 @@ fn clear_invalid_default_selection(config: &mut UserConfigFile) {
             return false;
         };
         selected.reasoning_variant.is_none_or(|variant| {
-            model
-                .reasoning_variants
-                .as_ref()
-                .is_some_and(|variants| variants.contains_key(variant))
+            model.reasoning_variants.as_ref().is_some_and(|variants| variants.contains_key(variant))
         })
     });
     if !valid {
@@ -367,22 +339,12 @@ fn empty_catalog(error: Option<String>) -> RedactedModelCatalog {
     }
 }
 
-fn catalog_from_data(
-    data: &UserConfigData,
-    selection: Result<(), ProviderError>,
-) -> RedactedModelCatalog {
+fn catalog_from_data(data: &UserConfigData, selection: Result<(), ProviderError>) -> RedactedModelCatalog {
     if data.config.providers.is_empty() {
         return empty_catalog(None);
     }
     let (error, default_selector) = match selection {
-        _ if data
-            .config
-            .providers
-            .values()
-            .all(|provider| provider.models.is_empty()) =>
-        {
-            (None, None)
-        }
+        _ if data.config.providers.values().all(|provider| provider.models.is_empty()) => (None, None),
         Ok(()) => (None, data.config.default_model.clone()),
         Err(error) => (Some(error.to_string()), data.config.default_model.clone()),
     };
@@ -407,10 +369,7 @@ fn catalog_from_data(
                     automatic_fields: model.automatic_fields.clone(),
                     model_id: model_id.clone(),
                     display_name: model.display_name.clone(),
-                    api_protocol: provider
-                        .api_protocol
-                        .clone()
-                        .or_else(|| model.api_protocol.clone()),
+                    api_protocol: provider.api_protocol.clone().or_else(|| model.api_protocol.clone()),
                     max_context_tokens: model.max_context_tokens,
                     max_output_tokens: model.max_output_tokens,
                     reasoning_variants: model.reasoning_variants.as_ref().map(|variants| {
@@ -431,11 +390,7 @@ fn catalog_from_data(
                 .collect(),
         })
         .collect();
-    RedactedModelCatalog {
-        error,
-        default_selector,
-        providers,
-    }
+    RedactedModelCatalog { error, default_selector, providers }
 }
 
 /// 写配置文件：把当前配置直接序列化成文件字节，只负责序列化和原子替换，不做二次清洗；可选
@@ -443,15 +398,10 @@ fn catalog_from_data(
 ///
 /// 不读文件里已有的内容：条目在不在由类型自身的序列化决定，被删掉的供应商、模型和推理档位会
 /// 随保存一起消失。`Map` 按键排序（本仓没启用 `preserve_order`），与文件里原先的书写顺序无关。
-fn write_json_file(
-    directory: &Path,
-    file_name: &str,
-    value: &impl Serialize,
-) -> Result<(), ProviderError> {
+fn write_json_file(directory: &Path, file_name: &str, value: &impl Serialize) -> Result<(), ProviderError> {
     singularity_core::create_data_dir(directory).map_err(user_config_error)?;
     let path = directory.join(file_name);
-    let mut bytes =
-        serde_json::to_vec_pretty(value).expect("provider configuration is JSON serializable");
+    let mut bytes = serde_json::to_vec_pretty(value).expect("provider configuration is JSON serializable");
     bytes.push(b'\n');
     singularity_core::atomic_replace_bytes(&path, &bytes)
         .map_err(|error| user_config_error(format!("could not update {}: {error}", path.display())))

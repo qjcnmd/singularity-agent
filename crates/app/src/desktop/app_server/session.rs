@@ -6,8 +6,8 @@
 use std::sync::{Arc, Mutex};
 
 use singularity_protocol::{
-    ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, SessionRuntime, SessionTerminalSnapshot,
-    TurnEvent, TurnEventEnvelope,
+    ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, SessionRuntime, SessionTerminalSnapshot, TurnEvent,
+    TurnEventEnvelope,
 };
 use singularity_runtime::{Conversation, ThreadSnapshot};
 
@@ -45,9 +45,7 @@ impl ConversationSlot {
     }
 
     pub(super) fn lock_state(&self) -> std::sync::MutexGuard<'_, SlotState> {
-        self.state
-            .lock()
-            .expect("conversation slot lock poisoned (fail-stop)")
+        self.state.lock().expect("conversation slot lock poisoned (fail-stop)")
     }
 
     pub(super) fn runtime_from(&self, state: &SlotState) -> SessionRuntime {
@@ -88,9 +86,7 @@ impl SlotState {
     pub(super) fn apply_turn_event(&mut self, event: TurnEvent) -> TurnEventEnvelope {
         self.bump_revision();
         if let TurnEvent::TurnStarted { turn, .. } = &event {
-            let snapshot = ActiveTurnRuntimeSnapshot {
-                turn_id: turn.turn_id.clone(),
-            };
+            let snapshot = ActiveTurnRuntimeSnapshot { turn_id: turn.turn_id.clone() };
             self.active_turn = Some(snapshot);
         }
         let envelope = TurnEventEnvelope {
@@ -101,18 +97,8 @@ impl SlotState {
         let replaced = match &envelope.event {
             TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
             | TurnEvent::ToolExecutionEnd { turn_id, item, .. }
-            | TurnEvent::ItemCompleted {
-                turn_id,
-                item,
-                content: Some(_),
-                ..
-            }
-            | TurnEvent::ItemFailed {
-                turn_id,
-                item,
-                content: Some(_),
-                ..
-            } => Some((turn_id, &item.item_id)),
+            | TurnEvent::ItemCompleted { turn_id, item, content: Some(_), .. }
+            | TurnEvent::ItemFailed { turn_id, item, content: Some(_), .. } => Some((turn_id, &item.item_id)),
             _ => None,
         };
         if let Some((turn, item_id)) = replaced {
@@ -121,9 +107,7 @@ impl SlotState {
                     TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
                     | TurnEvent::AssistantDelta { turn_id, item, .. }
                     | TurnEvent::AssistantThinkingDelta { turn_id, item, .. }
-                    | TurnEvent::ItemStarted { turn_id, item, .. } => {
-                        Some((turn_id, &item.item_id))
-                    }
+                    | TurnEvent::ItemStarted { turn_id, item, .. } => Some((turn_id, &item.item_id)),
                     _ => None,
                 };
                 progress != Some((turn, item_id))

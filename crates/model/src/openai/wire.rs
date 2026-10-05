@@ -17,11 +17,7 @@ pub enum ThinkingWireFormat {
 
 impl ThinkingWireFormat {
     /// 全部合法词形，顺序就是错误提示里的列举顺序。
-    pub(crate) const ALL: [Self; 3] = [
-        Self::ThinkingType,
-        Self::EnableThinking,
-        Self::ReasoningEffort,
-    ];
+    pub(crate) const ALL: [Self; 3] = [Self::ThinkingType, Self::EnableThinking, Self::ReasoningEffort];
 
     /// 没有声明 thinking_wire_format 时用的词形。
     pub(crate) const DEFAULT: Self = Self::ReasoningEffort;
@@ -36,9 +32,7 @@ impl ThinkingWireFormat {
     }
 
     pub(crate) fn from_wire_name(value: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|format| format.wire_name() == value)
+        Self::ALL.into_iter().find(|format| format.wire_name() == value)
     }
 
     pub(crate) fn names() -> String {

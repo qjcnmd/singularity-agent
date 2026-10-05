@@ -12,9 +12,7 @@ use crate::provider::contract::{
     finalize_provider_response, provider_content_filter_error, provider_response_validation_error,
 };
 use crate::provider::telemetry::ProviderStreamEvent;
-use crate::transport::stream::{
-    SseStreamDecoder, provider_stream_malformed_error, read_sse_stream,
-};
+use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
 use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
     ProviderReasoningReplay,
@@ -91,8 +89,7 @@ pub(crate) fn parse_openai_responses_response(
         .get("incomplete_details")
         .and_then(|details| details.get("reason"))
         .and_then(Value::as_str);
-    let length_truncated =
-        status == Some("incomplete") && incomplete_reason == Some("max_output_tokens");
+    let length_truncated = status == Some("incomplete") && incomplete_reason == Some("max_output_tokens");
     // 只有触达输出上限的不完整响应算正常截断，其余未完成一律失败。
     if status != Some("completed") && !length_truncated {
         if incomplete_reason == Some("content_filter") {
@@ -131,50 +128,32 @@ pub(crate) fn parse_openai_responses_response(
         };
         match item_type {
             "message" => {
-                let message =
-                    parse_responses_message_content(item.get("content")).map_err(|evidence| {
-                        provider_response_validation_error(
-                            "provider Responses message content was invalid",
-                            vec![evidence.to_string()],
-                        )
-                    })?;
+                let message = parse_responses_message_content(item.get("content")).map_err(|evidence| {
+                    provider_response_validation_error(
+                        "provider Responses message content was invalid",
+                        vec![evidence.to_string()],
+                    )
+                })?;
                 content.push_str(&message);
             }
             "function_call" => {
                 let arguments = parse_tool_call_arguments(item.get("arguments"))?;
                 tool_calls.push(ModelToolCall {
-                    tool_call_id: item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    tool_name: item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
+                    tool_call_id: item.get("call_id").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    tool_name: item.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
                     arguments,
                 });
             }
             "reasoning" => {
                 has_reasoning_item = true;
-                for summary in item
-                    .get("summary")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
+                for summary in item.get("summary").and_then(Value::as_array).into_iter().flatten() {
                     if summary.get("type").and_then(Value::as_str) == Some("summary_text")
                         && let Some(text) = summary.get("text").and_then(Value::as_str)
                     {
                         thinking.push_str(text);
                     }
                 }
-                if item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_none_or(str::is_empty)
-                {
+                if item.get("id").and_then(Value::as_str).is_none_or(str::is_empty) {
                     return Err(provider_response_validation_error(
                         "provider Responses reasoning item id was missing",
                         vec!["responses_reasoning_item_id_missing".to_string()],
@@ -269,10 +248,8 @@ pub(crate) fn openai_responses_input(
                 }));
             }
             ModelRole::Assistant => {
-                if let Some(ProviderReasoningReplay::Responses {
-                    items: replay_items,
-                    ..
-                }) = super::reasoning_replay_for(message, selection, provider_name)
+                if let Some(ProviderReasoningReplay::Responses { items: replay_items, .. }) =
+                    super::reasoning_replay_for(message, selection, provider_name)
                 {
                     items.extend(replay_items.iter().cloned());
                 } else {
@@ -318,11 +295,6 @@ fn responses_content(message: &ModelMessage) -> Value {
         return json!(message.content);
     }
     let mut parts = vec![json!({"type": "input_text", "text": message.content})];
-    parts.extend(
-        message
-            .images
-            .iter()
-            .map(|image| json!({"type": "input_image", "image_url": image})),
-    );
+    parts.extend(message.images.iter().map(|image| json!({"type": "input_image", "image_url": image})));
     json!(parts)
 }

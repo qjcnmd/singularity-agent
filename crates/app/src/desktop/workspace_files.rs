@@ -7,11 +7,7 @@ use singularity_core::workspace::is_ignored_directory;
 use singularity_protocol::FileCandidate;
 
 /// 查找路径中包含 query 的候选，取得调用者所需数量后停止遍历。
-pub(crate) fn search_files(
-    directory: &str,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<FileCandidate>, String> {
+pub(crate) fn search_files(directory: &str, query: &str, limit: usize) -> Result<Vec<FileCandidate>, String> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
         return Ok(Vec::new());
@@ -33,9 +29,7 @@ pub(crate) fn search_files(
                 // 其他读取失败必须上报，否则调用方会把漏项当成一次完整搜索。
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(format!(
-                        "workspace directory entry could not be read: {error}"
-                    ));
+                    return Err(format!("workspace directory entry could not be read: {error}"));
                 }
             }
         }

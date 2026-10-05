@@ -18,18 +18,14 @@ use crate::provider::telemetry::{
 };
 use crate::provider::{Provider, ProviderObserver};
 use crate::types::{
-    ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
-    ModelUsage,
+    ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse, ModelUsage,
 };
 
 /// 一次脚本化 attempt 的结果。
 #[derive(Debug, Clone)]
 pub enum ScriptedAttempt {
     /// 成功：返回给定 assistant 文本，可选携带真实 usage。
-    Success {
-        text: String,
-        usage: Option<ModelUsage>,
-    },
+    Success { text: String, usage: Option<ModelUsage> },
     /// 携带工具调用的成功 attempt。
     ToolCalls {
         text: String,
@@ -45,18 +41,12 @@ pub enum ScriptedAttempt {
 impl ScriptedAttempt {
     /// 无 usage 的成功 attempt。
     pub fn success(text: impl Into<String>) -> Self {
-        Self::Success {
-            text: text.into(),
-            usage: None,
-        }
+        Self::Success { text: text.into(), usage: None }
     }
 
     /// 携带真实 usage 的成功 attempt。
     pub fn success_with_usage(text: impl Into<String>, usage: ModelUsage) -> Self {
-        Self::Success {
-            text: text.into(),
-            usage: Some(usage),
-        }
+        Self::Success { text: text.into(), usage: Some(usage) }
     }
 
     /// 单个工具调用的成功 attempt（无可见文本）。
@@ -78,10 +68,7 @@ impl ScriptedAttempt {
 
     /// 已产生可见文本后失败的 attempt。
     pub fn visible_then_fail(text: impl Into<String>, error: ProviderError) -> Self {
-        Self::VisibleThenFail {
-            text: text.into(),
-            error,
-        }
+        Self::VisibleThenFail { text: text.into(), error }
     }
 
     /// 按错误种类构造失败 attempt。
@@ -118,16 +105,12 @@ impl ScriptedProvider {
     }
 
     fn next_attempt(&self) -> Result<ScriptedAttempt, ProviderError> {
-        self.attempts
-            .lock()
-            .expect("attempt script")
-            .pop_front()
-            .ok_or_else(|| {
-                ProviderError::new(
-                    ModelErrorKind::InvalidRequest,
-                    "ScriptedProvider ran out of scripted attempts",
-                )
-            })
+        self.attempts.lock().expect("attempt script").pop_front().ok_or_else(|| {
+            ProviderError::new(
+                ModelErrorKind::InvalidRequest,
+                "ScriptedProvider ran out of scripted attempts",
+            )
+        })
     }
 }
 
@@ -150,17 +133,10 @@ impl Provider for ScriptedProvider {
                 provider_name: "scripted".to_string(),
                 model_name: "scripted-model".to_string(),
             };
-            observer
-                .record_attempt(ProviderAttemptEvent::Started(started.clone()))
-                .await?;
-            self.requests
-                .lock()
-                .expect("request log")
-                .push(request.clone());
+            observer.record_attempt(ProviderAttemptEvent::Started(started.clone())).await?;
+            self.requests.lock().expect("request log").push(request.clone());
             match self.next_attempt().unwrap_or_else(ScriptedAttempt::Failure) {
-                ScriptedAttempt::Failure(error) => {
-                    Self::finish_error(error, started, observer).await
-                }
+                ScriptedAttempt::Failure(error) => Self::finish_error(error, started, observer).await,
                 ScriptedAttempt::VisibleThenFail { text, error } => {
                     if !text.is_empty() {
                         observer.on_stream(ProviderStreamEvent::OutputTextDelta { delta: text });
@@ -187,9 +163,12 @@ impl ScriptedProvider {
         observer: &mut dyn ProviderObserver,
     ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
         observer
-            .record_attempt(ProviderAttemptEvent::Finished(Box::new(
-                ProviderAttemptOccurrence::finished(started, 0, None, Some(&error)),
-            )))
+            .record_attempt(ProviderAttemptEvent::Finished(Box::new(ProviderAttemptOccurrence::finished(
+                started,
+                0,
+                None,
+                Some(&error),
+            ))))
             .await?;
         Err(error.into())
     }
@@ -206,14 +185,15 @@ impl ScriptedProvider {
         observer: &mut dyn ProviderObserver,
     ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
         if !text.is_empty() {
-            observer.on_stream(ProviderStreamEvent::OutputTextDelta {
-                delta: text.clone(),
-            });
+            observer.on_stream(ProviderStreamEvent::OutputTextDelta { delta: text.clone() });
         }
         observer
-            .record_attempt(ProviderAttemptEvent::Finished(Box::new(
-                ProviderAttemptOccurrence::finished(started, 0, usage.clone(), None),
-            )))
+            .record_attempt(ProviderAttemptEvent::Finished(Box::new(ProviderAttemptOccurrence::finished(
+                started,
+                0,
+                usage.clone(),
+                None,
+            ))))
             .await?;
         let mut message = ModelMessage::text(ModelRole::Assistant, text);
         message.tool_calls = calls;

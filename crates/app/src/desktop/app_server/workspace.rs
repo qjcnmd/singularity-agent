@@ -6,9 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use singularity_protocol::{
-    AppBootstrap, RedactedModelCatalog, RpcError, ThreadSummary, Workspace,
-};
+use singularity_protocol::{AppBootstrap, RedactedModelCatalog, RpcError, ThreadSummary, Workspace};
 
 use super::{AppServer, catalog_error, internal_error, invalid_request, workspace_error};
 use crate::desktop::workspace_files;
@@ -34,8 +32,7 @@ impl AppServer {
             .collect();
         let sessions_by_workspace = group_threads(&workspaces, threads).map_err(internal_error)?;
         Ok(AppBootstrap {
-            user_home: std::env::home_dir()
-                .and_then(|home| home.into_os_string().into_string().ok()),
+            user_home: std::env::home_dir().and_then(|home| home.into_os_string().into_string().ok()),
             session_phases,
             revision,
             workspaces,
@@ -45,18 +42,13 @@ impl AppServer {
     }
 
     pub fn add_workspace(&self, root: &str) -> Result<Workspace, RpcError> {
-        let workspace = self
-            .workspaces
-            .add(Path::new(root))
-            .map_err(workspace_error)?;
+        let workspace = self.workspaces.add(Path::new(root)).map_err(workspace_error)?;
         self.publish_app_snapshot();
         Ok(workspace)
     }
 
     pub fn rename_workspace(&self, workspace_id: &str, name: &str) -> Result<(), RpcError> {
-        self.workspaces
-            .rename(workspace_id, name)
-            .map_err(workspace_error)?;
+        self.workspaces.rename(workspace_id, name).map_err(workspace_error)?;
         self.publish_app_snapshot();
         Ok(())
     }
@@ -71,17 +63,18 @@ impl AppServer {
         // 它的规范 cwd 决定，忙不忙由它的运行阶段和待处理输入决定。生命周期临界区和启动
         // 占用共用同一条边界，检查和注销之间插不进新的占用。
         let lifecycle = self.lock_lifecycle();
-        let busy = self.lock_sessions().values().any(|slot| {
-            // 归属只做布尔判断，用的是和打开任务时同一条目录比较规则。
-            let belongs = matches!(
-                singularity_core::saved_directory_matches(
-                    &workspace.root,
-                    &slot.conversation().thread().cwd,
-                ),
-                Ok(true)
-            );
-            belongs && slot.conversation().is_occupied()
-        });
+        let busy =
+            self.lock_sessions().values().any(|slot| {
+                // 归属只做布尔判断，用的是和打开任务时同一条目录比较规则。
+                let belongs = matches!(
+                    singularity_core::saved_directory_matches(
+                        &workspace.root,
+                        &slot.conversation().thread().cwd,
+                    ),
+                    Ok(true)
+                );
+                belongs && slot.conversation().is_occupied()
+            });
         if busy {
             return Err(RpcError::new(
                 singularity_protocol::RpcErrorCode::WorkspaceBusy,
@@ -93,9 +86,7 @@ impl AppServer {
             .catalog
             .threads_in_workspace(draft_session_ids, &workspace.root)
             .map_err(catalog_error)?;
-        self.workspaces
-            .remove(workspace_id)
-            .map_err(workspace_error)?;
+        self.workspaces.remove(workspace_id).map_err(workspace_error)?;
         drop(lifecycle);
         self.publish_app_snapshot();
         Ok(removed_drafts)
@@ -108,13 +99,9 @@ impl AppServer {
             .ok_or_else(|| workspace_error(WorkspaceError::NotFound))
     }
 
-    pub fn skills(
-        &self,
-        workspace_id: &str,
-    ) -> Result<singularity_protocol::SkillCatalog, RpcError> {
+    pub fn skills(&self, workspace_id: &str) -> Result<singularity_protocol::SkillCatalog, RpcError> {
         let root = self.workspace(workspace_id)?.root;
-        let catalog =
-            singularity_core::skills::SkillCatalog::discover(Path::new(&root), &self.home);
+        let catalog = singularity_core::skills::SkillCatalog::discover(Path::new(&root), &self.home);
         Ok(singularity_protocol::SkillCatalog {
             skills: catalog
                 .skills
@@ -150,27 +137,19 @@ fn group_threads(
 ) -> Result<BTreeMap<String, Vec<ThreadSummary>>, String> {
     // 身份和它的分组桶在同一次构造里配好：匹配上的身份必然有自己的桶，
     // 不会出现「匹配到了却没有桶」的情况。
-    let mut grouped: BTreeMap<
-        String,
-        (singularity_core::CanonicalWorkspacePath, Vec<ThreadSummary>),
-    > = workspaces
-        .iter()
-        .map(|workspace| {
-            singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
-                .map(|identity| (workspace.workspace_id.clone(), (identity, Vec::new())))
-        })
-        .collect::<Result<_, _>>()?;
+    let mut grouped: BTreeMap<String, (singularity_core::CanonicalWorkspacePath, Vec<ThreadSummary>)> =
+        workspaces
+            .iter()
+            .map(|workspace| {
+                singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
+                    .map(|identity| (workspace.workspace_id.clone(), (identity, Vec::new())))
+            })
+            .collect::<Result<_, _>>()?;
     for thread in threads {
         let identity = singularity_core::CanonicalWorkspacePath::from_saved(&thread.cwd)?;
-        if let Some((_, bucket)) = grouped
-            .values_mut()
-            .find(|(workspace, _)| workspace == &identity)
-        {
+        if let Some((_, bucket)) = grouped.values_mut().find(|(workspace, _)| workspace == &identity) {
             bucket.push(thread);
         }
     }
-    Ok(grouped
-        .into_iter()
-        .map(|(workspace_id, (_, threads))| (workspace_id, threads))
-        .collect())
+    Ok(grouped.into_iter().map(|(workspace_id, (_, threads))| (workspace_id, threads)).collect())
 }

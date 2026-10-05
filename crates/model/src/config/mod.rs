@@ -17,9 +17,7 @@ pub(crate) use user::*;
 use super::{ModelErrorKind, ProviderApiProtocol, ProviderError};
 use crate::openai::wire::ThinkingWireFormat;
 
-use selection::{
-    OpenAiProviderConfig, SelectedModel, resolve_model_definition, resolve_model_selection,
-};
+use selection::{OpenAiProviderConfig, SelectedModel, resolve_model_definition, resolve_model_selection};
 pub use selection::{ParsedModelSelector, compose_model_selector, parse_model_selector};
 
 pub(crate) fn configuration_error(message: impl Into<String>, code: &'static str) -> ProviderError {
@@ -34,21 +32,14 @@ pub(crate) fn missing_provider_config_error(name: &str) -> ProviderError {
 }
 
 pub(crate) fn missing_provider_auth_error() -> ProviderError {
-    ProviderError::new(
-        ModelErrorKind::AuthError,
-        "required provider authentication is missing".to_string(),
-    )
-    .with_code("provider_auth_missing")
+    ProviderError::new(ModelErrorKind::AuthError, "required provider authentication is missing".to_string())
+        .with_code("provider_auth_missing")
 }
 
 pub(crate) fn validate_provider_value(value: &str, name: &str) -> Result<(), ProviderError> {
     let invalid_boundary_whitespace = value.chars().next().is_some_and(char::is_whitespace)
         || value.chars().next_back().is_some_and(char::is_whitespace);
-    if value
-        .chars()
-        .any(|character| matches!(character, '\r' | '\n' | '\0'))
-        || invalid_boundary_whitespace
-    {
+    if value.chars().any(|character| matches!(character, '\r' | '\n' | '\0')) || invalid_boundary_whitespace {
         return Err(configuration_error(
             format!(
                 "invalid model configuration: {name} contains forbidden control characters or boundary whitespace"

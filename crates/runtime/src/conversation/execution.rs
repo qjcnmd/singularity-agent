@@ -28,9 +28,7 @@ impl Conversation {
     ) -> Result<TurnOutcome, ConversationError> {
         loop {
             let outcome = self.run_single_turn(input, sink).await?;
-            if outcome.manually_stopped
-                || outcome.turn_status == singularity_protocol::TurnStatus::Failed
-            {
+            if outcome.manually_stopped || outcome.turn_status == singularity_protocol::TurnStatus::Failed {
                 return Ok(outcome);
             }
             if self.lock_state().pending_input.is_none() {
@@ -66,10 +64,7 @@ impl Conversation {
             let mut state = conversation.lock_state();
             let current = match input {
                 TurnInput::Submitted(request) => request,
-                TurnInput::Queued => state
-                    .pending_input
-                    .take()
-                    .expect("reservation owns the queued input"),
+                TurnInput::Queued => state.pending_input.take().expect("reservation owns the queued input"),
             };
             controls.lock_inbox().open();
             state.turn = TurnLifecycle::Running(Arc::clone(&controls));

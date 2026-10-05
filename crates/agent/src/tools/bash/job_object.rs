@@ -21,8 +21,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
@@ -71,8 +71,7 @@ impl JobObject {
     /// 绑定失败意味着这个进程不在本次作业内（例如已被一个不允许嵌套的祖先作业占用），
     /// 作业终止对它就是空操作，调用方必须改成单独终止它，不能假设绑定一定成功。
     fn assign(&self, process: HANDLE) -> io::Result<()> {
-        let assigned =
-            unsafe { AssignProcessToJobObject(self.handle.as_raw_handle() as HANDLE, process) };
+        let assigned = unsafe { AssignProcessToJobObject(self.handle.as_raw_handle() as HANDLE, process) };
         if assigned == 0 {
             return Err(last_os_error("AssignProcessToJobObject"));
         }
@@ -124,9 +123,7 @@ impl ManagedChild {
             self.child.kill()
         };
         if let Err(error) = terminated {
-            failures.push(format!(
-                "failed to terminate the command process tree: {error}"
-            ));
+            failures.push(format!("failed to terminate the command process tree: {error}"));
         }
         let deadline = Instant::now() + RECLAIM_GRACE;
         loop {
@@ -160,11 +157,7 @@ impl ManagedChild {
 ///
 /// 命令行转义、环境与管道仍交给 `std::process::Command`（稳定 `CommandExt` 不提供创建
 /// 时的作业属性，见 `PROC_THREAD_ATTRIBUTE_JOB_LIST`）：这些语义只有它实现得完整。
-pub(crate) fn spawn_in_job(
-    shell: &str,
-    script: &str,
-    cwd: &std::path::Path,
-) -> io::Result<ManagedChild> {
+pub(crate) fn spawn_in_job(shell: &str, script: &str, cwd: &std::path::Path) -> io::Result<ManagedChild> {
     let job = JobObject::new()?;
     let mut command = Command::new(shell);
     command
@@ -177,11 +170,7 @@ pub(crate) fn spawn_in_job(
     let child = command.spawn()?;
     let process = child.as_raw_handle() as HANDLE;
     // 回收主体先建出来，归属结果初始为 false，只有 assign 成功才改成 true。
-    let mut started = ManagedChild {
-        child,
-        job,
-        owned_by_job: false,
-    };
+    let mut started = ManagedChild { child, job, owned_by_job: false };
     let assigned = started.job.assign(process);
     if assigned.is_ok() {
         started.owned_by_job = true;
@@ -210,10 +199,7 @@ fn attach_reclaim_failures(primary: io::Error, failures: &[String]) -> io::Error
     if failures.is_empty() {
         return primary;
     }
-    io::Error::new(
-        primary.kind(),
-        format!("{primary}; {}", failures.join("; ")),
-    )
+    io::Error::new(primary.kind(), format!("{primary}; {}", failures.join("; ")))
 }
 
 /// 打开刚创建的子进程的初始线程；句柄归本边界所有，随 `OwnedHandle` 在恢复之后立刻关闭。
@@ -275,8 +261,5 @@ fn enumeration_end_error(operation: &str) -> Option<io::Error> {
     if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
         return None;
     }
-    Some(io::Error::new(
-        error.kind(),
-        format!("{operation}: {error}"),
-    ))
+    Some(io::Error::new(error.kind(), format!("{operation}: {error}")))
 }

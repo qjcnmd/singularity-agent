@@ -32,11 +32,7 @@ fn wait_pipe_readable(handle: HANDLE, timeout: Duration) -> io::Result<bool> {
             &mut available,
             core::ptr::null_mut(),
         ) != 0;
-        if ok {
-            Ok(available)
-        } else {
-            Err(GetLastError())
-        }
+        if ok { Ok(available) } else { Err(GetLastError()) }
     };
     match peek_result {
         Ok(available) if available > 0 => return Ok(true),
@@ -93,10 +89,8 @@ pub(super) fn pump_output(
             // 不为被中断或异常关闭的管道合成替换字节。
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                let _ = sender.send(Err(io::Error::new(
-                    error.kind(),
-                    format!("failed to read {stream}: {error}"),
-                )));
+                let _ = sender
+                    .send(Err(io::Error::new(error.kind(), format!("failed to read {stream}: {error}"))));
                 break;
             }
         }
@@ -158,7 +152,8 @@ impl Utf8Decoder {
 /// 把解码后的文本追加到输出，只留可见字符：制表符、换行和 ANSI ESC 留给客户端
 /// 渲染，其余控制字符一律剔除（包括 CRLF 里的 \r，行尾由换行重建）。
 fn push_visible(output: &mut String, text: &str) {
-    output.extend(text.chars().filter(|character| {
-        matches!(character, '\t' | '\n' | '\u{1b}') || (*character as u32) > 0x1f
-    }));
+    output.extend(
+        text.chars()
+            .filter(|character| matches!(character, '\t' | '\n' | '\u{1b}') || (*character as u32) > 0x1f),
+    );
 }

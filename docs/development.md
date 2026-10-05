@@ -40,9 +40,20 @@ cargo test -p singularity_runtime --lib --locked terminal_write_failure_keeps_th
 
 将示例中的包名和过滤条件换成受影响的行为，确认实际选中了用例。只删测试时确认剩余测试可编译，并运行受影响的保留用例；不因此重跑无关模块。普通文档检查最终内容、链接与 `git diff --check`。CI 和发布步骤由 `.github/workflows` 维护，不作为日常修改的默认验证清单。
 
+## 代码排版
+
+Rust 使用仓库根目录的 `rustfmt.toml`，行宽上限为 110 字符，调用和链式表达式的阈值为 90，结构体字面量的阈值为 40。简单调用和构造器优先单行；较长链式表达式、多字段构造器及复杂嵌套分行展示。
+
+在仓库根目录格式化并检查：
+
+```powershell
+cargo fmt --all
+cargo fmt --all -- --check
+```
+
 ## 桌面 E2E
 
-需要完整桌面回归时，使用已构建的 production 资源，安装 PowerShell 7 后在仓库根目录运行以下示例。日常修改按上一节选择检查范围，不默认执行这组模型、扩展与取消场景：
+需要完整桌面回归时，使用已构建的 production 资源，安装 PowerShell 7 后在仓库根目录运行以下示例。日常修改按[检查](#检查)选择检查范围，不默认执行这组模型、扩展与取消场景：
 
 ```powershell
 $env:SINGULARITY_HOME = "$PWD/outputs/desktop-e2e/home"

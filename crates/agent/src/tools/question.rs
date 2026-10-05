@@ -23,9 +23,7 @@ impl QuestionArgs {
                 || question.question.trim().is_empty()
                 || !ids.insert(&question.id)
             {
-                return Err(error_result(
-                    "Each question needs a unique, nonempty id and question text",
-                ));
+                return Err(error_result("Each question needs a unique, nonempty id and question text"));
             }
             let mut labels = std::collections::HashSet::new();
             if question
@@ -33,9 +31,7 @@ impl QuestionArgs {
                 .iter()
                 .any(|option| option.label.trim().is_empty() || !labels.insert(&option.label))
             {
-                return Err(error_result(
-                    "Option labels must be nonempty and unique within each question",
-                ));
+                return Err(error_result("Option labels must be nonempty and unique within each question"));
             }
         }
         Ok(self)

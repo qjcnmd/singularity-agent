@@ -35,12 +35,7 @@ impl JsonlRenderer {
 
     /// 写入终态 summary；字段的省略与空值规则由协议类型决定。
     /// 已发生输出故障时不再追加，避免与残留的半行拼接。
-    pub fn emit_summary(
-        &mut self,
-        status: TurnStatus,
-        usage: Option<TurnModelUsage>,
-        truncated: bool,
-    ) {
+    pub fn emit_summary(&mut self, status: TurnStatus, usage: Option<TurnModelUsage>, truncated: bool) {
         let summary = TerminalSummary::new(self.thread_id.as_deref(), status, usage, truncated);
         self.write_line(&summary.to_line());
     }
@@ -50,8 +45,7 @@ impl JsonlRenderer {
         if self.output_error.is_some() {
             return;
         }
-        let mut bytes =
-            serde_json::to_vec(line).expect("CLI protocol values are JSON serializable");
+        let mut bytes = serde_json::to_vec(line).expect("CLI protocol values are JSON serializable");
         bytes.push(b'\n');
         if let Err(error) = self.out.write_all(&bytes).and_then(|()| self.out.flush()) {
             self.output_error = Some(error.to_string());

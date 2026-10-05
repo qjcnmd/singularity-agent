@@ -31,12 +31,8 @@ fn an_accepted_stop_survives_a_terminal_write_failure() {
                 && !blocked
             {
                 // 真实失败已经确定：接受停止并让终态记录写不进去。
-                conversation
-                    .steer("cancelled steer")
-                    .expect("steer is accepted");
-                conversation
-                    .submit_follow_up("must stay queued")
-                    .expect("a queued follow-up is accepted");
+                conversation.steer("cancelled steer").expect("steer is accepted");
+                conversation.submit_follow_up("must stay queued").expect("a queued follow-up is accepted");
                 *queued.lock().unwrap() = conversation.snapshot().pending_input;
                 conversation.abort().expect("the stop is accepted");
                 let mut readonly = permissions.clone();
@@ -51,17 +47,9 @@ fn an_accepted_stop_survives_a_terminal_write_failure() {
 
     assert!(blocked);
     assert!(
-        matches!(
-            result,
-            Err(ConversationError::Turn(
-                TurnRunError::Terminalization { .. }
-            ))
-        ),
+        matches!(result, Err(ConversationError::Turn(TurnRunError::Terminalization { .. }))),
         "a terminal write failure keeps its own error shape: {result:?}"
     );
     let pending = conversation.snapshot().pending_input.unwrap();
-    assert_eq!(
-        pending.control_id,
-        queued.lock().unwrap().as_ref().unwrap().control_id
-    );
+    assert_eq!(pending.control_id, queued.lock().unwrap().as_ref().unwrap().control_id);
 }

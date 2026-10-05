@@ -26,8 +26,8 @@ mod history;
 mod thread_catalog;
 
 pub use conversation::{
-    Conversation, ConversationControlError, ConversationError, ConversationSnapshot,
-    FollowUpPromotion, OperationReservation, OperationResult, validate_input,
+    Conversation, ConversationControlError, ConversationError, ConversationSnapshot, FollowUpPromotion,
+    OperationReservation, OperationResult, validate_input,
 };
 pub use error::{TurnFailureCause, TurnRunError};
 pub use runner::{TurnOutcome, TurnRunner};

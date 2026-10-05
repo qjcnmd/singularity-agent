@@ -62,8 +62,7 @@ pub fn create_new_file(path: &std::path::Path) -> std::io::Result<std::fs::File>
 
 /// 通过系统文件 API 创建应用数据目录，允许目录链接和 junction。
 pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
-    std::fs::create_dir_all(path)
-        .map_err(|error| format!("failed to create {}: {error}", path.display()))
+    std::fs::create_dir_all(path).map_err(|error| format!("failed to create {}: {error}", path.display()))
 }
 
 /// 用「临时文件 + 原子替换」把字节写入目标路径：先在同一个目录下写临时文件并 sync_all，再做
@@ -89,10 +88,7 @@ pub fn atomic_replace_workspace_file(path: &std::path::Path, bytes: &[u8]) -> st
         path,
         bytes,
         |temporary| {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(temporary)?;
+            let file = std::fs::OpenOptions::new().write(true).create_new(true).open(temporary)?;
             if let Some(permissions) = &permissions {
                 file.set_permissions(permissions.clone())?;
             }
@@ -111,10 +107,7 @@ fn atomic_write(
     use std::io::Write;
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     // 临时名只需在目标目录中唯一，不依赖目标文件名的字符编码。
-    let temporary = parent.join(format!(
-        ".singularity-tmp-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let temporary = parent.join(format!(".singularity-tmp-{}", uuid::Uuid::new_v4().simple()));
     let result = (|| -> std::io::Result<()> {
         let mut handle = create(&temporary)?;
         handle.write_all(bytes)?;
@@ -130,11 +123,7 @@ fn atomic_write(
 
 /// 用 MoveFileExW 提交同卷临时文件；创建模式不允许覆盖目标。
 #[allow(unsafe_code)]
-fn atomic_move(
-    from: &std::path::Path,
-    to: &std::path::Path,
-    replace_existing: bool,
-) -> std::io::Result<()> {
+fn atomic_move(from: &std::path::Path, to: &std::path::Path, replace_existing: bool) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,

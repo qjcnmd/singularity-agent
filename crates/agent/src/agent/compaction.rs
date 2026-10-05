@@ -48,11 +48,10 @@ impl Agent {
         let keep_recent_tokens =
             (self.model.context_window() as f64 * COMPACTION_RETAIN_RATIO).floor() as u64;
         // 历史里没有可替换的前缀（内容太少）：本次无需摘要。
-        let prefix =
-            Self::with_context(&self.session, &mut self.context, move |session, context| {
-                Ok(context.compaction_prefix(&lock_writer(session), keep_recent_tokens))
-            })
-            .await?;
+        let prefix = Self::with_context(&self.session, &mut self.context, move |session, context| {
+            Ok(context.compaction_prefix(&lock_writer(session), keep_recent_tokens))
+        })
+        .await?;
         let Some(prefix) = prefix else {
             return Ok(pruned);
         };
@@ -82,10 +81,7 @@ impl Agent {
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        with_writer_async(&self.session, move |writer| {
-            writer.append_compaction_with_id(&id, entry)
-        })
-        .await?;
+        with_writer_async(&self.session, move |writer| writer.append_compaction_with_id(&id, entry)).await?;
         Self::with_context(&self.session, &mut self.context, |session, context| {
             context.rebuild(&lock_writer(session));
             Ok(())
@@ -113,9 +109,7 @@ impl Agent {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<bool> {
-        let changed = self
-            .compact_context(&self.request_definitions(), on_event, cancellation)
-            .await?;
+        let changed = self.compact_context(&self.request_definitions(), on_event, cancellation).await?;
         if changed {
             self.refresh_instructions(on_event).await?;
             self.refresh_tools(on_event, cancellation).await;
@@ -141,8 +135,7 @@ impl Agent {
                 self.request_definitions()
             }
         };
-        self.compact_context(&definitions, on_event, cancellation)
-            .await?;
+        self.compact_context(&definitions, on_event, cancellation).await?;
         Ok(())
     }
 }

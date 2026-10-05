@@ -17,19 +17,11 @@ pub(crate) fn convert(result: CallToolResult) -> McpToolResult {
         match block {
             ContentBlock::Text(content) => text.push(content.text),
             ContentBlock::Image(content) => {
-                images.push(format!(
-                    "data:{};base64,{}",
-                    content.mime_type, content.data
-                ));
+                images.push(format!("data:{};base64,{}", content.mime_type, content.data));
             }
             ContentBlock::Resource(content) => match content.resource {
                 ResourceContents::TextResourceContents { text: content, .. } => text.push(content),
-                ResourceContents::BlobResourceContents {
-                    uri,
-                    mime_type,
-                    blob,
-                    ..
-                } => match mime_type {
+                ResourceContents::BlobResourceContents { uri, mime_type, blob, .. } => match mime_type {
                     Some(mime) if mime.starts_with("image/") => {
                         images.push(format!("data:{mime};base64,{blob}"));
                     }

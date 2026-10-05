@@ -35,11 +35,7 @@ impl CanonicalWorkspacePath {
     fn from_native(native: PathBuf) -> Self {
         let display = display_path(&native);
         let comparison_key = display.to_lowercase();
-        Self {
-            native,
-            display,
-            comparison_key,
-        }
+        Self { native, display, comparison_key }
     }
 
     /// 调用文件系统 API 时使用的规范原生路径。
@@ -71,23 +67,13 @@ pub fn saved_directory_matches(left: &str, right: &str) -> Result<bool, String> 
 /// 把一个已存在的目录收敛成唯一的 Workspace 路径身份。
 pub fn canonicalize_workspace(path: impl AsRef<Path>) -> Result<CanonicalWorkspacePath, String> {
     let requested = path.as_ref();
-    let native = std::fs::canonicalize(requested).map_err(|error| {
-        format!(
-            "workspace directory is unavailable ({}): {error}",
-            requested.display()
-        )
-    })?;
+    let native = std::fs::canonicalize(requested)
+        .map_err(|error| format!("workspace directory is unavailable ({}): {error}", requested.display()))?;
     let metadata = std::fs::metadata(&native).map_err(|error| {
-        format!(
-            "workspace directory cannot be inspected ({}): {error}",
-            requested.display()
-        )
+        format!("workspace directory cannot be inspected ({}): {error}", requested.display())
     })?;
     if !metadata.is_dir() {
-        return Err(format!(
-            "workspace path is not a directory: {}",
-            requested.display()
-        ));
+        return Err(format!("workspace path is not a directory: {}", requested.display()));
     }
     Ok(CanonicalWorkspacePath::from_native(native))
 }
@@ -102,10 +88,7 @@ pub(crate) fn project_root(cwd: &Path) -> Result<PathBuf, String> {
             Ok(_) => return Ok(ancestor.to_path_buf()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(format!(
-                    "project_root_marker_read_failed:{}:{error}",
-                    marker.display()
-                ));
+                return Err(format!("project_root_marker_read_failed:{}:{error}", marker.display()));
             }
         }
     }

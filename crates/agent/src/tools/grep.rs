@@ -64,10 +64,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let regex = match Regex::new(&args.pattern) {
         Ok(regex) => regex,
         Err(error) => {
-            return error_result(format!(
-                "invalid regular expression {:?}: {error}",
-                args.pattern
-            ));
+            return error_result(format!("invalid regular expression {:?}: {error}", args.pattern));
         }
     };
     let include_regex = match include {
@@ -88,10 +85,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         // include 过滤：相对路径或文件名任一命中，这个文件就保留。
         if let Some(glob) = &include_regex {
             let rel_path = display_path(&relative);
-            let base_name = relative
-                .file_name()
-                .map(|name| name.to_string_lossy())
-                .unwrap_or_default();
+            let base_name = relative.file_name().map(|name| name.to_string_lossy()).unwrap_or_default();
             if !glob.is_match(&rel_path) && !glob.is_match(base_name.as_ref()) {
                 return ControlFlow::Continue(());
             }
@@ -145,9 +139,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         output = format!(
             "no matches for {:?} under {path}{}",
             args.pattern,
-            include
-                .map(|include| format!(" (include: {include})"))
-                .unwrap_or_default()
+            include.map(|include| format!(" (include: {include})")).unwrap_or_default()
         );
     }
     if let Some(aborted) = ctx.abort_if_cancelled() {

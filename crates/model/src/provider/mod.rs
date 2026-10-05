@@ -29,10 +29,7 @@ pub enum ProviderCallError {
 
 impl From<std::io::Error> for ProviderCallError {
     fn from(storage: std::io::Error) -> Self {
-        Self::Recording {
-            execution: None,
-            storage,
-        }
+        Self::Recording { execution: None, storage }
     }
 }
 

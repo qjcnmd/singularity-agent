@@ -35,12 +35,8 @@ impl fmt::Debug for ProviderReasoningReplay {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = formatter.debug_struct("ProviderReasoningReplay");
         match self {
-            Self::Chat {
-                reasoning_content, ..
-            } => {
-                debug
-                    .field("protocol", &"chat")
-                    .field("reasoning_content_len", &reasoning_content.len());
+            Self::Chat { reasoning_content, .. } => {
+                debug.field("protocol", &"chat").field("reasoning_content_len", &reasoning_content.len());
             }
             Self::Responses { items, .. } => {
                 debug
@@ -73,16 +69,8 @@ impl ProviderReasoningReplay {
 
     fn model_identity(&self) -> (&str, &str) {
         match self {
-            Self::Chat {
-                provider_name,
-                model_name,
-                ..
-            }
-            | Self::Responses {
-                provider_name,
-                model_name,
-                ..
-            } => (provider_name, model_name),
+            Self::Chat { provider_name, model_name, .. }
+            | Self::Responses { provider_name, model_name, .. } => (provider_name, model_name),
         }
     }
 }

@@ -38,10 +38,9 @@ pub(crate) fn parse_usage(
         return ModelUsage::default();
     };
     let count = |value: Option<&Value>| value.and_then(Value::as_u64);
-    let (Some(input_tokens), Some(output_tokens)) = (
-        count(usage.get(input_field)),
-        count(usage.get(output_field)),
-    ) else {
+    let (Some(input_tokens), Some(output_tokens)) =
+        (count(usage.get(input_field)), count(usage.get(output_field)))
+    else {
         return ModelUsage::default();
     };
     ModelUsage {

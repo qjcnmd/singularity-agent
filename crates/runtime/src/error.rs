@@ -16,9 +16,7 @@ pub(crate) fn provider_turn_cause(kind: ModelErrorKind) -> TurnFailureCause {
         NetworkError => TurnFailureCause::ProviderNetwork,
         Timeout => TurnFailureCause::ProviderTimeout,
         AuthError => TurnFailureCause::ProviderAuth,
-        InvalidRequest | JsonSchemaViolation | ContentFilter => {
-            TurnFailureCause::ProviderValidation
-        }
+        InvalidRequest | JsonSchemaViolation | ContentFilter => TurnFailureCause::ProviderValidation,
         ProviderOverloaded => TurnFailureCause::ProviderOverloaded,
         Cancelled => TurnFailureCause::ProviderCancelled,
         ContextLengthExceeded => TurnFailureCause::ProviderContextOverflow,

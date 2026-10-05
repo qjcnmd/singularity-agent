@@ -11,8 +11,7 @@ use crate::agent::AgentError;
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
 use crate::message::{AgentMessage, ItemScope};
 use crate::session::{
-    LedgerRecord, RequestDefinitions, SessionError, SessionWriter, append_record_async,
-    with_writer_async,
+    LedgerRecord, RequestDefinitions, SessionError, SessionWriter, append_record_async, with_writer_async,
 };
 
 /// 声明的输出预算同时受模型上限、请求用途和窗口余量约束。安全余量弥补启发式
@@ -24,13 +23,8 @@ pub(crate) fn output_budget_tokens(
 ) -> u32 {
     const OUTPUT_SAFETY_TOKENS: u64 = 4_096;
     let window = model.context_window();
-    let room = window
-        .saturating_sub(input_tokens)
-        .saturating_sub(OUTPUT_SAFETY_TOKENS.min(window / 20));
-    model
-        .max_output_tokens
-        .min(requested_output_tokens)
-        .min(room as u32)
+    let room = window.saturating_sub(input_tokens).saturating_sub(OUTPUT_SAFETY_TOKENS.min(window / 20));
+    model.max_output_tokens.min(requested_output_tokens).min(room as u32)
 }
 
 /// 本次执行的请求次数与已上报用量。
@@ -67,13 +61,8 @@ impl RequestAttempt<'_> {
         };
         let items = message.public_items(&self.result_entry_id, ItemScope::Completion);
         if !items.is_empty() {
-            append_record_async(
-                self.writer,
-                LedgerRecord::AssistantInterrupted {
-                    items: items.clone(),
-                },
-            )
-            .await?;
+            append_record_async(self.writer, LedgerRecord::AssistantInterrupted { items: items.clone() })
+                .await?;
         }
         (self.on_event)(AgentEvent::MessageFinished {
             message_id: self.result_entry_id.clone(),
@@ -111,11 +100,7 @@ impl From<ProviderCallError> for AgentError {
 }
 
 /// 指数退避；Provider 明确返回 Retry-After 时以它的建议为准。
-fn retry_delay_ms(
-    base_delay_ms: u64,
-    attempt: u32,
-    retry_after: Option<std::time::Duration>,
-) -> u64 {
+fn retry_delay_ms(base_delay_ms: u64, attempt: u32, retry_after: Option<std::time::Duration>) -> u64 {
     if let Some(retry_after) = retry_after {
         return singularity_core::duration_millis(retry_after);
     }
@@ -163,10 +148,7 @@ pub(crate) async fn execute_request(
             visible_text: String::new(),
             visible_reasoning: String::new(),
         };
-        let error = match provider
-            .complete_stream(request, cancellation, &mut attempt)
-            .await
-        {
+        let error = match provider.complete_stream(request, cancellation, &mut attempt).await {
             Ok(response) => return Ok((response, attempt.result_entry_id)),
             Err(error) => AgentError::from(error),
         };
@@ -191,16 +173,10 @@ pub(crate) async fn execute_request(
         }
         // 会话写入已失败时不再写中断显示记录。
         if purpose == singularity_protocol::RequestPurpose::Generation
-            && !matches!(
-                error,
-                AgentError::Session(_) | AgentError::FailureRecording { .. }
-            )
+            && !matches!(error, AgentError::Session(_) | AgentError::FailureRecording { .. })
             && let Err(storage) = attempt.finish_interrupted().await
         {
-            return Err(AgentError::FailureRecording {
-                execution: Box::new(error),
-                storage,
-            });
+            return Err(AgentError::FailureRecording { execution: Box::new(error), storage });
         }
         return Err(error);
     }
@@ -234,10 +210,7 @@ impl ProviderObserver for RequestAttempt<'_> {
             let mut observation = match event {
                 ProviderAttemptEvent::Started(started) => {
                     // 持久化线程只接收轨迹定义，不复制对话和私有续接材料。
-                    request_head = Some((
-                        self.definitions.clone(),
-                        self.request.model_preferences.clone(),
-                    ));
+                    request_head = Some((self.definitions.clone(), self.request.model_preferences.clone()));
                     singularity_protocol::RequestObservation {
                         request_id: self.attempt_id.clone(),
                         request_head: None,
@@ -258,10 +231,7 @@ impl ProviderObserver for RequestAttempt<'_> {
                     }
                 }
                 ProviderAttemptEvent::Finished(occurrence) => {
-                    let usage = occurrence
-                        .usage
-                        .as_ref()
-                        .filter(|usage| usage.usage_present);
+                    let usage = occurrence.usage.as_ref().filter(|usage| usage.usage_present);
                     if let Some(usage) = usage {
                         self.accounting.usage.merge(usage);
                     }

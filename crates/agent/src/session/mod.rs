@@ -34,9 +34,7 @@ pub type SessionWriter = std::sync::Arc<std::sync::Mutex<SessionManager>>;
 /// 加锁取回会话写者。锁中毒意味着共享会话状态已经损坏，直接 panic 停止，
 /// 不做静默恢复（与 inbox::lock_inbox 同一纪律）。
 pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionManager> {
-    writer
-        .lock()
-        .expect("session writer lock poisoned (fail-stop)")
+    writer.lock().expect("session writer lock poisoned (fail-stop)")
 }
 
 /// 在线程池追加一条持久记录；调用方 await 成功后才能发布依赖它的事件。

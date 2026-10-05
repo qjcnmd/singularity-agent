@@ -12,8 +12,7 @@ use crate::message::AgentMessage;
 
 use super::file::{ParsedSession, TailPolicy, parse_session_file, rewrite_file};
 use super::format::{
-    CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError, SessionHeader,
-    SessionMetadata,
+    CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError, SessionHeader, SessionMetadata,
 };
 
 /// JSONL 会话管理器。会话是严格的线性序列，entries 的物理顺序就是事实来源的顺序；
@@ -37,9 +36,7 @@ pub struct SessionData {
 
 impl std::fmt::Debug for SessionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionManager")
-            .field("data", &self.data)
-            .finish()
+        f.debug_struct("SessionManager").field("data", &self.data).finish()
     }
 }
 
@@ -66,8 +63,7 @@ impl std::fmt::Debug for SessionData {
 impl SessionManager {
     /// 新建会话：文件名与 header id 都用调用方指定的 UUID，创建时间在写入文件头时生成。
     pub fn create_with_id(cwd: &Path, sessions_dir: &Path, session_id: &str) -> Result<Self> {
-        let cwd =
-            singularity_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
+        let cwd = singularity_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
         let cwd_display = cwd.display().to_string();
         std::fs::create_dir_all(sessions_dir)?;
         let file = sessions_dir.join(super::session_file_name(session_id));
@@ -92,12 +88,8 @@ impl SessionManager {
     /// 调用方须在执行入口持有该会话的写入所有权。
     pub fn open_existing(path: &Path, expected_id: &str) -> Result<Self> {
         let file = path.to_path_buf();
-        let data =
-            SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite, Some(expected_id))?;
-        Ok(Self {
-            data,
-            append_error: None,
-        })
+        let data = SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite, Some(expected_id))?;
+        Ok(Self { data, append_error: None })
     }
 }
 
@@ -106,9 +98,7 @@ impl SessionData {
     pub fn image_directory(&self) -> PathBuf {
         let parent = self.file.parent().expect("session has a parent directory");
         let root = if parent.file_name().is_some_and(|name| name == "archived") {
-            parent
-                .parent()
-                .expect("archive belongs to sessions directory")
+            parent.parent().expect("archive belongs to sessions directory")
         } else {
             parent
         };
@@ -127,10 +117,7 @@ impl SessionData {
             .flat_map(AgentMessage::images)
             .find(|image| image.id == image_id)
             .ok_or_else(|| SessionError::InvalidSession("图片不在该任务历史中。".into()))?;
-        Ok(crate::image::load_image(
-            &self.image_directory(),
-            attachment,
-        )?)
+        Ok(crate::image::load_image(&self.image_directory(), attachment)?)
     }
 
     /// 为只读扫描（列表、摘要、分页投影）打开既有会话文件。
@@ -142,18 +129,9 @@ impl SessionData {
     }
 
     /// 两条打开路径共用解析与索引；写打开时修复尾行。
-    fn open_parsed(
-        path: &Path,
-        tail_policy: TailPolicy,
-        expected_id: Option<&str>,
-    ) -> Result<Self> {
+    fn open_parsed(path: &Path, tail_policy: TailPolicy, expected_id: Option<&str>) -> Result<Self> {
         let file = path.to_path_buf();
-        let ParsedSession {
-            header,
-            cwd,
-            entries,
-            needs_repair,
-        } = parse_session_file(&file, tail_policy)?;
+        let ParsedSession { header, cwd, entries, needs_repair } = parse_session_file(&file, tail_policy)?;
         if let Some(expected_id) = expected_id {
             verify_header_id(&header.id, expected_id)?;
         }
@@ -222,42 +200,29 @@ impl SessionManager {
     pub(crate) fn append_model_request(
         &mut self,
         observation: singularity_protocol::RequestObservation,
-        request: Option<(
-            super::RequestDefinitions,
-            singularity_protocol::RequestPreferences,
-        )>,
+        request: Option<(super::RequestDefinitions, singularity_protocol::RequestPreferences)>,
     ) -> Result<Option<Box<singularity_protocol::ModelRequestSnapshot>>> {
         let (context, head) = if let Some((definitions, model_preferences)) = request {
             let id = match self.latest_request_definitions() {
                 Some((id, previous)) if previous == &definitions => id.to_owned(),
-                _ => self.append_record(LedgerRecord::RequestDefinitions {
-                    definitions: definitions.clone(),
-                })?,
+                _ => {
+                    self.append_record(LedgerRecord::RequestDefinitions { definitions: definitions.clone() })?
+                }
             };
             let head = definitions.snapshot(&id, &model_preferences);
             (
-                Some(Box::new(super::request::RequestContext {
-                    definitions: id,
-                    model_preferences,
-                })),
+                Some(Box::new(super::request::RequestContext { definitions: id, model_preferences })),
                 Some(head),
             )
         } else {
             (None, None)
         };
-        self.append_record(LedgerRecord::ModelRequest {
-            observation,
-            context,
-        })?;
+        self.append_record(LedgerRecord::ModelRequest { observation, context })?;
         Ok(head)
     }
 
     /// 追加执行器为本次回答或工具结果预分配身份的消息。
-    pub(crate) fn append_message_with_id(
-        &mut self,
-        id: &str,
-        message: AgentMessage,
-    ) -> Result<String> {
+    pub(crate) fn append_message_with_id(&mut self, id: &str, message: AgentMessage) -> Result<String> {
         self.append_entry(SessionEntry::Message {
             id: id.to_string(),
             timestamp: now_iso(),
@@ -270,9 +235,7 @@ impl SessionManager {
         if let Some(error) = &self.append_error {
             return Err(SessionError::Io(std::io::Error::new(
                 error.kind(),
-                format!(
-                    "previous session append failed; reopen the writer to repair its tail: {error}"
-                ),
+                format!("previous session append failed; reopen the writer to repair its tail: {error}"),
             )));
         }
         let id = entry.id().to_string();

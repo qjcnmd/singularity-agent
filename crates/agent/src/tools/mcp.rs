@@ -29,9 +29,7 @@ pub(super) async fn execute(
             }) {
                 Ok(image) => execution.images.push(image),
                 Err(error) => {
-                    execution
-                        .content
-                        .push_str(&format!("\n\nMCP 图片无效：{error}"));
+                    execution.content.push_str(&format!("\n\nMCP 图片无效：{error}"));
                     execution.is_error = true;
                 }
             }

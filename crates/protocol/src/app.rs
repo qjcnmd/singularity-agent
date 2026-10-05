@@ -292,11 +292,7 @@ pub struct RpcError {
 impl RpcError {
     /// 创建带恢复建议的工作台错误。未提交的草稿由前端自己保存，
     /// 错误载荷里不再回传用户输入。
-    pub fn new(
-        code: RpcErrorCode,
-        message: impl Into<String>,
-        recovery: impl Into<String>,
-    ) -> Self {
+    pub fn new(code: RpcErrorCode, message: impl Into<String>, recovery: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),

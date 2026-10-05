@@ -68,39 +68,26 @@ fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError
         RpcRequest::ModelRemoveProvider(params) => value(app.remove_provider(&params.provider_id)?),
         RpcRequest::McpList(_) => value(app.mcp.list().map_err(invalid_request)?),
         RpcRequest::McpSave(params) => value(app.mcp.save(params.server).map_err(invalid_request)?),
-        RpcRequest::McpRemove(params) => {
-            value(app.mcp.remove(&params.server_id).map_err(invalid_request)?)
+        RpcRequest::McpRemove(params) => value(app.mcp.remove(&params.server_id).map_err(invalid_request)?),
+        RpcRequest::McpToggle(params) => {
+            value(app.mcp.toggle(&params.server_id, params.enabled).map_err(invalid_request)?)
         }
-        RpcRequest::McpToggle(params) => value(
-            app.mcp
-                .toggle(&params.server_id, params.enabled)
-                .map_err(invalid_request)?,
-        ),
         RpcRequest::SessionCreate(params) => value(app.create_session(&params.workspace_id)?),
-        RpcRequest::SessionRead(params) => value(app.read_session(
-            &params.session_id,
-            params.limit,
-            params.before_turn.as_deref(),
-        )?),
-        RpcRequest::SessionImageRead(params) => {
-            value(app.image_data(&params.session_id, &params.image_id)?)
+        RpcRequest::SessionRead(params) => {
+            value(app.read_session(&params.session_id, params.limit, params.before_turn.as_deref())?)
         }
-        RpcRequest::SessionRename(params) => {
-            value(app.rename_session(&params.session_id, &params.name)?)
-        }
+        RpcRequest::SessionImageRead(params) => value(app.image_data(&params.session_id, &params.image_id)?),
+        RpcRequest::SessionRename(params) => value(app.rename_session(&params.session_id, &params.name)?),
         RpcRequest::SessionArchive(params) => value(app.archive_session(&params.session_id)?),
-        RpcRequest::SessionSubmit(params) => value(app.submit(
-            &params.session_id,
-            input(params.text, params.images, params.skills)?,
-        )?),
-        RpcRequest::SessionSteer(params) => value(app.steer(
-            &params.session_id,
-            input(params.text, params.images, params.skills)?,
-        )?),
-        RpcRequest::SessionFollowUp(params) => value(app.follow_up(
-            &params.session_id,
-            input(params.text, params.images, params.skills)?,
-        )?),
+        RpcRequest::SessionSubmit(params) => {
+            value(app.submit(&params.session_id, input(params.text, params.images, params.skills)?)?)
+        }
+        RpcRequest::SessionSteer(params) => {
+            value(app.steer(&params.session_id, input(params.text, params.images, params.skills)?)?)
+        }
+        RpcRequest::SessionFollowUp(params) => {
+            value(app.follow_up(&params.session_id, input(params.text, params.images, params.skills)?)?)
+        }
         RpcRequest::SessionQueueWithdraw(params) => {
             value(app.queue_withdraw(&params.session_id, &params.control_id)?)
         }

@@ -156,7 +156,34 @@ function McpEditor({ server, busy, error, onSave }: { server?: McpServerInput; b
         <label className="sg-field"><span>服务地址</span><input className="sg-input" aria-label="MCP 服务地址" type="url" required value={url} onChange={event => setUrl(event.target.value)} placeholder="https://example.com/mcp" /></label>
         <label className="sg-field"><span>请求头（JSON 对象）</span><textarea className="sg-input" aria-label="MCP 请求头" rows={3} spellCheck={false} value={headers} onChange={event => setHeaders(event.target.value)} placeholder={'{"Authorization": "Bearer token"}'} /></label>
       </>}
-      <div className="mcp-timeouts"><label className="sg-field"><span>连接超时（秒）</span><input className="sg-input" aria-label="MCP 连接超时" type="number" min={1} step={1} required value={startup} onChange={event => setStartup(Number(event.target.value))} /></label><label className="sg-field"><span>调用超时（秒）</span><input className="sg-input" aria-label="MCP 调用超时" type="number" min={1} step={1} required value={timeout} onChange={event => setTimeout(Number(event.target.value))} /></label></div>
+      <div className="mcp-timeouts">
+        <label className="sg-field">
+          <span>连接超时（秒）</span>
+          <input
+            className="sg-input"
+            aria-label="MCP 连接超时"
+            type="number"
+            min={1}
+            step={1}
+            required
+            value={startup}
+            onChange={event => setStartup(Number(event.target.value))}
+          />
+        </label>
+        <label className="sg-field">
+          <span>调用超时（秒）</span>
+          <input
+            className="sg-input"
+            aria-label="MCP 调用超时"
+            type="number"
+            min={1}
+            step={1}
+            required
+            value={timeout}
+            onChange={event => setTimeout(Number(event.target.value))}
+          />
+        </label>
+      </div>
       {(failure || error) && <p role="alert" className="form-error">{failure || error}</p>}
     </div>
     <footer><button type="submit" className="primary-button" disabled={busy}>{busy ? '保存中…' : '保存 MCP'}</button></footer>

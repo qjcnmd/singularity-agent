@@ -91,12 +91,6 @@ pub async fn run(setup: DesktopSetup) -> Result<(), String> {
 async fn write(output: &mut tokio::io::Stdout, value: &impl Serialize) -> Result<(), String> {
     let mut bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
-    output
-        .write_all(&bytes)
-        .await
-        .map_err(|e| format!("write desktop pipe: {e}"))?;
-    output
-        .flush()
-        .await
-        .map_err(|e| format!("flush desktop pipe: {e}"))
+    output.write_all(&bytes).await.map_err(|e| format!("write desktop pipe: {e}"))?;
+    output.flush().await.map_err(|e| format!("flush desktop pipe: {e}"))
 }

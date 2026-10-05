@@ -6,9 +6,7 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
-use crate::tools::truncate::{
-    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, format_size, truncate_tail,
-};
+use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, format_size, truncate_tail};
 
 /// 内存里保留的尾部缓冲字节上限（100KB），防止超大的单行输出耗尽内存。
 const INTERNAL_TAIL_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;

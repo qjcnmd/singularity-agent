@@ -34,9 +34,7 @@ impl IndexedTurn {
     /// 本轮公开分页用的 cursor：`turn:{turnId}`，不属于任何 turn 的前导组是 `turn:leading`。
     /// thread/read 的 before_turn 和返回的 next_cursor 都用这个值，而不是某个 item id。
     pub fn cursor(&self) -> String {
-        self.turn_id
-            .as_ref()
-            .map_or_else(|| "turn:leading".into(), |id| format!("turn:{id}"))
+        self.turn_id.as_ref().map_or_else(|| "turn:leading".into(), |id| format!("turn:{id}"))
     }
 
     /// 按轮遍历持久条目，直接写出最终的公开 items；工具 wire ID 的映射、同一个
@@ -92,24 +90,18 @@ impl IndexedTurn {
                 SessionEntry::Metadata { metadata, id, .. } => match metadata {
                     // thread 名称不作为公开历史条目。
                     SessionMetadata::ThreadName { .. } => {}
-                    SessionMetadata::ThreadSettings {
-                        provider,
-                        model,
-                        reasoning,
-                    } => items.push(HistoryItem::Settings {
-                        id: id.clone(),
-                        provider: provider.clone(),
-                        model: model.clone(),
-                        reasoning: reasoning.clone(),
-                    }),
+                    SessionMetadata::ThreadSettings { provider, model, reasoning } => {
+                        items.push(HistoryItem::Settings {
+                            id: id.clone(),
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            reasoning: reasoning.clone(),
+                        })
+                    }
                 },
                 SessionEntry::Record {
                     timestamp,
-                    record:
-                        LedgerRecord::ModelRequest {
-                            observation,
-                            context,
-                        },
+                    record: LedgerRecord::ModelRequest { observation, context },
                     ..
                 } => {
                     let mut observation = observation.clone();
@@ -123,11 +115,7 @@ impl IndexedTurn {
                     } else {
                         // 每次请求只有一个终态观测；开始时刻和请求详情保留在原条目。
                         let position = request_positions[&observation.request_id];
-                        let HistoryItem::Request {
-                            observation: previous,
-                            ..
-                        } = &mut items[position]
-                        else {
+                        let HistoryItem::Request { observation: previous, .. } = &mut items[position] else {
                             unreachable!()
                         };
                         observation.request_head = previous.request_head.take();
@@ -146,13 +134,7 @@ impl IndexedTurn {
                 } => compacted = false,
                 SessionEntry::Record {
                     id,
-                    record:
-                        LedgerRecord::OperationFinished {
-                            turn_id: None,
-                            outcome,
-                            error,
-                            ..
-                        },
+                    record: LedgerRecord::OperationFinished { turn_id: None, outcome, error, .. },
                     ..
                 } if !compacted || *outcome != TurnStatus::Completed => {
                     items.push(HistoryItem::CompactionResult {
@@ -165,15 +147,10 @@ impl IndexedTurn {
                     timestamp,
                     record: LedgerRecord::OperationStarted { turn_id, .. },
                     ..
-                } if turn_id.is_some() && turn_id == &self.turn_id => {
-                    started_at = Some(timestamp.clone())
-                }
+                } if turn_id.is_some() && turn_id == &self.turn_id => started_at = Some(timestamp.clone()),
                 SessionEntry::Record {
                     timestamp,
-                    record:
-                        LedgerRecord::OperationFinished {
-                            turn_id: Some(id), ..
-                        },
+                    record: LedgerRecord::OperationFinished { turn_id: Some(id), .. },
                     ..
                 } if Some(id) == self.turn_id.as_ref() => finished_at = Some(timestamp.clone()),
                 SessionEntry::Record { .. } => {}
@@ -309,9 +286,7 @@ fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
         usage.input_tokens += observation.input_tokens.unwrap_or(0);
         usage.cached_input_tokens += observation.cached_input_tokens.unwrap_or(0);
         usage.output_tokens += observation.output_tokens.unwrap_or(0);
-        usage.total_tokens += observation
-            .total_tokens
-            .expect("reported usage has a total");
+        usage.total_tokens += observation.total_tokens.expect("reported usage has a total");
         usage.cache_usage_complete &= observation.cached_input_tokens.is_some();
         if let (Some(ms), Some(tokens)) = (observation.decode_ms, observation.output_tokens)
             && ms > 0

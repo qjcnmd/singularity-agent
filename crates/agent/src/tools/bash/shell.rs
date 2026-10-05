@@ -25,8 +25,7 @@ pub(super) fn bash_path() -> Result<String, String> {
 /// 大小写：PATH 里的 `C:\windows\system32` 必须和 `C:\Windows\System32` 一样被排除。
 /// `SystemRoot` 缺失时没法做前缀比较，就只按 `System32\bash.exe` 后缀判断。
 fn is_system32_bash_launcher(candidate: &Path, system_root: &str) -> bool {
-    if !system_root.is_empty() && !starts_with_ignore_ascii_case(candidate, Path::new(system_root))
-    {
+    if !system_root.is_empty() && !starts_with_ignore_ascii_case(candidate, Path::new(system_root)) {
         return false;
     }
     let Some(file_name) = candidate.file_name() else {
@@ -42,11 +41,9 @@ fn is_system32_bash_launcher(candidate: &Path, system_root: &str) -> bool {
 fn starts_with_ignore_ascii_case(path: &Path, prefix: &Path) -> bool {
     let mut components = path.components();
     prefix.components().all(|expected| {
-        components.next().is_some_and(|actual| {
-            expected
-                .as_os_str()
-                .eq_ignore_ascii_case(actual.as_os_str())
-        })
+        components
+            .next()
+            .is_some_and(|actual| expected.as_os_str().eq_ignore_ascii_case(actual.as_os_str()))
     })
 }
 
@@ -71,7 +68,5 @@ fn find_bash_on_windows() -> Option<String> {
             candidates.push(candidate.display().to_string());
         }
     }
-    candidates
-        .into_iter()
-        .find(|candidate| Path::new(candidate).is_file())
+    candidates.into_iter().find(|candidate| Path::new(candidate).is_file())
 }

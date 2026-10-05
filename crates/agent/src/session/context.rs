@@ -9,9 +9,7 @@ use self::resolution::{push_context_entry, resolve_context_entries};
 
 use singularity_model::{ModelMessage, ModelRole, ModelUsage};
 
-use crate::message::{
-    AgentMessage, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock,
-};
+use crate::message::{AgentMessage, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock};
 
 use super::format::{LedgerRecord, SessionEntry};
 use super::manager::SessionData;
@@ -47,10 +45,7 @@ fn project_messages(entries: &[ContextPosition], session: &SessionData) -> Vec<C
                 None => {
                     let mut result = ModelMessage::text(ModelRole::Tool, UNKNOWN_TOOL_OUTCOME);
                     result.tool_call_id = Some(call.tool_call_id.clone());
-                    ContextMessage {
-                        message: result,
-                        images: Vec::new(),
-                    }
+                    ContextMessage { message: result, images: Vec::new() }
                 }
             });
         }
@@ -69,12 +64,8 @@ fn context_token_estimate(entries: &[ContextPosition], session: &SessionData) ->
             results += usize::from(message.tool_call_id().is_some());
         }
     }
-    let unknown_result_tokens = content_token_estimate(
-        &[ContentBlock::Text {
-            text: UNKNOWN_TOOL_OUTCOME.to_string(),
-        }],
-        true,
-    );
+    let unknown_result_tokens =
+        content_token_estimate(&[ContentBlock::Text { text: UNKNOWN_TOOL_OUTCOME.to_string() }], true);
     tokens + (calls - results) as u64 * unknown_result_tokens
 }
 
@@ -88,9 +79,7 @@ enum ContextEntry<'a> {
 fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
     match entry {
         SessionEntry::Message { message, .. } => Some(ContextEntry::Message(message)),
-        SessionEntry::Compaction { compaction, .. } => {
-            Some(ContextEntry::Summary(&compaction.summary))
-        }
+        SessionEntry::Compaction { compaction, .. } => Some(ContextEntry::Summary(&compaction.summary)),
         SessionEntry::Metadata { .. } => None,
         SessionEntry::Record { record, .. } => match record {
             LedgerRecord::SkillInstructions { text } => Some(ContextEntry::SkillInstructions(text)),
@@ -108,19 +97,14 @@ fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
 pub(crate) fn entry_token_estimate(entry: &SessionEntry) -> u64 {
     match context_entry(entry) {
         Some(ContextEntry::Message(message)) => message_token_estimate(message),
-        Some(ContextEntry::Summary(summary)) => {
-            estimate_tokens_of(&compaction_summary(summary)) + 8
-        }
+        Some(ContextEntry::Summary(summary)) => estimate_tokens_of(&compaction_summary(summary)) + 8,
         Some(ContextEntry::SkillInstructions(text)) => estimate_tokens_of(text) + 8,
         None => 0,
     }
 }
 
 pub(crate) fn message_token_estimate(message: &crate::message::AgentMessage) -> u64 {
-    content_token_estimate(
-        message.content(),
-        matches!(message, AgentMessage::ToolResult { .. }),
-    )
+    content_token_estimate(message.content(), matches!(message, AgentMessage::ToolResult { .. }))
 }
 
 /// 只估算模型请求真正会带上的内容：公开思考不进入文本投影
@@ -136,9 +120,7 @@ fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
                 u64::from(image.width).div_ceil(32) * u64::from(image.height).div_ceil(32) + 128
             }
             ContentBlock::ToolCall(call) => {
-                estimate_tokens_of(&call.tool_name)
-                    + estimate_tokens_of(&call.arguments.to_string())
-                    + 4
+                estimate_tokens_of(&call.tool_name) + estimate_tokens_of(&call.arguments.to_string()) + 4
             }
         });
     }
@@ -222,17 +204,13 @@ impl ContextView {
                     ..
                 } => {
                     // tool_result_message 与剪枝记录都以正文开头，后接图片。
-                    let [ContentBlock::Text { text }, images @ ..] = position.content(session)
-                    else {
+                    let [ContentBlock::Text { text }, images @ ..] = position.content(session) else {
                         unreachable!("tool results start with a text block");
                     };
                     crate::compaction::prune_tool_text(text).map(|text| {
                         let mut content = vec![ContentBlock::Text { text }];
                         content.extend_from_slice(images);
-                        LedgerRecord::ToolResultPruned {
-                            entry_id: id.clone(),
-                            content,
-                        }
+                        LedgerRecord::ToolResultPruned { entry_id: id.clone(), content }
                     })
                 }
                 _ => None,
@@ -242,22 +220,12 @@ impl ContextView {
 
     /// 历史估价加请求装配提供的指令与工具开销，再加实测校正。
     pub(crate) fn request_tokens(&self, overhead: u64) -> u64 {
-        self.estimated_tokens
-            .saturating_add(overhead)
-            .saturating_add(self.usage_correction)
+        self.estimated_tokens.saturating_add(overhead).saturating_add(self.usage_correction)
     }
 
     /// 把实测的输入与输出对齐到同一请求的估价上；usage 缺失时只用启发式计量。
-    pub(crate) fn record_usage(
-        &mut self,
-        usage: &ModelUsage,
-        assistant_tokens: u64,
-        overhead: u64,
-    ) {
-        let estimated = self
-            .estimated_tokens
-            .saturating_add(assistant_tokens)
-            .saturating_add(overhead);
+    pub(crate) fn record_usage(&mut self, usage: &ModelUsage, assistant_tokens: u64, overhead: u64) {
+        let estimated = self.estimated_tokens.saturating_add(assistant_tokens).saturating_add(overhead);
         self.usage_correction = if usage.usage_present {
             usage.total_tokens.saturating_sub(estimated)
         } else {
@@ -274,17 +242,8 @@ impl ContextView {
     pub(crate) fn append_entry(&mut self, session: &SessionData, index: usize) {
         let entry = &session.entries()[index];
         if is_context_entry(entry) {
-            self.estimated_tokens = self
-                .estimated_tokens
-                .saturating_add(entry_token_estimate(entry));
-            push_context_entry(
-                &mut self.entries,
-                ContextPosition {
-                    index,
-                    pruned_index: None,
-                },
-                session,
-            );
+            self.estimated_tokens = self.estimated_tokens.saturating_add(entry_token_estimate(entry));
+            push_context_entry(&mut self.entries, ContextPosition { index, pruned_index: None }, session);
         }
     }
 
@@ -340,10 +299,9 @@ impl ContextPosition {
             .expect("context position references a context entry")
         {
             ContextEntry::Message(message) => match message {
-                AgentMessage::User { .. } => ModelMessage::text(
-                    ModelRole::User,
-                    crate::message::content_text(self.content(session)),
-                ),
+                AgentMessage::User { .. } => {
+                    ModelMessage::text(ModelRole::User, crate::message::content_text(self.content(session)))
+                }
                 AgentMessage::Assistant { .. } => ModelMessage {
                     role: ModelRole::Assistant,
                     content: crate::message::content_text(self.content(session)),
@@ -405,9 +363,7 @@ pub(crate) fn load_messages(
                     image.height,
                     path.display()
                 ));
-                message
-                    .images
-                    .push(crate::image::load_image(directory, image)?);
+                message.images.push(crate::image::load_image(directory, image)?);
             }
             Ok(message)
         })
@@ -422,11 +378,7 @@ pub(crate) fn is_context_entry(entry: &SessionEntry) -> bool {
 
 /// 从后往前累加到保留预算，再在候选上界之内取最后一个工具对闭合的切点；
 /// 预算为零时仍保留最后一个完整单元。
-fn find_cut_point(
-    entries: &[ContextPosition],
-    session: &SessionData,
-    keep_recent_tokens: u64,
-) -> usize {
+fn find_cut_point(entries: &[ContextPosition], session: &SessionData, keep_recent_tokens: u64) -> usize {
     let mut accumulated = 0u64;
     for index in (0..entries.len()).rev() {
         accumulated = accumulated.saturating_add(entries[index].token_estimate(session));
@@ -439,11 +391,7 @@ fn find_cut_point(
 
 /// 工具结果已经按调用顺序紧随 assistant；切点不能拆开这个工具单元。
 /// 缺失结果由模型投影补齐，Skill 与触发它的用户输入也一同保留。
-fn last_balanced_cut(
-    entries: &[ContextPosition],
-    session: &SessionData,
-    upper_bound: usize,
-) -> usize {
+fn last_balanced_cut(entries: &[ContextPosition], session: &SessionData, upper_bound: usize) -> usize {
     let mut cut = 0usize;
     for (position, candidate) in entries.iter().take(upper_bound).enumerate() {
         let next_is_tool_result = entries.get(position + 1).is_some_and(|next| {

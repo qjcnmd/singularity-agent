@@ -41,10 +41,7 @@ impl ClientHandler for Handler {
         info
     }
 
-    async fn list_roots(
-        &self,
-        _: RequestContext<RoleClient>,
-    ) -> Result<ListRootsResult, rmcp::ErrorData> {
+    async fn list_roots(&self, _: RequestContext<RoleClient>) -> Result<ListRootsResult, rmcp::ErrorData> {
         Ok(ListRootsResult::new(vec![Root::new(&self.root)]))
     }
 }
@@ -59,12 +56,7 @@ impl Connection {
         let startup = Duration::from_secs(config.startup_timeout_sec);
         let connect = async {
             let service = match &config.transport {
-                TransportConfig::Stdio {
-                    command,
-                    args,
-                    cwd: configured_cwd,
-                    env,
-                } => {
+                TransportConfig::Stdio { command, args, cwd: configured_cwd, env } => {
                     let mut command =
                         which_command(command).map_err(|error| format!("无法启动 MCP：{error}"))?;
                     command.args(args).envs(env).current_dir(
@@ -78,9 +70,7 @@ impl Connection {
                         use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject};
                         let mut wrapped = CommandWrap::from(command);
                         wrapped
-                            .wrap(CreationFlags(
-                                windows::Win32::System::Threading::CREATE_NO_WINDOW,
-                            ))
+                            .wrap(CreationFlags(windows::Win32::System::Threading::CREATE_NO_WINDOW))
                             .wrap(JobObject);
                         wrapped
                     };
@@ -106,10 +96,7 @@ impl Connection {
                             }
                         });
                     }
-                    handler
-                        .serve(transport)
-                        .await
-                        .map_err(|error| format!("MCP 初始化失败：{error}"))?
+                    handler.serve(transport).await.map_err(|error| format!("MCP 初始化失败：{error}"))?
                 }
                 TransportConfig::Http { url, headers } => {
                     // 与现有模型传输使用同一 ring provider，避免两个 TLS 默认实现冲突。
@@ -122,24 +109,18 @@ impl Connection {
                         .iter()
                         .map(|(name, value)| {
                             (
-                                reqwest::header::HeaderName::from_bytes(name.as_bytes()).expect(
-                                    "MCP header name was validated when loading configuration",
-                                ),
-                                reqwest::header::HeaderValue::from_str(value).expect(
-                                    "MCP header value was validated when loading configuration",
-                                ),
+                                reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                                    .expect("MCP header name was validated when loading configuration"),
+                                reqwest::header::HeaderValue::from_str(value)
+                                    .expect("MCP header value was validated when loading configuration"),
                             )
                         })
                         .collect();
                     let transport = StreamableHttpClientTransport::with_client(
                         client,
-                        StreamableHttpClientTransportConfig::with_uri(url.clone())
-                            .custom_headers(headers),
+                        StreamableHttpClientTransportConfig::with_uri(url.clone()).custom_headers(headers),
                     );
-                    handler
-                        .serve(transport)
-                        .await
-                        .map_err(|error| format!("MCP 初始化失败：{error}"))?
+                    handler.serve(transport).await.map_err(|error| format!("MCP 初始化失败：{error}"))?
                 }
             };
             Ok(Self {
@@ -150,19 +131,11 @@ impl Connection {
         };
         tokio::time::timeout(startup, connect)
             .await
-            .unwrap_or_else(|_| {
-                Err(format!(
-                    "MCP 初始化超过 {} 秒。",
-                    config.startup_timeout_sec
-                ))
-            })
+            .unwrap_or_else(|_| Err(format!("MCP 初始化超过 {} 秒。", config.startup_timeout_sec)))
             .map_err(|error| {
                 let logs = logs.lock().expect("MCP stderr lock poisoned");
                 // 尾部预算可能切掉首字符的一部分，只跳过开头残留的 UTF-8 续字节。
-                let start = logs
-                    .iter()
-                    .position(|byte| byte & 0xc0 != 0x80)
-                    .unwrap_or(logs.len());
+                let start = logs.iter().position(|byte| byte & 0xc0 != 0x80).unwrap_or(logs.len());
                 let logs = String::from_utf8_lossy(&logs[start..]);
                 config.redact(if logs.is_empty() {
                     error
@@ -174,19 +147,14 @@ impl Connection {
 
     pub async fn tools(&self) -> Result<Vec<Tool>, String> {
         // 每个回合重新发现，接纳服务器目录变更；回合内部由 Agent 冻结 schema。
-        tokio::time::timeout(
-            Duration::from_secs(self.config.startup_timeout_sec),
-            self.peer.list_all_tools(),
-        )
-        .await
-        .map_err(|_| "MCP 工具发现超时。".to_string())?
-        .map_err(|error| self.config.redact(format!("MCP 工具发现失败：{error}")))
+        tokio::time::timeout(Duration::from_secs(self.config.startup_timeout_sec), self.peer.list_all_tools())
+            .await
+            .map_err(|_| "MCP 工具发现超时。".to_string())?
+            .map_err(|error| self.config.redact(format!("MCP 工具发现失败：{error}")))
     }
 
     pub fn instructions(&self) -> Option<String> {
-        self.peer
-            .peer_info()
-            .and_then(|info| info.instructions.clone())
+        self.peer.peer_info().and_then(|info| info.instructions.clone())
     }
 
     pub async fn call(
@@ -233,9 +201,7 @@ pub(crate) fn tool_alias(server: &str, tool: &str) -> String {
     let alias = format!("mcp__{server}__{tool}");
     if alias.len() <= 64
         && !server.contains("__")
-        && alias
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && alias.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
         return alias;
     }
@@ -247,9 +213,6 @@ pub(crate) fn tool_alias(server: &str, tool: &str) -> String {
             .collect::<String>()
     };
     let digest = Sha256::digest(format!("{server}\0{tool}").as_bytes());
-    let suffix = digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let suffix = digest[..8].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     format!("mcp__{}__{}_{suffix}", readable(server), readable(tool))
 }

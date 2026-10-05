@@ -43,10 +43,7 @@ impl SseFrameDecoder {
         let (field, value) = if let Some(separator) = line.iter().position(|byte| *byte == b':') {
             // 值前按 SSE 约定只去掉一个空格。
             let value = &line[separator + 1..];
-            (
-                &line[..separator],
-                value.strip_prefix(b" ").unwrap_or(value),
-            )
+            (&line[..separator], value.strip_prefix(b" ").unwrap_or(value))
         } else {
             (line, &[] as &[u8])
         };
@@ -96,12 +93,8 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
     let mut frames = SseFrameDecoder::default();
 
     loop {
-        let chunk = provider_future(
-            cancellation,
-            "provider_response_body_read_failed",
-            response.chunk(),
-        )
-        .await?;
+        let chunk =
+            provider_future(cancellation, "provider_response_body_read_failed", response.chunk()).await?;
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
         }
@@ -129,10 +122,5 @@ pub(crate) fn provider_stream_malformed_error(
     code: &'static str,
     reason: &'static str,
 ) -> ProviderError {
-    ProviderError::diagnostic(
-        ModelErrorKind::JsonSchemaViolation,
-        message,
-        code,
-        vec![reason.to_string()],
-    )
+    ProviderError::diagnostic(ModelErrorKind::JsonSchemaViolation, message, code, vec![reason.to_string()])
 }

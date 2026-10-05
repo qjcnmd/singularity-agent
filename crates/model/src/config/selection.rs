@@ -66,16 +66,10 @@ pub fn parse_model_selector(selector: &str) -> Result<ParsedModelSelector<'_>, P
         )
     })?;
     super::validate_identifier(provider_name, "provider id").map_err(|_| {
-        configuration_error(
-            "model selector must contain a valid provider id",
-            "provider_selector_invalid",
-        )
+        configuration_error("model selector must contain a valid provider id", "provider_selector_invalid")
     })?;
     super::validate_model_id(model_name, "model id").map_err(|_| {
-        configuration_error(
-            "model selector must contain a valid model id",
-            "provider_selector_invalid",
-        )
+        configuration_error("model selector must contain a valid model id", "provider_selector_invalid")
     })?;
     if let Some(reasoning_variant) = reasoning_variant {
         super::validate_identifier(reasoning_variant, "reasoning variant").map_err(|_| {
@@ -96,25 +90,19 @@ pub(super) fn resolve_model_selection(
     data: &UserConfigData,
     selector: Option<&str>,
 ) -> Result<(OpenAiProviderConfig, SelectedModel), ProviderError> {
-    let selected = selector
-        .or(data.config.default_model.as_deref())
-        .ok_or_else(|| {
-            configuration_error(
-                "未选择模型，请指定 provider/model[#variant] 或在配置中设置 default_model。",
-                "provider_selector_invalid",
-            )
-        })?;
+    let selected = selector.or(data.config.default_model.as_deref()).ok_or_else(|| {
+        configuration_error(
+            "未选择模型，请指定 provider/model[#variant] 或在配置中设置 default_model。",
+            "provider_selector_invalid",
+        )
+    })?;
     let parsed = parse_model_selector(selected)?;
-    let provider = data
-        .config
-        .providers
-        .get(parsed.provider_name)
-        .ok_or_else(|| {
-            configuration_error(
-                "model selector references an unknown provider",
-                "provider_selector_unknown_provider",
-            )
-        })?;
+    let provider = data.config.providers.get(parsed.provider_name).ok_or_else(|| {
+        configuration_error(
+            "model selector references an unknown provider",
+            "provider_selector_unknown_provider",
+        )
+    })?;
     let model = provider.models.get(parsed.model_name).ok_or_else(|| {
         configuration_error(
             "model selector references an unknown or disallowed model",
@@ -132,10 +120,7 @@ pub(super) fn resolve_model_selection(
     validate_provider_value(key, "api_key")?;
     let model = resolve_model_definition(
         model,
-        provider
-            .api_protocol
-            .as_deref()
-            .or(model.api_protocol.as_deref()),
+        provider.api_protocol.as_deref().or(model.api_protocol.as_deref()),
         parsed.model_name,
         parsed.reasoning_variant,
     )?;
@@ -174,31 +159,20 @@ pub(super) fn resolve_model_definition(
     let supports_developer_role = model_file.supports_developer_role.unwrap_or(false);
     let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
     let undeclared_variants = std::collections::BTreeMap::new();
-    let reasoning_variants = model_file
-        .reasoning_variants
-        .as_ref()
-        .unwrap_or(&undeclared_variants);
-    validate_reasoning_variants(
-        protocol,
-        reasoning_variants,
-        model_file.default_variant.as_deref(),
-    )?;
+    let reasoning_variants = model_file.reasoning_variants.as_ref().unwrap_or(&undeclared_variants);
+    validate_reasoning_variants(protocol, reasoning_variants, model_file.default_variant.as_deref())?;
     let thinking_wire_format =
         parse_thinking_wire_format(model_file.thinking_wire_format.as_deref(), protocol)?;
     let chat_output_tokens_field =
         parse_chat_output_tokens_field(model_file.chat_output_tokens_field.as_deref(), protocol)?;
-    if model_file
-        .requires_reasoning_content_for_tool_calls
-        .is_some()
-        && protocol != ProviderApiProtocol::Chat
+    if model_file.requires_reasoning_content_for_tool_calls.is_some() && protocol != ProviderApiProtocol::Chat
     {
         return Err(configuration_error(
             "requires_reasoning_content_for_tool_calls only applies to Chat",
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
-    if model_file.requires_assistant_content_for_tool_calls && protocol != ProviderApiProtocol::Chat
-    {
+    if model_file.requires_assistant_content_for_tool_calls && protocol != ProviderApiProtocol::Chat {
         return Err(configuration_error(
             "requires_assistant_content_for_tool_calls only applies to Chat",
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
@@ -226,10 +200,7 @@ pub(super) fn resolve_model_definition(
                     "provider_selector_unknown_reasoning_variant",
                 )
             })?;
-            (
-                Some(requested_variant.to_string()),
-                variant.wire_effort.clone(),
-            )
+            (Some(requested_variant.to_string()), variant.wire_effort.clone())
         }
     };
     Ok(SelectedModel {
@@ -247,7 +218,6 @@ pub(super) fn resolve_model_definition(
             .unwrap_or(false)
             && reasoning_variant.as_deref() != Some("off"),
         reasoning_variant,
-        requires_assistant_content_for_tool_calls: model_file
-            .requires_assistant_content_for_tool_calls,
+        requires_assistant_content_for_tool_calls: model_file.requires_assistant_content_for_tool_calls,
     })
 }

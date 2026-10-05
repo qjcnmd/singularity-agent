@@ -16,7 +16,8 @@ use singularity_model::{
 /// 摘要请求的目标输出上限；实际值还受模型上限与本次请求的窗口余量约束。
 const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
 
-const INITIAL_SUMMARY_INSTRUCTION: &str = "Summarize the earlier conversation so another coding assistant can continue the user's current task.";
+const INITIAL_SUMMARY_INSTRUCTION: &str =
+    "Summarize the earlier conversation so another coding assistant can continue the user's current task.";
 const UPDATE_SUMMARY_INSTRUCTION: &str = "Update the previous summary with the new conversation above. Preserve still-current goals, constraints, completed work, and decisions. Move finished work to Done, remove resolved blockers, and revise Next Steps.";
 const SUMMARY_FORMAT: &str = r#"Output only a concise summary with these Markdown sections, in order:
 ## Goal
@@ -53,10 +54,8 @@ impl PreparedCompaction {
     ) -> crate::agent::Result<Self> {
         let overhead_tokens = definitions.estimated_tokens();
         let mut instructions = definitions.model_messages()?;
-        instructions.extend(crate::session::context::load_messages(
-            prefix.messages,
-            &prefix.image_directory,
-        )?);
+        instructions
+            .extend(crate::session::context::load_messages(prefix.messages, &prefix.image_directory)?);
         let mut messages = instructions;
         let instruction = match prefix.previous_summary {
             Some(previous) => format!(
@@ -93,9 +92,7 @@ impl PreparedCompaction {
         }
         let text = response.assistant_message.content;
         if text.trim().is_empty() {
-            return Err(AgentError::InvalidSummary(
-                "summary contains no text".into(),
-            ));
+            return Err(AgentError::InvalidSummary("summary contains no text".into()));
         }
         // 摘要请求的用量由统一请求账本记录（会话累计与展示都从那里读），这里只保留正文和保留锚点。
         Ok(CompactionEntry {

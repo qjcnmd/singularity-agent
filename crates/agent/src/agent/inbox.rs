@@ -46,10 +46,7 @@ impl UserInput {
         Ok(Self {
             text,
             skills,
-            images: images
-                .into_iter()
-                .map(crate::image::InputImage::upload)
-                .collect::<Result<_, _>>()?,
+            images: images.into_iter().map(crate::image::InputImage::upload).collect::<Result<_, _>>()?,
         })
     }
 
@@ -91,12 +88,7 @@ impl ControlRequest {
         PendingInput {
             control_id: self.control_id(),
             text: self.input.text.clone(),
-            images: self
-                .input
-                .images
-                .iter()
-                .map(|image| image.attachment.clone())
-                .collect(),
+            images: self.input.images.iter().map(|image| image.attachment.clone()).collect(),
         }
     }
 }
@@ -137,10 +129,7 @@ impl SteeringInbox {
 
     /// 新提交前先交付较早接受的 steer，保持跨执行的输入顺序。
     pub(super) fn drain_before(&mut self, sequence: u64) -> Vec<ControlRequest> {
-        let (earlier, later) = self
-            .drain()
-            .into_iter()
-            .partition(|request| request.sequence < sequence);
+        let (earlier, later) = self.drain().into_iter().partition(|request| request.sequence < sequence);
         self.entries = later;
         earlier
     }
