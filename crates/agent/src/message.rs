@@ -66,9 +66,6 @@ pub enum AgentMessage {
         /// 观测到的工具执行耗时；结果未知或没有执行时缺省。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
-        /// 用于展示的文件改动；不会包含在发给模型的内容里。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        diff: Option<String>,
         /// read 实际读取到的源文件范围；只有 read 的成功结果才带这个字段。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         read_source: Option<singularity_protocol::ReadSource>,
@@ -235,7 +232,6 @@ pub(crate) fn tool_result_message(tool_call_id: &str, execution: &ToolExecution)
         tool_call_id: tool_call_id.to_string(),
         is_error: execution.is_error,
         duration_ms: execution.duration_ms,
-        diff: execution.diff.clone(),
         read_source: execution.read_source,
     }
 }

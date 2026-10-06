@@ -113,9 +113,6 @@ pub enum HistoryItem {
             ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
         )]
         images: Vec<crate::ImageAttachment>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "typescript", ts(optional))]
-        diff: Option<String>,
         /// read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
         #[serde(rename = "readSource", skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]

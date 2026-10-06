@@ -118,7 +118,7 @@ pub enum TurnEvent {
         item: ItemRef,
         partial_result: String,
     },
-    /// 最终的工具结果：模型可见文本、失败标志和文件变更各自保持原字段。
+    /// 最终的工具结果：输出、失败标志与观测信息。
     #[serde(rename = "tool/execution/end")]
     ToolExecutionEnd {
         thread_id: String,
@@ -132,9 +132,6 @@ pub enum TurnEvent {
         )]
         images: Vec<crate::ImageAttachment>,
         is_error: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "typescript", ts(optional))]
-        diff: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         duration_ms: Option<u64>,

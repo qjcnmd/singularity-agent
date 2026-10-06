@@ -232,9 +232,6 @@ flowchart LR
     Facts --> Usage["contextOccupancy<br/>最近实测与冻结容量"]
     Timeline --> Render["组件渲染时生成标签和格式文本"]
     Trace --> Render
-    ToolResult["成功 edit/write 的真实 diff"] --> Diff["timeline.ts parsePatch<br/>一次解析，供统计与展示复用"]
-    Diff --> DiffContext["diffView.ts diffContext<br/>裁出展示上下文"]
-    DiffContext --> Render
 ```
 
 执行链期间，Host 固定链开始前的历史，实时投影覆盖该链内各回合；收尾后从日志刷新历史并清除实时投影。Electron 渲染进程在同步边界将两种输入归约为共同执行事实，展示模块只做布局和格式转换。任务生命周期由同步层统一更新，选中详情引用同一对象；结算立即显示空闲并保留活动内容，历史补读成功后整体替换。用户消息（初始输入与注入输入）经 `turn/userMessage` 携带生产者派生的公开内容块身份（该条目首个文本块，即 `item.itemId`），实时投影与历史重读因此共用同一身份；无 Turn 前导条目保留各自身份。控制处置变化经带类型的事件出口发布为会话快照，控制队列不进入实时正文投影。分页加载核对会话和分页锚点；刷新尾页只保留连续重叠的已加载前缀。
@@ -243,7 +240,7 @@ flowchart LR
 
 Electron 渲染进程 Store 逐帧归约协议状态，正文、思考与工具进度的显示通知按 50 毫秒窗口合并；操作、终态和连接变化立即通知最新状态。代码高亮只把异步高亮器的就绪状态存入 React 状态，token 按当前代码派生；已完成代码块通过稳定参数复用渲染结果。
 
-上下文用量从执行事实尾部反向查找，遇到成功压缩或模型切换即停止，不另存需要同步更新的最近测量。时间线按不可变轮次缓存投影，活动轮内仍按条目复用工具差异；轨迹 JSON 呈现按输入身份复用序列化结果，流式更新不重复处理未变化的大输入。
+上下文用量从执行事实尾部反向查找，遇到成功压缩或模型切换即停止，不另存需要同步更新的最近测量。时间线按不可变轮次缓存投影，活动轮内仍按条目复用投影；轨迹 JSON 呈现按输入身份复用序列化结果，流式更新不重复处理未变化的大输入。
 
 前端订阅只缓存所需字段，避免无关组件保留完整旧会话。高亮引擎按实际语言加载语法；屏幕外正文使用 Chromium 的 `content-visibility` 跳过内部布局与绘制，保留 DOM 和阅读锚点。轨迹退出动画结束后卸载。Canvas 光栅匹配实际显示像素，固定丝带纹理复用；窗口隐藏时采用 Chromium 默认后台节流，Rust 执行不受影响。
 
@@ -251,7 +248,7 @@ Electron 渲染进程 Store 逐帧归约协议状态，正文、思考与工具�
 
 同步提问沿用回合控制和工具结果链路：桌面装配启用 `ask_user_question`，`TurnControls` 持有当前回合的 `UserQuestions`；Agent 在独占工具准入内等待单次答案或取消。待答请求通过 `SessionRuntime.pendingQuestion` 发布，`session.answerQuestion` 按工具条目身份校验并交付；`QuestionPanel` 展示快照并经 Store 提交。请求是进程内等待状态，调用参数与答案分别由现有 assistant 工具调用和 tool result 账本保存；刷新只重读等待快照，进程重启沿用中断恢复，不重新执行提问或其他工具。
 
-源码：[App](../apps/desktop/src/app.tsx) · [Store 动作与偏好](../apps/desktop/src/appStore.ts) · [Store 状态与连接同步](../apps/desktop/src/sessionStore.ts) · [时间线](../apps/desktop/src/timeline.ts) · [轨迹](../apps/desktop/src/trajectory.ts) · [执行事实](../apps/desktop/src/execution.ts) · [输入候选](../apps/desktop/src/inputTrigger.ts) · [差异](../apps/desktop/src/diffView.ts)。具体显示与操作约定见[工作台交互](desktop-ui.md)。
+源码：[App](../apps/desktop/src/app.tsx) · [Store 动作与偏好](../apps/desktop/src/appStore.ts) · [Store 状态与连接同步](../apps/desktop/src/sessionStore.ts) · [时间线](../apps/desktop/src/timeline.ts) · [轨迹](../apps/desktop/src/trajectory.ts) · [执行事实](../apps/desktop/src/execution.ts) · [输入候选](../apps/desktop/src/inputTrigger.ts)。具体显示与操作约定见[工作台交互](desktop-ui.md)。
 
 <a id="sync"></a>
 ## 6. 桌面协议、进程边界与同步
@@ -731,10 +728,10 @@ flowchart TB
     Specs --> Preflight
     Preflight -->|"非法参数 / 未知工具"| Rejected["模型可见失败，不启动 worker"]
     Preflight -->|"PreparedTool"| Dispatch["dispatch_tools：按 source order 准入"]
-    Dispatch --> ReadOnly["read / glob / grep<br/>共享读锁，并行执行"]
-    Dispatch --> Barrier["bash / edit / write / MCP<br/>独占写锁，按声明顺序执行"]
+    Dispatch --> ReadOnly["read<br/>共享读锁，并行执行"]
+    Dispatch --> Barrier["bash / 交互提问 / MCP<br/>独占写锁，按声明顺序执行"]
     Dispatch -->|"工具内部 panic"| HostFatal["终止后端进程<br/>工作台提示重启"]
-    ReadOnly --> Result["ToolExecution<br/>文字、图片、错误、差异与观测信息"]
+    ReadOnly --> Result["ToolExecution<br/>文字、图片、错误与观测信息"]
     Barrier --> Result
     Rejected --> Result
     Result --> Persist["完成一项即保存 tool result"]
@@ -744,34 +741,29 @@ flowchart TB
 
 工具定义由 `ToolRegistrySnapshot` 持有，请求装配与开销计算按需从它派生 schema。准备参数按值交给工具 worker；进度携带公开条目身份，完成结果携带公开身份与 provider 调用身份，派发者直接落盘和发布，不保留另一份准备批次供下标回查。
 
-Agent、请求重试、Provider 网络传输和工具派发共用异步执行链。Provider 的 HTTP 发送、响应块读取及重试等待直接 `await`；工具中的文件扫描、原子替换和命令进程管理在 Tokio blocking pool 执行。派发者按模型调用顺序取得读锁或写锁；每轮工具调用最多同时准入 8 个只读工具，结果提交后释放空位，后续读取随即可继续。处理工具完成事件时先提交结果、再释放准入锁；后续独占工具因此只会在前序结果成功落盘后开始。结果提交失败会停止后续派发，并等待已启动任务结束；内部程序异常直接终止进程。
+Agent、请求重试、Provider 网络传输和工具派发共用异步执行链。Provider 的 HTTP 发送、响应块读取及重试等待直接 `await`；文件读取和命令进程管理在 Tokio blocking pool 执行。派发者按模型调用顺序取得读锁或写锁；每轮工具调用最多同时准入 8 个只读工具，结果提交后释放空位，后续读取随即可继续。处理工具完成事件时先提交结果、再释放准入锁；后续独占工具因此只会在前序结果成功落盘后开始。结果提交失败会停止后续派发，并等待已启动任务结束；内部程序异常直接终止进程。
 
 ### 15.2 文件与 shell 的内部边界
 
 ```mermaid
 flowchart LR
-    Edit["edit：当前文件精确匹配<br/>多处命中要求 replaceAll"] --> Lock["mutation_lock<br/>进程共享同路径互斥"]
-    Write["write：完整覆盖"] --> Lock
-    Lock --> Read["锁内读取 / 匹配 / 生成新内容"]
-    Read --> Atomic["临时文件 + atomic replace<br/>保留既有文件权限"]
-    Atomic --> Diff["similar 生成真实 diff<br/>模型收简短回执，UI 收独立差异"]
-    Bash["bash：解析参数与 shell"] --> Exec["exec / capture / pump<br/>进程启动、输出收集、超时与取消"]
+    Read["read：文本与图片"] --> File["有界读取 / 源行范围<br/>图片校验与快照"]
+    Bash["bash：命令参数与 Git Bash"] --> Exec["exec / capture / pump<br/>进程启动、输出收集、超时与取消"]
+    Exec --> Commands["rg 搜索与文件发现<br/>Python 等命令编辑和写入"]
     Exec --> Tree["Windows Job Object<br/>每次调用拥有整个子进程树"]
     Tree --> Finish["调用结束回收后代进程"]
     Exec --> Truncate["truncate<br/>有界显示 + 超长输出临时日志"]
-    Search["glob / grep"] --> Walk["walk.rs<br/>共同遍历、取消检查、跳过反馈"]
-    Walk --> Partial["子目录失败保留可用结果并报告<br/>根目录失败则直接失败"]
 ```
 
-同路径锁覆盖跨任务、跨轮次的 edit/write，解析父目录别名，末级文件保持目录项替换语义；外部程序和 bash 的写入不受此锁约束。工具不要求先调用 `read`。`edit` 将 LF/CRLF 视为等价行尾，其他空白精确匹配，未命中部分保留原字节与 BOM，并在准备完成、真正原子替换之前做最后一次取消判定。找不到文件、参数无效这类预期失败仍是模型可见的工具结果；工具任务的 panic 统一终止后端进程，工作台提示重启。
+内建文件能力由 `read` 与 `bash` 提供；交互提问只在交互宿主启用，MCP 工具合入同一注册表。`read` 保留文本分页、真实源行范围和图片输入，Skill 正文也通过它读取。搜索与文件修改由模型通过 `bash` 调用本机命令，写入的权限、行尾、原子性和并发协调由所执行的命令负责。文件修改按命令输出反馈。
 
-Windows 的后台 shell 子进程也在本次调用结束时回收；长任务需在同一次调用内前台执行。新工作区文件使用系统默认权限，私有配置使用独立的仅所有者文件创建规则。
+Windows 的后台 shell 子进程也在本次调用结束时回收；长任务需在同一次调用内前台执行。找不到文件、参数无效等预期失败仍是模型可见的工具结果；工具任务的 panic 统一终止后端进程，工作台提示重启。
 
-`grep` 的匹配结果最多 500 行、50KB，达到任一限制即停止并提示缩小查询；单行保持 1024 字节上限。`bash` 收尾读取失败会与退出码、超时或取消原因一起报告，保留已经捕获的输出。
+`bash` 收尾读取失败会与退出码、超时或取消原因一起报告，保留已经捕获的输出。它连续收集完整输出，首份进度立即发布，后续累计尾部快照最多每 100 毫秒发布一次；静默期间由既有输出轮询交付待更新内容。最终工具结果直接携带完整的有界结果与截断说明，不等待进度间隔，也不依赖客户端拼接历史进度。
 
-`bash` 连续收集完整输出，首份进度立即发布，后续累计尾部快照最多每 100 毫秒发布一次；静默期间由既有输出轮询交付待更新内容。最终工具结果直接携带完整的有界结果与截断说明，不等待进度间隔，也不依赖客户端拼接历史进度。
+应用配置、会话修复和图片快照继续使用 `core` 的原子文件写入，数据完整性由各自持久化边界维护。工具取舍见[文件操作工具边界](adr/adr-0005-file-tools.md)。
 
-源码：[注册与派发](../crates/agent/src/tools/registry.rs) · [异步准入与结果提交](../crates/agent/src/agent/dispatch.rs) · [路径锁](../crates/agent/src/tools/mutation.rs) · [edit](../crates/agent/src/tools/edit.rs) · [write](../crates/agent/src/tools/write.rs) · [bash](../crates/agent/src/tools/bash/mod.rs) · [进程树](../crates/agent/src/tools/bash/job_object.rs) · [遍历](../crates/agent/src/tools/walk.rs) · [文件原子替换](../crates/core/src/lib.rs)。
+源码：[注册与派发](../crates/agent/src/tools/registry.rs) · [异步准入与结果提交](../crates/agent/src/agent/dispatch.rs) · [read](../crates/agent/src/tools/read.rs) · [bash](../crates/agent/src/tools/bash/mod.rs) · [进程树](../crates/agent/src/tools/bash/job_object.rs) · [应用数据原子写入](../crates/core/src/lib.rs)。
 
 <a id="requests"></a>
 ## 16. 请求观测与定义快照
@@ -877,8 +869,8 @@ JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通�
 
 | 要改变的行为 | 规则或状态的维护入口 | 需要一起检查的使用方 |
 | --- | --- | --- |
-| 新增或调整工具 | `tools/registry.rs` 与对应工具；并行语义在 `PreparedTool`，批次准备、准入与结果提交在 `agent/dispatch.rs` | 提示词名单、模型 schema、参数预检、取消、结果落盘、公开历史与实时事件；显示差异时查看 `timeline.ts`、`trajectory.ts`。 |
-| 修改文件写入行为 | `tools/edit.rs`、`write.rs`、`mutation.rs`、`core/lib.rs` | 两种写工具、跨任务同路径、权限与行尾、模型回执、独立 diff 字段。 |
+| 新增或调整工具 | `tools/registry.rs` 与对应工具；并行语义在 `PreparedTool`，批次准备、准入与结果提交在 `agent/dispatch.rs` | 提示词名单、模型 schema、参数预检、取消、结果落盘、公开历史与实时事件；展示规则在 `timeline.ts`、`trajectory.ts`。 |
+| 修改命令执行行为 | `tools/bash` | Git Bash 参数、工作目录、输出、超时、取消与进程树；搜索和文件修改共用此入口。 |
 | 改变发送、排队或停止 | `runtime/conversation.rs`；单轮收尾在 `runner.rs` | 桌面控制 RPC、Composer 队列、运行期队列、历史恢复、JSONL 共享执行入口。 |
 | 改变终态或事件字段 | `protocol/event.rs`、`protocol/params.rs` 与 runtime 投影 | JSONL、桌面事件 envelope、活动快照、前端协议、正文、轨迹、用量；协议 wire 样例。 |
 | 修改历史或会话格式 | `agent/session/format.rs`、`manager.rs`、`file.rs` | `ContextView`、工具配对投影、请求索引、catalog 摘要、分页与前端历史。 |

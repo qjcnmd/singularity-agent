@@ -107,7 +107,7 @@ pub(super) fn parse_session_file(file: &Path, tail_policy: TailPolicy) -> Result
 }
 
 pub(super) fn rewrite_file(file: &Path, header: &SessionHeader, entries: &[SessionEntry]) -> Result<()> {
-    // 序列化完成后交给共享的原子替换原语：与工具层（edit/write）走同一条安全管道。
+    // 完整序列化后原子替换，避免修复过程中公开不完整的会话。
     let mut bytes = Vec::new();
     serde_json::to_writer(&mut bytes, header)?;
     bytes.push(b'\n');

@@ -5,7 +5,7 @@ export type FactStatus = 'stable' | 'running' | 'ok' | 'error' | 'cancelled'
 interface FactBase { id: string; status: FactStatus; startedAt: string | null; error?: string; images?: ImageAttachment[] }
 export type ExecutionItem = FactBase & (
   | { kind: 'user' | 'assistant' | 'thinking'; text: string; requestId?: string }
-  | { kind: 'tool'; name: string; args: unknown; output: string; diff?: string; duration?: number; readSource?: ReadSource }
+  | { kind: 'tool'; name: string; args: unknown; output: string; duration?: number; readSource?: ReadSource }
   | { kind: 'request'; observation: RequestObservation }
   | { kind: 'settings'; provider: string; model: string; reasoning: string | null }
   | { kind: 'compaction' | 'compaction_result' | 'event'; text: string }
@@ -71,12 +71,12 @@ function toolCallItem(id: string, name: string, args: unknown): Extract<Executio
   return { ...base(id), kind: 'tool', name, args, output: '' }
 }
 
-/** 工具结果条目：名称与参数沿用已配对的调用，失败标志与 diff 由结果决定。 */
+/** 工具结果条目：名称与参数沿用已配对的调用，输出与状态由结果决定。 */
 function toolResultItem(item: Extract<HistoryItem, { type: 'tool_result' }>, previous: ExecutionItem | undefined): ExecutionItem {
   const tool = previous as Extract<ExecutionItem, { kind: 'tool' }>
   return { ...base(item.id, item.isError ? 'error' : 'ok'), kind: 'tool',
     name: tool.name, args: tool.args,
-    output: item.output, diff: item.isError ? undefined : item.diff, duration: item.durationMs,
+    output: item.output, duration: item.durationMs,
     readSource: item.readSource, images: item.images }
 }
 
@@ -242,7 +242,7 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
       const p = event.params
       const tool = turn.items.find(item => item.id === p.item.itemId) as Extract<ExecutionItem, { kind: 'tool' }>
       turn = upsert(turn, { ...tool, status: p.isError ? 'error' : 'ok',
-        output: p.output, diff: p.isError ? undefined : p.diff, duration: p.durationMs,
+        output: p.output, duration: p.durationMs,
         readSource: p.readSource, images: p.images })
       break
     }

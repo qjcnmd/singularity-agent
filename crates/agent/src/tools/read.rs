@@ -110,7 +110,7 @@ fn execute_reader(
         }
         // 超出展示预算就返回，不必读取整行；额外四字节覆盖截点处的 UTF-8 字符。
         let mut line_reader = std::io::Read::take(&mut *reader, (DEFAULT_MAX_BYTES + 4) as u64);
-        let line = match super::line::read_line_bytes(&mut line_reader) {
+        let line = match read_line_bytes(&mut line_reader) {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(error) => {
@@ -162,6 +162,21 @@ fn execute_reader(
     }
     let output_text = render_read_output(start_line_display, &state);
     ToolExecution::text(output_text).with_read_source(read_source(start_line_display, &state))
+}
+
+/// 读取下一行字节，剥掉换行与 CRLF 的 CR；EOF 返回 None。
+fn read_line_bytes(reader: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    if reader.read_until(b'\n', &mut bytes)? == 0 {
+        return Ok(None);
+    }
+    if bytes.ends_with(b"\n") {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    Ok(Some(bytes))
 }
 
 /// read 实际读到的源文件范围；起始行和正文行数在这里算好，说明文字不计入正文行数。

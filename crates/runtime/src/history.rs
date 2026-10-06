@@ -63,7 +63,6 @@ impl IndexedTurn {
                         tool_call_id,
                         is_error,
                         duration_ms,
-                        diff,
                         read_source,
                         ..
                     } => {
@@ -75,7 +74,6 @@ impl IndexedTurn {
                             images: message.images().cloned().collect(),
                             is_error: *is_error,
                             duration_ms: *duration_ms,
-                            diff: diff.clone(),
                             read_source: *read_source,
                         });
                     }

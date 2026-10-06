@@ -3,17 +3,14 @@ import { AttachedImages } from './Images'
 import { Disclosure } from './Disclosure'
 import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import Anser from 'anser'
-import type { StructuredPatch } from 'diff'
-import { CircleAlert, Pencil } from 'lucide-react'
-import { diffContext } from '../diffView'
+import { CircleAlert } from 'lucide-react'
 import { motion, useReducedMotion } from 'motion/react'
 import { disclosureTransition } from '../motion'
 import { useSelectionGuard } from '../interactions'
 import { MarkdownBody } from '../markdown'
-import { CodeTokens, useCodeTokens, languageIdFor } from '../highlight'
 import { factStatusText } from '../copy'
-import { readOutputLines, toolOutputLines } from '../readOutput'
-import { formatTurnDuration, failureSummary, timelineBody, timelineStatus, toolDisplay, toolArgument, type TimelineItemModel } from '../timeline'
+import { readOutputLines } from '../readOutput'
+import { formatTurnDuration, failureSummary, timelineBody, timelineStatus, toolArgument, type TimelineItemModel } from '../timeline'
 
 const previewLineCount = 8
 
@@ -65,8 +62,6 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
         <ExpandChevron expanded={expanded} className="step-chevron" />
         <span className="step-separator" aria-hidden="true">·</span>
         <span className="step-summary">{failure ?? oneLine(timelineBody(item))}</span>
-        {item.addedLines > 0 && <span className="diff-stat is-added">+{item.addedLines}</span>}
-        {item.removedLines > 0 && <span className="diff-stat is-removed">−{item.removedLines}</span>}
         {timelineStatus(item) === 'cancelled' && <span className="item-status">{statusLabel(timelineStatus(item))}</span>}
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
@@ -88,8 +83,8 @@ function TurnDuration({ itemKey, startedAt, finishedAt }: { itemKey: string; sta
 }
 
 function StepLabel({ item, icon }: Props & { icon?: ReactNode }) {
-  const animated = item.kind === 'thinking' || item.tool !== undefined
-  const muted = item.kind === 'thinking' || (item.tool !== undefined && toolDisplay(item.title)?.output === 'read')
+  const animated = item.kind === 'thinking' || item.fact?.kind === 'tool'
+  const muted = item.kind === 'thinking' || (item.fact?.kind === 'tool' && item.title === 'read')
   return <span className="step-label">
     {icon !== undefined && <span className="step-icon" aria-hidden="true">{icon}</span>}
     <span className={`step-title${animated ? ' execution-title' : ''}${muted ? ' muted-execution-title' : ''}`}>{item.title}</span>
@@ -141,8 +136,7 @@ function ReasoningRow({ item }: Props) {
 
 function ToolOutput({ item }: Props) {
   const fact = item.fact
-  const tool = item.tool
-  if (!tool || fact?.kind !== 'tool') {
+  if (fact?.kind !== 'tool') {
     const body = timelineBody(item)
     if (!body && !fact?.error) return null
     return (
@@ -153,14 +147,12 @@ function ToolOutput({ item }: Props) {
     )
   }
   const { args: input, output } = fact
-  const { diff, patches } = tool
-  if (diff !== '') return <DiffBody text={diff} patches={patches} />
-  const command = toolDisplay(item.title)?.output === 'terminal' ? toolArgument(item.title, input) : null
+  const command = item.title === 'bash' ? toolArgument(item.title, input) : null
   if (command !== null) return <div>
     <div className="terminal-command"><span aria-hidden="true">$</span><code>{command}</code></div>
     {output !== '' && <><OutputHeader label="输出" /><pre>{Anser.ansiToJson(output, { remove_empty: true }).map((part, index) => <span key={index} style={{ color: part.fg ? `rgb(${part.fg})` : undefined, backgroundColor: part.bg ? `rgb(${part.bg})` : undefined, fontWeight: part.decorations.includes('bold') ? 700 : undefined }}>{part.content}</span>)}</pre></>}
   </div>
-  if (item.filePath !== null && output !== '' && toolDisplay(item.title)?.output === 'read' && timelineStatus(item) !== 'error') return <div>
+  if (item.filePath !== null && output !== '' && item.title === 'read' && timelineStatus(item) !== 'error') return <div>
     <OutputHeader label={item.filePath} />
     {/* 只有 producer 记录了真实来源范围才编号；旧记录按普通文本展示，不猜边界。 */}
     {fact.readSource
@@ -169,7 +161,6 @@ function ToolOutput({ item }: Props) {
       ))}</div>
       : <pre><code>{output}</code></pre>}
   </div>
-  if (output !== '' && (toolDisplay(item.title)?.output === 'search')) return <div><OutputHeader label="搜索结果" /><SearchOutput text={output} /></div>
   return (
     <div>
       <ToolSection label="参数"><pre><code>{JSON.stringify(input, null, 2) || '（空）'}</code></pre></ToolSection>
@@ -186,50 +177,11 @@ function OutputHeader({ label }: { label: string }) {
   return <div className="tool-output-header">{label}</div>
 }
 
-function SearchOutput({ text }: { text: string }) {
-  // grep/glob 的 file:line: 前缀仍按原有规则解析。
-  const lines = toolOutputLines(text)
-  return <div className="tool-lines">{lines.map((line, index) => {
-    const match = /^(.*?):(\d+):(.*)$/.exec(line)
-    return <div key={index} className="tool-line">{match && <span>{match[1]}:</span>}{match?.[2] !== undefined && <span className="tool-line-number">{match[2]}</span>}<span>{match?.[3] ?? line}</span></div>
-  })}</div>
-}
-
 function ToolSection({ label, children }: { label: string; children: ReactNode }) {
   return <section className="timeline-section">
     <h4>{label}</h4>
     {children}
   </section>
-}
-
-function DiffBody({ text, patches }: { text: string; patches: StructuredPatch[] }) {
-  if (patches.length === 0) return <div><OutputHeader label="文件改动" /><pre>{text}</pre></div>
-  return <div className="diff-files">{patches.map((patch, index) => <DiffFile key={index} patch={patch} />)}</div>
-}
-
-function DiffFile({ patch }: { patch: StructuredPatch }) {
-  const filename = (patch.newFileName === '/dev/null' ? patch.oldFileName : patch.newFileName) ?? ''
-  const extension = filename.split('.').pop()?.toLowerCase() ?? ''
-  const language = languageIdFor(extension)
-  return <section className="diff-file">
-    <div className="diff-file-lines">{diffContext(patch.hunks).map((hunk, index) => <DiffHunk key={index} hunk={hunk} language={language} />)}</div>
-  </section>
-}
-
-function DiffHunk({ hunk, language }: { hunk: StructuredPatch['hunks'][number]; language: string }) {
-  const before = useCodeTokens(hunk.lines.filter(line => line[0] === '-' || line[0] === ' ').map(line => line.slice(1)).join('\n'), language)
-  const after = useCodeTokens(hunk.lines.filter(line => line[0] === '+' || line[0] === ' ').map(line => line.slice(1)).join('\n'), language)
-  let oldLine = hunk.oldStart, newLine = hunk.newStart, beforeIndex = 0, afterIndex = 0
-  return <div className="diff-hunk">{hunk.lines.map((line, index) => {
-    const marker = line[0]
-    if (marker === '\\') return <div className="diff-no-newline" key={index}>{line.slice(2)}</div>
-    const removed = marker === '-', added = marker === '+'
-    const number = removed ? oldLine : newLine
-    const tokens = removed ? before?.[beforeIndex] : after?.[afterIndex]
-    if (!added) { oldLine++; beforeIndex++ }
-    if (!removed) { newLine++; afterIndex++ }
-    return <div key={index} className={`diff-line ${added ? 'diff-add' : removed ? 'diff-remove' : 'diff-context'}`} aria-label={added ? `新增行 ${number}` : removed ? `删除行 ${number}` : undefined}><span className="diff-line-number">{number}</span><code><CodeTokens tokens={tokens} fallback={line.slice(1)} /></code></div>
-  })}</div>
 }
 
 function preview(text: string): string {
@@ -241,7 +193,7 @@ function statusLabel(status: ReturnType<typeof timelineStatus>): string {
   return status === 'stable' ? '' : factStatusText[status]
 }
 
-const stepKinds = new Set<TimelineItemModel['kind']>(['thinking', 'tool', 'diff', 'compaction'])
+const stepKinds = new Set<TimelineItemModel['kind']>(['thinking', 'tool', 'compaction'])
 
 function oneLine(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
@@ -251,9 +203,7 @@ function oneLine(text: string): string {
 
 function StepIcon({ item }: Props) {
   if (timelineStatus(item) === 'error') return <CircleAlert size={15} strokeWidth={1.6} />
-  if (item.kind === 'diff') return <Pencil size={16} strokeWidth={1.6} aria-hidden="true" />
-  const path = toolDisplay(item.title)?.output === 'terminal' ? 'm4 6 5 6-5 6m8 0h8'
-    : toolDisplay(item.title)?.output === 'search' ? 'M15 15l6 6M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0'
-      : 'M14 2H5v20h14V7zM14 2v6h5M8 12h8M8 16h8'
+  const path = item.title === 'bash' ? 'm4 6 5 6-5 6m8 0h8'
+    : 'M14 2H5v20h14V7zM14 2v6h5M8 12h8M8 16h8'
   return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d={path} /></svg>
 }

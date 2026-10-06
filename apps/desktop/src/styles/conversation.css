@@ -110,7 +110,7 @@
   font-family: var(--font-mono);
   font-size: 12.5px;
 }
-.timeline-body :not(pre):not(.diff-line) > code {
+.timeline-body :not(pre) > code {
   padding: 2px 5px;
   border: 1px solid var(--line);
   border-radius: 4px;
@@ -156,10 +156,6 @@
 .step-separator { flex: none; margin: 0 8px; color: var(--ink-faint); }
 .step-summary { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--ink-faint); }
 .step-summary.follows-end { text-overflow: clip; }
-.activity-toggle .diff-stat { margin-left: 8px; flex: none; font-size: 12px; }
-.activity-toggle:has(.diff-stat) .step-summary { flex: 0 1 auto; }
-.diff-stat.is-added { color: var(--positive); }
-.diff-stat.is-removed { color: var(--danger); }
 .activity-step.status-error .step-summary, .activity-step.status-error .step-icon { color: var(--danger); }
 .activity-toggle .item-status { margin-left: 8px; font-size: 12px; }
 .reasoning-row .step-summary { position: relative; }
@@ -179,9 +175,6 @@
 .terminal-command code { background: transparent !important; padding: 0 !important; border: 0 !important; }
 .timeline-section h4 { margin: 0; padding: 6px 14px; border-bottom: 1px solid var(--line); font: 12px var(--font-sans); color: var(--ink-soft); }
 .timeline-section + .timeline-section { border-top: 1px solid var(--line); }
-.diff-add { color: #16803c; background: #eaf8ef; }
-.diff-remove { color: #c03336; background: #fff0f0; }
-.diff-context { color: var(--ink-soft); }
 .turn-activity { width: fit-content; height: 26px; font-size: 14px; color: var(--ink-soft); }
 .activity-shimmer { background: linear-gradient(90deg, var(--ink-soft) 35%, var(--ink-faint) 50%, var(--ink-soft) 65%); background-size: 250% 100%; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: activity-shimmer 2.8s ease-in-out infinite; }
 .execution-title { --execution-color: var(--accent); background-image: linear-gradient(var(--execution-color), var(--execution-color)); background-size: 200% 100%; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: execution-shine .7s linear infinite paused; }
@@ -202,9 +195,7 @@
 @keyframes latest-dot-bounce { 0%, 50%, 100% { transform: translateY(0); } 25% { transform: translateY(-3px); } }
 @media (prefers-reduced-motion: reduce) { .return-to-latest i { animation: none; } }
 
-[data-theme=dark] .diff-add { color: #7ee7a2; background: #183528; }
 
-[data-theme=dark] .diff-remove { color: #ffa3aa; background: #45252a; }
 
 .stopped-marker { align-self: flex-start; padding: 0 6px; border-radius: 6px; background: var(--surface-hover); color: var(--ink-faint); font-size: 11px; line-height: 18px; }
 
@@ -222,18 +213,6 @@
 .tool-line { display: flex; white-space: pre; min-height: 1.5em; }
 .tool-line-number { min-width: 3.5em; padding-right: 1em; text-align: right; color: var(--ink-soft); user-select: none; flex-shrink: 0; }
 
-.activity-output:has(> .diff-files) { background: transparent; max-height: 360px; border-radius: 0; }
-.diff-files { display: grid; gap: 12px; }
-.diff-file { min-width: 0; border: 1px solid var(--line); overflow: hidden; background: var(--surface); }
-.diff-file-lines { overflow-x: auto; }
-.diff-hunk { min-width: max-content; }
-.diff-hunk + .diff-hunk { border-top: 6px solid var(--surface-muted); }
-.diff-line { display: flex; min-height: 24px; border-left: 4px solid transparent; font: 400 13px/1.8 var(--font-mono); }
-.diff-line.diff-add { border-left-color: #22a447; }
-.diff-line.diff-remove { border-left-color: #dc4449; }
-.diff-line-number { flex: 0 0 56px; padding-right: 12px; text-align: right; user-select: none; border-right: 2px solid var(--surface); font-variant-numeric: tabular-nums; }
-.diff-line code { tab-size: 4; display: block; padding: 0 20px; white-space: pre; font: inherit; background: transparent !important; }
-.diff-no-newline { padding: 0 20px 0 80px; color: var(--ink-faint); font-style: italic; }
 
 .message-body code { font-size: .875em; }
 .message-body h1 { font-size: 1.625em; }

@@ -44,7 +44,7 @@ where
 pub(crate) fn spec() -> super::super::registry::ToolSpec {
     super::super::registry::ToolSpec {
         name: "bash",
-        snippet: "Execute bash commands (ls, grep, find, etc.)",
+        snippet: "Run commands, search with rg, and edit or write files with Python or other commands",
         description: &DESCRIPTION,
         parameters: json!({
             "type": "object",

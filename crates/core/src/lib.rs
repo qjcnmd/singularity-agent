@@ -68,48 +68,21 @@ pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
 /// 用「临时文件 + 原子替换」把字节写入目标路径：先在同一个目录下写临时文件并 sync_all，再做
 /// 原子替换，读者看到的要么是完整的旧内容、要么是完整的新内容；写入或替换失败时删掉临时文件。
 pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    atomic_write(path, bytes, create_new_file, true)
+    atomic_write(path, bytes, true)
 }
 
 /// 原子创建新的数据文件：完整内容写入同目录临时文件后才公开目标路径；目标已存在时失败。
 pub fn atomic_create_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    atomic_write(path, bytes, create_new_file, false)
+    atomic_write(path, bytes, false)
 }
 
-/// 原子写入 workspace 文件，并保留文件原有权限；文件还不存在时使用 Windows
-/// 的创建默认权限。凭据等应用状态必须改用 `atomic_replace_bytes`。
-pub fn atomic_replace_workspace_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let permissions = match std::fs::metadata(path) {
-        Ok(metadata) => Some(metadata.permissions()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
-    atomic_write(
-        path,
-        bytes,
-        |temporary| {
-            let file = std::fs::OpenOptions::new().write(true).create_new(true).open(temporary)?;
-            if let Some(permissions) = &permissions {
-                file.set_permissions(permissions.clone())?;
-            }
-            Ok(file)
-        },
-        true,
-    )
-}
-
-fn atomic_write(
-    path: &std::path::Path,
-    bytes: &[u8],
-    create: impl FnOnce(&std::path::Path) -> std::io::Result<std::fs::File>,
-    replace_existing: bool,
-) -> std::io::Result<()> {
+fn atomic_write(path: &std::path::Path, bytes: &[u8], replace_existing: bool) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     // 临时名只需在目标目录中唯一，不依赖目标文件名的字符编码。
     let temporary = parent.join(format!(".singularity-tmp-{}", uuid::Uuid::new_v4().simple()));
     let result = (|| -> std::io::Result<()> {
-        let mut handle = create(&temporary)?;
+        let mut handle = create_new_file(&temporary)?;
         handle.write_all(bytes)?;
         handle.sync_all()?;
         Ok(())

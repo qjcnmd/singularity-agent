@@ -100,7 +100,6 @@ impl AssistantItemEvents {
                     output: execution.content,
                     images: execution.images.into_iter().map(|image| image.attachment).collect(),
                     is_error: execution.is_error,
-                    diff: execution.diff,
                     duration_ms: execution.duration_ms,
                     read_source: execution.read_source,
                 });

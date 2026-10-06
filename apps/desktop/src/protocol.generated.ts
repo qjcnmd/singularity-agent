@@ -28,7 +28,7 @@ export type FileCandidate = { path: string, };
 
 export type FileSearchParams = { workspaceId: string, query: string, limit: number, };
 
-export type HistoryItem = { "type": "request", startedAt?: string, observation: RequestObservation, } | { "type": "message", id: string, role: string, text: string, images?: Array<ImageAttachment>, } | { "type": "thinking", id: string, text: string, } | { "type": "tool_call", id: string, name: string, args: JsonValue, } | { "type": "tool_result", id: string, output: string, images?: Array<ImageAttachment>, diff?: string,
+export type HistoryItem = { "type": "request", startedAt?: string, observation: RequestObservation, } | { "type": "message", id: string, role: string, text: string, images?: Array<ImageAttachment>, } | { "type": "thinking", id: string, text: string, } | { "type": "tool_call", id: string, name: string, args: JsonValue, } | { "type": "tool_result", id: string, output: string, images?: Array<ImageAttachment>,
 /**
  * read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
  */
@@ -270,7 +270,7 @@ export type TurnEventEnvelope = { sessionRevision: number, } & ({ "method": "tur
 /**
  * 与历史共享的公开 occurrence 身份，不是 provider 在 wire 上的调用 ID。
  */
-item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, images?: Array<ImageAttachment>, isError: boolean, diff?: string, durationMs?: number,
+item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, images?: Array<ImageAttachment>, isError: boolean, durationMs?: number,
 /**
  * read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
  */

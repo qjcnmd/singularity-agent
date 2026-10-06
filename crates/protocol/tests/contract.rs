@@ -65,7 +65,7 @@ fn execution_turn(status: TurnStatus, usage: bool) -> Turn {
 /// 出现/省略的差异都会先在这张表上显形；方法词表由本表的标签集固定。
 #[test]
 fn turn_event_wire_goldens() {
-    let args = json!({"path": "src/main.rs", "old_string": "a"});
+    let args = json!({"path": "src/main.rs"});
     let cases: Vec<(&str, TurnEvent, &str)> = vec![
         (
             "turn/started",
@@ -112,11 +112,11 @@ fn turn_event_wire_goldens() {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 item: ItemRef { item_id: "call-1".to_string() },
-                tool_name: "edit".to_string(),
+                tool_name: "read".to_string(),
                 args,
                 started_at: "2026-09-08T00:00:00Z".into(),
             },
-            r#"{"args":{"old_string":"a","path":"src/main.rs"},"item":{"itemId":"call-1"},"startedAt":"2026-09-08T00:00:00Z","threadId":"thread-1","toolName":"edit","turnId":"turn-1"}"#,
+            r#"{"args":{"path":"src/main.rs"},"item":{"itemId":"call-1"},"startedAt":"2026-09-08T00:00:00Z","threadId":"thread-1","toolName":"read","turnId":"turn-1"}"#,
         ),
         (
             "tool/execution/update",
@@ -137,7 +137,6 @@ fn turn_event_wire_goldens() {
                 item: ItemRef { item_id: "call-1".to_string() },
                 output: "done".to_string(),
                 is_error: false,
-                diff: None,
                 duration_ms: None,
                 read_source: None,
             },
@@ -152,7 +151,6 @@ fn turn_event_wire_goldens() {
                 item: ItemRef { item_id: "call-2".to_string() },
                 output: "line".to_string(),
                 is_error: false,
-                diff: None,
                 duration_ms: Some(3),
                 read_source: Some(singularity_protocol::ReadSource { start_line: 1, line_count: 1 }),
             },

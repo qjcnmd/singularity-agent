@@ -1,9 +1,8 @@
 import { factStatusText, compactionTitle } from './copy'
-import { parsePatch, type StructuredPatch } from 'diff'
 import Anser from 'anser'
 import type { ExecutionItem, ExecutionTurn, FactStatus, SessionView } from './execution'
 
-type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'diff' | 'compaction' | 'terminal' | 'duration'
+type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'compaction' | 'terminal' | 'duration'
 
 export interface TimelineItemModel {
   key: string
@@ -12,13 +11,9 @@ export interface TimelineItemModel {
   fact: ExecutionItem | null
   summary: string
   filePath: string | null
-  addedLines: number
-  removedLines: number
   /** 条目自身状态；没有执行事实的运行时反馈（如正在压缩）用它表达状态。 */
   status?: FactStatus
   timing?: { startedAt: string; finishedAt?: string }
-  /** 工具展示的派生数据；工具运行事实本身只由顶层 fact 持有。 */
-  tool?: { diff: string; patches: StructuredPatch[] }
 }
 
 export function timelineStatus(item: TimelineItemModel): FactStatus {
@@ -74,19 +69,15 @@ function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null |
     if (!item) {
       const key = `content:${group}:${fact.id}`
       if (fact.kind === 'tool') {
-        const diff = fact.status === 'error' ? '' : fact.diff ?? ''
-        let patches: StructuredPatch[] = []
-        try { patches = parsePatch(diff) } catch { /* Malformed patches remain visible as their original text. */ }
         const filePath = pathFromArgs(fact.name, fact.args)
-        const stats = diffStats(patches)
         const summary = fact.status === 'error' ? failureSummary(fact.output)
           : filePath !== null ? displayPath(filePath, cwd, userHome) : toolSummary(fact.name, fact.args) || firstLine(fact.output)
-        item = { key, fact, kind: diff !== '' || toolDisplay(fact.name)?.output === 'diff' ? 'diff' : 'tool', title: fact.name === 'ask_user_question' ? '询问用户' : fact.name,
-          summary, filePath, addedLines: stats.added, removedLines: stats.removed, tool: { diff, patches } }
+        item = { key, fact, kind: 'tool', title: fact.name === 'ask_user_question' ? '询问用户' : fact.name,
+          summary, filePath }
       } else {
         const kind = fact.kind === 'compaction' || fact.kind === 'compaction_result' ? 'compaction' : fact.kind
         const title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'compaction' ? compactionTitle : kind
-        item = { key, fact, kind, title, summary: '', filePath: null, addedLines: 0, removedLines: 0 }
+        item = { key, fact, kind, title, summary: '', filePath: null }
       }
       projectedItems.set(fact, { item, cwd, userHome })
     }
@@ -97,7 +88,7 @@ function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null |
     result.splice(workStartIndex < 0 ? result.length : workStartIndex, 0, {
       key: `content:${group}:duration`, kind: 'duration', title: '',
       timing: { startedAt, finishedAt: turn.finishedAt },
-      fact: null, summary: '', filePath: null, addedLines: 0, removedLines: 0,
+      fact: null, summary: '', filePath: null,
     })
   }
   if (turn.status === 'interrupted') result.push(stoppedItem(`content:${group}:terminal`))
@@ -107,34 +98,16 @@ function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null |
 
 /** 压缩反馈行：标题固定，正文是这次压缩的状态或结果。 */
 function compactionItem(key: string, status: FactStatus, text: string): TimelineItemModel {
-  return { key, kind: 'compaction', title: compactionTitle, fact: null, summary: text, filePath: null, addedLines: 0, removedLines: 0, status }
+  return { key, kind: 'compaction', title: compactionTitle, fact: null, summary: text, filePath: null, status }
 }
 
 function stoppedItem(key = 'terminal:interrupted'): TimelineItemModel {
-  return { key, kind: 'terminal', title: factStatusText.cancelled, fact: null, summary: '', filePath: null, addedLines: 0, removedLines: 0 }
-}
-
-interface ToolDisplay {
-  argument: string
-  output: 'terminal' | 'search' | 'read' | 'diff'
-}
-
-const toolDisplays: Record<string, ToolDisplay | undefined> = {
-  bash: { argument: 'command', output: 'terminal' },
-  grep: { argument: 'pattern', output: 'search' },
-  glob: { argument: 'pattern', output: 'search' },
-  read: { argument: 'path', output: 'read' },
-  edit: { argument: 'path', output: 'diff' },
-  write: { argument: 'path', output: 'diff' },
-}
-
-export function toolDisplay(name: string): ToolDisplay | undefined {
-  return Object.hasOwn(toolDisplays, name) ? toolDisplays[name] : undefined
+  return { key, kind: 'terminal', title: factStatusText.cancelled, fact: null, summary: '', filePath: null }
 }
 
 export function toolArgument(name: string, args: unknown): string | null {
-  const display = toolDisplay(name)
-  const value = display ? record(args)[display.argument] : undefined
+  const input = record(args)
+  const value = name === 'bash' ? input.command : name === 'read' ? input.path : undefined
   return typeof value === 'string' ? value : null
 }
 
@@ -162,25 +135,10 @@ function displayPath(path: string, cwd: string, userHome?: string | null): strin
 }
 
 function pathFromArgs(name: string, args: unknown): string | null {
-  if (toolDisplay(name)?.argument !== 'path') return null
+  if (name !== 'read') return null
   const value = toolArgument(name, args)
   return value?.trim() ? value : null
 }
-
-function diffStats(patches: StructuredPatch[]): { added: number; removed: number } {
-  let added = 0
-  let removed = 0
-  for (const patch of patches) {
-    for (const hunk of patch.hunks) {
-      for (const line of hunk.lines) {
-        if (line.startsWith('+')) added += 1
-        if (line.startsWith('-')) removed += 1
-      }
-    }
-  }
-  return { added, removed }
-}
-
 
 function firstLine(text: string): string {
   return text.split(/\r?\n/, 1)[0]?.trim() ?? ''

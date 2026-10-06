@@ -8,11 +8,7 @@ use singularity_model::ModelToolSchema;
 use tokio_util::sync::CancellationToken;
 
 use super::bash;
-use super::edit;
-use super::glob;
-use super::grep;
 use super::read;
-use super::write;
 
 /// 一次工具执行的模型可见结果。工具自身的失败（路径不存在、参数非法、被取消等）
 /// 一律用 is_error=true 的结果表达，不走任何错误通道。
@@ -20,8 +16,6 @@ use super::write;
 pub struct ToolExecution {
     pub content: String,
     pub images: Vec<crate::image::InputImage>,
-    /// 实际的文件改动，供展示和历史使用；不进入模型输入。
-    pub diff: Option<String>,
     pub is_error: bool,
     /// 由派发者计量的墙钟耗时，不发给模型。
     pub duration_ms: Option<u64>,
@@ -36,16 +30,9 @@ impl ToolExecution {
             content: content.into(),
             images: Vec::new(),
             is_error: false,
-            diff: None,
             duration_ms: None,
             read_source: None,
         }
-    }
-
-    /// 附上文件差异。
-    pub fn with_diff(mut self, diff: String) -> Self {
-        self.diff = Some(diff);
-        self
     }
 
     pub fn with_read_source(mut self, source: singularity_protocol::ReadSource) -> Self {
@@ -59,21 +46,14 @@ impl ToolExecution {
 pub(crate) enum PreparedTool {
     Read(read::ReadArgs),
     Question(super::question::QuestionArgs),
-    Glob(glob::GlobArgs),
-    Grep(grep::GrepArgs),
     Bash(bash::BashArgs),
-    Edit(edit::EditArgs),
-    Write(write::WriteArgs),
     Mcp(singularity_mcp::McpTool, serde_json::Map<String, Value>),
 }
 
 impl PreparedTool {
     /// 只有只读工具可以重叠执行；变更类工具和 shell 命令是屏障。
     pub(crate) fn supports_parallel(&self) -> bool {
-        match self {
-            Self::Read(_) | Self::Glob(_) | Self::Grep(_) => true,
-            Self::Bash(_) | Self::Edit(_) | Self::Write(_) | Self::Mcp(..) | Self::Question(_) => false,
-        }
+        matches!(self, Self::Read(_))
     }
 
     /// 执行 ToolRegistrySnapshot::preflight 准备好的调用。失败也作为模型可见的
@@ -98,11 +78,7 @@ impl PreparedTool {
             }
             match &self {
                 Self::Read(args) => read::execute(args, ctx),
-                Self::Glob(args) => glob::execute(args, ctx),
-                Self::Grep(args) => grep::execute(args, ctx),
                 Self::Bash(args) => bash::execute(args, ctx),
-                Self::Edit(args) => edit::execute(args, ctx),
-                Self::Write(args) => write::execute(args, ctx),
                 Self::Question(_) => unreachable!("questions execute on the turn control plane"),
                 Self::Mcp(..) => unreachable!("MCP tools execute asynchronously"),
             }
@@ -148,7 +124,7 @@ pub(crate) struct ToolSpec {
 type ToolParser = fn(&Value) -> Result<PreparedTool, ToolExecution>;
 
 /// 一次 turn 内冻结的工具注册表快照；Default 会注册默认工具集
-/// （read/glob/grep/bash/edit/write）。提示词名单、provider schema、参数
+/// （bash/read）。提示词名单、provider schema、参数
 /// 校验和执行分发都由本模块维护；哪些调用可以并行由 PreparedTool 决定。
 #[derive(Debug)]
 pub(crate) struct ToolRegistrySnapshot {
@@ -164,11 +140,7 @@ impl Default for ToolRegistrySnapshot {
             mcp: Vec::new(),
             tools: vec![
                 (bash::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Bash)),
-                (edit::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Edit)),
-                (glob::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Glob)),
-                (grep::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Grep)),
                 (read::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Read)),
-                (write::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Write)),
             ],
         }
     }

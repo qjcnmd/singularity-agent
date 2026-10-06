@@ -64,7 +64,7 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
         }
         if (prompt) previousPrompt = prompt
       } else if (fact.kind === 'tool') {
-        item = { ...entry(fact.id, 'tool', fact.name, fact.diff ? `${fact.output}\n\n${fact.diff}` : fact.output),
+        item = { ...entry(fact.id, 'tool', fact.name, fact.output),
           input: fact.args, schema: previousPrompt?.tools.find(tool => tool.name === fact.name), duration: fact.duration ?? null }
       } else if (fact.kind === 'thinking') {
         item = { ...entry(fact.id, 'assistant', '助手'), thinking: fact.text }

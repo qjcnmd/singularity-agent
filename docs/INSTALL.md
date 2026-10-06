@@ -9,6 +9,8 @@ Singularity 当前发布目标为 Windows x86-64。发布包包含 Electron、�
 3. 安装 [Git for Windows](https://git-scm.com/install/windows)。程序先检查标准 Git 安装目录，再查找 `PATH` 中的 `bash.exe`；自定义安装位置可将 Git 的 `bin` 目录加入 `PATH`，不使用 Windows 的 WSL 启动器代替 Git Bash。
 4. 按目标项目需要安装 Python、Node.js、Rust 等工具链。
 
+Agent 使用 `read` 读取文本与图片，通过 `bash` 执行搜索、文本编辑和文件写入。使用 `rg`、Python 等命令前，将相应程序加入 `PATH`，使 Git Bash 可以调用；发布包不包含这些命令。
+
 验证安装：
 
 ```powershell

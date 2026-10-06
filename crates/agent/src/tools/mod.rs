@@ -5,19 +5,12 @@
 //! ToolRegistrySnapshot 完成参数校验与执行分发。
 
 pub mod bash;
-mod edit;
-mod glob;
-mod grep;
-pub(crate) mod line;
 mod mcp;
-pub(crate) mod mutation;
 mod question;
 mod read;
 mod registry;
-mod write;
 
 mod truncate;
-mod walk;
 
 pub use registry::ToolExecution;
 pub(crate) use registry::{ABORTED_MESSAGE, error_result};
