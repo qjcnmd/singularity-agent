@@ -68,7 +68,9 @@ impl Agent {
                     guard = &mut admission => break Some(guard.expect("tool admission remains open")),
                     event = receiver.recv(), if active > 0 => {
                         let event = event.expect("active tool retains its result sender");
-                        active -= usize::from(matches!(event, WorkerEvent::Ended { .. }));
+                        if matches!(event, WorkerEvent::Ended { .. }) {
+                            active -= 1;
+                        }
                         if let Err(error) = self.process_tool_event(event, on_event).await {
                             failure = Some(error);
                             break None;
@@ -150,7 +152,9 @@ impl Agent {
             {
                 failure = Some(error);
             }
-            active -= usize::from(ended);
+            if ended {
+                active -= 1;
+            }
         }
         failure.map_or(Ok(()), Err)
     }

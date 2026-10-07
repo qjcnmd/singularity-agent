@@ -50,29 +50,31 @@ fn context_insertion_index(
         return None;
     };
     let call_id = message.tool_call_id()?;
-    // 声明这个调用的 assistant 就是顺序来源：借用它的工具列表，一次查找同时得到
-    // 该调用在其中的序号，不必另建 ID 数组。
-    let (assistant_index, assistant, ordinal) =
-        context.iter().enumerate().rev().find_map(|(index, candidate)| {
-            let SessionEntry::Message { message, .. } = &session.entries()[candidate.index] else {
-                return None;
+    // 最近一次声明该调用的 assistant 决定工具结果的顺序。
+    for (assistant_index, candidate) in context.iter().enumerate().rev() {
+        let SessionEntry::Message { message: assistant, .. } = candidate.entry(session) else {
+            continue;
+        };
+        let Some(call_ordinal) = assistant.tool_calls().position(|call| call.tool_call_id == *call_id) else {
+            continue;
+        };
+        for (result_index, candidate) in context.iter().enumerate().skip(assistant_index + 1) {
+            let SessionEntry::Message { message: result, .. } = candidate.entry(session) else {
+                continue;
             };
-            let ordinal = message.tool_calls().position(|call| call.tool_call_id == *call_id)?;
-            Some((index, message, ordinal))
-        })?;
-    Some(
-        context
-            .iter()
-            .enumerate()
-            .skip(assistant_index + 1)
-            .find_map(|(index, candidate)| {
-                let SessionEntry::Message { message, .. } = &session.entries()[candidate.index] else {
-                    return None;
-                };
-                let id = message.tool_call_id()?;
-                let existing = assistant.tool_calls().position(|call| call.tool_call_id == *id)?;
-                (existing > ordinal).then_some(index)
-            })
-            .unwrap_or(context.len()),
-    )
+            let Some(result_call_id) = result.tool_call_id() else {
+                continue;
+            };
+            let Some(result_ordinal) =
+                assistant.tool_calls().position(|call| call.tool_call_id == *result_call_id)
+            else {
+                continue;
+            };
+            if result_ordinal > call_ordinal {
+                return Some(result_index);
+            }
+        }
+        return Some(context.len());
+    }
+    None
 }

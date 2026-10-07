@@ -53,10 +53,8 @@ impl PreparedCompaction {
         model: &ModelConfigurationSnapshot,
     ) -> crate::agent::Result<Self> {
         let overhead_tokens = definitions.estimated_tokens();
-        let mut instructions = definitions.model_messages();
-        instructions
-            .extend(crate::session::context::load_messages(prefix.messages, &prefix.image_directory)?);
-        let mut messages = instructions;
+        let mut messages = definitions.model_messages();
+        messages.extend(crate::session::context::load_messages(prefix.messages, &prefix.image_directory)?);
         let instruction = match prefix.previous_summary {
             Some(previous) => format!(
                 "<previous-summary>\n{previous}\n</previous-summary>\n\n{UPDATE_SUMMARY_INSTRUCTION}\n\n{SUMMARY_FORMAT}"

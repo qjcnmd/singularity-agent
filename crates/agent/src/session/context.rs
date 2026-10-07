@@ -61,7 +61,9 @@ fn context_token_estimate(entries: &[ContextPosition], session: &SessionData) ->
         tokens += position.token_estimate(session);
         if let SessionEntry::Message { message, .. } = position.entry(session) {
             calls += message.tool_calls().count();
-            results += usize::from(message.tool_call_id().is_some());
+            if message.tool_call_id().is_some() {
+                results += 1;
+            }
         }
     }
     let unknown_result_tokens =
@@ -155,11 +157,12 @@ impl ContextView {
         if cut == 0 {
             return None;
         }
-        let previous_summary = match entries[0].entry(session) {
-            SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
-            _ => None,
+        // 已有摘要交给更新指令，新摘要的对话前缀从它之后开始。
+        let (previous_summary, conversation_start) = match entries[0].entry(session) {
+            SessionEntry::Compaction { compaction, .. } => (Some(compaction.summary.clone()), 1),
+            _ => (None, 0),
         };
-        let selected = &entries[usize::from(previous_summary.is_some())..cut];
+        let selected = &entries[conversation_start..cut];
         let messages = project_messages(selected, session);
         if messages.is_empty() {
             return None;

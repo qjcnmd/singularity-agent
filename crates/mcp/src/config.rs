@@ -130,15 +130,17 @@ impl ServerConfig {
         let mut values: Vec<&str> = match &self.transport {
             TransportConfig::Stdio { env, .. } => env.values().map(String::as_str).collect(),
             TransportConfig::Http { url, headers } => {
-                std::iter::once(url.as_str())
-                    .chain(headers.values().map(String::as_str))
-                    .chain(headers.iter().filter_map(|(name, value)| {
-                        // 服务端错误可能只回显认证值，没有 Bearer / Basic 前缀。
-                        name.eq_ignore_ascii_case("authorization")
-                            .then(|| value.split_once(' ').map(|(_, value)| value.trim()))
-                            .flatten()
-                    }))
-                    .collect()
+                let mut values = vec![url.as_str()];
+                values.extend(headers.values().map(String::as_str));
+                for (name, value) in headers {
+                    // 服务端错误可能只回显认证值，没有 Bearer / Basic 前缀。
+                    if name.eq_ignore_ascii_case("authorization")
+                        && let Some((_, credential)) = value.split_once(' ')
+                    {
+                        values.push(credential.trim());
+                    }
+                }
+                values
             }
         };
         // 先替换完整长值，避免短值覆盖后留下另一个凭据的后缀。
