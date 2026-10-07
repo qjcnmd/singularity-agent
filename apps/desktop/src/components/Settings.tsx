@@ -53,9 +53,7 @@ export function Settings({ state }: { state: SettingsState }) {
     <Dialog open={state.settingsOpen} onClose={close} labelledBy="settings-title" className="sg-settings-modal">
       <header className="modal-header sg-modal-header">
         <h2 id="settings-title">设置</h2>
-        <div className="sg-modal-actions">
-          <button type="button" className="icon-button" data-autofocus onClick={close} aria-label="关闭设置">×</button>
-        </div>
+        <button type="button" className="icon-button" data-autofocus onClick={close} aria-label="关闭设置">×</button>
       </header>
       <div className="sg-settings-layout">
         <nav className="sg-settings-nav" aria-label="设置分类">

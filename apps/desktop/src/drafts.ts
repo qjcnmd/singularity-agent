@@ -50,19 +50,6 @@ export async function loadDrafts(): Promise<Record<string, Draft>> {
     cursor.continue()
   }
   await complete(transaction)
-  // 只迁移旧版文字草稿，成功提交后才删除旧键；已有新记录优先。
-  const prefix = 'singularity.app.view.v1:draft:'
-  for (let index = localStorage.length - 1; index >= 0; index--) {
-    const key = localStorage.key(index)
-    if (!key?.startsWith(prefix)) continue
-    const id = key.slice(prefix.length)
-    const text = localStorage.getItem(key) ?? ''
-    if (result[id] === undefined && text !== '') {
-      result[id] = { text, images: [] }
-      await persistDraft(id, result[id])
-    }
-    localStorage.removeItem(key)
-  }
   return result
 }
 

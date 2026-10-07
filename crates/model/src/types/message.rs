@@ -1,17 +1,6 @@
 use super::reasoning::ProviderReasoningReplay;
 use super::tool::ModelToolCall;
-use serde::{Deserialize, Serialize};
-
-/// 模型对话历史里可以出现的角色。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelRole {
-    System,
-    Developer,
-    User,
-    Assistant,
-    Tool,
-}
+pub use singularity_protocol::ModelRole;
 
 /// 发往模型提供方的一条消息，含继续本轮对话所需的工具调用信息。
 #[derive(Debug, Clone, PartialEq)]

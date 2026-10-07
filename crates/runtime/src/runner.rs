@@ -157,10 +157,10 @@ impl TurnRunner {
             // 执行期的存储/宿主故障不写可信终态；历史把未闭合 operation 投影为中断。
             // 链条到此停止。
             Err(error) => {
-                let (cause, code) = classify_agent_error(&error);
+                let cause = classify_agent_error(&error);
                 let detail = TurnErrorDetail { cause, message: error.to_string() };
-                if let Some(code) = code {
-                    return Err(fail_stop_execution(&thread.thread_id, &turn_id, detail, code, sink));
+                if cause == TurnFailureCause::Store {
+                    return Err(fail_stop_execution(&thread.thread_id, &turn_id, detail, sink));
                 }
                 (TurnStatus::Failed, false, Some(detail))
             }
@@ -256,23 +256,15 @@ impl TurnRunner {
         Ok((provider, config))
     }
     fn resolve_provider(&self, thread: &Thread) -> Result<Arc<dyn Provider + Send + Sync>, TurnRunError> {
-        let provider: Arc<dyn Provider + Send + Sync> = {
-            #[cfg(test)]
-            let overridden = self.provider_override.clone();
-            #[cfg(not(test))]
-            let overridden: Option<Arc<dyn Provider + Send + Sync>> = None;
-            match overridden {
-                Some(provider) => provider,
-                None => {
-                    let snapshot = self.models.snapshot();
-                    Arc::new(
-                        singularity_model::OpenAiProvider::from_snapshot(&snapshot, thread.model.as_deref())
-                            .map_err(|error| TurnRunError::Preparation(error.to_string()))?,
-                    )
-                }
-            }
-        };
-        Ok(provider)
+        #[cfg(test)]
+        if let Some(provider) = &self.provider_override {
+            return Ok(Arc::clone(provider));
+        }
+        let snapshot = self.models.snapshot();
+        Ok(Arc::new(
+            singularity_model::OpenAiProvider::from_snapshot(&snapshot, thread.model.as_deref())
+                .map_err(|error| TurnRunError::Preparation(error.to_string()))?,
+        ))
     }
 }
 

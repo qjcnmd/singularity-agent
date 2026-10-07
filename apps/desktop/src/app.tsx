@@ -145,7 +145,7 @@ export function App() {
 }
 
 const MainContent = memo(function MainContent({ compactViewport }: { compactViewport: boolean }) {
-  const state = useAppStore(['selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'bootstrap', 'sidebarCollapsed', 'trajectoryOpen', 'actionErrors', 'actionErrorOrigin', 'pendingActions', 'workspaceAppearance'])
+  const state = useAppStore(['selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'bootstrap', 'sidebarCollapsed', 'trajectoryOpen', 'actionErrors', 'actionErrorOrigin', 'pendingActions'])
   const items = useMemo(() => buildTimeline(state.session, state.bootstrap?.userHome), [state.session, state.bootstrap?.userHome])
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspaceSessions = appStore.sessions()

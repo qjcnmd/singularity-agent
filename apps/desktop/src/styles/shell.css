@@ -67,10 +67,6 @@
   background: var(--surface-hover);
   color: var(--ink);
 }
-.icon-button.danger:hover {
-  background: var(--danger-soft);
-  color: var(--danger);
-}
 .quiet-button {
   padding: 4px 8px;
   background: transparent;

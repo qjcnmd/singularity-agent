@@ -10,7 +10,6 @@ pub(crate) struct Bindings {
     config: Config,
     declarations: BTreeMap<String, String>,
     visited: HashSet<TypeId>,
-    extra: Vec<String>,
 }
 
 impl Bindings {
@@ -30,10 +29,6 @@ impl Bindings {
         }
         T::visit_dependencies(self);
     }
-
-    pub(crate) fn push(&mut self, declaration: String) {
-        self.extra.push(declaration);
-    }
 }
 
 impl TypeVisitor for Bindings {
@@ -48,9 +43,8 @@ pub fn client_types() -> String {
         config: Config::default().with_large_int("number"),
         declarations: BTreeMap::new(),
         visited: HashSet::new(),
-        extra: Vec::new(),
     };
-    crate::rpc::export_rpc_types(&mut bindings);
+    let rpc_contract = crate::rpc::export_rpc_types(&mut bindings);
     bindings.add::<crate::StreamEnvelope>();
     bindings.add::<crate::RpcResponse>();
     let mut output = String::from(
@@ -58,7 +52,7 @@ pub fn client_types() -> String {
     );
     output.push_str(&bindings.declarations.into_values().collect::<Vec<_>>().join("\n\n"));
     output.push_str("\n\n");
-    output.push_str(&bindings.extra.join("\n\n"));
+    output.push_str(&rpc_contract);
     // 固定枚举的字符串序列没有可失败的 JSON 值，生成器与运行时共享同一份字段清单。
     let field_names =
         serde_json::to_string(&crate::ModelConfigurationField::ALL).expect("field names serialize");

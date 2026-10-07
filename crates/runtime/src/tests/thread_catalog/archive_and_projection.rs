@@ -86,28 +86,7 @@ fn thread_cwd_projects_one_usable_shape_across_every_surface() {
     assert_thread_cwd_shape(&fixture, &catalog, &workspace.join(".").join("."));
     // Windows 上 canonicalize 返回带扩展前缀的规范路径。
     let canonical = std::fs::canonicalize(&workspace).expect("canonical workspace");
-    let seeded = assert_thread_cwd_shape(&fixture, &catalog, &canonical);
-
-    // 会话头可以包含 //?/ 前缀。header 只在创建时写出、之后不
-    // 重写，因此在解析侧归一化路径。该形状只可能
-    // 在 Windows 上产生，其余平台跳过这一段。
-    if cfg!(windows) {
-        let file = session_path(&fixture, &seeded.thread_id);
-        let text = std::fs::read_to_string(&file).expect("session file");
-        let patched =
-            text.replace(&format!("\"cwd\":\"{}\"", seeded.cwd), &format!("\"cwd\":\"//?/{}\"", seeded.cwd));
-        assert_ne!(patched, text, "the fixture does not store the projected cwd");
-        std::fs::write(&file, patched).expect("write legacy-shaped header");
-        let resumed = catalog.resume_thread(&seeded.thread_id).expect("resume legacy-shaped session");
-        assert_eq!(resumed.cwd, seeded.cwd, "a stored verbatim cwd reaches the Thread projection unchanged");
-        let listed = catalog
-            .list_threads()
-            .expect("list")
-            .into_iter()
-            .find(|entry| entry.thread_id == seeded.thread_id)
-            .expect("listed thread");
-        assert_eq!(listed.cwd, seeded.cwd, "a stored verbatim cwd reaches the listing");
-    }
+    assert_thread_cwd_shape(&fixture, &catalog, &canonical);
 }
 
 /// 会话累计用量汇总整份账本中各次请求的终态观测，

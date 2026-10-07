@@ -15,32 +15,7 @@ import type { SessionModelUsage } from './protocol'
  */
 export function sessionUsage(session: SessionView | null): SessionModelUsage | null {
   if (session === null) return null
-  const base = session.summary.usage
-  const live = liveUsage(session)
-  const usage: SessionModelUsage = {
-    ttftMs: base.ttftMs + live.ttftMs,
-    ttftRequests: base.ttftRequests + live.ttftRequests,
-    inputTokens: base.inputTokens + live.inputTokens,
-    cachedInputTokens: base.cachedInputTokens + live.cachedInputTokens,
-    outputTokens: base.outputTokens + live.outputTokens,
-    totalTokens: base.totalTokens + live.totalTokens,
-    decodeTokens: base.decodeTokens + live.decodeTokens,
-    decodeMs: base.decodeMs + live.decodeMs,
-    cacheUsageComplete: base.cacheUsageComplete && live.cacheUsageComplete,
-    generationMs: base.generationMs + live.generationMs,
-    usagePresent: base.usagePresent || live.usagePresent,
-  }
-  return usage.usagePresent || usage.ttftRequests > 0 ? usage : null
-}
-
-/** 活动回合的请求观测（每个 requestId 仅一条）；计时和消费各按实际记录合计。 */
-function liveUsage(session: SessionView): SessionModelUsage {
-  const usage: SessionModelUsage = {
-    ttftMs: 0, ttftRequests: 0,
-    inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0,
-    decodeTokens: 0, decodeMs: 0, cacheUsageComplete: true,
-    generationMs: 0, usagePresent: false,
-  }
+  const usage = { ...session.summary.usage }
   for (const turn of session.facts.active) {
     for (const item of turn.items) {
       if (item.kind !== 'request') continue
@@ -63,7 +38,7 @@ function liveUsage(session: SessionView): SessionModelUsage {
       usage.usagePresent = true
     }
   }
-  return usage
+  return usage.usagePresent || usage.ttftRequests > 0 ? usage : null
 }
 
 /** 缓存命中率：分母是输入（不含输出）；没有输入时无定义。 */

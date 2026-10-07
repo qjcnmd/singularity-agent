@@ -76,12 +76,6 @@ pub enum TurnEvent {
         )]
         images: Vec<crate::ImageAttachment>,
     },
-    #[serde(rename = "item/started")]
-    ItemStarted {
-        thread_id: String,
-        turn_id: String,
-        item: ItemRef,
-    },
     #[serde(rename = "item/agentMessage/delta")]
     AssistantDelta {
         thread_id: String,
@@ -234,7 +228,6 @@ pub enum ProviderAttemptStatus {
 pub enum TurnFailureCause {
     Store,
     ProjectInstructions,
-    Workspace,
     ProviderRateLimited,
     ProviderNetwork,
     ProviderTimeout,

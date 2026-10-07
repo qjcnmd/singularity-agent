@@ -248,7 +248,7 @@ impl ModelConfigManager {
 /// 把本次提交的模型输入转成要落盘的模型映射：只做纯转换，不读写配置和凭据；模型 id、容量、
 /// 档位和重复项的校验都在返回前完成，调用方拿到完整映射后才提交，失败不会留下写了一半的结果。
 ///
-/// 旧配置里那些表单上没有的能力标记按模型 id 保留；旧配置里没有的模型不参与转换。
+/// 已保存但未在表单中展示的能力标记按模型 id 保留；已移除的模型不参与转换。
 fn model_definitions(
     models: Vec<ModelConfigurationInput>,
     provider_protocol: Option<&str>,

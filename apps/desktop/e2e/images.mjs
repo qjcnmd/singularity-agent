@@ -56,11 +56,7 @@ const settle = async sessionId => {
   throw new Error(`Task did not settle: ${sessionId}`)
 }
 const select = async sessionId => {
-  await page.evaluate(({ sessionId, workspaceId }) => {
-    const key = 'singularity.app.view.v1'
-    const view = JSON.parse(localStorage.getItem(key) ?? '{}')
-    localStorage.setItem(key, JSON.stringify({ ...view, selectedSessionId: sessionId, selectedWorkspaceId: workspaceId }))
-  }, { sessionId, workspaceId: workspace.workspaceId })
+  await page.locator('.session-main').filter({ has: page.getByText(sessionId, { exact: true }) }).click()
   await page.reload()
   await page.getByRole('textbox', { name: '任务说明' }).waitFor()
   await page.waitForFunction(() => !document.querySelector('textarea[aria-label="任务说明"]')?.disabled)
@@ -68,6 +64,7 @@ const select = async sessionId => {
 const create = async selector => {
   const session = await rpc('session.create', { workspaceId: workspace.workspaceId })
   const id = session.history.summary.threadId
+  await rpc('session.rename', { sessionId: id, name: id })
   await rpc('session.updateSettings', { sessionId: id, selector })
   await select(id)
   return id
@@ -102,11 +99,7 @@ try {
 
   const id = await create('image-check/chat')
   const textbox = page.getByRole('textbox', { name: '任务说明' })
-  await page.evaluate(id => localStorage.setItem(`singularity.app.view.v1:draft:${id}`, '旧版文字草稿'), id)
   await select(id)
-  assert.equal(await textbox.inputValue(), '旧版文字草稿')
-  assert.equal(await page.evaluate(id => localStorage.getItem(`singularity.app.view.v1:draft:${id}`), id), null)
-  record('legacy-text-draft-migration', true)
   await textbox.fill('图文草稿')
   await page.getByRole('button', { name: '展开任务工具', exact: true }).click()
   await page.getByRole('button', { name: '添加图片', exact: true }).waitFor({ state: 'visible' })

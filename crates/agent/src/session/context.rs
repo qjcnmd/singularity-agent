@@ -5,7 +5,7 @@
 
 mod resolution;
 
-use self::resolution::{apply_context_entry, resolve_context_entries};
+use self::resolution::resolve_context_entries;
 
 use singularity_model::{ModelMessage, ModelRole};
 
@@ -72,7 +72,6 @@ fn context_token_estimate(entries: &[ContextPosition], session: &SessionData) ->
 enum ContextEntry<'a> {
     Message(&'a AgentMessage),
     Summary(&'a str),
-    SkillInstructions(&'a str),
 }
 
 /// 把 ledger 条目穷尽分类；计量、保留边界和请求投影共用这一处可见性判断。
@@ -80,16 +79,7 @@ fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
     match entry {
         SessionEntry::Message { message, .. } => Some(ContextEntry::Message(message)),
         SessionEntry::Compaction { compaction, .. } => Some(ContextEntry::Summary(&compaction.summary)),
-        SessionEntry::Metadata { .. } => None,
-        SessionEntry::Record { record, .. } => match record {
-            LedgerRecord::SkillInstructions { text } => Some(ContextEntry::SkillInstructions(text)),
-            LedgerRecord::ToolResultPruned { .. }
-            | LedgerRecord::AssistantInterrupted { .. }
-            | LedgerRecord::ModelRequest { .. }
-            | LedgerRecord::RequestDefinitions { .. }
-            | LedgerRecord::OperationStarted { .. }
-            | LedgerRecord::OperationFinished { .. } => None,
-        },
+        SessionEntry::Metadata { .. } | SessionEntry::Record { .. } => None,
     }
 }
 
@@ -98,7 +88,6 @@ pub(crate) fn entry_token_estimate(entry: &SessionEntry) -> u64 {
     match context_entry(entry) {
         Some(ContextEntry::Message(message)) => message_token_estimate(message),
         Some(ContextEntry::Summary(summary)) => estimate_tokens_of(&compaction_summary(summary)) + 8,
-        Some(ContextEntry::SkillInstructions(text)) => estimate_tokens_of(text) + 8,
         None => 0,
     }
 }
@@ -130,11 +119,9 @@ fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
     tokens
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub(crate) struct ContextView {
     entries: Vec<ContextPosition>,
-    /// 历史与模型投影补入结果的估算值；usage 基线缺失时用它计量。
-    estimated_tokens: u64,
 }
 
 /// 已按工具配对边界选好的摘要前缀。
@@ -151,8 +138,7 @@ impl ContextView {
     /// 按已保存的压缩与剪枝边界还原模型历史；边界在生成记录时确定。
     pub(crate) fn derive(session: &SessionData) -> Self {
         let entries = resolve_context_entries(session);
-        let estimated_tokens = context_token_estimate(&entries, session);
-        Self { entries, estimated_tokens }
+        Self { entries }
     }
 
     pub(crate) fn messages(&self, session: &SessionData) -> Vec<ContextMessage> {
@@ -211,26 +197,9 @@ impl ContextView {
             .collect()
     }
 
-    /// 已提交历史的缓存估价；本轮请求开销与实测校正由 Agent 添加。
-    pub(crate) fn estimated_tokens(&self) -> u64 {
-        self.estimated_tokens
-    }
-
-    /// 把刚提交的日志位置推进到视图里；追加与重新打开走同一套排序规则。
-    pub(crate) fn append_entry(&mut self, session: &SessionData, index: usize) {
-        let entry = &session.entries()[index];
-        let replaced =
-            apply_context_entry(&mut self.entries, ContextPosition { index, pruned_index: None }, session);
-        if let Some(previous) = replaced {
-            // 剪枝只替换结果内容，工具配对及其补齐估价不变。
-            let current = ContextPosition { pruned_index: Some(index), ..previous };
-            self.estimated_tokens =
-                self.estimated_tokens - previous.token_estimate(session) + current.token_estimate(session);
-        } else if matches!(entry, SessionEntry::Compaction { .. }) {
-            self.estimated_tokens = context_token_estimate(&self.entries, session);
-        } else if is_context_entry(entry) {
-            self.estimated_tokens = self.estimated_tokens.saturating_add(entry_token_estimate(entry));
-        }
+    /// 按当前模型投影估算历史；本轮请求开销与实测校正由 Agent 添加。
+    pub(crate) fn estimated_tokens(&self, session: &SessionData) -> u64 {
+        context_token_estimate(&self.entries, session)
     }
 }
 
@@ -273,7 +242,7 @@ impl ContextPosition {
         }
     }
 
-    /// 对话历史、Skill 与摘要前缀共用同一套消息投影；文件指令由 Agent 加入。
+    /// 对话历史与摘要前缀共用同一套消息投影；文件指令由 Agent 加入。
     fn model_message(&self, session: &SessionData) -> ContextMessage {
         let message = match context_entry(self.entry(session))
             .expect("context position references a context entry")
@@ -302,7 +271,6 @@ impl ContextPosition {
             ContextEntry::Summary(summary) => {
                 ModelMessage::text(ModelRole::User, compaction_summary(summary))
             }
-            ContextEntry::SkillInstructions(text) => ModelMessage::text(ModelRole::User, text),
         };
         let images = match self.entry(session) {
             SessionEntry::Message { .. } => self
@@ -370,10 +338,10 @@ fn find_cut_point(entries: &[ContextPosition], session: &SessionData, keep_recen
 }
 
 /// 工具结果已经按调用顺序紧随 assistant；切点不能拆开这个工具单元。
-/// 缺失结果由模型投影补齐，Skill 与触发它的用户输入也一同保留。
+/// 缺失结果由模型投影补齐。
 fn last_balanced_cut(entries: &[ContextPosition], session: &SessionData, upper_bound: usize) -> usize {
     let mut cut = 0usize;
-    for (position, candidate) in entries.iter().take(upper_bound).enumerate() {
+    for position in 0..upper_bound {
         let next_is_tool_result = entries.get(position + 1).is_some_and(|next| {
             matches!(
                 next.entry(session),
@@ -383,15 +351,7 @@ fn last_balanced_cut(entries: &[ContextPosition], session: &SessionData, upper_b
                 }
             )
         });
-        if !next_is_tool_result
-            && !matches!(
-                candidate.entry(session),
-                SessionEntry::Record {
-                    record: LedgerRecord::SkillInstructions { .. },
-                    ..
-                }
-            )
-        {
+        if !next_is_tool_result {
             cut = position + 1;
         }
     }

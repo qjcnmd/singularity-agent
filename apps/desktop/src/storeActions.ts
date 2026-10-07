@@ -12,7 +12,7 @@ const inlineActionPrefixes = [actionOrigin.control('', ''), actionOrigin.provide
 
 /** 这些动作在对应控件显示错误；目录选择器的错误仍显示在工作台。 */
 export function hasInlineActionError(origin: string): boolean {
-  return origin !== actionOrigin.directoryPicker && inlineActionPrefixes.some(prefix => origin.startsWith(prefix))
+  return inlineActionPrefixes.some(prefix => origin.startsWith(prefix))
 }
 
 /** 待处理动作键：方法名与来源。查询方按同一规则在已订阅的 pendingActions

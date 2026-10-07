@@ -4,11 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// 这次 provider 请求的发起原因；摘要请求和生成请求共用同一套计量。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RequestPurpose {
-    #[default]
     Generation,
     Compaction,
 }
@@ -26,18 +25,17 @@ pub struct RequestObservation {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub request_head: Option<Box<crate::ModelRequestSnapshot>>,
-    #[serde(default)]
     pub purpose: RequestPurpose,
     pub attempt: u32,
     pub provider: String,
     pub model: String,
     pub status: crate::ProviderAttemptStatus,
     pub duration_ms: u64,
-    /// 请求开始到首个生成增量的实测耗时；旧记录未采集时保持未知。
+    /// 请求开始到首个生成增量的实测耗时；没有生成增量时保持未知。
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub ttft_ms: Option<u64>,
-    /// 首个生成增量到请求完成的耗时；旧记录未采集时保持未知。
+    /// 首个生成增量到请求完成的耗时；没有生成增量时保持未知。
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub decode_ms: Option<u64>,
@@ -276,8 +274,8 @@ pub struct SummaryTurn {
     #[serde(rename = "threadId", skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub usage: Option<TurnModelUsage>,
-    /// 只在截断终态出现；非截断终态会省略这个键（对老客户端是加法兼容）。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// 只在截断终态出现；非截断终态会省略这个键。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
 

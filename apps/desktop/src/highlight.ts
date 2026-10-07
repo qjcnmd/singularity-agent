@@ -1,6 +1,6 @@
 /**
  * 公共代码高亮：Shiki 引擎、明暗双主题 token，以及消费 token 的 React 绑定。
- * Markdown 代码块与 Diff 都从这里取高亮结果，不各自持有或从对方转发。
+ * Markdown 代码块从这里取高亮结果。
  */
 import { createElement, useEffect, useMemo, useState, type CSSProperties } from 'react'
 
@@ -25,7 +25,7 @@ const LANGUAGE_ALIASES: Record<string, LanguageId> = {
 }
 
 /** 将围栏语言名或文件扩展名解析为已加载语言；未知语言保留纯文本。 */
-export function languageIdFor(language: string): LanguageId | 'text' {
+function languageIdFor(language: string): LanguageId | 'text' {
   const name = language.trim().split(/\s+/)[0].toLowerCase()
   if (Object.hasOwn(LANGUAGE_LOADERS, name)) return name as LanguageId
   return Object.hasOwn(LANGUAGE_ALIASES, name) ? LANGUAGE_ALIASES[name] : 'text'
@@ -70,8 +70,7 @@ function loadLanguage(language: LanguageId): Promise<Highlighter> {
   return pending
 }
 
-function tokenize(highlighter: Highlighter, code: string, language: string): HighlightedLines {
-  const lang = languageIdFor(language)
+function tokenize(highlighter: Highlighter, code: string, lang: LanguageId): HighlightedLines {
   // 明暗两套配色由库一次给出；defaultColor: false 让样式只保留 CSS 变量，
   // 由样式表按当前主题选用其中之一。
   return highlighter.codeToTokens(code, {
@@ -81,7 +80,7 @@ function tokenize(highlighter: Highlighter, code: string, language: string): Hig
   }).tokens
 }
 
-/** 单行高亮 token 的库类型；两个消费者只通过下面的 hook/渲染器使用它。 */
+/** 单行高亮 token 的库类型。 */
 type CodeLine = HighlightedLines[number]
 
 /** 只把异步资源就绪存入状态；token 由当前代码派生，不再经 Promise 写回状态。
@@ -106,9 +105,9 @@ export function useCodeTokens(code: string, language: string) {
   }, [loaded, code, lang])
 }
 
-/** 单行高亮 token；`undefined` 表示该行还没有高亮结果，调用方落回原文。 */
-export function CodeTokens({ tokens, fallback }: { tokens?: CodeLine; fallback: string }) {
-  return tokens === undefined ? fallback : tokens.map((token, column) => createElement('span', {
+/** 高亮就绪后的单行 token。 */
+export function CodeTokens({ tokens }: { tokens: CodeLine }) {
+  return tokens.map((token, column) => createElement('span', {
     key: column,
     className: 'code-token',
     style: {

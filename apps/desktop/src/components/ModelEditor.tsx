@@ -130,7 +130,6 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
     const output = parseCapacity(draft.outputText)
     if (context == null || output == null) return '上下文窗口和最大输出 Token 应为正整数，可使用 K / M。'
     if (output >= context) return '最大输出 Token 必须小于上下文窗口。'
-    const variants = draft.reasoningVariants ?? []
     if (variants.some(v => !v.id || /[\s/#]/.test(v.id) || (v.wireEffort !== null && /[\s/#]/.test(v.wireEffort)))) return '思考选项及线上档位不能包含空格、/ 或 #。'
     if (new Set(variants.map(v => v.id)).size !== variants.length) return '思考选项不能重名。'
     if (variants.length && !variants.some(v => v.id === draft.defaultVariant)) return '请选择默认思考选项。'

@@ -8,13 +8,8 @@ pub(super) fn resolve_context_entries(session: &SessionData) -> Vec<ContextPosit
     context
 }
 
-/// 将已提交的日志作用于上下文位置；追加与重新打开共用替换、Skill 相邻和工具结果排序规则。
-/// 剪枝时返回替换前的位置，供追加路径差量更新估价。
-pub(super) fn apply_context_entry(
-    context: &mut Vec<ContextPosition>,
-    position: ContextPosition,
-    session: &SessionData,
-) -> Option<ContextPosition> {
+/// 按账本顺序应用摘要、剪枝和工具结果排序规则。
+fn apply_context_entry(context: &mut Vec<ContextPosition>, position: ContextPosition, session: &SessionData) {
     match position.entry(session) {
         SessionEntry::Compaction { compaction, .. } => {
             let index = context
@@ -23,7 +18,7 @@ pub(super) fn apply_context_entry(
                 .expect("compaction retains an active context entry");
             context.drain(..index);
             context.insert(0, position);
-            return None;
+            return;
         }
         SessionEntry::Record {
             record: LedgerRecord::ToolResultPruned { entry_id, .. },
@@ -33,33 +28,17 @@ pub(super) fn apply_context_entry(
                 .iter_mut()
                 .find(|candidate| candidate.entry(session).id() == entry_id)
                 .expect("pruning references an active tool result");
-            let previous = *original;
             original.pruned_index = Some(position.index);
-            return Some(previous);
+            return;
         }
-        entry if !is_context_entry(entry) => return None,
+        entry if !is_context_entry(entry) => return,
         _ => {}
-    }
-    // 手动 Skill 记录在触发它的用户消息之后落盘；模型视图把它放在该输入之前，
-    // 保留用户输入作为本轮最后的指令。文件指令不在历史内，不影响这个邻接关系。
-    if matches!(
-        &session.entries()[position.index],
-        SessionEntry::Record {
-            record: LedgerRecord::SkillInstructions { .. },
-            ..
-        }
-    ) && context.last().is_some_and(|last| {
-        matches!(last.entry(session), SessionEntry::Message { message: AgentMessage::User { .. }, .. })
-    }) {
-        context.insert(context.len() - 1, position);
-        return None;
     }
     if let Some(insert_at) = context_insertion_index(context, &session.entries()[position.index], session) {
         context.insert(insert_at, position);
     } else {
         context.push(position);
     }
-    None
 }
 
 fn context_insertion_index(

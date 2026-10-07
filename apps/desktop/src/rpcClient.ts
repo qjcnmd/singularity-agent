@@ -49,9 +49,8 @@ export class RpcClient {
     this.unsubscribe = window.singularity.onFrame(frame => this.accept(frame))
     this.unsubscribeFailure = window.singularity.onFailure(() => this.onStatus('recovering'))
     this.onStatus('connecting')
-    void window.singularity.connect().then(frame => {
-      if (!this.stopped) this.accept(frame)
-    }).catch(() => { if (!this.stopped) this.onStatus('recovering') })
+    void window.singularity.connect().then(frame => this.accept(frame))
+      .catch(() => { if (!this.stopped) this.onStatus('recovering') })
   }
 
   stop(): void {

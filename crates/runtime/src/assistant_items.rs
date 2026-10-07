@@ -28,7 +28,7 @@ impl AssistantItemEvents {
         match event {
             AgentEvent::MessageUpdate { message_id, delta } => {
                 let item =
-                    self.start_assistant_item(sink, singularity_agent::session::text_item_id(&message_id, 0));
+                    self.start_assistant_item(singularity_agent::session::text_item_id(&message_id, 0));
                 sink(TurnEvent::AssistantDelta {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
@@ -37,8 +37,8 @@ impl AssistantItemEvents {
                 });
             }
             AgentEvent::ThinkingUpdate { message_id, delta } => {
-                let item = self
-                    .start_assistant_item(sink, singularity_agent::session::thinking_item_id(&message_id, 0));
+                let item =
+                    self.start_assistant_item(singularity_agent::session::thinking_item_id(&message_id, 0));
                 sink(TurnEvent::AssistantThinkingDelta {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
@@ -64,7 +64,7 @@ impl AssistantItemEvents {
                 // 完成事件里只有正文和思考（生产侧已按 ItemScope::Completion 物化过），
                 // 这里不必再筛一次它自己的产物。
                 for content in items {
-                    let item = self.start_assistant_item(sink, content.id().to_string());
+                    let item = self.start_assistant_item(content.id().to_string());
                     self.finish_assistant_item(sink, &item.item_id, failed, Some(content));
                 }
                 for item_id in [
@@ -142,16 +142,9 @@ impl AssistantItemEvents {
         }
     }
 
-    fn start_assistant_item(&mut self, sink: &mut dyn FnMut(TurnEvent), item_id: String) -> ItemRef {
-        let item = ItemRef { item_id };
-        if self.open_assistant_items.insert(item.item_id.clone()) {
-            sink(TurnEvent::ItemStarted {
-                thread_id: self.thread_id.clone(),
-                turn_id: self.turn_id.clone(),
-                item: item.clone(),
-            });
-        }
-        item
+    fn start_assistant_item(&mut self, item_id: String) -> ItemRef {
+        self.open_assistant_items.insert(item_id.clone());
+        ItemRef { item_id }
     }
 
     fn finish_assistant_item(

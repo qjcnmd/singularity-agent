@@ -1,8 +1,8 @@
-//! 轨迹里提示词与工具定义的快照；对话内容不在这里建索引。
+//! 轨迹里提示词与工具定义的快照及引用解析。
 use super::manager::SessionData;
 use super::{LedgerRecord, SessionEntry};
 use serde::{Deserialize, Serialize};
-use singularity_model::{ModelMessage, ModelRole, ModelToolSchema};
+use singularity_model::{ModelMessage, ModelToolSchema};
 use singularity_protocol::{ModelRequestSnapshot, RequestMessage, RequestPreferences, RequestTool};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -31,14 +31,7 @@ impl RequestDefinitions {
             messages: messages
                 .iter()
                 .map(|message| RequestMessage {
-                    role: match message.role {
-                        ModelRole::System => "system",
-                        ModelRole::Developer => "developer",
-                        ModelRole::User => "user",
-                        ModelRole::Assistant => "assistant",
-                        ModelRole::Tool => "tool",
-                    }
-                    .into(),
+                    role: message.role,
                     content: message.content.clone(),
                 })
                 .collect(),
@@ -63,14 +56,11 @@ impl RequestDefinitions {
         instructions + tools
     }
 
-    /// 持久化边界恢复完整指令前缀；角色解析失败按会话数据错误报告。
-    pub(crate) fn model_messages(&self) -> super::Result<Vec<ModelMessage>> {
+    /// 从已解析的定义恢复完整指令前缀。
+    pub(crate) fn model_messages(&self) -> Vec<ModelMessage> {
         self.messages
             .iter()
-            .map(|message| {
-                let role = serde_json::from_value(serde_json::Value::String(message.role.clone()))?;
-                Ok(ModelMessage::text(role, &message.content))
-            })
+            .map(|message| ModelMessage::text(message.role, &message.content))
             .collect()
     }
 }
@@ -85,42 +75,34 @@ pub struct RequestContext {
 }
 
 impl SessionData {
-    pub(super) fn observe_definitions(&mut self, position: usize) {
-        if let SessionEntry::Record {
-            id,
-            record: LedgerRecord::RequestDefinitions { .. },
-            ..
-        } = &self.entries[position]
-        {
-            self.definitions.insert(id.clone(), position);
-        }
-    }
-
     /// 最近一次请求实际使用的指令与工具，供独立压缩复用。
     pub(crate) fn latest_request_definitions(&self) -> Option<(&str, &RequestDefinitions)> {
-        let position = *self.definitions.values().max()?;
-        let SessionEntry::Record {
-            id,
-            record: LedgerRecord::RequestDefinitions { definitions },
-            ..
-        } = &self.entries[position]
-        else {
-            unreachable!("definition index references its ledger record")
-        };
-        Some((id, definitions))
+        self.entries.iter().rev().find_map(|entry| match entry {
+            SessionEntry::Record {
+                id,
+                record: LedgerRecord::RequestDefinitions { definitions },
+                ..
+            } => Some((id.as_str(), definitions)),
+            _ => None,
+        })
     }
 
     /// 展开请求记录引用的提示词与工具；不涉及对话内容。
     pub fn request_head(&self, context: &RequestContext) -> Box<ModelRequestSnapshot> {
         // 定义先于引用写入；追加失败后写者不再接受后续记录。
-        let position = self.definitions[&context.definitions];
-        let SessionEntry::Record {
-            record: LedgerRecord::RequestDefinitions { definitions },
-            ..
-        } = &self.entries[position]
-        else {
-            unreachable!()
-        };
+        let definitions = self
+            .entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                SessionEntry::Record {
+                    id,
+                    record: LedgerRecord::RequestDefinitions { definitions },
+                    ..
+                } if id == &context.definitions => Some(definitions),
+                _ => None,
+            })
+            .expect("request references an earlier definition record");
         definitions.snapshot(&context.definitions, &context.model_preferences)
     }
 }

@@ -159,12 +159,9 @@ impl CaptureState {
         }
         let tail_result = truncate_tail(&self.tail);
         let total_lines = self.total_lines();
-        // 尾部缓冲本身没被裁剪时，截断只可能来自累计输出：按累计的行数或字节数区分原因。
-        let truncated_by = match tail_result.truncated_by {
-            Some(reason) => reason,
-            None if self.total_bytes > DEFAULT_MAX_BYTES => TruncatedBy::Bytes,
-            None => TruncatedBy::Lines,
-        };
+        // 尾部缓冲上限是展示字节预算的两倍；丢弃前缀后仍超过展示预算，
+        // 未丢弃时则保留全部累计输出。因此这里必然带有截断原因。
+        let truncated_by = tail_result.truncated_by.expect("truncated capture exceeds display budget");
         let start_line = total_lines.saturating_sub(tail_result.output_lines) + 1;
         let end_line = total_lines;
         let note = if tail_result.last_line_partial {

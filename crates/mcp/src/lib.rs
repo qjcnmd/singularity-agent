@@ -81,11 +81,10 @@ impl McpManager {
 
     /// 返回设置编辑所需的配置；只走私有桌面 RPC，不进入会话与模型请求。
     pub fn list(&self) -> Result<Vec<McpServerInput>, String> {
-        let _connections = self.lock();
         Ok(config::read(&self.home)?
             .servers
-            .iter()
-            .map(|(id, config)| config.input(id.clone()))
+            .into_iter()
+            .map(|(id, config)| config.into_input(id))
             .collect())
     }
 

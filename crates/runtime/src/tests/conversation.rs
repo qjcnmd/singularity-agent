@@ -48,27 +48,6 @@ fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
         .count()
 }
 
-/// 最后一条 thread_settings 记录反推的 selector（与 resume 投影的
-/// last-wins 组合规则一致）。
-fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option<String> {
-    SessionData::open(&sessions.join(singularity_agent::session::session_file_name(thread_id)))
-        .expect("reopen")
-        .entries()
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            SessionEntry::Metadata {
-                metadata: SessionMetadata::ThreadSettings { provider, model, reasoning },
-                ..
-            } => Some(singularity_model::compose_model_selector(
-                provider,
-                model,
-                reasoning.as_deref().filter(|value| !value.is_empty()),
-            )),
-            _ => None,
-        })
-}
-
 /// 运行中修改名称与设置立即落盘；当前请求继续使用已经冻结的模型。
 #[test]
 fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
@@ -120,7 +99,7 @@ fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
     );
 
     assert_eq!(
-        last_recorded_selector(&sessions, &thread_id).as_deref(),
+        fixture.catalog().resume_thread(&thread_id).unwrap().model.as_deref(),
         Some("openai_compatible/base-model-2")
     );
     release_tx.send(()).expect("gate release");
@@ -136,7 +115,7 @@ fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
         "the next turn does not duplicate the already persisted selector"
     );
     assert_eq!(
-        last_recorded_selector(&sessions, &thread_id).as_deref(),
+        fixture.catalog().resume_thread(&thread_id).unwrap().model.as_deref(),
         Some("openai_compatible/base-model-2"),
         "resume projection (last-wins) shows the mid-turn change"
     );

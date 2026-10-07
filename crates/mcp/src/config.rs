@@ -68,23 +68,17 @@ impl ServerConfig {
         }
     }
 
-    pub fn input(&self, server_id: String) -> McpServerInput {
+    pub fn into_input(self, server_id: String) -> McpServerInput {
         McpServerInput {
             server_id,
             enabled: self.enabled,
             startup_timeout_sec: self.startup_timeout_sec,
             tool_timeout_sec: self.tool_timeout_sec,
-            transport: match &self.transport {
-                TransportConfig::Stdio { command, args, cwd, env } => McpTransportInput::Stdio {
-                    command: command.clone(),
-                    args: args.clone(),
-                    cwd: cwd.clone(),
-                    env: env.clone(),
-                },
-                TransportConfig::Http { url, headers } => McpTransportInput::Http {
-                    url: url.clone(),
-                    headers: headers.clone(),
-                },
+            transport: match self.transport {
+                TransportConfig::Stdio { command, args, cwd, env } => {
+                    McpTransportInput::Stdio { command, args, cwd, env }
+                }
+                TransportConfig::Http { url, headers } => McpTransportInput::Http { url, headers },
             },
         }
     }

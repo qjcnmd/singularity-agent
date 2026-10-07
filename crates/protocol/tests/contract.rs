@@ -27,7 +27,7 @@ fn request_observation(
     RequestObservation {
         request_id: format!("attempt-{attempt}"),
         request_head: None,
-        purpose: Default::default(),
+        purpose: singularity_protocol::RequestPurpose::Generation,
         attempt,
         provider: "openai_compatible".to_string(),
         model: "test-model-a".to_string(),
@@ -87,15 +87,6 @@ fn turn_event_wire_goldens() {
             r#"{"item":{"itemId":"entry-1:text:0"},"text":"task","threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         ("turn/controlChanged", TurnEvent::ControlChanged {}, r#"{}"#),
-        (
-            "item/started",
-            TurnEvent::ItemStarted {
-                thread_id: "thread-1".to_string(),
-                turn_id: "turn-1".to_string(),
-                item: ItemRef { item_id: "item-1".to_string() },
-            },
-            r#"{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
-        ),
         (
             "item/agentMessage/delta",
             TurnEvent::AssistantDelta {

@@ -1,15 +1,13 @@
 use super::*;
 
 /// 同一个穷尽的分类既决定终态原因，也决定是否必须停止执行链。
-/// 存储故障写不出可信终态，因此返回对应的致命诊断码。
-pub(super) fn classify_agent_error(error: &AgentError) -> (TurnFailureCause, Option<&'static str>) {
+/// 存储故障写不出可信终态，执行器按 Store 分类停止执行链。
+pub(super) fn classify_agent_error(error: &AgentError) -> TurnFailureCause {
     match error {
-        AgentError::Provider(error) => (provider_turn_cause(error.kind), None),
-        AgentError::Session(_) | AgentError::FailureRecording { .. } => {
-            (TurnFailureCause::Store, Some(diagnostic_code::STORAGE_FATAL))
-        }
-        AgentError::Instructions(_) => (TurnFailureCause::ProjectInstructions, None),
-        AgentError::Aborted | AgentError::InvalidSummary(_) => (TurnFailureCause::Internal, None),
+        AgentError::Provider(error) => provider_turn_cause(error.kind),
+        AgentError::Session(_) | AgentError::FailureRecording { .. } => TurnFailureCause::Store,
+        AgentError::Instructions(_) => TurnFailureCause::ProjectInstructions,
+        AgentError::Aborted | AgentError::InvalidSummary(_) => TurnFailureCause::Internal,
     }
 }
 
@@ -23,7 +21,7 @@ pub(super) fn fail_stop_terminalization(
     storage_error: String,
     sink: &mut dyn FnMut(TurnEvent),
 ) -> TurnRunError {
-    publish_fatal(thread_id, turn_id, diagnostic_code::STORAGE_FATAL, &storage_error, sink);
+    publish_storage_fatal(thread_id, turn_id, &storage_error, sink);
     TurnRunError::Terminalization {
         execution: execution.cloned(),
         storage: storage_error,
@@ -35,25 +33,18 @@ pub(super) fn fail_stop_execution(
     thread_id: &str,
     turn_id: &str,
     detail: TurnErrorDetail,
-    code: &str,
     sink: &mut dyn FnMut(TurnEvent),
 ) -> TurnRunError {
-    publish_fatal(thread_id, turn_id, code, &detail.message, sink);
+    publish_storage_fatal(thread_id, turn_id, &detail.message, sink);
     TurnRunError::Execution(detail)
 }
 
-pub(super) fn publish_fatal(
-    thread_id: &str,
-    turn_id: &str,
-    code: &str,
-    message: &str,
-    sink: &mut dyn FnMut(TurnEvent),
-) {
+fn publish_storage_fatal(thread_id: &str, turn_id: &str, message: &str, sink: &mut dyn FnMut(TurnEvent)) {
     sink(TurnEvent::Diagnostic {
         thread_id: thread_id.to_string(),
         turn_id: Some(turn_id.to_string()),
         severity: DiagnosticSeverity::Error,
-        code: code.to_string(),
+        code: diagnostic_code::STORAGE_FATAL.to_string(),
         message: message.to_string(),
     });
 }

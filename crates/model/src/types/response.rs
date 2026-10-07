@@ -23,17 +23,6 @@ pub struct ModelTurnResponse {
 }
 
 impl ModelTurnResponse {
-    /// 构造一条已完成的模型响应。
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn completed(content: impl Into<String>) -> Self {
-        Self {
-            assistant_message: ModelMessage::text(super::message::ModelRole::Assistant, content),
-            thinking: String::new(),
-            usage: ModelUsage::default(),
-            stop_reason: ModelStopReason::Stop,
-        }
-    }
-
     /// 提供方是否因为输出额度用尽而停下。
     pub fn is_length_truncated(&self) -> bool {
         self.stop_reason == ModelStopReason::Length

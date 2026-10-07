@@ -115,9 +115,9 @@ fn openai_message_payload_with_reasoning(
     provider_name: &str,
 ) -> Value {
     let role = if message.role == ModelRole::Developer && !selection.supports_developer_role {
-        &ModelRole::System
+        json!("system")
     } else {
-        &message.role
+        json!(message.role)
     };
     let mut content = openai_message_content(message);
     // 该端点的工具调用消息必须带 content 字段，用空串补齐。

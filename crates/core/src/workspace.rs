@@ -19,8 +19,7 @@ pub struct CanonicalWorkspacePath {
 impl CanonicalWorkspacePath {
     /// 从已保存的路径恢复绝对目录身份，不重新解析当前文件系统或符号链接。
     pub fn from_saved(path: impl AsRef<Path>) -> Result<Self, String> {
-        let normalized = PathBuf::from(display_path(path.as_ref()));
-        let path = normalized.as_path();
+        let path = path.as_ref();
         if !path.is_absolute() {
             return Err("saved workspace path must be absolute".to_string());
         }

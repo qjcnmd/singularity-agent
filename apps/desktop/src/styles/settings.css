@@ -51,12 +51,6 @@
   font-size: 16px;
   color: var(--ink);
 }
-.sg-modal-actions {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
 .sg-settings-layout { display: flex; flex: 1; min-height: 0; }
 .sg-settings-nav { flex: 0 0 180px; padding: 18px 12px; border-right: 1px solid var(--line); background: var(--surface-muted); }
 .sg-settings-nav button { display: flex; align-items: center; gap: 10px; width: 100%; padding: 11px 12px; margin-bottom: 4px; border: 0; border-radius: 10px; background: transparent; color: var(--ink-soft); text-align: left; cursor: pointer; }
@@ -414,5 +408,4 @@
 @media (max-width: 760px) {
   .modal-backdrop { padding: 8px; }
   .sg-settings-nav { flex-basis: 132px; padding: 12px 8px; }
-  .sg-settings-page { padding: 20px; }
 }

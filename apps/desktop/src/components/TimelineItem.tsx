@@ -38,7 +38,7 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
       <article
         className={`timeline-item message-item timeline-${item.kind} status-${timelineStatus(item)}`}
         data-item-id={item.key}
-        aria-label={`${item.title}，${statusLabel(timelineStatus(item)) || factStatusText.stable}`}
+        aria-label={`${item.title}，${factStatusText[timelineStatus(item)]}`}
       >
         <div className="timeline-body message-body">{item.kind === 'user' ? <div className="user-text">{body}</div> : <MarkdownBody text={body} />}</div>
         {sessionId && item.fact?.images && <AttachedImages sessionId={sessionId} images={item.fact.images} />}
@@ -56,13 +56,13 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
   const fact = item.fact
   const failure = timelineStatus(item) === 'error' ? (fact?.kind === 'tool' ? item.summary : failureSummary(fact?.error ?? timelineBody(item))) : undefined
   return (
-    <article className={`timeline-item activity-step timeline-${item.kind} status-${timelineStatus(item)}`} data-item-id={item.key} aria-label={`${item.title}，${statusLabel(timelineStatus(item)) || factStatusText.stable}`}>
+    <article className={`timeline-item activity-step timeline-${item.kind} status-${timelineStatus(item)}`} data-item-id={item.key} aria-label={`${item.title}，${factStatusText[timelineStatus(item)]}`}>
       <button type="button" className="activity-toggle" {...selectionGuard(() => setExpanded(value => !value))} aria-expanded={expanded}>
         <StepLabel item={item} icon={<StepIcon item={item} />} />
         <ExpandChevron expanded={expanded} className="step-chevron" />
         <span className="step-separator" aria-hidden="true">·</span>
         <span className="step-summary">{failure ?? oneLine(timelineBody(item))}</span>
-        {timelineStatus(item) === 'cancelled' && <span className="item-status">{statusLabel(timelineStatus(item))}</span>}
+        {timelineStatus(item) === 'cancelled' && <span className="item-status">{factStatusText.cancelled}</span>}
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
         <div className="timeline-body activity-output"><ToolOutput item={item} />{sessionId && item.fact?.images && <AttachedImages sessionId={sessionId} images={item.fact.images} />}</div>
@@ -186,11 +186,6 @@ function ToolSection({ label, children }: { label: string; children: ReactNode }
 
 function preview(text: string): string {
   return text.split('\n').slice(0, previewLineCount).join('\n')
-}
-
-/// 时间线只在非 stable 状态显示标签；词表与轨迹共用 copy.ts 的一份。
-function statusLabel(status: ReturnType<typeof timelineStatus>): string {
-  return status === 'stable' ? '' : factStatusText[status]
 }
 
 const stepKinds = new Set<TimelineItemModel['kind']>(['thinking', 'tool', 'compaction'])

@@ -53,7 +53,7 @@ impl PreparedCompaction {
         model: &ModelConfigurationSnapshot,
     ) -> crate::agent::Result<Self> {
         let overhead_tokens = definitions.estimated_tokens();
-        let mut instructions = definitions.model_messages()?;
+        let mut instructions = definitions.model_messages();
         instructions
             .extend(crate::session::context::load_messages(prefix.messages, &prefix.image_directory)?);
         let mut messages = instructions;

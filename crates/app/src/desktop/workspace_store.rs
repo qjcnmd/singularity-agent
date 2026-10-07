@@ -12,26 +12,7 @@ const WORKSPACE_REGISTRY_FILE_NAME: &str = "workspaces.json";
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryFile {
-    workspaces: Vec<WorkspaceRecord>,
-}
-
-/// 登记文件的格式独立于工作台 DTO；修改展示合同不改变已保存的登记记录。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkspaceRecord {
-    workspace_id: String,
-    name: String,
-    root: String,
-}
-
-impl From<&WorkspaceRecord> for Workspace {
-    fn from(record: &WorkspaceRecord) -> Self {
-        Self {
-            workspace_id: record.workspace_id.clone(),
-            name: record.name.clone(),
-            root: record.root.clone(),
-        }
-    }
+    workspaces: Vec<Workspace>,
 }
 
 /// 登记操作的错误分三类：输入有问题、项目不存在、持久化失败；入口据此选择恢复提示。
@@ -71,9 +52,9 @@ impl WorkspaceStore {
         Ok(Self { path, state: Mutex::new(state) })
     }
 
-    /// 将当前登记记录转换为工作台可用的独立快照。
+    /// 返回当前登记的独立快照。
     pub fn list(&self) -> Vec<Workspace> {
-        self.lock().workspaces.iter().map(Workspace::from).collect()
+        self.lock().workspaces.clone()
     }
 
     /// 按稳定身份查询当前登记，返回工作台 DTO。
@@ -82,7 +63,7 @@ impl WorkspaceStore {
             .workspaces
             .iter()
             .find(|workspace| workspace.workspace_id == workspace_id)
-            .map(Workspace::from)
+            .cloned()
     }
 
     /// 登记已存在的目录；规范目录身份重复时拒绝，不改变已有登记。
@@ -104,13 +85,12 @@ impl WorkspaceStore {
                 .filter(|value| !value.is_empty())
                 .unwrap_or(canonical.display())
                 .to_string();
-            let record = WorkspaceRecord {
+            let workspace = Workspace {
                 workspace_id: Uuid::new_v4().to_string(),
                 name,
                 root: canonical.display().to_string(),
             };
-            let workspace = Workspace::from(&record);
-            registry.workspaces.push(record);
+            registry.workspaces.push(workspace.clone());
             Ok(workspace)
         })
     }

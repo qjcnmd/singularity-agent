@@ -94,7 +94,7 @@ pub struct Agent {
     registry: ToolRegistrySnapshot,
     questions: Option<Arc<UserQuestions>>,
     mcp: Arc<singularity_mcp::McpManager>,
-    skills: singularity_core::skills::SkillCatalog,
+    skill_instructions: String,
     developer_instructions: String,
     /// 本轮全局与项目文件指令；压缩后直接用重新读取的内容替换。
     file_instructions: Option<ModelMessage>,
@@ -122,13 +122,14 @@ impl Agent {
         let model = provider.model_configuration();
         let cwd = lock_writer(&session).cwd().to_path_buf();
         let registry = ToolRegistrySnapshot::default();
-        let skills = singularity_core::skills::SkillCatalog::discover(&cwd, &config.instruction_home);
+        let skill_instructions =
+            singularity_core::skills::SkillCatalog::discover(&cwd, &config.instruction_home).prompt();
         Self {
             session,
             registry,
             questions: None,
             mcp,
-            skills,
+            skill_instructions,
             // 生成请求前由 refresh_tools 组装当前指令；独立压缩可直接复用历史定义。
             developer_instructions: String::new(),
             file_instructions: None,
@@ -191,11 +192,12 @@ impl Agent {
             let usage = response.usage.clone();
             let assistant = assistant_response_message(response);
             let overhead_tokens = self.request_overhead_tokens();
-            let estimated = lock_writer(&self.session)
-                .context()
-                .estimated_tokens()
-                .saturating_add(crate::session::context::message_token_estimate(&assistant))
-                .saturating_add(overhead_tokens);
+            let estimated = {
+                let writer = lock_writer(&self.session);
+                writer.context().estimated_tokens(&writer)
+            }
+            .saturating_add(crate::session::context::message_token_estimate(&assistant))
+            .saturating_add(overhead_tokens);
             self.usage_correction = if usage.usage_present {
                 usage.total_tokens.saturating_sub(estimated)
             } else {

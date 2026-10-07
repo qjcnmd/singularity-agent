@@ -9,14 +9,6 @@ use crate::session::{RequestDefinitions, lock_writer};
 use singularity_model::{ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnResponse};
 use tokio_util::sync::CancellationToken;
 
-/// Harness 指令使用 Developer 角色；不支持 developer 的端点由 Provider 降级。
-fn developer_message(instruction: &str) -> Option<ModelMessage> {
-    if instruction.is_empty() {
-        return None;
-    }
-    Some(ModelMessage::text(ModelRole::Developer, instruction))
-}
-
 fn file_instruction_message(instructions: &str) -> Option<ModelMessage> {
     if instructions.is_empty() {
         return None;
@@ -68,15 +60,15 @@ impl Agent {
     ) -> Result<()> {
         let home = self.config.instruction_home.clone();
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let (loaded, skills) = tokio::task::spawn_blocking(move || {
+        let (loaded, skill_instructions) = tokio::task::spawn_blocking(move || {
             let loaded = singularity_core::load_agent_instructions(&cwd, &home);
-            let skills = singularity_core::skills::SkillCatalog::discover(&cwd, &home);
-            (loaded, skills)
+            let skill_instructions = singularity_core::skills::SkillCatalog::discover(&cwd, &home).prompt();
+            (loaded, skill_instructions)
         })
         .await
         .expect("instruction loader completes while the runtime is running");
         let loaded = loaded.map_err(AgentError::Instructions)?;
-        self.skills = skills;
+        self.skill_instructions = skill_instructions;
         self.apply_instructions(loaded, on_event);
         Ok(())
     }
@@ -112,11 +104,12 @@ impl Agent {
         self.request_tokens(self.request_overhead_tokens())
     }
 
-    /// 会话持有历史估价，本轮 Agent 添加请求定义开销与实测校正。
+    /// 从账本派生历史估价，本轮 Agent 添加请求定义开销与实测校正。
     fn request_tokens(&self, overhead: u64) -> u64 {
-        lock_writer(&self.session)
+        let writer = lock_writer(&self.session);
+        writer
             .context()
-            .estimated_tokens()
+            .estimated_tokens(&writer)
             .saturating_add(overhead)
             .saturating_add(self.usage_correction)
     }
@@ -170,11 +163,11 @@ impl Agent {
     /// 对话历史。技能文件引用随用户输入进入历史，正文通过普通工具结果交付。
     pub(super) fn instruction_prefix(&self) -> Vec<ModelMessage> {
         let mut messages = Vec::new();
-        if let Some(instruction) = developer_message(&self.developer_instructions) {
-            messages.push(instruction);
-        }
-        if let Some(catalog) = developer_message(&self.skills.prompt()) {
-            messages.push(catalog);
+        // Harness 指令先于 Skill 目录；不支持 Developer 的端点由 Provider 降级。
+        for instruction in [&self.developer_instructions, &self.skill_instructions] {
+            if !instruction.is_empty() {
+                messages.push(ModelMessage::text(ModelRole::Developer, instruction));
+            }
         }
         if let Some(files) = &self.file_instructions {
             messages.push(files.clone());

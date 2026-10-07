@@ -48,16 +48,8 @@ export function buildTimeline(session: SessionView | null, userHome?: string | n
   return result
 }
 
-// 只重投影发生变化的轮次；弱引用随历史页和任务释放，不维护额外失效版本。
-const projectedTurns = new WeakMap<ExecutionTurn, {
-  cwd: string; userHome: string | null | undefined; showDuration: boolean; items: TimelineItemModel[]
-}>()
-
 function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null | undefined, active: boolean): TimelineItemModel[] {
   const startedAt = turn.startedAt
-  const showDuration = Boolean(startedAt && (turn.finishedAt || active))
-  const cachedTurn = projectedTurns.get(turn)
-  if (cachedTurn?.cwd === cwd && cachedTurn.userHome === userHome && cachedTurn.showDuration === showDuration) return cachedTurn.items
   const result: TimelineItemModel[] = []
   // 开头的 settings 组没有 turn id；显示键为它统一使用一个稳定占位符。
   const group = turn.id ?? 'leading'
@@ -84,7 +76,7 @@ function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null |
     if (item.kind !== 'user' && workStartIndex < 0) workStartIndex = result.length
     result.push(item)
   }
-  if (startedAt && showDuration) {
+  if (startedAt && (turn.finishedAt || active)) {
     result.splice(workStartIndex < 0 ? result.length : workStartIndex, 0, {
       key: `content:${group}:duration`, kind: 'duration', title: '',
       timing: { startedAt, finishedAt: turn.finishedAt },
@@ -92,7 +84,6 @@ function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null |
     })
   }
   if (turn.status === 'interrupted') result.push(stoppedItem(`content:${group}:terminal`))
-  projectedTurns.set(turn, { cwd, userHome, showDuration, items: result })
   return result
 }
 

@@ -89,7 +89,7 @@ fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_
     let permissions = std::fs::metadata(&path).unwrap().permissions();
     let mut events = Vec::new();
     let mut blocked = false;
-    let queued = std::sync::Mutex::new(None);
+    let mut queued = None;
     let result = {
         let conversation = Arc::clone(&conversation);
         crate::test_support::run_async(conversation.run_turn("go", &mut |event| {
@@ -100,7 +100,7 @@ fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_
                 std::fs::set_permissions(&path, readonly).unwrap();
                 blocked = true;
                 conversation.submit_follow_up("must stay queued").unwrap();
-                *queued.lock().unwrap() = conversation.snapshot().pending_input;
+                queued = conversation.snapshot().pending_input;
             }
             events.push(event);
         }))
@@ -133,7 +133,7 @@ fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_
     // 链条停止：没有第二次模型请求，后续输入原样留队。
     assert_eq!(provider.requests().len(), 1);
     let pending = conversation.snapshot().pending_input.unwrap();
-    assert_eq!(pending.control_id, queued.lock().unwrap().as_ref().unwrap().control_id);
+    assert_eq!(pending.control_id, queued.as_ref().unwrap().control_id);
 
     let saved = SessionData::open(&path).unwrap();
     assert!(
@@ -238,9 +238,8 @@ fn an_accepted_stop_survives_a_fatal_session_failure() {
         None,
     );
     let permissions = std::fs::metadata(&path).unwrap().permissions();
-    let mut events = Vec::new();
     let mut blocked = false;
-    let queued = std::sync::Mutex::new(None);
+    let mut queued = None;
     let result = {
         let conversation = Arc::clone(&conversation);
         crate::test_support::run_async(conversation.run_turn("go", &mut |event| {
@@ -249,14 +248,13 @@ fn an_accepted_stop_survives_a_fatal_session_failure() {
                 // 只读，使工具结果的提交本身失败（副作用已发生、结果无法落盘）。
                 conversation.steer("cancelled steer").expect("steer is accepted");
                 conversation.submit_follow_up("must stay queued").expect("a queued follow-up is accepted");
-                *queued.lock().unwrap() = conversation.snapshot().pending_input;
+                queued = conversation.snapshot().pending_input;
                 conversation.abort().expect("the stop is accepted");
                 let mut readonly = permissions.clone();
                 readonly.set_readonly(true);
                 std::fs::set_permissions(&path, readonly).unwrap();
                 blocked = true;
             }
-            events.push(event);
         }))
     };
     std::fs::set_permissions(&path, permissions).unwrap();
@@ -270,7 +268,7 @@ fn an_accepted_stop_survives_a_fatal_session_failure() {
         "the storage failure still stops the chain without a trusted terminal: {result:?}"
     );
     let pending = conversation.snapshot().pending_input.unwrap();
-    assert_eq!(pending.control_id, queued.lock().unwrap().as_ref().unwrap().control_id);
+    assert_eq!(pending.control_id, queued.as_ref().unwrap().control_id);
 }
 
 mod stop_and_replay;

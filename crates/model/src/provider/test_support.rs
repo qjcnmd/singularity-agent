@@ -24,10 +24,8 @@ use crate::types::{
 /// 一次脚本化 attempt 的结果。
 #[derive(Debug, Clone)]
 pub enum ScriptedAttempt {
-    /// 成功：返回给定 assistant 文本，可选携带真实 usage。
-    Success { text: String, usage: Option<ModelUsage> },
-    /// 携带工具调用的成功 attempt。
-    ToolCalls {
+    /// 成功：返回 assistant 文本与工具调用，可选携带真实 usage。
+    Success {
         text: String,
         calls: Vec<ModelToolCall>,
         usage: Option<ModelUsage>,
@@ -41,12 +39,20 @@ pub enum ScriptedAttempt {
 impl ScriptedAttempt {
     /// 无 usage 的成功 attempt。
     pub fn success(text: impl Into<String>) -> Self {
-        Self::Success { text: text.into(), usage: None }
+        Self::Success {
+            text: text.into(),
+            calls: Vec::new(),
+            usage: None,
+        }
     }
 
     /// 携带真实 usage 的成功 attempt。
     pub fn success_with_usage(text: impl Into<String>, usage: ModelUsage) -> Self {
-        Self::Success { text: text.into(), usage: Some(usage) }
+        Self::Success {
+            text: text.into(),
+            calls: Vec::new(),
+            usage: Some(usage),
+        }
     }
 
     /// 单个工具调用的成功 attempt（无可见文本）。
@@ -55,7 +61,7 @@ impl ScriptedAttempt {
         tool_name: impl Into<String>,
         arguments: serde_json::Value,
     ) -> Self {
-        Self::ToolCalls {
+        Self::Success {
             text: String::new(),
             calls: vec![ModelToolCall {
                 tool_call_id: call_id.into(),
@@ -143,10 +149,7 @@ impl Provider for ScriptedProvider {
                     }
                     Self::finish_error(error, started, observer).await
                 }
-                ScriptedAttempt::Success { text, usage } => {
-                    Self::finish_ok(text, Vec::new(), usage, started, observer).await
-                }
-                ScriptedAttempt::ToolCalls { text, calls, usage } => {
+                ScriptedAttempt::Success { text, calls, usage } => {
                     Self::finish_ok(text, calls, usage, started, observer).await
                 }
             }

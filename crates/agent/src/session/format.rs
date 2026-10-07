@@ -2,7 +2,7 @@
 //!
 //! 当前版本（CURRENT_SESSION_VERSION）的 operation_finished 只持久化终态所需的
 //! 结果、错误与停止事实。请求用量由请求
-//! 观测记录提供；文件指令与工具剪枝记录改变模型视图，系统与工具定义按内容去重。
+//! 观测记录提供；工具剪枝记录改变模型视图，指令与工具定义按内容去重。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -78,8 +78,6 @@ pub enum LedgerRecord {
     AssistantInterrupted {
         items: Vec<singularity_protocol::HistoryItem>,
     },
-    /// 当前格式下已保存的技能正文；保留读取以恢复已有会话，新调用通过 read 工具结果保存。
-    SkillInstructions { text: String },
     /// 用来替换模型上下文里那份工具结果的正文；原始 Message 仍保留，供历史和轨迹查看。
     ToolResultPruned {
         #[serde(rename = "entryId")]

@@ -213,11 +213,7 @@ class AppStore extends SessionStore {
     this.saveView({ viewportAnchors }, true)
   }
 
-  clearError(origin?: string): void {
-    if (origin === undefined) {
-      this.patch({ actionErrors: {}, actionErrorOrigin: null })
-      return
-    }
+  clearError(origin: string): void {
     const actionErrors = { ...this.state.actionErrors }
     delete actionErrors[origin]
     this.patch({

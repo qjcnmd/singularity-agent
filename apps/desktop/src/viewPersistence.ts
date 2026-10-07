@@ -1,4 +1,4 @@
-// 桌面视图、分任务草稿键和默认值；运行态由 Store 独立维护。
+// 桌面视图及默认值；运行态由 Store 独立维护。
 import type { ViewportAnchor } from './protocol'
 
 export const defaultAnchor = (): ViewportAnchor => ({
@@ -45,21 +45,7 @@ export function loadPersisted(): PersistedView {
     viewportAnchors: {},
   }
   try {
-    const stored = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Partial<PersistedView> | null
-    const value = stored ?? fallback
-    return {
-      ...fallback,
-      theme: value.theme === 'dark' ? 'dark' : 'light',
-      messageFontSize: normalizeMessageFontSize(value.messageFontSize ?? messageFontSize.default),
-      selectedWorkspaceId: value.selectedWorkspaceId ?? null,
-      selectedSessionId: value.selectedSessionId ?? null,
-      sidebarWidth: clampSidebarWidth(value.sidebarWidth ?? fallback.sidebarWidth),
-      sidebarCollapsed: value.sidebarCollapsed ?? false,
-      sidebarView: { collapsed: value.sidebarView?.collapsed ?? [] },
-      trajectoryOpen: value.trajectoryOpen ?? false,
-      workspaceAppearance: value.workspaceAppearance ?? {},
-      viewportAnchors: value.viewportAnchors ?? {},
-    }
+    return (JSON.parse(localStorage.getItem(storageKey) ?? 'null') as PersistedView | null) ?? fallback
   } catch {
     return fallback
   }

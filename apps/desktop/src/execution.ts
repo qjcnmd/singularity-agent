@@ -207,7 +207,6 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
       turn = { ...turn, startedAt: event.params.startedAt }
       break
     case 'turn/controlChanged':
-    case 'item/started':
       return facts
     case 'turn/userMessage': turn = upsert(turn, { ...base(event.params.item.itemId), kind: 'user', text: event.params.text, images: event.params.images }); break
     case 'provider/attempt': {

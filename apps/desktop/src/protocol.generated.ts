@@ -72,6 +72,8 @@ chatOutputTokensField: string | null, requiresReasoningContentForToolCalls: bool
 
 export type ModelRequestSnapshot = { definitionsId: string, messages: Array<RequestMessage>, tools: Array<RequestTool>, modelPreferences: RequestPreferences, };
 
+export type ModelRole = "developer" | "user" | "assistant" | "tool";
+
 export type PendingInput = { controlId: string, text: string, images?: Array<ImageAttachment>, };
 
 export type PendingQuestion = {
@@ -118,7 +120,7 @@ error: string | null, defaultSelector: string | null, providers: Array<RedactedP
 
 export type RedactedProvider = { apiProtocol: string | null, providerId: string, displayName: string | null, baseUrl: string, credentialConfigured: boolean, models: Array<ModelConfigurationInput>, };
 
-export type RequestMessage = { role: string, content: string, };
+export type RequestMessage = { role: ModelRole, content: string, };
 
 export type RequestObservation = {
 /**
@@ -131,11 +133,11 @@ requestId: string,
  */
 requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, attempt: number, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number,
 /**
- * 请求开始到首个生成增量的实测耗时；旧记录未采集时保持未知。
+ * 请求开始到首个生成增量的实测耗时；没有生成增量时保持未知。
  */
 ttftMs?: number,
 /**
- * 首个生成增量到请求完成的耗时；旧记录未采集时保持未知。
+ * 首个生成增量到请求完成的耗时；没有生成增量时保持未知。
  */
 decodeMs?: number,
 /**
@@ -266,7 +268,7 @@ usage?: TurnModelUsage, };
 
 export type TurnErrorDetail = { cause: TurnFailureCause, message: string, };
 
-export type TurnEventEnvelope = { sessionRevision: number, } & ({ "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, item: ItemRef, text: string, images?: Array<ImageAttachment>, } } | { "method": "item/started", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string,
+export type TurnEventEnvelope = { sessionRevision: number, } & ({ "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, item: ItemRef, text: string, images?: Array<ImageAttachment>, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string,
 /**
  * 与历史共享的公开 occurrence 身份，不是 provider 在 wire 上的调用 ID。
  */
@@ -284,7 +286,7 @@ turnId: string | null, severity: DiagnosticSeverity, code: string, message: stri
  */
 turnId: string | null, } } | { "method": "turn/completed", "params": { turn: Turn, finishedAt: string, } } | { "method": "turn/controlChanged", "params": Record<symbol, never> } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, finishedAt: string, } });
 
-export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
+export type TurnFailureCause = "store" | "project_instructions" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 
 export type TurnModelUsage = { inputTokens: number, outputTokens: number, totalTokens: number, cachedInputTokens: number, reasoningTokens: number,
 /**

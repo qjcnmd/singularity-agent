@@ -63,9 +63,9 @@ impl TurnRunner {
             Ok(_) => (TurnStatus::Completed, None),
             Err(AgentError::Aborted) => (TurnStatus::Interrupted, None),
             Err(error) => {
-                let (cause, fatal) = classify_agent_error(&error);
+                let cause = classify_agent_error(&error);
                 let detail = TurnErrorDetail { cause, message: error.to_string() };
-                if fatal.is_some() {
+                if cause == TurnFailureCause::Store {
                     return Err(TurnRunError::Execution(detail));
                 }
                 (TurnStatus::Failed, Some(detail))

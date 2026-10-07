@@ -62,8 +62,6 @@ body {
   font-family: var(--font-sans);
   font-size: 13.5px;
   line-height: 1.55;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
 }
 button, input, textarea, select { font: inherit; }
 button { color: inherit; }

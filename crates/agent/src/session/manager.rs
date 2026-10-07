@@ -26,8 +26,6 @@ pub struct CommittedEntry {
 /// 执行入口负责交接单个写者，turn 内通过 SessionWriter 串行追加。
 pub struct SessionManager {
     pub(super) data: SessionData,
-    /// 与账本同寿命的模型视图；只在持久提交成功后推进。
-    context: ContextView,
     append_error: Option<Arc<std::io::Error>>,
 }
 
@@ -39,8 +37,6 @@ pub struct SessionData {
     pub(super) entries: Vec<SessionEntry>,
     pub(super) session_id: String,
     pub(super) header_timestamp: String,
-    /// 请求定义 ID 对应的条目位置。
-    pub(super) definitions: std::collections::HashMap<String, usize>,
 }
 
 impl std::fmt::Debug for SessionManager {
@@ -87,9 +83,7 @@ impl SessionManager {
                 entries: Vec::new(),
                 session_id: header.id,
                 header_timestamp: header.timestamp,
-                definitions: std::collections::HashMap::new(),
             },
-            context: ContextView::default(),
             append_error: None,
         })
     }
@@ -99,13 +93,12 @@ impl SessionManager {
     pub fn open_existing(path: &Path, expected_id: &str) -> Result<Self> {
         let file = path.to_path_buf();
         let data = SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite, Some(expected_id))?;
-        let context = ContextView::derive(&data);
-        Ok(Self { data, context, append_error: None })
+        Ok(Self { data, append_error: None })
     }
 
-    /// 已提交账本的上下文位置与增量估价；调用方只读，追加统一维护它。
-    pub(crate) fn context(&self) -> &ContextView {
-        &self.context
+    /// 从已提交账本派生本次使用的模型上下文位置。
+    pub(crate) fn context(&self) -> ContextView {
+        ContextView::derive(&self.data)
     }
 }
 
@@ -154,29 +147,20 @@ impl SessionData {
         if matches!(tail_policy, TailPolicy::RepairAndRewrite) && needs_repair {
             rewrite_file(&file, &header, &entries)?;
         }
-        let mut data = Self {
+        Ok(Self {
             file,
             cwd,
             entries,
             session_id: header.id,
             header_timestamp: header.timestamp,
-            definitions: std::collections::HashMap::new(),
-        };
-        for position in 0..data.entries.len() {
-            data.observe_definitions(position);
-        }
-        Ok(data)
+        })
     }
 }
 
 impl SessionManager {
-    /// 往线性日志追加一条消息，写盘成功后再推进内存视图并返回提交信息。
+    /// 往线性日志追加一条消息，写盘成功后再保存到内存账本并返回提交信息。
     pub fn append_message(&mut self, message: AgentMessage) -> Result<CommittedEntry> {
-        self.append_entry(SessionEntry::Message {
-            id: super::new_entry_id(),
-            timestamp: now_iso(),
-            message,
-        })
+        self.append_message_with_id(&super::new_entry_id(), message)
     }
 
     /// 追加一条 compaction 条目并立即写盘（id 是预分配的：本次摘要 attempt 的
@@ -203,7 +187,7 @@ impl SessionManager {
     }
 
     /// 追加一条 operation ledger 记录。记录本身就是持久事实；是否进入模型上下文看
-    /// 类别：操作与请求观测服务查看，指令与工具剪枝记录改变模型视图。
+    /// 类别：操作与请求观测服务查看，工具剪枝记录改变模型视图。
     pub fn append_record(&mut self, record: LedgerRecord) -> Result<CommittedEntry> {
         self.append_entry(SessionEntry::Record {
             id: super::new_entry_id(),
@@ -268,9 +252,6 @@ impl SessionManager {
         let bytes_to_write = serialized.as_bytes();
         self.write_append(&mut handle, bytes_to_write)?;
         self.data.entries.push(entry);
-        let index = self.data.entries.len() - 1;
-        self.data.observe_definitions(index);
-        self.context.append_entry(&self.data, index);
         Ok(committed)
     }
 

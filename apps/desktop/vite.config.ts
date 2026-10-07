@@ -5,8 +5,5 @@ export default defineConfig({
   plugins: [react()],
   build: {
     target: 'es2023',
-    outDir: 'dist',
-    emptyOutDir: true,
-    sourcemap: false,
   },
 })

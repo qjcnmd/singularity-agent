@@ -166,14 +166,14 @@ macro_rules! rpc_methods {
             $(#[serde(rename = $wire)] $variant($params),)*
         }
         #[cfg(feature = "typescript")]
-        pub(crate) fn export_rpc_types(out: &mut crate::typescript::Bindings) {
+        pub(crate) fn export_rpc_types(out: &mut crate::typescript::Bindings) -> String {
             $(out.add::<$params>(); out.add::<$result>();)*
-            out.push(format!("export interface RpcContract {{\n{}\n}}",
+            format!("export interface RpcContract {{\n{}\n}}",
                 [$(format!("  {}: {{ params: {}; result: {} }}",
                     stringify!($wire),
                     <$params as ts_rs::TS>::name(out.config()),
                     <$result as ts_rs::TS>::name(out.config())
-                )),*].join("\n")));
+                )),*].join("\n"))
         }
     };
 }

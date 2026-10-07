@@ -66,12 +66,10 @@ impl ConversationSlot {
 }
 
 impl SlotState {
-    /// 开始一次回合：冻结刚读出来的持久化 history，清掉上一次的终态和活动回合。
+    /// 开始一次回合：冻结刚读出来的持久化 history，清掉上一次的终态。
     /// 调用方必须在同一次加锁内把发布做完，事件和读取才会看到同一个瞬间。
     pub(super) fn begin_turn(&mut self, history: Arc<ThreadSnapshot>) {
         self.history = Some(history);
-        self.active_turn = None;
-        self.events.clear();
         self.terminal = None;
     }
 
@@ -106,8 +104,9 @@ impl SlotState {
                 let progress = match &previous.event {
                     TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
                     | TurnEvent::AssistantDelta { turn_id, item, .. }
-                    | TurnEvent::AssistantThinkingDelta { turn_id, item, .. }
-                    | TurnEvent::ItemStarted { turn_id, item, .. } => Some((turn_id, &item.item_id)),
+                    | TurnEvent::AssistantThinkingDelta { turn_id, item, .. } => {
+                        Some((turn_id, &item.item_id))
+                    }
                     _ => None,
                 };
                 progress != Some((turn, item_id))

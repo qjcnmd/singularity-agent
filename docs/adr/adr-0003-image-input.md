@@ -10,6 +10,6 @@
 
 配置模型均按支持文本和图像使用，图片经过相应协议编码后直接发送。
 
-工作台将完整文字、图片草稿保存在 IndexedDB，保存新记录成功后迁移旧文字草稿；普通恢复过程不增加提示。输入缩略图与历史预览共用呈现。采用 DSH 的缩略图、点击大图和图片内移除操作，保存机制按本项目的单页面与会话所有权实现。
+工作台将完整文字、图片草稿保存在 IndexedDB；普通恢复过程不增加提示。输入缩略图与历史预览共用呈现。采用 DSH 的缩略图、点击大图和图片内移除操作，保存机制按本项目的单页面与会话所有权实现。
 
 参考 [DSH 持久附件](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/attachment.md)、[DSH 图片输入呈现](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/client/ui-attachment/src/client/ComposerAttachments.tsx)、[Gemini 文件读取](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/utils/fileUtils.ts)、[Cline Chat 工具图片投影](https://github.com/cline/cline/blob/main/sdk/packages/llms/src/providers/middleware/split-tool-images.ts)和 [Responses 工具输出类型](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_function_call_output_item_list_param.py)。采用输入与历史共用快照、显示与模型载荷分离及协议正确投影；需要跨任务共享图片、输出媒体或适配具体模型的尺寸预算时再评估存储和模型内容结构。

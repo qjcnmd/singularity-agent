@@ -4,6 +4,17 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// 模型输入与请求快照共用的消息角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRole {
+    Developer,
+    User,
+    Assistant,
+    Tool,
+}
+
 /// 请求里内嵌的检查载荷：定义身份、完整指令前缀（包括文件指令）、工具定义和本次请求的偏好。
 /// 请求身份由所属的 `RequestObservation` 承载；定义身份用于判断指令和工具是否变化。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -20,7 +31,7 @@ pub struct ModelRequestSnapshot {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct RequestMessage {
-    pub role: String,
+    pub role: ModelRole,
     pub content: String,
 }
 

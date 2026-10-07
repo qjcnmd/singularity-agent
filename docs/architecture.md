@@ -185,7 +185,7 @@ flowchart LR
 | 项目身份 | `CanonicalWorkspacePath` 规范化路径及比较键；`WorkspaceStore` 维护登记；bootstrap 按同一登记快照分组任务。读取历史身份不要求原目录仍存在。 |
 | 模型与凭据 | `ModelConfigManager` 内部串行读取和修改，生成运行快照、脱敏目录；修改结果与修改后的实际目录在同一临界区中取得，部分保存失败也返回当前目录；Electron 渲染进程只写新密钥，不从目录读回密钥。 |
 | 会话事实 | `SessionManager` 写入，`SessionData` 只读；上下文、中断操作恢复、历史、摘要、请求详情均从同一日志派生。未消费的控制输入是内存状态，不由日志恢复。 |
-| 视图与草稿 | `viewPersistence.ts` 保存视图；`drafts.ts` 在 IndexedDB 中按任务保存完整输入，并迁移旧文字草稿。 |
+| 视图与草稿 | `viewPersistence.ts` 保存视图；`drafts.ts` 在 IndexedDB 中按任务保存完整输入。 |
 | 图片 | `agent/image.rs` 共用识别、解码与格式转换；用户输入和工具结果共用 Agent 的消息追加入口，先在会话锁外保存像素，再追加引用图片的消息；成功后才发布完成事件。排队图片仍属于进程内输入。 |
 | 临时工具输出 | 工具结果给出实际日志路径；新建输出时清理超过七天的旧输出，保存失败明确反馈。 |
 
@@ -241,7 +241,7 @@ flowchart LR
 
 Electron 渲染进程 Store 逐帧归约协议状态，正文、思考与工具进度的显示通知按 50 毫秒窗口合并；操作、终态和连接变化立即通知最新状态。代码高亮只把异步高亮器的就绪状态存入 React 状态，token 按当前代码派生；已完成代码块通过稳定参数复用渲染结果。
 
-上下文用量从执行事实尾部反向查找，遇到成功压缩或模型切换即停止，不另存需要同步更新的最近测量。时间线按不可变轮次缓存投影，活动轮内仍按条目复用投影；轨迹 JSON 呈现按输入身份复用序列化结果，流式更新不重复处理未变化的大输入。
+上下文用量从执行事实尾部反向查找，遇到成功压缩或模型切换即停止，不另存需要同步更新的最近测量。时间线按不可变条目复用投影；轨迹 JSON 呈现按输入身份复用序列化结果，流式更新不重复处理未变化的大输入。
 
 前端订阅只缓存所需字段，避免无关组件保留完整旧会话。高亮引擎按实际语言加载语法；屏幕外正文使用 Chromium 的 `content-visibility` 跳过内部布局与绘制，保留 DOM 和阅读锚点。轨迹退出动画结束后卸载。Canvas 光栅匹配实际显示像素，固定丝带纹理复用；窗口隐藏时采用 Chromium 默认后台节流，Rust 执行不受影响。
 
@@ -409,9 +409,9 @@ flowchart TB
     Calls -->|"有，但模型输出截断"| Truncated["工具派发入口提交失败结果<br/>不执行不完整调用"]
     Truncated --> Cancel
     Calls -->|"有且回复完整"| Preflight["registry.preflight<br/>解析参数、绑定工具、生成公开条目 ID"]
-    Preflight --> Dispatch["dispatch_tools<br/>Tokio task 与异步准入锁"]
+    Preflight --> Dispatch["dispatch_tools<br/>Tokio task 与异步许可"]
     Dispatch --> Results["每项完成即保存结果<br/>随后发布 tool/execution/end"]
-    Results --> Context["SessionManager 追加<br/>提交成功后更新 ContextView<br/>模型结果仍按调用顺序排列"]
+    Results --> Context["SessionManager 追加<br/>提交成功后加入账本<br/>模型结果按调用顺序投影"]
     Context --> Cancel
 ```
 
@@ -628,7 +628,7 @@ flowchart TB
 
 用户数据目录与项目指令目录指向同一路径时，该来源只加载一次。文件指令每文件最多读取 32 KiB 加一个截断判定字节、合计 64 KiB，截断有反馈；读取失败和保留前缀中的非法 UTF-8 终止准备，截断后的内容不读取。Harness 规则与 Skill 目录提示是独立的 Developer 消息，本轮读取的项目文件内容作为历史之前的 User 消息。
 
-选择 Skill 时，草稿记录技能名与绝对文件路径的绑定；文字、图片和绑定一起发送、排队、取回编辑或插话。Agent 交付输入时把完整技能词展开为路径，作为 `AgentMessage::User` 保存，`displayText` 仅在文字发生展开时保存原始界面文字。模型、计量、摘要和恢复消费已展开的内容，用户消息和任务标题共用原始文字的展示投影。正文通过模型调用 `read` 取得并保存为普通工具结果，读取失败沿用工具错误反馈。当前格式下已有的 `skill_instructions` 记录仍参与历史恢复。
+选择 Skill 时，草稿记录技能名与绝对文件路径的绑定；文字、图片和绑定一起发送、排队、取回编辑或插话。Agent 交付输入时把完整技能词展开为路径，作为 `AgentMessage::User` 保存，`displayText` 仅在文字发生展开时保存原始界面文字。模型、计量、摘要和恢复消费已展开的内容，用户消息和任务标题共用原始文字的展示投影。正文通过模型调用 `read` 取得并保存为普通工具结果，读取失败沿用工具错误反馈。
 
 文件指令在每轮开始及压缩后重新读取并直接覆盖本轮值，不进行新旧判断；完整请求前缀保存在请求定义快照中，供轨迹查看与手动摘要复用，不作为可压缩的对话消息。旧请求快照没有记录的文件指令无法事后恢复；下一次正常请求会直接读取当前文件。
 
@@ -644,9 +644,9 @@ flowchart TB
 ```mermaid
 flowchart LR
     Ledger[("Session 原始条目<br/>始终保留完整消息")]
-    Ledger --> Context["SessionManager 持有 ContextView<br/>有效历史位置、工具剪枝引用<br/>历史估算与压缩切点"]
+    Ledger --> Context["按需派生 ContextView<br/>有效历史位置、工具剪枝引用<br/>历史估算与压缩切点"]
     Ledger --> Public["公开历史 / 轨迹<br/>仍可查看原始工具输出"]
-    Message["message / skill_instructions"] -->|"追加可压缩历史"| Context
+    Message["message"] -->|"追加可压缩历史"| Context
     Prune["tool_result_pruned"] -->|"在原位置替换已有工具内容"| Context
     Compact["compaction<br/>summary + firstKeptEntryId"] -->|"替换当前历史前缀"| Context
     Context --> History["当前可发送历史<br/>普通回复为完整视图，摘要为切点前缀"]
@@ -690,7 +690,7 @@ flowchart TB
 
 首次摘要按目标、约束、进度、关键决定、下一步和关键上下文生成固定结构；再次压缩时，从有效历史中取出上一份摘要，只用本次新覆盖的消息更新该结构。自动、手动和溢出恢复均复用这条路径。
 
-`SessionManager` 与账本一起持有 `ContextView`，所有追加在持久提交成功后、同一写者锁内推进上下文。普通消息和 Skill 记录增量更新位置与估价；剪枝沿同一投影规则替换结果内容，并按替换前后的估价差量更新总额；摘要替换后重算活动历史的估价，重新打开时才从整份账本派生视图。写入失败不推进账本或上下文。Agent 在线程池中读取投影、选择摘要前缀和加载图片，图片读取不持有写者锁；本轮 `usage_correction` 由 Agent 持有，普通追加保留校正，剪枝、摘要提交或文件指令刷新后清零。
+`SessionManager` 在持久提交成功后、同一写者锁内追加内存账本。请求装配与缩减按需从账本派生 `ContextView`，沿保存的摘要边界、剪枝引用和工具调用顺序还原有效历史，并按这份投影计算估价。写入失败不追加内存账本。Agent 在线程池中读取投影、选择摘要前缀和加载图片，图片读取不持有写者锁；本轮 `usage_correction` 由 Agent 持有，普通追加保留校正，剪枝、摘要提交或文件指令刷新后清零。
 
 摘要请求与其他请求一样经统一请求账本计量：其 provider usage 记录在该请求自己的 request observation 上，会话累计与工作台展示都由账本聚合，compaction 条目只保存 summary 与 firstKeptEntryId。
 
@@ -729,8 +729,8 @@ flowchart TB
     Specs --> Preflight
     Preflight -->|"非法参数 / 未知工具"| Rejected["模型可见失败，不启动 worker"]
     Preflight -->|"PreparedTool"| Dispatch["dispatch_tools：按 source order 准入"]
-    Dispatch --> ReadOnly["read<br/>共享读锁，并行执行"]
-    Dispatch --> Barrier["bash / 交互提问 / MCP<br/>独占写锁，按声明顺序执行"]
+    Dispatch --> ReadOnly["read<br/>取得 1 份许可，并行执行"]
+    Dispatch --> Barrier["bash / 交互提问 / MCP<br/>取得全部 8 份许可，按声明顺序执行"]
     Dispatch -->|"工具内部 panic"| HostFatal["终止后端进程<br/>工作台提示重启"]
     ReadOnly --> Result["ToolExecution<br/>文字、图片、错误与观测信息"]
     Barrier --> Result
@@ -742,7 +742,7 @@ flowchart TB
 
 工具定义由 `ToolRegistrySnapshot` 持有，请求装配与开销计算按需从它派生 schema。准备参数按值交给工具 worker；进度携带公开条目身份，完成结果携带公开身份与 provider 调用身份，派发者直接落盘和发布，不保留另一份准备批次供下标回查。
 
-Agent、请求重试、Provider 网络传输和工具派发共用异步执行链。Provider 的 HTTP 发送、响应块读取及重试等待直接 `await`；文件读取和命令进程管理在 Tokio blocking pool 执行。派发者按模型调用顺序取得读锁或写锁；每轮工具调用最多同时准入 8 个只读工具，结果提交后释放空位，后续读取随即可继续。处理工具完成事件时先提交结果、再释放准入锁；后续独占工具因此只会在前序结果成功落盘后开始。结果提交失败会停止后续派发，并等待已启动任务结束；内部程序异常直接终止进程。
+Agent、请求重试、Provider 网络传输和工具派发共用异步执行链。Provider 的 HTTP 发送、响应块读取及重试等待直接 `await`；文件读取和命令进程管理在 Tokio blocking pool 执行。派发者按模型调用顺序从同一个 Semaphore 取得许可：读取取 1 份，独占工具取全部 8 份；等待期间继续消费工具事件。每轮工具调用最多同时准入 8 个只读工具，结果提交后释放许可，后续读取随即可继续。处理工具完成事件时先提交结果、再释放许可；后续独占工具因此只会在前序结果成功落盘后开始。结果提交失败会停止后续派发，并等待已启动任务结束；内部程序异常直接终止进程。
 
 ### 15.2 文件与 shell 的内部边界
 
@@ -788,7 +788,7 @@ flowchart TB
 
 `ModelTurnRequest` 只含 Provider 无关的模型输入；`execute_request` 为每次发送建立 `RequestAttempt`，其 requestId 配对开始与结束观测，输出另用预分配的会话条目 ID 维持流式展示与最终写入。重试复用同一份输入，但每次有独立的观测与输出身份。请求观测不进入模型上下文，不另存每次请求的完整对话。实时 `provider/attempt` 与持久历史轨迹直接携带同一个 `RequestObservation`；事件自身只补充 threadId 和 turnId，不在后端拆字段、前端再拼回。失败类别与稳定诊断码都随该观测持久化，实时事件从同一份记录派生，重试后最终成功的请求仍能回溯前几次为何失败。请求身份只由该观测承载，内嵌的 context 与展开 header 都不再复制同一个 id。用量未上报时保持未知；回合累计已上报计数，usagePresent 表示至少一次请求完整上报输入和输出；缓存字段缺失与明确零命中有不同含义。历史投影从请求记录的 context 直接解析定义；结束观测保留开始观测的请求头与开始记录时间。请求定义先于引用持久化，历史投影直接使用这一关系。观测追加失败停止执行；请求本身也已失败时，同时保留提供方原因与记录写入原因。
 
-源码：[请求执行与用量](../crates/agent/src/request_execution.rs) · [定义索引](../crates/agent/src/session/request.rs) · [SessionData](../crates/agent/src/session/manager.rs) · [历史投影](../crates/runtime/src/history.rs)。
+源码：[请求执行与用量](../crates/agent/src/request_execution.rs) · [请求定义](../crates/agent/src/session/request.rs) · [SessionData](../crates/agent/src/session/manager.rs) · [历史投影](../crates/runtime/src/history.rs)。
 
 <a id="recovery"></a>
 ## 17. 历史读取、写入与异常恢复
@@ -798,8 +798,8 @@ flowchart TB
 ```mermaid
 flowchart TB
     JSONL[("严格 JSONL v11<br/>header：id、version、cwd、timestamp")]
-    JSONL --> Data["SessionData<br/>原始条目与定义位置索引，只读能力"]
-    Data --> Context["ContextView<br/>构建 Agent 时派生的模型有效历史"]
+    JSONL --> Data["SessionData<br/>原始条目，只读能力"]
+    Data --> Context["ContextView<br/>请求装配与缩减时派生的模型有效历史"]
     Data --> Turns["index_turn_history<br/>Turn 条目范围、终态与手动停止"]
     Turns --> Summary["summarize_thread<br/>名称、updatedAt、状态与轮数"]
     Turns --> Page["IndexedTurn.project<br/>只展开请求的历史页"]
@@ -811,7 +811,7 @@ flowchart TB
     Context --> Model["模型输入<br/>缺失工具结果标明未知"]
 ```
 
-`message`、`compaction`、`metadata`、`record` 是日志中的不同条目类型；`skill_instructions`、`tool_result_pruned` 和请求观测属于 record 的具体种类。操作记录决定历史回合状态，模型历史只消费与上下文相关的种类。执行器在工具结果全部落盘后提交终态；缺少终态的历史回合由投影显示为中断。缺失的工具结果只在模型输入中标明未知，原始历史保持不变。
+`message`、`compaction`、`metadata`、`record` 是日志中的不同条目类型；`tool_result_pruned` 和请求观测属于 record 的具体种类。操作记录决定历史回合状态，模型历史只消费与上下文相关的种类。执行器在工具结果全部落盘后提交终态；缺少终态的历史回合由投影显示为中断。缺失的工具结果只在模型输入中标明未知，原始历史保持不变。
 
 ### 17.2 重新打开会话时发生什么
 
@@ -836,7 +836,7 @@ flowchart TB
 已有任务的 RPC 只提交 sessionId，执行目录来自会话自身的 cwd。打开文件时核对 header id 与请求的任务编号；项目登记用于创建任务与列表分组。文件与技能候选从当前项目根目录查询。
 
 
-目录与分页直接读取当前会话并构造不可变快照；只读打开不派生模型上下文。压缩锚点与剪枝引用由写入路径保证有效，构建 Agent 时直接按这些引用派生上下文。文件与技能候选查询直接使用项目登记的根目录。
+目录与分页直接读取当前会话并构造不可变快照；只读打开不派生模型上下文。压缩锚点与剪枝引用由写入路径保证有效，请求装配与缩减时直接按这些引用派生上下文。文件与技能候选查询直接使用项目登记的根目录。
 
 活动执行持有开始前的历史快照，并将其与该回合的增量事件组合。选中任务结算后，Electron 渲染进程读取持久历史，再刷新工作台列表。
 
@@ -874,7 +874,7 @@ JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通�
 | 修改命令执行行为 | `tools/bash` | Git Bash 参数、工作目录、输出、超时、取消与进程树；搜索和文件修改共用此入口。 |
 | 改变发送、排队或停止 | `runtime/conversation.rs`；单轮收尾在 `runner.rs` | 桌面控制 RPC、Composer 队列、运行期队列、历史恢复、JSONL 共享执行入口。 |
 | 改变终态或事件字段 | `protocol/event.rs`、`protocol/params.rs` 与 runtime 投影 | JSONL、桌面事件 envelope、活动快照、前端协议、正文、轨迹、用量；协议 wire 样例。 |
-| 修改历史或会话格式 | `agent/session/format.rs`、`manager.rs`、`file.rs` | `ContextView`、工具配对投影、请求索引、catalog 摘要、分页与前端历史。 |
+| 修改历史或会话格式 | `agent/session/format.rs`、`manager.rs`、`file.rs` | `ContextView`、工具配对投影、请求定义引用、catalog 摘要、分页与前端历史。 |
 | 改变模型接入或能力 | `model/config`、`provider/contract.rs`、`openai`、`transport` | selector 与冻结快照、重试和摘要、续接身份、请求观测、设置表单、模型选择器。 |
 | 调整上下文预算或摘要 | `agent/request.rs`、`agent/compaction.rs`、`request_execution.rs`、`compaction.rs`、`session/context.rs` | 正常发送、精确溢出恢复、手动压缩、文件指令刷新、用量记录；原历史与工具批次完整性。 |
 | 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs`、`agent/agent/inbox.rs` | 工作台候选、技能引用展开、排队编辑、steer、模型 `read` 结果留存与压缩后文件指令刷新。 |

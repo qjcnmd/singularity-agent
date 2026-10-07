@@ -1,6 +1,5 @@
 //! bash 工具的执行环：进程树管理、主等待与排空循环，以及退出状态的投影。
 
-use std::io;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,7 +71,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                 Ok(Ok(chunk)) => state.ingest(&chunk),
                 Ok(Err(error)) => {
                     // 活动阶段读到错误就直接停掉命令；排空阶段的读错另行汇总处理。
-                    break BashOutcome::OutputFailed(error);
+                    break Err(error.to_string());
                 }
                 Err(RecvTimeoutError::Disconnected) => readers_drained = true,
                 Err(RecvTimeoutError::Timeout) => {}
@@ -82,22 +81,26 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         }
         publish_output(&mut state, &mut on_update);
         if signal.is_cancelled() {
-            break BashOutcome::Aborted;
+            break Err(ABORTED_MESSAGE.to_string());
         }
         if started.elapsed() >= Duration::from_millis(timeout_ms) {
-            break BashOutcome::TimedOut(timeout_ms);
+            break Err(format!(
+                "Command timed out after {timeout_ms} ms and was terminated; the output above is what \
+                 it produced before that. Re-run with a larger timeout_ms if the work needs \
+                 more time, or narrow the command."
+            ));
         }
         match managed.child.try_wait() {
-            Ok(Some(status)) => break BashOutcome::Completed(status),
+            Ok(Some(status)) => break Ok(status),
             Ok(None) => {}
             // 观察失败只是一种结束原因：它和其他非正常结束共用后面的回收与输出收尾，
             // 已捕获的输出不会在错误分支上被丢掉。
-            Err(error) => break BashOutcome::WaitFailed(error),
+            Err(error) => break Err(format!("failed to wait for the command process: {error}")),
         }
     };
     // 唯一的回收点：自然观察到退出时子进程已经回收；其余结束原因都必须终止整棵
     // 进程树并在同一个有界窗口内等它结束。回收失败只作附加信息，不覆盖结束原因。
-    let cleanup_failures = if matches!(outcome, BashOutcome::Completed(_)) {
+    let cleanup_failures = if outcome.is_ok() {
         Vec::new()
     } else {
         managed.reclaim()
@@ -153,33 +156,18 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
 }
 
 /// 把结束原因和附加失败信息写进结果文本；返回本次调用是不是失败结果。
-fn append_outcome(content: &mut String, outcome: BashOutcome, auxiliary_failures: &[String]) -> bool {
+fn append_outcome(
+    content: &mut String,
+    outcome: Result<ExitStatus, String>,
+    auxiliary_failures: &[String],
+) -> bool {
     let mut is_error = false;
     match outcome {
-        BashOutcome::OutputFailed(error) => {
-            append_status(content, &error.to_string());
+        Err(error) => {
+            append_status(content, &error);
             is_error = true;
         }
-        BashOutcome::WaitFailed(error) => {
-            append_status(content, &format!("failed to wait for the command process: {error}"));
-            is_error = true;
-        }
-        BashOutcome::Aborted => {
-            append_status(content, ABORTED_MESSAGE);
-            is_error = true;
-        }
-        BashOutcome::TimedOut(ms) => {
-            append_status(
-                content,
-                &format!(
-                    "Command timed out after {ms} ms and was terminated; the output above is what \
-                     it produced before that. Re-run with a larger timeout_ms if the work needs \
-                     more time, or narrow the command."
-                ),
-            );
-            is_error = true;
-        }
-        BashOutcome::Completed(status) => {
+        Ok(status) => {
             if status.success() {
                 if content.is_empty() {
                     *content = "(no output)".to_string();
@@ -217,12 +205,4 @@ fn describe_exit(status: ExitStatus) -> String {
         // 没有退出码说明进程被信号终止，而不是正常退出。
         None => "Command terminated".to_string(),
     }
-}
-
-enum BashOutcome {
-    Completed(ExitStatus),
-    Aborted,
-    TimedOut(u64),
-    OutputFailed(io::Error),
-    WaitFailed(io::Error),
 }

@@ -7,9 +7,9 @@ use serde_json::Value;
 
 use crate::{SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Workspace {
     pub workspace_id: String,
     pub name: String,

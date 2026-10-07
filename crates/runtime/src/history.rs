@@ -23,7 +23,7 @@ use singularity_protocol::{HistoryItem, SessionModelUsage, ThreadSummary, Thread
 pub(crate) struct IndexedTurn {
     pub turn_id: Option<String>,
     pub status: Option<TurnStatus>,
-    /// 本轮终态记录里落盘的失败细节；非失败轮和旧日志是 None。
+    /// 本轮终态记录里落盘的失败细节；非失败轮和没有可信终态的回合是 None。
     pub error: Option<singularity_protocol::TurnErrorDetail>,
     /// 本轮以 interrupted 结束，而且是由用户停止触发的；没有终态记录的回合为 false。
     pub manually_stopped: bool,

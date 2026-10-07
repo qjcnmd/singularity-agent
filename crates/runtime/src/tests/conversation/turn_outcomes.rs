@@ -147,7 +147,7 @@ fn running_turn_keeps_its_frozen_window_across_configuration_refresh() {
 fn failed_turn_reports_usage_recorded_before_the_failure() {
     let fixture = SessionsFixture::new();
     let provider = ScriptedProvider::new([
-        ScriptedAttempt::ToolCalls {
+        ScriptedAttempt::Success {
             text: "calling a tool".to_string(),
             calls: vec![singularity_model::ModelToolCall {
                 tool_call_id: "call-1".to_string(),
@@ -207,14 +207,14 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
     let thread_id = conversation.thread().thread_id;
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
-    let ready_tx = std::sync::Mutex::new(Some(ready_tx));
+    let mut ready_tx = Some(ready_tx);
     let worker = {
         let conversation = Arc::clone(&conversation);
         std::thread::spawn(move || {
             let mut sink = move |event: TurnEvent| {
                 if let TurnEvent::ToolExecutionUpdate { ref partial_result, .. } = event
                     && partial_result.contains("ready")
-                    && let Some(sender) = ready_tx.lock().expect("ready lock").take()
+                    && let Some(sender) = ready_tx.take()
                 {
                     let _ = sender.send(());
                 }

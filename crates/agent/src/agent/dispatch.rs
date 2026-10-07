@@ -1,11 +1,11 @@
-//! 按模型给出的顺序准入工具。只读调用共享准入锁；命令和文件修改独占它。
+//! 按模型给出的顺序准入工具。只读调用各占一个许可；命令和文件修改占用全部许可。
 //! 结果一完成就落盘，随后才发布完成事件。失败后排空已启动的工具，不派发后续调用。
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use singularity_model::ModelToolCall;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::{Agent, AgentEvent, Result};
@@ -26,7 +26,7 @@ enum WorkerEvent {
         item_id: String,
         tool_call_id: String,
         execution: ToolExecution,
-        _admission: Admission,
+        _admission: OwnedSemaphorePermit,
     },
 }
 
@@ -44,7 +44,7 @@ impl Agent {
         // 只为读 cwd 短暂持有会话写者锁；绝不跨工具执行持锁，否则会阻塞控制
         // 接受与终态落盘（工具 worker 与控制面共用同一写者）。
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let gate = Arc::new(RwLock::with_max_readers((), MAX_PARALLEL_TOOL_WORKERS));
+        let gate = Arc::new(Semaphore::new(MAX_PARALLEL_TOOL_WORKERS as usize));
         let (sender, mut receiver) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
         let mut active = 0usize;
         let mut failure = None;
@@ -60,21 +60,12 @@ impl Agent {
                 self.registry.preflight(&call.tool_name, &call.arguments)
             };
             let parallel = matches!(&prepared, Ok(prepared) if prepared.supports_parallel());
-            let admission = async {
-                if parallel {
-                    Admission::Read {
-                        _guard: Arc::clone(&gate).read_owned().await,
-                    }
-                } else {
-                    Admission::Write {
-                        _guard: Arc::clone(&gate).write_owned().await,
-                    }
-                }
-            };
+            let permits = if parallel { 1 } else { MAX_PARALLEL_TOOL_WORKERS };
+            let admission = Arc::clone(&gate).acquire_many_owned(permits);
             tokio::pin!(admission);
             let guard = loop {
                 tokio::select! {
-                    guard = &mut admission => break Some(guard),
+                    guard = &mut admission => break Some(guard.expect("tool admission remains open")),
                     event = receiver.recv(), if active > 0 => {
                         let event = event.expect("active tool retains its result sender");
                         active -= usize::from(matches!(event, WorkerEvent::Ended { .. }));
@@ -197,13 +188,4 @@ impl Agent {
         on_event(AgentEvent::ToolExecutionEnded { item_id: item_id.to_string(), execution });
         Ok(())
     }
-}
-
-enum Admission {
-    Read {
-        _guard: tokio::sync::OwnedRwLockReadGuard<()>,
-    },
-    Write {
-        _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
-    },
 }

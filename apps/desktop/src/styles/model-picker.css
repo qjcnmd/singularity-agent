@@ -42,7 +42,6 @@
 .sg-track:has(:focus-visible) .sg-thumb { outline: 2px solid var(--focus); outline-offset: 2px; }
 
 .sg-native-slider::-webkit-slider-thumb { appearance: none; width: 28px; height: 27px; }
-.sg-native-slider::-moz-range-thumb { width: 28px; height: 27px; border: 0; }
 
 /* 只有原生 input 拥有指针交互；可见 range 仅作装饰。 */
 .sg-root button:not(:disabled):active { transform: none; }

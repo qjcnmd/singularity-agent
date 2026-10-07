@@ -111,7 +111,7 @@ fn an_accepted_stop_stops_the_chain_even_when_the_turn_fails() {
     )]));
     let (conversation, path) =
         conversation_with(&fixture, Arc::clone(&script) as Arc<dyn Provider + Send + Sync>, None);
-    let queued = std::sync::Mutex::new(None);
+    let mut queued = None;
     let outcome = {
         let conversation = Arc::clone(&conversation);
         crate::test_support::run_async(conversation.run_turn("go", &mut |event| {
@@ -122,7 +122,7 @@ fn an_accepted_stop_stops_the_chain_even_when_the_turn_fails() {
                 conversation
                     .submit_follow_up("must stay queued")
                     .expect("a queued input is accepted before the terminal");
-                *queued.lock().unwrap() = conversation.snapshot().pending_input;
+                queued = conversation.snapshot().pending_input;
                 conversation.abort().expect("the stop is accepted");
             }
         }))
@@ -144,7 +144,7 @@ fn an_accepted_stop_stops_the_chain_even_when_the_turn_fails() {
     );
     assert_eq!(script.requests().len(), 1, "an accepted stop never starts the next queued turn");
     let pending = conversation.snapshot().pending_input.unwrap();
-    assert_eq!(pending.control_id, queued.lock().unwrap().as_ref().unwrap().control_id);
+    assert_eq!(pending.control_id, queued.as_ref().unwrap().control_id);
 }
 
 /// 接受停止同时关闭本轮注入窗口：其后的 steer 与 send-now 都被拒绝，

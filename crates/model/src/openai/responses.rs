@@ -227,10 +227,8 @@ pub(crate) fn openai_responses_input(
     selection: &SelectedModel,
     provider_name: &str,
 ) -> (Option<String>, Vec<Value>) {
-    let instruction_count = messages
-        .iter()
-        .take_while(|message| matches!(message.role, ModelRole::System | ModelRole::Developer))
-        .count();
+    let instruction_count =
+        messages.iter().take_while(|message| message.role == ModelRole::Developer).count();
     let instructions = messages[..instruction_count]
         .iter()
         .map(|message| message.content.as_str())
@@ -270,12 +268,11 @@ pub(crate) fn openai_responses_input(
                     }));
                 }
             }
-            ModelRole::System | ModelRole::Developer | ModelRole::User => {
+            ModelRole::Developer | ModelRole::User => {
                 let role = match message.role {
-                    // 开头的 system/developer 已折叠进上面的 instructions 字段；历史之后的
-                    // developer 消息只能用 Responses 输入 schema 接受的角色，而 system
-                    // 保留它原本的指令语义。
-                    ModelRole::System | ModelRole::Developer => "system",
+                    // 开头的 developer 已折叠进 instructions；历史之后的 developer
+                    // 使用 Responses 输入 schema 接受的 system 角色。
+                    ModelRole::Developer => "system",
                     ModelRole::User => "user",
                     ModelRole::Assistant | ModelRole::Tool => unreachable!(),
                 };

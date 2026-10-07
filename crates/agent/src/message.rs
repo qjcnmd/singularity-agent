@@ -85,7 +85,7 @@ impl AgentMessage {
             Self::ToolResult { .. } => return Vec::new(),
         };
         let include_tool_calls = matches!(scope, ItemScope::History);
-        let images = self.images().cloned().collect::<Vec<_>>();
+        let mut images = self.images().cloned().collect::<Vec<_>>();
         let (mut text_index, mut thinking_index, mut call_index) = (0, 0, 0);
         self.display_content()
             .iter()
@@ -100,11 +100,7 @@ impl AgentMessage {
                             id,
                             role: role.into(),
                             text: text.clone(),
-                            images: if text_index == 1 {
-                                images.clone()
-                            } else {
-                                Vec::new()
-                            },
+                            images: std::mem::take(&mut images),
                         }
                     }
                     ContentBlock::Thinking { thinking } if !thinking.is_empty() => {

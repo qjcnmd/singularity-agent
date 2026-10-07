@@ -84,28 +84,24 @@ fn load_instruction_directories(
             directory.join(PROJECT_INSTRUCTIONS_FILE_NAME).display(),
             instruction_file.text
         );
-        let byte_len = source_text.len();
         let remaining = PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES - content.len();
         let separator_len = if content.is_empty() {
             0
         } else {
             PROJECT_INSTRUCTIONS_SEPARATOR.len()
         };
-        if byte_len + separator_len > remaining {
-            let (take, _) = crate::utf8_prefix(&source_text, remaining.saturating_sub(separator_len));
-            if !take.trim().is_empty() {
-                if !content.is_empty() {
-                    content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
-                }
-                content.push_str(take);
+        let (take, source_truncated) =
+            crate::utf8_prefix(&source_text, remaining.saturating_sub(separator_len));
+        if !take.trim().is_empty() {
+            if !content.is_empty() {
+                content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
             }
+            content.push_str(take);
+        }
+        if source_truncated {
             truncated = true;
             break;
         }
-        if !content.is_empty() {
-            content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
-        }
-        content.push_str(&source_text);
     }
 
     if content.is_empty() {

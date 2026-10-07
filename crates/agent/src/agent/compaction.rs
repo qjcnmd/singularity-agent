@@ -13,7 +13,7 @@ const AUTO_COMPACTION_TRIGGER_RATIO: f64 = 0.9;
 const COMPACTION_RETAIN_RATIO: f64 = 0.1;
 
 impl Agent {
-    /// 把剪枝作为「引用原消息」的追加记录落盘，由会话同步推进模型视图。
+    /// 把剪枝作为「引用原消息」的追加记录落盘，后续投影使用替换后的正文。
     /// 剪枝覆盖整个活动历史：超长工具结果不分新旧。
     async fn prune_tool_results(&mut self, cancellation: &CancellationToken) -> Result<bool> {
         let signal = cancellation.clone();
