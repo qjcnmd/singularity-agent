@@ -219,16 +219,14 @@ impl ContextView {
     /// 把刚提交的日志位置推进到视图里；追加与重新打开走同一套排序规则。
     pub(crate) fn append_entry(&mut self, session: &SessionData, index: usize) {
         let entry = &session.entries()[index];
-        apply_context_entry(&mut self.entries, ContextPosition { index, pruned_index: None }, session);
-        if matches!(
-            entry,
-            SessionEntry::Compaction { .. }
-                | SessionEntry::Record {
-                    record: LedgerRecord::ToolResultPruned { .. },
-                    ..
-                }
-        ) {
-            // 结构替换只重算活动历史，不再重放整份账本；普通追加继续使用尾部增量。
+        let replaced =
+            apply_context_entry(&mut self.entries, ContextPosition { index, pruned_index: None }, session);
+        if let Some(previous) = replaced {
+            // 剪枝只替换结果内容，工具配对及其补齐估价不变。
+            let current = ContextPosition { pruned_index: Some(index), ..previous };
+            self.estimated_tokens =
+                self.estimated_tokens - previous.token_estimate(session) + current.token_estimate(session);
+        } else if matches!(entry, SessionEntry::Compaction { .. }) {
             self.estimated_tokens = context_token_estimate(&self.entries, session);
         } else if is_context_entry(entry) {
             self.estimated_tokens = self.estimated_tokens.saturating_add(entry_token_estimate(entry));

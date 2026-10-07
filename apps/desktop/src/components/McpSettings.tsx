@@ -66,7 +66,7 @@ export function McpSettings({ workspaceId, active }: { workspaceId: string | nul
   return <section className="mcp-settings" aria-labelledby="mcp-settings-title">
     <header className="sg-view-header">
       <h3 id="mcp-settings-title">MCP</h3>
-      <p>连接外部工具。配置和开关在下次发送时生效，正在运行的回合继续使用已有工具。</p>
+      <p>连接外部工具。配置和开关在下一回合开始或上下文压缩后刷新时生效。</p>
     </header>
     {loading && <p role="status">正在读取 MCP 配置…</p>}
     {error && <p role="alert" className="form-error">{error} <button type="button" className="quiet-button" disabled={busy} onClick={() => void load()}>重新读取</button></p>}

@@ -123,7 +123,7 @@ pub(crate) struct ToolSpec {
 
 type ToolParser = fn(&Value) -> Result<PreparedTool, ToolExecution>;
 
-/// 一次 turn 内冻结的工具注册表快照；Default 会注册默认工具集
+/// 回合开始及压缩后更新、连续请求间复用的工具注册表快照；Default 注册默认工具集
 /// （bash/read）。提示词名单、provider schema、参数
 /// 校验和执行分发都由本模块维护；哪些调用可以并行由 PreparedTool 决定。
 #[derive(Debug)]

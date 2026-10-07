@@ -33,7 +33,7 @@ use crate::request_execution::RequestAccounting;
 
 use self::inbox::lock_inbox;
 use crate::message::{AgentMessage, ItemScope, assistant_response_message};
-use crate::session::{SessionError, SessionWriter, lock_writer, with_writer_async};
+use crate::session::{SessionError, SessionWriter, lock_writer};
 use crate::tools::ToolRegistrySnapshot;
 
 /// Agent 的首次文件指令及后续指令加载目录。
@@ -206,7 +206,7 @@ impl Agent {
             let tool_calls = assistant.tool_calls().cloned().collect::<Vec<_>>();
             // 实时完成事件只需要正文与思考；工具的生命周期由工具自己的事件表达。
             let public_items = assistant.public_items(&assistant_result_entry_id, ItemScope::Completion);
-            self.append_message(Some(&assistant_result_entry_id), assistant).await?;
+            self.append_message(Some(&assistant_result_entry_id), assistant, &[]).await?;
             on_event(AgentEvent::MessageFinished {
                 message_id: assistant_result_entry_id.clone(),
                 items: public_items,
@@ -254,14 +254,13 @@ impl Agent {
         input: &UserInput,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        self.save_images(&input.images).await?;
         let images: Vec<_> = input.images.iter().map(|image| image.attachment.clone()).collect();
         let model_text = input.model_text();
         let display_text = (model_text != input.text).then(|| input.text.clone());
         let mut content = vec![crate::message::ContentBlock::Text { text: model_text }];
         content.extend(images.iter().cloned().map(crate::message::ContentBlock::Image));
         let message = AgentMessage::User { content, display_text };
-        let entry_id = self.append_message(None, message).await?;
+        let entry_id = self.append_message(None, message, &input.images).await?;
         on_event(AgentEvent::UserMessage {
             entry_id,
             text: input.text.clone(),
@@ -270,31 +269,33 @@ impl Agent {
         Ok(())
     }
 
-    async fn save_images(&self, images: &[crate::image::InputImage]) -> Result<()> {
-        if images.is_empty() {
-            return Ok(());
-        }
-        let directory = lock_writer(&self.session).image_directory();
+    /// 先在会话锁外保存图片，再追加引用它们的消息；成功后调用方才能发布完成事件。
+    /// id 为 Some 时沿用预分配的结果条目身份，返回已提交的消息 id。
+    async fn append_message(
+        &mut self,
+        id: Option<&str>,
+        message: AgentMessage,
+        images: &[crate::image::InputImage],
+    ) -> Result<String> {
+        let session = Arc::clone(&self.session);
+        let id = id.map(str::to_string);
         let images = images.to_vec();
-        tokio::task::spawn_blocking(move || {
-            for image in images {
-                image.save(&directory)?;
+        Ok(tokio::task::spawn_blocking(move || {
+            if !images.is_empty() {
+                let directory = lock_writer(&session).image_directory();
+                for image in images {
+                    image.save(&directory)?;
+                }
             }
-            Ok::<_, SessionError>(())
+            let mut writer = lock_writer(&session);
+            let committed = match id {
+                Some(id) => writer.append_message_with_id(&id, message),
+                None => writer.append_message(message),
+            }?;
+            Ok::<_, SessionError>(committed.id)
         })
         .await
-        .expect("image worker completes while the runtime is running")?;
-        Ok(())
-    }
-
-    /// 持久化一条消息并推进上下文，返回持久条目 id；id 为 Some 时沿用预分配的结果条目 id。
-    async fn append_message(&mut self, id: Option<&str>, message: AgentMessage) -> Result<String> {
-        let id = id.map(str::to_string);
-        Ok(with_writer_async(&self.session, move |writer| match id {
-            Some(id) => writer.append_message_with_id(&id, message),
-            None => writer.append_message(message),
-        })
-        .await?)
+        .expect("message writer completes while the runtime is running")?)
     }
 
     /// 本轮从 Provider 冻结的上下文容量。

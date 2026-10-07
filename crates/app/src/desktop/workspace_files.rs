@@ -3,7 +3,6 @@
 //! 这里只做目录遍历和过滤；原生文件夹选择窗口在 `apps/desktop/desktop/main.ts`。扫描失败照常返回
 //! Err，只有「条目在扫描期间消失」这种瞬时情况按没有候选跳过。
 
-use singularity_core::workspace::is_ignored_directory;
 use singularity_protocol::FileCandidate;
 
 /// 查找路径中包含 query 的候选，取得调用者所需数量后停止遍历。
@@ -52,7 +51,8 @@ pub(crate) fn search_files(directory: &str, query: &str, limit: usize) -> Result
             }
             let path = entry.path();
             if file_type.is_dir() {
-                if !is_ignored_directory(&entry.file_name().to_string_lossy()) {
+                if !matches!(entry.file_name().to_string_lossy().as_ref(), ".git" | "node_modules" | "target")
+                {
                     pending.push(path);
                 }
                 continue;

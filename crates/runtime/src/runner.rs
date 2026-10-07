@@ -20,7 +20,7 @@ use singularity_agent::agent::SteeringInbox;
 use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, AgentTerminalReason};
 use singularity_agent::session::{
     LedgerRecord, SessionManager, SessionWriter, append_record_async, lock_writer,
-    turn_usage_from_model_usage, with_writer_async,
+    turn_usage_from_model_usage,
 };
 use singularity_core::load_agent_instructions;
 use singularity_model::{ModelConfigManager, Provider};
@@ -177,13 +177,8 @@ impl TurnRunner {
             error: error.clone(),
             user_stopped: cancel_accepted,
         };
-        let finished_at = match with_writer_async(&writer, move |writer| {
-            writer.append_record(record)?;
-            Ok(writer.entries().last().expect("successful append has an entry").timestamp().to_owned())
-        })
-        .await
-        {
-            Ok(timestamp) => timestamp,
+        let finished_at = match append_record_async(&writer, record).await {
+            Ok(committed) => committed.timestamp,
             Err(storage_error) => {
                 return Err(fail_stop_terminalization(
                     &thread.thread_id,
@@ -241,12 +236,10 @@ impl TurnRunner {
             agent
         };
         let mut writer = lock_writer(&writer);
-        writer
+        let committed = writer
             .append_record(LedgerRecord::OperationStarted { turn_id: Some(controls.turn_id.clone()) })
             .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
-        let started_at =
-            writer.entries().last().expect("successful append has an entry").timestamp().to_owned();
-        Ok((agent, started_at))
+        Ok((agent, committed.timestamp))
     }
 
     /// 解析 Provider 与 AgentConfig；模型容量由 Agent 从 Provider 冻结。

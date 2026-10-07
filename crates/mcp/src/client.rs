@@ -146,7 +146,7 @@ impl Connection {
     }
 
     pub async fn tools(&self) -> Result<Vec<Tool>, String> {
-        // 每个回合重新发现，接纳服务器目录变更；回合内部由 Agent 冻结 schema。
+        // 回合开始及压缩后重新发现；Agent 在两次发现之间复用同一份 schema。
         tokio::time::timeout(Duration::from_secs(self.config.startup_timeout_sec), self.peer.list_all_tools())
             .await
             .map_err(|_| "MCP 工具发现超时。".to_string())?

@@ -13,7 +13,7 @@ pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
     SessionMetadata, text_item_id, thinking_item_id, tool_item_id, turn_usage_from_model_usage,
 };
-pub use manager::{SessionData, SessionManager};
+pub use manager::{CommittedEntry, SessionData, SessionManager};
 pub use request::RequestContext;
 pub(crate) use request::RequestDefinitions;
 
@@ -37,7 +37,7 @@ pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionM
 }
 
 /// 在线程池追加一条持久记录；调用方 await 成功后才能发布依赖它的事件。
-pub async fn append_record_async(writer: &SessionWriter, record: LedgerRecord) -> Result<String> {
+pub async fn append_record_async(writer: &SessionWriter, record: LedgerRecord) -> Result<CommittedEntry> {
     with_writer_async(writer, move |writer| writer.append_record(record)).await
 }
 

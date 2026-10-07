@@ -8,11 +8,6 @@ use std::path::{Path, PathBuf};
 
 use crate::display_path;
 
-/// 本地文件发现时要跳过的生成目录和仓库内部目录。
-pub fn is_ignored_directory(name: &str) -> bool {
-    matches!(name, ".git" | "node_modules" | "target")
-}
-
 /// Workspace 的规范路径身份；从持久数据恢复身份时不要求原目录仍然存在。
 #[derive(Debug, Clone)]
 pub struct CanonicalWorkspacePath {

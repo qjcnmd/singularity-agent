@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! 用户级 MCP 配置、按工作目录复用的连接，以及每回合冻结的工具目录。
+//! 用户级 MCP 配置、按工作目录复用的连接，以及回合开始和压缩后发现的工具目录。
 
 mod client;
 mod config;
@@ -89,7 +89,7 @@ impl McpManager {
             .collect())
     }
 
-    /// 先验证并原子落盘，再发布新配置；已有回合继续持有原来的连接与目录。
+    /// 先验证并原子落盘，再发布新配置；Agent 在下次工具发现前继续持有原连接与目录。
     pub fn save(&self, input: McpServerInput) -> Result<(), String> {
         let id = input.server_id.clone();
         let config = ServerConfig::from_input(input);
@@ -108,7 +108,7 @@ impl McpManager {
         })
     }
 
-    /// 删除设置并释放管理器持有的连接，运行中的回合通过自己的快照继续收尾。
+    /// 删除设置并释放管理器持有的连接；已有工具快照继续可用，直到 Agent 刷新目录。
     pub fn remove(&self, id: &str) -> Result<(), String> {
         self.update(id, |all| {
             all.servers.remove(id).ok_or("MCP 服务器不存在。")?;

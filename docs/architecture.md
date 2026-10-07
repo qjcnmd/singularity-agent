@@ -186,7 +186,7 @@ flowchart LR
 | 模型与凭据 | `ModelConfigManager` 内部串行读取和修改，生成运行快照、脱敏目录；修改结果与修改后的实际目录在同一临界区中取得，部分保存失败也返回当前目录；Electron 渲染进程只写新密钥，不从目录读回密钥。 |
 | 会话事实 | `SessionManager` 写入，`SessionData` 只读；上下文、中断操作恢复、历史、摘要、请求详情均从同一日志派生。未消费的控制输入是内存状态，不由日志恢复。 |
 | 视图与草稿 | `viewPersistence.ts` 保存视图；`drafts.ts` 在 IndexedDB 中按任务保存完整输入，并迁移旧文字草稿。 |
-| 图片 | `agent/image.rs` 共用识别、解码与格式转换；消费输入或完成工具时先保存像素，再追加 Image 内容块。排队图片仍属于进程内输入。 |
+| 图片 | `agent/image.rs` 共用识别、解码与格式转换；用户输入和工具结果共用 Agent 的消息追加入口，先在会话锁外保存像素，再追加引用图片的消息；成功后才发布完成事件。排队图片仍属于进程内输入。 |
 | 临时工具输出 | 工具结果给出实际日志路径；新建输出时清理超过七天的旧输出，保存失败明确反馈。 |
 
 移除项目删除登记，归档任务移动日志，二者成功后由前端清理对应草稿和阅读锚点。项目移除时，ThreadCatalog 根据候选任务的持久 cwd 确定归属，包含已归档任务；前端将返回的任务身份交给 IndexedDB 在一个事务中删除草稿。 会话写入与本地草稿属于不同存储，草稿删除失败时报告已完成的操作和未完成的清理，保留原草稿记录。运行中或仍有待处理输入的任务会阻止移除所属项目。私有配置依赖 Windows 用户目录权限并使用原子替换；Session 追加的“先写后发布”不承诺断电持久性。
@@ -386,7 +386,7 @@ sequenceDiagram
     Runner-->>Conv: 已提交的终态事件<br/>Result：TurnOutcome 或 TurnRunError
 ```
 
-`TurnRunner` 持有单回合生命周期，`Conversation` 持有普通排队输入和 steer 输入箱；一个回合可包含多个模型请求。`prepare_turn` 在会话写入窗口内完成模型、指令和 Agent 准备，成功写入 `operation_started` 后，Conversation 才移交本轮输入并开放 Running 控制窗口；准备失败时排队输入仍保持原位。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 直接交回 `Result<TurnOutcome, TurnRunError>`，执行链依据结果中的停止标志和失败状态结束；未消费的 steer 仍由 Conversation 持有。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。动作 RPC 确认是否接受；队列编辑另返回取回的完整输入，执行事实由后续事件与快照提供。
+`TurnRunner` 持有单回合生命周期，`Conversation` 持有普通排队输入和 steer 输入箱；一个回合可包含多个模型请求。`prepare_turn` 在会话写入窗口内完成模型、指令和 Agent 准备，成功写入 `operation_started` 后，Conversation 才移交本轮输入并开放 Running 控制窗口；准备失败时排队输入仍保持原位。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 直接交回 `Result<TurnOutcome, TurnRunError>`，执行链依据结果中的停止标志和失败状态结束；未消费的 steer 仍由 Conversation 持有。Session 追加成功后返回 `CommittedEntry`（条目 ID 与落盘时间戳），Runner 直接使用提交时间构造开始和终态事件。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。动作 RPC 确认是否接受；队列编辑另返回取回的完整输入，执行事实由后续事件与快照提供。
 
 源码：[Store.submit](../apps/desktop/src/appStore.ts) · [AppServer.submit](../crates/app/src/desktop/app_server/actions.rs) · [spawn_operation](../crates/app/src/desktop/app_server.rs) · [Conversation.run_chain / run_single_turn](../crates/runtime/src/conversation/execution.rs) · [TurnRunner.run / 终态提交](../crates/runtime/src/runner.rs)。
 
@@ -690,7 +690,7 @@ flowchart TB
 
 首次摘要按目标、约束、进度、关键决定、下一步和关键上下文生成固定结构；再次压缩时，从有效历史中取出上一份摘要，只用本次新覆盖的消息更新该结构。自动、手动和溢出恢复均复用这条路径。
 
-`SessionManager` 与账本一起持有 `ContextView`，所有追加在持久提交成功后、同一写者锁内推进上下文。普通消息和 Skill 记录增量更新位置与估价；剪枝和摘要沿同一投影规则调整活动位置，只重算活动历史的估价，重新打开时才从整份账本派生视图。写入失败不推进账本或上下文。Agent 在线程池中读取投影、选择摘要前缀和加载图片，图片读取不持有写者锁；本轮 `usage_correction` 由 Agent 持有，普通追加保留校正，剪枝、摘要提交或文件指令刷新后清零。
+`SessionManager` 与账本一起持有 `ContextView`，所有追加在持久提交成功后、同一写者锁内推进上下文。普通消息和 Skill 记录增量更新位置与估价；剪枝沿同一投影规则替换结果内容，并按替换前后的估价差量更新总额；摘要替换后重算活动历史的估价，重新打开时才从整份账本派生视图。写入失败不推进账本或上下文。Agent 在线程池中读取投影、选择摘要前缀和加载图片，图片读取不持有写者锁；本轮 `usage_correction` 由 Agent 持有，普通追加保留校正，剪枝、摘要提交或文件指令刷新后清零。
 
 摘要请求与其他请求一样经统一请求账本计量：其 provider usage 记录在该请求自己的 request observation 上，会话累计与工作台展示都由账本聚合，compaction 条目只保存 summary 与 firstKeptEntryId。
 
@@ -711,7 +711,7 @@ Chat 编码器将图片工具结果中的像素放到完整工具结果组之后
 
 ### 15.1 工具定义、执行与结果共用一条路径
 
-`McpManager` 由应用装配层创建，设置 RPC 与共享 TurnRunner 持有同一实例。用户数据目录 `mcp.json` 是配置事实来源，每次设置操作和回合发现读取文件；连接按任务 cwd 和服务器身份复用，配置变化、删除或显式重连后，新回合使用新连接，运行中回合由自己的快照保留原连接。每回合开始时通过官方 `rmcp` SDK 完成 stdio/Streamable HTTP 初始化与分页工具发现，并按服务器和工具名称排序。发现结果合入 `ToolRegistrySnapshot`，第一次模型请求即包含全部可用工具，普通连续请求复用当前定义。手动摘要前及上下文缩减完成后复用同一工具准备方法，目录变更在下一回合或压缩后的刷新边界重新发现，连接失败同时产生用户诊断与模型可见的不可用说明。
+`McpManager` 由应用装配层创建，设置 RPC 与共享 TurnRunner 持有同一实例。用户数据目录 `mcp.json` 是配置事实来源，每次设置操作和回合发现读取文件；连接按任务 cwd 和服务器身份复用，配置变化、删除或显式重连后，已有快照继续持有原连接；Agent 在下一回合开始或压缩后刷新时重新发现工具并接纳新配置。每回合开始时通过官方 `rmcp` SDK 完成 stdio/Streamable HTTP 初始化与分页工具发现，并按服务器和工具名称排序。发现结果合入 `ToolRegistrySnapshot`，第一次模型请求即包含全部可用工具，普通连续请求复用当前定义。上下文缩减完成后复用同一工具准备方法；手动摘要沿用最近请求的定义，仅在没有请求快照时发现工具。目录变更在下一回合或压缩后的刷新边界重新发现，连接失败同时产生用户诊断与模型可见的不可用说明。
 
 MCP 工具执行沿用现有独占准入；不根据服务器提供的只读提示扩大并发。SDK 负责 MCP 请求配对和超时，用户停止发送取消通知，调用不自动重试。工具结果在 Agent 边界转换为 `ToolExecution`，图片通过现有校验、保存和投影；停止任务并结算后，退出关闭连接并通过 Windows Job Object 回收本地服务器进程树。配置输入和运行状态走 MCP 设置 RPC，工具定义、调用与结果复用既有请求观测和会话日志。
 

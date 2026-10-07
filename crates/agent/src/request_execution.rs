@@ -256,15 +256,12 @@ impl ProviderObserver for RequestAttempt<'_> {
                     }
                 }
             };
-            let saved = with_writer_async(self.writer, move |writer| {
-                writer
-                    .append_model_request(observation.clone(), request_head)
-                    .map(|head| (observation, head))
+            let persisted = observation.clone();
+            observation.request_head = with_writer_async(self.writer, move |writer| {
+                writer.append_model_request(persisted, request_head)
             })
             .await
             .map_err(std::io::Error::other)?;
-            observation = saved.0;
-            observation.request_head = saved.1;
             (self.on_event)(AgentEvent::ProviderAttempt { observation });
             Ok(())
         })

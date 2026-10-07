@@ -16,6 +16,12 @@ use super::format::{
     CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError, SessionHeader, SessionMetadata,
 };
 
+/// 已成功追加到会话的条目身份与时间；与日志中的值一致。
+pub struct CommittedEntry {
+    pub id: String,
+    pub timestamp: String,
+}
+
 /// JSONL 会话管理器。会话是严格的线性序列，entries 的物理顺序就是事实来源的顺序；
 /// 执行入口负责交接单个写者，turn 内通过 SessionWriter 串行追加。
 pub struct SessionManager {
@@ -164,8 +170,8 @@ impl SessionData {
 }
 
 impl SessionManager {
-    /// 往线性日志追加一条消息，写盘成功后再推进内存视图。返回新条目的 id。
-    pub fn append_message(&mut self, message: AgentMessage) -> Result<String> {
+    /// 往线性日志追加一条消息，写盘成功后再推进内存视图并返回提交信息。
+    pub fn append_message(&mut self, message: AgentMessage) -> Result<CommittedEntry> {
         self.append_entry(SessionEntry::Message {
             id: super::new_entry_id(),
             timestamp: now_iso(),
@@ -174,12 +180,12 @@ impl SessionManager {
     }
 
     /// 追加一条 compaction 条目并立即写盘（id 是预分配的：本次摘要 attempt 的
-    /// result_entry_id 就指向它）。返回新条目的 id。
+    /// result_entry_id 就指向它）。返回已提交条目的身份与时间。
     pub(crate) fn append_compaction_with_id(
         &mut self,
         id: &str,
         compaction: CompactionEntry,
-    ) -> Result<String> {
+    ) -> Result<CommittedEntry> {
         self.append_entry(SessionEntry::Compaction {
             id: id.to_string(),
             timestamp: now_iso(),
@@ -188,7 +194,7 @@ impl SessionManager {
     }
 
     /// 追加一条不进入模型上下文的 metadata。
-    pub fn append_metadata(&mut self, metadata: SessionMetadata) -> Result<String> {
+    pub fn append_metadata(&mut self, metadata: SessionMetadata) -> Result<CommittedEntry> {
         self.append_entry(SessionEntry::Metadata {
             id: super::new_entry_id(),
             timestamp: now_iso(),
@@ -198,7 +204,7 @@ impl SessionManager {
 
     /// 追加一条 operation ledger 记录。记录本身就是持久事实；是否进入模型上下文看
     /// 类别：操作与请求观测服务查看，指令与工具剪枝记录改变模型视图。
-    pub fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
+    pub fn append_record(&mut self, record: LedgerRecord) -> Result<CommittedEntry> {
         self.append_entry(SessionEntry::Record {
             id: super::new_entry_id(),
             timestamp: now_iso(),
@@ -217,6 +223,7 @@ impl SessionManager {
                 Some((id, previous)) if previous == &definitions => id.to_owned(),
                 _ => {
                     self.append_record(LedgerRecord::RequestDefinitions { definitions: definitions.clone() })?
+                        .id
                 }
             };
             let head = definitions.snapshot(&id, &model_preferences);
@@ -232,7 +239,11 @@ impl SessionManager {
     }
 
     /// 追加执行器为本次回答或工具结果预分配身份的消息。
-    pub(crate) fn append_message_with_id(&mut self, id: &str, message: AgentMessage) -> Result<String> {
+    pub(crate) fn append_message_with_id(
+        &mut self,
+        id: &str,
+        message: AgentMessage,
+    ) -> Result<CommittedEntry> {
         self.append_entry(SessionEntry::Message {
             id: id.to_string(),
             timestamp: now_iso(),
@@ -240,7 +251,7 @@ impl SessionManager {
         })
     }
 
-    pub(super) fn append_entry(&mut self, entry: SessionEntry) -> Result<String> {
+    pub(super) fn append_entry(&mut self, entry: SessionEntry) -> Result<CommittedEntry> {
         // 上次追加已经失败：文件尾部可能残缺，重开修复前不再接受任何写入。
         if let Some(error) = &self.append_error {
             return Err(SessionError::Io(std::io::Error::new(
@@ -248,7 +259,10 @@ impl SessionManager {
                 format!("previous session append failed; reopen the writer to repair its tail: {error}"),
             )));
         }
-        let id = entry.id().to_string();
+        let committed = CommittedEntry {
+            id: entry.id().to_string(),
+            timestamp: entry.timestamp().to_string(),
+        };
         let serialized = serde_json::to_string(&entry)?;
         let mut handle = OpenOptions::new().append(true).open(&self.file)?;
         let bytes_to_write = serialized.as_bytes();
@@ -257,7 +271,7 @@ impl SessionManager {
         let index = self.data.entries.len() - 1;
         self.data.observe_definitions(index);
         self.context.append_entry(&self.data, index);
-        Ok(id)
+        Ok(committed)
     }
 
     fn write_append(&mut self, handle: &mut impl Write, bytes: &[u8]) -> Result<()> {
