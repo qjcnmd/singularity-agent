@@ -9,7 +9,6 @@ mod format;
 mod manager;
 mod request;
 
-pub use context::ContextView;
 pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
     SessionMetadata, text_item_id, thinking_item_id, tool_item_id, turn_usage_from_model_usage,

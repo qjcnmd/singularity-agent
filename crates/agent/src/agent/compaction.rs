@@ -13,28 +13,34 @@ const AUTO_COMPACTION_TRIGGER_RATIO: f64 = 0.9;
 const COMPACTION_RETAIN_RATIO: f64 = 0.1;
 
 impl Agent {
-    /// 把剪枝作为「引用原消息」的追加记录落盘，随后从同一份账本重建模型视图。
+    /// 把剪枝作为「引用原消息」的追加记录落盘，由会话同步推进模型视图。
     /// 剪枝覆盖整个活动历史：超长工具结果不分新旧。
     async fn prune_tool_results(&mut self, cancellation: &CancellationToken) -> Result<bool> {
         let signal = cancellation.clone();
-        Self::with_context(&self.session, &mut self.context, move |session, context| {
-            let replacements = context.pruned_tool_results(&lock_writer(session));
+        let session = std::sync::Arc::clone(&self.session);
+        let changed = tokio::task::spawn_blocking(move || {
+            let replacements = {
+                let writer = lock_writer(&session);
+                writer.context().pruned_tool_results(&writer)
+            };
             let changed = !replacements.is_empty();
             for record in replacements {
                 if signal.is_cancelled() {
                     return Err(AgentError::Aborted);
                 }
-                lock_writer(session).append_record(record)?;
-            }
-            if changed {
-                context.rebuild(&lock_writer(session));
+                lock_writer(&session).append_record(record)?;
             }
             Ok(changed)
         })
         .await
+        .expect("context worker completes while the runtime is running")?;
+        if changed {
+            self.usage_correction = 0;
+        }
+        Ok(changed)
     }
 
-    /// 所有触发共用剪枝、摘要提交和历史重建；返回是否缩减了上下文。
+    /// 所有触发共用剪枝与摘要提交；返回是否缩减了上下文。
     async fn compact_context(
         &mut self,
         definitions: &RequestDefinitions,
@@ -48,21 +54,23 @@ impl Agent {
         let keep_recent_tokens =
             (self.model.context_window() as f64 * COMPACTION_RETAIN_RATIO).floor() as u64;
         // 历史里没有可替换的前缀（内容太少）：本次无需摘要。
-        let prefix = Self::with_context(&self.session, &mut self.context, move |session, context| {
-            Ok(context.compaction_prefix(&lock_writer(session), keep_recent_tokens))
-        })
-        .await?;
-        let Some(prefix) = prefix else {
-            return Ok(pruned);
-        };
         let summary_definitions = definitions.clone();
         let model = self.model.clone();
-
+        let session = std::sync::Arc::clone(&self.session);
         let summary = tokio::task::spawn_blocking(move || {
-            PreparedCompaction::new(prefix, &summary_definitions, &model)
+            let prefix = {
+                let writer = lock_writer(&session);
+                writer.context().compaction_prefix(&writer, keep_recent_tokens)
+            };
+            prefix
+                .map(|prefix| PreparedCompaction::new(prefix, &summary_definitions, &model))
+                .transpose()
         })
         .await
         .expect("image context preparation completes while the runtime is running")?;
+        let Some(summary) = summary else {
+            return Ok(pruned);
+        };
         // 请求层已经做过唯一一次 ProviderCallError→AgentError 分类；压缩只传播结果，
         // 不再按取消令牌改写真实失败原因（停止是否被接受由操作层的终态边界裁决）。
         let (response, id) = execute_request(
@@ -82,11 +90,7 @@ impl Agent {
             return Err(AgentError::Aborted);
         }
         with_writer_async(&self.session, move |writer| writer.append_compaction_with_id(&id, entry)).await?;
-        Self::with_context(&self.session, &mut self.context, |session, context| {
-            context.rebuild(&lock_writer(session));
-            Ok(())
-        })
-        .await?;
+        self.usage_correction = 0;
         Ok(true)
     }
 

@@ -23,8 +23,9 @@ fn new_conversation(
     conversation_with(fixture, provider, model).0
 }
 
-fn run_compaction(reservation: &mut crate::OperationReservation) -> Result<(), crate::ConversationError> {
-    match crate::test_support::run_async(reservation.execute(&mut |_| {})) {
+fn run_compaction(reservation: crate::OperationReservation) -> Result<(), crate::ConversationError> {
+    let (result, _guard) = crate::test_support::run_async(reservation.execute(&mut |_| {}));
+    match result {
         crate::OperationResult::Compaction(result) => result,
         crate::OperationResult::Turn(_) => panic!("expected the reserved compaction"),
     }
@@ -163,9 +164,9 @@ fn failed_compaction_closes_its_durable_operation() {
     seed_compaction_history(&fixture, &thread_id);
 
     {
-        let mut reservation = conversation.reserve_compaction().unwrap();
+        let reservation = conversation.reserve_compaction().unwrap();
         conversation.rename("compacting task").expect("compaction writer accepts rename");
-        run_compaction(&mut reservation).expect("failure terminal is persisted");
+        run_compaction(reservation).expect("failure terminal is persisted");
     }
     assert_eq!(
         fixture.catalog().read_snapshot(&thread_id).unwrap().summary.title.as_deref(),
@@ -201,7 +202,7 @@ fn invalid_compaction_response_preserves_its_validation_source() {
 
     conversation
         .reserve_compaction()
-        .and_then(|mut reservation| run_compaction(&mut reservation))
+        .and_then(run_compaction)
         .expect("failure terminal is persisted");
 
     // 失败原因随同一份 operation 终态落盘：重新打开 JSONL 仍能定位这次压缩
@@ -244,11 +245,7 @@ fn compaction_summary_append_failure_stops_execution() {
     let path = sessions.join(singularity_agent::session::session_file_name(&thread_id));
     let worker = {
         let conversation = Arc::clone(&conversation);
-        std::thread::spawn(move || {
-            conversation
-                .reserve_compaction()
-                .and_then(|mut reservation| run_compaction(&mut reservation))
-        })
+        std::thread::spawn(move || conversation.reserve_compaction().and_then(run_compaction))
     };
     started_rx
         .recv_timeout(std::time::Duration::from_secs(10))

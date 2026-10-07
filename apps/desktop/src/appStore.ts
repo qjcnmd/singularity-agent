@@ -36,11 +36,6 @@ class AppStore extends SessionStore {
     void this.setDraftFor(id, { ...draft, images: append ? [...draft.images, ...images] : images })
   }
 
-  /** 按 phase 路由的动作只有在所选 session 的 runtime 快照可信后才会触发。 */
-  private runtimeSynced(): boolean {
-    return this.state.connection === 'ready' && this.state.sessionLoad.status !== 'loading'
-  }
-
   /** 排队与取回期间只锁住内容输入，工具栏仍由各自的操作条件决定。 */
   inputLocked(): boolean {
     const id = this.state.selectedSessionId
@@ -61,7 +56,7 @@ class AppStore extends SessionStore {
     // 按连接、任务读取、运行阶段和在途提交的顺序给出第一项阻止原因。
     let blockedReason: string | null = null
     if (state.connection !== 'ready') blockedReason = '连接恢复后即可发送，草稿会保留。'
-    else if (!this.runtimeSynced()) blockedReason = '正在同步任务状态，稍后即可发送。'
+    else if (state.sessionLoad.status === 'loading') blockedReason = '正在同步任务状态，稍后即可发送。'
     else if (this.inputLocked()) blockedReason = '请先编辑、删除或发送排队消息。'
     else if (state.selectedSessionId !== null && state.session === null) blockedReason = state.sessionLoad.status === 'error'
       ? '任务读取失败，请点击上方“重试读取”。' : '正在读取任务，稍后即可发送。'
@@ -101,9 +96,8 @@ class AppStore extends SessionStore {
   }
 
   async withdraw(sessionId: string, controlId: string): Promise<boolean> {
-    return this.action('session.queue', actionOrigin.session(sessionId), async () => {
-      await this.transport.rpc('session.queueWithdraw', { sessionId, controlId })
-    })
+    return this.action('session.queue', actionOrigin.session(sessionId),
+      () => this.transport.rpc('session.queueWithdraw', { sessionId, controlId }))
   }
 
   async editQueuedInput(sessionId: string, controlId: string): Promise<boolean> {
@@ -118,22 +112,19 @@ class AppStore extends SessionStore {
   }
 
   async sendNow(sessionId: string, controlId: string): Promise<boolean> {
-    return this.action('session.queue', actionOrigin.session(sessionId), async () => {
-      await this.transport.rpc('session.queueSendNow', { sessionId, controlId })
-    })
+    return this.action('session.queue', actionOrigin.session(sessionId),
+      () => this.transport.rpc('session.queueSendNow', { sessionId, controlId }))
   }
 
   async renameWorkspace(workspaceId: string, name: string): Promise<boolean> {
-    return this.action('workspace.rename', actionOrigin.workspace(workspaceId), async () => {
-      await this.transport.rpc('workspace.rename', { workspaceId, name })
-    })
+    return this.action('workspace.rename', actionOrigin.workspace(workspaceId),
+      () => this.transport.rpc('workspace.rename', { workspaceId, name }))
   }
 
   async renameSession(sessionId: string, name: string): Promise<boolean> {
     if (name.trim() === '') return false
-    return this.action('session.rename', actionOrigin.session(sessionId), async () => {
-      await this.transport.rpc('session.rename', { sessionId, name })
-    })
+    return this.action('session.rename', actionOrigin.session(sessionId),
+      () => this.transport.rpc('session.rename', { sessionId, name }))
   }
 
   async archiveSession(sessionId: string): Promise<boolean> {
@@ -175,15 +166,13 @@ class AppStore extends SessionStore {
   }
 
   async saveProvider(provider: ProviderConfigurationInput, apiKey?: string): Promise<boolean> {
-    return this.action('model.saveProvider', actionOrigin.provider(provider.providerId), async () => {
-      await this.transport.rpc('model.saveProvider', { provider, apiKey: apiKey || undefined })
-    })
+    return this.action('model.saveProvider', actionOrigin.provider(provider.providerId),
+      () => this.transport.rpc('model.saveProvider', { provider, apiKey: apiKey || undefined }))
   }
 
   async removeProvider(providerId: string): Promise<boolean> {
-    return this.action('model.removeProvider', actionOrigin.provider(providerId), async () => {
-      await this.transport.rpc('model.removeProvider', { providerId })
-    })
+    return this.action('model.removeProvider', actionOrigin.provider(providerId),
+      () => this.transport.rpc('model.removeProvider', { providerId }))
   }
 
   openDirectoryPicker(): void {
@@ -267,9 +256,8 @@ class AppStore extends SessionStore {
     const sessionId = this.state.selectedSessionId
     if (sessionId === null) return false
     const origin = target === undefined ? actionOrigin.session(sessionId) : actionOrigin.control(sessionId, target)
-    return this.action(method, origin, async () => {
-      await this.transport.rpc(method, { ...params, sessionId } as RpcParams<M>)
-    })
+    return this.action(method, origin,
+      () => this.transport.rpc(method, { ...params, sessionId } as RpcParams<M>))
   }
 
   setSidebarView(value: Partial<PersistedView['sidebarView']>): void {

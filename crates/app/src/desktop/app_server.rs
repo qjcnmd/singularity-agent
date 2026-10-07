@@ -25,7 +25,7 @@ use singularity_protocol::{
 use singularity_runtime::UserInput;
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
-    OperationReservation, OperationResult, ThreadCatalog, TurnRunner,
+    OperationGuard, OperationReservation, OperationResult, ThreadCatalog, TurnRunner,
 };
 use tokio::sync::broadcast;
 
@@ -242,32 +242,33 @@ impl AppServer {
         session_id: &str,
         slot: &ConversationSlot,
         terminal: Option<SessionTerminalSnapshot>,
-        reservation: OperationReservation,
+        guard: OperationGuard,
     ) {
         let mut state = slot.lock_state();
         // 保存本次执行结果或错误反馈；后续历史读取失败不会覆盖它。清空冻结的
         // history 后，下一次会话读取会重新尝试读盘并单独呈现读取错误。
         state.settle(terminal);
-        // 发布结算之前先放掉操作预订；新操作的开始投影要等这把锁。
-        drop(reservation);
+        // 发布结算之前释放占用守卫；新操作的开始投影要等这把锁。
+        drop(guard);
         self.emit(StreamEvent::SessionSettled {
             session_id: session_id.to_string(),
             payload: slot.runtime_from(&state),
         });
     }
 
-    /// 将执行交给 Tokio task；预订由 task 持有直到投影结算。
+    /// 将执行交给 Tokio task；占用守卫由 task 持有直到投影结算。
     fn spawn_operation(
         self: &Arc<Self>,
         session_id: &str,
         slot: Arc<ConversationSlot>,
-        mut reservation: OperationReservation,
+        reservation: OperationReservation,
     ) {
         let app_server = Arc::clone(self);
         let session_id = session_id.to_string();
         self.runtime_handle.spawn(async move {
             let mut event_sink = |event| app_server.on_turn_event(&session_id, &slot, event);
-            let terminal = match reservation.execute(&mut event_sink).await {
+            let (result, guard) = reservation.execute(&mut event_sink).await;
+            let terminal = match result {
                 OperationResult::Turn(result) => Some(turn_terminal(result)),
                 OperationResult::Compaction(result) => match result {
                     Ok(_) => None,
@@ -279,7 +280,7 @@ impl AppServer {
                     }),
                 },
             };
-            app_server.on_session_settled(&session_id, &slot, terminal, reservation);
+            app_server.on_session_settled(&session_id, &slot, terminal, guard);
         });
     }
 

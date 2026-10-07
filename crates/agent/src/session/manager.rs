@@ -10,6 +10,7 @@ use singularity_core::now_iso;
 
 use crate::message::AgentMessage;
 
+use super::context::ContextView;
 use super::file::{ParsedSession, TailPolicy, parse_session_file, rewrite_file};
 use super::format::{
     CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError, SessionHeader, SessionMetadata,
@@ -19,6 +20,8 @@ use super::format::{
 /// 执行入口负责交接单个写者，turn 内通过 SessionWriter 串行追加。
 pub struct SessionManager {
     pub(super) data: SessionData,
+    /// 与账本同寿命的模型视图；只在持久提交成功后推进。
+    context: ContextView,
     append_error: Option<Arc<std::io::Error>>,
 }
 
@@ -80,6 +83,7 @@ impl SessionManager {
                 header_timestamp: header.timestamp,
                 definitions: std::collections::HashMap::new(),
             },
+            context: ContextView::default(),
             append_error: None,
         })
     }
@@ -89,7 +93,13 @@ impl SessionManager {
     pub fn open_existing(path: &Path, expected_id: &str) -> Result<Self> {
         let file = path.to_path_buf();
         let data = SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite, Some(expected_id))?;
-        Ok(Self { data, append_error: None })
+        let context = ContextView::derive(&data);
+        Ok(Self { data, context, append_error: None })
+    }
+
+    /// 已提交账本的上下文位置与增量估价；调用方只读，追加统一维护它。
+    pub(crate) fn context(&self) -> &ContextView {
+        &self.context
     }
 }
 
@@ -244,7 +254,9 @@ impl SessionManager {
         let bytes_to_write = serialized.as_bytes();
         self.write_append(&mut handle, bytes_to_write)?;
         self.data.entries.push(entry);
-        self.data.observe_definitions(self.data.entries.len() - 1);
+        let index = self.data.entries.len() - 1;
+        self.data.observe_definitions(index);
+        self.context.append_entry(&self.data, index);
         Ok(id)
     }
 

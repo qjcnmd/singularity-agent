@@ -3,8 +3,8 @@
 //! 每轮组装请求、调用 provider 并执行工具；模型准备结束时，原子地取走停止窗口内
 //! 新到的转向输入或关闭窗口，决定继续还是完成。
 //!
-//! 上下文压缩有两个触发点：发送前按 ContextView 的真实 usage 基线主动压缩（基线缺失时
-//! 用装配阶段的估算兜底）；provider 明确返回 ContextLengthExceeded 时强制压缩后重发。
+//! 上下文压缩有两个触发点：发送前按会话上下文估价与本轮实测校正主动压缩；
+//! provider 明确返回 ContextLengthExceeded 时强制压缩后重发。
 //! 重发机会每个轮步只有一次，重发失败直接报告该次请求的原因。
 //!
 //! 模型请求观测、消息与工具结果都经 SessionManager 追加到同一份会话日志，工具结果落盘后
@@ -33,8 +33,7 @@ use crate::request_execution::RequestAccounting;
 
 use self::inbox::lock_inbox;
 use crate::message::{AgentMessage, ItemScope, assistant_response_message};
-use crate::session::context::ContextView;
-use crate::session::{SessionError, SessionWriter, lock_writer};
+use crate::session::{SessionError, SessionWriter, lock_writer, with_writer_async};
 use crate::tools::ToolRegistrySnapshot;
 
 /// Agent 的首次文件指令及后续指令加载目录。
@@ -105,8 +104,8 @@ pub struct Agent {
     config: AgentConfig,
     /// 借用会话持有的 steer 输入箱，只存在于内存。
     inbox: SteeringInboxHandle,
-    /// 请求前上下文规模的唯一计量口径（usage 基线 + 尾部增量）。
-    context: ContextView,
+    /// 本轮同形状请求的实测用量与估价差量；结构替换或文件指令刷新后作废。
+    usage_correction: u64,
     /// 本 operation 内所有生成、重试与摘要请求的用量累计。
     accounting: RequestAccounting,
 }
@@ -121,7 +120,6 @@ impl Agent {
         mcp: Arc<singularity_mcp::McpManager>,
     ) -> Self {
         let model = provider.model_configuration();
-        let context = ContextView::derive(&lock_writer(&session));
         let cwd = lock_writer(&session).cwd().to_path_buf();
         let registry = ToolRegistrySnapshot::default();
         let skills = singularity_core::skills::SkillCatalog::discover(&cwd, &config.instruction_home);
@@ -138,7 +136,7 @@ impl Agent {
             model,
             config,
             inbox,
-            context,
+            usage_correction: 0,
             accounting: RequestAccounting::default(),
         }
     }
@@ -193,11 +191,16 @@ impl Agent {
             let usage = response.usage.clone();
             let assistant = assistant_response_message(response);
             let overhead_tokens = self.request_overhead_tokens();
-            self.context.record_usage(
-                &usage,
-                crate::session::context::message_token_estimate(&assistant),
-                overhead_tokens,
-            );
+            let estimated = lock_writer(&self.session)
+                .context()
+                .estimated_tokens()
+                .saturating_add(crate::session::context::message_token_estimate(&assistant))
+                .saturating_add(overhead_tokens);
+            self.usage_correction = if usage.usage_present {
+                usage.total_tokens.saturating_sub(estimated)
+            } else {
+                0
+            };
 
             // 工具调用既要随消息持久化、又要交给执行器：落盘前先取出执行侧的副本。
             let tool_calls = assistant.tool_calls().cloned().collect::<Vec<_>>();
@@ -287,48 +290,11 @@ impl Agent {
     /// 持久化一条消息并推进上下文，返回持久条目 id；id 为 Some 时沿用预分配的结果条目 id。
     async fn append_message(&mut self, id: Option<&str>, message: AgentMessage) -> Result<String> {
         let id = id.map(str::to_string);
-        Self::append_to_context(&self.session, &mut self.context, move |writer| match id {
+        Ok(with_writer_async(&self.session, move |writer| match id {
             Some(id) => writer.append_message_with_id(&id, message),
             None => writer.append_message(message),
         })
-        .await
-    }
-
-    /// 追加期间一直持写者锁，直到新条目被上下文吸收：锁内保证追加的条目就是随后被上下文
-    /// 吸收的同一条尾条目。控制输入先进入 inbox，之后也走这条追加路径。
-    async fn append_to_context(
-        session: &SessionWriter,
-        context: &mut ContextView,
-        append: impl FnOnce(&mut crate::session::SessionManager) -> std::result::Result<String, SessionError>
-        + Send
-        + 'static,
-    ) -> Result<String> {
-        Self::with_context(session, context, move |session, context| {
-            let mut writer = lock_writer(session);
-            let entry_id = append(&mut writer)?;
-            context.append_entry(&writer, writer.entries().len() - 1);
-            Ok(entry_id)
-        })
-        .await
-    }
-
-    /// 在线程池中使用本轮上下文；业务失败也先归还上下文，再传播错误。
-    /// 操作自行决定写者锁范围，避免把整个剪枝或请求准备过程扩大为一个临界区。
-    async fn with_context<T: Send + 'static>(
-        session: &SessionWriter,
-        context: &mut ContextView,
-        operation: impl FnOnce(&SessionWriter, &mut ContextView) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let session = Arc::clone(session);
-        let mut current = std::mem::take(context);
-        let (updated, result) = tokio::task::spawn_blocking(move || {
-            let result = operation(&session, &mut current);
-            (current, result)
-        })
-        .await
-        .expect("context worker completes while the runtime is running");
-        *context = updated;
-        result
+        .await?)
     }
 
     /// 本轮从 Provider 冻结的上下文容量。

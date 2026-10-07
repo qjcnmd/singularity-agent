@@ -240,7 +240,6 @@ impl TurnRunner {
         } else {
             agent
         };
-        controls.record_context_window(agent.context_window());
         let mut writer = lock_writer(&writer);
         writer
             .append_record(LedgerRecord::OperationStarted { turn_id: Some(controls.turn_id.clone()) })

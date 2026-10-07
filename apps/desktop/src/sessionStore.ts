@@ -343,7 +343,7 @@ export class SessionStore {
   protected async action(
     method: string,
     origin: string,
-    operation: () => Promise<void>,
+    operation: () => Promise<unknown>,
   ): Promise<boolean> {
     const key = pendingKey(method, origin)
     if (this.state.pendingActions.has(key)) return false

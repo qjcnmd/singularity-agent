@@ -14,8 +14,8 @@ impl Conversation {
         input: &str,
         sink: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<TurnOutcome, ConversationError> {
-        let mut reservation = self.reserve_start(input)?;
-        match reservation.execute(sink).await {
+        let (result, _guard) = self.reserve_start(input)?.execute(sink).await;
+        match result {
             OperationResult::Turn(result) => result,
             OperationResult::Compaction(_) => unreachable!("reserved a turn"),
         }
@@ -67,6 +67,7 @@ impl Conversation {
                 TurnInput::Queued => state.pending_input.take().expect("reservation owns the queued input"),
             };
             controls.lock_inbox().open();
+            state.last_context_window = Some(prepared.0.context_window());
             state.turn = TurnLifecycle::Running(Arc::clone(&controls));
             Ok::<_, TurnRunError>((thread, controls, current, prepared))
         })
@@ -82,9 +83,6 @@ impl Conversation {
             let _window = self.lock_writer_window();
             let mut state = self.lock_state();
             state.turn = TurnLifecycle::Reserved;
-            if let Some(window) = controls.context_window() {
-                state.last_context_window = Some(window);
-            }
             drop(controls);
         }
         result

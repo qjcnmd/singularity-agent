@@ -145,7 +145,8 @@ flowchart TB
     Slots --> Projection["SlotState<br/>session_revision<br/>active_turn / active_compaction、terminal"]
     Slots --> Stable["执行链开始前的 ThreadSnapshot<br/>空闲 slot 释放整份历史<br/>历史投影包含独立压缩结果"]
     Conv --> Running["当前 TurnControls<br/>turnId、inbox、取消令牌、共享写者"]
-    Conv --> Reservation["OperationReservation<br/>绑定操作与输入，独占执行权"]
+    Conv --> Reservation["OperationReservation<br/>绑定操作与输入，消费式执行"]
+    Reservation --> Guard["OperationGuard<br/>占用窗口直到投影结算"]
     Running --> Writer["SessionWriter<br/>Arc + Mutex + SessionManager"]
     Projection -. "phase 由窗口与取消令牌派生" .-> Conv
     Projection -->|"带版本的协议快照"| Store["Electron 渲染进程 AppStore"]
@@ -153,7 +154,7 @@ flowchart TB
     Store --> Views["正文 / 轨迹 / 用量 / 任务列表"]
 ```
 
-普通 `session_changed` / `session_settled` 的 payload 均直接承载轻量 runtime（生命周期、队列、活动身份与终态）；完整活动事件只随 `session.read` 恢复快照传输。终态携带来源（普通回合或独立压缩）：任务状态只跟随回合终态，压缩结果在对话区自成一行。不同任务可并行；一个任务同一时刻只有一个普通执行链或独立压缩窗口。`OperationReservation` 在预订时绑定普通输入、唯一排队输入或独立压缩，宿主统一调用 `execute`，结果携带操作来源。预订保持到调用方完成投影收尾，释放时归还执行窗口。写者只在追加或读取时短暂加锁，不跨模型等待与工具执行持锁。工作台的会话生命周期操作（查找或创建 slot、建立执行或压缩预订、归档与移除）共用一段短临界区：销毁操作不能穿过启动占用尚未打开写者的窗口。
+普通 `session_changed` / `session_settled` 的 payload 均直接承载轻量 runtime（生命周期、队列、活动身份与终态）；完整活动事件只随 `session.read` 恢复快照传输。终态携带来源（普通回合或独立压缩）：任务状态只跟随回合终态，压缩结果在对话区自成一行。不同任务可并行；一个任务同一时刻只有一个普通执行链或独立压缩窗口。`OperationReservation` 在预订时绑定普通输入、唯一排队输入或独立压缩及其参数，宿主调用消费式 `execute`，取得带操作来源的结果和 `OperationGuard`。守卫保持到调用方完成投影收尾，释放时归还执行窗口。写者只在追加或读取时短暂加锁，不跨模型等待与工具执行持锁。工作台的会话生命周期操作（查找或创建 slot、建立执行或压缩预订、归档与移除）共用一段短临界区：销毁操作不能穿过启动占用尚未打开写者的窗口。`ConversationState.last_context_window` 保存最近一次准备成功的回合容量，和转入 Running 一起更新；准备失败保留旧值，运行中配置变更不影响它，结束后仍可读取。
 
 源码：[AppServer](../crates/app/src/desktop/app_server.rs) · [ConversationSlot / SlotState](../crates/app/src/desktop/app_server/session.rs) · [Conversation / OperationReservation](../crates/runtime/src/conversation.rs) · [TurnControls](../crates/runtime/src/conversation/state.rs) · [SessionWriter](../crates/agent/src/session/mod.rs) · [工具身份](../crates/agent/src/session/format.rs)。
 
@@ -410,7 +411,7 @@ flowchart TB
     Calls -->|"有且回复完整"| Preflight["registry.preflight<br/>解析参数、绑定工具、生成公开条目 ID"]
     Preflight --> Dispatch["dispatch_tools<br/>Tokio task 与异步准入锁"]
     Dispatch --> Results["每项完成即保存结果<br/>随后发布 tool/execution/end"]
-    Results --> Context["append_to_context<br/>同锁内追加并增量更新 ContextView<br/>模型结果仍按调用顺序排列"]
+    Results --> Context["SessionManager 追加<br/>提交成功后更新 ContextView<br/>模型结果仍按调用顺序排列"]
     Context --> Cancel
 ```
 
@@ -643,7 +644,7 @@ flowchart TB
 ```mermaid
 flowchart LR
     Ledger[("Session 原始条目<br/>始终保留完整消息")]
-    Ledger --> Context["ContextView<br/>有效历史位置、工具剪枝引用<br/>历史估算与压缩切点"]
+    Ledger --> Context["SessionManager 持有 ContextView<br/>有效历史位置、工具剪枝引用<br/>历史估算与压缩切点"]
     Ledger --> Public["公开历史 / 轨迹<br/>仍可查看原始工具输出"]
     Message["message / skill_instructions"] -->|"追加可压缩历史"| Context
     Prune["tool_result_pruned"] -->|"在原位置替换已有工具内容"| Context
@@ -689,7 +690,7 @@ flowchart TB
 
 首次摘要按目标、约束、进度、关键决定、下一步和关键上下文生成固定结构；再次压缩时，从有效历史中取出上一份摘要，只用本次新覆盖的消息更新该结构。自动、手动和溢出恢复均复用这条路径。
 
-Agent 的 `with_context` 统一在线程池中移交和归还上下文，供消息追加、剪枝、压缩前缀选择、重建和消息组装使用；业务错误在归还上下文后传播，各操作保留自己的写者锁范围。
+`SessionManager` 与账本一起持有 `ContextView`，所有追加在持久提交成功后、同一写者锁内推进上下文。普通消息和 Skill 记录增量更新位置与估价；剪枝和摘要沿同一投影规则调整活动位置，只重算活动历史的估价，重新打开时才从整份账本派生视图。写入失败不推进账本或上下文。Agent 在线程池中读取投影、选择摘要前缀和加载图片，图片读取不持有写者锁；本轮 `usage_correction` 由 Agent 持有，普通追加保留校正，剪枝、摘要提交或文件指令刷新后清零。
 
 摘要请求与其他请求一样经统一请求账本计量：其 provider usage 记录在该请求自己的 request observation 上，会话累计与工作台展示都由账本聚合，compaction 条目只保存 summary 与 firstKeptEntryId。
 

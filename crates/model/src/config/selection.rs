@@ -120,7 +120,12 @@ pub(super) fn resolve_model_selection(
     validate_provider_value(key, "api_key")?;
     let model = resolve_model_definition(
         model,
-        provider.api_protocol.as_deref().or(model.api_protocol.as_deref()),
+        provider
+            .api_protocol
+            .as_deref()
+            .or(model.api_protocol.as_deref())
+            .map(parse_catalog_protocol)
+            .transpose()?,
         parsed.model_name,
         parsed.reasoning_variant,
     )?;
@@ -136,18 +141,17 @@ pub(super) fn resolve_model_selection(
 
 pub(super) fn resolve_model_definition(
     model_file: &UserConfigModel,
-    api_protocol: Option<&str>,
+    api_protocol: Option<ProviderApiProtocol>,
     model_name: &str,
     requested_variant: Option<&str>,
 ) -> Result<SelectedModel, ProviderError> {
     // api_protocol 只能由用户显式声明。
-    let Some(api_protocol) = api_protocol else {
+    let Some(protocol) = api_protocol else {
         return Err(configuration_error(
             "user config model must declare api_protocol (chat or responses)",
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     };
-    let protocol = parse_catalog_protocol(api_protocol)?;
     // 目录补全或用户填写的容量随配置保存；执行不猜测缺失值。
     let (Some(max_context_tokens), Some(max_output_tokens)) =
         (model_file.max_context_tokens, model_file.max_output_tokens)

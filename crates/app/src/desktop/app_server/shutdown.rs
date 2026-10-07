@@ -12,11 +12,7 @@ impl AppServer {
                 match slot.conversation().phase() {
                     SessionPhase::Idle => continue,
                     SessionPhase::Running | SessionPhase::Compacting => {
-                        if let Err(error) = slot.conversation().abort()
-                            && !matches!(error, ConversationControlError::NotRunning)
-                        {
-                            eprintln!("desktop shutdown cancellation: {error}");
-                        }
+                        let _ = slot.conversation().abort();
                     }
                     SessionPhase::Reserved | SessionPhase::Stopping => {}
                 }

@@ -51,8 +51,6 @@ pub(crate) struct TurnControls {
     pub(crate) inbox: SteeringInboxHandle,
     pub(crate) questions: Arc<singularity_agent::agent::UserQuestions>,
     writer: SessionWriter,
-    /// 本轮冻结下来的模型有效上下文窗口；prepare_turn 解析之前是 None。
-    context_window: std::sync::OnceLock<u64>,
 }
 
 impl TurnControls {
@@ -63,21 +61,11 @@ impl TurnControls {
             inbox,
             questions: Arc::new(singularity_agent::agent::UserQuestions::default()),
             writer,
-            context_window: std::sync::OnceLock::new(),
         }
     }
 
     pub(crate) fn cancellation(&self) -> &CancellationToken {
         &self.window.cancellation
-    }
-
-    /// 记录本轮冻结模型的有效上下文窗口（由 runner 在解析完成后调用一次）。
-    pub(crate) fn record_context_window(&self, window: u64) {
-        let _ = self.context_window.set(window);
-    }
-
-    pub(crate) fn context_window(&self) -> Option<u64> {
-        self.context_window.get().copied()
     }
 
     pub(crate) fn inbox_handle(&self) -> SteeringInboxHandle {
@@ -151,15 +139,6 @@ impl ConversationState {
         self.turn.is_busy() || self.pending_input.is_some()
     }
 
-    /// 当前执行（或最近一次执行）冻结的有效上下文窗口；空闲之后仍保留最近一次执行的事实。
-    pub(super) fn model_context_window(&self) -> Option<u64> {
-        let window = match &self.turn {
-            TurnLifecycle::Running(controls) => controls.context_window(),
-            _ => None,
-        };
-        window.or(self.last_context_window)
-    }
-
     /// 返回唯一排队输入的只读投影。
     pub(super) fn pending_input(&self) -> Option<singularity_protocol::PendingInput> {
         self.pending_input.as_ref().map(ControlRequest::pending)
@@ -196,7 +175,6 @@ pub(super) enum TurnLifecycle {
     Reserved,
     Running(Arc<TurnControls>),
     Compacting {
-        thread: Thread,
         writer: SessionWriter,
         window: Arc<CancelWindow>,
     },

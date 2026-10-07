@@ -2,49 +2,42 @@ use super::*;
 
 pub(super) fn resolve_context_entries(session: &SessionData) -> Vec<ContextPosition> {
     let mut context: Vec<ContextPosition> = Vec::new();
-    for (entry_index, entry) in session.entries().iter().enumerate() {
-        match entry {
-            SessionEntry::Compaction { compaction, .. } => {
-                let index = context
-                    .iter()
-                    .position(|candidate| {
-                        session.entries()[candidate.index].id() == compaction.first_kept_entry_id
-                    })
-                    .expect("compaction retains an active context entry");
-                context.drain(..index);
-                context.insert(0, ContextPosition { index: entry_index, pruned_index: None });
-            }
-            SessionEntry::Record {
-                record: LedgerRecord::ToolResultPruned { entry_id, .. },
-                ..
-            } => {
-                let original = context
-                    .iter_mut()
-                    .find(|candidate| session.entries()[candidate.index].id() == entry_id)
-                    .expect("pruning references an active tool result");
-                original.pruned_index = Some(entry_index);
-            }
-            _ if is_context_entry(entry) => {
-                push_context_entry(
-                    &mut context,
-                    ContextPosition { index: entry_index, pruned_index: None },
-                    session,
-                );
-            }
-            // 操作记录、请求观测与元数据都不进入模型上下文。
-            _ => {}
-        }
+    for index in 0..session.entries().len() {
+        apply_context_entry(&mut context, ContextPosition { index, pruned_index: None }, session);
     }
     context
 }
 
-/// 完成顺序是持久事实，但 provider 重放时要按 assistant 声明的调用顺序排列
-/// 同级结果。实时执行和重新打开会话都套用同一套投影。
-pub(super) fn push_context_entry(
+/// 将已提交的日志作用于上下文位置；追加与重新打开共用替换、Skill 相邻和工具结果排序规则。
+pub(super) fn apply_context_entry(
     context: &mut Vec<ContextPosition>,
     position: ContextPosition,
     session: &SessionData,
 ) {
+    match position.entry(session) {
+        SessionEntry::Compaction { compaction, .. } => {
+            let index = context
+                .iter()
+                .position(|candidate| candidate.entry(session).id() == compaction.first_kept_entry_id)
+                .expect("compaction retains an active context entry");
+            context.drain(..index);
+            context.insert(0, position);
+            return;
+        }
+        SessionEntry::Record {
+            record: LedgerRecord::ToolResultPruned { entry_id, .. },
+            ..
+        } => {
+            let original = context
+                .iter_mut()
+                .find(|candidate| candidate.entry(session).id() == entry_id)
+                .expect("pruning references an active tool result");
+            original.pruned_index = Some(position.index);
+            return;
+        }
+        entry if !is_context_entry(entry) => return,
+        _ => {}
+    }
     // 手动 Skill 记录在触发它的用户消息之后落盘；模型视图把它放在该输入之前，
     // 保留用户输入作为本轮最后的指令。文件指令不在历史内，不影响这个邻接关系。
     if matches!(

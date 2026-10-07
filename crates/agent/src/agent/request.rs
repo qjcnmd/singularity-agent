@@ -90,7 +90,7 @@ impl Agent {
             .as_ref()
             .map(singularity_core::ProjectInstructions::content)
             .and_then(file_instruction_message);
-        self.context.reset_usage_correction();
+        self.usage_correction = 0;
         if loaded.as_ref().is_some_and(singularity_core::ProjectInstructions::truncated) {
             on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
                 singularity_protocol::diagnostic_code::PROJECT_INSTRUCTIONS_TRUNCATED,
@@ -109,7 +109,16 @@ impl Agent {
     }
 
     pub(super) fn context_pressure_tokens(&self) -> u64 {
-        self.context.request_tokens(self.request_overhead_tokens())
+        self.request_tokens(self.request_overhead_tokens())
+    }
+
+    /// 会话持有历史估价，本轮 Agent 添加请求定义开销与实测校正。
+    fn request_tokens(&self, overhead: u64) -> u64 {
+        lock_writer(&self.session)
+            .context()
+            .estimated_tokens()
+            .saturating_add(overhead)
+            .saturating_add(self.usage_correction)
     }
 
     /// 组装并发送一次生成请求；发送、预算和观测共用同一份指令与工具定义。
@@ -121,23 +130,25 @@ impl Agent {
         let prefix = self.instruction_prefix();
         let tools = self.registry.provider_schemas();
         let definitions = RequestDefinitions::new(&prefix, tools.clone());
-        let messages = Self::with_context(&self.session, &mut self.context, move |session, context| {
+        let session = std::sync::Arc::clone(&self.session);
+        let messages = tokio::task::spawn_blocking(move || {
             let mut messages = prefix;
             let (materials, directory) = {
-                let writer = lock_writer(session);
-                (context.messages(&writer), writer.image_directory())
+                let writer = lock_writer(&session);
+                (writer.context().messages(&writer), writer.image_directory())
             };
             messages.extend(crate::session::context::load_messages(materials, &directory)?);
-            Ok(messages)
+            Ok::<_, crate::session::SessionError>(messages)
         })
-        .await?;
+        .await
+        .expect("context worker completes while the runtime is running")?;
         let request = ModelTurnRequest {
             messages,
             tools,
             model_preferences: ModelPreferences {
                 max_output_tokens: Some(output_budget_tokens(
                     &self.model,
-                    self.context.request_tokens(definitions.estimated_tokens()),
+                    self.request_tokens(definitions.estimated_tokens()),
                     self.model.max_output_tokens,
                 )),
             },

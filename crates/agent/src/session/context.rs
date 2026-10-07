@@ -5,9 +5,9 @@
 
 mod resolution;
 
-use self::resolution::{push_context_entry, resolve_context_entries};
+use self::resolution::{apply_context_entry, resolve_context_entries};
 
-use singularity_model::{ModelMessage, ModelRole, ModelUsage};
+use singularity_model::{ModelMessage, ModelRole};
 
 use crate::message::{AgentMessage, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock};
 
@@ -131,13 +131,10 @@ fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ContextView {
+pub(crate) struct ContextView {
     entries: Vec<ContextPosition>,
     /// 历史与模型投影补入结果的估算值；usage 基线缺失时用它计量。
     estimated_tokens: u64,
-    /// 最近一次同形状请求的实测总量相对本次估价的差量；结构替换后由
-    /// [`Self::rebuild`] 作废。
-    usage_correction: u64,
 }
 
 /// 已按工具配对边界选好的摘要前缀。
@@ -152,14 +149,10 @@ pub(crate) struct CompactionPrefix {
 
 impl ContextView {
     /// 按已保存的压缩与剪枝边界还原模型历史；边界在生成记录时确定。
-    pub fn derive(session: &SessionData) -> Self {
+    pub(crate) fn derive(session: &SessionData) -> Self {
         let entries = resolve_context_entries(session);
         let estimated_tokens = context_token_estimate(&entries, session);
-        Self {
-            entries,
-            estimated_tokens,
-            usage_correction: 0,
-        }
+        Self { entries, estimated_tokens }
     }
 
     pub(crate) fn messages(&self, session: &SessionData) -> Vec<ContextMessage> {
@@ -218,39 +211,28 @@ impl ContextView {
             .collect()
     }
 
-    /// 历史估价加请求装配提供的指令与工具开销，再加实测校正。
-    pub(crate) fn request_tokens(&self, overhead: u64) -> u64 {
-        self.estimated_tokens.saturating_add(overhead).saturating_add(self.usage_correction)
-    }
-
-    /// 把实测的输入与输出对齐到同一请求的估价上；usage 缺失时只用启发式计量。
-    pub(crate) fn record_usage(&mut self, usage: &ModelUsage, assistant_tokens: u64, overhead: u64) {
-        let estimated = self.estimated_tokens.saturating_add(assistant_tokens).saturating_add(overhead);
-        self.usage_correction = if usage.usage_present {
-            usage.total_tokens.saturating_sub(estimated)
-        } else {
-            0
-        };
-    }
-
-    /// 文件指令重新读取后，旧请求的实测校正不再适用。
-    pub(crate) fn reset_usage_correction(&mut self) {
-        self.usage_correction = 0;
+    /// 已提交历史的缓存估价；本轮请求开销与实测校正由 Agent 添加。
+    pub(crate) fn estimated_tokens(&self) -> u64 {
+        self.estimated_tokens
     }
 
     /// 把刚提交的日志位置推进到视图里；追加与重新打开走同一套排序规则。
     pub(crate) fn append_entry(&mut self, session: &SessionData, index: usize) {
         let entry = &session.entries()[index];
-        if is_context_entry(entry) {
+        apply_context_entry(&mut self.entries, ContextPosition { index, pruned_index: None }, session);
+        if matches!(
+            entry,
+            SessionEntry::Compaction { .. }
+                | SessionEntry::Record {
+                    record: LedgerRecord::ToolResultPruned { .. },
+                    ..
+                }
+        ) {
+            // 结构替换只重算活动历史，不再重放整份账本；普通追加继续使用尾部增量。
+            self.estimated_tokens = context_token_estimate(&self.entries, session);
+        } else if is_context_entry(entry) {
             self.estimated_tokens = self.estimated_tokens.saturating_add(entry_token_estimate(entry));
-            push_context_entry(&mut self.entries, ContextPosition { index, pruned_index: None }, session);
         }
-    }
-
-    /// 结构替换（压缩、工具结果剪枝）之后重建视图：被替换掉的内容已经不是产生旧
-    /// 实测校正的那份请求形状，所以校正一并作废。正常追加不重建，校正继续有效。
-    pub fn rebuild(&mut self, session: &SessionData) {
-        *self = Self::derive(session);
     }
 }
 

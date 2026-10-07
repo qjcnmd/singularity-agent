@@ -303,6 +303,10 @@ fn model_definitions(
             chat_output_tokens_field: model.chat_output_tokens_field.filter(|field| !field.is_empty()),
             thinking_wire_format: model.thinking_wire_format,
         };
+        let protocol = match parsed_provider {
+            Some(protocol) => Some(protocol),
+            None => protocol.map(parse_catalog_protocol).transpose()?,
+        };
         resolve_model_definition(&configured, protocol, &model.model_id, None)?;
         definitions.insert(model.model_id, configured);
     }

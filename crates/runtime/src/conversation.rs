@@ -54,13 +54,24 @@ pub struct Conversation {
 
 /// 一次执行预订；绑定操作和输入，队列在回合准备成功前保持原位，drop 时释放窗口。
 pub struct OperationReservation {
+    // 放弃预订时先丢弃操作持有的写者，再由守卫释放生命周期窗口。
+    operation: ReservedOperation,
+    guard: OperationGuard,
+}
+
+/// 独占操作窗口，直到宿主完成事件投影与结算；丢弃守卫才允许下一次操作。
+#[must_use = "hold the operation guard until settlement is complete"]
+pub struct OperationGuard {
     conversation: Arc<Conversation>,
-    operation: Option<ReservedOperation>,
 }
 
 enum ReservedOperation {
     Turn(TurnInput),
-    Compaction,
+    Compaction {
+        thread: Thread,
+        writer: SessionWriter,
+        window: Arc<CancelWindow>,
+    },
 }
 
 enum TurnInput {
@@ -75,32 +86,30 @@ pub enum OperationResult {
 }
 
 impl OperationReservation {
-    /// 执行预订时绑定的操作一次。结果返回后仍占用窗口；宿主完成事件投影后再释放预订。
-    pub async fn execute(&mut self, sink: &mut (dyn FnMut(TurnEvent) + Send)) -> OperationResult {
-        match self.operation.take().expect("reservation executes once") {
+    /// 消费预订并执行一次。返回的守卫继续占用窗口，宿主完成事件投影后再释放它。
+    pub async fn execute(
+        self,
+        sink: &mut (dyn FnMut(TurnEvent) + Send),
+    ) -> (OperationResult, OperationGuard) {
+        let Self { guard, operation } = self;
+        let result = match operation {
             ReservedOperation::Turn(input) => {
-                OperationResult::Turn(self.conversation.run_chain(input, sink).await)
+                OperationResult::Turn(guard.conversation.run_chain(input, sink).await)
             }
-            ReservedOperation::Compaction => OperationResult::Compaction(self.compact(sink).await),
-        }
-    }
-
-    async fn compact(&self, sink: &mut (dyn FnMut(TurnEvent) + Send)) -> Result<(), ConversationError> {
-        let (thread, writer, window) = match &self.conversation.lock_state().turn {
-            TurnLifecycle::Compacting { thread, writer, window } => {
-                (thread.clone(), Arc::clone(writer), Arc::clone(window))
-            }
-            _ => unreachable!("compaction reservation owns its execution window"),
+            ReservedOperation::Compaction { thread, writer, window } => OperationResult::Compaction(
+                guard
+                    .conversation
+                    .runner
+                    .compact_thread(&thread, &window, writer, sink)
+                    .await
+                    .map_err(ConversationError::Turn),
+            ),
         };
-        self.conversation
-            .runner
-            .compact_thread(&thread, &window, writer, sink)
-            .await
-            .map_err(ConversationError::Turn)
+        (result, guard)
     }
 }
 
-impl Drop for OperationReservation {
+impl Drop for OperationGuard {
     fn drop(&mut self) {
         let mut state = self.conversation.lock_state();
         state.turn = TurnLifecycle::Idle;
@@ -187,8 +196,8 @@ impl Conversation {
         let request = state.next_control(input.into())?;
         state.turn = TurnLifecycle::Reserved;
         Ok(OperationReservation {
-            conversation: Arc::clone(self),
-            operation: Some(ReservedOperation::Turn(TurnInput::Submitted(request))),
+            guard: OperationGuard { conversation: Arc::clone(self) },
+            operation: ReservedOperation::Turn(TurnInput::Submitted(request)),
         })
     }
 
@@ -269,8 +278,8 @@ impl Conversation {
                 state.turn = TurnLifecycle::Reserved;
                 Ok(FollowUpPromotion::Reserved {
                     reservation: OperationReservation {
-                        conversation: Arc::clone(self),
-                        operation: Some(ReservedOperation::Turn(TurnInput::Queued)),
+                        guard: OperationGuard { conversation: Arc::clone(self) },
+                        operation: ReservedOperation::Turn(TurnInput::Queued),
                     },
                 })
             }
@@ -298,14 +307,14 @@ impl Conversation {
             state.thread.clone()
         };
         let writer = self.runner.open_turn_writer(&thread)?;
+        let window = Arc::new(CancelWindow::new());
         self.lock_state().turn = TurnLifecycle::Compacting {
-            thread,
-            writer,
-            window: Arc::new(CancelWindow::new()),
+            writer: Arc::clone(&writer),
+            window: Arc::clone(&window),
         };
         Ok(OperationReservation {
-            conversation: Arc::clone(self),
-            operation: Some(ReservedOperation::Compaction),
+            guard: OperationGuard { conversation: Arc::clone(self) },
+            operation: ReservedOperation::Compaction { thread, writer, window },
         })
     }
 
@@ -324,7 +333,7 @@ impl Conversation {
         ConversationSnapshot {
             phase: state.turn.phase(),
             selector: state.thread.model.clone(),
-            model_context_window: state.model_context_window(),
+            model_context_window: state.last_context_window,
             pending_input: state.pending_input(),
             pending_question: match &state.turn {
                 TurnLifecycle::Running(controls) => controls.questions.pending(),
