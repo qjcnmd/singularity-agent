@@ -357,7 +357,7 @@ function ComposerTools({ compactDisabled, theme, occupancy, imageInput }: { comp
 
 /**
  * 输入框下方的会话统计条；有计时或消费记录时显示，运行中请求不打断已有读数。
- * 口径由 sessionUsage 单点定义，悬停说明给出耗时和消费明细。
+ * 统计口径由 sessionUsage 定义，悬停说明给出耗时和消费明细。
  */
 function ComposerStats({ usage }: { usage: SessionModelUsage }) {
   const hit = cacheHitPercent(usage)

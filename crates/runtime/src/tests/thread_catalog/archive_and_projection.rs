@@ -24,10 +24,9 @@ fn archive_hides_the_thread_and_preserves_its_file() {
     assert!(matches!(catalog.archive(&thread_id), Err(CatalogError::NotFound(_))));
 }
 
-/// Thread 的工作目录是一个事实：它必须在创建、恢复、列表与会话头四个表面上呈现
-/// 同一个字面值，与调用方的拼法无关，不带 Windows verbatim 前缀，并且被系统
-/// 提示词逐字承载。该字符串会原样交给模型，模型会把它抄进命令，\\?\C:\… 与
-/// //?/C:/… 两种形状在 shell 里都不可用。
+/// Thread 的工作目录是一个事实：它必须在创建、恢复、列表与会话头四个表面上呈现同一个
+/// 字面值，与调用方的拼法无关，不带 Windows verbatim 前缀，并原样进入系统提示词。该字符串
+/// 会交给模型并抄进命令，\\?\C:\… 与 //?/C:/… 两种形状在 shell 里都不可用。
 fn assert_thread_cwd_shape(
     fixture: &SessionsFixture,
     catalog: &ThreadCatalog,
@@ -89,9 +88,9 @@ fn thread_cwd_projects_one_usable_shape_across_every_surface() {
     assert_thread_cwd_shape(&fixture, &catalog, &canonical);
 }
 
-/// 会话累计用量汇总整份账本中各次请求的终态观测，
-/// 只有上报 usage 的请求参与合计；未报告 usage 的请求（进行中、失败或取消）不进入
-/// 计数也不影响缓存完整性，上报了 usage 但缺缓存明细的请求让命中率保持不可计算。
+/// 会话累计用量汇总整份账本中各次请求的终态观测，只有上报 usage 的请求参与合计；
+/// 未报告 usage 的请求（进行中、失败或取消）不进入计数也不影响缓存完整性，上报了 usage
+/// 但缺缓存明细的请求让命中率保持不可计算。
 #[test]
 fn summary_usage_sums_usage_bearing_requests_and_skips_the_rest() {
     use singularity_protocol::HistoryItem;

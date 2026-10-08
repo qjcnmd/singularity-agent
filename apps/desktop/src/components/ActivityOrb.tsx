@@ -19,7 +19,7 @@ function OrbCanvas({ fast, theme }: { fast: boolean; theme: 'light' | 'dark' }) 
     const tick = (now: number) => {
       const elapsed = last === null ? 0 : Math.min((now - last) / 1000, 0.1)
       last = now
-      // 将速度积分进已用时间；改变它绝不改变当前 phase。
+      // 速度按已用时间积分，改速度不影响当前 phase。
       render(elapsed * speed.current)
       frame = requestAnimationFrame(tick)
     }

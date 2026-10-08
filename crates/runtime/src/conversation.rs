@@ -1,18 +1,16 @@
-//! 一个 session 的内存输入，以及它唯一的活动执行窗口。
-//! 已经被消费的输入由 Agent 落盘；还在等待处理的输入只活在进程里，进程结束就没了。
+//! 一个 session 的内存输入，以及它的执行窗口：同一时刻只允许一个活动。已消费的输入由
+//! Agent 落盘；还在等待处理的输入只存在内存里，进程退出后丢失。
 //!
 //! # 锁
 //!
-//! 两个锁各管一件事，加锁顺序固定为「写者窗口 → 状态」，不会互相反向等待：
+//! 加锁顺序固定为「写者窗口 → 状态」。writer_window 串行化写者打开、回合准备、
+//! Running→Reserved 交接和元数据写盘，文件 I/O 不占状态锁，持有它时不得反向等待状态锁的
+//! 持有者；state 管线程设置、活动阶段、控制接受顺序和待处理输入，控制面的读取
+//! （steer/abort/snapshot/phase）只取这把锁，不会被写者的 I/O 挡住。
 //!
-//! - `writer_window`：会话写者的打开、回合准备、Running→Reserved 的交接与元数据写盘在这里互斥；
-//!   文件 I/O 不占着状态锁。
-//! - `state`：线程设置、活动阶段、控制接受顺序和待处理输入；控制面的读取
-//!   （steer/abort/snapshot/phase）只取它，不会被写者的 I/O 挡住。
+//! # 锁失效
 //!
-//! # 锁失效策略
-//!
-//! 锁中毒表示共享状态已经不可信，直接 panic 结束进程，不降级继续运行。
+//! 锁中毒说明共享状态已经不可信，直接 panic 结束进程。
 
 mod execution;
 mod state;
@@ -31,13 +29,13 @@ use crate::runner::{TurnOutcome, TurnRunner};
 use singularity_protocol::Thread;
 use singularity_protocol::TurnEvent;
 
-/// 在同一个 state 临界区里读出的会话侧事实：生命周期、模型选择、冻结的上下文窗口
-/// 和待处理控制。它是不可变投影，不缓存、不跨调用复用，也不是新的事实来源。
+/// 在同一个 state 临界区里读出的会话侧投影：生命周期、模型选择、冻结的上下文窗口和
+/// 待处理控制。不可变，不缓存也不跨调用复用。
 pub struct ConversationSnapshot {
     pub phase: SessionPhase,
     pub selector: Option<String>,
-    /// 本轮冻结的有效上下文窗口：用来解释最近请求的用量，不会因为之后编辑配置而
-    /// 改变；进程内还没有执行过，或进程重启之后，都是 None。
+    /// 本轮冻结的有效上下文窗口，用来解释最近请求的用量，之后编辑配置不会改变它。
+    /// 进程内没执行过，或进程重启之后，是 None。
     pub model_context_window: Option<u64>,
     pub pending_input: Option<singularity_protocol::PendingInput>,
     pub pending_question: Option<singularity_protocol::PendingQuestion>,
@@ -54,7 +52,7 @@ pub struct Conversation {
 
 /// 一次执行预订；绑定操作和输入，队列在回合准备成功前保持原位，drop 时释放窗口。
 pub struct OperationReservation {
-    // 放弃预订时先丢弃操作持有的写者，再由守卫释放生命周期窗口。
+    // 放弃预订时先丢弃操作持有的写者，守卫再释放生命周期窗口。
     operation: ReservedOperation,
     guard: OperationGuard,
 }
@@ -118,7 +116,7 @@ impl Drop for OperationGuard {
 
 /// 一次「立即发送」原子提升的结果。
 pub enum FollowUpPromotion {
-    /// 输入已经进入当前 turn 的注入箱，沿用原来的 control 身份。
+    /// 输入已经进入当前 turn 的注入箱，control 身份不变。
     Injected,
     /// Session 已经空闲；预订选定下一条输入，消息仍保留在队列中。
     Reserved { reservation: OperationReservation },
@@ -179,8 +177,8 @@ impl Conversation {
         })
     }
 
-    /// 校验并绑定本轮输入，原子预订执行链窗口；execute 时交给 Runner。
-    /// 放弃预订不留下输入。预订与写者打开和交接在同一处串行。
+    /// 校验并绑定本轮输入，原子预订执行链窗口，execute 时交给 Runner。放弃预订不留下
+    /// 输入。预订与写者打开、交接在同一处串行。
     pub fn reserve_start(
         self: &Arc<Self>,
         input: impl Into<UserInput>,
@@ -232,7 +230,7 @@ impl Conversation {
     /// 生成身份和输入入箱都在同一个生命周期临界区内完成，避免跨过收尾窗口。
     pub fn steer(&self, input: impl Into<UserInput>) -> Result<(), ConversationControlError> {
         let mut state = self.lock_state();
-        // 正文校验放在确认可以注入之后。
+        // 先判断能否注入，再校验正文，NotRunning 优先于空输入。
         let controls = match &state.turn {
             TurnLifecycle::Running(controls) => Arc::clone(controls),
             _ => return Err(ConversationControlError::NotRunning),
@@ -262,7 +260,7 @@ impl Conversation {
         self: &Arc<Self>,
         control_id: &str,
     ) -> Result<FollowUpPromotion, ConversationControlError> {
-        // 空闲分支会发布预订窗口，因此要和写者窗口串行。
+        // 空闲分支会发布预订窗口，要和写者窗口串行。
         let _window = self.lock_writer_window();
         let mut state = self.lock_state();
         let request = state.editable_pending_input(control_id)?;
@@ -295,8 +293,8 @@ impl Conversation {
         Ok(())
     }
 
-    /// 为独立压缩预订唯一的操作窗口，并公开共享写者，供设置立即保存；写者打开在状态锁
-    /// 之外完成，见模块文档「锁」。
+    /// 为独立压缩预订操作窗口，并公开共享写者，供设置立即保存；写者打开在状态锁之外
+    /// 完成，见模块文档「锁」。
     pub fn reserve_compaction(self: &Arc<Self>) -> Result<OperationReservation, ConversationError> {
         let _window = self.lock_writer_window();
         let thread = {
@@ -378,10 +376,9 @@ impl Conversation {
         Ok(())
     }
 
-    /// 校验并立即保存下一轮要用的设置。运行或压缩期间复用当前的会话写者，空闲和预订阶段
-    /// 临时开一个写者；写入成功之后才改变内存里的选择。写盘在状态锁之外完成：写者窗口把
-    /// 打开和写盘串行化，状态锁只用来读取阶段和提交选择；临时开的写者在本函数返回前释放，
-    /// 后续预订在同一个窗口里看到的是已经释放的写者。
+    /// 校验并保存下一轮生效的设置。运行或压缩期间复用当前的会话写者，空闲和预订阶段临时
+    /// 开一个；写盘成功之后才更新内存里的选择。写盘在状态锁之外完成，写者窗口把打开和写盘
+    /// 串行化，临时开的写者在函数返回前释放，后续预订在同一窗口里看到的是已释放的写者。
     pub fn update_settings(&self, selector: &str) -> Result<(), ConversationError> {
         self.runner.validate_model_selector(selector).map_err(ConversationError::Configuration)?;
         let _window = self.lock_writer_window();
@@ -417,8 +414,8 @@ impl Conversation {
         self.state.lock().expect("conversation state lock poisoned (fail-stop)")
     }
 
-    /// 写者窗口：打开写者、交接写者和写盘都在这里串行。持有本窗口时只取状态锁做
-    /// 短暂的读写，绝不反向等待状态锁的持有者，见模块文档「锁」。
+    /// 写者窗口：写者打开、交接和写盘都在这把锁上串行。持有本窗口时只取状态锁做短暂的
+    /// 读写，不得反向等待状态锁的持有者，见模块文档「锁」。
     fn lock_writer_window(&self) -> std::sync::MutexGuard<'_, ()> {
         self.writer_window.lock().expect("conversation writer window poisoned (fail-stop)")
     }

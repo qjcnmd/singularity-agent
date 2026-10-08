@@ -59,8 +59,8 @@ function SidebarView() {
   const [dialog, setDialog] = useState<PendingDialog>({ kind: 'none' })
   const collapsed = new Set(state.sidebarView.collapsed)
   const [showAll, setShowAll] = useState<Set<string>>(new Set())
-  // 行的显现与隐去由外层 Disclosure 统一负责。这里若再叠一层逐行错开动画，同一次
-  // 展开就会同时跑两套时长与缓动，并把透明度叠成两次渐隐。
+  // 行的显现与隐去由外层 Disclosure 负责。本组件再叠一层逐行错开动画，同一次展开
+  // 会同时跑两套时长与缓动，透明度也会叠成两次渐隐。
   const sessionRow = (session: ThreadSummary, title: string) => <div key={session.threadId}><SessionButton session={session} title={title} selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
       unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })} onArchive={() => { void appStore.archiveSession(session.threadId) }} /></div>
   return (
@@ -266,7 +266,7 @@ function relativeTime(value: string): string {
   return days < 7 ? `${days}天` : new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric' }).format(then)
 }
 
-/** 侧栏唯一使用的图标：添加项目（打开文件夹选择）。 */
+/** 侧栏使用的图标：添加项目（打开文件夹选择）。 */
 function FolderIcon() {
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M20 12v8H3V5h6l3 3h3M19 3v6M16 6h6" /></svg>
 }

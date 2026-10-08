@@ -1,10 +1,6 @@
-//! 全局与项目指令文件（AGENTS.md）的加载与合并。
-//!
-//! 先读应用主目录，再从工作区根目录逐层向下检索到当前工作目录，并按这个层级
-//! 顺序合并内容。单个文件超过 32KB 时只取预算内的前缀；合并总预算 64KB（文件
-//! 之间的分隔符也计入）用完后就不再纳入后面的文件。只有确实有内容被预算放弃
-//! 才算截断，这种情况通过 ProjectInstructions::truncated() 报告而不是报错；
-//! 真正的 I/O 错误及纳入预算的前缀里非法 UTF-8 仍然直接失败；被截断的后缀不读取。
+//! 全局与项目指令文件（AGENTS.md）的加载与合并：先读应用主目录，再从 workspace root
+//! 逐层检索到 cwd 按层级合并；单文件超 32KB 取预算内前缀，合并总预算 64KB（含分隔符）
+//! 用尽即停，被放弃的内容记 truncated()，I/O 错误和预算内前缀的非法 UTF-8 直接失败。
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -17,7 +13,7 @@ const PROJECT_INSTRUCTIONS_SEPARATOR: &str = "\n\n";
 /// 当前 workspace 加载到的项目指令：正文以及它有没有被截断。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectInstructions {
-    /// 按 workspace root 到 cwd 的顺序合并后的正文，也是唯一发给模型的那份内容。
+    /// 按 workspace root 到 cwd 的顺序合并后的正文，发给模型的就是这一份。
     content: String,
     /// 是否因为单文件超限或合并预算用尽，导致正文被截断。
     truncated: bool,
@@ -120,7 +116,7 @@ struct ProjectInstructionFile {
 
 /// 返回 workspace root 到 cwd 之间需要检查指令的目录，两端都包含。
 fn instruction_directories(workspace_root: &Path, cwd: &Path) -> Vec<PathBuf> {
-    // 不变量：workspace root 是 cwd 的祖先，所以 strip_prefix 一定成功。
+    // workspace root 是 cwd 的祖先，strip_prefix 一定成功。
     let depth = cwd
         .strip_prefix(workspace_root)
         .expect("cwd 必在 workspace root 之下")

@@ -19,7 +19,7 @@ export function CopyButton({ text, label = '复制' }: { text: string; label?: s
       if (current !== revision.current) return
       setCopied(true)
       timer.current = setTimeout(() => setCopied(false), 1200)
-    } catch { /* A failed copy must not show success. */ }
+    } catch { /* 复制失败不显示成功。 */ }
   }
   return <button type="button" className="quiet-button" {...guard(() => { void copy() })}>{copied ? '已复制' : label}</button>
 }

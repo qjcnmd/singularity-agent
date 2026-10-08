@@ -47,7 +47,7 @@ impl SseFrameDecoder {
         } else {
             (line, &[] as &[u8])
         };
-        // Responses 使用 JSON type，其他 SSE 字段不参与执行。
+        // Responses 的事件内容都在 data 字段的 JSON 里，其他 SSE 字段不参与执行。
         if field == b"data" {
             if !self.event_data.is_empty() {
                 self.event_data.push(b'\n');

@@ -26,8 +26,8 @@ pub(crate) fn new_entry_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
-/// 一个 turn 内共享的会话写者。turn 执行与控制面用同一个 SessionManager 实例，因此
-/// 写者只有一份；每次追加各自短暂加锁、串行落盘，绝不跨 provider 调用或工具执行持锁。
+/// 一个 turn 内共享的会话写者。turn 执行与控制面用同一个 SessionManager 实例，
+/// 写者只有一份；每次追加各自短暂加锁、串行落盘，不跨 provider 调用或工具执行持锁。
 pub type SessionWriter = std::sync::Arc<std::sync::Mutex<SessionManager>>;
 
 /// 加锁取回会话写者。锁中毒意味着共享会话状态已经损坏，直接 panic 停止，

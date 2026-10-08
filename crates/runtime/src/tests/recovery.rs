@@ -216,9 +216,8 @@ fn terminal_write_failure_keeps_the_execution_failure_and_the_storage_failure() 
     );
 }
 
-/// 接受停止与执行期存储故障同时发生：致命失败不改变已接受停止的处置——本轮
-/// 停止窗口内未送达的 steer 既不归还也不再交付，处置事件带同一控制身份；
-/// 用户先前明确排队的输入原样留队。
+/// 接受停止与执行期存储故障同时发生：致命失败不改变已接受停止的处置。本轮停止窗口内
+/// 未送达的 steer 既不归还也不再交付，处置事件带同一控制身份；用户先前排队的输入原样留队。
 #[test]
 fn an_accepted_stop_survives_a_fatal_session_failure() {
     use crate::conversation::ConversationError;

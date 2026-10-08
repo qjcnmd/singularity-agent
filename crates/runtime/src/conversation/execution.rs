@@ -3,12 +3,12 @@ use uuid::Uuid;
 
 impl Conversation {
     /// 执行一轮 turn 直到终态，正常完成后把排队输入启动成有独立 turn id 的下一轮。
-    /// 同一时刻只允许一个活动 turn，执行期间客户端从其他线程通过共享的 TurnControls 做
+    /// 同一时刻只允许一个活动 turn，执行期间客户端从其他线程经共享的 TurnControls 做
     /// steer 和取消。
     ///
-    /// 失败或已接受的停止会结束执行链，排队输入保持原位。终态已经落盘时返回 Ok，
-    /// 失败终态携带 singularity_protocol::TurnErrorDetail；准备或终态提交失败返回 Err。
-    /// 返回值是最后一个到达终态的 turn 结果。
+    /// 失败或已接受的停止会结束执行链，排队输入保持原位。终态落盘后返回 Ok，失败终态携带
+    /// singularity_protocol::TurnErrorDetail；准备或终态提交失败返回 Err。返回值是最后一个
+    /// 到达终态的 turn 结果。
     pub async fn run_turn(
         self: &Arc<Self>,
         input: &str,
@@ -76,10 +76,10 @@ impl Conversation {
         let (thread_snapshot, controls, current, prepared) = opened?;
         let result = TurnRunner::run(current, &thread_snapshot, &controls, prepared, sink).await;
         {
-            // Running → Reserved 的交接在同一个写者窗口内完成：先替换生命周期、释放
-            // 本函数持有的控制句柄，旧写者的守卫随之在窗口内关闭。之后任何写者打开
-            // （下一轮 turn，或空闲时临时打开）都在本窗口之后观察到已经释放的写者；
-            // 控制命令经状态锁串行，不可能跨过交接点还持有旧句柄。
+            // Running → Reserved 的交接在同一个写者窗口内完成：先替换生命周期，再释放
+            // 本函数持有的控制句柄，旧写者的守卫随之关闭。之后的写者打开（下一轮 turn，
+            // 或空闲时临时打开）都会看到已释放的写者；控制命令经状态锁串行，不可能跨过
+            // 交接点持有旧句柄。
             let _window = self.lock_writer_window();
             let mut state = self.lock_state();
             state.turn = TurnLifecycle::Reserved;

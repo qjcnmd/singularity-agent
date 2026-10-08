@@ -117,8 +117,8 @@ pub enum LedgerRecord {
 
 /// 会话条目：以 type 为标签的 tagged enum，序列化和严格类型校验都由 serde 生成。
 ///
-/// payload 一律嵌成子对象（message/compaction/metadata/record），外层和各载荷都是
-/// deny_unknown_fields——出现未知字段就拒绝。文件行的物理顺序就是追加顺序；模型上下文
+/// payload 一律嵌成子对象（message/compaction/metadata/record），外层和各载荷都设了
+/// deny_unknown_fields，出现未知字段就拒绝。文件行的物理顺序就是追加顺序；模型上下文
 /// 顺序另由 `session::context` 的投影安排（例如工具结果按 assistant 声明的顺序排列）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -182,9 +182,9 @@ pub fn tool_item_id(assistant_entry_id: &str, call_index: usize) -> String {
 }
 
 /// session 文件头在磁盘上的形状：字段集固定、未知字段拒绝，读写共用这一份表示。
-/// 各字段值原样保留磁盘内容——cwd 不在这里归一化，运行期路径由
+/// 各字段值原样保留磁盘内容，cwd 不在这里归一化，运行期路径由
 /// [`SessionHeader::canonical_cwd`] 单独给出，修复写回也不会改写已存的路径。
-/// 构造只有 `new`（写入）与 `parse`（读取）两个入口，类型不变量由它们把关。
+/// 构造只有 `new`（写入）和 `parse`（读取）两个入口，类型不变量由它们把关。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SessionHeader {

@@ -62,7 +62,7 @@ export type ModelConfigurationField = "displayName" | "maxContextTokens" | "maxO
 
 export type ModelConfigurationInput = { modelId: string,
 /**
- * 智能配置管理的字段；None 表示未记录归属，编辑器仅补齐空字段。空列表为全手动。
+ * 智能配置管理的字段。None 表示未记录归属，编辑器只补空字段；空列表表示全部手动管理。
  */
 automaticFields: Array<ModelConfigurationField> | null, displayName: string | null, apiProtocol: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant> | null, defaultVariant: string | null, thinkingWireFormat: string | null,
 /**
@@ -145,8 +145,8 @@ decodeMs?: number,
  */
 totalTokens?: number, inputTokens: number | null, outputTokens: number | null, cachedInputTokens: number | null, error: string | null,
 /**
- * 这次 attempt 的稳定诊断码：它和 `error` 类别一起构成可以持久回放的失败
- * 事实，实时事件和历史读取都从这一份记录派生。
+ * 这次 attempt 的稳定诊断码，与 `error` 类别一起构成可以持久回放的失败事实；
+ * 实时事件和历史读取都从这一份记录派生。
  */
 diagnosticCode?: string, };
 
@@ -234,8 +234,8 @@ export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, 
  */
 manuallyStopped: boolean, turnCount: number,
 /**
- * 整份账本的累计模型用量。它只在生成快照时更新，运行中回合的增量由调用方
- * 从活动事件里另算（读盘的冻结窗口保证两者不重叠），所以这里不是实时值。
+ * 整份账本的累计模型用量。它只在生成快照时更新，运行中回合的增量要调用方从活动
+ * 事件里另算（读盘的冻结窗口保证两者不重叠），因此不是实时值。
  */
 usage: SessionModelUsage, };
 
@@ -270,7 +270,7 @@ export type TurnErrorDetail = { cause: TurnFailureCause, message: string, };
 
 export type TurnEventEnvelope = { sessionRevision: number, } & ({ "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, item: ItemRef, text: string, images?: Array<ImageAttachment>, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string,
 /**
- * 与历史共享的公开 occurrence 身份，不是 provider 在 wire 上的调用 ID。
+ * 与历史共享的公开 occurrence 身份；provider 的 wire 调用 ID 不在协议里。
  */
 item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, images?: Array<ImageAttachment>, isError: boolean, durationMs?: number,
 /**
@@ -290,8 +290,8 @@ export type TurnFailureCause = "store" | "project_instructions" | "provider_rate
 
 export type TurnModelUsage = { inputTokens: number, outputTokens: number, totalTokens: number, cachedInputTokens: number, reasoningTokens: number,
 /**
- * 这次聚合里是否至少有一个请求完整上报了输入和输出计数（两项都齐全）。
- * 为 false 时各个计数保持「未知」的含义，不把缺失伪装成零消费或可计算的金额。
+ * 这次聚合里是否至少有一个请求完整上报了输入和输出计数。为 false 时各计数表示
+ * 未知，不能当零消费或计费依据。
  */
 usagePresent: boolean, };
 

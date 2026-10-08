@@ -1,4 +1,4 @@
-//! Private newline-delimited pipe transport. Only correlation IDs wrap the existing protocol.
+//! 私有管道传输，按行分隔，只在既有协议外套上请求关联 id。
 
 use std::sync::Arc;
 

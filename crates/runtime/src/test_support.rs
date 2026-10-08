@@ -1,11 +1,7 @@
 //! Runtime 包内测试共享的确定性夹具与门控钩子。
 //!
-//! 提供隔离的临时 sessions 目录、provider 配置快照、
-//! 请求输入投影、注入了 provider 的会话构造 conversation_with，以及门控
-//! 替身 GatedProvider：首个请求到达时发出信号并阻塞，让测试在 turn 仍在
-//! 执行、会话执行窗口仍被占用时观测 durable 事实，并按采样取消语义响应取消令牌。
-//!
-//! 夹具使用隔离 home；注入的 provider 替身不触网，省略替身时按该 home 的配置解析。
+//! 提供隔离的临时 sessions 目录、provider 配置快照、请求输入投影、会话构造
+//! conversation_with，以及门控替身 GatedProvider。夹具使用隔离 home，注入的替身不触网。
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 夹具构造失败即测试环境损坏，直接 panic
 
 use std::path::{Path, PathBuf};
@@ -79,7 +75,7 @@ impl SessionsFixture {
 }
 
 /// 每次生成请求中最后一条人工输入；项目指令位于对话历史之前。
-/// （更早的输入会作为历史上下文重放，不能用于唯一性判断。）
+/// （更早的输入会作为历史上下文重放，无法用来区分身份。）
 pub fn input_sequence(requests: &[ModelTurnRequest]) -> Vec<String> {
     requests
         .iter()
@@ -126,9 +122,9 @@ pub fn write_provider_fixture(home: &Path, alternate_model: &str) {
     }
 }
 
-/// 在给定夹具上注入 fake provider 构造会话协调器，返回会话与其 thread 的
-/// 规范 session 文件路径；model 为 thread 初始 selector（None 走目录默认）。
-/// 夹具由调用方持有，保证会话目录在执行期间保留。
+/// 在给定夹具上注入 fake provider 构造会话协调器，返回会话和 thread 的规范 session
+/// 文件路径；model 是 thread 初始 selector（None 走目录默认）。夹具由调用方持有，
+/// 保证会话目录在执行期间保留。
 pub fn conversation_with(
     fixture: &SessionsFixture,
     provider: Arc<dyn Provider + Send + Sync>,
@@ -143,10 +139,9 @@ pub fn conversation_with(
     (Conversation::new(runner, thread), path)
 }
 
-/// 模型边界门控替身：首个请求到达时发出 started 信号并阻塞，直到测试释放
-/// 或关闭通道；经门控时已取消的请求按采样取消语义返回 Cancelled。其余请求
-/// 委托给注入的 inner 替身。让断言精确锚定在「turn 已在执行、operation
-/// 起始记录已 durable、会话执行窗口仍被占用」的时刻。
+/// 模型边界门控替身。首个请求到达时发出 started 信号并阻塞，直到测试释放或关闭通道；
+/// 经门控时已取消的请求按采样取消语义返回 Cancelled，其余请求委托给 inner 替身。断言能
+/// 锚定在「turn 已在执行、operation 起始记录已 durable、执行窗口仍被占用」的时刻。
 pub struct GatedProvider {
     started: std::sync::mpsc::Sender<()>,
     release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,

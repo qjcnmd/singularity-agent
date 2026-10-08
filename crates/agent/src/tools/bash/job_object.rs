@@ -36,7 +36,7 @@ fn last_os_error(operation: &str) -> io::Error {
 
 /// 子进程一旦绑进作业，它派生的所有子孙都留在同一个作业里；关闭作业句柄或显式终止
 /// 时，内核会连带杀掉整棵树，不必逐个枚举进程。句柄由 `OwnedHandle` 独占持有：创建
-/// 成功就交出所有权，配置失败和析构都走同一条自动关闭路径，不再有第二个手工释放处。
+/// 成功就交出所有权，配置失败和析构都走同一条自动关闭路径，没有别的手工释放处。
 pub(super) struct JobObject {
     handle: OwnedHandle,
 }
@@ -47,7 +47,7 @@ impl JobObject {
         if raw == 0 {
             return Err(last_os_error("CreateJobObjectW"));
         }
-        // 不变量：CreateJobObjectW 一旦成功就返回有效句柄，所有权随即交给 OwnedHandle。
+        // 调用成功时句柄有效，所有权交给 OwnedHandle。
         let handle = unsafe { OwnedHandle::from_raw_handle(raw as *mut c_void) };
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -80,8 +80,8 @@ impl JobObject {
 
     /// 整树终止：内核会连带终止作业里的所有子孙进程。
     ///
-    /// 返回值是内核的实际结果，调用方必须按回收失败来报告：终止被拒绝时进程树仍然
-    /// 活着。重复执行同一动作不改变结果，句柄关闭时的 kill-on-close 仍兜底资源回收。
+    /// 返回值是内核的实际结果，调用方按回收失败报告：终止被拒绝时进程树还活着。
+    /// 重复执行同一动作不改变结果，句柄关闭时的 kill-on-close 也会杀掉进程树。
     fn terminate(&self) -> io::Result<()> {
         let terminated = unsafe { TerminateJobObject(self.handle.as_raw_handle() as HANDLE, 1) };
         if terminated == 0 {
@@ -91,9 +91,8 @@ impl JobObject {
     }
 }
 
-/// 终止动作之后等待回收的有界窗口：窗口内没观察到退出就不再等，回收结果按未知上报，
-/// 作业句柄关闭时的 kill-on-close 兜底资源回收。常规收尾和启动失败共用同一个窗口，
-/// 两条路径的「有界」语义因此一致。
+/// 终止后等待退出的上限；超时仍未退出就按未知上报，句柄关闭时 kill-on-close 会杀掉整个作业。
+/// 常规收尾和启动失败共用这个窗口。
 const RECLAIM_GRACE: Duration = Duration::from_secs(5);
 
 /// 已经纳入平台进程树管理的 shell 子进程。
@@ -107,11 +106,9 @@ pub(crate) struct ManagedChild {
 }
 
 impl ManagedChild {
-    /// 回收本次调用的进程树：先做一次终止动作，再做一次有界等待。
-    ///
-    /// 这是整个工具唯一的回收入口——常规收尾和启动失败都用它，所以两条路径的终止动作、
-    /// 等待窗口和失败报告不会各自跑偏。返回值是回收本身的失败文案（终止被拒绝、窗口内
-    /// 没退出、等待出错），只作附加信息，不覆盖主要的结束原因。
+    /// 回收进程树：先终止，再有界等待退出。常规收尾和启动失败都走这里，两条路径的
+    /// 终止动作和等待窗口一致。返回值只是附加的失败信息（终止被拒绝、窗口内没退出、
+    /// 等待出错），不覆盖调用方的主要错误。
     ///
     /// 用哪种终止动作取决于实际归属：归属成功时作业对象的整树终止已覆盖主进程，再补
     /// 一次 `Child::kill` 也不改变结果；归属失败时它不在本作业内，只能单独终止。
@@ -150,10 +147,10 @@ impl ManagedChild {
 
 /// 启动子进程，并把它纳入平台的进程树管理。
 ///
-/// 这个顺序就是契约：先建作业，再用 `CREATE_SUSPENDED` 创建子进程——被挂起的主线程在
-/// 恢复之前不会执行任何用户命令，也派生不出下一代——接着绑定作业，最后用本边界自己
-/// 持有的初始线程句柄把它恢复。任何一步失败都走同一条回收路径：终止尚未运行的子进程
-/// 并释放全部句柄，既不会留下没归属本次作业的后代，也不会把启动失败拖成无限等待。
+/// 顺序就是契约：先建作业，再用 `CREATE_SUSPENDED` 创建子进程（被挂起的主线程恢复前
+/// 不会执行任何用户命令，也派生不出下一代），接着绑定作业，最后用本边界持有的初始
+/// 线程句柄把它恢复。任何一步失败都走同一条回收路径：终止尚未运行的子进程并释放全部
+/// 句柄，不会留下没归属本次作业的后代，也不会把启动失败拖成无限等待。
 ///
 /// 命令行转义、环境与管道仍交给 `std::process::Command`（稳定 `CommandExt` 不提供创建
 /// 时的作业属性，见 `PROC_THREAD_ATTRIBUTE_JOB_LIST`）：这些语义只有它实现得完整。
@@ -204,16 +201,16 @@ fn attach_reclaim_failures(primary: io::Error, failures: &[String]) -> io::Error
 
 /// 打开刚创建的子进程的初始线程；句柄归本边界所有，随 `OwnedHandle` 在恢复之后立刻关闭。
 ///
-/// `CREATE_SUSPENDED` 保证这个进程在恢复之前只有一个线程，也不会自己创建线程，所以
-/// 快照里属于它的线程就是 `CreateProcess` 建立的主线程。稳定工具链的 `std::process`
-/// 不暴露主线程句柄（`main_thread_handle` 在 unstable 的 `process_internals` 之后），
-/// 因此这里按进程 id 枚举线程，而不是把整个 `CreateProcessW` 调用重写一遍。
+/// `CREATE_SUSPENDED` 保证这个进程在恢复之前只有一个线程，也不会自己创建线程，快照里
+/// 属于它的线程就是 `CreateProcess` 建立的主线程。稳定工具链的 `std::process` 不暴露
+/// 主线程句柄（`main_thread_handle` 在 unstable 的 `process_internals` 之后），这里按
+/// 进程 id 枚举线程，不重写整个 `CreateProcessW` 调用。
 fn owned_initial_thread(process_id: u32) -> io::Result<OwnedHandle> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(last_os_error("CreateToolhelp32Snapshot"));
     }
-    // 不变量：快照句柄一旦创建成功，所有权随即交给 OwnedHandle。
+    // 快照句柄创建成功，所有权交给 OwnedHandle。
     let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot as *mut c_void) };
     let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
     entry.dwSize = size_of::<THREADENTRY32>() as u32;
@@ -248,7 +245,7 @@ fn owned_initial_thread(process_id: u32) -> io::Result<OwnedHandle> {
     if thread == 0 {
         return Err(last_os_error("OpenThread"));
     }
-    // 不变量：OpenThread 一旦成功就返回有效句柄，所有权随即交给 OwnedHandle。
+    // OpenThread 调用成功时返回有效句柄，所有权交给 OwnedHandle。
     Ok(unsafe { OwnedHandle::from_raw_handle(thread as *mut c_void) })
 }
 

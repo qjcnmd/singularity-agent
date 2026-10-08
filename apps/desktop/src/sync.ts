@@ -18,8 +18,8 @@ function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSe
   const previous = state.liveSessions[sessionId]
   if (previous && incoming.sessionRevision <= previous.sessionRevision) return state
   const selected = state.session?.summary.threadId === sessionId ? state.session : null
-  // 后台会话只有生命周期字段，不伪造完整 runtime；所选会话的 runtime 是同一
-  // 份 lifecycle 对象的完整形状，detail 因此与列表共享这一个引用。
+  // 后台会话只有生命周期字段，不伪造完整 runtime；所选会话的 runtime 是同一份
+  // lifecycle 对象的完整形状，detail 与列表共享这个引用。
   if (selected === null) {
     const lifecycle: LiveSessionState = { sessionRevision: incoming.sessionRevision, phase: incoming.phase, terminal: incoming.terminal }
     return { ...state, liveSessions: { ...state.liveSessions, [sessionId]: lifecycle } }

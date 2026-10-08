@@ -1,11 +1,7 @@
 //! 单个 turn 的完整执行管线：准备、会话单写者、Agent 执行、事件投影和终态落盘。
-//!
-//! 执行不变量：
-//! - 准备阶段的失败，与 operation_started 成功之后的提交失败，分开归类；
-//! - 本 turn 的 operation_started 先于一切事件落盘；终态记录
-//!   （operation_finished，状态与错误事实）先于终态事件；
-//! - 一个 turn 只打开一次会话文件，同一个 SessionManager 贯穿全程；
-//! - 投影是尽力而为的观察侧信道：投影失败只丢掉这次投影，不影响执行事实。
+//! operation_started 先于本 turn 的一切事件落盘，终态记录（operation_finished，状态与
+//! 错误事实）先于终态事件；一个 turn 只打开一次会话文件，同一个 SessionManager 贯穿全程。
+//! 投影是尽力而为的观察侧信道，投影失败只丢掉这一次投影，不影响执行事实。
 
 mod compaction;
 mod error;
@@ -32,8 +28,8 @@ use singularity_protocol::{
     DiagnosticSeverity, Thread, Turn, TurnErrorDetail, TurnEvent, TurnModelUsage, TurnStatus, diagnostic_code,
 };
 
-/// 一次收敛到可信终态的 turn 结果（completed/failed/interrupted 都是可信终态；
-/// 没有可信终态的情形由 TurnRunError 表达）。
+/// 一次收敛到可信终态的 turn 结果。completed/failed/interrupted 都是可信终态，
+/// 没有可信终态的情形由 TurnRunError 表达。
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
     pub turn_status: TurnStatus,
@@ -41,8 +37,8 @@ pub struct TurnOutcome {
     pub manually_stopped: bool,
     pub truncated: bool,
     pub usage: TurnModelUsage,
-    /// 失败终态的协议错误细节（其中的 cause/message 与已发布的 turn/error 事件同源）；
-    /// 非失败终态是 None。客户端用它报告进程结果，不必再从事件流里重建终态事实。
+    /// 失败终态的协议错误细节，与 turn/error 事件携带的是同一份；非失败终态是 None。
+    /// 客户端用它报告进程结果，不必从事件流重建终态事实。
     pub error: Option<TurnErrorDetail>,
 }
 
@@ -50,8 +46,8 @@ pub struct TurnOutcome {
 pub struct TurnRunner {
     sessions_dir: PathBuf,
     user_questions: bool,
-    /// 磁盘模型配置的唯一访问入口，和工作台共享同一个实例；每次使用都从它取一份
-    /// 本次操作的局部快照，不长期缓存配置。
+    /// 磁盘模型配置的访问入口，和工作台共享同一个实例；每次使用取一份本次操作的局部
+    /// 快照，不长期缓存配置。
     models: Arc<ModelConfigManager>,
     mcp: Arc<singularity_mcp::McpManager>,
     #[cfg(test)]
@@ -106,14 +102,14 @@ impl TurnRunner {
         Ok(Arc::new(std::sync::Mutex::new(session)))
     }
 
-    /// 执行已准备的 turn，直到终态收敛。调用方持有 crate::conversation::TurnControls，以便在
-    /// 执行期间注入输入或取消。
+    /// 执行已准备的 turn，直到终态收敛。调用方持有 crate::conversation::TurnControls，
+    /// 以便在执行期间注入输入或取消。
     ///
-    /// 返回 Ok 时终态（completed/failed/interrupted）已经落盘、终态事件也已经发出——失败终态的
-    /// TurnOutcome::error 带着与 turn/error 事件同源的协议错误细节。返回
-    /// TurnRunError::Terminalization 时终态记录写不下去，不会发出任何虚假的终态事件。
+    /// 返回 Ok 时终态（completed/failed/interrupted）已落盘，终态事件也已发出，失败终态的
+    /// TurnOutcome::error 与 turn/error 事件携带同一份协议错误细节。返回
+    /// TurnRunError::Terminalization 时终态记录写不下去，不会发出终态事件。
     ///
-    /// `input` 是本轮已接受的完整输入；进入历史后由会话持久化维护。
+    /// `input` 是本轮已接受的完整输入，之后由会话持久化维护。
     pub(crate) async fn run(
         input: ControlRequest,
         thread: &Thread,
@@ -154,7 +150,7 @@ impl TurnRunner {
                 outcome.truncated,
                 None,
             ),
-            // 执行期的存储/宿主故障不写可信终态；历史把未闭合 operation 投影为中断。
+            // 执行期的存储/宿主故障不写可信终态，历史把未闭合的 operation 投影为中断；
             // 链条到此停止。
             Err(error) => {
                 let cause = classify_agent_error(&error);
@@ -166,14 +162,13 @@ impl TurnRunner {
             }
         };
         let usage = agent.request_usage();
-        // 所有执行结果共用同一套顺序：冻结取消控制、终态落盘、发布终态；
-        // 任何一次存储失败都 fail-stop，不发布虚假终态。
+        // 所有执行结果共用同一套顺序：冻结取消控制、终态落盘、发布终态；存储失败一律
+        // fail-stop，不发布虚假终态。
         let usage = turn_usage_from_model_usage(usage);
         let record = LedgerRecord::OperationFinished {
             turn_id: Some(turn_id.clone()),
             outcome: turn_status,
-            // 失败终态的结构化原因随同一份持久记录落盘：它是这个 turn 失败原因的
-            // 长期来源，重读历史时不再依赖 runtime 最近一次的文本。
+            // 失败终态的结构化原因随同一份持久记录落盘，重读历史时不依赖 runtime 最近一次的文本。
             error: error.clone(),
             user_stopped: cancel_accepted,
         };
@@ -222,8 +217,8 @@ impl TurnRunner {
         thread: &Thread,
         controls: &crate::conversation::TurnControls,
     ) -> Result<(Agent, String), TurnRunError> {
-        // 会话写者由 Conversation 在 turn 开始前打开；这里只做剩下的
-        // fail-fast 准备（provider/config/项目指令），全部就绪之后才写任何 operation 状态。
+        // 会话写者由 Conversation 在 turn 开始前打开；本函数只做剩下的 fail-fast 准备
+        // （provider/config/项目指令），就绪之后才写 operation 状态。
         let writer = controls.writer();
         let (provider, config) = self.resolve_agent_runtime(thread)?;
         // OperationStarted 记录 turn 身份。输入消息由 Agent 单独落盘；

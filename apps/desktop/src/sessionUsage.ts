@@ -2,16 +2,15 @@ import type { SessionView } from './execution'
 import type { SessionModelUsage } from './protocol'
 
 /**
- * 会话累计用量 = 服务端按整份账本聚合的冻结历史 + 当前回合的实时观测。
+ * 会话累计用量 = 服务端按整份账本聚合的冻结历史 + 当前回合的实时观测。两块不重叠
+ * 由服务端的读盘冻结窗口保证：回合开始冻结的快照不含该回合之后落盘的记录，该回合
+ * 的观测随活动事件到达，结算后的下一次读取才并进快照。两项直接相加即可，不在前端
+ * 重算历史（历史分页加载，重算会漏掉更早的回合），也不会重复计数。
  *
- * 两部分不重叠由服务端的读盘冻结窗口保证：回合开始时冻结的快照不含该回合之后
- * 落盘的记录，该回合的观测只随活动事件到达，结算后的下一次读取才把它并入快照。
- * 因此这里直接相加即可：既不用在前端重算历史（历史分页加载，重算会漏掉更早的
- * 回合），也不会重复计数。归并规则与服务端 `session_usage` 一致：同一 requestId
- * 取末次观测——活动事实本就以 requestId 为 id 做 upsert（`execution.ts`），因此
- * 每个请求在这里只出现一次；TTFT 只统计实测样本，消费只统计上报 usage 的请求。
- * 没有消费记录的请求不进入消费计数，也不影响缓存完整性。
- * 没有消费或首 token 计时样本时返回 null，调用方不显示伪造的零消费。
+ * 归并与服务端 `session_usage` 一致：同一 requestId 取末次观测，活动事实按
+ * requestId 做 upsert（见 `execution.ts`），每个请求只出现一次。TTFT 只统计实测
+ * 样本，消费只统计上报 usage 的请求；没有消费记录的请求不进计数，也不影响缓存
+ * 完整性。没有消费或首 token 计时样本时返回 null，调用方不显示伪造的零消费。
  */
 export function sessionUsage(session: SessionView | null): SessionModelUsage | null {
   if (session === null) return null

@@ -30,7 +30,7 @@ pub enum WorkspaceError {
     },
 }
 
-/// 工作区登记的唯一持久化入口；只有文件更新成功后才提交内存状态。
+/// 工作区登记的写入口；只有文件更新成功后才提交内存状态。
 pub struct WorkspaceStore {
     path: PathBuf,
     state: Mutex<RegistryFile>,

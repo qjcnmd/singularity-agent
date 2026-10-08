@@ -31,7 +31,7 @@ enum WorkerEvent {
 }
 
 impl Agent {
-    /// 准入在派发者中按 source order 等待，确保后面的独占调用不会越过前面的读取。
+    /// 准入在派发者中按 source order 等待，后面的独占调用不会越过前面的读取。
     /// 等待锁期间继续消费结果和进度，避免背压阻止已运行工具释放锁。
     pub(super) async fn dispatch_tools(
         &mut self,
@@ -41,8 +41,8 @@ impl Agent {
         cancellation: &CancellationToken,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        // 只为读 cwd 短暂持有会话写者锁；绝不跨工具执行持锁，否则会阻塞控制
-        // 接受与终态落盘（工具 worker 与控制面共用同一写者）。
+        // 只为读 cwd 短暂持有会话写者锁，不跨工具执行持锁，否则会阻塞控制接受与
+        // 终态落盘（工具 worker 与控制面共用同一写者）。
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
         let gate = Arc::new(Semaphore::new(MAX_PARALLEL_TOOL_WORKERS as usize));
         let (sender, mut receiver) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);

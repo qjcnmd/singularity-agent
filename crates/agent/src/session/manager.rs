@@ -257,7 +257,7 @@ impl SessionManager {
 
     fn write_append(&mut self, handle: &mut impl Write, bytes: &[u8]) -> Result<()> {
         // 写入失败可能在文件尾部留下半行 JSONL。这一行原样保留，交给现有的重开
-        // 修复路径处理；绝不往它后面再追加任何记录。
+        // 修复路径处理，不往它后面再追加任何记录。
         let result = handle
             .write_all(bytes)
             .and_then(|()| handle.write_all(b"\n"))

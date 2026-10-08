@@ -47,8 +47,8 @@ pub struct RequestObservation {
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub error: Option<String>,
-    /// 这次 attempt 的稳定诊断码：它和 `error` 类别一起构成可以持久回放的失败
-    /// 事实，实时事件和历史读取都从这一份记录派生。
+    /// 这次 attempt 的稳定诊断码，与 `error` 类别一起构成可以持久回放的失败事实；
+    /// 实时事件和历史读取都从这一份记录派生。
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub diagnostic_code: Option<String>,
@@ -75,7 +75,7 @@ pub struct ReadSource {
 pub enum HistoryItem {
     /// 请求条目。身份只由 `observation.request_id` 承载，条目里不再单独保存
     /// 同一个值；`started_at` 是该请求开始观测时的记录时间，只有终态观测（旧
-    /// 日志，或开始记录缺失）才为 None——不用结束时间去冒充开始时刻。
+    /// 日志，或开始记录缺失）才为 None。不用结束时间去冒充开始时刻。
     Request {
         #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
@@ -140,9 +140,9 @@ pub enum HistoryItem {
 }
 
 impl HistoryItem {
-    /// 公开 history item 的稳定公开 id。历史翻页的锚点不是 item id：分页按轮 cursor
-    /// （`turn:{turnId}`，无归属的前导组是 `turn:leading`）定位，见 runtime 的分页实现。
-    /// 请求条目的身份就是它所观测的 request id：生产者和消费者从同一处拿到同一个身份。
+    /// 公开 history item 的稳定 id。历史翻页的锚点是轮 cursor
+    /// （`turn:{turnId}`，无归属的前导组是 `turn:leading`），见 runtime 的分页实现。
+    /// 请求条目的身份就是它所观测的 request id，生产者和消费者从同一处拿到同一个值。
     pub fn id(&self) -> &str {
         match self {
             Self::Request { observation, .. } => &observation.request_id,
@@ -216,19 +216,17 @@ pub struct TurnModelUsage {
     pub total_tokens: u64,
     pub cached_input_tokens: u64,
     pub reasoning_tokens: u64,
-    /// 这次聚合里是否至少有一个请求完整上报了输入和输出计数（两项都齐全）。
-    /// 为 false 时各个计数保持「未知」的含义，不把缺失伪装成零消费或可计算的金额。
+    /// 这次聚合里是否至少有一个请求完整上报了输入和输出计数。为 false 时各计数表示
+    /// 未知，不能当零消费或计费依据。
     pub usage_present: bool,
 }
 
-/// 会话累计的模型用量：整份账本里 provider 请求观测的合计，供工作台展示成本和速度。
+/// 整份账本里 provider 请求观测的合计，供工作台展示成本和速度。
 ///
-/// 与 TurnModelUsage 的分工在范围与字段，不是两套重试口径：后者是一轮 turn 的计费累计
-/// （`--json` 与评估的口径，含该轮内的全部重试），本类型跨轮次累计输入、输出和耗时。
-/// requestId 标识一次具体的 provider 请求，每次 attempt 各自生成一个，所以按 requestId 归并
-/// 折叠的是同一个请求的 started 与终态观测（取末次），重试和后续轮次全部计入；这个身份规则
-/// 和工作台历史的请求投影一致，两处显示的数字吻合。TTFT 统计有实测计时的请求；消费只统计
-/// 上报了 usage 的请求，没有消费记录的请求不进入消费计数也不影响缓存完整性。
+/// requestId 每次 attempt 各生成一个，按它归并同一请求的 started 与终态观测（取末次），
+/// 重试计入合计，该规则与工作台历史的请求投影一致。TTFT 只统计有实测计时的请求，token
+/// 与消费只统计上报了 usage 的请求；与 TurnModelUsage 的区别是范围，后者按轮计费
+/// （`--json` 与评估口径，含该轮全部重试），本类型跨轮累计输入、输出和耗时。
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -256,8 +254,7 @@ pub struct SessionModelUsage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
-/// turn 的生命周期状态：运行中（running）、已完成（completed）、已失败（failed）
-/// 或已中断（interrupted）。wire 词形由 serde 的 snake_case 单点提供，没有手写词表。
+/// turn 的生命周期状态。wire 词形由 serde 的 snake_case 统一提供，没有手写词表。
 pub enum TurnStatus {
     Running,
     Completed,
@@ -279,7 +276,7 @@ pub struct SummaryTurn {
     pub truncated: bool,
 }
 
-/// --json 唯一的终态 summary 对象：{"summary":{"turn":…}} 的内层形状。它是事件投影
+/// --json 终态 summary 对象的形状，{"summary":{"turn":…}} 的内层。它是事件投影
 /// 的输出契约，不取代 Session ledger 这个执行事实源；序列化统一由 Self::to_line 完成。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -305,7 +302,7 @@ impl TerminalSummary {
         }
     }
 
-    /// summary 行唯一的 wire 投影：外层 {"summary": …} 这个键只在这里出现一次。
+    /// summary 行的 wire 投影：外层 {"summary": …} 这个键只在这里出现一次。
     pub fn to_line(&self) -> serde_json::Value {
         serde_json::json!({ "summary": self })
     }

@@ -1,7 +1,7 @@
 use super::*;
 
-/// 同一个穷尽的分类既决定终态原因，也决定是否必须停止执行链。
-/// 存储故障写不出可信终态，执行器按 Store 分类停止执行链。
+/// 这套穷尽的分类同时决定终态原因，以及是否必须停止执行链。存储故障写不出可信终态，
+/// 执行器按 Store 分类停止执行链。
 pub(super) fn classify_agent_error(error: &AgentError) -> TurnFailureCause {
     match error {
         AgentError::Provider(error) => provider_turn_cause(error.kind),
@@ -11,9 +11,8 @@ pub(super) fn classify_agent_error(error: &AgentError) -> TurnFailureCause {
     }
 }
 
-/// 终态写不下去时的 fail-stop 出口：发出 storage_fatal 诊断，不发布任何终态事件，
-/// 客户端不会把没确认写入的结果当成完成。已经发生的执行失败随同一份错误一起报告，
-/// 不会被收尾故障覆盖。
+/// 终态写不下去时的 fail-stop 出口：发出 storage_fatal 诊断，不发布终态事件，客户端不会
+/// 把没落盘的结果当成完成。已发生的执行失败随同一份错误报告，不被收尾故障覆盖。
 pub(super) fn fail_stop_terminalization(
     thread_id: &str,
     turn_id: &str,

@@ -14,12 +14,10 @@ Conversation 持有 `pending_input: Option<ControlRequest>` 与会话级 `Steeri
 
 ## 依据与边界
 
-DSH 将普通排队和 `next-step` 输入分开，Pi 也分别持有 follow-up 与 steering 队列；两者不会因当前请求失败把尚未消费的 steer 合并成普通排队消息。本项目采用会话持有 steer 的职责划分，同时遵循[宪章](../constitution.md#运行边界)：待处理输入只在进程内存在，重启后由用户手动继续已保存历史。
+请求失败或停止结束当前执行链时，尚未消费的 steer 归会话持有，不退化为普通排队消息；用户明确停止仍取消未消费的 steer。这遵循[宪章](../constitution.md#运行边界)：待处理输入只在进程内存在，重启后由用户手动继续已保存历史。
 
 单条排队限制由后端接受边界维护。排队和取回期间的内容锁由工作台统一派生；队列操作错误复用会话动作反馈。
 
 如果未来需要重启后继续待处理输入，必须重新评估输入接受与持久化的边界；内存箱不能承担该保证。
 
 实现入口：[Conversation](../../crates/runtime/src/conversation.rs)、[SteeringInbox](../../crates/agent/src/agent/inbox.rs)、[Composer](../../apps/desktop/src/components/Composer.tsx)。
-
-参考：[DSH Agent Loop](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/core/agent-loop)、[Pi Agent](https://github.com/badlogic/pi-mono/blob/main/packages/agent/src/agent.ts)。DSH 行为依据本机安装的 `0.1.7-alpha.2` 源码核对。

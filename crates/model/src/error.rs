@@ -166,7 +166,7 @@ pub(crate) struct ProviderErrorBodyFields {
 }
 
 /// 从提供方的 error 对象（{"code": "...", "type": "...", "message": "..."}）里取结构化
-/// 字段；不是对象、或字段类型不符，一律当作没提供。流内事件、200 载荷里的内嵌错误和非
+/// 字段；不是对象或字段类型不符，都当作没提供。流内事件、200 载荷里的内嵌错误和非
 /// 2xx 响应体共用这一个提取点。
 pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
     let text = |field: &str| error.get(field).and_then(Value::as_str).map(str::to_string);
@@ -178,7 +178,7 @@ pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
 }
 
 /// 服务端原始协议事实的有限条目：HTTP 状态和线上 code/type 都留下，不改变 kind/code 的分类
-/// 结果；空字段不产生条目，正文只取长度有限的诊断，绝不保存原始响应体或凭据。HTTP 和 SSE
+/// 结果；空字段不产生条目，正文只取长度有限的诊断，不保存原始响应体或凭据。HTTP 和 SSE
 /// 两条入口共用这一套保留规则。
 pub(crate) fn provider_wire_facts(status: Option<u16>, fields: &ProviderErrorBodyFields) -> Vec<String> {
     let mut facts = Vec::new();
@@ -195,7 +195,7 @@ pub(crate) fn provider_wire_facts(status: Option<u16>, fields: &ProviderErrorBod
 }
 
 /// 解析非 2xx 响应体的 {"error": {"code": "...", "message": "..."}} 形状；顶层没有
-/// error、或 error 不是对象，一律当作没提供。
+/// error 或 error 不是对象，都当作没提供。
 pub(crate) fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields {
     serde_json::from_slice::<Value>(body)
         .ok()
@@ -203,8 +203,7 @@ pub(crate) fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields 
         .unwrap_or_default()
 }
 
-/// 线上错误码到具体 kind 的精确映射（全等匹配，不靠文本推断）；
-/// 没命中就返回 None，由调用方决定兜底归到哪一类。
+/// 线上错误码到具体 kind 的精确映射（全等匹配，不靠文本推断）；没命中就返回 None，分类由调用方决定。
 pub(crate) fn provider_error_kind_for_code(code: Option<&str>) -> Option<ModelErrorKind> {
     match code {
         Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE) => Some(ModelErrorKind::ContextLengthExceeded),
@@ -223,7 +222,7 @@ pub(crate) fn provider_error_kind_for_transport(error: &reqwest::Error) -> Model
 }
 
 /// HTTP 状态到错误类别的共同定义：401/403 认证、408 超时、429 限流、其余 4xx 算输入错误、
-/// 5xx 算提供方过载，其他算未知。调用方只对确实不一样的状态码在自己那里单独处理。
+/// 5xx 算提供方过载，其他算未知。调用方只对确实不一样的状态码单独处理。
 pub(crate) fn provider_error_kind_for_http_status(status: u16) -> ModelErrorKind {
     match status {
         crate::HTTP_STATUS_UNAUTHORIZED | crate::HTTP_STATUS_FORBIDDEN => ModelErrorKind::AuthError,
@@ -263,7 +262,7 @@ pub(crate) fn bounded_provider_error_diagnostic(text: &str) -> String {
     diagnostic
 }
 
-/// 从线上 message 取出的、有长度上限的非空诊断；兜底内容由协议调用方决定。
+/// 从线上 message 取出的、有长度上限的非空诊断；回退内容由协议调用方决定。
 pub(crate) fn bounded_wire_detail(fields: &ProviderErrorBodyFields) -> Option<String> {
     fields
         .message
@@ -274,7 +273,7 @@ pub(crate) fn bounded_wire_detail(fields: &ProviderErrorBodyFields) -> Option<St
 
 /// 构造内嵌的提供方错误（来自流内事件或 200 载荷）：已知线上错误码映射到对应的
 /// kind（上下文溢出触发强制压缩、限流保持可重试、配额归入不可重试的认证类），
-/// 未知码保持 UnknownProviderError（可重试），但带上提供方原文和码，绝不静默丢弃。
+/// 未知码保持 UnknownProviderError（可重试），但带上提供方原文和码，不静默丢弃。
 pub(crate) fn provider_embedded_error(
     fields: &ProviderErrorBodyFields,
     fallback_message: &str,

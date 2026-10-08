@@ -1,8 +1,7 @@
 //! 正文渲染：Markdown（GFM、数学公式）与代码块布局。
 //!
-//! 时间线条目与轨迹详情都显示模型正文，两者的渲染规则因此必须同源；这里只
-//! 承载这些共用渲染与代码块布局，不持有时线条目的编排状态，也不承载代码高亮
-//! 本身——高亮由 highlight 模块提供。
+//! 时间线条目与轨迹详情都显示模型正文，渲染规则由本模块统一提供。本模块只承载
+//! 共用渲染与代码块布局，不持有时线条目的编排状态，代码高亮由 highlight 提供。
 
 import { isValidElement, memo, type ReactNode } from 'react'
 import ReactMarkdown, { type Components } from 'react-markdown'

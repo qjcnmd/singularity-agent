@@ -1,8 +1,7 @@
 //! Thread 的目录操作：创建、定位、只读分页投影与归档。
 //!
-//! JSONL 会话文件是唯一的持久事实源；这里只提供路径和打开会话的统一
-//! 入口，不复制会话状态。ThreadCatalog 持有 sessions_dir；目录
-//! 布局与路径函数留在本模块；crate 根导出目录名。
+//! JSONL 会话文件是持久事实的落点，本模块提供路径和打开会话的入口，不复制会话状态。
+//! 目录布局与路径函数留在本模块，目录名在 crate 根导出。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,7 +70,7 @@ impl ThreadCatalog {
     }
 }
 
-/// 在已经打开的唯一会话写者上保存 selector；创建任务和提交设置共用这个入口。
+/// 在已经打开的会话写者上保存 selector；创建任务和提交设置共用这个入口。
 /// 创建或变更任务时追加一次选择；Thread 没有模型覆盖时不记录。
 pub(crate) fn record_thread_settings_metadata(
     session: &mut SessionManager,
@@ -141,7 +140,7 @@ impl ThreadCatalog {
                 Err(error) => return Err(error),
             }
         }
-        // 目录顺序只在这里产生：按最近更新时间降序；时间相同时按任务 ID 升序。
+        // 目录顺序只在本模块产生：按最近更新时间降序，时间相同时按任务 ID 升序。
         threads.sort_by(|left, right| {
             right.updated_at.cmp(&left.updated_at).then_with(|| left.thread_id.cmp(&right.thread_id))
         });
@@ -293,9 +292,8 @@ fn thread_facts(session: &SessionData) -> (ThreadSummary, Vec<IndexedTurn>) {
     (summarize_thread(session, &turns), turns)
 }
 
-/// 归档会话的子目录（相对 sessions_dir）。删除改成归档保留；列表和摘要的扫描
-/// 只读顶层的 .jsonl，因此天然跳过 archived/——这是列表过滤所依赖的前提，改动
-/// 扫描方式时必须复核。
+/// 归档会话的子目录（相对 sessions_dir）。删除改成归档保留；列表和摘要只扫描顶层的
+/// .jsonl，archived/ 下的文件不会进结果，列表过滤依赖这一点，改动扫描方式时要复核。
 pub const ARCHIVED_SESSIONS_DIR_NAME: &str = "archived";
 
 impl ThreadCatalog {

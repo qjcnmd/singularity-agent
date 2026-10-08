@@ -1,10 +1,6 @@
-//! --json 渲染：每条事件写一行 JSONL，最后再写一行终态 summary；事件行的
-//! {"method", "params"} 信封就是 TurnEvent 自己的 tagged serde 形状，直接编码写出，
-//! 不拼中间 JSON 树，终态行的形状只由 protocol 的 TerminalSummary 定义。
-//!
-//! 输出故障只算投影层的问题：stdout 写失败后，通道已无法确认行边界（write_all 不保证
-//! 原子，可能留下半行），所以连 summary 一起停止写入；执行事实由调用方照常落盘，输出
-//! 故障另外经 stderr 和退出码报告。
+//! --json 渲染：每条事件写一行 JSONL，最后写终态 summary；事件行直接编码 TurnEvent 的
+//! tagged serde 形状，终态行形状只由 protocol 的 TerminalSummary 定义。stdout 写失败后
+//! 行边界无法确认，summary 一并停写；执行事实照常落盘，故障经 stderr 和退出码报告。
 
 use std::io::Write;
 

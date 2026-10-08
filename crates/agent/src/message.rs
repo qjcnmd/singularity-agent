@@ -9,8 +9,8 @@ use std::borrow::Cow;
 
 use crate::tools::ToolExecution;
 
-/// 公开内容的投影范围：工具的生命周期由工具自己的 start/end 事件表达，而历史归约
-/// 需要工具项才能和结果配对，所以同一条消息的两类消费方需要的块并不一样。
+/// 公开内容的投影范围。工具的生命周期由工具自己的 start/end 事件表达，历史归约又要
+/// 工具项才能和结果配对，同一条消息的两类消费方需要的块不一样。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemScope {
     /// 完整的公开历史：正文、思考和工具调用都包含在内。
@@ -187,10 +187,9 @@ pub const COMPACTION_SUMMARY_PREFIX: &str = "This checkpoint summarizes earlier 
 /// 压缩摘要节点进入模型上下文时加在后面的闭合标记。
 pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</compacted-summary>";
 
-/// 构造公开可见内容块的唯一规则：空思考和空正文各自跳过，顺序固定为
-/// Thinking → Text；正常响应和失败时的可见部分都走这条规则，tool_calls、
-/// 私有续接材料是两条路径的差别。按值接收让正常路径直接移动模型
-/// 响应里的字符串，失败路径只在确实要持久化时才构造拥有所有权的值。
+/// 构造公开可见内容块的唯一规则：空思考和空正文各自跳过，顺序固定为 Thinking → Text。
+/// 正常响应和失败时的可见部分都走这条规则，差别只在 tool_calls 和私有续接材料。按值接收
+/// 让正常路径直接移动模型响应里的字符串，失败路径只在确实要持久化时才构造拥有所有权的值。
 pub(crate) fn public_thinking_text_blocks(thinking: String, text: String) -> Vec<ContentBlock> {
     let mut content = Vec::with_capacity(2);
     if !thinking.is_empty() {

@@ -48,7 +48,7 @@
   /* 所有高度 disclosure 共用一个时钟：面板、其内容显现与 chevron。
      展开与收起各有一套：同一条前重后轻的曲线用在收起方向，会在开头就把面板
      收掉大半、只剩末端细缝，看起来像被切断；收起改用均分的曲线并略短。
-     四个数值的唯一来源是 motion.ts：启动时派生后写到 documentElement，
+     四个数值都由 motion.ts 派生：启动时写到 documentElement，
      这里不再各写一份。 */
   --font-sans: -apple-system-body, ui-sans-serif, -apple-system, system-ui, "Segoe UI", "Helvetica", "Apple Color Emoji", "Arial", sans-serif, "Segoe UI Emoji", "Segoe UI Symbol";
   --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;

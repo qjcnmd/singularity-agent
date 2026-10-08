@@ -1,9 +1,9 @@
 use super::*;
 
 impl TurnRunner {
-    /// 在 turn 之外压缩已有的 Thread：以独立的 compaction operation 落盘
-    /// （operation_started/operation_finished，不绑定 turn）。`window` 和普通 turn 共用同一个
-    /// 停止接受窗口，边界之前接受的停止进入终态裁决，但不会改写真实的失败原因。
+    /// 在 turn 之外压缩已有的 Thread，以独立的 compaction operation 落盘
+    /// （operation_started/operation_finished，不绑定 turn）。`window` 与普通 turn 共用同一个
+    /// 停止接受窗口，冻结前接受的停止进入终态裁决，但不改写真实的失败原因。
     pub(crate) async fn compact_thread(
         self: &Arc<Self>,
         thread: &Thread,

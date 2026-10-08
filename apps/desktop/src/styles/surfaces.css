@@ -56,7 +56,7 @@
 @keyframes menu-enter { from { opacity: 0; } to { opacity: 1; } }
 
 @media (prefers-reduced-motion: reduce) {
-  /* !important 按参考要求保留：确保关闭动效的用户不被任何作用域规则覆盖。 */
+  /* !important 保证关闭动效的用户不被任何作用域规则覆盖。 */
   .content-disclosure, .content-disclosure > div, .picker-disclosure, .expand-chevron { transition: none !important; }
   .context-menu, .context-menu > button { animation: none; }
 }

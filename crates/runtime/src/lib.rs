@@ -1,21 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! Thread/Turn 的生命周期协调与进程内 turn 执行管线。
-//!
-//! runtime 是评估入口（--json）和 桌面工作台共用的唯一执行层：TurnRunner 负责单个 turn 的
-//! 完整生命周期；Conversation 在它之上维护一个 Thread 的长驻状态：单活动 turn 的不变量、
-//! steer/followUp 注入、取消，以及设置何时生效。
-//!
-//! 职责边界：
-//! - 上下文与压缩留在 singularity_agent::compaction；
-//! - 内建工具与指令装配由 Agent 准备，runtime 不参与工具注册；
-//! - Provider 的选择与请求留在 singularity_model（dyn Provider 就是模型接缝）；
-//! - 会话的 JSONL 持久化留在 singularity_agent::session；
-//! - 协议层提供事件与公共对象这些共享类型；文本渲染、JSONL 输出和序列化
-//!   由各个客户端自己完成。
-//!
-//! 事件的事实源是 singularity_protocol::TurnEvent：文本渲染和 JSONL 输出各自
-//! 消费同一个枚举，任何一方失败都只影响自己的投影。
+//! Thread/Turn 的生命周期协调与进程内 turn 执行管线，评估入口（--json）和桌面工作台共用。
+//! TurnRunner 负责单个 turn，Conversation 维护 Thread 长驻状态：单活动 turn、steer/followUp、
+//! 取消和设置生效时机。JSONL 持久化在 singularity_agent::session，客户端各自投影事件。
 
 mod conversation;
 mod error;
@@ -40,5 +27,5 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
-/// 文字与图片组成的任务输入；Conversation 在接受操作时校验输入是否为空。
+/// 文字与图片组成的任务输入，Conversation 在接受操作时校验输入不为空。
 pub use singularity_agent::agent::UserInput;

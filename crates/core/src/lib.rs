@@ -12,8 +12,8 @@ pub use user_home::{HomeOrigin, ResolvedHome, resolve_home};
 pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace, saved_directory_matches};
 
 /// 项目根标记：从工作目录向上找到的第一个带该标记的目录就是项目根。指令加载与技能发现
-/// 共用这个标记，但读标记失败时的策略不同（指令加载直接报错，技能发现退回当前目录），
-/// 所以这里只共享标记本身，查找策略留在各自调用方。
+/// 读标记失败时的策略不同，指令加载直接报错，技能发现退回当前目录；所以这里只共享标记
+/// 本身，查找策略留在各自调用方。
 pub(crate) const PROJECT_ROOT_MARKER: &str = ".git";
 
 /// 把时长换算成毫秒；超出协议整数范围时截到 u64 能表示的最大值。

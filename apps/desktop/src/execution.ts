@@ -10,10 +10,10 @@ export type ExecutionItem = FactBase & (
   | { kind: 'settings'; provider: string; model: string; reasoning: string | null }
   | { kind: 'compaction' | 'compaction_result' | 'event'; text: string }
 )
-/** `null` 保留 wire 的含义：持久前导组或不属于回合的活动压缩。 */
+/** `null` 表示持久前导组，或不属于回合的活动压缩。 */
 export interface ExecutionTurn { startedAt?: string; finishedAt?: string; id: string | null; status: TurnStatus | null; error?: TurnErrorDetail; items: ExecutionItem[] }
 interface ExecutionFacts { history: ExecutionTurn[]; active: ExecutionTurn[] }
-/** 已加载的 history 只以事实形式存在；wire page 是读取边界，而非常驻状态。 */
+/** 已加载的 history 只保存事实；wire page 是读取边界，不是常驻状态。 */
 export interface SessionView {
   summary: ThreadSummary
   nextCursor: string | null
@@ -23,7 +23,7 @@ export interface SessionView {
 const base = (id: string, status: FactStatus = 'stable'): FactBase => ({ id, status, startedAt: null })
 const lastRequest = (turn: ExecutionTurn) => turn.items.findLast(item => item.kind === 'request')?.id
 
-/** 在任何显示投影之前，先一次性配对身份并结算执行状态。 */
+/** 配对身份并结算执行状态，先于任何显示投影。 */
 function upsert(turn: ExecutionTurn, item: ExecutionItem): ExecutionTurn {
   const index = turn.items.findIndex(previous => previous.id === item.id)
   const items = [...turn.items]
@@ -33,9 +33,9 @@ function upsert(turn: ExecutionTurn, item: ExecutionItem): ExecutionTurn {
 }
 
 /**
- * 助手/思考片段的状态由产出它的请求的失败终态决定：请求取消得到 cancelled、
- * 真正失败得到 error，实时与历史因此一致。请求成功或仍在进行时不改写片段
- * 自己的终态，独立失败（存储、工具、未关联请求的片段）不被覆盖。
+ * 助手/思考片段的状态跟随产出它的请求的失败终态：请求取消记 cancelled，失败记
+ * error，实时与历史一致。请求成功或进行中时不改写片段自己的终态；存储、工具和
+ * 未关联请求的片段这类独立失败也不改写。
  */
 function settleAssistantItems(turn: ExecutionTurn): ExecutionTurn {
   let failures: Map<string, FactStatus> | undefined
@@ -57,8 +57,8 @@ function settleAssistantItems(turn: ExecutionTurn): ExecutionTurn {
   return changed ? { ...turn, items } : turn
 }
 
-/** 请求条目：开始观测是 running；已知的开始时间与请求头不因终态观测被清空，
- *  没有开始记录时保持未知，不用结束时间补。实时与批量构建共用这一条规则。 */
+/** 请求条目：开始观测是 running。已知的开始时间与请求头不因终态观测被清空，
+ *  没有开始记录时保持未知，不用结束时间补。实时与批量构建共用这条规则。 */
 function requestItem(observation: RequestObservation, previous: ExecutionItem | undefined, startedAt: string | null): ExecutionItem {
   const prior = previous?.kind === 'request' ? previous.observation : undefined
   return { ...base(observation.requestId, observation.status === 'started' ? 'running' : observation.status),
@@ -66,12 +66,12 @@ function requestItem(observation: RequestObservation, previous: ExecutionItem | 
     startedAt: startedAt ?? (previous?.kind === 'request' ? previous.startedAt : null) }
 }
 
-/** 工具调用条目：名称与参数归调用所有，结果随后按同一 id 就地替换。 */
+/** 工具调用条目：名称与参数属于调用本身，结果随后按同一 id 就地替换。 */
 function toolCallItem(id: string, name: string, args: unknown): Extract<ExecutionItem, { kind: 'tool' }> {
   return { ...base(id), kind: 'tool', name, args, output: '' }
 }
 
-/** 工具结果条目：名称与参数沿用已配对的调用，输出与状态由结果决定。 */
+/** 工具结果条目：名称与参数取自已配对的调用，输出与状态由结果决定。 */
 function toolResultItem(item: Extract<HistoryItem, { type: 'tool_result' }>, previous: ExecutionItem | undefined): ExecutionItem {
   const tool = previous as Extract<ExecutionItem, { kind: 'tool' }>
   return { ...base(item.id, item.isError ? 'error' : 'ok'), kind: 'tool',
@@ -80,10 +80,10 @@ function toolResultItem(item: Extract<HistoryItem, { type: 'tool_result' }>, pre
     readSource: item.readSource, images: item.images }
 }
 
-/** 单条 wire HistoryItem → ExecutionItem 的唯一字段映射：批量页与实时
- *  content 共用同一份字段归属规则。previous 是同 id 的既有条目（请求沿用
- *  开始时间与请求头，工具结果沿用已配对的调用），requestId 是助手/思考
- *  片段归属的请求；更新算法由调用方决定。 */
+/** 单条 wire HistoryItem → ExecutionItem 的字段映射：批量页与实时 content
+ *  共用同一份字段归属规则。previous 是同 id 的既有条目，请求从它取开始时间与
+ *  请求头，工具结果从它取名称与参数。requestId 是助手/思考片段归属的请求，
+ *  更新算法由调用方决定。 */
 function historyItemToExecution(item: HistoryItem, previous: ExecutionItem | undefined, requestId: string | undefined): ExecutionItem {
   switch (item.type) {
     case 'request': return requestItem(item.observation, previous, item.startedAt ?? null)
@@ -100,12 +100,11 @@ function historyItemToExecution(item: HistoryItem, previous: ExecutionItem | und
 }
 
 /**
- * 唯一的转换边界：一个 wire page 一次局部构建成 execution turns。
- * id→位置与当前 request 关联只存在于这次构建内：同 id 的条目就地替换
- * （request 的 start/end 合并、tool call/result 配对），逐项不再复制整段
- * items；结束时发布一次 ExecutionTurn，并在此接上助手终态归约
- * 与请求开始时间。字段映射复用单条转换，这里只保留位置与
- * 当前 request 的更新算法。
+ * 一个 wire page 一次性构建成 execution turns。id→位置与当前 request 的
+ * 关联只存在于这次构建内，同 id 的条目就地替换（request 合并 start/end，tool
+ * call 与 result 配对），逐项不复制整段 items。结束时发布一次 ExecutionTurn，
+ * 并结算助手终态与请求开始时间。字段映射复用单条转换，本函数只保留位置与当前
+ * request 的更新算法。
  */
 function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
   return page.turns.map(turn => {
@@ -114,7 +113,7 @@ function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
     let currentRequest: string | undefined
     for (const wire of turn.items) {
       if (wire.type === 'request') currentRequest = wire.observation.requestId
-      // 请求条目的身份就是其观测的 request id，其余条目自带 id。
+      // 请求条目的身份是其观测的 request id，其余条目自带 id。
       const id = wire.type === 'request' ? wire.observation.requestId : wire.id
       const position = positions.get(id)
       const previous = position === undefined ? undefined : items[position]
@@ -150,8 +149,8 @@ function settleRequests(turn: ExecutionTurn, runtime: SessionRuntime, active = f
 }
 
 /**
- * 把一个 session page 读成事实。新的尾部只在与其重叠时
- * 保留已加载的前缀；无重叠时该 page 自带 cursor，缺口因此可见。
+ * 把一个 session page 读成事实。新 page 的尾部与已加载内容重叠时保留原前缀，
+ * 不重叠时该 page 自带 cursor，未加载的缺口会暴露出来。
  */
 export function readExecution(source: SessionReadResult, previous: SessionView | null = null): SessionView {
   const first = source.history.turns[0]
@@ -197,7 +196,7 @@ function finishTurn(turn: ExecutionTurn, status: TurnStatus): ExecutionTurn {
     ? { ...item, status: status === 'interrupted' ? 'cancelled' : status === 'failed' ? 'error' : 'ok' } : item) })
 }
 
-/** delta 工作量以可见 items 为界，绝不取决于更早 delta 的数量。 */
+/** delta 的工作量只按可见 items 计算，与更早 delta 的数量无关。 */
 export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnvelope): ExecutionFacts {
   const id = eventTurnId(event)
   const index = facts.active.findIndex(turn => turn.id === id)

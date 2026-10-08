@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 //! 运行期控制输入在竞态和失败边界的持久化测试。
 //!
-//! GatedProvider 在模型边界固定运行中的窗口，以复现控制输入与失败的先后顺序。
+//! GatedProvider 在模型边界固定运行中的窗口，复现控制输入与失败的先后顺序。
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
@@ -245,9 +245,8 @@ fn a_failed_turn_leaves_only_the_explicitly_queued_input() {
     assert_eq!(users.iter().filter(|text| **text == "second accepted").count(), 1);
 }
 
-/// 失败 turn 的细节随 operation 终态落盘，历史重读直接带同一错误概念：
-/// 后续成功轮次、重新打开目录都不会让较早的失败原因消失，也不再依赖
-/// runtime 最近一次错误文本。
+/// 失败 turn 的细节随 operation 终态落盘，历史重读带同一份错误概念：后续成功轮次和
+/// 重新打开目录都不改写较早的失败原因，不依赖 runtime 最近一次的文本。
 #[test]
 fn a_failed_turn_keeps_its_detail_across_reload_and_a_later_success() {
     let fixture = SessionsFixture::new();

@@ -184,8 +184,8 @@ fn invalid_compaction_response_preserves_its_validation_source() {
         .and_then(run_compaction)
         .expect("failure terminal is persisted");
 
-    // 失败原因随同一份 operation 终态落盘：重新打开 JSONL 仍能定位这次压缩
-    // 为什么失败，而不是只看到一次 provider 请求与无原因 Failed。
+    // 失败原因随同一份 operation 终态落盘，重新打开 JSONL 仍能定位这次压缩为什么失败，
+    // 不用只看到一次 provider 请求和无原因的 Failed。
     let durable =
         SessionData::open(&sessions.join(singularity_agent::session::session_file_name(&thread_id)))
             .expect("reopen the session file")
@@ -243,7 +243,7 @@ fn ledger_of(sessions: &Path, thread_id: &str) -> Vec<singularity_agent::session
         .ledger_records()
 }
 
-/// 工具执行边界的中断测试：bash 进程产生部分流式输出后仍在运行，
-/// 此时触发中断，验证子进程树被正常终止、工具以模型可见失败闭合、
-/// operation 收敛为 interrupted，且未完成副作用绝不被自动重放，下一条输入可正常开启新轮次。
+/// 工具执行边界的中断测试：bash 进程产生部分流式输出后仍在运行时触发中断，核对子进程树
+/// 被终止、工具以模型可见的失败闭合、operation 收敛为 interrupted，未完成的副作用不会
+/// 自动重放，下一条输入可开启新轮次。
 mod turn_outcomes;

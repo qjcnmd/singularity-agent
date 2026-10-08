@@ -12,4 +12,4 @@
 
 执行仍只读取已保存的配置，每轮冻结模型快照；后续配置变更不会修改在途轮次。已保存的值使断网后仍可使用已配置模型；公共目录只临时加载，不常驻整个目录。字段归属使用协议定义的枚举，客户端字段列表由 Rust 生成。
 
-参考 [ZCode 桌面配置草稿](https://github.com/zai-org/ZCode/blob/29628c9acdb81b703bbd4080c207a0e7ce5e276e/packages/ui/src/settings/model-provider-section/useProviderModelDraft.ts)及 [配置投影与覆盖](https://github.com/zai-org/ZCode/blob/29628c9acdb81b703bbd4080c207a0e7ce5e276e/packages/ui/src/settings/model-provider-section/ProviderModelDraftState.ts)。采用统一表单、智能归属、字段覆盖和最终配置校验；Singularity 使用现有配置文件与 AppServer，不引入模板、规则表达式或独立远端发布系统。提供方目录和 models.dev 的资料在用户请求时获取。
+采用统一表单、智能归属、字段覆盖和最终配置校验；配置保存在现有配置文件与 AppServer 中，不引入模板、规则表达式或独立远端发布系统。提供方目录和 models.dev 的资料在用户请求时获取。

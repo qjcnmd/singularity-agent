@@ -19,8 +19,8 @@ interface Props {
   sessionId?: string
 }
 
-/// 投影为未变化的项复用同一 item 引用；这里把该引用稳定性接到渲染边界上，使
-/// 活动项的流式更新不再让整段历史 Markdown 重新渲染。展开等组件内状态不受影响。
+/// 投影为未变化的项复用同一 item 引用；把该引用稳定性接到渲染边界，活动项的
+/// 流式更新不会让整段历史 Markdown 重新渲染。展开等组件内状态不受影响。
 export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Props) {
   const isStep = stepKinds.has(item.kind)
   const hiddenLines = item.kind === 'user' ? Math.max(0, timelineBody(item).trimEnd().split('\n').length - previewLineCount) : 0

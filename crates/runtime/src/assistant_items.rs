@@ -1,7 +1,7 @@
 //! 把 Agent 事件投影成工作台条目，并管理条目的生命周期。
 //!
-//! assistant 的第一个增量会打开条目，工具条目复用持久结果的 ID；
-//! assistant 完成或丢弃事件闭合已打开条目，工具结果由 Agent 直接发布。
+//! assistant 的第一个增量打开条目，完成或丢弃事件闭合已打开的条目；工具条目复用持久
+//! 结果的 ID，工具结果由 Agent 直接发布。
 
 use singularity_agent::agent::{AgentDiagnostic, AgentEvent};
 use singularity_protocol::{HistoryItem, ItemRef, TurnEvent};
@@ -61,8 +61,8 @@ impl AssistantItemEvents {
                 }
             }
             AgentEvent::MessageFinished { message_id, items, failed } => {
-                // 完成事件里只有正文和思考（生产侧已按 ItemScope::Completion 物化过），
-                // 这里不必再筛一次它自己的产物。
+                // 完成事件只含正文和思考，生产侧已按 ItemScope::Completion 物化过，
+                // 投影里无需再筛。
                 for content in items {
                     let item = self.start_assistant_item(content.id().to_string());
                     self.finish_assistant_item(sink, &item.item_id, failed, Some(content));
@@ -126,7 +126,7 @@ impl AssistantItemEvents {
                 });
             }
             // ControlChanged 在 runner 的执行循环里就被截获并更新控制投影，
-            // 不会走到条目投影。
+            // 到不了条目投影。
             AgentEvent::ControlChanged => {}
         }
     }

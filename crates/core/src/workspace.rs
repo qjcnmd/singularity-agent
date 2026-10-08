@@ -1,8 +1,6 @@
-//! 本地 Workspace 的路径身份。
-//!
-//! 供文件系统调用的原生路径、给用户看的字符串、以及用于判等的比较键，都在这里一次性生成。
-//! Workspace 登记、Session 的 cwd 与项目指令加载共用这一份身份；它只表示路径，不代表 Agent
-//! 的权限边界。
+//! 本地 Workspace 的路径身份：供文件系统调用的原生路径、给用户看的字符串和判等用的
+//! 比较键，都在这里一次性生成。Workspace 登记、Session 的 cwd 与项目指令加载共用这份
+//! 身份；它只表示路径，不代表 Agent 的权限边界。
 
 use std::path::{Path, PathBuf};
 
@@ -58,7 +56,7 @@ pub fn saved_directory_matches(left: &str, right: &str) -> Result<bool, String> 
     Ok(left == right)
 }
 
-/// 把一个已存在的目录收敛成唯一的 Workspace 路径身份。
+/// 把一个已存在的目录规范化成 Workspace 路径身份。
 pub fn canonicalize_workspace(path: impl AsRef<Path>) -> Result<CanonicalWorkspacePath, String> {
     let requested = path.as_ref();
     let native = std::fs::canonicalize(requested)

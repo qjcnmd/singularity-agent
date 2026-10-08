@@ -1,6 +1,6 @@
 # Singularity
 
-Singularity 是以 Rust 实现的本地 coding-agent harness。通过 Electron 桌面应用启动工作台；`--json` 提供同一 Agent 能力的单次评估入口。Workspace、Session、模型配置和执行状态由本机 Host 统一管理，React 渲染进程负责呈现与控制。
+Singularity 是以 Rust 实现的本地 coding-agent harness。日常工作通过 Electron 桌面工作台进行；`--json` 用同一套 Agent 能力提供单次评估入口。Workspace、Session、模型配置和执行状态由本机 Host 管理，React 渲染进程负责呈现与控制。
 
 当前发布目标为 Windows x86-64。
 

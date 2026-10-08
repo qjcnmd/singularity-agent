@@ -90,7 +90,7 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                     "responses_stream_failed",
                 ));
             }
-            // 其余事件不影响公开文本与终态，统一忽略。
+            // 其余事件不影响公开文本与终态，都忽略。
             _ => {}
         }
         Ok(())

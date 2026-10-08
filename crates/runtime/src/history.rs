@@ -1,10 +1,7 @@
-//! 把 JSONL 会话条目投影成公开历史。
-//!
-//! IndexedTurn::project 只复制用户能看到的 message/thinking/tool/settings/
-//! compaction 字段，绝不序列化原始 entry 或它的
-//! provider_reasoning_replay。index_turn_history 按 run operation 的起点划出每轮的
-//! 条目范围，并归约出每个回合的终态和手动停止事实；summarize_thread 从同一份索引
-//! 派生目录摘要；ThreadSnapshot 只投影请求页内的轮次，并按内容引用还原请求详情。
+//! 把 JSONL 会话条目投影成公开历史。IndexedTurn::project 只投影用户能看到的
+//! message/thinking/tool/settings/compaction 字段，不序列化原始 entry 或它的
+//! provider_reasoning_replay；索引、摘要和分页共用同一份回合事实，分页只展开请求页内的轮次，
+//! 按内容引用还原请求详情。
 
 use singularity_agent::{
     message::{AgentMessage, ContentBlock, ItemScope},
@@ -12,34 +9,31 @@ use singularity_agent::{
 };
 use singularity_protocol::{HistoryItem, SessionModelUsage, ThreadSummary, ThreadTurn, TurnStatus};
 
-/// thread/read 的按轮分组投影。
-///
-/// run operation 的 operation_started 划定轮次边界；同 turn id 的
-/// operation_finished 写进轮次状态而不是条目，message/compaction/settings 则投影成
-/// 轮内条目。第一个开始标记之前如果有已落盘的条目，它们构成一个不属于任何 turn 的
-/// 前导组（turnId/status 为 null）；一条条目都没有时不产生空组。
-///
-/// 没有终态的持久记录按 interrupted 投影；工作台的活动状态由执行器提供。
+/// thread/read 的按轮分组投影。operation_started 划定轮次边界，同 turn id 的
+/// operation_finished 写进轮次状态，不写成条目，message/compaction/settings 则投影成
+/// 轮内条目。第一个开始标记之前已落盘的条目构成前导组，不属于任何 turn（turnId/status
+/// 为 null），一条条目都没有时不产生空组。没有终态的持久记录按 interrupted 投影，
+/// 工作台的活动状态由执行器提供。
 pub(crate) struct IndexedTurn {
     pub turn_id: Option<String>,
     pub status: Option<TurnStatus>,
     /// 本轮终态记录里落盘的失败细节；非失败轮和没有可信终态的回合是 None。
     pub error: Option<singularity_protocol::TurnErrorDetail>,
-    /// 本轮以 interrupted 结束，而且是由用户停止触发的；没有终态记录的回合为 false。
+    /// 本轮以 interrupted 结束且由用户停止触发；没有终态记录的回合为 false。
     pub manually_stopped: bool,
     pub entries: std::ops::Range<usize>,
 }
 
 impl IndexedTurn {
     /// 本轮公开分页用的 cursor：`turn:{turnId}`，不属于任何 turn 的前导组是 `turn:leading`。
-    /// thread/read 的 before_turn 和返回的 next_cursor 都用这个值，而不是某个 item id。
+    /// thread/read 的 before_turn 和返回的 next_cursor 都用这个值，不用 item id。
     pub fn cursor(&self) -> String {
         self.turn_id.as_ref().map_or_else(|| "turn:leading".into(), |id| format!("turn:{id}"))
     }
 
-    /// 按轮遍历持久条目，直接写出最终的公开 items；工具 wire ID 的映射、同一个
-    /// request 多次观测的归并都在这里完成。请求详情在这一轮条目合并完之后才展开
-    /// 一次，避免先生成临时身份再回头改写。
+    /// 按轮遍历持久条目，直接写出最终的公开 items。工具 wire ID 的映射、同一个 request
+    /// 多次观测的归并都在这一次遍历里完成；请求详情等本轮条目合并完才展开一次，避免先生成
+    /// 临时身份再回头改写。
     pub fn project(&self, session: &SessionData) -> ThreadTurn {
         let mut items = Vec::new();
         let mut started_at = None;
@@ -165,8 +159,7 @@ impl IndexedTurn {
     }
 }
 
-/// 这里只索引轮次的条目范围、终态、失败细节和手动停止事实；公开正文和请求详情
-/// 等到请求分页时才构建。
+/// 只索引轮次的条目范围、终态、失败细节和手动停止事实；公开正文和请求详情等分页时才构建。
 pub(crate) fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
     let mut turns: Vec<IndexedTurn> = Vec::new();
     for (position, entry) in entries.iter().enumerate() {
@@ -228,7 +221,7 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
 const MAX_SESSION_TITLE_CHARS: usize = 8;
 
 /// 默认标题：把用户消息正文里的连续空白压成一个空格，再截取前 MAX_SESSION_TITLE_CHARS
-/// 个字符；逐块借用正文，不把整段文本复制出来，没有内容时是 None。
+/// 个字符；逐块借用正文，不复制整段文本，没有内容时是 None。
 fn default_title(content: &[ContentBlock]) -> Option<String> {
     let mut title = String::new();
     let mut remaining = MAX_SESSION_TITLE_CHARS;
@@ -255,12 +248,12 @@ fn default_title(content: &[ContentBlock]) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-/// 整份账本累计的模型用量，供工作台展示成本和速度。每次 attempt 只有一条终态观测
-/// 可以带用量，开始观测没有用量；重试、后续轮次和摘要请求各自计入合计。
+/// 整份账本累计的模型用量，供工作台展示成本和速度。每次 attempt 只有一条终态观测能带
+/// 用量，开始观测没有用量；重试、后续轮次和摘要请求各自计入合计。
 ///
 /// 与 turn 级 usage 的差异在范围和字段，不是两套重试口径：turn 的 RequestAccounting 只累计
-/// 本轮请求（含本轮的重试），并且带总数和思考 token；本视图跨轮次累计输入、输出和耗时。
-/// TTFT 只计实测样本；消费只计上报了 usage 的请求，没有消费记录的请求不影响缓存完整性。
+/// 本轮请求（含本轮的重试）并带总数和思考 token，本视图跨轮次累计输入、输出和耗时。TTFT
+/// 只计实测样本；消费只计上报了 usage 的请求，缺消费记录的请求不影响缓存完整性。
 fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
     let mut usage = SessionModelUsage {
         cache_usage_complete: true,

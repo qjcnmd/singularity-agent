@@ -9,7 +9,7 @@ mkdirSync(join(output, 'workspace'), { recursive: true })
 let app = await launch()
 let directoryRequested
 const requested = new Promise(resolve => { directoryRequested = resolve })
-// A slow read-only provider query must not delay accepted task cancellation on exit.
+// 慢的只读提供方查询不得拖延退出时已接受的任务取消。
 const directory = createServer(() => directoryRequested())
 await new Promise(resolve => directory.listen(0, '127.0.0.1', resolve))
 try {

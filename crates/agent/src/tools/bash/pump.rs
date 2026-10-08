@@ -15,9 +15,9 @@ const PIPE_BUFFER_BYTES: usize = 64 * 1024;
 /// pump 有界读的等待切片：没有数据且还没 EOF 时，按这个周期醒来检查停止标志。
 pub(super) const OUTPUT_PIPE_READ_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// 有界地等待管道变为可读。Windows 上不能靠 WaitForSingleObject：匿名管道句柄
-/// 不是可靠的可等待对象，句柄不可等待时调用会直接失败，pump 就永远等不到数据。
-/// 这里改用 PeekNamedPipe，非破坏性地查询待读字节数和是否已断开。
+/// 有界地等待管道变为可读。Windows 上不能靠 WaitForSingleObject：匿名管道句柄不是
+/// 可靠的可等待对象，句柄不可等待时调用会直接失败，pump 就永远等不到数据。这里改用
+/// PeekNamedPipe，非破坏性地查询待读字节数和是否已断开。
 #[allow(unsafe_code)] // Windows 管道可读性经 PeekNamedPipe 查询，与平台的底层能力一致。
 fn wait_pipe_readable(handle: HANDLE, timeout: Duration) -> io::Result<bool> {
     use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA, GetLastError};
@@ -48,10 +48,10 @@ fn wait_pipe_readable(handle: HANDLE, timeout: Duration) -> io::Result<bool> {
 
 /// 从管道读取字节流，过滤控制字符，再按块发到通道。
 ///
-/// 读取器自己就持有管道身份：可读性查询用的句柄在函数内取得，调用方不必再把
-/// 同一个管道拆成「读取器 + 裸句柄」两项。每次读取前都有界等待管道可读；stop
-/// 置位后线程会在下一个等待切片内收敛，所以即使后台进程一直握着管道写端，
-/// 这个线程也一定会结束，不会无限阻塞。
+/// 读取器自己就持有管道身份：可读性查询用的句柄在函数内取得，调用方不必再把同一个
+/// 管道拆成「读取器 + 裸句柄」两项。每次读取前都有界等待管道可读；stop 置位后线程
+/// 在下一个等待切片内退出，即使后台进程一直握着管道写端，这个线程也一定会结束，
+/// 不会无限阻塞。
 pub(super) fn pump_output(
     mut reader: impl Read + Send + AsRawHandle + 'static,
     sender: mpsc::SyncSender<io::Result<String>>,
@@ -120,7 +120,7 @@ impl Utf8Decoder {
                 Err(error) => {
                     let valid = error.valid_up_to();
                     if valid > 0 {
-                        // 不变量：from_utf8 保证 valid_up_to 之前的前缀一定合法（std 文档如此承诺）。
+                        // from_utf8 保证 valid_up_to 之前的前缀合法（std 文档的承诺）。
                         let text = std::str::from_utf8(&self.pending[consumed..consumed + valid])
                             .expect("valid_up_to must describe valid UTF-8");
                         push_visible(&mut output, text);

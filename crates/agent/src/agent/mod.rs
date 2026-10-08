@@ -3,9 +3,9 @@
 //! 每轮组装请求、调用 provider 并执行工具；模型准备结束时，原子地取走停止窗口内
 //! 新到的转向输入或关闭窗口，决定继续还是完成。
 //!
-//! 上下文压缩有两个触发点：发送前按会话上下文估价与本轮实测校正主动压缩；
-//! provider 明确返回 ContextLengthExceeded 时强制压缩后重发。
-//! 重发机会每个轮步只有一次，重发失败直接报告该次请求的原因。
+//! 上下文压缩有两个触发点：发送前按会话上下文估价与本轮实测校正主动压缩；provider
+//! 明确返回 ContextLengthExceeded 时强制压缩后重发。重发机会每个轮步只有一次，重发
+//! 失败直接报告该次请求的原因。
 //!
 //! 模型请求观测、消息与工具结果都经 SessionManager 追加到同一份会话日志，工具结果落盘后
 //! 才发布完成事件。历史中缺失的工具结果只在模型输入投影为结果未知，不改写执行事实。
@@ -89,7 +89,7 @@ pub struct AgentOutcome {
 /// Agent：持有本次执行需要的会话写者、operation 范围、压缩配置、工具注册表快照与模型提供方。
 pub struct Agent {
     /// 共享的会话写者：turn 执行、请求观测与工具结果追加都走同一个 SessionManager，
-    /// 各自短暂加锁串行追加（lock_writer），绝不跨 provider 调用或工具执行持锁。
+    /// 各自短暂加锁、串行追加（lock_writer），不跨 provider 调用或工具执行持锁。
     session: SessionWriter,
     registry: ToolRegistrySnapshot,
     questions: Option<Arc<UserQuestions>>,
@@ -152,9 +152,8 @@ impl Agent {
     /// 跑完一个完整的 Agent 循环：把输入持久化为 user 消息，循环处理工具调用，
     /// 运行期间注入的转向输入在后续轮次生效，直到模型停下来。
     ///
-    /// 取消时返回 terminal_reason=Aborted（取消不算错误）；已经生成的内容以会话内容
-    /// 和完成事件为准，不由返回值重复携带。
-    /// 生命周期所有者在返回后关闭输入箱。
+    /// 取消时返回 terminal_reason=Aborted（取消不算错误）；已生成的内容以会话内容和
+    /// 完成事件为准，不由返回值重复携带。生命周期所有者在返回后关闭输入箱。
     pub async fn run(
         &mut self,
         input: &ControlRequest,

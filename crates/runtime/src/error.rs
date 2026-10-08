@@ -1,8 +1,7 @@
 //! Turn 的失败分类与运行错误。
 //!
-//! 失败的分类体系（cause 和它在 wire 上的词形）由 protocol 单点定义，runtime 直接
-//! 复用：cause 说明失败来自哪里，message 保留真实原因文本（认证材料不进错误文本）。
-//! 本模块只负责一件事：把 model 的具体失败类型归入对应的 provider cause。
+//! cause 和它在 wire 上的取值由 protocol 定义，runtime 直接复用。本模块把 model 的具体
+//! 失败类型归入对应的 provider cause；message 保留真实原因文本，认证材料不进错误文本。
 
 use singularity_model::ModelErrorKind;
 use singularity_protocol::TurnErrorDetail;
@@ -24,8 +23,8 @@ pub(crate) fn provider_turn_cause(kind: ModelErrorKind) -> TurnFailureCause {
     }
 }
 
-/// 执行器未提交可信终态的失败。普通 Agent 错误随 TurnOutcome 返回；
-/// 准备、执行期致命故障和终态落盘失败在这里分别表达。
+/// 执行器未提交可信终态时的错误。普通 Agent 错误随 TurnOutcome 返回，
+/// 准备、执行期致命故障和终态落盘失败在本枚举中分别表达。
 #[derive(Debug, Error)]
 pub enum TurnRunError {
     #[error("{0}")]

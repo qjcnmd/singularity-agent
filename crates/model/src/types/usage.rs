@@ -8,13 +8,13 @@ pub struct ModelUsage {
     pub cached_input_tokens: Option<u64>,
     pub reasoning_tokens: u64,
     /// 输入与输出计数是否都有效上报：单次解析要求两者都有，聚合时任一为真即为真。原始 usage
-    /// 对象在、但缺分项时为 false；各计数仍按「未知」表示，不把缺失当成零消费或其它可以算钱的数字。
+    /// 对象在、但缺分项时为 false；各计数仍按「未知」处理，缺失不当成零。
     pub usage_present: bool,
 }
 
 impl ModelUsage {
-    /// 累加已上报用量，缓存计数保留“未知”与零的区别。传入的已是协议解析后的 usage，总数在那里
-    /// 就按「显式值优先、缺失时用已知的输入输出补出」定好，聚合方和消费方都不再推算。
+    /// 累加已上报用量，缓存计数保留「未知」与零的区别。传入的 usage 已经过协议解析，总数按
+    /// 「显式值优先、缺失时用输入输出补出」定好，聚合方和消费方都不再推算。
     pub fn merge(&mut self, other: &ModelUsage) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);

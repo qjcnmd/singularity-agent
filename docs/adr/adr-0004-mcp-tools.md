@@ -2,7 +2,7 @@
 
 日期：2026-10-02。状态：已采用。
 
-用户在设置中管理 MCP 服务器及开关，工作台与 CLI 使用同一工具能力。采用官方 Rust `rmcp` SDK 的 stdio 和 Streamable HTTP 传输；本地配置命令、参数、工作目录和环境变量，远程配置地址与请求头。参考 [Claude Code 配置](https://code.claude.com/docs/en/mcp)、[Codex 配置](https://developers.openai.com/codex/mcp)及 [OpenCode 配置与开关](https://opencode.ai/docs/mcp-servers/)，采用独立服务器配置、开关、连接检查与工具发现。当前使用范围为工具调用和请求头认证。
+用户在设置中管理 MCP 服务器及开关，工作台与 CLI 使用同一工具能力。采用官方 Rust `rmcp` SDK 的 stdio 和 Streamable HTTP 传输；本地配置命令、参数、工作目录和环境变量，远程配置地址与请求头。每个服务器独立配置、独立开关，连接检查与工具发现按服务器进行。当前使用范围为工具调用和请求头认证。
 
 用户级 `mcp.json` 与 MCP 连接归 `McpManager` 所有，由应用装配并共享给设置与执行器。连接按项目 cwd 复用，保障服务器工作目录与 roots 对应任务项目；工具结果进入 Agent 的现有派发、取消、会话写入、图片快照和事件流程。stdio 通过 Windows Job Object 管理进程树，正常退出先结算任务，再等待 SDK 关闭传输。
 

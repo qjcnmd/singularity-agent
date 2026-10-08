@@ -29,8 +29,8 @@ pub struct ThreadSummary {
     /// 最近一次被中断的 run，在账本里有明确的用户取消记录。
     pub manually_stopped: bool,
     pub turn_count: usize,
-    /// 整份账本的累计模型用量。它只在生成快照时更新，运行中回合的增量由调用方
-    /// 从活动事件里另算（读盘的冻结窗口保证两者不重叠），所以这里不是实时值。
+    /// 整份账本的累计模型用量。它只在生成快照时更新，运行中回合的增量要调用方从活动
+    /// 事件里另算（读盘的冻结窗口保证两者不重叠），因此不是实时值。
     pub usage: SessionModelUsage,
 }
 
@@ -43,7 +43,7 @@ pub struct ThreadReadPage {
     pub next_cursor: Option<String>,
 }
 
-/// 会话中唯一的待发送输入；身份用于取回编辑、删除和发送。
+/// 会话中待发送的输入，同一时刻只有一条；身份用于取回编辑、删除和发送。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -94,8 +94,8 @@ pub struct ActiveCompactionSnapshot {
     pub started_at: String,
 }
 
-/// 产生了终态反馈的操作：普通回合，或一次独立的压缩。界面按来源决定反馈放在
-/// 哪里——回合终态描述任务本身，压缩终态只描述那次压缩，不改变任务状态。
+/// 产生了终态反馈的操作：普通回合，或一次独立的压缩。界面按来源决定反馈放在哪里。
+/// 回合终态描述任务本身，压缩终态只描述那次压缩，不改变任务状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -138,7 +138,7 @@ pub struct SessionRuntime {
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfigurationInput {
     pub model_id: String,
-    /// 智能配置管理的字段；None 表示未记录归属，编辑器仅补齐空字段。空列表为全手动。
+    /// 智能配置管理的字段。None 表示未记录归属，编辑器只补空字段；空列表表示全部手动管理。
     pub automatic_fields: Option<Vec<ModelConfigurationField>>,
     pub display_name: Option<String>,
     pub api_protocol: Option<String>,

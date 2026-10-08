@@ -199,10 +199,10 @@
 }
 .queue-actions { display: flex; }
 /* 关闭态：一个小圆形按钮。打开态：一个圆角面板。
-   宽/高/border-radius 参与动画；打开态使用比关闭
+   宽/高/border-radius 参与动画；打开态用比关闭态
    更弹性的缓动。
-   composer 工具栏是此控件的唯一表面，因此其占位
-   在此声明一次，而不是由作用域覆盖重复声明。 */
+   composer 工具栏是这个控件唯一的出现位置，占位在
+   此声明一次，不由作用域覆盖重复声明。 */
 .t-morph {
   --tools-menu-height: 220px;
   --tools-menu-width: 200px;
@@ -211,7 +211,7 @@
   height: 34px;
   border-radius: var(--morph-r-closed);
   overflow: clip;
-  /* 从触发按钮所在的左下角长出，缩放与滑入锚定这里而非元素中心。 */
+  /* 从触发按钮所在的左下角长出，缩放与滑入锚定触发按钮，不锚定元素中心。 */
   transform-origin: bottom left;
   transition:
     width var(--morph-close-dur) var(--morph-close-ease),

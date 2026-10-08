@@ -42,7 +42,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             return error_result(format!("failed to spawn shell {shell}: {error}"));
         }
     };
-    // 不变量：job_object::spawn_in_job 已把 stdout/stderr 配成管道，所以 take 一定是 Some。
+    // spawn_in_job 已把 stdout/stderr 配成管道，take 一定拿到 Some。
     let stdout = managed.child.stdout.take().expect("bash stdout is piped");
     let stderr = managed.child.stderr.take().expect("bash stderr is piped");
     let stop = Arc::new(AtomicBool::new(false));

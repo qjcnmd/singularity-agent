@@ -208,7 +208,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   min-height: 0;
   overflow-y: auto;
 }
-/* “显示更多”沿用 quiet-button 外观，只把文本缩进到任务标题左侧。 */
+/* “显示更多”用 quiet-button 的外观，只把文本缩进到任务标题左侧。 */
 .session-list .quiet-button { padding: 6px 10px 6px 32px; text-align: left; }
 .session-row {
   position: relative;

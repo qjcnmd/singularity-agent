@@ -12,9 +12,9 @@ use singularity_protocol::{
 
 use super::*;
 
-/// 一次轮次的不可变容量快照：在每轮开始时冻结「请求前压缩」和「输出预算」需要的两项容量；
-/// 改设置只产生后续轮次的新快照，不会改写正在用的快照。这里只放真正被消费的容量数字，
-/// 模型身份和协议由 SelectedModel、OpenAiProviderConfig 和 ProviderAttemptEvent 承载。
+/// 一次轮次的不可变容量快照：每轮开始时冻结「请求前压缩」和「输出预算」要用的两项容量，
+/// 改设置只产生后续轮次的新快照，不改写正在用的快照。模型身份和协议由 SelectedModel、
+/// OpenAiProviderConfig 和 ProviderAttemptEvent 承载。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelConfigurationSnapshot {
     pub max_context_tokens: u32,
@@ -125,7 +125,7 @@ impl ModelConfigManager {
                 |mut error| {
                     error.message =
                         format!("提供方配置已删除，但 API 密钥删除失败；请重试删除：{}", error.message);
-                    // 与保存失败一样标成半成品状态：界面据此提示重试这一步，而不是笼统的配置错误。
+                    // 与保存失败一样标成半成品状态：界面据此提示重试这一步，不提示笼统的配置错误。
                     error.with_code(crate::CREDENTIAL_DELETE_FAILED_CODE)
                 },
             )?;
@@ -198,7 +198,7 @@ impl ModelConfigManager {
         api_key: Option<&str>,
     ) -> Result<(), ProviderError> {
         validate_identifier(&input.provider_id, "provider id")?;
-        // 密钥是本次请求的纯输入，所以在任何文件读写之前先校验：否则非法密钥会先写下
+        // 密钥是本次请求的纯输入，在任何文件读写之前先校验：非法密钥会先写下
         // config.json，再以「配置已保存、密钥保存失败」结束，白白留下持久化改动。
         if let Some(key) = api_key {
             validate_provider_value(key, "api_key")?;

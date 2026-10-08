@@ -47,7 +47,7 @@ pub struct DesktopSetup {
     pub runner: Arc<TurnRunner>,
     pub catalog: ThreadCatalog,
     pub workspaces: WorkspaceStore,
-    /// 磁盘模型配置的唯一入口；runner 和设置页面共用这一个实例。
+    /// 磁盘模型配置的入口；runner 和设置页面共用这一个实例。
     pub models: Arc<ModelConfigManager>,
     pub mcp: Arc<singularity_mcp::McpManager>,
     /// 应用主目录：技能发现这类宿主查询和执行链读的是同一个事实。

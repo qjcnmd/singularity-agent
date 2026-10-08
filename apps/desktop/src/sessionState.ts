@@ -8,10 +8,10 @@ export function isBlankSession(session: ThreadSummary): boolean {
 }
 
 /**
- * 侧栏任务状态的唯一派生：活动相位优先；空闲时状态只由**回合**终态决定。
+ * 侧栏任务状态的派生规则：活动相位优先，空闲时只由**回合**终态决定。
  *
- * 独立压缩的终态属于那次压缩：它在对话区自成一行，不改变任务状态，因此压缩
- * 失败或中断不会把已经完成的任务标成失败。
+ * 独立压缩的终态属于那次压缩。它在对话区自成一行，不改任务状态，压缩失败或
+ * 中断不会把已完成的任务标成失败。
  */
 export function sessionState(session: ThreadSummary, live: LiveSessionState | undefined) {
   if (live !== undefined && live.phase !== 'idle') {

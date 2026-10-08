@@ -19,7 +19,7 @@ pub(super) fn bash_path() -> Result<String, String> {
 /// 判断候选路径是不是 System32 下的 bash 启动器存根。
 ///
 /// System32 下的 bash.exe 是 WSL 的启动器存根：路径语义和进程模型与 Unix shell 完全
-/// 不同，在没有安装发行版或服务没运行时还会静默无输出，所以绝不能当作执行后端。
+/// 不同，在没有安装发行版或服务没运行时还会静默无输出，不能当作执行后端。
 ///
 /// Windows 路径不区分大小写，而 `Path` 的组件比较是逐字节的，所以这里显式折叠 ASCII
 /// 大小写：PATH 里的 `C:\windows\system32` 必须和 `C:\Windows\System32` 一样被排除。

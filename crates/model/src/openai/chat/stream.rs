@@ -189,7 +189,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
                 .join("")
         };
         // 未识别的 finish_reason 不能当成「没有停止原因」：宿主无法判断这是正常完成、截断
-        // 还是出错，所以一律按协议失败结束，绝不走进正常完成或工具执行路径。
+        // 还是出错，所以按协议失败结束，不走进正常完成或工具执行路径。
         let stop_reason = match finish_reason.as_str() {
             "length" => ModelStopReason::Length,
             "stop" | "tool_calls" | "function_call" => ModelStopReason::Stop,
@@ -282,7 +282,7 @@ impl<'a> ChatSseDecoder<'a> {
             return Err(provider_chat_stream_malformed_error("tool_function_field_invalid"));
         }
         // 工具分片归到哪个调用必须没有歧义：省略 index 的单个调用按兼容保留，非法
-        // 索引直接拒绝，绝不把不同调用拼进同一个聚合槽。
+        // 索引直接拒绝，不把不同调用拼进同一个聚合槽。
         let index = stream_index(call.get("index"), "tool_call_index_invalid")?;
         let entry = self.tool_calls.entry(index).or_default();
         if let Some(id) = call.get("id").and_then(Value::as_str)

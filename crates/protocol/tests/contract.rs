@@ -1,10 +1,7 @@
-//! 协议 wire 合同 golden：逐事件 envelope/params 形状与终态 summary 形状。
-//! 这些是 --json、桌面工作台与外部评估器共同消费的形状合同；方法名、键名、
-//! 嵌套形状、可选字段出现/省略的任一漂移都会先在此显形。
-//!
-//! 失败词表（stage/cause）与 attempt 状态词形不在这里逐条重抄：它们由
-//! serde snake_case 单源投影（Display 与 wire 词形结构上不可能分叉），
-//! 消费路径由下方 attempt golden 覆盖。
+//! 协议 wire 合同 golden：逐事件 envelope/params 形状与终态 summary 形状，由 --json、
+//! 桌面工作台与外部评估器共同消费；方法名、键名、嵌套形状和可选字段出现/省略的漂移
+//! 都会在此显形。失败词表（stage/cause）与 attempt 状态词形不在此逐条重抄，Display 与
+//! wire 词形同出 serde snake_case，不会分叉，消费路径由下方 attempt golden 覆盖。
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 

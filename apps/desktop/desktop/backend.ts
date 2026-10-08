@@ -3,7 +3,7 @@ import { createInterface } from 'node:readline'
 import { EventEmitter } from 'node:events'
 import type { RpcResponse, StreamEnvelope } from '../src/protocol.generated.js'
 
-/** Owns one Rust process. Payloads remain singularity_protocol values. */
+/** 持有一个 Rust 进程，载荷始终是 singularity_protocol 的值。 */
 export class Backend extends EventEmitter {
   readonly child
   readonly ready: Promise<StreamEnvelope>
@@ -80,7 +80,7 @@ export class Backend extends EventEmitter {
   async stop(): Promise<void> {
     this.stopping = true
     this.child.stdin.end()
-    // EOF cancels Rust work and lets it persist terminal facts. A stuck provider must not prevent exit.
+    // EOF 会取消 Rust 侧的工作，让它把终态事实落盘。provider 卡住不能挡住退出。
     const timer = setTimeout(() => this.child.kill(), 10_000)
     await this.exited
     clearTimeout(timer)

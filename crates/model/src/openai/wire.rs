@@ -22,7 +22,7 @@ impl ThinkingWireFormat {
     /// 没有声明 thinking_wire_format 时用的词形。
     pub(crate) const DEFAULT: Self = Self::ReasoningEffort;
 
-    /// 配置解析、错误提示与目录发现共用的词形文本，也是词形的唯一定义处。
+    /// 配置解析、错误提示与目录发现共用的词形文本，词形只在这一处定义。
     pub(crate) fn wire_name(self) -> &'static str {
         match self {
             Self::ThinkingType => "thinking_type",
@@ -41,8 +41,7 @@ impl ThinkingWireFormat {
 }
 
 /// Chat Completions 请求里输出上限所用的 wire 字段名，也是配置没写时的默认值。
-/// 配置里写什么就发什么（DeepSeek、dashscope 用 `max_tokens`，OpenAI 官方推理模型用
-/// `max_completion_tokens`），不按模型名或提供方去猜。
+/// 配置里写什么就发什么，两个合法词形都有 provider 在用；不按模型名或提供方去猜。
 pub(crate) const DEFAULT_CHAT_OUTPUT_TOKENS_FIELD: &str = "max_tokens";
 
 /// 输入的规范形状：去掉首尾空白与结尾斜杠；不改变地址语义。

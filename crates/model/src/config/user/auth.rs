@@ -1,7 +1,7 @@
 //! 用户鉴权文件与它的安全保护（auth.json 只读访问）。
 //!
-//! 凭据目录里只有 auth.json 这一个文件，访问保护依靠 Windows 用户目录自身的 ACL；导入一律
-//! 先写临时文件、再在同卷内原子改名，运行时不扫描其他凭据文件。
+//! 凭据目录里只有 auth.json 这一个文件，访问保护依靠 Windows 用户目录自身的 ACL。写入先落
+//! 临时文件、再在同卷内原子改名，运行时不扫描其他凭据文件。
 
 use std::collections::BTreeMap;
 use std::path::Path;

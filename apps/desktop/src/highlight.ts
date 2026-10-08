@@ -5,8 +5,8 @@
 import { createElement, useEffect, useMemo, useState, type CSSProperties } from 'react'
 
 /**
- * 支持高亮的语言。静态 import 说明符是打包分块边界，语言名与加载器必须成对出现，
- * 因此这里用一个对象同时给出两者：语言清单由对象键派生，不再另写一份名单。
+ * 支持高亮的语言。静态 import 说明符是打包分块边界，语言名与加载器只能成对出现，
+ * 改用一个对象同时给出两者：语言清单由对象键派生，不需要另写一份名单。
  */
 const LANGUAGE_LOADERS = {
   javascript: () => import('@shikijs/langs/javascript'),
@@ -83,8 +83,8 @@ function tokenize(highlighter: Highlighter, code: string, lang: LanguageId): Hig
 /** 单行高亮 token 的库类型。 */
 type CodeLine = HighlightedLines[number]
 
-/** 只把异步资源就绪存入状态；token 由当前代码派生，不再经 Promise 写回状态。
- *  流式代码变化因此不会形成高亮完成 → setState → 再次提交的更新链。 */
+/** 状态里只存异步资源是否就绪；token 由当前代码派生，不经 Promise 写回。
+ *  流式代码变化不会形成高亮完成 → setState → 再次提交的更新链。 */
 export function useCodeTokens(code: string, language: string) {
   const lang = languageIdFor(language)
   const [loaded, setLoaded] = useState<{ highlighter: Highlighter; language: LanguageId } | null>(null)

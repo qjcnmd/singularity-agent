@@ -15,8 +15,7 @@ pub enum ModelStopReason {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelTurnResponse {
     pub assistant_message: ModelMessage,
-    /// 提供方明确返回的、可以展示的思考文本或推理摘要；与不透明的续接数据、以及本轮是否
-    /// 发生工具调用都无关。
+    /// 提供方明确返回、可以展示的思考文本或推理摘要，与不透明的续接数据和本轮是否发生工具调用无关。
     pub thinking: String,
     pub usage: ModelUsage,
     pub stop_reason: ModelStopReason,

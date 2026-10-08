@@ -535,7 +535,7 @@ flowchart TB
 
 发现元数据与执行配置分离：提供方响应优先，公共目录按实际端点与精确模型 ID 补剩余空缺。思考开关、effort 档位与线上字段分别表达；协议在发现请求中明确传入。已保存取值是执行事实，导入只更新智能管理字段，用户覆盖保持不变。元数据解析与补全集中在 `model_metadata.rs`；详见 [模型元数据决策](adr/adr-0002-model-metadata.md)。
 
-`base_url` 的含义只由模型层一处解释：保存与查询先规范输入形状（去首尾空白与结尾斜杠，不改写你写明的地址），再剥掉写明的已知端点得到 API 根——根逐字使用，中间层不替消费者补版本段——Chat、Responses 与 `/models` 三种地址都由这一个根派生；设置表单不承担地址清理。
+`base_url` 的含义只由模型层一处解释：保存与查询先规范输入形状（去首尾空白与结尾斜杠，不改写你写明的地址），再剥掉写明的已知端点得到 API 根。根逐字使用，中间层不补版本段；Chat、Responses 与 `/models` 三种地址都由这个根拼出。设置表单不承担地址清理。
 
 新任务在存在默认模型时保存其 selector，无默认时等待用户选择。配置编辑清空失效的默认选择。改名和修改模型设置通过 Conversation 共用写者选择规则，运行时复用当前写者，空闲时短开写者，失败保持原选择；相同选择不重复写入，执行开始不回扫设置历史。每轮捕获自己的模型快照，活动轮不随设置变化。表单地址、凭据、提供方或协议变更后丢弃旧发现结果；公共目录请求不携带用户地址或凭据。发现失败保留认证、网络、限流／过载、请求和响应格式类别：配置与认证问题引导修正设置，暂时不可用或无效目录允许稍后重试或手动添加。缺失元数据不伪造成能力，thinking 开关或 budget 不等同于 effort 档位。
 
@@ -861,7 +861,7 @@ flowchart TB
     Runtime --> Summary["JSONL 事件 + summary"]
 ```
 
-JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通道不再能确认行边界，因此不再追加任何行（含 summary），执行事实照常持久化；输出故障与准备／任务结果合并成唯一的进程结果，两者都保留并以失败退出。外部强制终止或异常进程退出不保证 summary。评估器属于独立仓库，本项目只维护无交互执行接口。
+JSONL 准备失败也输出 failed summary。stdout 写入失败后，该通道不再能确认行边界，就不再追加任何行（含 summary），执行事实照常持久化；输出故障和准备或任务结果都保留，进程以失败退出。外部强制终止或异常进程退出不保证 summary。评估器属于独立仓库，本项目只维护无交互执行接口。
 
 源码：[前端 build](../apps/desktop/package.json) · [桌面主进程](../apps/desktop/desktop/main.ts) · [打包配置](../apps/desktop/electron-builder.json) · [JSONL 输出](../crates/app/src/jsonl_mode.rs) · [发布 workflow](../.github/workflows/release.yml) · [打包脚本](../.github/scripts/package-release.ps1)。构建、检查与发布命令见[开发指南](development.md)。
 

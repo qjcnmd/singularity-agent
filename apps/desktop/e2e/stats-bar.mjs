@@ -103,7 +103,7 @@ try {
   await page.screenshot({ path: join(output, 'stats-bar.png') })
   let scenario
   server = createServer(async (request, response) => {
-    for await (const _ of request) { /* Drain the request before serving the controlled stream. */ }
+    for await (const _ of request) { /* 先读掉请求体，再发受控流。 */ }
     const { protocol, delay, streamed, usage } = scenario
     response.writeHead(200, { 'Content-Type': 'text/event-stream' })
     const event = body => response.write(`data: ${JSON.stringify(body)}\n\n`)

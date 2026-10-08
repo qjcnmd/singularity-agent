@@ -1,7 +1,7 @@
 //! Agent 运行事件的出口：生命周期事件与脱敏后的诊断。
 //!
-//! 事件通过调用方传入的唯一回调 `&mut dyn FnMut(AgentEvent)` 流式送出；投递尽力而为，
-//! 消费方自己吸收失败，不影响轮次结果，不需要观察事件的调用方传空闭包。
+//! 事件通过调用方传入的 `&mut dyn FnMut(AgentEvent)` 回调流式送出。投递尽力而为，
+//! 消费方自己吸收失败，不影响轮次结果；不需要观察事件的调用方传空闭包。
 
 use serde_json::Value;
 use singularity_protocol::DiagnosticSeverity;
@@ -12,7 +12,7 @@ pub(crate) mod diagnostic_code {
     pub const PROVIDER_RETRY_SCHEDULED: &str = "provider_retry_scheduled";
 }
 
-/// 安全且不落盘的诊断。code 对消费方保持稳定；message 文本刻意不包含 provider 的原始 payload（这是脱敏边界）。
+/// 安全且不落盘的诊断。code 对消费方保持稳定；message 不含 provider 的原始 payload。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDiagnostic {
     pub severity: DiagnosticSeverity,

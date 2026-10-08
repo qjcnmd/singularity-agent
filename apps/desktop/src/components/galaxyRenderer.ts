@@ -51,7 +51,7 @@ const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 const rgba = (c: Rgb, a: number) =>
   `rgba(${Math.round(c[0])}, ${Math.round(c[1])}, ${Math.round(c[2])}, ${clamp01(a).toFixed(3)})`;
 
-/** 以固定逻辑尺寸绘制参考实现的 Thinking 外观，再由 CSS 缩放。 */
+/** 以固定逻辑尺寸绘制 Thinking 外观，再由 CSS 缩放。 */
 export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
   const { ctx, size, dpr } = createOrbCanvas(canvas, 'Galaxy')
   const cx = size / 2;
@@ -278,8 +278,8 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
     ctx.restore();
   };
 
-  // 三个旋转角度都是累计时间的线性函数：由 t 与固定速度/起始值一次推导，
-  // 不再各自维护一份同步累加的状态。levelS 是真实的平滑滤波状态，单独保留。
+  // 三个旋转角度都是累计时间的线性函数，由 t 与固定速度、起始值一次算出，
+  // 不需要各自维护一份同步累加的状态。levelS 是平滑滤波状态，单独保留。
   const render = (dt: number) => {
     t += dt;
     levelS += (0.24 + 0.2 * Math.abs(Math.sin(t * 2.4)) - levelS) * (1 - Math.exp(-8 * dt));

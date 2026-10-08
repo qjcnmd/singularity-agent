@@ -13,7 +13,7 @@ pub enum ProviderStreamEvent {
     ReasoningTextDelta { delta: String },
 }
 
-/// 一次真实 provider HTTP attempt 在安全运行时边界上产生的事件。
+/// 一次真实 provider HTTP attempt 产生的事件。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderAttemptEvent {
     /// 在发出 HTTP 请求之前立即发射。

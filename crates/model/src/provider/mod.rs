@@ -14,7 +14,7 @@ use std::pin::Pin;
 use tokio_util::sync::CancellationToken;
 
 /// 模型调用失败，或 attempt 记录提交不出去。
-/// 记录类错误保留它的 IO 原因，绝不进入 provider 的重试策略。
+/// 记录类错误保留它的 IO 原因，不进入 provider 的重试策略。
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderCallError {
     #[error(transparent)]

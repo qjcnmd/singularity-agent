@@ -1,10 +1,7 @@
-//! 执行事件的唯一事实源，以及它到 wire 格式的投影。
-//!
-//! TurnEvent 用 serde 的 method/params 标签序列化：事件声明本身就同时定义了方法名
-//! 和载荷。TurnEventEnvelope 只额外补上工作台的数据版本。
-//!
-//! Agent 内部的诊断 code 由 agent 的事件模块定义；runtime 的诊断 code 由
-//! diagnostic_code 定义。
+//! 执行事件的定义，以及它到 wire 格式的投影。
+//! TurnEvent 用 serde 的 method/params 标签序列化，方法名和载荷都由事件声明定义，
+//! TurnEventEnvelope 只补工作台的数据版本。诊断 code 中 agent 内部的由 agent 的事件
+//! 模块定义，runtime 的由 diagnostic_code 定义。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,9 +15,8 @@ pub mod diagnostic_code {
     pub const STORAGE_FATAL: &str = "storage_fatal";
 }
 
-/// 无字段枚举在 wire 上的词形只有这一处来源：serde 的 rename_all =
-/// "snake_case" 投影。Display 用它把同一个词形呈现到给人读的错误和诊断文本里，
-/// 不存在第二份手写的词形表。
+/// 无字段枚举的 wire 词形来自 serde 的 rename_all = "snake_case" 投影。Display 用它
+/// 把同一个词形呈现到给人读的错误和诊断文本里，不存在第二份手写的词形表。
 pub fn wire_word<T: Serialize>(value: T) -> String {
     serde_json::to_value(value)
         .expect("fieldless enum serializes")
@@ -61,8 +57,8 @@ pub enum TurnEvent {
     #[serde(rename = "turn/started")]
     TurnStarted { turn: Turn, started_at: String },
     /// 已经落盘的用户消息事实：初始输入和注入输入共用这同一条出口。
-    /// item 是该条目首个文本块的公开内容块身份，与历史投影用的是同一套派生规则，
-    /// 客户端不必自己拼接 id。
+    /// item 是该条目首个文本块的公开内容块 id，与历史投影的派生规则相同，
+    /// 客户端不用自己拼接。
     #[serde(rename = "turn/userMessage")]
     UserMessage {
         thread_id: String,
@@ -83,8 +79,8 @@ pub enum TurnEvent {
         item: ItemRef,
         delta: String,
     },
-    /// assistant 消息里思考块的事实；落盘之后按块实时发布。
-    /// 这是当前思考块的公开文本增量，与终态的思考块使用同一个 item 身份。
+    /// assistant 消息里思考块的事实，落盘后按块实时发布。这是当前思考块的公开文本
+    /// 增量，与终态的思考块使用同一个 item 身份。
     #[serde(rename = "item/agentThinking/delta")]
     AssistantThinkingDelta {
         thread_id: String,
@@ -92,19 +88,18 @@ pub enum TurnEvent {
         item: ItemRef,
         delta: String,
     },
-    /// 工具事实的静态定义：名称和参数只在 Start 发布一次，之后都按同一个 item
-    /// 身份更新。事件本身不会重复携带工具定义。
+    /// 工具名称和参数只在 Start 事件发布一次，之后按同一个 item 身份更新。
     #[serde(rename = "tool/execution/start")]
     ToolExecutionStart {
         thread_id: String,
         turn_id: String,
-        /// 与历史共享的公开 occurrence 身份，不是 provider 在 wire 上的调用 ID。
+        /// 与历史共享的公开 occurrence 身份；provider 的 wire 调用 ID 不在协议里。
         item: ItemRef,
         tool_name: String,
         args: Value,
         started_at: String,
     },
-    /// 累计的有界进度文本；是整体替换而不是追加，所以恢复快照和它的实时投影一致。
+    /// 累计的有界进度文本，每条整体替换；恢复快照与实时投影读到的内容一致。
     #[serde(rename = "tool/execution/update")]
     ToolExecutionUpdate {
         thread_id: String,
@@ -169,9 +164,8 @@ pub enum TurnEvent {
         code: String,
         message: String,
     },
-    /// 实时 attempt 事件与持久历史共享同一个 RequestObservation；事件自身只
-    /// 补充 turn 身份。诊断码只由
-    /// observation.diagnostic_code 承载，不在事件外层再重复一份。
+    /// 实时 attempt 事件与持久历史共享同一个 RequestObservation，事件自身只补 turn
+    /// 身份。诊断码只由 observation.diagnostic_code 承载，不在事件外层重复一份。
     #[serde(rename = "provider/attempt")]
     ProviderAttempt {
         observation: crate::RequestObservation,

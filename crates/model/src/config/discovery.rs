@@ -1,4 +1,4 @@
-//! 配置编辑器用的只读模型元数据。已保存的配置始终是权威来源。
+//! 配置编辑器用的只读模型元数据。补全只填缺失值，不覆盖已保存的配置。
 
 use std::collections::BTreeMap;
 
@@ -100,7 +100,7 @@ fn read_listing(body: &Value) -> Result<Vec<DiscoveredModel>, ProviderError> {
     };
     let mut models = BTreeMap::new();
     for (id, entry) in entries {
-        // 形状不对或 id 不合法的条目直接跳过，不让整次发现因此失败。
+        // 形状不对或 id 不合法的条目直接跳过，不让整次发现失败。
         if entry.is_object() && validate_model_id(id, "model id").is_ok() {
             models.entry(id.to_string()).or_insert_with(|| metadata(id, entry));
         }

@@ -1,10 +1,10 @@
-//! 确定性 Provider 替身：脚本化的 attempt 结果，绝不触网。
+//! 确定性 Provider 替身：脚本化的 attempt 结果，不触网。
 //!
 //! 每次 complete_stream 消费脚本中的下一个结果并发出 Started / Finished
 //! 观测。脚本耗尽时明确报错，让调用次数错误可被断言。替身不检查取消令牌，
 //! 也不执行真实协议响应校验；取消或失败结果由脚本显式提供。
 
-// 测试基础设施：Mutex 中毒意味着测试进程已不可继续，直接 panic 收敛。
+// 测试基础设施：Mutex 中毒意味着测试进程已不可继续，直接 panic。
 
 use std::collections::VecDeque;
 use std::sync::Mutex;

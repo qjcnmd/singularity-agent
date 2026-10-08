@@ -1,5 +1,5 @@
 //! 用户配置的持久化类型与读取；认证文件的读取由 `auth` 子模块维护。
-//! 配置和凭据的修改由 `ModelConfigManager` 统一协调。
+//! 配置和凭据的修改都收在 `ModelConfigManager`。
 pub(crate) mod auth;
 
 pub(crate) use auth::*;

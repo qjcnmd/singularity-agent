@@ -1,7 +1,7 @@
 /**
- * 展开/收起的时间常量，也是 disclosure 时序的唯一权威：CSS 的 disclosure
- * （见 `styles/tokens.css`）驱动面板高度，这里驱动仍需 JS 计算高度的少数地方。
- * 下面导出的四个自定义属性在启动时写入 documentElement，由 CSS 消费同名变量。
+ * 展开/收起的时间常量。CSS 的 disclosure（见 `styles/tokens.css`）驱动面板高度，
+ * 这里驱动仍需 JS 计算高度的少数地方。导出的四个自定义属性在启动时写入
+ * documentElement，由 CSS 消费同名变量。
  */
 const easeOut = [0.22, 1, 0.36, 1] as const
 const expand = { duration: 0.25, ease: easeOut } as const

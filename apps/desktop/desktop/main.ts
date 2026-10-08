@@ -8,7 +8,7 @@ import type { DirectoryPickResult, RpcResponse } from '../src/protocol.generated
 
 const entry = 'singularity://app/'
 const home = resolve(process.env.SINGULARITY_HOME || join(homedir(), '.singularity'))
-// Different data directories must not share Electron's Chromium profile lock or view state.
+// 不同数据目录不得共用 Electron 的 Chromium profile 锁和视图状态。
 app.setPath('userData', join(app.getPath('appData'), 'Singularity', createHash('sha256').update(home.toLowerCase()).digest('hex').slice(0, 16)))
 protocol.registerSchemesAsPrivileged([{ scheme: 'singularity', privileges: { standard: true, secure: true, supportFetchAPI: true } }])
 let window: BrowserWindow
@@ -44,7 +44,7 @@ async function start(): Promise<void> {
   })
   backend = new Backend(app.isPackaged ? join(process.resourcesPath, 'runtime', 'singularity.exe') : join(app.getAppPath(), 'desktop-runtime', 'singularity.exe'))
   backend.on('failure', (error: Error) => {
-    // Before a window exists, start() reports the rejected ready promise once.
+    // 窗口还没建好时，start() 只报告一次被拒绝的 ready promise。
     if (!window || window.isDestroyed()) return
     window.webContents.send('singularity:failure')
     void dialog.showMessageBox({ type: 'error', title: 'Singularity', message: '工作台后端已停止', detail: error.message, buttons: ['退出'] }).then(() => app.quit())
