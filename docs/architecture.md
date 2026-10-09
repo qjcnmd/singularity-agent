@@ -44,14 +44,12 @@ flowchart TB
     WB --> Config[("项目登记 / 模型配置 / 凭据")]
 ```
 
-窗口关闭隐藏到托盘，刷新只重建渲染进程状态，Rust 内的执行继续；托盘退出取消任务并关闭子进程。项目分组决定任务目录与导航归属；工具使用本机权限，Workspace 不构成文件访问沙箱。外部评估器通过 `--json` 使用同一执行层，自行负责超时、进程终止和判分。
-
 源码：[程序入口](../crates/app/src/main.rs) · [Host](../crates/app/src/desktop/transport.rs) · [AppServer](../crates/app/src/desktop/app_server.rs) · [共享执行层](../crates/runtime/src/lib.rs)。产品边界见[宪章](constitution.md)。
 
 <a id="modules"></a>
 ## 2. 源码依赖与模块职责
 
-下图只画 Rust crate 的直接生产依赖；箭头从使用方指向被使用方。测试使用的依赖另见各 crate 的 Cargo.toml。
+下图只画 Rust crate 的直接生产依赖；箭头从使用方指向被使用方。
 
 ```mermaid
 flowchart TB
@@ -228,7 +226,7 @@ flowchart LR
     Baseline["SessionReadResult.history<br/>稳定历史页"] --> Facts["execution.ts<br/>消息、请求、工具与用量事实"]
     Frames["TurnEventEnvelope<br/>当前执行链的实时帧"] --> Sync["sync.ts<br/>检查版本水位"]
     Sync --> Facts
-    Facts --> Timeline["buildTimeline<br/>正文布局与工具差异"]
+    Facts --> Timeline["buildTimeline<br/>正文与工具结果布局"]
     Facts --> Trace["buildTrajectory<br/>请求归组与提示词比较"]
     Facts --> Usage["contextOccupancy<br/>最近实测与冻结容量"]
     Timeline --> Render["组件渲染时生成标签和格式文本"]
@@ -243,7 +241,7 @@ Electron 渲染进程 Store 逐帧归约协议状态，正文、思考与工具�
 
 上下文用量从执行事实尾部反向查找，遇到成功压缩或模型切换即停止，不另存需要同步更新的最近测量。时间线按不可变条目复用投影；轨迹 JSON 呈现按输入身份复用序列化结果，流式更新不重复处理未变化的大输入。
 
-前端订阅只缓存所需字段，避免无关组件保留完整旧会话。高亮引擎按实际语言加载语法；屏幕外正文使用 Chromium 的 `content-visibility` 跳过内部布局与绘制，保留 DOM 和阅读锚点。轨迹退出动画结束后卸载。Canvas 光栅匹配实际显示像素，固定丝带纹理复用；窗口隐藏时采用 Chromium 默认后台节流，Rust 执行不受影响。
+前端订阅只缓存所需字段，避免无关组件保留完整旧会话。高亮引擎按实际语言加载语法；屏幕外正文使用 Chromium 的 `content-visibility` 跳过内部布局与绘制，保留 DOM 和阅读锚点。轨迹退出动画结束后卸载。Canvas 光栅匹配实际显示像素，固定丝带纹理复用；球体在页面隐藏或减少动态效果时停止动画帧，Rust 执行不受影响。
 
 `inputTrigger.ts` 维护 `@文件`、`/技能` 候选触发，`Composer` 持有候选结果与查询错误；查询显式绑定项目和任务，切换或输入改变后丢弃旧请求的结果。`ModelPicker` 从共同模型目录生成选择，`modelChoices.ts` 维护推理档位排序；`interactions.ts` 与 `Menu`、`Dialog`、`Disclosure` 等组件维护共享交互。主题变量位于 `styles/tokens.css`；`styles/app.css` 按外壳、对话、设置与展开表面依次导入样式，模型选择器样式位于 `styles/model-picker.css`。各面板保留自己的展开与焦点状态，任务正文与列表共用同一任务名称来源。
 
@@ -289,11 +287,12 @@ sequenceDiagram
     Host-->>View: bootstrap baseline
     View->>Host: session.read（当前选择）
     Host-->>View: history + runtime（含 sessionRevision）+ activeEvents
-    View->>View: 基线收敛后标记 connection ready，开放按 phase 路由的动作
     View->>View: flushFrames()，缓冲帧交回 reducer 判断是否已被 baseline 覆盖
+    View->>View: 基线与缓冲帧收敛后标记 connection ready，开放按 phase 路由的动作
     Host-->>View: 连续 turn_event / session_changed
     View->>View: reduceStream()，推进水位并返回同步动作
     alt 慢消费者落后
+        Host-->>View: resync_required
         View->>View: 重新读取权威快照，收敛后恢复就绪
     else 基线读取失败
         View->>Conn: 停止事件订阅
@@ -303,21 +302,9 @@ sequenceDiagram
     end
 ```
 
-```mermaid
-flowchart LR
-    Gate["sync.ts 接受帧与快照"]
-    Global["全局 revision<br/>分配序号与广播在同一锁内"] --> Gate
-    SessionRevision["session revision<br/>当前任务运行投影版本"] --> Gate
-    Gate -->|"新且连续"| Apply["更新正文、列表 phase 和控件"]
-    Gate -->|"已包含 / 迟到"| Ignore["丢弃旧投影"]
-    Gate -->|"无法连续衔接"| Resync["resync → baseline → 缓冲帧"]
-    Mutation["一次用户动作"] --> Once["RPC 只发送一次"]
-    Once -->|"响应不确定 / 信封不可信"| Resync
-```
+普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受与消费共同更新 `Conversation` 的当前投影；AppServer 在接受及真实消费边界通过既有 `session_changed` 快照发布该事实，不另存一份控制生命周期。完整工作台替换快照的构造和发布仍串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。
 
-普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受与消费共同更新 `Conversation` 的当前投影；AppServer 在接受及真实消费边界通过既有 `session_changed` 快照发布该事实，不另存一份控制生命周期。完整工作台替换快照的构造和发布仍串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。不可读取或版本与请求标识不匹配的 RPC 响应与不可达、被拒绝同属连接级失败：基线读取失败不宣告就绪，下一轮有效基线才收敛。
-
-项目、任务目录和模型配置 mutation 以服务端随操作发布的 `app_changed` 完整快照为权威。修改类 RPC 成功只返回空结果，只有创建动作返回动作本身需要的新身份（`workspace.add` 的 workspaceId、`session.create` 的读取结果），不再额外请求 bootstrap，也不另造目录或摘要回执。创建 RPC 返回前到达的目录帧先缓冲；返回的新任务身份保留到包含它的目录快照到达。`session_settled` 仍触发任务终态读取和目录刷新，重同步通知或页面刷新则走完整 resync。RPC bootstrap 读取与完整快照发布共用 `app_publication` 临界区，配置内容与序号在同一发布边界内绑定。
+项目、任务目录和模型配置变更通过服务端的 `app_changed` 完整快照发布。RPC 按动作返回所需结果：创建动作返回新身份（`workspace.add` 的 workspaceId、`session.create` 的读取结果），`workspace.remove` 返回草稿清理所需的任务身份，模型保存等操作返回空结果。返回的新任务身份保留到包含它的目录快照被应用。`session_settled` 触发任务终态读取和目录刷新；重同步通知或页面刷新走完整 resync。RPC bootstrap 读取与完整快照发布共用 `app_publication` 临界区，配置内容与序号在同一发布边界内绑定。
 
 `protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`TurnEventEnvelope` 为执行事件补充会话版本号。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与基线同步，组件使用生产单例。`sessionStore.ts` 拥有任务选择、创建、历史读取和同步的完整过程：选择序号、读取接纳、身份保护及缓冲释放均在内部维护。创建任务时由 `DraftStore` 完成草稿转移：目标保存成功才清空源，期间继续编辑的源草稿保留。`appStore.ts` 通过任务身份和操作意图调用导航入口，维护提交、设置和视图偏好等工作台动作。
 
@@ -523,7 +510,7 @@ flowchart TB
     Discover --> Remote["提供方模型列表与容量 / effort 元数据"]
     Remote --> Missing["缺失字段从 models.dev 补齐<br/>实际端点与精确模型 ID 匹配"]
     Missing --> Candidates["候选返回表单<br/>用户保存前不改运行配置"]
-    Form --> Save["model.saveProvider：配置与可选新密钥<br/>ModelConfigManager 内部串行修改<br/>返回操作结果及实际目录"]
+    Form --> Save["model.saveProvider：配置与可选新密钥<br/>ModelConfigManager 内部串行修改"]
     Candidates --> Save
     Save --> Disk[("config.json / auth.json")]
     Save --> Parsed["一次读取 UserConfigData<br/>冻结配置与凭据"]
@@ -725,8 +712,6 @@ Chat 编码器将图片工具结果中的像素放到完整工具结果组之后
 
 MCP 工具执行沿用现有独占准入；不根据服务器提供的只读提示扩大并发。SDK 负责 MCP 请求配对和超时，用户停止发送取消通知，调用不自动重试。工具结果在 Agent 边界转换为 `ToolExecution`，图片通过现有校验、保存和投影；停止任务并结算后，退出关闭连接并通过 Windows Job Object 回收本地服务器进程树。配置输入和运行状态走 MCP 设置 RPC，工具定义、调用与结果复用既有请求观测和会话日志。
 
-SDK 内容在 MCP 边界转换为文字与待校验图片，Agent 将它们接入现有结果与图片校验流程。
-
 连接缓存只保存成功连接；首次连接失败由本次发现或检查报告，下一次独立发现会重新尝试建立连接。已经建立的连接仍可通过设置中的“重新连接”替换。
 
 源码：[MCP 管理器](../crates/mcp/src/lib.rs) · [SDK 连接与取消](../crates/mcp/src/client.rs) · [MCP 内容转换](../crates/mcp/src/result.rs) · [Agent 结果接入](../crates/agent/src/tools/mcp.rs) · [设置](../apps/desktop/src/components/McpSettings.tsx) · [设计取舍](adr/adr-0004-mcp-tools.md)。
@@ -846,9 +831,7 @@ flowchart TB
 已有任务的 RPC 只提交 sessionId，执行目录来自会话自身的 cwd。打开文件时核对 header id 与请求的任务编号；项目登记用于创建任务与列表分组。文件与技能候选从当前项目根目录查询。
 
 
-目录与分页直接读取当前会话并构造不可变快照；只读打开不派生模型上下文。压缩锚点与剪枝引用由写入路径保证有效，请求装配与缩减时直接按这些引用派生上下文。文件与技能候选查询直接使用项目登记的根目录。
-
-活动执行持有开始前的历史快照，并将其与该回合的增量事件组合。选中任务结算后，Electron 渲染进程读取持久历史，再刷新工作台列表。
+目录与分页直接读取当前会话并构造不可变快照；只读打开不派生模型上下文。压缩锚点与剪枝引用由写入路径保证有效，请求装配与缩减时直接按这些引用派生上下文。
 
 源码：[Session 格式](../crates/agent/src/session/format.rs) · [SessionData / SessionManager](../crates/agent/src/session/manager.rs) · [JSONL 文件处理](../crates/agent/src/session/file.rs) · [上下文投影](../crates/agent/src/session/context.rs) · [会话写入窗口](../crates/runtime/src/conversation.rs) · [回合索引与摘要](../crates/runtime/src/history.rs) · [目录](../crates/runtime/src/thread_catalog.rs)。
 
@@ -883,7 +866,7 @@ JSONL 准备失败也输出 failed summary。stdout 写入失败后，该通道�
 | 新增或调整工具 | `tools/registry.rs` 与对应工具；并行语义在 `PreparedTool`，批次准备、准入与结果提交在 `agent/dispatch.rs` | 提示词名单、模型 schema、参数预检、取消、结果落盘、公开历史与实时事件；展示规则在 `timeline.ts`、`trajectory.ts`。 |
 | 修改命令执行行为 | `tools/bash` | Git Bash 参数、工作目录、输出、超时、取消与进程树；搜索和文件修改共用此入口。 |
 | 改变发送、排队或停止 | `runtime/conversation.rs`；单轮收尾在 `runner.rs` | 桌面控制 RPC、Composer 队列、运行期队列、历史恢复、JSONL 共享执行入口。 |
-| 改变终态或事件字段 | `protocol/event.rs`、`protocol/params.rs` 与 runtime 投影 | JSONL、桌面事件 envelope、活动快照、前端协议、正文、轨迹、用量；协议 wire 样例。 |
+| 改变终态或事件字段 | `protocol/event.rs`、`protocol/params.rs` 与 runtime 投影 | JSONL、桌面事件 envelope、活动快照、前端协议、正文、轨迹、用量。 |
 | 修改历史或会话格式 | `agent/session/format.rs`、`manager.rs`、`file.rs` | `ContextView`、工具配对投影、请求定义引用、catalog 摘要、分页与前端历史。 |
 | 改变模型接入或能力 | `model/config`、`provider/contract.rs`、`openai`、`transport` | selector 与冻结快照、重试和摘要、续接身份、请求观测、设置表单、模型选择器。 |
 | 调整上下文预算或摘要 | `agent/request.rs`、`agent/compaction.rs`、`request_execution.rs`、`compaction.rs`、`session/context.rs` | 正常发送、精确溢出恢复、手动压缩、文件指令刷新、用量记录；原历史与工具批次完整性。 |
