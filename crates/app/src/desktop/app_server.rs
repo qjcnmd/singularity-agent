@@ -32,6 +32,12 @@ use session::{ConversationSlot, SlotState};
 
 const STREAM_CAPACITY: usize = 512;
 
+/// 首次提交的 RPC 在对应用户消息落盘后才成功；尚未保存的失败直接交回提交方。
+struct SubmissionReceipt {
+    item_id: String,
+    sender: std::sync::mpsc::SyncSender<Result<(), RpcError>>,
+}
+
 pub struct AppServer {
     revision: Mutex<u64>,
     /// 管住完整工作台快照的构造和发布顺序；不插手会话执行，也不管普通增量事件。
@@ -259,12 +265,26 @@ impl AppServer {
         session_id: &str,
         slot: Arc<ConversationSlot>,
         reservation: OperationReservation,
+        mut receipt: Option<SubmissionReceipt>,
     ) {
         let app_server = Arc::clone(self);
         let session_id = session_id.to_string();
         self.runtime_handle.spawn(async move {
-            let mut event_sink = |event| app_server.on_turn_event(&session_id, &slot, event);
+            let mut event_sink = |event| {
+                let committed = matches!(&event, TurnEvent::UserMessage { item, .. }
+                    if receipt.as_ref().is_some_and(|receipt| receipt.item_id == item.item_id));
+                app_server.on_turn_event(&session_id, &slot, event);
+                if committed {
+                    let _ = receipt.take().expect("matched submitted message").sender.send(Ok(()));
+                }
+            };
             let (result, guard) = reservation.execute(&mut event_sink).await;
+            let uncommitted = receipt.map(|receipt| {
+                let OperationResult::Turn(Err(error)) = &result else {
+                    unreachable!("an uncommitted submitted input must fail execution");
+                };
+                (receipt.sender, internal_error(error.to_string()))
+            });
             let terminal = match result {
                 OperationResult::Turn(result) => Some(turn_terminal(result)),
                 OperationResult::Compaction(result) => match result {
@@ -278,6 +298,9 @@ impl AppServer {
                 },
             };
             app_server.on_session_settled(&session_id, &slot, terminal, guard);
+            if let Some((sender, error)) = uncommitted {
+                let _ = sender.send(Err(error));
+            }
         });
     }
 

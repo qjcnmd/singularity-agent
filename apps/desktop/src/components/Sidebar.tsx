@@ -2,7 +2,7 @@ import { Ellipsis, Plus } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useSelectionGuard } from '../interactions'
-import { actionOrigin, appStore, useAppStore, type AppState } from '../appStore'
+import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
 import type { ThreadSummary, Workspace } from '../protocol'
 import { sessionTitles } from '../sessionTitle'
 import { isBlankSession, sessionState } from '../sessionState'
@@ -21,7 +21,7 @@ type PendingDialog =
 
 export const Sidebar = memo(SidebarView)
 
-const sidebarFields = ['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceId', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'workspaceAppearance', 'actionErrors'] as const
+const sidebarFields = ['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceId', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'workspaceAppearance'] as const
 type SidebarState = Pick<AppState, typeof sidebarFields[number]>
 
 /** 侧栏显示阶段与终态，不消费流序号；其他消费者仍可订阅完整 liveSessions。 */
@@ -214,40 +214,46 @@ function SessionButton({
 
 function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () => void }) {
   const [name, setName] = useState('')
+  const { actionErrors, pendingActions } = useAppStore(['actionErrors', 'pendingActions'])
+  const method = state.kind === 'rename' ? 'session.rename' : state.kind === 'workspace-rename' ? 'workspace.rename' : 'workspace.remove'
+  const origin = state.kind === 'none' ? null : actionOrigin.inline(method, state.kind === 'rename' ? state.session.threadId : state.workspace.workspaceId)
+  const busy = origin !== null && pendingActions.has(pendingKey(method, origin))
+  const close = () => { if (!busy) onClose() }
   const initialName = state.kind === 'rename' ? state.session.title ?? '' : state.kind === 'workspace-rename' ? state.workspace.name : ''
-  useEffect(() => setName(initialName), [initialName, state.kind])
+  useEffect(() => {
+    setName(initialName)
+    if (origin !== null) appStore.clearError(origin)
+  }, [initialName, origin])
+  const failure = origin === null ? undefined : actionErrors[origin]
   if (state.kind === 'none') return null
   if (state.kind === 'rename' || state.kind === 'workspace-rename') {
     const title = state.kind === 'rename' ? '重命名任务' : '重命名项目'
-    const origin = state.kind === 'rename' ? actionOrigin.session(state.session.threadId) : actionOrigin.workspace(state.workspace.workspaceId)
-    const failure = appStore.getSnapshot().actionErrors[origin]
     const submit = async () => {
       if (name.trim() === '') return
       const accepted = state.kind === 'rename' ? await appStore.renameSession(state.session.threadId, name.trim()) : await appStore.renameWorkspace(state.workspace.workspaceId, name.trim())
       if (accepted) onClose()
     }
     return (
-      <Dialog open onClose={onClose} labelledBy="rename-title" className="confirm-modal">
-        <header className="modal-header"><div><span>任务</span><h2 id="rename-title">{title}</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="关闭">×</button></header>
+      <Dialog open onClose={close} labelledBy="rename-title" className="confirm-modal">
+        <header className="modal-header"><div><span>任务</span><h2 id="rename-title">{title}</h2></div><button type="button" className="icon-button" disabled={busy} onClick={close} aria-label="关闭">×</button></header>
         <form className="confirm-body" onSubmit={(event) => { event.preventDefault(); void submit() }}>
-          <label><span>名称</span><input data-autofocus value={name} onChange={(event) => setName(event.target.value)} /></label>
+          <label><span>名称</span><input data-autofocus disabled={busy} value={name} onChange={(event) => setName(event.target.value)} /></label>
           {failure && <p className="form-error" role="alert">{failure.message}</p>}
-          <footer><button type="button" className="secondary-button" onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={name.trim() === ''}>保存</button></footer>
+          <footer><button type="button" className="secondary-button" disabled={busy} onClick={close}>取消</button><button type="submit" className="primary-button" disabled={busy || name.trim() === ''}>保存</button></footer>
         </form>
       </Dialog>
     )
   }
   const title = '移除项目'
   const targetName = state.workspace.name
-  const failure = appStore.getSnapshot().actionErrors[actionOrigin.workspace(state.workspace.workspaceId)]
   const confirm = async () => { if (await appStore.removeWorkspace(state.workspace.workspaceId)) onClose() }
   return (
-    <Dialog open onClose={onClose} labelledBy="confirm-title" className="confirm-modal">
-      <header className="modal-header"><div><span>确认操作</span><h2 id="confirm-title">{title}</h2></div><button type="button" className="icon-button" data-autofocus onClick={onClose} aria-label="关闭">×</button></header>
+    <Dialog open onClose={close} labelledBy="confirm-title" className="confirm-modal">
+      <header className="modal-header"><div><span>确认操作</span><h2 id="confirm-title">{title}</h2></div><button type="button" className="icon-button" data-autofocus disabled={busy} onClick={close} aria-label="关闭">×</button></header>
       <div className="confirm-body">
         <p>{`移除“${targetName}”并清除该项目的未发送草稿。本机文件和已保存的任务历史会保留。`}</p>
         {failure && <p className="form-error" role="alert">{failure.message} {failure.recovery}</p>}
-        <footer><button type="button" className="secondary-button" onClick={onClose}>取消</button><button type="button" className="danger-button" onClick={() => void confirm()}>{title}</button></footer>
+        <footer><button type="button" className="secondary-button" disabled={busy} onClick={close}>取消</button><button type="button" className="danger-button" disabled={busy} onClick={() => void confirm()}>{title}</button></footer>
       </div>
     </Dialog>
   )

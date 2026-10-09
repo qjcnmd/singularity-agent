@@ -1,9 +1,6 @@
 pub mod contract;
 pub mod telemetry;
 
-#[cfg(feature = "test-support")]
-pub mod test_support;
-
 pub use telemetry::*;
 
 use crate::config::ModelConfigurationSnapshot;

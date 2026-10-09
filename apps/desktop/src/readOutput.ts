@@ -14,7 +14,7 @@ interface ReadOutputLine {
 }
 
 export function readOutputLines(text: string, source: ReadSource): ReadOutputLine[] {
-  const lines = text.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n')
+  const lines = text.replace(/\r\n/g, '\n').split('\n')
   return lines.map((line, index) => index < source.lineCount
     ? { text: line, number: source.startLine + index }
     : { text: line })

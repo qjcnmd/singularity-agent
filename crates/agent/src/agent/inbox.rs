@@ -93,6 +93,11 @@ impl ControlRequest {
         self.sequence.to_string()
     }
 
+    /// 输入落盘后发布的用户消息条目身份，供宿主确认这一次输入已保存。
+    pub fn item_id(&self) -> String {
+        crate::session::text_item_id(&self.message_id, 0)
+    }
+
     /// 待处理输入只公开身份和正文；接受序号留在协调器内部。
     pub fn pending(&self) -> PendingInput {
         PendingInput {

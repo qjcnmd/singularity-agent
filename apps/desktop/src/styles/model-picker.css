@@ -8,7 +8,6 @@
 .sg-chevron { color: var(--ink-faint); flex: none; }
 .sg-menu { z-index: 20; width: 100%; max-height: min(460px, 100vh - 96px); color: var(--ink); flex-direction: column; padding: 4px; display: flex; overflow: hidden; }
 
-.sg-error { background: var(--surface-hover); color: var(--danger); border-radius: 8px; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 4px; padding: 7px 8px; font-size: 12px; line-height: 18px; display: flex; }
 
 .sg-groups { min-height: 0; max-height: 200px; overflow-y: auto; }
 .sg-group + .sg-group { margin-top: 4px; }

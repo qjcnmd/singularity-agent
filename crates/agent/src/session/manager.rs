@@ -271,18 +271,6 @@ impl SessionManager {
 }
 
 impl SessionData {
-    /// 读取测试需要断言的持久记录；不包含消息、摘要和元数据。
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn ledger_records(&self) -> Vec<LedgerRecord> {
-        self.entries
-            .iter()
-            .filter_map(|entry| match entry {
-                SessionEntry::Record { record, .. } => Some(record.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// 会话头部声明的稳定身份，即会话 id。
     pub fn session_id(&self) -> &str {
         &self.session_id

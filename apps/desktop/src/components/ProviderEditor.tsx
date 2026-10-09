@@ -22,7 +22,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
   const [models, setModels] = useState<ModelInput[]>(() => provider?.models ?? [])
   const [modelEditor, setModelEditor] = useState<{ index: number | null; draft: ModelInput } | null>(null)
   const [saved, setSaved] = useState(false)
-  const origin = actionOrigin.provider(providerId.trim())
+  const origin = actionOrigin.inline('model.saveProvider', providerId.trim())
   const busy = state.pendingActions.has(pendingKey('model.saveProvider', origin))
   const [fetching, setFetching] = useState(false)
   const [failure, setFailure] = useState<string | null>(null)
@@ -91,6 +91,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
   const save = async (event: FormEvent) => {
     event.preventDefault()
     setFailure(null)
+    appStore.clearError(origin)
     if (!/^[^\s/#]+$/.test(providerId.trim())) {
       setFailure('请输入不含空格、/ 或 # 的提供方 ID。')
       return
@@ -125,10 +126,11 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
       }
       submitted.push({ ...model, modelId: id, displayName: model.displayName?.trim() || null })
     }
-    if (await appStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl, apiProtocol: protocol, models: submitted }, apiKey.trim())) {
+    const result = await appStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl, apiProtocol: protocol, models: submitted }, apiKey.trim())
+    if (result.ok) {
       setApiKey('')
       onDone()
-    } else if (appStore.getSnapshot().actionErrors[origin]?.code === 'configuration_partially_saved') {
+    } else if (result.error?.code === 'configuration_partially_saved') {
       setSaved(true)
     }
   }
@@ -169,7 +171,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
                   <button type="button" className="quiet-button" disabled={fetching || !baseUrl.trim()} onClick={() => void discover()}>{fetching ? '正在询问提供方…' : '获取可用模型'}</button>
                 </span>
               </div>
-              {models.length === 0 && <p className="sg-model-empty">尚无模型。获取可用模型或手动添加后，即可在任务中选择。</p>}
+              {models.length === 0 && <p className="sg-model-empty">尚无模型。</p>}
               <div className="sg-model-list">
                 {models.map((model, index) => (
                   <div key={index} className="sg-model-entry">

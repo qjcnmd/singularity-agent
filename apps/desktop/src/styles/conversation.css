@@ -174,7 +174,6 @@
 .terminal-command code { background: transparent !important; padding: 0 !important; border: 0 !important; }
 .timeline-section h4 { margin: 0; padding: 6px 14px; border-bottom: 1px solid var(--line); font: 12px var(--font-sans); color: var(--ink-soft); }
 .timeline-section + .timeline-section { border-top: 1px solid var(--line); }
-.turn-activity { width: fit-content; height: 26px; font-size: 14px; color: var(--ink-soft); }
 .activity-shimmer { background: linear-gradient(90deg, var(--ink-soft) 35%, var(--ink-faint) 50%, var(--ink-soft) 65%); background-size: 250% 100%; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: activity-shimmer 2.8s ease-in-out infinite; }
 .execution-title { --execution-color: var(--accent); background-image: linear-gradient(var(--execution-color), var(--execution-color)); background-size: 200% 100%; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: execution-shine .7s linear infinite paused; }
 .status-running .execution-title { background-image: linear-gradient(100deg, var(--execution-color) 0%, var(--execution-color) 35%, #fff 50%, var(--execution-color) 65%, var(--execution-color) 100%); animation-play-state: running; }

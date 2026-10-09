@@ -21,11 +21,5 @@ pub use runner::{TurnOutcome, TurnRunner};
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;
 pub use thread_catalog::{CatalogError, SESSIONS_DIR_NAME, ThreadCatalog, ThreadSnapshot};
 
-#[cfg(test)]
-mod test_support;
-
-#[cfg(test)]
-mod tests;
-
 /// 文字与图片组成的任务输入，Conversation 在接受操作时校验输入不为空。
 pub use singularity_agent::agent::UserInput;

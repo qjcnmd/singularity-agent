@@ -84,6 +84,14 @@ pub enum OperationResult {
 }
 
 impl OperationReservation {
+    /// 首次提交绑定的消息身份；排队消息和独立压缩没有新的提交回执。
+    pub fn submitted_item_id(&self) -> Option<String> {
+        match &self.operation {
+            ReservedOperation::Turn(TurnInput::Submitted(request)) => Some(request.item_id()),
+            _ => None,
+        }
+    }
+
     /// 消费预订并执行一次。返回的守卫继续占用窗口，宿主完成事件投影后再释放它。
     pub async fn execute(
         self,

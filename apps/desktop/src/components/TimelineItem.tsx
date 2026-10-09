@@ -152,7 +152,8 @@ function ToolOutput({ item }: Props) {
     <div className="terminal-command"><span aria-hidden="true">$</span><code>{command}</code></div>
     {output !== '' && <><OutputHeader label="输出" /><pre>{Anser.ansiToJson(output, { remove_empty: true }).map((part, index) => <span key={index} style={{ color: part.fg ? `rgb(${part.fg})` : undefined, backgroundColor: part.bg ? `rgb(${part.bg})` : undefined, fontWeight: part.decorations.includes('bold') ? 700 : undefined }}>{part.content}</span>)}</pre></>}
   </div>
-  if (item.filePath !== null && output !== '' && item.title === 'read' && timelineStatus(item) !== 'error') return <div>
+  const hasReadLines = fact.readSource !== undefined && fact.readSource.lineCount > 0
+  if (item.filePath !== null && (output !== '' || hasReadLines) && item.title === 'read' && timelineStatus(item) !== 'error') return <div>
     <OutputHeader label={item.filePath} />
     {/* 只有 producer 记录了真实来源范围才编号；旧记录按普通文本展示，不猜边界。 */}
     {fact.readSource

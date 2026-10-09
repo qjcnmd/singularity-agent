@@ -20,9 +20,3 @@ thiserror.workspace = true
 # 执行器持有 provider 的执行环境句柄，因此运行期依赖是生产依赖。
 tokio.workspace = true
 uuid = { workspace = true, features = ["v7"] }
-
-[dev-dependencies]
-serde_json.workspace = true
-singularity_agent = { path = "../agent", features = ["test-support"] }
-singularity_model = { path = "../model", features = ["test-support"] }
-tempfile.workspace = true

@@ -20,11 +20,11 @@ pub(super) fn turn_terminal(
 }
 
 pub(crate) fn invalid_request(message: impl Into<String>) -> RpcError {
-    RpcError::new(RpcErrorCode::InvalidRequest, message, "检查输入后重试。")
+    RpcError::new(RpcErrorCode::InvalidRequest, message, "")
 }
 
 pub(super) fn internal_error(message: impl Into<String>) -> RpcError {
-    RpcError::new(RpcErrorCode::Internal, message, "刷新工作台；若问题持续，检查启动终端中的错误。")
+    RpcError::new(RpcErrorCode::Internal, message, "")
 }
 
 pub(super) fn configuration_error(message: impl Into<String>) -> RpcError {

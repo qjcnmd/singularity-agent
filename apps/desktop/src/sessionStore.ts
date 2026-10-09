@@ -3,7 +3,7 @@ import { loadPersisted, persistView, type PersistedView } from './viewPersistenc
 import { RpcFailure, RpcClient, isConnectionFailure } from './rpcClient'
 import type { ConnectionStatus, StreamEnvelope, AppBootstrap, ThreadSummary } from './protocol'
 import { actionOrigin, pendingKey } from './storeActions'
-import { emptyDraft, loadDrafts, persistDraft, hasDraft, type Draft } from './drafts'
+import { DraftStore, DraftStorageError, hasDraft, type DraftSnapshot } from './drafts'
 import { prependExecutionHistory } from './execution'
 import { isBlankSession } from './sessionState'
 
@@ -16,6 +16,9 @@ export interface ActionError {
   recovery: string
 }
 
+/** 忙碌时未重复执行，error 为 null；执行失败直接携带本次反馈，不必回读全局状态。 */
+export type ActionResult = { ok: true } | { ok: false; error: ActionError | null }
+
 interface SessionLoadState {
   status: 'idle' | 'loading' | 'error'
   error: ActionError | null
@@ -24,7 +27,7 @@ interface SessionLoadState {
 interface SessionReadFailure { error: unknown }
 
 export interface AppState extends PersistedView, SyncState {
-  drafts: Record<string, Draft> | null
+  drafts: DraftSnapshot | null
   connection: ConnectionStatus
   sessionLoad: SessionLoadState
   unreadSessions: ReadonlySet<string>
@@ -35,7 +38,7 @@ export interface AppState extends PersistedView, SyncState {
 }
 
 
-/** 任务导航、草稿和读取/事件同步的状态所有者；导航请求的身份与接纳规则留在内部。 */
+/** 任务导航和读取/事件同步的状态所有者；导航请求的身份与接纳规则留在内部。 */
 export class SessionStore {
   protected state: AppState = {
     ...loadPersisted(),
@@ -55,7 +58,10 @@ export class SessionStore {
   /** Store 持有的连接。设置、补全等局部查询直接复用它，不为每个查询维护
    *  专用转发方法；传输生命周期（start/stop）与状态同步仍由 Store 独占。 */
   readonly transport = new RpcClient(frame => this.onFrame(frame), connection => this.patch({ connection }))
-  private draftLoad: Promise<void> | null = null
+  protected readonly drafts = new DraftStore(
+    drafts => this.patch({ drafts }),
+    (error, sessionId) => this.reportError(error, sessionId === null ? 'draft.storage' : actionOrigin.session(sessionId)),
+  )
   private started = false
   private queuedFrames: StreamEnvelope[] = []
 
@@ -78,7 +84,7 @@ export class SessionStore {
     if (this.started) return
     this.started = true
     window.addEventListener('pagehide', this.flushView)
-    void this.restoreDrafts()
+    void this.drafts.load()
     this.transport.start()
   }
 
@@ -147,15 +153,8 @@ export class SessionStore {
         sessionLoad: { status: 'idle', error: null },
       })
       this.saveSelection()
-      if (transferDraft && sourceKey !== null && sourceKey !== session.history.summary.threadId) {
-        const draft = this.state.drafts?.[sourceKey] ?? emptyDraft
-        if (hasDraft(draft)) {
-          const saved = await this.setDraftFor(session.history.summary.threadId, draft)
-          // 目标保存成功才清空源；保存期间修改过的源草稿仍保留。
-          if (saved && this.state.drafts?.[sourceKey] === draft) {
-            await this.setDraftFor(sourceKey, emptyDraft)
-          }
-        }
+      if (transferDraft && sourceKey !== null) {
+        await this.drafts.transfer(sourceKey, session.history.summary.threadId)
       }
       createdSessionId = session.history.summary.threadId
     })
@@ -180,29 +179,6 @@ export class SessionStore {
         || this.state.session?.nextCursor !== beforeTurn) return
       this.patch({ session: prependExecutionHistory(this.state.session, older.history) })
     })
-  }
-
-  protected restoreDrafts(): Promise<void> {
-    if (this.state.drafts !== null) return Promise.resolve()
-    return this.draftLoad ??= loadDrafts().then(
-      drafts => this.patch({ drafts }),
-      error => this.reportError(new RpcFailure('storage', `无法读取草稿：${error instanceof Error ? error.message : String(error)}`, '检查本地存储空间后刷新页面。'), 'draft.storage'),
-    ).finally(() => { this.draftLoad = null })
-  }
-
-  protected async setDraftFor(key: string, draft: Draft): Promise<boolean> {
-    if (this.state.drafts === null) return false
-    const drafts = { ...this.state.drafts }
-    if (hasDraft(draft)) drafts[key] = draft
-    else delete drafts[key]
-    this.patch({ drafts })
-    try {
-      await persistDraft(key, draft)
-      return true
-    } catch {
-      this.reportError(new RpcFailure('storage', '草稿暂时只能保留在当前页面。', '请保留页面并检查本地存储空间后重试。'), actionOrigin.session(key))
-      return false
-    }
   }
 
   /** 业务读取失败由 sessionLoad 展示；原始错误返回给 resync，供它处理连接失败。 */
@@ -354,8 +330,16 @@ export class SessionStore {
     origin: string,
     operation: () => Promise<unknown>,
   ): Promise<boolean> {
+    return (await this.actionResult(method, origin, operation)).ok
+  }
+
+  protected async actionResult(
+    method: string,
+    origin: string,
+    operation: () => Promise<unknown>,
+  ): Promise<ActionResult> {
     const key = pendingKey(method, origin)
-    if (this.state.pendingActions.has(key)) return false
+    if (this.state.pendingActions.has(key)) return { ok: false, error: null }
     const pendingActions = new Set(this.state.pendingActions)
     pendingActions.add(key)
     const actionErrors = { ...this.state.actionErrors }
@@ -363,10 +347,9 @@ export class SessionStore {
     this.patch({ pendingActions, actionErrors, actionErrorOrigin: null })
     try {
       await operation()
-      return true
+      return { ok: true }
     } catch (error) {
-      this.reportError(error, origin)
-      return false
+      return { ok: false, error: this.reportError(error, origin) }
     } finally {
       const next = new Set(this.state.pendingActions)
       next.delete(key)
@@ -374,24 +357,26 @@ export class SessionStore {
     }
   }
 
-  protected reportError(error: unknown, origin: string): void {
+  protected reportError(error: unknown, origin: string): ActionError {
     const actionError = this.toActionError(error, origin)
-    if (actionError.code === 'unavailable') return
-    this.patch({
-      actionErrors: { ...this.state.actionErrors, [origin]: actionError },
-      actionErrorOrigin: origin,
-    })
+    if (actionError.code !== 'unavailable') {
+      this.patch({
+        actionErrors: { ...this.state.actionErrors, [origin]: actionError },
+        actionErrorOrigin: origin,
+      })
+    }
+    return actionError
   }
 
   private toActionError(error: unknown, origin: string): ActionError {
-    if (error instanceof RpcFailure) {
-      return { origin, code: error.code, message: error.message, recovery: error.recovery }
+    if (error instanceof RpcFailure || error instanceof DraftStorageError) {
+      return { origin, code: error instanceof DraftStorageError ? 'storage' : error.code, message: error.message, recovery: error.recovery }
     }
     return {
       origin,
       code: 'internal',
       message: error instanceof Error ? error.message : '发生了未知错误。',
-      recovery: '请刷新页面后重试。',
+      recovery: '',
     }
   }
 

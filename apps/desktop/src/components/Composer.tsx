@@ -170,7 +170,7 @@ function ComposerView({ centered }: { centered: boolean }) {
             {fileQuery !== undefined && fileStatus === 'empty' && <p className="candidate-message">没有匹配的文件</p>}
             {fileQuery !== undefined && fileStatus === 'error' && fileError !== null && (
               <div className="candidate-message candidate-error" role="alert">
-                <strong>{fileError.message}</strong><span>{fileError instanceof RpcFailure ? fileError.recovery : '请重试文件查询。'}</span>
+                <strong>{fileError.message}</strong>{fileError instanceof RpcFailure && fileError.recovery && <span>{fileError.recovery}</span>}
               </div>
             )}
           </div>
@@ -271,10 +271,8 @@ function ContextRing({ percent = 0 }: { percent?: number }) {
 
 function ComposerTools({ compactDisabled, theme, occupancy, imageInput }: { compactDisabled: boolean; theme: AppState['theme']; occupancy: { used: number; capacity: number; percent: number } | null; imageInput: ReturnType<typeof useImageInput> }) {
   const [expanded, setExpanded] = useState(false)
-  const [confirming, setConfirming] = useState(false)
   const [contextOpen, setContextOpen] = useState(false)
   const changeExpanded = useCallback((next: boolean) => {
-    setConfirming(false)
     setContextOpen(false)
     setExpanded(next)
   }, [])
@@ -284,9 +282,6 @@ function ComposerTools({ compactDisabled, theme, occupancy, imageInput }: { comp
   const compactButton = useRef<HTMLButtonElement>(null)
   const reducedMotion = useReducedMotion()
   const guard = useSelectionGuard()
-
-  useEffect(() => { if (compactDisabled) setConfirming(false) }, [compactDisabled])
-  useDismissOnOutside(compactButton, confirming, () => setConfirming(false), { captureClick: true })
 
   useEffect(() => {
     if (!expanded) return
@@ -320,16 +315,17 @@ function ComposerTools({ compactDisabled, theme, occupancy, imageInput }: { comp
           <span>添加图片</span>
         </button>
         <button ref={compactButton} type="button" className="composer-tools-item" aria-disabled={compactDisabled}
-          aria-label={confirming ? '确认压缩上下文' : '压缩上下文'} aria-describedby="composer-context-usage"
+          aria-label="压缩上下文" aria-describedby="composer-context-usage"
           onPointerEnter={() => setContextOpen(true)} onPointerLeave={() => setContextOpen(false)}
           onFocus={() => setContextOpen(true)} onBlur={() => setContextOpen(false)}
           {...guard(() => {
             if (compactDisabled) return
-            if (confirming) { changeExpanded(false); toggleButton.current?.focus({ preventScroll: true }); void appStore.compact() }
-            else setConfirming(true)
+            changeExpanded(false)
+            toggleButton.current?.focus({ preventScroll: true })
+            void appStore.compact()
           })}>
           <span className="composer-tools-icon" aria-hidden="true"><ContextRing percent={occupancy?.percent} /></span>
-          <span>{confirming ? '确认压缩上下文' : '上下文压缩'}</span>
+          <span>上下文压缩</span>
         </button>
         <button type="button" className="composer-tools-item" aria-label={theme === 'light' ? '切换深色模式' : '切换浅色模式'} onClick={() => {
           const update = () => flushSync(() => appStore.setTheme(theme === 'light' ? 'dark' : 'light'))

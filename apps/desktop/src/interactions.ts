@@ -131,10 +131,10 @@ export function useAnchoredSurface(anchor: RefObject<HTMLElement | null>, contai
   }, [anchor, container])
 }
 
-/** 点击表面外关闭；portal 可另指定锚点，确认按钮同时监听键盘产生的 click。 */
+/** 点击表面外关闭；portal 可另指定锚点。 */
 export function useDismissOnOutside(
   container: RefObject<HTMLElement | null>, active: boolean, onClose: () => void,
-  { anchor, captureClick = false }: { anchor?: RefObject<HTMLElement | null>; captureClick?: boolean } = {},
+  { anchor }: { anchor?: RefObject<HTMLElement | null> } = {},
 ) {
   const close = useRef(onClose)
   close.current = onClose
@@ -143,11 +143,9 @@ export function useDismissOnOutside(
     const outside = (event: Event) => {
       if (event.target instanceof Node && !container.current?.contains(event.target) && !anchor?.current?.contains(event.target)) close.current()
     }
-    document.addEventListener('pointerdown', outside, captureClick)
-    if (captureClick) document.addEventListener('click', outside, true)
+    document.addEventListener('pointerdown', outside)
     return () => {
-      document.removeEventListener('pointerdown', outside, captureClick)
-      if (captureClick) document.removeEventListener('click', outside, true)
+      document.removeEventListener('pointerdown', outside)
     }
-  }, [container, anchor, active, captureClick])
+  }, [container, anchor, active])
 }

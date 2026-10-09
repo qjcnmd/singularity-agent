@@ -234,7 +234,7 @@ pub enum TurnFailureCause {
     Internal,
 }
 
-/// 错误文本和 golden 词表测试都通过 Display 呈现 wire 词形。
+/// 错误文本通过 Display 呈现与序列化一致的词形。
 impl std::fmt::Display for TurnFailureCause {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&wire_word(*self))

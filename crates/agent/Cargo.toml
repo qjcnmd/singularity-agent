@@ -9,10 +9,6 @@ repository.workspace = true
 [lints]
 workspace = true
 
-[features]
-# 仅供下游 crate 的测试构建启用：暴露自带协调器的会话构造与账本读取辅助。
-test-support = []
-
 [dependencies]
 tokio-util.workspace = true
 tokio.workspace = true

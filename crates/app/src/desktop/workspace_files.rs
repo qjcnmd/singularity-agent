@@ -18,10 +18,15 @@ pub(crate) fn search_files(directory: &str, query: &str, limit: usize) -> Result
         if candidates.len() >= limit {
             break;
         }
+        let directory_entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && directory != root.as_path() => {
+                continue;
+            }
+            Err(error) => return Err(format!("workspace directory could not be read: {error}")),
+        };
         let mut entries = Vec::new();
-        for entry in std::fs::read_dir(&directory)
-            .map_err(|error| format!("workspace directory could not be read: {error}"))?
-        {
+        for entry in directory_entries {
             match entry {
                 Ok(entry) => entries.push(entry),
                 // 遍历期间条目消失属于可接受的瞬时情况，按没有候选跳过；

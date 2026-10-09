@@ -14,7 +14,7 @@ interface ModelChoice {
 
 interface ModelPickerProps {
   /** 只声明本组件读取的字段：父级按同一份清单订阅。 */
-  state: Pick<AppState, 'bootstrap' | 'session' | 'selectedWorkspaceId' | 'selectedSessionId' | 'actionErrors' | 'pendingActions'>
+  state: Pick<AppState, 'bootstrap' | 'session' | 'selectedWorkspaceId' | 'selectedSessionId' | 'pendingActions'>
 }
 
 export function ModelPicker({ state }: ModelPickerProps) {
@@ -51,7 +51,6 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
   const pending = sessionId === null
     ? state.selectedWorkspaceId !== null && state.pendingActions.has(pendingKey('session.create', actionOrigin.workspace(state.selectedWorkspaceId)))
     : state.pendingActions.has(pendingKey('session.updateSettings', origin))
-  const error = sessionId === null ? undefined : state.actionErrors[origin]
 
   useTransientFocus(open, () => onOpenChange(false), root, node => node.querySelector<HTMLElement>('.sg-native-slider:not(:disabled), .sg-menu button:not(:disabled)'))
   useDismissOnOutside(root, open, () => onOpenChange(false))
@@ -175,11 +174,6 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
             </div>
           )}
 
-          {error !== undefined && (
-            <p className="sg-error" role="alert">
-              {error.message}
-            </p>
-          )}
         </div>
       </PickerSurface>
     </div>

@@ -7,10 +7,11 @@ import { ExpandChevron } from './ExpandChevron'
 
 type InspectionState = { loading: true } | { loading: false; result: McpInspection }
 
-export function McpSettings({ workspaceId, active }: { workspaceId: string | null; active: boolean }) {
+export function McpSettings({ workspaceId, active, busy, onBusyChange }: {
+  workspaceId: string | null; active: boolean; busy: boolean; onBusyChange: (busy: boolean) => void
+}) {
   const [servers, setServers] = useState<McpServerInput[]>([])
   const [loading, setLoading] = useState(true)
-  const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [inspections, setInspections] = useState<Record<string, InspectionState>>({})
   const [expanded, setExpanded] = useState<string | null>(null)
@@ -56,20 +57,20 @@ export function McpSettings({ workspaceId, active }: { workspaceId: string | nul
 
   async function mutate(action: () => Promise<unknown>) {
     if (busy) return false
-    setBusy(true)
+    onBusyChange(true)
     setError(null)
     try { await action(); await load(); return true }
     catch (error) { setError(error instanceof Error ? error.message : '保存 MCP 配置失败。'); return false }
-    finally { setBusy(false) }
+    finally { onBusyChange(false) }
   }
 
   return <section className="mcp-settings" aria-labelledby="mcp-settings-title">
     <header className="sg-view-header">
       <h3 id="mcp-settings-title">MCP</h3>
-      <p>连接外部工具。配置和开关在下一回合开始或上下文压缩后刷新时生效。</p>
+      <p>更改会在下次运行或压缩后生效。</p>
     </header>
     {loading && <p role="status">正在读取 MCP 配置…</p>}
-    {error && <p role="alert" className="form-error">{error} <button type="button" className="quiet-button" disabled={busy} onClick={() => void load()}>重新读取</button></p>}
+    {error && editor === null && removing === null && <p role="alert" className="form-error">{error} <button type="button" className="quiet-button" disabled={busy} onClick={() => void load()}>重新读取</button></p>}
     <div className="sg-provider-list">
       {servers.map(server => {
         const inspection = inspections[server.serverId]
@@ -83,15 +84,14 @@ export function McpSettings({ workspaceId, active }: { workspaceId: string | nul
             </button>
             <span className="sg-row-actions">
               <label className="mcp-switch"><input type="checkbox" role="switch" aria-label={`启用 MCP ${server.serverId}`} checked={server.enabled} disabled={busy || loading} onChange={event => { const enabled = event.target.checked; void mutate(() => appStore.transport.rpc('mcp.toggle', { serverId: server.serverId, enabled })) }} />启用</label>
-              <button type="button" className="quiet-button" disabled={busy} aria-label={`编辑 MCP ${server.serverId}`} onClick={() => setEditor(server)}>编辑</button>
-              <button type="button" className="quiet-button danger" disabled={busy} aria-label={`删除 MCP ${server.serverId}`} onClick={() => setRemoving(server)}>删除</button>
+              <button type="button" className="quiet-button" disabled={busy} aria-label={`编辑 MCP ${server.serverId}`} onClick={() => { setError(null); setEditor(server) }}>编辑</button>
+              <button type="button" className="quiet-button danger" disabled={busy} aria-label={`删除 MCP ${server.serverId}`} onClick={() => { setError(null); setRemoving(server) }}>删除</button>
             </span>
           </div>
           <Disclosure open={open}><div id={`mcp-tools-${server.serverId}`} className="mcp-tools">
             <p className="mcp-endpoint">{server.transport.type === 'stdio' ? `${server.transport.command} ${server.transport.args.join(' ')}` : server.transport.url}</p>
             {result?.error && server.enabled && <p role="alert" className="form-error">{result.error}</p>}
             {server.enabled && <button type="button" className="secondary-button" disabled={busy || inspection?.loading} onClick={() => void inspect(server.serverId, true)}>重新连接</button>}
-            {result?.connected && result.tools.length === 0 && <p>服务器已连接，没有提供工具。</p>}
             {result?.tools.map(tool => <div key={tool.name} className="mcp-tool"><strong>{tool.name}</strong><p>{tool.description}</p></div>)}
           </div></Disclosure>
         </div>

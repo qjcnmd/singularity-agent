@@ -113,14 +113,13 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
       const found = (await discover(draft.apiProtocol ?? 'chat')).find(model => model.modelId === id)
       if (current !== revision.current) return
       if (!found) {
-        setFeedback('目录中未找到此模型，可继续手动填写。')
+        setFeedback('目录中未找到此模型。')
         return
       }
       setError(null)
       setDraft(current => fillDraft(current, found))
-      setFeedback(`已获取模型能力 · ${found.metadataSource ?? '提供方模型目录'}`)
     } catch (error) {
-      if (current === revision.current) setFeedback(`${error instanceof Error ? error.message : '获取失败'} 可手动填写或重新获取。`)
+      if (current === revision.current) setFeedback(error instanceof Error ? error.message : '获取失败')
     } finally {
       if (current === revision.current) setLoading(false)
     }

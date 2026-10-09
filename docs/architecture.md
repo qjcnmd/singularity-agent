@@ -174,7 +174,7 @@ flowchart LR
     ModelManager --> Auth
     Manager["SessionManager + 进程内写者守卫"] -->|"单写者追加"| Ledger
     Browser["viewPersistence.ts"] --> View[("localStorage：view.v1<br/>选择、外观、布局、滚动锚点")]
-    DraftStore["drafts.ts"] --> Draft[("IndexedDB：按任务保存文字与图片草稿")]
+    DraftStore["drafts.ts / DraftStore<br/>加载、编辑、转移与删除"] --> Draft[("IndexedDB：按任务保存文字与图片草稿")]
     Home --> Images[("sessions / images / 任务 ID / 图片 ID<br/>持久像素快照")]
     Ledger -.->|"Image 内容块引用"| Images
     Bash["bash 输出截断"] --> Temp[("系统临时目录<br/>singularity-tool-output / UUID.log")]
@@ -185,7 +185,7 @@ flowchart LR
 | 项目身份 | `CanonicalWorkspacePath` 规范化路径及比较键；`WorkspaceStore` 维护登记；bootstrap 按同一登记快照分组任务。读取历史身份不要求原目录仍存在。 |
 | 模型与凭据 | `ModelConfigManager` 内部串行读取和修改，生成运行快照、脱敏目录；修改结果与修改后的实际目录在同一临界区中取得，部分保存失败也返回当前目录；Electron 渲染进程只写新密钥，不从目录读回密钥。 |
 | 会话事实 | `SessionManager` 写入，`SessionData` 只读；上下文、中断操作恢复、历史、摘要、请求详情均从同一日志派生。未消费的控制输入是内存状态，不由日志恢复。 |
-| 视图与草稿 | `viewPersistence.ts` 保存视图；`drafts.ts` 在 IndexedDB 中按任务保存完整输入。 |
+| 视图与草稿 | `viewPersistence.ts` 保存视图；`drafts.ts` 的 `DraftStore` 拥有草稿快照和加载过程，在 IndexedDB 中按任务保存完整输入。工作台订阅同一份只读快照，编辑、转移、发送后清空及删除均经此入口。 |
 | 图片 | `agent/image.rs` 共用识别、解码与格式转换；用户输入和工具结果共用 Agent 的消息追加入口，先在会话锁外保存像素，再追加引用图片的消息；成功后才发布完成事件。排队图片仍属于进程内输入。 |
 | 临时工具输出 | 工具结果给出实际日志路径；新建输出时清理超过七天的旧输出，保存失败明确反馈。 |
 
@@ -319,9 +319,11 @@ flowchart LR
 
 项目、任务目录和模型配置 mutation 以服务端随操作发布的 `app_changed` 完整快照为权威。修改类 RPC 成功只返回空结果，只有创建动作返回动作本身需要的新身份（`workspace.add` 的 workspaceId、`session.create` 的读取结果），不再额外请求 bootstrap，也不另造目录或摘要回执。创建 RPC 返回前到达的目录帧先缓冲；返回的新任务身份保留到包含它的目录快照到达。`session_settled` 仍触发任务终态读取和目录刷新，重同步通知或页面刷新则走完整 resync。RPC bootstrap 读取与完整快照发布共用 `app_publication` 临界区，配置内容与序号在同一发布边界内绑定。
 
-`protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`TurnEventEnvelope` 为执行事件补充会话版本号，事件的 wire 形状由协议 golden 验证。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与基线同步，组件使用生产单例。`sessionStore.ts` 拥有任务选择、创建、草稿转移、历史读取和同步的完整过程：选择序号、读取接纳、身份保护及缓冲释放均在内部维护。`appStore.ts` 通过任务身份和操作意图调用导航入口，维护提交、设置和视图偏好等工作台动作。
+`protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`TurnEventEnvelope` 为执行事件补充会话版本号。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与基线同步，组件使用生产单例。`sessionStore.ts` 拥有任务选择、创建、历史读取和同步的完整过程：选择序号、读取接纳、身份保护及缓冲释放均在内部维护。创建任务时由 `DraftStore` 完成草稿转移：目标保存成功才清空源，期间继续编辑的源草稿保留。`appStore.ts` 通过任务身份和操作意图调用导航入口，维护提交、设置和视图偏好等工作台动作。
 
-源码：[工作台 DTO](../crates/protocol/src/app.rs) · [RPC 合同](../crates/protocol/src/rpc.rs) · [RPC adapter](../crates/app/src/desktop/rpc.rs) · [Electron 主进程](../apps/desktop/desktop/main.ts) · [连接](../apps/desktop/src/rpcClient.ts) · [同步归约](../apps/desktop/src/sync.ts) · [Store 状态与连接同步](../apps/desktop/src/sessionStore.ts)。生成与序列化检查见[协议测试](../crates/protocol/tests/contract.rs)和[终态与请求合同](../crates/protocol/tests/request_contract.rs)。
+工作台动作共用忙碌状态与错误反馈。只需判断完成与否的调用使用布尔结果；提供方保存需要区分部分保存失败，直接返回本次 `ActionResult`，其中的错误与原位展示使用同一份反馈。草稿编辑立即更新页面，保存失败保留页面内容并报告；归档或移除后的草稿删除失败保留原记录，错误说明已完成的业务操作与未完成的清理。
+
+源码：[工作台 DTO](../crates/protocol/src/app.rs) · [RPC 合同](../crates/protocol/src/rpc.rs) · [RPC adapter](../crates/app/src/desktop/rpc.rs) · [Electron 主进程](../apps/desktop/desktop/main.ts) · [连接](../apps/desktop/src/rpcClient.ts) · [同步归约](../apps/desktop/src/sync.ts) · [Store 状态与连接同步](../apps/desktop/src/sessionStore.ts)。协议声明的更新步骤见[开发指南](development.md#协议更新)。
 
 <a id="execution"></a>
 ## 7. 一次发送的完整执行主链
@@ -346,15 +348,22 @@ sequenceDiagram
             WB-->>UI: RPC 错误，输入保留
         else 历史读取成功
             WB->>WB: begin_turn<br/>冻结历史、推进水位并启动 worker
-            WB-->>UI: 空结果（RPC 成功即接受）<br/>后台 worker 继续
             WB->>Conv: reservation.execute() → run_chain()
-            Conv->>Conv: run_single_turn<br/>打开写者，交给 TurnRunner
-            Conv-->>WB: 单轮事件持续回传
-            WB-->>UI: StreamEnvelope 实时更新
-            Conv->>Conv: 根据终态<br/>决定是否执行下一条
-            Conv-->>WB: 执行链返回
-            WB->>WB: on_session_settled<br/>清空冻结历史、释放预订
-            WB-->>UI: session_settled<br/>读取最终历史
+            Conv->>Conv: 准备回合并保存文字、图片
+            alt 本次输入保存失败或准备失败
+                Conv-->>WB: 执行错误
+                WB->>WB: 结算并释放预订
+                WB-->>UI: RPC 错误，保留草稿
+            else 本次输入已保存
+                Conv-->>WB: UserMessage（匹配预订的条目身份）
+                WB-->>UI: 消息事件及 RPC 成功，清空未改动的草稿
+                Conv-->>WB: 模型与工具执行事件持续回传
+                WB-->>UI: StreamEnvelope 实时更新
+                Conv->>Conv: 根据终态决定是否执行下一条
+                Conv-->>WB: 执行链返回
+                WB->>WB: on_session_settled<br/>清空冻结历史、释放预订
+                WB-->>UI: session_settled<br/>读取最终历史
+            end
         end
     end
 ```
@@ -386,7 +395,7 @@ sequenceDiagram
     Runner-->>Conv: 已提交的终态事件<br/>Result：TurnOutcome 或 TurnRunError
 ```
 
-`TurnRunner` 持有单回合生命周期，`Conversation` 持有普通排队输入和 steer 输入箱；一个回合可包含多个模型请求。`prepare_turn` 在会话写入窗口内完成模型、指令和 Agent 准备，成功写入 `operation_started` 后，Conversation 才移交本轮输入并开放 Running 控制窗口；准备失败时排队输入仍保持原位。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 直接交回 `Result<TurnOutcome, TurnRunError>`，执行链依据结果中的停止标志和失败状态结束；未消费的 steer 仍由 Conversation 持有。Session 追加成功后返回 `CommittedEntry`（条目 ID 与落盘时间戳），Runner 直接使用提交时间构造开始和终态事件。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。动作 RPC 确认是否接受；队列编辑另返回取回的完整输入，执行事实由后续事件与快照提供。
+`TurnRunner` 持有单回合生命周期，`Conversation` 持有普通排队输入和 steer 输入箱；一个回合可包含多个模型请求。`prepare_turn` 在会话写入窗口内完成模型、指令和 Agent 准备，成功写入 `operation_started` 后，Conversation 才移交本轮输入并开放 Running 控制窗口；准备失败时排队输入仍保持原位。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 直接交回 `Result<TurnOutcome, TurnRunError>`，执行链依据结果中的停止标志和失败状态结束；未消费的 steer 仍由 Conversation 持有。Session 追加成功后返回 `CommittedEntry`（条目 ID 与落盘时间戳），Runner 直接使用提交时间构造开始和终态事件。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。空闲任务的 session.submit 等到本次文字和图片落盘才返回成功，准备或保存失败在操作结算后返回原错误；回执按预订的条目身份匹配 UserMessage，不等待模型或工具。前端仅在成功且草稿未被继续编辑时清空输入。排队与插话 RPC 仍按进程内接受结果返回；队列编辑返回取回的完整输入，执行事实由后续事件与快照提供。
 
 源码：[Store.submit](../apps/desktop/src/appStore.ts) · [AppServer.submit](../crates/app/src/desktop/app_server/actions.rs) · [spawn_operation](../crates/app/src/desktop/app_server.rs) · [Conversation.run_chain / run_single_turn](../crates/runtime/src/conversation/execution.rs) · [TurnRunner.run / 终态提交](../crates/runtime/src/runner.rs)。
 

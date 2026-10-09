@@ -101,7 +101,7 @@ export function Conversation({ state, items }: Props) {
     if (state.sessionLoad.status === 'error' && state.sessionLoad.error !== null) {
       return (
         <Empty title="任务读取失败" body={state.sessionLoad.error.message}>
-          <p className="empty-recovery">{state.sessionLoad.error.recovery}</p>
+          {state.sessionLoad.error.recovery && <p className="empty-recovery">{state.sessionLoad.error.recovery}</p>}
           <button type="button" className="secondary-button" onClick={() => appStore.retrySession()}>重试读取</button>
         </Empty>
       )
@@ -125,11 +125,6 @@ export function Conversation({ state, items }: Props) {
           </button>
         )}
         {items.map(item => <TimelineItem key={item.key} item={item} sessionId={sessionId ?? undefined} />)}
-        {(state.session.runtime.phase === 'stopping' || state.session.runtime.phase === 'compacting') && (
-          <div className="turn-activity" role="status">
-            {state.session.runtime.phase === 'stopping' ? 'stopping…' : 'compacting…'}
-          </div>
-        )}
       </div>
 
     </div>

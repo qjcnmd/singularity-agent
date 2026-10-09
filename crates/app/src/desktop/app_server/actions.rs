@@ -9,7 +9,8 @@ impl AppServer {
         self.catalog.image_data(session_id, image_id).map_err(catalog_error)
     }
 
-    /// 接受输入并启动后台执行；返回成功表示已接受，终态通过会话事件发布。
+    /// 启动后台执行并等待本次输入保存；RPC 阻塞线程只等本地提交，不等待模型或工具。
+    /// 返回失败时前端保留草稿，执行终态仍通过会话事件发布。
     pub fn submit(self: &Arc<Self>, session_id: &str, input: UserInput) -> Result<(), RpcError> {
         singularity_runtime::validate_input(&input).map_err(control_error)?;
         // 查找或创建 slot 和建立执行预订属于同一段生命周期交接，归档或移除插不进这两步之间。
@@ -20,8 +21,10 @@ impl AppServer {
             (slot, reservation)
         };
         self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
-        self.spawn_operation(session_id, slot, reservation);
-        Ok(())
+        let item_id = reservation.submitted_item_id().expect("reserve_start binds submitted input");
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        self.spawn_operation(session_id, slot, reservation, Some(SubmissionReceipt { item_id, sender }));
+        receiver.recv().expect("operation reports submitted input commit or failure")
     }
 
     pub fn answer_question(
@@ -89,7 +92,7 @@ impl AppServer {
                 // 生命周期交接已经由预订做完，后面的读盘和启动不再占全局临界区。
                 drop(lifecycle);
                 self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
-                self.spawn_operation(session_id, slot, reservation);
+                self.spawn_operation(session_id, slot, reservation, None);
                 Ok(())
             }
         }
@@ -151,7 +154,7 @@ impl AppServer {
         self.begin_operation(session_id, &slot, |state, history| {
             state.begin_compaction(history, now_iso());
         })?;
-        self.spawn_operation(session_id, slot, reservation);
+        self.spawn_operation(session_id, slot, reservation, None);
         Ok(())
     }
 

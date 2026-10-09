@@ -3,11 +3,11 @@ export const actionOrigin = {
   session: (id: string | null) => `session:${id}`,
   workspace: (id: string | null) => `workspace:${id}`,
   control: (sessionId: string | null, controlId: string) => `control:${sessionId}:${controlId}`,
-  provider: (id: string) => `provider:${id}`,
+  inline: (method: string, id: string | null) => `inline:${method}:${id}`,
   directoryPicker: 'directory:picker',
 }
 
-const inlineActionPrefixes = [actionOrigin.control('', ''), actionOrigin.provider('')]
+const inlineActionPrefixes = [actionOrigin.control('', ''), actionOrigin.inline('', '')]
   .map(key => key.slice(0, key.indexOf(':') + 1))
 
 /** 这些动作在对应控件显示错误；目录选择器的错误仍显示在工作台。 */

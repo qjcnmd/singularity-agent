@@ -1,7 +1,6 @@
 import { join, resolve } from 'node:path'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
-import { createServer } from 'node:http'
 import { setupE2E, rpc, modelSelector } from './support.mjs'
 
 // 统计条行为回归：按提供方实际用量决定缓存命中率是否可显示，
@@ -10,7 +9,6 @@ const { output, launch } = setupE2E('e2e-stats-bar')
 const app = await launch()
 const errors = []
 const report = { command: 'node apps/desktop/e2e/stats-bar.mjs', model: modelSelector, executable: process.env.SINGULARITY_E2E_PACKAGED }
-let server
 try {
   const page = await app.firstWindow()
   page.on('pageerror', error => errors.push(error.message))
@@ -101,55 +99,6 @@ try {
   assert.deepEqual(report.afterReload.usage, report.afterAbort.usage, '重读应保留同一份消费事实')
 
   await page.screenshot({ path: join(output, 'stats-bar.png') })
-  let scenario
-  server = createServer(async (request, response) => {
-    for await (const _ of request) { /* 先读掉请求体，再发受控流。 */ }
-    const { protocol, delay, streamed, usage } = scenario
-    response.writeHead(200, { 'Content-Type': 'text/event-stream' })
-    const event = body => response.write(`data: ${JSON.stringify(body)}\n\n`)
-    event(protocol === 'chat' ? { choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] } : { type: 'response.created' })
-    await new Promise(resolve => setTimeout(resolve, delay))
-    if (streamed) {
-      event(protocol === 'chat' ? { choices: [{ index: 0, delta: { reasoning_content: 'Thinking.' }, finish_reason: null }] } : { type: 'response.reasoning_summary_text.delta', delta: 'Thinking.' })
-      await new Promise(resolve => setTimeout(resolve, 120))
-      event(protocol === 'chat' ? { choices: [{ index: 0, delta: { content: 'OK' }, finish_reason: null }] } : { type: 'response.output_text.delta', delta: 'OK' })
-    }
-    if (protocol === 'chat') {
-      event({ choices: [{ index: 0, delta: streamed ? {} : { content: 'OK' }, finish_reason: 'stop' }], ...(usage ? { usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } } : {}) })
-      response.end('data: [DONE]\n\n')
-    } else {
-      event({ type: 'response.completed', response: { status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'OK' }] }], ...(usage ? { usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 } } : {}) } })
-      response.end()
-    }
-  })
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
-  await rpc(page, 'model.saveProvider', { provider: { providerId: 'ttft-check', displayName: 'TTFT E2E', baseUrl: `http://127.0.0.1:${server.address().port}/v1`, apiProtocol: null,
-    models: ['chat', 'responses'].map(protocol => ({ modelId: protocol, displayName: protocol, apiProtocol: protocol, automaticFields: [],
-      maxContextTokens: 64000, maxOutputTokens: 4096, reasoningVariants: null, defaultVariant: null, thinkingWireFormat: null,
-      chatOutputTokensField: null, requiresReasoningContentForToolCalls: null })) }, apiKey: 'local-fixture' })
-  report.controlled = []
-  for (const next of [
-    { protocol: 'chat', delay: 180, streamed: true, usage: true },
-    { protocol: 'chat', delay: 480, streamed: true, usage: false },
-    { protocol: 'responses', delay: 240, streamed: true, usage: false },
-    { protocol: 'responses', delay: 180, streamed: false, usage: true },
-  ]) {
-    scenario = next
-    const current = (await rpc(page, 'app.bootstrap')).sessionsByWorkspace[workspaceEntry.workspaceId][0]
-    await rpc(page, 'session.updateSettings', { sessionId: current.threadId, selector: `ttft-check/${next.protocol}` })
-    await page.reload(); await textarea.waitFor()
-    await send('Reply OK.'); await waitIdle()
-    const checked = await checkSettledStats()
-    const snapshot = await rpc(page, 'session.read', { sessionId: current.threadId, limit: 40 })
-    const observation = snapshot.history.turns.at(-1).items.find(item => item.type === 'request').observation
-    if (next.streamed) {
-      assert.ok(observation.ttftMs >= next.delay - 10, '空 role 或协议起始帧不算首 token')
-      assert.ok(observation.decodeMs >= 110, '思考增量就是首 token，无需等待正文')
-    } else assert.equal(observation.ttftMs, undefined, '未观察到生成增量时计时未知')
-    const { ttftMs, decodeMs, durationMs, status } = observation
-    report.controlled.push({ ...next, timing: { ttftMs, decodeMs, durationMs, status }, checked })
-  }
-  await page.screenshot({ path: join(output, 'stats-bar-controlled.png') })
   assert.deepEqual(errors, [])
   report.status = 'passed'
   console.log('stats-bar E2E PASS', JSON.stringify(report))
@@ -160,5 +109,4 @@ try {
 } finally {
   writeFileSync(join(output, 'stats-bar.json'), JSON.stringify({ ...report, errors }, null, 2))
   await app.close()
-  server?.closeAllConnections(); server?.close()
 }

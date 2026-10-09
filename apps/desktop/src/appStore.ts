@@ -1,4 +1,4 @@
-import { SessionStore, type AppState } from './sessionStore'
+import { SessionStore, type AppState, type ActionResult } from './sessionStore'
 import { actionOrigin } from './storeActions'
 export { actionOrigin, hasInlineActionError, pendingKey } from './storeActions'
 export type { AppState, ActionError } from './sessionStore'
@@ -6,8 +6,7 @@ import { effectiveSelector, selectedModel } from './modelChoices'
 import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
-import { RpcFailure } from './rpcClient'
-import { emptyDraft, imageFile, imageUpload, removeDrafts, type Draft } from './drafts'
+import { emptyDraft, imageFile, imageUpload, type Draft } from './drafts'
 import type { DeliveryIntent, ProviderConfigurationInput, RpcMethod, RpcParams, SkillMetadata, ViewportAnchor } from './protocol'
 
 class AppStore extends SessionStore {
@@ -18,7 +17,7 @@ class AppStore extends SessionStore {
     const draft = this.inputDraft()
     const skills = Object.fromEntries(Object.entries(draft.skills ?? {}).filter(([name]) => text.includes(`/${name}`)))
     if (skill !== undefined) skills[skill.name] = skill.path
-    void this.setDraftFor(id, { ...draft, text, skills })
+    void this.drafts.set(id, { ...draft, text, skills })
   }
 
   draft(): string {
@@ -27,13 +26,13 @@ class AppStore extends SessionStore {
 
   inputDraft(): Draft {
     const id = this.state.selectedSessionId
-    return id === null ? emptyDraft : this.state.drafts?.[id] ?? emptyDraft
+    return id === null ? emptyDraft : this.drafts.get(id)
   }
 
   setImages(id: string, images: Draft['images'], append = false): void {
     if (id === this.state.selectedSessionId && this.inputLocked()) return
-    const draft = this.state.drafts?.[id] ?? emptyDraft
-    void this.setDraftFor(id, { ...draft, images: append ? [...draft.images, ...images] : images })
+    const draft = this.drafts.get(id)
+    void this.drafts.set(id, { ...draft, images: append ? [...draft.images, ...images] : images })
   }
 
   /** 排队与取回期间只锁住内容输入，工具栏仍由各自的操作条件决定。 */
@@ -55,16 +54,16 @@ class AppStore extends SessionStore {
     const submitPending = ['session.submit', 'session.followUp', 'session.steer'].some(method => this.isPending(method, actionOrigin.session(state.selectedSessionId)))
     // 按连接、任务读取、运行阶段和在途提交的顺序给出第一项阻止原因。
     let blockedReason: string | null = null
-    if (state.connection !== 'ready') blockedReason = '连接恢复后即可发送，草稿会保留。'
-    else if (state.sessionLoad.status === 'loading') blockedReason = '正在同步任务状态，稍后即可发送。'
-    else if (this.inputLocked()) blockedReason = '请先编辑、删除或发送排队消息。'
+    if (state.connection !== 'ready') blockedReason = '连接未就绪'
+    else if (state.sessionLoad.status === 'loading') blockedReason = '正在读取任务'
+    else if (this.inputLocked()) blockedReason = '已有排队消息'
     else if (state.selectedSessionId !== null && state.session === null) blockedReason = state.sessionLoad.status === 'error'
-      ? '任务读取失败，请点击上方“重试读取”。' : '正在读取任务，稍后即可发送。'
-    else if (phase === 'stopping') blockedReason = '正在停止当前任务，结束后即可发送。'
-    else if (phase === 'reserved') blockedReason = '正在启动任务，稍后可继续发送。'
-    else if (phase === 'compacting') blockedReason = '上下文整理完成后即可发送，也可以先停止整理。'
+      ? '任务读取失败' : '正在读取任务'
+    else if (phase === 'stopping') blockedReason = '正在停止'
+    else if (phase === 'reserved') blockedReason = '正在启动'
+    else if (phase === 'compacting') blockedReason = '正在压缩上下文'
     else if (submitPending) blockedReason = '正在发送…'
-    else if (!(phase === 'running' && intent === 'steer') && !this.modelAvailable()) blockedReason = '请选择模型后发送。'
+    else if (!(phase === 'running' && intent === 'steer') && !this.modelAvailable()) blockedReason = '请选择模型'
     const method = phase === 'running'
       ? intent === 'steer' ? 'session.steer' : 'session.followUp'
       : 'session.submit'
@@ -78,7 +77,7 @@ class AppStore extends SessionStore {
     const draft = this.inputDraft()
     return this.action(method, actionOrigin.session(sessionId), async () => {
       await this.transport.rpc(method, { sessionId, text: draft.text, skills: draft.skills, images: await Promise.all(draft.images.map(imageUpload)) })
-      if (this.state.drafts?.[sessionId] === draft) await this.setDraftFor(sessionId, emptyDraft)
+      await this.drafts.clearIfUnchanged(sessionId, draft)
     })
   }
 
@@ -103,7 +102,7 @@ class AppStore extends SessionStore {
   async editQueuedInput(sessionId: string, controlId: string): Promise<boolean> {
     return this.action('session.queue', actionOrigin.session(sessionId), async () => {
       const input = await this.transport.rpc('session.queueEdit', { sessionId, controlId })
-      await this.setDraftFor(sessionId, {
+      await this.drafts.set(sessionId, {
         text: input.text,
         skills: input.skills,
         images: input.images.map(imageFile),
@@ -117,23 +116,22 @@ class AppStore extends SessionStore {
   }
 
   async renameWorkspace(workspaceId: string, name: string): Promise<boolean> {
-    return this.action('workspace.rename', actionOrigin.workspace(workspaceId),
+    return this.action('workspace.rename', actionOrigin.inline('workspace.rename', workspaceId),
       () => this.transport.rpc('workspace.rename', { workspaceId, name }))
   }
 
   async renameSession(sessionId: string, name: string): Promise<boolean> {
     if (name.trim() === '') return false
-    return this.action('session.rename', actionOrigin.session(sessionId),
+    return this.action('session.rename', actionOrigin.inline('session.rename', sessionId),
       () => this.transport.rpc('session.rename', { sessionId, name }))
   }
 
   async archiveSession(sessionId: string): Promise<boolean> {
-    await this.restoreDrafts()
-    if (this.state.drafts === null) return false
+    if (await this.drafts.load() === null) return false
     return this.action('session.archive', actionOrigin.session(sessionId), async () => {
       await this.transport.rpc('session.archive', { sessionId })
       this.clearSessionAnchors([sessionId])
-      await this.clearDrafts([sessionId], '任务已归档')
+      await this.drafts.remove([sessionId], '任务已归档')
     })
   }
 
@@ -149,11 +147,11 @@ class AppStore extends SessionStore {
   }
 
   async removeWorkspace(workspaceId: string): Promise<boolean> {
-    await this.restoreDrafts()
-    if (this.state.drafts === null) return false
+    const drafts = await this.drafts.load()
+    if (drafts === null) return false
     const sessions = this.state.bootstrap?.sessionsByWorkspace[workspaceId] ?? []
-    const draftSessionIds = Object.keys(this.state.drafts)
-    return this.action('workspace.remove', actionOrigin.workspace(workspaceId), async () => {
+    const draftSessionIds = Object.keys(drafts)
+    return this.action('workspace.remove', actionOrigin.inline('workspace.remove', workspaceId), async () => {
       const removedDrafts = await this.transport.rpc('workspace.remove', { workspaceId, draftSessionIds })
       this.clearSessionAnchors([...sessions.map(session => session.threadId), ...removedDrafts])
       const workspaceAppearance = { ...this.state.workspaceAppearance }
@@ -161,17 +159,17 @@ class AppStore extends SessionStore {
       this.saveView({ workspaceAppearance, sidebarView: {
         collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceId),
       } })
-      await this.clearDrafts(removedDrafts, '项目已移除')
+      await this.drafts.remove(removedDrafts, '项目已移除')
     })
   }
 
-  async saveProvider(provider: ProviderConfigurationInput, apiKey?: string): Promise<boolean> {
-    return this.action('model.saveProvider', actionOrigin.provider(provider.providerId),
+  async saveProvider(provider: ProviderConfigurationInput, apiKey?: string): Promise<ActionResult> {
+    return this.actionResult('model.saveProvider', actionOrigin.inline('model.saveProvider', provider.providerId),
       () => this.transport.rpc('model.saveProvider', { provider, apiKey: apiKey || undefined }))
   }
 
   async removeProvider(providerId: string): Promise<boolean> {
-    return this.action('model.removeProvider', actionOrigin.provider(providerId),
+    return this.action('model.removeProvider', actionOrigin.inline('model.removeProvider', providerId),
       () => this.transport.rpc('model.removeProvider', { providerId }))
   }
 
@@ -229,19 +227,6 @@ class AppStore extends SessionStore {
       delete viewportAnchors[id]
     }
     this.saveView({ viewportAnchors })
-  }
-
-  private async clearDrafts(ids: string[], completed: string): Promise<void> {
-    try {
-      await removeDrafts(ids)
-    } catch (error) {
-      throw new RpcFailure('storage', `${completed}，但草稿清理失败：${error instanceof Error ? error.message : String(error)}`, '草稿仍保存在本机，请检查本地存储状态。')
-    }
-    if (this.state.drafts !== null) {
-      const drafts = { ...this.state.drafts }
-      for (const id of ids) delete drafts[id]
-      this.patch({ drafts })
-    }
   }
 
   private async sessionAction<M extends RpcMethod>(

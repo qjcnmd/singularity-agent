@@ -50,8 +50,6 @@ pub struct TurnRunner {
     /// 快照，不长期缓存配置。
     models: Arc<ModelConfigManager>,
     mcp: Arc<singularity_mcp::McpManager>,
-    #[cfg(test)]
-    provider_override: Option<Arc<dyn Provider + Send + Sync>>,
 }
 
 impl TurnRunner {
@@ -66,21 +64,12 @@ impl TurnRunner {
             user_questions: false,
             models,
             mcp,
-            #[cfg(test)]
-            provider_override: None,
         }
     }
 
     /// 声明宿主能显示问题并提交答案。
     pub fn with_user_questions(mut self) -> Self {
         self.user_questions = true;
-        self
-    }
-
-    /// 测试注入：覆写模型执行的 provider；设置修改仍校验磁盘配置中的 selector。
-    #[cfg(test)]
-    pub(crate) fn with_provider_override(mut self, provider: Arc<dyn Provider + Send + Sync>) -> Self {
-        self.provider_override = Some(provider);
         self
     }
 
@@ -251,10 +240,6 @@ impl TurnRunner {
         Ok((provider, config))
     }
     fn resolve_provider(&self, thread: &Thread) -> Result<Arc<dyn Provider + Send + Sync>, TurnRunError> {
-        #[cfg(test)]
-        if let Some(provider) = &self.provider_override {
-            return Ok(Arc::clone(provider));
-        }
         let snapshot = self.models.snapshot();
         Ok(Arc::new(
             singularity_model::OpenAiProvider::from_snapshot(&snapshot, thread.model.as_deref())

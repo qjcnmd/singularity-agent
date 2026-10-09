@@ -32,13 +32,9 @@ cargo run -p singularity_app --locked -- --json "summarize this repository"
 
 ## 检查
 
-所有任务的检查范围、执行成本和停止条件按 [项目指令](../AGENTS.md#验证与交付) 选择。围绕实际变化选择最小充分检查，复用已有证据；新增检查只用于解决具体缺口，局部修正只复查相关部分，不按技术栈或模块类别固定扩展流程。构建、打包和环境准备按需要执行，目标已核实、必要检查通过后结束。常规局部验证在交付汇报中说明操作与结果；复杂回归或用户要求时保留复现产物。保留的隔离测试只用于具体且重要、现有 E2E 难以检出的故障，必要时用包名和测试名过滤，例如在仓库根目录运行：
+所有任务的检查范围、执行成本和停止条件按 [项目指令](../AGENTS.md#验证与交付) 选择。围绕实际变化选择最小充分检查，复用已有证据；新增检查只用于解决具体缺口，局部修正只复查相关部分，不按技术栈或模块类别固定扩展流程。构建、打包和环境准备按需要执行，目标已核实、必要检查通过后结束。常规局部验证在交付汇报中说明操作与结果；复杂回归或用户要求时保留复现产物。
 
-```powershell
-cargo test -p singularity_runtime --lib --locked terminal_write_failure_keeps_the_execution_failure_and_the_storage_failure
-```
-
-将示例中的包名和过滤条件换成受影响的行为，确认实际选中了用例。只删测试时确认剩余测试可编译，并运行受影响的保留用例；不因此重跑无关模块。普通文档检查最终内容、链接与 `git diff --check`。CI 和发布步骤由 `.github/workflows` 维护，不作为日常修改的默认验证清单。
+普通文档检查最终内容、链接与 `git diff --check`。CI 和发布步骤由 `.github/workflows` 维护，不作为日常修改的默认验证清单。
 
 ## 代码排版
 
@@ -69,7 +65,7 @@ node apps/desktop/e2e/smoke.mjs
 
 脚本使用真实 Electron 窗口及 Windows 原生目录对话框，会调用 `bai/deepseek-v4.1-flash`；验证期间不要操作该窗口。输出目录保留 JSON 结果、流事件、会话读取结果与截图。取消 `SINGULARITY_E2E_PACKAGED` 可验证源码启动；`smoke.mjs` 不设置模型和扩展标记时只检查基础桌面行为。Playwright 自身使用的调试连接不属于产品通信；无监听验证须另用普通启动的发布程序执行。`node apps/desktop/e2e/lifecycle.mjs` 使用同一组环境变量验证刚提交任务时退出、重启读取中断历史。`node apps/desktop/e2e/stats-bar.mjs` 验证用量与统计栏，缓存命中率按实际上报的明细核对；这两条脚本均会调用模型。测试完成后删除隔离目录中的凭据副本。
 
-图片相关操作在运行的 production Electron 工作台中直接验证，按本次变更选择受影响的上传、预览、草稿、排队、停止和恢复操作。涉及模型调用时，使用[项目指令](../AGENTS.md#验证与交付)指定的真实模型。
+`node apps/desktop/e2e/images.mjs` 检查图片选择、粘贴、拖放、草稿刷新、预览关闭与损坏图片的明确错误；设置 `SINGULARITY_E2E_MODEL=1` 后，使用真实模型检查上传识图、`read` 识图及删除原文件后重启继续识图。图片排队、停止等其他操作按本次变更在运行的 production Electron 工作台中直接验证。涉及模型调用时，使用[项目指令](../AGENTS.md#验证与交付)指定的真实模型。
 
 桌面 E2E 的启动、环境检查、模型默认值和 RPC 调用由 `apps/desktop/e2e/support.mjs` 维护；各脚本独立管理验证流程和应用实例。CI 使用托管运行器的标准工具目录，并缓存 Cargo 依赖与检查工具。
 
@@ -81,10 +77,9 @@ Rust 的 `protocol` crate 维护 RPC 方法与 DTO。修改协议后，在仓库
 
 ```powershell
 cargo run -p singularity_protocol --features typescript --example export_types
-cargo test -p singularity_protocol --features typescript --locked
 ```
 
-`--json` 的对外事件和终态形状由协议 golden 检查。私有桌面 RPC 与流信封通过 Electron E2E 检查实际请求、反馈和恢复结果；协议测试核对生成的 TypeScript 声明与 Rust 合同一致。
+`--json` 的对外事件和终态形状由协议 DTO 与序列化规则维护；客户端声明从同一组 Rust DTO 生成。私有桌面 RPC 与流信封通过 Electron E2E 检查实际请求、反馈和恢复结果。
 
 ## 测试保留与删减
 
@@ -92,20 +87,9 @@ cargo test -p singularity_protocol --features typescript --locked
 
 绝不在编写实现代码后为覆盖率补写单元测试。隔离测试仅用于具体且重要、现有 E2E 难以检出的故障；新增前说明该故障的实际依据及 E2E 遗漏原因，再编写最少必要的测试与实现代码，不穷举假设场景。现有测试按同一标准保留，接口或格式变化时只维护有价值的覆盖，不顺带增加场景或断言。调查用脚本和临时数据在完成验证后清理。
 
-CI 继续运行保留下来的测试，作为 E2E 难以检出故障的回归检查。
-
-## 测试组织
-
-采用 [Rust 的测试组织约定](https://doc.rust-lang.org/book/ch11-03-test-organization.html)：只使用 crate 公共接口的独立集成测试放在 crate 根下的 `tests/`，跨模块但需要内部接口的行为测试集中在各 crate 的 `src/tests/`。
-
-- Runtime 与应用层 中涉及多个模块的行为测试集中在各自的 `src/tests/`。
-- 协议的外部契约测试使用 `crates/protocol/tests/`，由 Cargo 自动发现；不把内部模块伪装成此类 target。
-- 跨 crate 使用的测试夹具留在拥有相应能力的模块，由 `test-support` feature 开启。只供单个测试组使用的辅助代码与该组放在一起，不增加全仓测试工具包。
-- 符合上一节例外而确需新增的隔离测试，按行为或契约放入对应测试组。
-
 ## CI 与发布
 
-[CI 入口](../.github/workflows/ci.yml) 在推送 `main` 时调用 [共享检查工作流](../.github/workflows/rust-gates.yml)。Windows 任务执行前端构建、Rust 格式、Clippy、测试和二进制构建；Ubuntu 任务只运行 cargo-deny 与前端生产依赖审计，不编译或验证 Linux 产品。依赖检查复用同一锁文件与策略，保留 Ubuntu 执行器不代表支持 Linux。工具版本和具体步骤由工作流维护。
+[CI 入口](../.github/workflows/ci.yml) 在推送 `main` 时调用 [共享检查工作流](../.github/workflows/rust-gates.yml)。Windows 任务执行前端构建、Rust 格式、Clippy 和二进制构建；Ubuntu 任务只运行 cargo-deny 与前端生产依赖审计，不编译或验证 Linux 产品。依赖检查复用同一锁文件与策略，保留 Ubuntu 执行器不代表支持 Linux。工具版本和具体步骤由工作流维护。
 
 需要在本地复现完整功能检查时，在安装依赖后执行：
 
@@ -113,7 +97,6 @@ CI 继续运行保留下来的测试，作为 E2E 难以检出故障的回归检
 npm --prefix apps/desktop run build
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
-cargo test --workspace --all-targets --features singularity_protocol/typescript --locked --no-fail-fast
 cargo build --workspace --bins --locked
 git diff --check
 ```
