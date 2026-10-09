@@ -317,7 +317,7 @@ flowchart LR
 
 普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受与消费共同更新 `Conversation` 的当前投影；AppServer 在接受及真实消费边界通过既有 `session_changed` 快照发布该事实，不另存一份控制生命周期。完整工作台替换快照的构造和发布仍串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。不可读取或版本与请求标识不匹配的 RPC 响应与不可达、被拒绝同属连接级失败：基线读取失败不宣告就绪，下一轮有效基线才收敛。
 
-项目、任务目录和模型配置 mutation 以服务端随操作发布的 `app_changed` 完整快照为权威。修改类 RPC 成功只返回空结果，只有创建动作返回动作本身需要的新身份（`workspace.add` 的 workspaceId、`session.create` 的读取结果），不再额外请求 bootstrap，也不另造目录或摘要回执。创建 RPC 返回前到达的目录帧先缓冲；返回的新任务身份保留到包含它的目录快照到达。`session_settled` 仍触发任务终态读取和目录刷新，重同步通知或页面刷新则走完整 resync。
+项目、任务目录和模型配置 mutation 以服务端随操作发布的 `app_changed` 完整快照为权威。修改类 RPC 成功只返回空结果，只有创建动作返回动作本身需要的新身份（`workspace.add` 的 workspaceId、`session.create` 的读取结果），不再额外请求 bootstrap，也不另造目录或摘要回执。创建 RPC 返回前到达的目录帧先缓冲；返回的新任务身份保留到包含它的目录快照到达。`session_settled` 仍触发任务终态读取和目录刷新，重同步通知或页面刷新则走完整 resync。RPC bootstrap 读取与完整快照发布共用 `app_publication` 临界区，配置内容与序号在同一发布边界内绑定。
 
 `protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`TurnEventEnvelope` 为执行事件补充会话版本号，事件的 wire 形状由协议 golden 验证。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与基线同步，组件使用生产单例。`sessionStore.ts` 拥有任务选择、创建、草稿转移、历史读取和同步的完整过程：选择序号、读取接纳、身份保护及缓冲释放均在内部维护。`appStore.ts` 通过任务身份和操作意图调用导航入口，维护提交、设置和视图偏好等工作台动作。
 
@@ -395,16 +395,17 @@ sequenceDiagram
 
 ```mermaid
 flowchart TB
-    Input["Agent.run_loop<br/>展开技能引用，保存 user 消息"] --> Cancel{"已取消？"}
+    Input["Agent.run<br/>先交付较早 steer，再保存新提交"] --> Cancel{"已取消？"}
     Cancel -->|"是"| Abort["返回 interrupted"]
-    Cancel -->|"否"| Inbox["drain inbox<br/>steer 写入用户消息与控制归宿"]
-    Inbox --> Prepare["prepare_request<br/>刷新指令、计算压力、必要时缩减"]
+    Cancel -->|"否"| Inbox["逐条保存 steer<br/>保存成功后从 inbox 确认移除"]
+    Inbox -->|"保存失败，保留未提交输入"| Failure
+    Inbox -->|"保存成功"| Prepare["prepare_request<br/>刷新指令、计算压力、必要时缩减"]
     Prepare --> Request["request_execution::execute_request 的显式重试循环<br/>生成与摘要共用执行、记录每次尝试"]
     Request -->|"错误 / 取消"| Failure["保留具体失败原因或返回中断"]
     Request -->|"归一回复"| Assistant["保存 assistant 消息并发布完成事件<br/>正文、thinking、工具调用、协议续接数据"]
     Assistant --> Calls{"有工具调用？"}
-    Calls -->|"无"| Stop["记录截断标记，正文已随消息落盘<br/>take_at_stop 检查停止窗口的 steer"]
-    Stop -->|"仍有输入"| Inbox
+    Calls -->|"无"| Stop["记录截断标记，正文已随消息落盘<br/>close_if_empty 原子检查并关闭空箱子"]
+    Stop -->|"仍有输入"| Cancel
     Stop -->|"没有输入，关闭 inbox"| Completed["聚合用量，返回 completed"]
     Calls -->|"有，但模型输出截断"| Truncated["工具派发入口提交失败结果<br/>不执行不完整调用"]
     Truncated --> Cancel
@@ -417,7 +418,7 @@ flowchart TB
 
 工具自身失败成为 `is_error` 结果供模型决定下一步；会话写入失败通过错误通道停止执行。运行中输入在模型步边界或自然停止窗口注入，已经发出的模型请求不会被改写。
 
-源码：[Agent.run_loop / inject_controls](../crates/agent/src/agent/mod.rs) · [请求准备 / run_turn](../crates/agent/src/agent/request.rs) · [请求执行](../crates/agent/src/request_execution.rs) · [SteeringInbox](../crates/agent/src/agent/inbox.rs) · [AgentEvent](../crates/agent/src/events.rs) · [公共事件投影](../crates/runtime/src/assistant_items.rs)。
+源码：[Agent.run / inject_controls](../crates/agent/src/agent/mod.rs) · [请求准备 / run_turn](../crates/agent/src/agent/request.rs) · [请求执行](../crates/agent/src/request_execution.rs) · [SteeringInbox](../crates/agent/src/agent/inbox.rs) · [AgentEvent](../crates/agent/src/events.rs) · [公共事件投影](../crates/runtime/src/assistant_items.rs)。
 
 <a id="controls"></a>
 ## 9. 控制队列与执行窗口
@@ -468,7 +469,7 @@ flowchart TB
     Queue -->|"当前轮失败或停止"| Wait["保持原位<br/>等待用户操作"]
 ```
 
-Conversation 持有唯一排队输入与 SteeringInbox，各次执行借用输入箱处理已经发送的 steer；普通提交直接绑定执行预订。ControlRequest 的 sequence 决定 steer 接受顺序和公开控制身份。编辑、删除和发送必须同时携带会话与消息身份，避免切换会话时改变操作对象。编辑返回完整文字和图片，由工作台保存为该会话草稿；其余队列操作通过会话快照反映结果。排队及取回 RPC 完成前，内容输入保持只读。
+Conversation 持有唯一排队输入与 SteeringInbox，各次执行借用输入箱处理已经发送的 steer；普通提交直接绑定执行预订。ControlRequest 的 sequence 决定 steer 接受顺序和公开控制身份，接受时分配的消息身份在保存重试期间保持不变。输入按接受序号保留在箱内，Agent 在不持有输入箱锁的情况下保存文字和图片，保存成功后按身份确认消费；失败时当前及后续未确认输入仍由箱子持有。重开日志已恢复的消息只确认消费，不重复追加或发布到新回合。编辑、删除和发送必须同时携带会话与消息身份，避免切换会话时改变操作对象。编辑返回完整文字和图片，由工作台保存为该会话草稿；其余队列操作通过会话快照反映结果。排队及取回 RPC 完成前，内容输入保持只读。
 
 模型请求失败、停止或准备与存储失败均结束执行链，尚未移交的普通排队消息保持原位。已写入历史的输入随历史保留；未消费的 steer 保留在原输入箱，下一次执行先按接受顺序消费较早的 steer，再纳入新提交；它们不转为普通排队消息，也不主动启动新执行。用户明确停止仍取消当前尚未消费的 steer。刷新窗口通过当前快照读取队列，程序退出后不恢复内存输入。
 

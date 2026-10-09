@@ -1,6 +1,6 @@
 //! 会话持有的 steer 输入箱，活动 turn 借用它的接受窗口。
 //!
-//! enqueue、drain 与 take_at_stop 都在调用方持有的同一把 Mutex 内执行。
+//! 接受、确认消费与停止窗口的关闭都在同一把 Mutex 内执行；保存期间不持锁。
 //! 请求失败关闭当前接受窗口，尚未消费的输入留待下一次执行。用户停止取消当前 steer。
 //! 输入仅随进程存在，交付时才保存为普通用户消息。
 
@@ -70,14 +70,24 @@ impl UserInput {
     }
 }
 
-/// 进程内已接受的输入：序号确定顺序和身份，正文只保存一份。
+/// 进程内已接受的输入：序号确定控制顺序和身份，消息身份在重试期间保持不变。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControlRequest {
     pub sequence: u64,
     pub input: UserInput,
+    pub(super) message_id: String,
 }
 
 impl ControlRequest {
+    /// 接受输入时分配消息身份，复制与保存失败后的重试沿用同一身份。
+    pub fn new(sequence: u64, input: UserInput) -> Self {
+        Self {
+            sequence,
+            input,
+            message_id: crate::session::new_entry_id(),
+        }
+    }
+
     /// 进程内接受序号同时确定不透明控制身份，不另存一份字符串。
     pub fn control_id(&self) -> String {
         self.sequence.to_string()
@@ -116,33 +126,29 @@ impl SteeringInbox {
         if self.closed {
             return false;
         }
-        self.entries.push(request);
+        // 较早排队的输入可能在较晚的 steer 之后才被发送，按接受序号插入。
+        let index = self.entries.partition_point(|entry| entry.sequence < request.sequence);
+        self.entries.insert(index, request);
         true
     }
 
-    /// 取走所有未交付条目，按 sequence 升序返回（FIFO 以它为准）。
-    pub fn drain(&mut self) -> Vec<ControlRequest> {
-        let mut drained = std::mem::take(&mut self.entries);
-        drained.sort_by_key(|request| request.sequence);
-        drained
+    /// 借出最早输入的保存副本；原输入一直归箱子持有，直到保存成功。
+    pub(super) fn next(&self) -> Option<ControlRequest> {
+        self.entries.first().cloned()
     }
 
-    /// 新提交前先交付较早接受的 steer，保持跨执行的输入顺序。
-    pub(super) fn drain_before(&mut self, sequence: u64) -> Vec<ControlRequest> {
-        let (earlier, later) = self.drain().into_iter().partition(|request| request.sequence < sequence);
-        self.entries = later;
-        earlier
+    /// 保存期间允许停止清空箱子或发送较早的排队输入，因此按身份确认，而非移除队首。
+    pub(super) fn acknowledge(&mut self, sequence: u64) {
+        self.entries.retain(|request| request.sequence != sequence);
     }
 
-    /// turn 自然停止处的原子屏障：箱内已有输入就保持开启，交给下一轮消费；箱为空则
-    /// 关闭本轮接受窗口，此后的 steer 明确拒绝。
-    pub(super) fn take_at_stop(&mut self) -> Option<Vec<ControlRequest>> {
-        if self.entries.is_empty() {
-            self.closed = true;
-            None
-        } else {
-            Some(self.drain())
+    /// 自然停止处的原子屏障：仅在箱子为空时关闭窗口，有输入则留给下一轮消费。
+    pub(super) fn close_if_empty(&mut self) -> bool {
+        if !self.entries.is_empty() {
+            return false;
         }
+        self.closed = true;
+        true
     }
 
     /// 查找仍未消费的图片，预览不改变队列。
@@ -154,7 +160,7 @@ impl SteeringInbox {
             .cloned()
     }
 
-    /// 关闭注入箱：此后的输入被拒绝；已收下但未交付的条目仍留待 drain 取走。
+    /// 关闭注入箱：此后的输入被拒绝；已收下但未保存的条目留待下次执行。
     pub fn close(&mut self) {
         self.closed = true;
     }

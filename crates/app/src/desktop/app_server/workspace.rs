@@ -13,10 +13,12 @@ use crate::desktop::workspace_store::WorkspaceError;
 
 impl AppServer {
     pub fn bootstrap(&self) -> Result<AppBootstrap, RpcError> {
+        let _publication = self.lock_app_publication();
         let catalog = self.models.redacted_catalog();
         self.bootstrap_with_catalog(catalog)
     }
 
+    /// 调用方持有发布锁，使配置读取、快照构造和序号绑定不与配置保存交错。
     pub(super) fn bootstrap_with_catalog(
         &self,
         model_catalog: RedactedModelCatalog,

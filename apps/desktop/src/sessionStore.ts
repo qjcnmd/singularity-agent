@@ -149,8 +149,13 @@ export class SessionStore {
       this.saveSelection()
       if (transferDraft && sourceKey !== null && sourceKey !== session.history.summary.threadId) {
         const draft = this.state.drafts?.[sourceKey] ?? emptyDraft
-        if (hasDraft(draft) && await this.setDraftFor(session.history.summary.threadId, draft)
-          && this.state.drafts?.[sourceKey] === draft) await this.setDraftFor(sourceKey, emptyDraft)
+        if (hasDraft(draft)) {
+          const saved = await this.setDraftFor(session.history.summary.threadId, draft)
+          // 目标保存成功才清空源；保存期间修改过的源草稿仍保留。
+          if (saved && this.state.drafts?.[sourceKey] === draft) {
+            await this.setDraftFor(sourceKey, emptyDraft)
+          }
+        }
       }
       createdSessionId = session.history.summary.threadId
     })
@@ -191,8 +196,13 @@ export class SessionStore {
     if (hasDraft(draft)) drafts[key] = draft
     else delete drafts[key]
     this.patch({ drafts })
-    try { await persistDraft(key, draft); return true }
-    catch { this.reportError(new RpcFailure('storage', '草稿暂时只能保留在当前页面。', '请保留页面并检查本地存储空间后重试。'), actionOrigin.session(key)); return false }
+    try {
+      await persistDraft(key, draft)
+      return true
+    } catch {
+      this.reportError(new RpcFailure('storage', '草稿暂时只能保留在当前页面。', '请保留页面并检查本地存储空间后重试。'), actionOrigin.session(key))
+      return false
+    }
   }
 
   /** 业务读取失败由 sessionLoad 展示；原始错误返回给 resync，供它处理连接失败。 */

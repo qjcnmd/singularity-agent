@@ -104,8 +104,14 @@ impl AssistantItemEvents {
                     read_source: execution.read_source,
                 });
             }
-            AgentEvent::Diagnostic(diagnostic) => {
-                sink(self.diagnostic_event(diagnostic));
+            AgentEvent::Diagnostic(AgentDiagnostic { severity, code, message }) => {
+                sink(TurnEvent::Diagnostic {
+                    thread_id: self.thread_id.clone(),
+                    turn_id: Some(self.turn_id.clone()),
+                    severity,
+                    code,
+                    message,
+                });
             }
             AgentEvent::ProviderAttempt { observation } => {
                 sink(TurnEvent::ProviderAttempt {
@@ -128,17 +134,6 @@ impl AssistantItemEvents {
             // ControlChanged 在 runner 的执行循环里就被截获并更新控制投影，
             // 到不了条目投影。
             AgentEvent::ControlChanged => {}
-        }
-    }
-
-    fn diagnostic_event(&self, diagnostic: AgentDiagnostic) -> TurnEvent {
-        let AgentDiagnostic { severity, code, message } = diagnostic;
-        TurnEvent::Diagnostic {
-            thread_id: self.thread_id.clone(),
-            turn_id: Some(self.turn_id.clone()),
-            severity,
-            code,
-            message,
         }
     }
 

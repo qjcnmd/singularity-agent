@@ -1,7 +1,7 @@
 //! Agent 的核心执行循环：模型调用、工具执行与转向输入都汇聚在这里。
 //!
-//! 每轮组装请求、调用 provider 并执行工具；模型准备结束时，原子地取走停止窗口内
-//! 新到的转向输入或关闭窗口，决定继续还是完成。
+//! 每轮组装请求、调用 provider 并执行工具；转向输入保存成功后才确认消费。模型准备
+//! 结束时，仅在输入箱为空时原子关闭接受窗口，否则继续下一轮。
 //!
 //! 上下文压缩有两个触发点：发送前按会话上下文估价与本轮实测校正主动压缩；provider
 //! 明确返回 ContextLengthExceeded 时强制压缩后重发。重发机会每个轮步只有一次，重发
@@ -164,9 +164,8 @@ impl Agent {
             truncated: false,
             terminal_reason: AgentTerminalReason::Completed,
         };
-        let earlier = lock_inbox(&self.inbox).drain_before(input.sequence);
-        self.inject_controls(earlier, on_event).await?;
-        self.append_user_input(&input.input, on_event).await?;
+        self.inject_controls(Some(input.sequence), on_event).await?;
+        self.append_user_input(input, on_event).await?;
 
         let loaded = self.config.initial_instructions.take();
         self.apply_instructions(loaded, on_event);
@@ -176,9 +175,7 @@ impl Agent {
             if cancellation.is_cancelled() {
                 return Ok(abort_outcome(outcome));
             }
-            // 把转向队列里的消息全部注入：按接受顺序追加为 user 消息，成功后再通知已消费。
-            let drained = lock_inbox(&self.inbox).drain();
-            self.inject_controls(drained, on_event).await?;
+            self.inject_controls(None, on_event).await?;
             let (response, assistant_result_entry_id) =
                 match self.generate_response(on_event, cancellation).await {
                     Ok(response) => response,
@@ -207,7 +204,7 @@ impl Agent {
             let tool_calls = assistant.tool_calls().cloned().collect::<Vec<_>>();
             // 实时完成事件只需要正文与思考；工具的生命周期由工具自己的事件表达。
             let public_items = assistant.public_items(&assistant_result_entry_id, ItemScope::Completion);
-            self.append_message(Some(&assistant_result_entry_id), assistant, &[]).await?;
+            self.append_message(&assistant_result_entry_id, assistant, &[]).await?;
             on_event(AgentEvent::MessageFinished {
                 message_id: assistant_result_entry_id.clone(),
                 items: public_items,
@@ -230,21 +227,25 @@ impl Agent {
             }
             // 没有工具调用：本轮响应就是最终轮，结果只保留截断标记。
             outcome.truncated = length_truncated;
-            // 模型准备停下来：把停止窗口内到达的转向输入注入后继续请求。
-            let Some(pending_inputs) = lock_inbox(&self.inbox).take_at_stop() else {
+            // 关闭空箱子的同时拒绝晚到输入；已接受的输入仍在箱内，下一轮统一交付。
+            if lock_inbox(&self.inbox).close_if_empty() {
                 return Ok(outcome);
-            };
-            self.inject_controls(pending_inputs, on_event).await?;
+            }
         }
     }
 
     async fn inject_controls(
         &mut self,
-        requests: Vec<ControlRequest>,
+        before_sequence: Option<u64>,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        for request in requests {
-            self.append_user_input(&request.input, on_event).await?;
+        loop {
+            let next = lock_inbox(&self.inbox)
+                .next()
+                .filter(|request| before_sequence.is_none_or(|sequence| request.sequence < sequence));
+            let Some(request) = next else { break };
+            self.append_user_input(&request, on_event).await?;
+            lock_inbox(&self.inbox).acknowledge(request.sequence);
             on_event(AgentEvent::ControlChanged);
         }
         Ok(())
@@ -252,16 +253,27 @@ impl Agent {
 
     async fn append_user_input(
         &mut self,
-        input: &UserInput,
+        request: &ControlRequest,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
+        // 正文写完、换行失败时，重开写者会恢复完整记录。按接受时分配的消息身份
+        // 确认已有事实，避免重复追加或把旧消息再发布到当前回合。
+        if lock_writer(&self.session)
+            .entries()
+            .iter()
+            .rev()
+            .any(|entry| entry.id() == request.message_id)
+        {
+            return Ok(());
+        }
+        let input = &request.input;
         let images: Vec<_> = input.images.iter().map(|image| image.attachment.clone()).collect();
         let model_text = input.model_text();
         let display_text = (model_text != input.text).then(|| input.text.clone());
         let mut content = vec![crate::message::ContentBlock::Text { text: model_text }];
         content.extend(images.iter().cloned().map(crate::message::ContentBlock::Image));
         let message = AgentMessage::User { content, display_text };
-        let entry_id = self.append_message(None, message, &input.images).await?;
+        let entry_id = self.append_message(&request.message_id, message, &input.images).await?;
         on_event(AgentEvent::UserMessage {
             entry_id,
             text: input.text.clone(),
@@ -271,15 +283,15 @@ impl Agent {
     }
 
     /// 先在会话锁外保存图片，再追加引用它们的消息；成功后调用方才能发布完成事件。
-    /// id 为 Some 时沿用预分配的结果条目身份，返回已提交的消息 id。
+    /// 沿用调用方预分配的消息身份，返回已提交的消息 id。
     async fn append_message(
         &mut self,
-        id: Option<&str>,
+        id: &str,
         message: AgentMessage,
         images: &[crate::image::InputImage],
     ) -> Result<String> {
         let session = Arc::clone(&self.session);
-        let id = id.map(str::to_string);
+        let id = id.to_string();
         let images = images.to_vec();
         Ok(tokio::task::spawn_blocking(move || {
             if !images.is_empty() {
@@ -289,10 +301,7 @@ impl Agent {
                 }
             }
             let mut writer = lock_writer(&session);
-            let committed = match id {
-                Some(id) => writer.append_message_with_id(&id, message),
-                None => writer.append_message(message),
-            }?;
+            let committed = writer.append_message_with_id(&id, message)?;
             Ok::<_, SessionError>(committed.id)
         })
         .await

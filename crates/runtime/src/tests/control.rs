@@ -25,7 +25,7 @@ fn run_with_control_window(
     conversation: &Arc<Conversation>,
     goal: &str,
     inject: impl FnOnce(&Arc<Conversation>),
-) -> (crate::TurnOutcome, Vec<TurnEvent>) {
+) -> (Result<crate::TurnOutcome, crate::ConversationError>, Vec<TurnEvent>) {
     let (release_tx, release_rx) = channel();
     gate.with_release(release_rx);
     let worker_conversation = Arc::clone(conversation);
@@ -44,7 +44,7 @@ fn run_with_control_window(
     inject(&control_conversation);
     let _ = release_tx.send(());
     let (outcome, events) = worker.join().expect("worker");
-    (outcome.expect("every control run converges to a trusted terminal outcome"), events)
+    (outcome, events)
 }
 
 /// 单条排队输入可撤回；多次 steer 按接受顺序进入下一份模型请求。
@@ -70,7 +70,7 @@ fn controls_preserve_input_order_and_withdrawal() {
         );
         c.submit_follow_up("f1").unwrap();
     });
-    assert_eq!(outcome.turn_status, TurnStatus::Completed);
+    assert_eq!(outcome.unwrap().turn_status, TurnStatus::Completed);
 
     assert!(conversation.snapshot().pending_input.is_none());
     assert!(
@@ -96,6 +96,71 @@ fn controls_preserve_input_order_and_withdrawal() {
         .position(|text| text.contains("steer right"))
         .expect("second steer precedes the next assistant response");
     assert!(left < right, "injection follows acceptance order");
+}
+
+/// 图片保存失败时，已提交的 steer 不重放，未提交的 steer 留待继续会话。
+#[test]
+fn steering_inputs_survive_a_failed_image_commit() {
+    let fixture = SessionsFixture::new();
+    let script = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::success("first response"),
+        ScriptedAttempt::success("continued"),
+    ]));
+    let (gate, started_rx) = GatedProvider::new(script.clone() as Arc<dyn Provider + Send + Sync>);
+    let (conversation, path) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
+    let image = singularity_agent::image::InputImage::upload(singularity_protocol::ImageUpload {
+        name: "pixel.gif".into(),
+        data_url: "data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==".into(),
+    })
+    .unwrap();
+    let image_id = image.attachment.id.clone();
+    let image_directory = SessionData::open(&path).unwrap().image_directory();
+    std::fs::create_dir_all(image_directory.parent().unwrap()).unwrap();
+    std::fs::write(&image_directory, "blocks image directory creation").unwrap();
+
+    let (outcome, _) = run_with_control_window(&gate, started_rx, &conversation, "initial", |c| {
+        c.steer("saved steer").unwrap();
+        c.steer(crate::UserInput {
+            text: "pending image".into(),
+            images: vec![image],
+            ..Default::default()
+        })
+        .unwrap();
+        c.steer("pending text").unwrap();
+    });
+    assert!(
+        matches!(outcome, Err(crate::ConversationError::Turn(_))),
+        "storage failure stops execution"
+    );
+    assert!(
+        conversation.pending_image(&image_id).is_some(),
+        "the failed input remains owned by the inbox"
+    );
+    std::fs::remove_file(&image_directory).unwrap();
+
+    let continued = crate::test_support::run_async(conversation.run_turn("continue", &mut |_| {})).unwrap();
+    assert_eq!(continued.turn_status, TurnStatus::Completed);
+    let requests = script.requests();
+    let users = requests[1]
+        .messages
+        .iter()
+        .filter(|message| message.role == ModelRole::User)
+        // 图片的模型输入还附带快照路径，首行仍是原始文字。
+        .map(|message| message.content.lines().next().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(
+        users.ends_with(&[
+            "initial",
+            "saved steer",
+            "pending image",
+            "pending text",
+            "continue"
+        ]),
+        "{users:?}"
+    );
+    assert_eq!(users.iter().filter(|text| **text == "saved steer").count(), 1);
+    assert_eq!(users.iter().filter(|text| **text == "pending image").count(), 1);
+    assert!(image_directory.join(&image_id).is_file(), "the continued input saves its image");
 }
 
 /// 已接受的停止与真实失败同时存在：终态保持真实失败原因并记录

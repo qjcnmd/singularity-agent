@@ -290,7 +290,7 @@ impl AppServer {
     /// 生命周期变更提交并释放其锁后调用，目录读盘期间其他任务仍可接受控制。
     fn publish_app_snapshot(&self) {
         let _publication = self.lock_app_publication();
-        self.publish_app_result(self.bootstrap());
+        self.publish_app_result(self.bootstrap_with_catalog(self.models.redacted_catalog()));
     }
 
     fn publish_app_result(&self, snapshot: Result<AppBootstrap, RpcError>) {
@@ -304,7 +304,7 @@ impl AppServer {
         }
     }
 
-    /// 完整替换快照必须在同一个发布临界区里构造并取得流序号；否则先构造的
+    /// RPC 读取与完整快照发布都在同一临界区里构造并取得流序号；否则先读取的
     /// payload 可能在更新的快照之后拿到更高的 revision。这把锁不参与会话事件
     /// 发布，免得形成「全局发布锁 → SlotState」的反向锁序。
     fn lock_app_publication(&self) -> std::sync::MutexGuard<'_, ()> {

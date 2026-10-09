@@ -28,7 +28,7 @@ cargo run -p singularity_app --locked -- --json "summarize this repository"
 
 该命令会调用已配置模型，每次创建并保存新会话。评估器通过 `SINGULARITY_HOME` 隔离配置与会话，具体配置见安装说明。
 
-页面状态回归按受影响的行为选择，可使用已有会话、结果或本地模拟 Provider；需要写入测试会话或更改配置时使用独立数据目录。模型选择、调用条件和验证范围按项目指令执行，临时提供商、会话和进程在验证后清理。
+页面状态回归按受影响的行为选择，优先复用已有会话和结果；需要写入测试会话或更改配置时使用独立数据目录。模型选择、调用条件和验证范围按[项目指令](../AGENTS.md#验证与交付)执行，临时会话和进程在验证后清理。
 
 ## 检查
 
@@ -69,7 +69,7 @@ node apps/desktop/e2e/smoke.mjs
 
 脚本使用真实 Electron 窗口及 Windows 原生目录对话框，会调用 `bai/deepseek-v4.1-flash`；验证期间不要操作该窗口。输出目录保留 JSON 结果、流事件、会话读取结果与截图。取消 `SINGULARITY_E2E_PACKAGED` 可验证源码启动；`smoke.mjs` 不设置模型和扩展标记时只检查基础桌面行为。Playwright 自身使用的调试连接不属于产品通信；无监听验证须另用普通启动的发布程序执行。`node apps/desktop/e2e/lifecycle.mjs` 使用同一组环境变量验证刚提交任务时退出、重启读取中断历史。`node apps/desktop/e2e/stats-bar.mjs` 验证用量与统计栏，缓存命中率按实际上报的明细核对；这两条脚本均会调用模型。测试完成后删除隔离目录中的凭据副本。
 
-`node apps/desktop/e2e/images.mjs` 使用同一环境验证图片选择、粘贴、拖入、预览、草稿恢复、排队编辑、取消与继续；本地模拟 Provider 核对 Chat / Responses 的多工具图片编码和压缩，再按 `SINGULARITY_E2E_MODEL` 调用默认真实模型识别图片及验证重启恢复。产物为 `images.json`、真实模型历史和截图。
+图片相关操作在运行的 production Electron 工作台中直接验证，按本次变更选择受影响的上传、预览、草稿、排队、停止和恢复操作。涉及模型调用时，使用[项目指令](../AGENTS.md#验证与交付)指定的真实模型。
 
 桌面 E2E 的启动、环境检查、模型默认值和 RPC 调用由 `apps/desktop/e2e/support.mjs` 维护；各脚本独立管理验证流程和应用实例。CI 使用托管运行器的标准工具目录，并缓存 Cargo 依赖与检查工具。
 

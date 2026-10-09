@@ -187,7 +187,7 @@ impl Agent {
         execution: ToolExecution,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        self.append_message(Some(item_id), tool_result_message(tool_call_id, &execution), &execution.images)
+        self.append_message(item_id, tool_result_message(tool_call_id, &execution), &execution.images)
             .await?;
         on_event(AgentEvent::ToolExecutionEnded { item_id: item_id.to_string(), execution });
         Ok(())

@@ -165,7 +165,7 @@ impl AppServer {
         Ok(())
     }
 
-    /// 归档无活动操作或待处理输入的任务；历史文件保留在归档目录。
+    /// 归档无活动操作或普通排队消息的任务，并结束其未消费的 steer；历史文件保留。
     pub fn archive_session(&self, session_id: &str) -> Result<(), RpcError> {
         // 占用检查、持久归档和注销 slot 必须在同一个临界区里，否则归档完的旧 slot 还会被启动。
         let lifecycle = self.lock_lifecycle();

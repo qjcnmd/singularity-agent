@@ -149,7 +149,7 @@ impl ConversationState {
         super::validate_input(&input)?;
         let sequence = self.control_sequence;
         self.control_sequence = sequence + 1;
-        Ok(ControlRequest { sequence, input })
+        Ok(ControlRequest::new(sequence, input))
     }
 
     /// 排队一条后续 turn 的输入，保留它的身份和接受序号；排队本身不需要写者。
