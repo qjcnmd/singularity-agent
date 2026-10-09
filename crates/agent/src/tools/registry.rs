@@ -133,8 +133,6 @@ pub(crate) struct ToolRegistrySnapshot {
 }
 
 impl Default for ToolRegistrySnapshot {
-    /// 唯一的初始化定义：默认注册表就是内置工具集本身，所以「默认注册表」广告出去的
-    /// schema、提示词名单和可执行的分发三者含义一致。
     fn default() -> Self {
         Self {
             mcp: Vec::new(),

@@ -85,7 +85,6 @@ fn preparation_failure(message: String) -> Result<(), String> {
     with_output_failure(Err(message), renderer.output_failure())
 }
 
-/// 直接转发共享执行层的事件，不另外建 worker 或事件队列。
 async fn execute_headless(
     conversation: &Arc<Conversation>,
     goal: &str,

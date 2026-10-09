@@ -20,7 +20,6 @@ struct SpillWriter {
 }
 
 impl SpillWriter {
-    /// 创建 spill 文件，initial 是它的完整初始内容。
     fn create(root: &Path, initial: &str) -> io::Result<Self> {
         std::fs::create_dir_all(root)?;
         cleanup_old_spills(root);

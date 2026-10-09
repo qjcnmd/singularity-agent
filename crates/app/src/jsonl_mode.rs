@@ -36,7 +36,6 @@ impl JsonlRenderer {
         self.write_line(&summary.to_line());
     }
 
-    /// 编码并写完一整行；写入失败保留底层原因。
     fn write_line(&mut self, line: &impl Serialize) {
         if self.output_error.is_some() {
             return;
