@@ -128,29 +128,6 @@ pub struct SessionRenameParams {
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-pub struct QueueControlParams {
-    pub session_id: String,
-    pub control_id: String,
-}
-
-/// 从进程内队列取回的完整输入，由工作台恢复为本会话草稿。
-#[derive(Debug, serde::Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct QueuedInputDraft {
-    pub text: String,
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    #[cfg_attr(
-        feature = "typescript",
-        ts(as = "Option<std::collections::BTreeMap<String, String>>", optional)
-    )]
-    pub skills: std::collections::BTreeMap<String, String>,
-    pub images: Vec<crate::ImageUpload>,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateSettingsParams {
     pub session_id: String,
     pub selector: String,
@@ -200,10 +177,6 @@ rpc_methods! {
     SessionArchive => "session.archive" (SessionParams) -> (),
     SessionSubmit => "session.submit" (SessionTextParams) -> (),
     SessionSteer => "session.steer" (SessionTextParams) -> (),
-    SessionFollowUp => "session.followUp" (SessionTextParams) -> (),
-    SessionQueueWithdraw => "session.queueWithdraw" (QueueControlParams) -> (),
-    SessionQueueEdit => "session.queueEdit" (QueueControlParams) -> QueuedInputDraft,
-    SessionQueueSendNow => "session.queueSendNow" (QueueControlParams) -> (),
     SessionAnswerQuestion => "session.answerQuestion" (crate::QuestionAnswerParams) -> (),
     SessionAbort => "session.abort" (SessionParams) -> (),
     SessionCompact => "session.compact" (SessionParams) -> (),

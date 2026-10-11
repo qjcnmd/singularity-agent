@@ -145,8 +145,3 @@ export function imageUpload(file: File): Promise<ImageUpload> {
     reader.readAsDataURL(file)
   })
 }
-
-export function imageFile({ name, dataUrl }: ImageUpload): File {
-  const bytes = Uint8Array.from(atob(dataUrl.split(',')[1]), value => value.charCodeAt(0))
-  return new File([bytes], name, { type: dataUrl.slice(5, dataUrl.indexOf(';')) })
-}

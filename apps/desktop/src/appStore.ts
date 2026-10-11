@@ -6,12 +6,11 @@ import { effectiveSelector, selectedModel } from './modelChoices'
 import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
-import { emptyDraft, imageFile, imageUpload, type Draft } from './drafts'
-import type { DeliveryIntent, ProviderConfigurationInput, RpcMethod, RpcParams, SkillMetadata, ViewportAnchor } from './protocol'
+import { emptyDraft, imageUpload, type Draft } from './drafts'
+import type { ProviderConfigurationInput, RpcMethod, RpcParams, SkillMetadata, ViewportAnchor } from './protocol'
 
 class AppStore extends SessionStore {
   setDraft(text: string, skill?: SkillMetadata): void {
-    if (this.inputLocked()) return
     const id = this.state.selectedSessionId
     if (id === null) return
     const draft = this.inputDraft()
@@ -30,17 +29,8 @@ class AppStore extends SessionStore {
   }
 
   setImages(id: string, images: Draft['images'], append = false): void {
-    if (id === this.state.selectedSessionId && this.inputLocked()) return
     const draft = this.drafts.get(id)
     void this.drafts.set(id, { ...draft, images: append ? [...draft.images, ...images] : images })
-  }
-
-  /** 排队与取回期间只锁住内容输入，工具栏仍由各自的操作条件决定。 */
-  inputLocked(): boolean {
-    const id = this.state.selectedSessionId
-    return this.state.session?.runtime.pendingInput != null
-      || this.isPending('session.followUp', actionOrigin.session(id))
-      || this.isPending('session.queue', actionOrigin.session(id))
   }
 
   modelAvailable(): boolean {
@@ -48,30 +38,27 @@ class AppStore extends SessionStore {
       effectiveSelector(this.state.session?.runtime.selector, this.state.bootstrap?.modelCatalog)) !== undefined
   }
 
-  submissionState(intent: DeliveryIntent = 'follow_up') {
+  submissionState() {
     const state = this.state
     const phase = state.session?.runtime.phase ?? 'idle'
-    const submitPending = ['session.submit', 'session.followUp', 'session.steer'].some(method => this.isPending(method, actionOrigin.session(state.selectedSessionId)))
+    const submitPending = ['session.submit', 'session.steer'].some(method => this.isPending(method, actionOrigin.session(state.selectedSessionId)))
     // 按连接、任务读取、运行阶段和在途提交的顺序给出第一项阻止原因。
     let blockedReason: string | null = null
     if (state.connection !== 'ready') blockedReason = '连接未就绪'
     else if (state.sessionLoad.status === 'loading') blockedReason = '正在读取任务'
-    else if (this.inputLocked()) blockedReason = '已有排队消息'
     else if (state.selectedSessionId !== null && state.session === null) blockedReason = state.sessionLoad.status === 'error'
       ? '任务读取失败' : '正在读取任务'
     else if (phase === 'stopping') blockedReason = '正在停止'
     else if (phase === 'reserved') blockedReason = '正在启动'
     else if (phase === 'compacting') blockedReason = '正在压缩上下文'
     else if (submitPending) blockedReason = '正在发送…'
-    else if (!(phase === 'running' && intent === 'steer') && !this.modelAvailable()) blockedReason = '请选择模型'
-    const method = phase === 'running'
-      ? intent === 'steer' ? 'session.steer' : 'session.followUp'
-      : 'session.submit'
+    else if (phase !== 'running' && !this.modelAvailable()) blockedReason = '请选择模型'
+    const method = phase === 'running' ? 'session.steer' : 'session.submit'
     return { canSubmit: state.drafts !== null && state.selectedWorkspaceId !== null && blockedReason === null && (this.draft().trim() !== '' || this.inputDraft().images.length > 0), blockedReason, method } as const
   }
 
-  async submitDraft(intent: DeliveryIntent = 'follow_up'): Promise<boolean> {
-    const { canSubmit, method } = this.submissionState(intent)
+  async submitDraft(): Promise<boolean> {
+    const { canSubmit, method } = this.submissionState()
     const sessionId = this.state.selectedSessionId
     if (!canSubmit || sessionId === null) return false
     const draft = this.inputDraft()
@@ -92,27 +79,6 @@ class AppStore extends SessionStore {
   async compact(): Promise<boolean> {
     if (!this.modelAvailable()) return false
     return this.sessionAction('session.compact', {})
-  }
-
-  async withdraw(sessionId: string, controlId: string): Promise<boolean> {
-    return this.action('session.queue', actionOrigin.session(sessionId),
-      () => this.transport.rpc('session.queueWithdraw', { sessionId, controlId }))
-  }
-
-  async editQueuedInput(sessionId: string, controlId: string): Promise<boolean> {
-    return this.action('session.queue', actionOrigin.session(sessionId), async () => {
-      const input = await this.transport.rpc('session.queueEdit', { sessionId, controlId })
-      await this.drafts.set(sessionId, {
-        text: input.text,
-        skills: input.skills,
-        images: input.images.map(imageFile),
-      })
-    })
-  }
-
-  async sendNow(sessionId: string, controlId: string): Promise<boolean> {
-    return this.action('session.queue', actionOrigin.session(sessionId),
-      () => this.transport.rpc('session.queueSendNow', { sessionId, controlId }))
   }
 
   async renameWorkspace(workspaceId: string, name: string): Promise<boolean> {

@@ -116,14 +116,6 @@ pub(super) fn session_busy() -> RpcError {
 pub(super) fn control_error(error: ConversationControlError) -> RpcError {
     match error {
         ConversationControlError::NotRunning => session_busy(),
-        ConversationControlError::PendingInputExists => {
-            RpcError::new(RpcErrorCode::SessionBusy, error.to_string(), "编辑、删除或发送排队消息后再输入。")
-        }
         ConversationControlError::InvalidInput => invalid_request("输入不能为空。"),
-        ConversationControlError::ControlNotFound => RpcError::new(
-            RpcErrorCode::ControlNotFound,
-            "待处理输入已不存在或已经开始执行。",
-            "刷新任务后确认待处理输入队列。",
-        ),
     }
 }

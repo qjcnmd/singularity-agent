@@ -12,7 +12,7 @@
       <stop offset="0" stop-color="#ffffff" stop-opacity="0.9"/>
       <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
     </radialGradient>
-    <!-- 深色：Galaxy Orb 的青色→品红边缘，配色取自 galaxyRenderer。 -->
+    <!-- 深色图标采用青色到品红色的边缘渐变。 -->
     <linearGradient id="rim" x1="0" y1="1" x2="1" y2="0">
       <stop offset="0" stop-color="#22d3ee"/>
       <stop offset="1" stop-color="#d946ef"/>

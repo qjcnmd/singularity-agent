@@ -43,21 +43,6 @@ pub struct ThreadReadPage {
     pub next_cursor: Option<String>,
 }
 
-/// 会话中待发送的输入，同一时刻只有一条；身份用于取回编辑、删除和发送。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct PendingInput {
-    pub control_id: String,
-    pub text: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[cfg_attr(
-        feature = "typescript",
-        ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
-    )]
-    pub images: Vec<crate::ImageAttachment>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -116,7 +101,7 @@ pub struct SessionTerminalSnapshot {
 }
 
 /// 普通 `session_changed` / `session_settled` 使用的精简运行态载荷：带着活动 turn/compaction 的
-/// 身份、终态、队列和冻结窗口，但不携带活动事件；完整事件只在 `session.read` 的恢复快照里传输。
+/// 身份、终态和冻结窗口，但不携带活动事件；完整事件只在 `session.read` 的恢复快照里传输。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -125,7 +110,6 @@ pub struct SessionRuntime {
     pub phase: SessionPhase,
     pub selector: Option<String>,
     pub model_context_window: Option<u64>,
-    pub pending_input: Option<PendingInput>,
     pub pending_question: Option<crate::PendingQuestion>,
     pub active_turn: Option<ActiveTurnRuntimeSnapshot>,
     pub active_compaction: Option<ActiveCompactionSnapshot>,
@@ -273,7 +257,6 @@ pub enum RpcErrorCode {
     WorkspaceBusy,
     SessionNotFound,
     SessionBusy,
-    ControlNotFound,
     ConfigurationInvalid,
     ConfigurationPartiallySaved,
     ProviderUnavailable,

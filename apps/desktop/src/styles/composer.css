@@ -110,12 +110,7 @@
 .orb-canvas { position: absolute; top: 50%; left: 50%; width: calc(100% / .87); height: calc(100% / .87); transform: translate(-50%, -50%); pointer-events: none; }
 .stop-button:disabled { cursor: default; }
 
-/* 候选建议与排队输入 */
-.queued-inputs {
-  overflow: hidden;
-  border: 1px solid var(--line);
-  box-shadow: var(--shadow-soft);
-}
+/* 候选建议 */
 .composer-candidate-anchor {
   position: relative;
   width: min(100%, 780px);
@@ -177,27 +172,6 @@
 }
 .candidate-error { color: var(--danger); }
 
-.queued-inputs-motion { width: min(calc(100% - 36px), 744px); margin: 0 auto; overflow: hidden; }
-.queued-inputs { width: 100%; margin: 0; padding-bottom: 8px; border-radius: var(--radius-xl) var(--radius-xl) 0 0; background: var(--surface-muted); }
-.queue-actions button { display: grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: 8px; color: var(--ink-soft); background: transparent; }
-.queue-actions button:hover { background: var(--surface); color: var(--ink); }
-
-.queue-row {
-  min-height: 48px;
-  display: grid;
-  grid-template-columns: 20px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 11px;
-  border-top: 0;
-}
-.queue-text {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12.5px;
-}
-.queue-actions { display: flex; }
 /* 关闭态：一个小圆形按钮。打开态：一个圆角面板。
    宽/高/border-radius 参与动画；打开态用比关闭态
    更弹性的缓动。

@@ -78,7 +78,8 @@ pub enum LedgerRecord {
     AssistantInterrupted {
         items: Vec<singularity_protocol::HistoryItem>,
     },
-    /// 用来替换模型上下文里那份工具结果的正文；原始 Message 仍保留，供历史和轨迹查看。
+    /// 已保存会话中的工具正文替换记录；当前压缩不再生成，只在恢复时应用。
+    /// 当前会话格式允许此记录，移除读取支持需先处理已有用户数据。
     ToolResultPruned {
         #[serde(rename = "entryId")]
         entry_id: String,

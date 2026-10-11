@@ -1,17 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
-import { createGalaxyRenderer } from './galaxyRenderer'
 import { createPearlRenderer } from './pearlRenderer'
 
 const normalSpeed = 6
 const activeSpeed = normalSpeed * 3
 
-function OrbCanvas({ fast, theme }: { fast: boolean; theme: 'light' | 'dark' }) {
+function OrbCanvas({ fast }: { fast: boolean }) {
   const canvas = useRef<HTMLCanvasElement>(null)
   const speed = useRef(fast ? activeSpeed : normalSpeed)
   useEffect(() => { speed.current = fast ? activeSpeed : normalSpeed }, [fast])
   useEffect(() => {
     if (!canvas.current) return
-    const render = theme === 'dark' ? createGalaxyRenderer(canvas.current) : createPearlRenderer(canvas.current)
+    const render = createPearlRenderer(canvas.current)
     render(0)
     const motion = window.matchMedia('(prefers-reduced-motion: reduce)')
     let frame = 0
@@ -36,14 +35,14 @@ function OrbCanvas({ fast, theme }: { fast: boolean; theme: 'light' | 'dark' }) 
       motion.removeEventListener('change', resume)
       document.removeEventListener('visibilitychange', resume)
     }
-  }, [theme])
+  }, [])
   return <canvas ref={canvas} className="orb-canvas" aria-hidden="true" />
 }
 
-export function ActivityOrb({ fast = false, theme = 'light' }: { fast?: boolean; theme?: 'light' | 'dark' }) {
+export function ActivityOrb({ fast = false }: { fast?: boolean }) {
   const [hovered, setHovered] = useState(false)
   const accelerated = fast || hovered
   return <span className="activity-orb" aria-hidden="true" onPointerEnter={() => setHovered(true)} onPointerLeave={() => setHovered(false)}>
-    <OrbCanvas fast={accelerated} theme={theme} />
+    <OrbCanvas fast={accelerated} />
   </span>
 }

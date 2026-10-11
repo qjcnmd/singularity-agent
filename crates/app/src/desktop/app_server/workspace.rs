@@ -80,7 +80,7 @@ impl AppServer {
             return Err(RpcError::new(
                 singularity_protocol::RpcErrorCode::WorkspaceBusy,
                 format!("项目 {} 仍有活动任务或待处理输入。", workspace.name),
-                "先停止运行并处理待处理输入队列。",
+                "先停止项目中正在运行的任务。",
             ));
         }
         let removed_drafts = self

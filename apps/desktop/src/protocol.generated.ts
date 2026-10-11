@@ -74,8 +74,6 @@ export type ModelRequestSnapshot = { definitionsId: string, messages: Array<Requ
 
 export type ModelRole = "developer" | "user" | "assistant" | "tool";
 
-export type PendingInput = { controlId: string, text: string, images?: Array<ImageAttachment>, };
-
 export type PendingQuestion = {
 /**
  * 工具条目身份；用于拒绝已经结束或属于另一轮的问题答案。
@@ -95,10 +93,6 @@ export type ProviderSaveParams = { provider: ProviderConfigurationInput,
 apiKey?: string, };
 
 export type QuestionAnswerParams = { sessionId: string, itemId: string, answers: Array<UserQuestionAnswer>, };
-
-export type QueueControlParams = { sessionId: string, controlId: string, };
-
-export type QueuedInputDraft = { text: string, skills?: { [key in string]: string }, images: Array<ImageUpload>, };
 
 export type ReadSource = {
 /**
@@ -158,7 +152,7 @@ export type RequestTool = { name: string, description: string, parametersSchema:
 
 export type RpcError = { code: RpcErrorCode, message: string, recovery: string, };
 
-export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "control_not_found" | "configuration_invalid" | "configuration_partially_saved" | "provider_unavailable" | "internal";
+export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "configuration_invalid" | "configuration_partially_saved" | "provider_unavailable" | "internal";
 
 export type RpcResponse = { "type": "success", result: JsonValue, } | { "type": "error", error: RpcError, };
 
@@ -204,7 +198,7 @@ export type SessionReadResult = { history: ThreadReadPage, runtime: SessionRunti
 
 export type SessionRenameParams = { sessionId: string, name: string, };
 
-export type SessionRuntime = { sessionRevision: number, phase: SessionPhase, selector: string | null, modelContextWindow: number | null, pendingInput: PendingInput | null, pendingQuestion: PendingQuestion | null, activeTurn: ActiveTurnRuntimeSnapshot | null, activeCompaction: ActiveCompactionSnapshot | null, terminal: SessionTerminalSnapshot | null, };
+export type SessionRuntime = { sessionRevision: number, phase: SessionPhase, selector: string | null, modelContextWindow: number | null, pendingQuestion: PendingQuestion | null, activeTurn: ActiveTurnRuntimeSnapshot | null, activeCompaction: ActiveCompactionSnapshot | null, terminal: SessionTerminalSnapshot | null, };
 
 export type SessionTerminalSnapshot = { source: SessionTerminalSource, status: TurnStatus,
 /**
@@ -338,10 +332,6 @@ export interface RpcContract {
   "session.archive": { params: SessionParams; result: null }
   "session.submit": { params: SessionTextParams; result: null }
   "session.steer": { params: SessionTextParams; result: null }
-  "session.followUp": { params: SessionTextParams; result: null }
-  "session.queueWithdraw": { params: QueueControlParams; result: null }
-  "session.queueEdit": { params: QueueControlParams; result: QueuedInputDraft }
-  "session.queueSendNow": { params: QueueControlParams; result: null }
   "session.answerQuestion": { params: QuestionAnswerParams; result: null }
   "session.abort": { params: SessionParams; result: null }
   "session.compact": { params: SessionParams; result: null }

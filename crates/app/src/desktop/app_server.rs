@@ -22,8 +22,8 @@ use singularity_protocol::{
 };
 use singularity_runtime::UserInput;
 use singularity_runtime::{
-    CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
-    OperationGuard, OperationReservation, OperationResult, ThreadCatalog, TurnRunner,
+    CatalogError, Conversation, ConversationControlError, ConversationError, OperationGuard,
+    OperationReservation, OperationResult, ThreadCatalog, TurnRunner,
 };
 use tokio::sync::broadcast;
 

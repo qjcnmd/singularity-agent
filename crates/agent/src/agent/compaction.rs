@@ -1,4 +1,4 @@
-//! 上下文缩减的编排：触发、剪枝、摘要提交与继续请求前的指令刷新。
+//! 上下文缩减的编排：触发、摘要提交与继续请求前的指令刷新。
 //! 手动压缩结束后释放 Agent；自动压缩和溢出恢复共用提交后的收尾规则。
 
 use super::{Agent, AgentError, AgentEvent, Result};
@@ -13,46 +13,19 @@ const AUTO_COMPACTION_TRIGGER_RATIO: f64 = 0.9;
 const COMPACTION_RETAIN_RATIO: f64 = 0.1;
 
 impl Agent {
-    /// 把剪枝作为「引用原消息」的追加记录落盘，后续投影使用替换后的正文。
-    /// 剪枝覆盖整个活动历史：超长工具结果不分新旧。
-    async fn prune_tool_results(&mut self, cancellation: &CancellationToken) -> Result<bool> {
-        let signal = cancellation.clone();
-        let session = std::sync::Arc::clone(&self.session);
-        let changed = tokio::task::spawn_blocking(move || {
-            let replacements = {
-                let writer = lock_writer(&session);
-                writer.context().pruned_tool_results(&writer)
-            };
-            let changed = !replacements.is_empty();
-            for record in replacements {
-                if signal.is_cancelled() {
-                    return Err(AgentError::Aborted);
-                }
-                lock_writer(&session).append_record(record)?;
-            }
-            Ok(changed)
-        })
-        .await
-        .expect("context worker completes while the runtime is running")?;
-        if changed {
-            self.usage_correction = 0;
-        }
-        Ok(changed)
-    }
-
-    /// 所有触发共用剪枝与摘要提交；返回是否缩减了上下文。
+    /// 所有触发共用摘要提交；返回是否缩减了上下文。
     async fn compact_context(
         &mut self,
         definitions: &RequestDefinitions,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<bool> {
-        let pruned = self.prune_tool_results(cancellation).await?;
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
         let keep_recent_tokens =
             (self.model.context_window() as f64 * COMPACTION_RETAIN_RATIO).floor() as u64;
+        // 摘要前保持历史正文原样，避免改写消息破坏可复用的请求前缀。
         // 历史里没有可替换的前缀（内容太少）：本次无需摘要。
         let summary_definitions = definitions.clone();
         let model = self.model.clone();
@@ -69,7 +42,7 @@ impl Agent {
         .await
         .expect("image context preparation completes while the runtime is running")?;
         let Some(summary) = summary else {
-            return Ok(pruned);
+            return Ok(false);
         };
         // 请求层已经做过唯一一次 ProviderCallError→AgentError 分类；压缩只传播结果，
         // 不再按取消令牌改写真实失败原因（停止是否被接受由操作层的终态边界裁决）。

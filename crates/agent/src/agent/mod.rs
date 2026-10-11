@@ -246,7 +246,6 @@ impl Agent {
             let Some(request) = next else { break };
             self.append_user_input(&request, on_event).await?;
             lock_inbox(&self.inbox).acknowledge(request.sequence);
-            on_event(AgentEvent::ControlChanged);
         }
         Ok(())
     }

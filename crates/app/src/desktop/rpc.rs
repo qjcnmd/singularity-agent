@@ -85,18 +85,6 @@ fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError
         RpcRequest::SessionSteer(params) => {
             value(app.steer(&params.session_id, input(params.text, params.images, params.skills)?)?)
         }
-        RpcRequest::SessionFollowUp(params) => {
-            value(app.follow_up(&params.session_id, input(params.text, params.images, params.skills)?)?)
-        }
-        RpcRequest::SessionQueueWithdraw(params) => {
-            value(app.queue_withdraw(&params.session_id, &params.control_id)?)
-        }
-        RpcRequest::SessionQueueEdit(params) => {
-            value(app.queue_edit(&params.session_id, &params.control_id)?)
-        }
-        RpcRequest::SessionQueueSendNow(params) => {
-            value(app.queue_send_now(&params.session_id, &params.control_id)?)
-        }
         RpcRequest::SessionAnswerQuestion(params) => {
             value(app.answer_question(&params.session_id, &params.item_id, params.answers)?)
         }

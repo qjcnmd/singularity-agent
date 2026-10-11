@@ -99,21 +99,3 @@ impl PreparedCompaction {
         })
     }
 }
-
-/// 正文剪枝的下限字符数：不到这个长度就不剪。
-const PRUNE_MIN_CHARS: usize = 8192;
-/// 剪枝后分别保留的头部、尾部字符数。
-const PRUNE_KEEP_HEAD_CHARS: usize = 4096;
-const PRUNE_KEEP_TAIL_CHARS: usize = 1024;
-
-/// 文本超过 [`PRUNE_MIN_CHARS`] 个 Unicode 字符时，保留头尾并标记省略部分。
-pub(crate) fn prune_tool_text(text: &str) -> Option<String> {
-    let total = text.chars().count();
-    if total <= PRUNE_MIN_CHARS {
-        return None;
-    }
-    let mut pruned: String = text.chars().take(PRUNE_KEEP_HEAD_CHARS).collect();
-    pruned.push_str("\n\n[... tool result middle pruned ...]\n\n");
-    pruned.extend(text.chars().skip(total - PRUNE_KEEP_TAIL_CHARS));
-    Some(pruned)
-}

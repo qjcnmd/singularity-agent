@@ -65,7 +65,7 @@ node apps/desktop/e2e/smoke.mjs
 
 脚本使用真实 Electron 窗口及 Windows 原生目录对话框，会调用 `bai/deepseek-v4.1-flash`；验证期间不要操作该窗口。输出目录保留 JSON 结果、流事件、会话读取结果与截图。取消 `SINGULARITY_E2E_PACKAGED` 可验证源码启动；`smoke.mjs` 不设置模型和扩展标记时只检查基础桌面行为。Playwright 自身使用的调试连接不属于产品通信；无监听验证须另用普通启动的发布程序执行。`node apps/desktop/e2e/lifecycle.mjs` 使用同一组环境变量验证刚提交任务时退出、重启读取中断历史。`node apps/desktop/e2e/stats-bar.mjs` 验证用量与统计栏，缓存命中率按实际上报的明细核对；这两条脚本均会调用模型。测试完成后删除隔离目录中的凭据副本。
 
-`node apps/desktop/e2e/images.mjs` 检查图片选择、粘贴、拖放、草稿刷新、预览关闭与损坏图片的明确错误；设置 `SINGULARITY_E2E_MODEL=1` 后，使用真实模型检查上传识图、`read` 识图及删除原文件后重启继续识图。图片排队、停止等其他操作按本次变更在运行的 production Electron 工作台中直接验证。涉及模型调用时，使用[项目指令](../AGENTS.md#验证与交付)指定的真实模型。
+`node apps/desktop/e2e/images.mjs` 检查图片选择、粘贴、拖放、草稿刷新、预览关闭与损坏图片的明确错误；设置 `SINGULARITY_E2E_MODEL=1` 后，使用真实模型检查上传识图、`read` 识图及删除原文件后重启继续识图。图片引导、停止等其他操作按本次变更在运行的 production Electron 工作台中直接验证。涉及模型调用时，使用[项目指令](../AGENTS.md#验证与交付)指定的真实模型。
 
 桌面 E2E 的启动、环境检查、模型默认值和 RPC 调用由 `apps/desktop/e2e/support.mjs` 维护；各脚本独立管理验证流程和应用实例。CI 使用托管运行器的标准工具目录，并缓存 Cargo 依赖与检查工具。
 

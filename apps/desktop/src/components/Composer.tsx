@@ -7,7 +7,7 @@ import { ModelPicker } from './ModelPicker'
 import { WorkspacePicker } from './WorkspacePicker'
 import { PickerSurface } from './PickerSurface'
 import { ActivityOrb } from './ActivityOrb'
-import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
+import { motion, useReducedMotion } from 'motion/react'
 import { flushSync } from 'react-dom'
 import { ImagePlus, Settings } from 'lucide-react'
 import { formatTokenCount } from '../copy'
@@ -16,7 +16,6 @@ import { cacheHitPercent, firstTokenLatency, generationRate, sessionUsage } from
 import { inputTrigger } from '../inputTrigger'
 import { disclosureTransition } from '../motion'
 import { QuestionPanel } from './QuestionPanel'
-import { QueuedInput } from './QueuedInput'
 import { DraftImages, useImageInput } from './Images'
 
 export const Composer = memo(ComposerView)
@@ -27,12 +26,10 @@ function ComposerView({ centered }: { centered: boolean }) {
   const draft = appStore.draft()
   const imageDraft = appStore.inputDraft().images
   const sessionId = state.selectedSessionId
-  const inputLocked = appStore.inputLocked()
-  const imageInput = useImageInput(images => { if (sessionId !== null) appStore.setImages(sessionId, images, true) }, sessionId === null || state.drafts === null || inputLocked)
+  const imageInput = useImageInput(images => { if (sessionId !== null) appStore.setImages(sessionId, images, true) }, sessionId === null || state.drafts === null)
   const phase = state.session?.runtime.phase ?? 'idle'
   const busy = phase === 'running' || phase === 'stopping' || phase === 'compacting'
   const hasTurns = state.session?.facts.history.some(turn => turn.id !== null) ?? false
-  const queuedInput = state.session?.runtime.pendingInput
   const [caret, setCaret] = useState(draft.length)
   const trigger = inputTrigger(draft, caret)
   const fileQuery = trigger?.kind === 'file' ? trigger.query : undefined
@@ -108,7 +105,7 @@ function ComposerView({ centered }: { centered: boolean }) {
     if (suggestion !== undefined) insertCandidate(suggestion)
   }
 
-  const showCandidateSurface = !inputLocked && suggestionsOpen
+  const showCandidateSurface = suggestionsOpen
     && trigger !== null && (skillMenu || suggestions.length > 0 || (fileQuery !== undefined && fileStatus !== 'idle'))
 
   useLayoutEffect(() => {
@@ -139,11 +136,6 @@ function ComposerView({ centered }: { centered: boolean }) {
       transition={{ layout: disclosureTransition(true, reducedMotion) }}>
       {state.session?.runtime.pendingQuestion && <QuestionPanel key={state.session.runtime.pendingQuestion.itemId} request={state.session.runtime.pendingQuestion} state={state} />}
       {!state.session?.runtime.pendingQuestion && <>
-      <AnimatePresence initial={false}>{sessionId !== null && queuedInput && <QueuedInput key={sessionId} sessionId={sessionId} control={queuedInput} state={state}
-        canSend={state.connection === 'ready' && state.sessionLoad.status !== 'loading' && (phase === 'running' || (phase === 'idle' && appStore.modelAvailable()))}
-        onEdit={() => { void appStore.editQueuedInput(sessionId, queuedInput.controlId).then(edited => {
-          if (edited && appStore.getSnapshot().selectedSessionId === sessionId) requestAnimationFrame(() => textarea.current?.focus())
-        }) }} />}</AnimatePresence>
       <div ref={candidateAnchor} className="composer-candidate-anchor">
         {centered && <div className="composer-project" hidden={showCandidateSurface}><WorkspacePicker state={state} /></div>}
         <PickerSurface open={showCandidateSurface}>
@@ -177,11 +169,10 @@ function ComposerView({ centered }: { centered: boolean }) {
         </PickerSurface>
       </div>
       <div {...imageInput.handlers} className={`composer-card${state.selectedWorkspaceId === null ? ' is-unavailable' : ''}`}>
-        <DraftImages images={imageDraft} remove={inputLocked ? undefined : index => { if (sessionId !== null) appStore.setImages(sessionId, imageDraft.filter((_, at) => at !== index)) }} />
+        <DraftImages images={imageDraft} remove={index => { if (sessionId !== null) appStore.setImages(sessionId, imageDraft.filter((_, at) => at !== index)) }} />
         <textarea
           ref={textarea}
           disabled={state.selectedWorkspaceId === null || state.drafts === null}
-          readOnly={inputLocked}
           value={draft}
           onSelect={event => { setCaret(event.currentTarget.selectionStart) }}
           onChange={(event) => {
@@ -213,9 +204,8 @@ function ComposerView({ centered }: { centered: boolean }) {
               event.preventDefault()
               if (event.repeat) return
               if (showCandidateSurface && suggestions.length > 0) chooseSuggestion(suggestionIndex)
-              else if (sessionId !== null && queuedInput && (event.ctrlKey || event.metaKey)) void appStore.sendNow(sessionId, queuedInput.controlId)
               else {
-                void appStore.submitDraft(event.ctrlKey || event.metaKey ? 'steer' : 'follow_up')
+                void appStore.submitDraft()
               }
             }
           }}
@@ -243,7 +233,7 @@ function ComposerView({ centered }: { centered: boolean }) {
                 aria-label={phase === 'stopping' ? '正在停止' : phase === 'compacting' ? '停止压缩' : '停止当前任务'}
                 title={phase === 'stopping' ? '正在停止' : phase === 'compacting' ? '停止压缩' : '停止'}
               >
-                <ActivityOrb theme={state.theme} fast />
+                <ActivityOrb fast />
               </button>
             )}
             {!busy && <button
@@ -254,7 +244,7 @@ function ComposerView({ centered }: { centered: boolean }) {
               title={blockedReason ?? '发送'}
               {...selectionGuard(() => { void appStore.submitDraft() })}
             >
-              <ActivityOrb theme={state.theme} />
+              <ActivityOrb />
             </button>}
           </div>
         </div>

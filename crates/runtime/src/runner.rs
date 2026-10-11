@@ -83,7 +83,7 @@ impl TurnRunner {
     }
 
     /// 在 Conversation 的写入窗口内打开本轮会话写者，承担随后的 operation 与终态落盘。
-    /// 控制队列不落盘。
+    /// 未消费的引导输入不落盘。
     pub(crate) fn open_turn_writer(&self, thread: &Thread) -> Result<SessionWriter, TurnRunError> {
         let path = crate::thread_catalog::thread_session_path(&self.sessions_dir, &thread.thread_id);
         let session = SessionManager::open_existing(&path, &thread.thread_id)
@@ -200,7 +200,7 @@ impl TurnRunner {
         })
     }
 
-    /// 在会话写入窗口内完成准备和开始记录；成功后才由 Conversation 移交排队输入。
+    /// 在会话写入窗口内完成准备和开始记录；成功后才开放运行控制窗口。
     pub(crate) fn prepare_turn(
         &self,
         thread: &Thread,

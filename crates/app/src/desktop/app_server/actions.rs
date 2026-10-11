@@ -2,10 +2,6 @@ use super::*;
 
 impl AppServer {
     pub fn image_data(&self, session_id: &str, image_id: &str) -> Result<String, RpcError> {
-        let slot = self.lock_sessions().get(session_id).cloned();
-        if let Some(image) = slot.and_then(|slot| slot.conversation().pending_image(image_id)) {
-            return Ok(image.data_url());
-        }
         self.catalog.image_data(session_id, image_id).map_err(catalog_error)
     }
 
@@ -43,59 +39,6 @@ impl AppServer {
 
     pub fn steer(&self, session_id: &str, input: UserInput) -> Result<(), RpcError> {
         self.apply_control(session_id, move |conversation| conversation.steer(input))
-    }
-
-    pub fn follow_up(&self, session_id: &str, input: UserInput) -> Result<(), RpcError> {
-        self.apply_control(session_id, move |conversation| conversation.submit_follow_up(input))
-    }
-
-    pub fn queue_withdraw(&self, session_id: &str, control_id: &str) -> Result<(), RpcError> {
-        self.apply_control(session_id, |conversation| conversation.withdraw_follow_up(control_id))
-    }
-
-    pub fn queue_edit(
-        &self,
-        session_id: &str,
-        control_id: &str,
-    ) -> Result<singularity_protocol::QueuedInputDraft, RpcError> {
-        let input = self.apply_control(session_id, |conversation| conversation.take_follow_up(control_id))?;
-        Ok(singularity_protocol::QueuedInputDraft {
-            text: input.text,
-            skills: input.skills,
-            images: input
-                .images
-                .iter()
-                .map(|image| singularity_protocol::ImageUpload {
-                    name: image.attachment.name.clone(),
-                    data_url: image.data_url(),
-                })
-                .collect(),
-        })
-    }
-
-    /// 发送指定排队消息，运行时插话，空闲时开始下一轮。
-    pub fn queue_send_now(self: &Arc<Self>, session_id: &str, control_id: &str) -> Result<(), RpcError> {
-        let lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(session_id)?;
-        // 和 worker 的事件、结算共用同一把 SlotState 锁：控制从 Conversation
-        // 转到公开投影并发布完之前，结算不能插进来把旧回执盖掉。
-        let mut state = slot.lock_state();
-        let promoted = slot.conversation().promote_pending(control_id).map_err(control_error)?;
-        match promoted {
-            FollowUpPromotion::Injected => {
-                self.publish_session_locked(session_id, &slot, &mut state);
-                Ok(())
-            }
-            FollowUpPromotion::Reserved { reservation } => {
-                // 预订成立就等于独占了该会话；先放开 slot 锁去取 history，再按同样的顺序提交。
-                drop(state);
-                // 生命周期交接已经由预订做完，后面的读盘和启动不再占全局临界区。
-                drop(lifecycle);
-                self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
-                self.spawn_operation(session_id, slot, reservation, None);
-                Ok(())
-            }
-        }
     }
 
     pub fn abort(&self, session_id: &str) -> Result<(), RpcError> {
@@ -168,7 +111,7 @@ impl AppServer {
         Ok(())
     }
 
-    /// 归档无活动操作或普通排队消息的任务，并结束其未消费的 steer；历史文件保留。
+    /// 归档无活动操作的任务，并结束其未消费的 steer；历史文件保留。
     pub fn archive_session(&self, session_id: &str) -> Result<(), RpcError> {
         // 占用检查、持久归档和注销 slot 必须在同一个临界区里，否则归档完的旧 slot 还会被启动。
         let lifecycle = self.lock_lifecycle();

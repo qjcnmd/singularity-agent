@@ -9,9 +9,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
-use singularity_protocol::PendingInput;
-
-/// 文字与图片作为一个输入一起接受、编辑和交付。
+/// 文字与图片作为一个输入一起接受和交付。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct UserInput {
     pub text: String,
@@ -88,23 +86,9 @@ impl ControlRequest {
         }
     }
 
-    /// 进程内接受序号同时确定不透明控制身份，不另存一份字符串。
-    pub fn control_id(&self) -> String {
-        self.sequence.to_string()
-    }
-
     /// 输入落盘后发布的用户消息条目身份，供宿主确认这一次输入已保存。
     pub fn item_id(&self) -> String {
         crate::session::text_item_id(&self.message_id, 0)
-    }
-
-    /// 待处理输入只公开身份和正文；接受序号留在协调器内部。
-    pub fn pending(&self) -> PendingInput {
-        PendingInput {
-            control_id: self.control_id(),
-            text: self.input.text.clone(),
-            images: self.input.images.iter().map(|image| image.attachment.clone()).collect(),
-        }
     }
 }
 
@@ -131,9 +115,7 @@ impl SteeringInbox {
         if self.closed {
             return false;
         }
-        // 较早排队的输入可能在较晚的 steer 之后才被发送，按接受序号插入。
-        let index = self.entries.partition_point(|entry| entry.sequence < request.sequence);
-        self.entries.insert(index, request);
+        self.entries.push(request);
         true
     }
 
@@ -142,7 +124,7 @@ impl SteeringInbox {
         self.entries.first().cloned()
     }
 
-    /// 保存期间允许停止清空箱子或发送较早的排队输入，因此按身份确认，而非移除队首。
+    /// 保存期间允许停止清空箱子，因此按身份确认，而非移除队首。
     pub(super) fn acknowledge(&mut self, sequence: u64) {
         self.entries.retain(|request| request.sequence != sequence);
     }
@@ -154,15 +136,6 @@ impl SteeringInbox {
         }
         self.closed = true;
         true
-    }
-
-    /// 查找仍未消费的图片，预览不改变队列。
-    pub fn image(&self, id: &str) -> Option<crate::image::InputImage> {
-        self.entries
-            .iter()
-            .flat_map(|request| &request.input.images)
-            .find(|image| image.attachment.id == id)
-            .cloned()
     }
 
     /// 关闭注入箱：此后的输入被拒绝；已收下但未保存的条目留待下次执行。

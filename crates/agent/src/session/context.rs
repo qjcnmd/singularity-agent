@@ -176,30 +176,6 @@ impl ContextView {
         })
     }
 
-    pub(crate) fn pruned_tool_results(&self, session: &SessionData) -> Vec<LedgerRecord> {
-        self.entries
-            .iter()
-            .filter_map(|position| match position.entry(session) {
-                SessionEntry::Message {
-                    id,
-                    message: AgentMessage::ToolResult { .. },
-                    ..
-                } => {
-                    // tool_result_message 与剪枝记录都以正文开头，后接图片。
-                    let [ContentBlock::Text { text }, images @ ..] = position.content(session) else {
-                        unreachable!("tool results start with a text block");
-                    };
-                    crate::compaction::prune_tool_text(text).map(|text| {
-                        let mut content = vec![ContentBlock::Text { text }];
-                        content.extend_from_slice(images);
-                        LedgerRecord::ToolResultPruned { entry_id: id.clone(), content }
-                    })
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
     /// 按当前模型投影估算历史；本轮请求开销与实测校正由 Agent 添加。
     pub(crate) fn estimated_tokens(&self, session: &SessionData) -> u64 {
         context_token_estimate(&self.entries, session)

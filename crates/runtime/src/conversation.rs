@@ -37,7 +37,6 @@ pub struct ConversationSnapshot {
     /// 本轮冻结的有效上下文窗口，用来解释最近请求的用量，之后编辑配置不会改变它。
     /// 进程内没执行过，或进程重启之后，是 None。
     pub model_context_window: Option<u64>,
-    pub pending_input: Option<singularity_protocol::PendingInput>,
     pub pending_question: Option<singularity_protocol::PendingQuestion>,
 }
 
@@ -50,7 +49,7 @@ pub struct Conversation {
     writer_window: Mutex<()>,
 }
 
-/// 一次执行预订；绑定操作和输入，队列在回合准备成功前保持原位，drop 时释放窗口。
+/// 一次执行预订；绑定操作和输入，drop 时释放窗口。
 pub struct OperationReservation {
     // 放弃预订时先丢弃操作持有的写者，守卫再释放生命周期窗口。
     operation: ReservedOperation,
@@ -64,17 +63,12 @@ pub struct OperationGuard {
 }
 
 enum ReservedOperation {
-    Turn(TurnInput),
+    Turn(ControlRequest),
     Compaction {
         thread: Thread,
         writer: SessionWriter,
         window: Arc<CancelWindow>,
     },
-}
-
-enum TurnInput {
-    Submitted(ControlRequest),
-    Queued,
 }
 
 /// 操作结果保留来源；宿主据此展示回合或独立压缩的结果。
@@ -84,10 +78,10 @@ pub enum OperationResult {
 }
 
 impl OperationReservation {
-    /// 首次提交绑定的消息身份；排队消息和独立压缩没有新的提交回执。
+    /// 提交绑定的消息身份；独立压缩没有提交回执。
     pub fn submitted_item_id(&self) -> Option<String> {
         match &self.operation {
-            ReservedOperation::Turn(TurnInput::Submitted(request)) => Some(request.item_id()),
+            ReservedOperation::Turn(request) => Some(request.item_id()),
             _ => None,
         }
     }
@@ -99,9 +93,9 @@ impl OperationReservation {
     ) -> (OperationResult, OperationGuard) {
         let Self { guard, operation } = self;
         let result = match operation {
-            ReservedOperation::Turn(input) => {
-                OperationResult::Turn(guard.conversation.run_chain(input, sink).await)
-            }
+            ReservedOperation::Turn(input) => OperationResult::Turn(
+                guard.conversation.run_single_turn(input, sink).await.map_err(Into::into),
+            ),
             ReservedOperation::Compaction { thread, writer, window } => OperationResult::Compaction(
                 guard
                     .conversation
@@ -120,14 +114,6 @@ impl Drop for OperationGuard {
         let mut state = self.conversation.lock_state();
         state.turn = TurnLifecycle::Idle;
     }
-}
-
-/// 一次「立即发送」原子提升的结果。
-pub enum FollowUpPromotion {
-    /// 输入已经进入当前 turn 的注入箱，control 身份不变。
-    Injected,
-    /// Session 已经空闲；预订选定下一条输入，消息仍保留在队列中。
-    Reserved { reservation: OperationReservation },
 }
 
 /// 协调层错误。
@@ -153,13 +139,9 @@ pub enum ConversationControlError {
     NotRunning,
     #[error("输入不能为空。")]
     InvalidInput,
-    #[error("pending control was not found")]
-    ControlNotFound,
-    #[error("会话已有一条排队消息。")]
-    PendingInputExists,
 }
 
-/// 输入正文的共同校验；在接受操作之前调用，空输入不占用执行窗口或队列序号。
+/// 输入正文的共同校验；在接受操作之前调用，空输入不占用执行窗口或接受序号。
 pub fn validate_input(input: &UserInput) -> Result<(), ConversationControlError> {
     if input.text.trim().is_empty() && input.images.is_empty() {
         Err(ConversationControlError::InvalidInput)
@@ -176,7 +158,6 @@ impl Conversation {
             state: Mutex::new(ConversationState {
                 thread,
                 turn: TurnLifecycle::Idle,
-                pending_input: None,
                 steering_inbox: singularity_agent::agent::SteeringInbox::default_handle(),
                 control_sequence: 0,
                 last_context_window: None,
@@ -185,7 +166,7 @@ impl Conversation {
         })
     }
 
-    /// 校验并绑定本轮输入，原子预订执行链窗口，execute 时交给 Runner。放弃预订不留下
+    /// 校验并绑定本轮输入，原子预订执行窗口，execute 时交给 Runner。放弃预订不留下
     /// 输入。预订与写者打开、交接在同一处串行。
     pub fn reserve_start(
         self: &Arc<Self>,
@@ -196,14 +177,11 @@ impl Conversation {
         if state.turn.is_busy() {
             return Err(ConversationError::TurnAlreadyActive);
         }
-        if state.pending_input.is_some() {
-            return Err(ConversationControlError::PendingInputExists.into());
-        }
         let request = state.next_control(input.into())?;
         state.turn = TurnLifecycle::Reserved;
         Ok(OperationReservation {
             guard: OperationGuard { conversation: Arc::clone(self) },
-            operation: ReservedOperation::Turn(TurnInput::Submitted(request)),
+            operation: ReservedOperation::Turn(request),
         })
     }
 
@@ -215,18 +193,6 @@ impl Conversation {
             return Err(ConversationError::TurnAlreadyActive);
         }
         Ok(action())
-    }
-
-    /// 待处理输入的图片只存在于内存，预览复用这份字节。
-    pub fn pending_image(&self, image_id: &str) -> Option<singularity_agent::image::InputImage> {
-        let state = self.lock_state();
-        state
-            .pending_input
-            .iter()
-            .flat_map(|request| &request.input.images)
-            .find(|image| image.attachment.id == image_id)
-            .cloned()
-            .or_else(|| state.steering_inbox.lock().expect("steering inbox lock poisoned").image(image_id))
     }
 
     /// 当前 Thread 的投影快照。
@@ -247,57 +213,6 @@ impl Conversation {
         if !controls.enqueue(request) {
             return Err(ConversationControlError::NotRunning);
         }
-        Ok(())
-    }
-
-    /// 排队一条输入，在活动回合正常完成后执行；空闲时应当直接开始回合。
-    pub fn submit_follow_up(&self, input: impl Into<UserInput>) -> Result<(), ConversationControlError> {
-        self.lock_state().queue_follow_up(input.into())
-    }
-
-    /// 原子取回尚未消费的完整输入，交给工作台继续编辑；取走后本轮不再消费它。
-    pub fn take_follow_up(&self, control_id: &str) -> Result<UserInput, ConversationControlError> {
-        let mut state = self.lock_state();
-        state.editable_pending_input(control_id)?;
-        Ok(state.pending_input.take().expect("located pending input exists").input)
-    }
-
-    /// 发送排队输入：运行时原子交给当前 turn 的 steer 输入箱，空闲时预订下一轮。
-    /// 注入窗口关闭时保持原位；空闲预订在回合准备成功后才取走输入。
-    pub fn promote_pending(
-        self: &Arc<Self>,
-        control_id: &str,
-    ) -> Result<FollowUpPromotion, ConversationControlError> {
-        // 空闲分支会发布预订窗口，要和写者窗口串行。
-        let _window = self.lock_writer_window();
-        let mut state = self.lock_state();
-        let request = state.editable_pending_input(control_id)?;
-        match &state.turn {
-            TurnLifecycle::Running(controls) => {
-                if !controls.enqueue(request.clone()) {
-                    return Err(ConversationControlError::NotRunning);
-                }
-                state.pending_input.take();
-                Ok(FollowUpPromotion::Injected)
-            }
-            TurnLifecycle::Idle => {
-                state.turn = TurnLifecycle::Reserved;
-                Ok(FollowUpPromotion::Reserved {
-                    reservation: OperationReservation {
-                        guard: OperationGuard { conversation: Arc::clone(self) },
-                        operation: ReservedOperation::Turn(TurnInput::Queued),
-                    },
-                })
-            }
-            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. } => {
-                Err(ConversationControlError::NotRunning)
-            }
-        }
-    }
-
-    /// 撤回还没被消费的输入，不写入对话历史。
-    pub fn withdraw_follow_up(&self, control_id: &str) -> Result<(), ConversationControlError> {
-        self.take_follow_up(control_id)?;
         Ok(())
     }
 
@@ -324,9 +239,9 @@ impl Conversation {
         })
     }
 
-    /// 是否正在执行，或者还有待处理输入；这两个事实在同一次状态读取里一起判断。
+    /// 是否有活动或已预订的执行操作。
     pub fn is_occupied(&self) -> bool {
-        self.lock_state().is_occupied()
+        self.lock_state().turn.is_busy()
     }
 
     pub fn phase(&self) -> SessionPhase {
@@ -340,7 +255,6 @@ impl Conversation {
             phase: state.turn.phase(),
             selector: state.thread.model.clone(),
             model_context_window: state.last_context_window,
-            pending_input: state.pending_input(),
             pending_question: match &state.turn {
                 TurnLifecycle::Running(controls) => controls.questions.pending(),
                 _ => None,
@@ -362,7 +276,7 @@ impl Conversation {
         }
     }
 
-    /// 停止当前回合或独立压缩，尚未执行的队列保留下来。
+    /// 停止当前回合或独立压缩，清空尚未消费的引导输入。
     pub fn abort(&self) -> Result<(), ConversationControlError> {
         match &self.lock_state().turn {
             TurnLifecycle::Running(controls) => controls.accept_cancel(),
