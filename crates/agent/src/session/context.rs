@@ -14,7 +14,7 @@ use crate::message::{AgentMessage, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY
 use super::format::{LedgerRecord, SessionEntry};
 use super::manager::SessionData;
 
-/// 按 UTF-16 字符数做启发式 Token 估算（ceil(chars / 4)），全仓只此一份实现。
+/// 启发式 Token 估算：按 UTF-16 字符数除以 4 向上取整。
 pub(crate) fn estimate_tokens_of(text: &str) -> u64 {
     let chars = text.encode_utf16().count() as u64;
     chars.div_ceil(4)
@@ -26,7 +26,7 @@ fn compaction_summary(summary: &str) -> String {
 
 const UNKNOWN_TOOL_OUTCOME: &str = "[previous execution was interrupted; outcome unknown. Inspect the current state before deciding whether to repeat an action with side effects.]";
 
-/// 只在模型输入里闭合工具单元；缺失结果不作为真实执行事实写回会话。
+/// 将会话条目映射为模型消息列表；若工具调用缺少对应结果（如被中断），补充占位提示以保证协议消息闭合。
 fn project_messages(entries: &[ContextPosition], session: &SessionData) -> Vec<ContextMessage> {
     let mut messages = Vec::new();
     let mut positions = entries.iter().peekable();

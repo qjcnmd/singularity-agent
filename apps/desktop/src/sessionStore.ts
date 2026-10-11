@@ -228,7 +228,7 @@ export class SessionStore {
   }
 
   private onFrame(frame: StreamEnvelope): void {
-    // ready 发起首次基线读取；读取在途的增量先缓冲，是否已被快照覆盖由 reducer 决定。
+    // 正在重同步或初始化加载时暂存接收到的事件，就绪后再回放
     if (this.resyncing !== null
       || (frame.type !== 'ready' && (this.state.bootstrap === null || this.state.sessionLoad.status === 'loading'))) {
       this.queuedFrames.push(frame)
@@ -250,14 +250,12 @@ export class SessionStore {
 
   private resync(): Promise<void> {
     if (this.resyncing !== null) return this.resyncing
-    // 每个重同步入口先自行撤销可提交状态，同一连接上的逻辑重同步
-    // （resync_required）与传输层是否已宣告 recovering 无关。
+    // 开始重同步：暂停 UI 提交
     if (this.state.connection === 'ready') this.patch({ connection: 'recovering' })
     this.resyncing = (async () => {
       let converged = false
       try {
         const bootstrap = await this.transport.rpc('app.bootstrap', {})
-        // 即使先前的创建帧丢失，也以 resync baseline 为准。
         this.createdSessionId = null
         this.applySync(resetBaseline(this.state, bootstrap))
         const workspaceId = this.state.selectedWorkspaceId
@@ -272,15 +270,11 @@ export class SessionStore {
             this.saveSelection()
           }
         }
-        // bootstrap 与选中会话读取都结束后才写入就绪，就绪前的旧会话快照不能
-        // 作为 phase 路由的依据。
+        // 等待全局元数据与当前会话数据均拉取完毕
         const { selectedSessionId } = this.state
         if (selectedSessionId !== null) {
           const read = await this.readSession(selectedSessionId)
-          // 连接级失败（unavailable）不能被读侧的 sessionLoad 吞掉，要交回本方法
-          // 既有的连接状态处理，不得宣告就绪。业务读失败（任务不存在或已归档、会话
-          // 内容损坏等）已由 sessionLoad 独立可见，属于允许的读失败，不伪装成基线
-          // 成功，也不把整条连接卡在 recovering。
+          // 仅网络/连接故障需阻断 ready；普通业务错误（如会话已归档）不阻断连接
           if (read !== null && isConnectionFailure(read.error)) throw read.error
         } else {
           this.patch({
@@ -290,7 +284,7 @@ export class SessionStore {
         }
         converged = true
       } catch (error) {
-        // 私有管道没有可重连的服务；基线失败后停止接收增量，刷新再建立基线。
+        // stdio 管道故障时断开连接并清空队列
         this.transport.stop()
         this.queuedFrames = []
         this.patch({ connection: 'recovering' })
@@ -298,8 +292,7 @@ export class SessionStore {
       } finally {
         this.resyncing = null
         this.flushFrames()
-        // 缓冲帧可能包含新的重同步通知，只有缓冲全部处理完且没有新的恢复进行时
-        // 才宣告可提交。
+        // 暂存帧回放完毕且无新重同步时，恢复 ready 状态
         if (converged && this.resyncing === null) this.patch({ connection: 'ready' })
       }
     })()
@@ -309,9 +302,7 @@ export class SessionStore {
   private flushFrames(): void {
     const queued = this.queuedFrames
     this.queuedFrames = []
-    // 缓冲释放不预先按 revision 过滤，帧全部交给同一个 reducer，由它判断哪些
-    // 已被快照覆盖、哪些仍要求重同步。真正过期的增量只在 reduceStream 里丢弃，
-    // 这个判断只有一处。
+    // 依次分发回放暂存的帧
     for (const frame of queued) this.onFrame(frame)
   }
 
@@ -394,7 +385,7 @@ export class SessionStore {
       const workspaces = new Set(bootstrap.workspaces.map(workspace => workspace.workspaceId))
       const sessions = new Set(Object.values(bootstrap.sessionsByWorkspace).flat().map(session => session.threadId))
       const created = this.createdSessionId
-      // 创建可能在其已发出的 catalog 快照被应用前就完成。
+      // 兼容新创建会话尚未包含在 catalog 快照中的过渡状态，避免被意外过滤
       const protectedId = created !== null && !sessions.has(created)
         ? created : null
       if (created !== null && sessions.has(created)) this.createdSessionId = null
@@ -425,7 +416,7 @@ export class SessionStore {
       ) }
     }
     this.state = { ...this.state, ...patch }
-    // 协议状态逐帧归约；只合并显示通知。操作、终态及连接变化立即交付最新状态。
+    // 节流优化：高频流式事件合并为 50ms 批量通知，终态与连接状态变化立即通知
     if (progress) this.notification ??= setTimeout(this.notify, 50)
     else this.notify()
   }

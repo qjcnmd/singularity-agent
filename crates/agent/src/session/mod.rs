@@ -17,7 +17,7 @@ pub use manager::{CommittedEntry, SessionData, SessionManager};
 pub use request::RequestContext;
 pub(crate) use request::RequestDefinitions;
 
-/// 会话 JSONL 文件名的唯一拼法，创建、查找与归档共用。
+/// 生成会话 JSONL 文件名：`{session_id}.jsonl`。
 pub fn session_file_name(session_id: &str) -> String {
     format!("{session_id}.jsonl")
 }
@@ -26,22 +26,20 @@ pub(crate) fn new_entry_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
-/// 一个 turn 内共享的会话写者。turn 执行与控制面用同一个 SessionManager 实例，
-/// 写者只有一份；每次追加各自短暂加锁、串行落盘，不跨 provider 调用或工具执行持锁。
+/// 线程安全的共享会话写入器（仅在读取或追加时短暂加锁）。
 pub type SessionWriter = std::sync::Arc<std::sync::Mutex<SessionManager>>;
 
-/// 加锁取回会话写者。锁中毒意味着共享会话状态已经损坏，直接 panic 停止，
-/// 不做静默恢复（与 inbox::lock_inbox 同一纪律）。
+/// 获取写者互斥锁（锁中毒时直接 fail-stop panic）。
 pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionManager> {
     writer.lock().expect("session writer lock poisoned (fail-stop)")
 }
 
-/// 在线程池追加一条持久记录；调用方 await 成功后才能发布依赖它的事件。
+/// 在阻塞任务线程池中异步追加一条账本记录。
 pub async fn append_record_async(writer: &SessionWriter, record: LedgerRecord) -> Result<CommittedEntry> {
     with_writer_async(writer, move |writer| writer.append_record(record)).await
 }
 
-/// 在线程池中操作共享写者；持久化错误向上传播，内部异常由进程统一终止。
+/// 在阻塞任务线程池中操作共享会话写者。
 pub async fn with_writer_async<T: Send + 'static>(
     writer: &SessionWriter,
     operation: impl FnOnce(&mut SessionManager) -> Result<T> + Send + 'static,

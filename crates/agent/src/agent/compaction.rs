@@ -44,8 +44,7 @@ impl Agent {
         let Some(summary) = summary else {
             return Ok(false);
         };
-        // 请求层已经做过唯一一次 ProviderError→AgentError 分类；压缩只传播结果，
-        // 不再按取消令牌改写真实失败原因（停止是否被接受由操作层的终态边界裁决）。
+        // 发起模型摘要请求并向上传播结果
         let (response, id) = execute_request(
             &self.provider,
             &self.session,

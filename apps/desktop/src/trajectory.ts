@@ -14,7 +14,7 @@ export interface TrajectoryEntry {
   request?: RequestObservation
   prompt?: ModelRequestSnapshot
   previousPrompt?: ModelRequestSnapshot
-  /** 该条目的类型化失败细节；只有失败终态条目携带。 */
+  /** 失败终态的结构化错误详情 */
   error?: TurnErrorDetail
   duration: number | null
   startedAt: string | null
@@ -30,7 +30,7 @@ function entry(id: string, kind: TrajectoryKind, title: string, text = ''): Traj
 const projections = new WeakMap<ExecutionTurn, { previous: ModelRequestSnapshot | undefined; next: ModelRequestSnapshot | undefined; turn: TrajectoryTurn }>()
 const requestTitle = (r: RequestObservation) => `${r.purpose === 'compaction' ? '摘要请求' : '请求'} #${r.attempt}`
 
-/** 布局与 prompt 对比都消费已解析的执行事实。 */
+/** 构建右侧轨迹面板所需的分轮次详细执行记录 */
 export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
   if (!session) return []
   let previousPrompt: ModelRequestSnapshot | undefined
@@ -77,27 +77,26 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
       }
       entries.push({ ...item, status: fact.status, startedAt: fact.startedAt })
     }
-    // 失败终态的细节是这一轮的事实：显示层只决定格式，说明正文取 message。
+    // 追加回合失败错误条目
     if (turn.error) entries.push({ ...entry(`turn-error:${turn.id ?? 'leading'}`, 'event', '运行错误', turn.error.message),
       status: 'error', error: turn.error })
     const projected = { id: turn.id ?? (standalone ? 'compaction' : 'leading'), title, entries }
     projections.set(turn, { previous, next: previousPrompt, turn: projected })
     return projected
   })
-  // 普通回合已持久化的错误不重复显示；独立压缩的失败是另一次操作，
-  // 即使前一轮也失败，仍保留它自己的原因。
+  // 补齐未持久化到历史中的运行时失败（如独立的上下文压缩失败）
   const terminal = session.runtime.terminal
   if (!session.facts.active.length && terminal?.status === 'failed' && terminal.message
     && (terminal.source === 'compaction' || !turns.at(-1)?.entries.some(entry => entry.error))) {
     const failure = { ...entry('runtime-error', 'event', terminal.source === 'compaction' ? '压缩失败' : '运行错误', terminal.message), status: 'error' as const }
     const last = turns.at(-1)
     if (last) turns[turns.length - 1] = { ...last, entries: [...last.entries, failure] }
-    else turns.push({ id: 'runtime', title: `第 ${++ordinal} 轮`, entries: [failure] })
+    else turns.push({ id: 'runtime', title: `第 ${++ordinal} 轮`, entries: [failure] } )
   }
   return turns.filter(turn => turn.entries.length)
 }
 
-/** settings 保持为结构化事实；显示字符串在此生成。 */
+/** 格式化显示模型配置信息 */
 function settingsText(settings: { provider: string; model: string; reasoning: string | null }): string {
   return `${settings.provider}/${settings.model}${settings.reasoning ? ` · ${settings.reasoning}` : ''}`
 }

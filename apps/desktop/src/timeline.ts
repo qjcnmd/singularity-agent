@@ -11,7 +11,7 @@ export interface TimelineItemModel {
   fact: ExecutionItem | null
   summary: string
   filePath: string | null
-  /** 条目自身状态；没有执行事实的运行时反馈（如正在压缩）用它表达状态。 */
+  /** 条目状态；用于无执行事实的运行时项（如压缩中） */
   status?: FactStatus
   timing?: { startedAt: string; finishedAt?: string }
 }
@@ -33,15 +33,14 @@ export function buildTimeline(session: SessionView | null, userHome?: string | n
     const active = session.runtime.activeTurn?.turnId === turn.id
     for (const item of projectTurn(turn, session.summary.cwd, userHome, active)) result.push(item)
   }
-  // 进行中的压缩来自 runtime；已提交的结果来自历史。终态只补充未能落盘的故障。
+  // 提取压缩状态：进行中来自 runtime，失败来自终态
   if (session.runtime.activeCompaction) {
     result.push(compactionItem('compaction:running', 'running', '正在压缩…'))
   } else if (session.runtime.terminal?.source === 'compaction') {
     const terminal = session.runtime.terminal
     result.push(compactionItem('compaction:failed', 'error', terminal.message ?? '压缩失败'))
   }
-  // 当前停止提示只看可见尾部：历史上更早的 terminal 不遮蔽本次停止；尾部已经
-  // 是停止提示时（相邻、没有新可见内容）合并为同一条。
+  // 若执行被手动中断，末尾追加“已停止”提示
   if (session.runtime.terminal?.source !== 'compaction'
     && session.runtime.terminal?.status === 'interrupted'
     && result[result.length - 1]?.kind !== 'terminal') result.push(stoppedItem())
@@ -51,7 +50,7 @@ export function buildTimeline(session: SessionView | null, userHome?: string | n
 function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null | undefined, active: boolean): TimelineItemModel[] {
   const startedAt = turn.startedAt
   const result: TimelineItemModel[] = []
-  // 开头的 settings 组没有 turn id；显示键为它统一使用一个稳定占位符。
+  // 首部 settings 记录没有 turnId，使用 'leading' 占位 key
   const group = turn.id ?? 'leading'
   let workStartIndex = -1
   for (const fact of turn.items) {
@@ -139,7 +138,7 @@ export function failureSummary(output: string): string {
   const lines = Anser.ansiToText(output).split(/\r?\n/).map(line => line.trim()).filter(Boolean)
   const diagnostic = lines.findLast(line => /\b[\w.]*(?:error|exception)\b\s*:|:\s*(?:command not found|No such file or directory|Permission denied)\b/i.test(line))
   const message = diagnostic ?? lines.findLast(line => /^Command (?:exited|timed out|terminated|aborted)\b/.test(line)) ?? lines[0] ?? ''
-  // 折叠行只展示简短原因，命令、路径、错误编号和堆栈保留在详情。
+  // 提取首行简短错误原因，完整输出与堆栈保留在详情中
   const reason = message.match(/\b(?:No such file or directory|Permission denied|command not found)\b/i)?.[0]
   if (reason) return reason
   if (/^Command timed out\b/.test(message)) return '执行超时'

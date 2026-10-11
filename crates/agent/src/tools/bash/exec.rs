@@ -98,17 +98,13 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             Err(error) => break Err(format!("failed to wait for the command process: {error}")),
         }
     };
-    // 唯一的回收点：自然观察到退出时子进程已经回收；其余结束原因都必须终止整棵
-    // 进程树并在同一个有界窗口内等它结束。回收失败只作附加信息，不覆盖结束原因。
+    // 进程未正常退出时（超时或取消），终止并回收 Job 关联的整棵子进程树
     let cleanup_failures = if outcome.is_ok() {
         Vec::new()
     } else {
         managed.reclaim()
     };
-    // 排空阶段：主进程已退出（或整棵树已被终止），但管道里可能还有缓冲输出，也可能
-    // 有子进程树成员仍握着写端。一个接收循环覆盖两个时间窗口：第一个窗口等尾部输出，
-    // 到 OUTPUT_DRAIN_GRACE 期限就停止 pump 并切到第二个窗口，后者一直读到 pump 不再
-    // 产出为止。进入第二个窗口即说明后台进程还握着写端，输出按截断处理。
+    // 排空管道中残留的输出；若后台派生的孤儿进程仍持续占用写端，超过宽限期后截断停止
     let mut output_truncated_by_background = false;
     if !readers_drained {
         let grace_deadline = Instant::now() + OUTPUT_DRAIN_GRACE;

@@ -6,24 +6,23 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{ModelErrorKind, ProviderError, provider_error_kind_for_http_status};
 use crate::{HTTP_STATUS_CONFLICT, PROVIDER_TIMEOUT_SECONDS};
 
-/// 进程内唯一的上游 HTTP 客户端：连接池与 TLS 会话跨 turn 复用；配置固定，构造点只此一处。
+/// 获取全局共享的 reqwest Client 单例（复用连接池与 TLS 会话）。
 pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     if let Some(client) = CLIENT.get() {
         return Ok(client.clone());
     }
     let client = reqwest::Client::builder()
-        // SSE 按到达字节解析；目录请求单独启用压缩，避免改变流式端点的传输行为。
+        // 禁用全局 gzip，保证 SSE 流式响应按原始到达字节即时解析
         .no_gzip()
         .read_timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
         .user_agent(format!("singularity-agent/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|error| provider_transport_error(error, "provider_client_initialization_failed"))?;
-    // 并发构造时保留先到的那个：两者配置相同，落败的实例直接丢掉。
     Ok(CLIENT.get_or_init(|| client).clone())
 }
 
-/// 生成请求返回非 2xx 时的失败；冲突允许重试，其余使用共同的状态分类。
+/// 根据非 2xx HTTP 状态码构造 ProviderError。
 pub(crate) fn provider_error_from_http_status(status: u16) -> ProviderError {
     let kind = match status {
         HTTP_STATUS_CONFLICT => ModelErrorKind::RateLimited,
@@ -33,9 +32,7 @@ pub(crate) fn provider_error_from_http_status(status: u16) -> ProviderError {
     ProviderError::new(kind, message).with_code("provider_http_status")
 }
 
-/// 有长度上限、已脱敏的原因文本：reqwest 的 Display 只给大类（body 读取失败一律是
-/// "error decoding response body"），具体原因在错误来源链的最内层（超时、断流等），所以取
-/// 最内层的描述；再去掉 URL（凭据只在请求头，本来也不会进错误文本），按共用上限折行截断。
+/// 提取网络传输异常的最内层错误原因（剥离 URL 保证安全，并限制最大字符长度）。
 pub(crate) fn transport_error_source(error: reqwest::Error) -> String {
     let error = error.without_url();
     let mut source: &(dyn std::error::Error + 'static) = &error;

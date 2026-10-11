@@ -65,26 +65,23 @@ impl SseFrameDecoder {
     }
 }
 
-/// 协议解码器只接收完整 SSE 帧并解释终态；字节缓冲与帧边界由读取循环持有。
+/// 协议特定 SSE 解码器接口（由 Chat / Responses 协议模块实现）。
 pub(crate) trait SseStreamDecoder: Sized {
     type Terminal;
-    /// 该协议的 malformed 构造器（帧边界失败时用的稳定词形）。
+    /// 构造协议格式错误的方法
     fn frame_malformed() -> fn(&'static str) -> ProviderError;
 
+    /// 派发处理单个完整的 SSE 数据帧
     fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError>;
 
-    /// 消费解码器，一次性移交结果；EOF 时也由此报告缺失的协议终态。
+    /// 消费解码器并物化最终响应结果
     fn materialize_terminal(self) -> Result<Self::Terminal, ProviderError>;
 
-    /// 本协议的终态是否已经到达。读取循环据此立刻物化结果并停止读取这个响应：
-    /// 已经完成的响应，成败不再取决于 HTTP body 是否结束；EOF 只用来判断意外截断。
+    /// 当前协议响应是否已达终态
     fn protocol_complete(&self) -> bool;
 }
 
-/// 通用的流读取循环：HTTP chunk 的任意切分和 SSE 帧边界都能正确保留。
-///
-/// 每轮异步等待一个 chunk，随后同步解码已收到的字节；取消与 transport 错误由共同的
-/// 等待函数映射。
+/// 通用的 SSE 流读取循环：处理网络 chunk 拆包并分发事件。
 pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
     cancellation: &CancellationToken,
     mut response: Response,
@@ -99,7 +96,6 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
             return Err(provider_cancelled_error());
         }
         let Some(chunk) = chunk else {
-            // 没到终态而 body 就结束了：只有走这条路径才算意外截断。
             frames.finish(D::frame_malformed())?;
             return decoder.materialize_terminal();
         };
@@ -107,7 +103,6 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
         for line in complete.split_inclusive(|byte| *byte == b'\n') {
             if let Some(frame) = frames.process_line(line) {
                 decoder.dispatch_event(&frame)?;
-                // 协议终态后不再解析尾帧，也不等待 HTTP body 关闭。
                 if decoder.protocol_complete() {
                     return decoder.materialize_terminal();
                 }
@@ -116,7 +111,7 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
     }
 }
 
-/// malformed 构造器的统一核心：各协议的字面词留在薄包装里，构造体只写这一份。
+/// 构造流式响应格式异常错误
 pub(crate) fn provider_stream_malformed_error(
     message: &'static str,
     code: &'static str,

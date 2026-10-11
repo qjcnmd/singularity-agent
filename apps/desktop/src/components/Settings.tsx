@@ -9,7 +9,7 @@ import { ExpandChevron } from './ExpandChevron'
 import { McpSettings } from './McpSettings'
 import { Palette, Boxes, Plug } from 'lucide-react'
 
-/** 设置面板只声明自己读取的字段：父级按同一份清单订阅。 */
+/** 设置面板组件所需的状态切片。 */
 type SettingsState = Pick<AppState, 'bootstrap' | 'settingsOpen' | 'messageFontSize' | 'actionErrors' | 'pendingActions' | 'selectedWorkspaceId'>
 
 type ProviderEditorState = null | { kind: 'new' } | { kind: 'existing'; provider: RedactedProvider }
@@ -24,7 +24,7 @@ export function Settings({ state }: { state: SettingsState }) {
     ['model.saveProvider', 'model.removeProvider'].some(method => key.startsWith(pendingKey(method, ''))))
   const catalog = state.bootstrap?.modelCatalog
   const providers = catalog?.providers ?? []
-  // 编辑中的配置属于表单；保存后目录读取失败不能卸载用户输入和失败反馈。
+  // 正在编辑的 Provider 优先显示在列表中，避免保存或读取失败时表单被冲掉
   const editingProvider = editor?.kind === 'existing' ? editor.provider : null
   const providerRows = editingProvider && !providers.some(provider => provider.providerId === editingProvider.providerId)
     ? [...providers, editingProvider] : providers

@@ -19,13 +19,12 @@ pub(crate) fn provider_content_filter_error(message: &str) -> ProviderError {
     ProviderError::new(ModelErrorKind::ContentFilter, message).with_code("content_filter")
 }
 
-/// Chat 兼容端点的 finish_reason 为 "network_error" 时，表示生成过程中网络出了故障。
+/// 构造流式生成过程中的网络错误（对应 finish_reason 为 "network_error"）。
 pub(crate) fn provider_finish_network_error(message: &str) -> ProviderError {
     ProviderError::new(ModelErrorKind::NetworkError, message).with_code("network_error")
 }
 
-/// 校验模型响应的结构性事实：正文非空、工具名非空、调用 ID 非空且唯一。工具是否
-/// 存在、参数是否有效由 preflight 判定并以模型可见的失败结果回到主循环，协议层不提前终结。
+/// 校验模型响应的基础结构完整性（正文与工具调用不同时为空、tool_call_id 非空且不重复、工具名非空）。
 pub(crate) fn finalize_provider_response(
     response: ModelTurnResponse,
 ) -> Result<ModelTurnResponse, ProviderError> {

@@ -14,24 +14,17 @@
 .context-menu button { display: flex; justify-content: space-between; gap: 24px; width: 100%; padding: 8px 11px; border: 0; text-align: left; background: transparent; color: var(--ink); border-radius: 10px; }
 .context-menu button:hover, .context-menu button:focus-visible { background: var(--surface-hover); }
 .context-menu button.danger { color: var(--danger); }
-/* 高度 disclosure：容器按量到的内容高度过渡 height，内层负责裁剪与去模糊。
-   不用 grid-template-rows 0fr→1fr 的原因：在 auto 高度的容器上做该过渡时，
-   容器的实际高度会超过它唯一的轨道（实测展开途中差 30–50px），文档流内的展开
-   会把下方内容提前推开一段再收回；浮层因为绝对定位而看不出来，但同一个机制
-   不该有两套表现。两个方向各声明一次过渡，收起可用与展开不同的时长与曲线。 */
+/* 折叠面板高度过渡动画 */
 .content-disclosure { overflow: hidden; height: 0; transition: height var(--disclosure-collapse-duration) var(--disclosure-collapse-ease); }
 .content-disclosure.is-open { height: auto; transition: height var(--disclosure-duration) var(--disclosure-ease); }
-/* 内层自身建立格式化上下文：内容的首尾外边距不会塌到内层之外，量到的高度才等于
-   实际内容高度。 */
+/* 内部内容淡入淡出与模糊滤镜 */
 .content-disclosure > div { overflow: hidden; opacity: 0; filter: blur(2px); transition: opacity var(--disclosure-collapse-duration) var(--disclosure-collapse-ease), filter var(--disclosure-collapse-duration) var(--disclosure-collapse-ease); }
 .content-disclosure.is-open > div { opacity: 1; filter: blur(0); transition: opacity var(--disclosure-duration) var(--disclosure-ease), filter var(--disclosure-duration) var(--disclosure-ease); }
-/* 所有 disclosure 箭头使用与 Accordion 相同的垂直翻转。两个方向各声明一次过渡，
-   与面板同一时钟：只写一条会让箭头在收起时比面板慢，翻转滞后于高度变化。
-   inline-flex 使 svg 成为可变换的盒，翻转才作用于图标本身。 */
+/* 折叠指示箭头垂直翻转动画 */
 .expand-chevron { display: inline-flex; transform: scaleY(1); transform-origin: center; transition: transform var(--disclosure-collapse-duration) var(--disclosure-collapse-ease); }
 .expand-chevron.is-open { transform: scaleY(-1); transition: transform var(--disclosure-duration) var(--disclosure-ease); }
 .expand-chevron path { vector-effect: non-scaling-stroke; }
-/* 浮层从触发点上方显现；退出完成后 display:none 释放布局和绘制。 */
+/* 下拉浮层显隐动画 */
 .picker-disclosure {
   display: none;
   opacity: 0;
@@ -56,12 +49,12 @@
 @keyframes menu-enter { from { opacity: 0; } to { opacity: 1; } }
 
 @media (prefers-reduced-motion: reduce) {
-  /* !important 保证关闭动效的用户不被任何作用域规则覆盖。 */
+  /* 响应系统的减少动态效果偏好 */
   .content-disclosure, .content-disclosure > div, .picker-disclosure, .expand-chevron { transition: none !important; }
   .context-menu, .context-menu > button { animation: none; }
 }
 
-/* 材质由浮动控件共享；文字与代码不做模糊。 */
+/* 浮动面板毛玻璃效果 */
 .modal, .context-menu, .context-tooltip, .workspace-appearance-picker, .action-toast {
   background: var(--glass);
   border-color: var(--glass-edge);
@@ -72,7 +65,7 @@
 @keyframes theme-icon-enter { from { opacity: 0; transform: rotate(-25deg) scale(.8); } to { opacity: 1; transform: none; } }
 ::view-transition-old(root), ::view-transition-new(root) { animation-duration: 220ms; }
 @media (prefers-reduced-motion: reduce) { .theme-icon svg { animation: none; } }
-/* 高亮配色来自 Shiki 的双主题输出：每个 token 带明暗两套 CSS 变量，这里只按主题选用。 */
+/* 代码高亮配色（基于 Shiki 主题变量） */
 .code-token { color: var(--shiki-light); }
 [data-theme=dark] .code-token { color: var(--shiki-dark); }
 [data-theme=dark] .sg-rail { background: #44464c; }

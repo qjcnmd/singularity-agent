@@ -17,16 +17,12 @@ pub(crate) fn parse_tool_call_arguments(value: Option<&Value>) -> Result<Value, 
     ))
 }
 
-/// 解析不了的字符串原样保留。它不是合法的工具参数，preflight 会明确拒绝。
+/// 解析工具参数 JSON 字符串；解析失败时保留原始字符串供预检阶段报错。
 pub(crate) fn parse_tool_arguments(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
-/// 按字段名解析 usage：input_field/output_field 是顶层计数，cached_path/reasoning_path 是
-/// 指向嵌套 detail 的 JSON Pointer；取值与「是否上报」来自同一个 Option，没上报的不并成零。
-///
-/// 只有输入与输出都上报时才提供可统计的用量；分项不齐保持未知。
-/// 总量采用提供方给出的数字，未给数字时由输入加输出计算。
+/// 解析上游返回的 Token 用量（输入、输出、缓存命中与思考消耗）。
 pub(crate) fn parse_usage(
     usage: Option<&Value>,
     input_field: &str,

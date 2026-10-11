@@ -11,17 +11,15 @@ pub use project_instructions::{ProjectInstructions, load_agent_instructions};
 pub use user_home::{HomeOrigin, ResolvedHome, resolve_home};
 pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace, saved_directory_matches};
 
-/// 项目根标记：从工作目录向上找到的第一个带该标记的目录就是项目根。指令加载与技能发现
-/// 读标记失败时的策略不同，指令加载直接报错，技能发现退回当前目录；所以这里只共享标记
-/// 本身，查找策略留在各自调用方。
+/// 项目根目录标记文件名（`.git`）。
 pub(crate) const PROJECT_ROOT_MARKER: &str = ".git";
 
-/// 把时长换算成毫秒；超出协议整数范围时截到 u64 能表示的最大值。
+/// 将 Duration 转换为毫秒数（防止超出 u64 范围）。
 pub fn duration_millis(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-/// 当前 UTC 时间，ISO 8601 格式、毫秒精度；会话记录与实时快照共用这个写法。
+/// 获取当前 UTC 时间的 ISO 8601 字符串（毫秒精度，形如 `2026-10-11T08:00:00.000Z`）。
 pub fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::macros::format_description!(
@@ -30,7 +28,7 @@ pub fn now_iso() -> String {
         .expect("utc timestamp always formats")
 }
 
-/// 协议与界面使用的路径文本：统一成正斜杠，并改写 Windows 的 verbatim 前缀。
+/// 规范化路径显示：替换为正斜杠，并处理 Windows 的 UNC 与 verbatim 扩展前缀。
 pub fn display_path(path: &std::path::Path) -> String {
     let text = path.to_string_lossy().replace('\\', "/");
     if let Some(rest) = text.strip_prefix("//?/UNC/") {
@@ -42,8 +40,7 @@ pub fn display_path(path: &std::path::Path) -> String {
     }
 }
 
-/// 返回不超过 max_bytes 字节的有效 UTF-8 前缀；text 超长时截到字符边界并
-/// 返回 true。按字节预算截断前缀的地方都走这一个实现。
+/// 按字节预算截取有效的 UTF-8 字符串前缀（保证字符完整性），返回切片与是否截断。
 pub fn utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
     if text.len() <= max_bytes {
         return (text, false);
@@ -52,7 +49,7 @@ pub fn utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
-/// 创建新的数据文件；访问权限沿用 Windows 目录继承下来的 ACL。
+/// 创建新文件（若文件已存在则返回错误）。
 pub fn create_new_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::fs::OpenOptions;
     let mut options = OpenOptions::new();
@@ -60,18 +57,17 @@ pub fn create_new_file(path: &std::path::Path) -> std::io::Result<std::fs::File>
     options.open(path)
 }
 
-/// 通过系统文件 API 创建应用数据目录，允许目录链接和 junction。
+/// 递归创建应用数据目录。
 pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(path).map_err(|error| format!("failed to create {}: {error}", path.display()))
 }
 
-/// 用「临时文件 + 原子替换」把字节写入目标路径：先在同一个目录下写临时文件并 sync_all，再做
-/// 原子替换，读者看到的要么是完整的旧内容、要么是完整的新内容；写入或替换失败时删掉临时文件。
+/// 原子覆盖写入：先写入同目录临时文件并刷盘，再原子替换目标文件。
 pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     atomic_write(path, bytes, true)
 }
 
-/// 原子创建新的数据文件：完整内容写入同目录临时文件后才公开目标路径；目标已存在时失败。
+/// 原子创建文件：先写入同目录临时文件，成功后再原子移动至目标位置（目标已存在时失败）。
 pub fn atomic_create_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     atomic_write(path, bytes, false)
 }

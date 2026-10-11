@@ -11,25 +11,24 @@ const SINGULARITY_HOME: &str = "SINGULARITY_HOME";
 
 pub const SINGULARITY_DIR_NAME: &str = ".singularity";
 
-/// 数据根是从哪里来的。来源既决定错误归因，也决定技能范围：显式指定的数据目录自成一体；
-/// 只有取自默认位置的数据根，才会和真实用户主目录下的 `.agents/skills` 共享技能。
+/// 数据根目录来源类型。
 #[derive(Debug, PartialEq, Eq)]
 pub enum HomeOrigin {
+    /// 通过 `SINGULARITY_HOME` 环境变量显式指定
     Explicit,
-    /// 系统用户主目录下的默认位置；字段里装的就是那个主目录。
+    /// 系统用户主目录下的默认位置（包含真实用户主目录路径）
     Default(PathBuf),
 }
 
-/// 已解析的数据根及其来源。
+/// 解析完成的数据根路径与来源信息。
 #[derive(Debug, PartialEq, Eq)]
 pub struct ResolvedHome {
-    /// 配置、凭据、会话与用户级技能共用的数据根目录。
+    /// 数据根目录绝对路径（用于存储配置、凭据与会话）
     pub path: PathBuf,
     pub origin: HomeOrigin,
 }
 
-/// 从当前进程环境解析应用数据根及来源；显式目录优先，否则使用系统主目录。
-/// 无效路径直接报错，不改变保存位置。
+/// 解析应用数据根目录（优先读取 `SINGULARITY_HOME` 环境变量，默认使用用户目录下的 `.singularity`）。
 pub fn resolve_home() -> Result<ResolvedHome, String> {
     if let Some(value) = std::env::var_os(SINGULARITY_HOME).filter(|value| !is_blank(value)) {
         let base = Path::new(&value);

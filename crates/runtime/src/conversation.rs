@@ -1,16 +1,11 @@
-//! 一个 session 的内存输入，以及它的执行窗口：同一时刻只允许一个活动。已消费的输入由
-//! Agent 落盘；还在等待处理的输入只存在内存里，进程退出后丢失。
+//! 会话内存状态与执行窗口协调器。
 //!
-//! # 锁
+//! 同一会话同一时刻只允许执行一个操作（回合或独立上下文压缩）。
 //!
-//! 加锁顺序固定为「写者窗口 → 状态」。writer_window 串行化写者打开、回合准备、
-//! Running→Reserved 交接和元数据写盘，文件 I/O 不占状态锁，持有它时不得反向等待状态锁的
-//! 持有者；state 管线程设置、活动阶段、控制接受顺序和待处理输入，控制面的读取
-//! （steer/abort/snapshot/phase）只取这把锁，不会被写者的 I/O 挡住。
-//!
-//! # 锁失效
-//!
-//! 锁中毒说明共享状态已经不可信，直接 panic 结束进程。
+//! # 锁顺序
+//! 固定为 `writer_window` -> `state`：
+//! - `writer_window`: 串行化文件 I/O、写者创建与回合交接。
+//! - `state`: 维护生命周期阶段、模型选择与待处理输入队列（steer/abort）。
 
 mod execution;
 mod state;
@@ -29,34 +24,31 @@ use crate::runner::{TurnOutcome, TurnRunner};
 use singularity_protocol::Thread;
 use singularity_protocol::TurnEvent;
 
-/// 在同一个 state 临界区里读出的会话侧投影：生命周期、模型选择、冻结的上下文窗口和
-/// 待处理控制。不可变，不缓存也不跨调用复用。
+/// 会话状态快照：生命周期阶段、模型选择、冻结的上下文窗口大小与等待中的提问。
 pub struct ConversationSnapshot {
     pub phase: SessionPhase,
     pub selector: Option<String>,
-    /// 本轮冻结的有效上下文窗口，用来解释最近请求的用量，之后编辑配置不会改变它。
-    /// 进程内没执行过，或进程重启之后，是 None。
+    /// 本回合冻结的有效上下文容量上限（用于解释请求用量百分比）
     pub model_context_window: Option<u64>,
     pub pending_question: Option<singularity_protocol::PendingQuestion>,
 }
 
-/// 一个 Thread 的长驻协调器。
+/// 单个会话的核心协调器。
 pub struct Conversation {
     runner: Arc<TurnRunner>,
-    /// Thread 设置、活动阶段、控制接受顺序和待处理输入由同一把锁协调。
+    /// 会话状态与控制信号互斥锁
     state: Mutex<ConversationState>,
-    /// 会话写入窗口：写者打开、turn 交接、设置与元数据写盘的互斥点，见模块文档「锁」。
+    /// 文件写入与生命周期交接互斥锁
     writer_window: Mutex<()>,
 }
 
-/// 一次执行预订；绑定操作和输入，drop 时释放窗口。
+/// 执行预订凭证：绑定待执行操作与生命周期守卫，Drop 时自动释放窗口。
 pub struct OperationReservation {
-    // 放弃预订时先丢弃操作持有的写者，守卫再释放生命周期窗口。
     operation: ReservedOperation,
     guard: OperationGuard,
 }
 
-/// 独占操作窗口，直到宿主完成事件投影与结算；丢弃守卫才允许下一次操作。
+/// 操作独占守卫：保持占用状态直至完成投影与状态结算。
 #[must_use = "hold the operation guard until settlement is complete"]
 pub struct OperationGuard {
     conversation: Arc<Conversation>,

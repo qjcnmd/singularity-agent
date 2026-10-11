@@ -160,26 +160,24 @@ impl HistoryItem {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-/// 按 turn 组织的一轮公开历史。turn 的边界由 JSONL 里的 run operation_started 记录划定；第一个
-/// 开始标记之前落盘的前导条目（settings 等）不属于任何 turn，turnId/status 为 null。
+/// 公开历史中的单回合数据结构（包含回合起止时间、终态状态、错误详情与条目列表）。
 pub struct ThreadTurn {
-    /// 本轮 run operation 的持久化边界时间；前导组或缺失边界为 None。
+    /// 回合开始时间戳
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub started_at: Option<String>,
+    /// 回合结束时间戳
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub finished_at: Option<String>,
     pub turn_id: Option<String>,
-    /// 该轮的终态；只有开始标记、还没结束的轮是 running（崩溃遗留的会被整体
-    /// 状态投影修正为 interrupted），前导组是 null。
+    /// 回合终态
     pub status: Option<TurnStatus>,
-    /// 该轮失败终态落盘下来的细节；成功、中断、前导组，以及没记录细节的旧日志都是 None。
-    /// 它和实时的 `turn/error` 事件表达同一个概念，重读历史时不依赖 runtime 最近一次的错误文本。
+    /// 回合失败详情
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub error: Option<crate::TurnErrorDetail>,
-    /// 该轮的公开条目，按会话顺序排列。
+    /// 该回合内的公开历史条目
     pub items: Vec<HistoryItem>,
 }
 
@@ -254,7 +252,7 @@ pub struct SessionModelUsage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
-/// turn 的生命周期状态。wire 词形由 serde 的 snake_case 统一提供，没有手写词表。
+/// 回合生命周期状态。
 pub enum TurnStatus {
     Running,
     Completed,
@@ -262,8 +260,7 @@ pub enum TurnStatus {
     Interrupted,
 }
 
-/// --json 终态 summary 里的 turn 事实：状态、已知时的 threadId、观测到的 usage，以及只在截断
-/// 终态出现的 truncated 标志。usage 为 None 时就以 null 出现，不把未知用量伪装成零。
+/// `--json` 终态摘要中的回合结果信息。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SummaryTurn {
@@ -271,13 +268,12 @@ pub struct SummaryTurn {
     #[serde(rename = "threadId", skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub usage: Option<TurnModelUsage>,
-    /// 只在截断终态出现；非截断终态会省略这个键。
+    /// 是否由于达到截断限制而结束
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
 
-/// --json 终态 summary 对象的形状，{"summary":{"turn":…}} 的内层。它是事件投影
-/// 的输出契约，不取代 Session ledger 这个执行事实源；序列化统一由 Self::to_line 完成。
+/// `--json` 终态摘要对象 `{"summary": {"turn": ...}}`。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalSummary {
@@ -285,7 +281,7 @@ pub struct TerminalSummary {
 }
 
 impl TerminalSummary {
-    /// 构造终态 summary；任务身份已知时填入 turn.threadId，未知时省略。
+    /// 构造终态摘要对象。
     pub fn new(
         thread_id: Option<&str>,
         status: TurnStatus,
@@ -302,7 +298,7 @@ impl TerminalSummary {
         }
     }
 
-    /// summary 行的 wire 投影：外层 {"summary": …} 这个键只在这里出现一次。
+    /// 序列化为终态输出的 JSON 行。
     pub fn to_line(&self) -> serde_json::Value {
         serde_json::json!({ "summary": self })
     }

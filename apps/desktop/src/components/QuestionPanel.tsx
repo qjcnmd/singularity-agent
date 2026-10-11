@@ -3,7 +3,7 @@ import { ChevronLeft, ChevronRight, Pencil } from 'lucide-react'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import type { PendingQuestion, UserQuestionAnswer } from '../protocol'
 
-/** 一次显示一道题；答案在同一次提交中交给当前等待的工具调用。 */
+/** Agent 交互提问面板：逐题分页填写，完成后统一提交给等待中的工具调用。 */
 export function QuestionPanel({ request, state }: {
   request: PendingQuestion
   state: Pick<AppState, 'selectedSessionId' | 'pendingActions' | 'actionErrors' | 'connection'>

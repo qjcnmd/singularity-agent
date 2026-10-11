@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::format::{Result, SessionEntry, SessionError, SessionHeader};
 
-/// 写打开修复尾行，只读打开只读取完整行。
+/// 尾行未闭合换行时的处理策略（写入前修复截断行，或只读模式仅读取完整行）。
 #[derive(Clone, Copy)]
 pub(super) enum TailPolicy {
     RepairAndRewrite,
@@ -14,15 +14,14 @@ pub(super) enum TailPolicy {
 }
 
 pub(super) struct ParsedSession {
-    /// 磁盘上文件头的原始内容；修复写回时原样写回它的字段值。
     pub(super) header: SessionHeader,
-    /// header 里 cwd 归一化后的唯一结果，供运行期使用。
+    /// 归一化后的工作目录路径
     pub(super) cwd: std::path::PathBuf,
     pub(super) entries: Vec<SessionEntry>,
     pub(super) needs_repair: bool,
 }
 
-/// 逐行解析会话文件：普通行顺序迭代，尾部的撕裂行在这里被识别成待修复状态。
+/// 逐行解析会话 JSONL 文件，并检测未闭合的末尾行。
 pub(super) fn parse_session_file(file: &Path, tail_policy: TailPolicy) -> Result<ParsedSession> {
     let handle = std::fs::File::open(file)?;
     let mut reader = BufReader::new(handle);

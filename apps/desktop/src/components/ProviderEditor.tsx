@@ -36,7 +36,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
     return () => { discoveryRevision.current += 1 }
   }, [providerId, baseUrl, apiKey, protocol])
   const saveError = state.actionErrors[origin]
-  /** 校验并提交模型编辑草稿：返回错误消息表示未提交（编辑框保留），null 表示已写入列表。 */
+  /** 校验并提交模型草稿。返回错误提示字符串表示校验失败，null 表示已成功加入列表。 */
   const commitModel = (index: number | null, draft: ModelInput): string | null => {
     if (invalidModelId(models, index, draft.modelId)) return '请输入有效且不重复的模型 ID。'
     setModels(rows => index === null ? [...rows, draft] : rows.map((row, at) => at === index ? draft : row))
@@ -68,8 +68,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
     setFailure(null)
     setFetching(true)
     try {
-      // 局部查询直接复用 Store 持有的同一条连接；空密钥映射留在调用边界，
-      // 请求仍走既有 RPC envelope/版本/错误处理。
+      // 复用当前 RPC 传输通道执行模型发现
       const found = await queryModels(protocol)
       if (revision !== discoveryRevision.current) return
       if (found.length === 0) {
@@ -118,8 +117,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
         setFailure(`第 ${index + 1} 行模型 ID 为空、重复或包含无效字符。`)
         return
       }
-      // 列表里的容量已由行编辑解析或来自提供方发现结果；这里只校验数值域，
-      // 因为 ModelInput 是类型，不证明外部给的数值一定合法。
+      // 检查上下文容量和最大输出 Token 是否为合法正整数
       if (model.maxContextTokens === null || model.maxOutputTokens === null || !isValidCapacity(model.maxContextTokens) || !isValidCapacity(model.maxOutputTokens)) {
         setFailure(`请编辑第 ${index + 1} 行模型，补齐有效的上下文窗口和最大输出 Token。`)
         return

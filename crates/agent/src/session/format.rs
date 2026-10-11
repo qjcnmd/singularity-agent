@@ -12,8 +12,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::message::AgentMessage;
-/// 当前会话格式版本。旧格式不做迁移，未知字段依旧拒绝。
-pub const CURRENT_SESSION_VERSION: u32 = 11;
+/// 开发阶段固定为 1，格式随当前实现更新；发布前再确定版本策略。
+pub const CURRENT_SESSION_VERSION: u32 = 1;
 /// 会话读写过程中可能出现的错误。
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -33,8 +33,7 @@ pub enum SessionError {
 
 /// 会话操作的统一返回结果。
 pub type Result<T> = std::result::Result<T, SessionError>;
-/// compaction 条目携带的内容：摘要正文与保留锚点。摘要请求自身的 token 消耗记在
-/// 请求账本的 request observation 上，这条条目只表达被替换历史的摘要和保留边界。
+/// 上下文压缩记录：包含摘要正文与保留历史的起点 entry_id。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionEntry {
@@ -42,7 +41,7 @@ pub struct CompactionEntry {
     #[serde(rename = "firstKeptEntryId")]
     pub first_kept_entry_id: String,
 }
-/// 把本轮已上报的领域用量转换为协议形状。
+/// 将模型用量结构体转换为协议通信 DTO。
 pub fn turn_usage_from_model_usage(usage: &ModelUsage) -> TurnModelUsage {
     TurnModelUsage {
         input_tokens: usage.input_tokens,
@@ -54,7 +53,7 @@ pub fn turn_usage_from_model_usage(usage: &ModelUsage) -> TurnModelUsage {
     }
 }
 
-/// 一条可恢复的 session metadata；每个 variant 直接带着自己合法的 payload。
+/// 会话元数据条目（如模型配置覆盖、自定义名称）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "metadataType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionMetadata {
@@ -69,42 +68,37 @@ pub enum SessionMetadata {
     },
 }
 
-/// 单会话执行与请求的持久事实。记录只在
-/// durable acceptance 之后才对消费者可见；物理行序就是记录顺序，引用只向后指。
+/// 会话执行与请求观测的持久化账本记录。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "recordType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LedgerRecord {
-    /// 被中断时留下来展示的内容，不进入模型上下文，也不参与摘要。
+    /// 执行被手动中断前已生成的内容（仅供历史展示，不进入后续模型上下文）。
     AssistantInterrupted {
         items: Vec<singularity_protocol::HistoryItem>,
     },
-    /// 已保存会话中的工具正文替换记录；当前压缩不再生成，只在恢复时应用。
-    /// 当前会话格式允许此记录，移除读取支持需先处理已有用户数据。
+    /// 历史会话中的工具正文裁剪记录（兼容旧数据读取）。
     ToolResultPruned {
         #[serde(rename = "entryId")]
         entry_id: String,
         content: Vec<crate::message::ContentBlock>,
     },
-    /// 一次模型请求尝试的开始与终态观测：同一个 request 先写 Started、再写终态。
+    /// 单次模型调用的请求与结果观测。
     ModelRequest {
         observation: singularity_protocol::RequestObservation,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context: Option<Box<super::request::RequestContext>>,
     },
-    /// 不可变的规范请求消息或工具定义；后续观测只引用这条记录的条目 ID。
+    /// 规范化的请求消息与工具定义快照。
     RequestDefinitions {
         definitions: super::request::RequestDefinitions,
     },
-    /// operation 已被接受的起步事实，先于任何实时执行事件落盘。
+    /// 回合或压缩操作开始记录。
     OperationStarted {
-        /// run operation 绑定的 turn id；独立 compaction 没有，为 None。
+        /// 回合 ID；独立压缩无回合 ID。
         #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
-    /// operation 的终态。run 的记录同时就是这个 turn 唯一的终态事实，outcome 恒为
-    /// 终态。error 是 run 失败终态里可持久化的细节
-    /// （cause/message），也是普通回合及独立压缩失败原因的长期来源。
-    /// 成功与中断的操作不带错误详情。
+    /// 回合或压缩操作终态记录，包含成功/失败/中断状态与错误详情。
     OperationFinished {
         #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
@@ -116,11 +110,7 @@ pub enum LedgerRecord {
     },
 }
 
-/// 会话条目：以 type 为标签的 tagged enum，序列化和严格类型校验都由 serde 生成。
-///
-/// payload 一律嵌成子对象（message/compaction/metadata/record），外层和各载荷都设了
-/// deny_unknown_fields，出现未知字段就拒绝。文件行的物理顺序就是追加顺序；模型上下文
-/// 顺序另由 `session::context` 的投影安排（例如工具结果按 assistant 声明的顺序排列）。
+/// 会话 JSONL 单行条目枚举。物理行顺序对应事件写入顺序。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionEntry {
@@ -147,7 +137,7 @@ pub enum SessionEntry {
 }
 
 impl SessionEntry {
-    /// 条目落盘的时间；实时事件与历史投影共用这一边界。
+    /// 条目写入时间戳。
     pub fn timestamp(&self) -> &str {
         match self {
             Self::Message { timestamp, .. }
@@ -167,25 +157,22 @@ impl SessionEntry {
     }
 }
 
-/// 已持久化消息里某个文本块的稳定公开身份；消费方直接读取结果，不要自己拼后缀。
+/// 派生文本消息块的稳定 item ID。
 pub fn text_item_id(entry_id: &str, index: usize) -> String {
     format!("{entry_id}:text:{index}")
 }
 
-/// 已持久化消息里某个思考块的稳定公开身份。
+/// 派生思考过程块的稳定 item ID。
 pub fn thinking_item_id(entry_id: &str, index: usize) -> String {
     format!("{entry_id}:thinking:{index}")
 }
 
-/// 工具出现位置的稳定公开身份；即使 provider 复用了 call-ID 也不受影响。
+/// 派生工具调用的稳定 item ID（基于助手消息 ID 与调用序号）。
 pub fn tool_item_id(assistant_entry_id: &str, call_index: usize) -> String {
     format!("{assistant_entry_id}:tool:{call_index}")
 }
 
-/// session 文件头在磁盘上的形状：字段集固定、未知字段拒绝，读写共用这一份表示。
-/// 各字段值原样保留磁盘内容，cwd 不在这里归一化，运行期路径由
-/// [`SessionHeader::canonical_cwd`] 单独给出，修复写回也不会改写已存的路径。
-/// 构造只有 `new`（写入）和 `parse`（读取）两个入口，类型不变量由它们把关。
+/// 会话 JSONL 文件的 Header（第一行）。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SessionHeader {
@@ -197,11 +184,11 @@ pub(super) struct SessionHeader {
     pub(super) cwd: String,
 }
 
-/// 文件头 `type` 字段唯一允许的取值；写入端恒写此值，读取端只认此值。
+/// 文件头 type 字段固定值。
 const SESSION_HEADER_TYPE: &str = "session";
 
 impl SessionHeader {
-    /// 新建会话文件头：类型与版本由 schema 的持有者固定，调用方只提供身份信息。
+    /// 构造新会话文件头。
     pub(super) fn new(session_id: String, cwd: String, timestamp: String) -> Self {
         Self {
             kind: SESSION_HEADER_TYPE.to_string(),
@@ -212,8 +199,7 @@ impl SessionHeader {
         }
     }
 
-    /// 从磁盘 JSON 解析文件头；字段形状和未知字段由 serde 把关，这里只做必须显式
-    /// 表达的语义校验：type 取值、非空 UUID、版本必须是当前版本、创建时间非空。
+    /// 从 JSON 解析并校验会话文件头（校验类型、版本号、UUID 与时间戳格式）。
     pub(super) fn parse(value: Value) -> Result<Self> {
         if value.get("type").and_then(Value::as_str) != Some(SESSION_HEADER_TYPE) {
             return Err(SessionError::InvalidHeader("first entry is not a session header".into()));
@@ -234,8 +220,7 @@ impl SessionHeader {
         Ok(header)
     }
 
-    /// 已存 cwd 唯一的归一化入口：磁盘上的字面值仍留在 header 里，归一化结果
-    /// 只供运行期使用，列表、Thread 投影与系统提示词共用这一形状。
+    /// 获取规范化后的工作目录路径。
     pub(super) fn canonical_cwd(&self) -> Result<std::path::PathBuf> {
         singularity_core::CanonicalWorkspacePath::from_saved(&self.cwd)
             .map_err(SessionError::InvalidHeader)

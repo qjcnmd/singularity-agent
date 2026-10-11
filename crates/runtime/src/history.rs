@@ -9,31 +9,24 @@ use singularity_agent::{
 };
 use singularity_protocol::{HistoryItem, SessionModelUsage, ThreadSummary, ThreadTurn, TurnStatus};
 
-/// thread/read 的按轮分组投影。operation_started 划定轮次边界，同 turn id 的
-/// operation_finished 写进轮次状态，不写成条目，message/compaction/settings 则投影成
-/// 轮内条目。第一个开始标记之前已落盘的条目构成前导组，不属于任何 turn（turnId/status
-/// 为 null），一条条目都没有时不产生空组。没有终态的持久记录按 interrupted 投影，
-/// 工作台的活动状态由执行器提供。
+/// 会话历史的按轮分组索引。
 pub(crate) struct IndexedTurn {
     pub turn_id: Option<String>,
     pub status: Option<TurnStatus>,
-    /// 本轮终态记录里落盘的失败细节；非失败轮和没有可信终态的回合是 None。
+    /// 回合失败终态中的详细错误信息
     pub error: Option<singularity_protocol::TurnErrorDetail>,
-    /// 本轮以 interrupted 结束且由用户停止触发；没有终态记录的回合为 false。
+    /// 是否由用户主动中断
     pub manually_stopped: bool,
     pub entries: std::ops::Range<usize>,
 }
 
 impl IndexedTurn {
-    /// 本轮公开分页用的 cursor：`turn:{turnId}`，不属于任何 turn 的前导组是 `turn:leading`。
-    /// thread/read 的 before_turn 和返回的 next_cursor 都用这个值，不用 item id。
+    /// 回合分页游标字符串：`turn:{turnId}`，前导组为 `turn:leading`。
     pub fn cursor(&self) -> String {
         self.turn_id.as_ref().map_or_else(|| "turn:leading".into(), |id| format!("turn:{id}"))
     }
 
-    /// 按轮遍历持久条目，直接写出最终的公开 items。工具 wire ID 的映射、同一个 request
-    /// 多次观测的归并都在这一次遍历里完成；请求详情等本轮条目合并完才展开一次，避免先生成
-    /// 临时身份再回头改写。
+    /// 将持久化条目投影为公开的 `ThreadTurn` 历史视图对象。
     pub fn project(&self, session: &SessionData) -> ThreadTurn {
         let mut items = Vec::new();
         let mut started_at = None;

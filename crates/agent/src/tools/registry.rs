@@ -10,21 +10,20 @@ use tokio_util::sync::CancellationToken;
 use super::bash;
 use super::read;
 
-/// 一次工具执行的模型可见结果。工具自身的失败（路径不存在、参数非法、被取消等）
-/// 一律用 is_error=true 的结果表达，不走任何错误通道。
+/// 工具调用的执行结果。若工具执行失败（如路径不存在或命令返回非零），通过 `is_error: true` 反馈给模型。
 #[derive(Debug, Clone)]
 pub struct ToolExecution {
     pub content: String,
     pub images: Vec<crate::image::InputImage>,
     pub is_error: bool,
-    /// 由派发者计量的墙钟耗时，不发给模型。
+    /// 工具执行耗时（毫秒，仅供本地展示与统计）
     pub duration_ms: Option<u64>,
-    /// read 实际读到的源文件范围；只有 read 的成功结果会带，展示层据此编号。
+    /// read 工具读到的源文件行号范围（供前端按行展示）
     pub read_source: Option<singularity_protocol::ReadSource>,
 }
 
 impl ToolExecution {
-    /// 构造成功的纯文本结果；耗时由派发者结算。
+    /// 构造成功的纯文本结果。
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
@@ -41,7 +40,7 @@ impl ToolExecution {
     }
 }
 
-/// 执行前完成查找与参数解析（preflight）的结果。用静态枚举派发，闭包不分配堆内存。
+/// 预检并解析参数后的待执行工具实例。
 #[derive(Debug)]
 pub(crate) enum PreparedTool {
     Read(read::ReadArgs),
@@ -51,13 +50,12 @@ pub(crate) enum PreparedTool {
 }
 
 impl PreparedTool {
-    /// 只有只读工具可以重叠执行；变更类工具和 shell 命令是屏障。
+    /// 是否支持并行执行（目前仅只读工具 `read` 支持并行）。
     pub(crate) fn supports_parallel(&self) -> bool {
         matches!(self, Self::Read(_))
     }
 
-    /// 执行 ToolRegistrySnapshot::preflight 准备好的调用。失败也作为模型可见的
-    /// 结果返回；唯一的错误通道仍然是 ToolExecution::is_error。
+    /// 执行预检完毕的工具调用，执行失败转换为 `ToolExecution::is_error = true`。
     pub(crate) async fn execute(
         self,
         cwd: std::path::PathBuf,

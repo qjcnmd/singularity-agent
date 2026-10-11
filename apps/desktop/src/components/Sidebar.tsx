@@ -24,7 +24,7 @@ export const Sidebar = memo(SidebarView)
 const sidebarFields = ['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceId', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'workspaceAppearance'] as const
 type SidebarState = Pick<AppState, typeof sidebarFields[number]>
 
-/** 侧栏显示阶段与终态，不消费流序号；其他消费者仍可订阅完整 liveSessions。 */
+/** 浅比较侧栏依赖的状态，避免无关后台事件触发重渲染。 */
 function sameSidebarState(previous: SidebarState, next: SidebarState): boolean {
   return sidebarFields.every(key => {
     if (key !== 'liveSessions') return Object.is(previous[key], next[key])
@@ -59,8 +59,6 @@ function SidebarView() {
   const [dialog, setDialog] = useState<PendingDialog>({ kind: 'none' })
   const collapsed = new Set(state.sidebarView.collapsed)
   const [showAll, setShowAll] = useState<Set<string>>(new Set())
-  // 行的显现与隐去由外层 Disclosure 负责。本组件再叠一层逐行错开动画，同一次展开
-  // 会同时跑两套时长与缓动，透明度也会叠成两次渐隐。
   const sessionRow = (session: ThreadSummary, title: string) => <div key={session.threadId}><SessionButton session={session} title={title} selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
       unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })} onArchive={() => { void appStore.archiveSession(session.threadId) }} /></div>
   return (
@@ -83,8 +81,7 @@ function SidebarView() {
           </div>
           <div className="workspace-list">
             {state.bootstrap?.workspaces.map((item) => {
-              // 顺序由目录派生（更新时间降序、任务 ID 升序），这里只过滤与切片。
-              // 标题按完整任务组一次派生，过滤只决定哪些行显示。
+              // 派生展示标题，并过滤隐藏未选中的空白未命名会话
               const all = state.bootstrap?.sessionsByWorkspace[item.workspaceId] ?? []
               const titleOf = sessionTitles(all)
               const sessions = all.filter(session => {

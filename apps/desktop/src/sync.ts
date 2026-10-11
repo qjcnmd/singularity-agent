@@ -12,13 +12,12 @@ export const initialSyncState = (): SyncState => ({
   revision: 0, bootstrap: null, session: null, liveSessions: {},
 })
 
-/** 列表和所选任务共用同一份运行状态；旧版本的更新不覆盖当前状态。 */
+/** 更新指定会话的实时运行状态，按 sessionRevision 丢弃过时更新 */
 function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionState, event?: TurnEventEnvelope): SyncState {
   const previous = state.liveSessions[sessionId]
   if (previous && incoming.sessionRevision <= previous.sessionRevision) return state
   const selected = state.session?.summary.threadId === sessionId ? state.session : null
-  // 后台会话只有生命周期字段，不伪造完整 runtime；所选会话的 runtime 是同一份
-  // lifecycle 对象的完整形状，detail 与列表共享这个引用。
+  // 当前选中会话维护完整 runtime，非选中的后台会话仅维护基础生命周期状态
   if (selected === null) {
     const lifecycle: LiveSessionState = { sessionRevision: incoming.sessionRevision, phase: incoming.phase, terminal: incoming.terminal }
     return { ...state, liveSessions: { ...state.liveSessions, [sessionId]: lifecycle } }
@@ -33,7 +32,7 @@ function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSe
   }
 }
 
-/** RPC 快照不消耗 stream revision；未见过的 stream 事件仍然可用。 */
+/** 应用全局 bootstrap 元数据快照 */
 export function acceptBootstrap(state: SyncState, bootstrap: AppBootstrap): SyncState {
   if (state.bootstrap !== null && bootstrap.revision < state.bootstrap.revision) return state
   return { ...state, bootstrap }
@@ -89,7 +88,7 @@ export function reduceStream(state: SyncState, selectedSessionId: string | null,
   }
 }
 
-/** 后台任务完成时标记未读；重新运行或选中任务时清除。 */
+/** 计算会话未读状态：非当前选中任务执行完毕时标记未读，用户切换进入时清除 */
 export function reduceUnread(
   unread: ReadonlySet<string>,
   previous: SyncState['liveSessions'],

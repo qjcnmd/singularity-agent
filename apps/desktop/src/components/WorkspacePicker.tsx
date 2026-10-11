@@ -6,7 +6,7 @@ import { PickerSurface } from './PickerSurface'
 import { ExpandChevron } from './ExpandChevron'
 import { WorkspaceIcon } from './WorkspaceAppearancePicker'
 
-/** 只声明本组件读取的字段：父级按同一份清单订阅。 */
+/** 工作区选择器所需状态。 */
 type Props = Pick<AppState, 'bootstrap' | 'selectedWorkspaceId' | 'workspaceAppearance' | 'pendingActions'>
 
 export function WorkspacePicker({ state }: { state: Props }) {

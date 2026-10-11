@@ -57,7 +57,7 @@
   align-items: center;
   gap: 8px;
 }
-/* 输入框下方的用量统计条：与输入框同宽同轴并居中，读数常显、不随工具栏菜单开合。 */
+/* 输入框下方的会话用量统计条 */
 .composer-stats {
   display: flex;
   align-items: center;
@@ -172,11 +172,7 @@
 }
 .candidate-error { color: var(--danger); }
 
-/* 关闭态：一个小圆形按钮。打开态：一个圆角面板。
-   宽/高/border-radius 参与动画；打开态用比关闭态
-   更弹性的缓动。
-   composer 工具栏是这个控件唯一的出现位置，占位在
-   此声明一次，不由作用域覆盖重复声明。 */
+/* 工具栏加号按钮与菜单变形展开动画 */
 .t-morph {
   --tools-menu-height: 220px;
   --tools-menu-width: 200px;
@@ -185,7 +181,7 @@
   height: 34px;
   border-radius: var(--morph-r-closed);
   overflow: clip;
-  /* 从触发按钮所在的左下角长出，缩放与滑入锚定触发按钮，不锚定元素中心。 */
+  /* 锚定左下角展开 */
   transform-origin: bottom left;
   transition:
     width var(--morph-close-dur) var(--morph-close-ease),
@@ -201,7 +197,7 @@
     height var(--morph-open-dur) var(--morph-ease),
     border-radius var(--morph-open-dur) var(--morph-ease);
 }
-/* 加号淡出 + 滑出，图标旋转成 ×。 */
+/* 加号按钮淡出与旋转成关闭图标 */
 .t-morph-plus {
   position: absolute;
   inset: auto auto 0 0;
@@ -225,7 +221,7 @@
 .t-morph[data-open="true"] .t-morph-plus svg {
   transform: scale(var(--morph-scale)) rotate(var(--morph-rotate));
 }
-/* 菜单以滑入 + 缩放 + 模糊开始；打开时显现。 */
+/* 菜单面板滑入与显现 */
 .t-morph-menu {
   position: absolute;
   inset: 0;
@@ -249,7 +245,7 @@
   .t-morph, .t-morph-plus, .t-morph-menu { transition: none !important; }
 }
 
-/* 表面从左下角展开时保持工具栏占位固定。 */
+/* 工具栏容器与定位 */
 .composer-tools { position: relative; flex: 0 0 34px; width: 34px; height: 34px; }
 .composer-tools .t-morph { position: absolute; bottom: 0; left: 0; background: var(--surface); box-shadow: var(--shadow-soft); }
 .composer-tools .t-morph[data-open="true"] { box-shadow: var(--shadow-floating); }
@@ -261,7 +257,6 @@
 .composer-tools-item:hover { background: var(--surface-hover); }
 .composer-tools-item[aria-disabled=true], .composer-tools-item:disabled { color: var(--ink-faint); cursor: default; }
 .composer-tools > .context-tooltip[data-open=true] { display: block; }
-/* 关闭只走尺寸与圆角回落，不再叠加位移抖动：位移会与尺寸过渡互相干扰。 */
 @media (prefers-reduced-motion: reduce) { .t-morph-plus svg { transition: none; } }
 
 @media (max-width: 760px) {
