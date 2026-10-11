@@ -187,7 +187,7 @@ flowchart LR
 | 图片 | `agent/image.rs` 共用识别、解码与格式转换；用户输入和工具结果共用 Agent 的消息追加入口，先在会话锁外保存像素，再追加引用图片的消息；成功后才发布完成事件。未消费的 steer 图片仍属于进程内输入。 |
 | 临时工具输出 | 工具结果给出实际日志路径；新建输出时清理超过七天的旧输出，保存失败明确反馈。 |
 
-移除项目删除登记，归档任务移动日志，二者成功后由前端清理对应草稿和阅读锚点。项目移除时，ThreadCatalog 根据候选任务的持久 cwd 确定归属，包含已归档任务；前端将返回的任务身份交给 IndexedDB 在一个事务中删除草稿。 会话写入与本地草稿属于不同存储，草稿删除失败时报告已完成的操作和未完成的清理，保留原草稿记录。运行中或仍有待处理输入的任务会阻止移除所属项目。私有配置依赖 Windows 用户目录权限并使用原子替换；Session 追加的“先写后发布”不承诺断电持久性。
+移除项目删除登记，归档任务移动日志，二者成功后由前端清理对应草稿和阅读锚点。归档先在生命周期锁内标记目标 slot，阻止新的修改与执行，读取和事件投影继续；随后复用退出时的 `stop_sessions` 等待停止和结算，包括尚未进入 Running 的预订。等待不持有全局生命周期锁；结算后在写者窗口内移动日志并注销 slot。归档失败由守卫解除标记，保留任务供继续使用或重试。项目移除时，ThreadCatalog 根据候选任务的持久 cwd 确定归属，包含已归档任务；前端将返回的任务身份交给 IndexedDB 在一个事务中删除草稿。 会话写入与本地草稿属于不同存储，草稿删除失败时报告已完成的操作和未完成的清理，保留原草稿记录。运行中或仍有待处理输入的任务会阻止移除所属项目。私有配置依赖 Windows 用户目录权限并使用原子替换；Session 追加的“先写后发布”不承诺断电持久性。
 
 源码：[数据根](../crates/core/src/user_home.rs) · [路径身份](../crates/core/src/workspace.rs) · [项目登记](../crates/app/src/desktop/workspace_store.rs) · [配置](../crates/model/src/config/manager.rs) · [会话目录](../crates/runtime/src/thread_catalog.rs) · [视图持久化](../apps/desktop/src/viewPersistence.ts) · [临时输出日志](../crates/agent/src/tools/bash/capture.rs)。文件维护见[安装说明](INSTALL.md#数据更新与卸载)。
 
@@ -306,7 +306,7 @@ sequenceDiagram
 
 项目、任务目录和模型配置变更通过服务端的 `app_changed` 完整快照发布。RPC 按动作返回所需结果：创建动作返回新身份（`workspace.add` 的 workspaceId、`session.create` 的读取结果），`workspace.remove` 返回草稿清理所需的任务身份，模型保存等操作返回空结果。返回的新任务身份保留到包含它的目录快照被应用。`session_settled` 触发任务终态读取和目录刷新；重同步通知或页面刷新走完整 resync。RPC bootstrap 读取与完整快照发布共用 `app_publication` 临界区，配置内容与序号在同一发布边界内绑定。
 
-`protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`TurnEventEnvelope` 为执行事件补充会话版本号。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与基线同步，组件使用生产单例。`sessionStore.ts` 拥有任务选择、创建、历史读取和同步的完整过程：选择序号、读取接纳、身份保护及缓冲释放均在内部维护。创建任务时由 `DraftStore` 完成草稿转移：目标保存成功才清空源，期间继续编辑的源草稿保留。`appStore.ts` 通过任务身份和操作意图调用导航入口，维护提交、设置和视图偏好等工作台动作。
+`protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`TurnEventEnvelope` 为执行事件补充会话版本号。`sync.ts` 在同一个接纳入口归并会话版本、运行状态与实时条目，再返回所需动作；Store 执行读取、缓冲与基线同步，组件使用生产单例。`sessionStore.ts` 拥有任务选择、创建、历史读取和同步的完整过程：选择序号、读取接纳、身份保护及缓冲释放均在内部维护。当前读取由 `latestRead` 同时持有请求身份和结果 Promise；选择失效时清除它，旧读取不能覆盖新选择。历史页只负责条目配对和转换，运行状态统一结合 runtime 结算；前插旧页时只处理新加载的轮次，实时与历史工具结果共用字段转换。创建任务时由 `DraftStore` 完成草稿转移：目标保存成功才清空源，期间继续编辑的源草稿保留。`appStore.ts` 通过任务身份和操作意图调用导航入口，维护提交、设置和视图偏好等工作台动作。
 
 工作台动作共用忙碌状态与错误反馈。只需判断完成与否的调用使用布尔结果；提供方保存需要区分部分保存失败，直接返回本次 `ActionResult`，其中的错误与原位展示使用同一份反馈。草稿编辑立即更新页面，保存失败保留页面内容并报告；归档或移除后的草稿删除失败保留原记录，错误说明已完成的业务操作与未完成的清理。
 
@@ -406,7 +406,7 @@ flowchart TB
     Calls -->|"有，但模型输出截断"| Truncated["工具派发入口提交失败结果<br/>不执行不完整调用"]
     Truncated --> Cancel
     Calls -->|"有且回复完整"| Preflight["registry.preflight<br/>解析参数、绑定工具、生成公开条目 ID"]
-    Preflight --> Dispatch["dispatch_tools<br/>Tokio task 与异步许可"]
+    Preflight --> Dispatch["dispatch_tools<br/>Tokio task 与派发者准入计数"]
     Dispatch --> Results["每项完成即保存结果<br/>随后发布 tool/execution/end"]
     Results --> Context["SessionManager 追加<br/>提交成功后加入账本<br/>模型结果按调用顺序投影"]
     Context --> Cancel
@@ -517,7 +517,7 @@ flowchart TB
     Frozen --> Requests["本轮普通请求、重试与摘要共用"]
 ```
 
-提供方表单通过一个 RPC 保存配置与可选新密钥；Host 完成两份文件的写入后，从一次读取生成执行快照与脱敏目录，只发布一次最终状态。密钥写入失败明确返回部分保存，并按实际磁盘刷新，表单可以重试。快照保留冻结的 `UserConfigData`，校验时直接解析实际 selector；默认选择损坏或其他提供方未完成配置，不妨碍显式选择可用模型。快照本身不携带 Tokio handle，也不创建网络对象：具体 Provider 的构造入口接收快照与 selector。Agent 从该 Provider 取得本轮容量，Runner 的活动容量投影读取同一份冻结结果。
+提供方表单通过一个 RPC 保存配置与可选新密钥；Host 完成两份文件的写入后，从一次读取生成执行快照与脱敏目录，只发布一次最终状态。密钥写入失败明确返回部分保存，并按实际磁盘刷新，表单可以重试。快照保留冻结的 `UserConfigData`，校验时直接解析实际 selector；默认选择损坏或其他提供方未完成配置，不妨碍显式选择可用模型。快照本身不携带 Tokio handle，也不创建网络对象：`OpenAiProvider::from_snapshot` 接收快照与 selector，创建由本轮 Agent 独占的模型客户端；Chat 与 Responses 的选择、编码和传输封装在模型模块内。Agent 从客户端取得本轮容量，Runner 的活动容量投影读取同一份冻结结果。
 
 模型目录与保存请求共用 `ModelConfigurationInput`。已有配置缺失或无效的协议保留原值供编辑，保存与执行分别在模型解析边界校验；新建模型的 Chat 默认值属于编辑器。
 
@@ -536,27 +536,23 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    Request["ModelTurnRequest<br/>messages + tools + preferences"] --> Retry["request_execution::execute_request 显式重试循环<br/>取消、退避、尝试次数、RequestAttempt"]
-    Retry --> Provider["dyn Provider.complete_stream<br/>OpenAiProvider（openai/provider.rs）"]
-    Provider --> Validate["provider/contract.rs<br/>能力与请求约束校验"]
-    Validate --> Protocol{"已选 apiProtocol"}
-    Protocol -->|"chat"| Chat["openai/chat.rs + chat/stream.rs<br/>Chat 请求 / SSE 解码 / 回复终结"]
-    Protocol -->|"responses"| Responses["openai/responses.rs + responses/stream.rs<br/>Responses 请求 / SSE 解码 / 回复终结"]
-    Chat --> Transport["transport/http.rs<br/>一次 HTTP attempt<br/>状态映射与错误体解析来自 error.rs<br/>HTTP 状态与 wire code/type 保留在有界诊断里"]
+    Request["ModelTurnRequest<br/>messages + tools + preferences"] --> Retry["request_execution::execute_request<br/>取消、退避、尝试次数、RequestAttempt"]
+    Retry --> Start["保存开始记录<br/>RequestObservation + 请求定义"]
+    Start -->|"成功才调用"| Provider["OpenAiProvider.complete_stream<br/>按已选协议编码并发送一次请求"]
+    Provider --> Chat["openai/chat.rs + chat/stream.rs<br/>Chat 请求 / SSE 解码 / 回复终结"]
+    Provider --> Responses["openai/responses.rs + responses/stream.rs<br/>Responses 请求 / SSE 解码 / 回复终结"]
+    Chat --> Transport["transport<br/>HTTP、可取消等待、SSE 分帧"]
     Responses --> Transport
-    Transport --> Record["record_attempt：可失败的开始记录"]
-    Record -->|"成功才发送"| SSE["transport/stream.rs<br/>共享 SSE 分帧与可取消读取循环"]
-    SSE --> Deltas["ProviderStreamEvent<br/>正文与思考增量"]
-    Record -->|"I/O 失败"| StorageError["ProviderCallError.Recording<br/>保留原始存储错误，停止发送"]
-    Transport --> Attempts["ProviderAttemptEvent<br/>请求执行层生成共享 RequestObservation<br/>实时事件直接内嵌该观测"]
-    SSE --> Reply["ModelTurnResponse<br/>assistant、工具调用、thinking<br/>usage、停止原因、续接数据"]
-    Reply --> Check["回复结构与工具身份 / 名称校验"]
-    Check --> Agent["Agent 保存消息并执行下一步"]
-    Transport --> Error["ProviderError<br/>分类、具体原因、重试约束"]
-    Error --> Retry
+    Transport --> Deltas["ProviderStreamEvent<br/>RequestAttempt 计时并发布正文与思考增量"]
+    Transport --> Completion["ProviderCompletion<br/>协议结果或 ProviderError + 已上报用量<br/>回复结构与续接校验仍属于模型层"]
+    Completion --> Finish["RequestAttempt 汇总计时与用量<br/>保存结束记录并发布 RequestObservation"]
+    Finish -->|"成功回复"| Agent["Agent 保存正式消息并执行下一步"]
+    Finish -->|"可重试的 ProviderError"| Retry
+    Start -->|"写盘失败"| StorageError["SessionError / FailureRecording<br/>保留具体原因，停止执行"]
+    Finish -->|"写盘失败"| StorageError
 ```
 
-普通生成和摘要共同调用 `request_execution`，传输层只执行一次 attempt。提供方完成请求校验后，必须成功完成开始记录才会发送 HTTP；结束记录失败同样沿类型化错误返回。观测追加失败停止执行，保留存储或校验原因。可重试错误最多尝试三次，等待可取消。可见正文与思考不改变错误的可重试性；重试前通过 `item/discarded` 清除该次临时输出，使用相同请求输入再次尝试。最终失败或取消的半截内容保存为 `assistant_interrupted` 显示记录，刷新后仍可查看，但不进入后续模型上下文或摘要。成功回复才保存为正式 assistant 消息。
+普通生成和摘要共同调用 `request_execution`，它按“保存开始 → 调用模型 → 保存结束”的顺序编排每次尝试，同时维护计时与用量。模型层只负责协议与传输，返回结果和已上报用量；即使回复因缺少必要续接材料而被拒绝，用量仍会累计。开始记录写入失败时不会发送 HTTP；结束记录写入失败时停止执行，并保留同时发生的模型错误和原始存储错误。请求耗时从保存开始记录前算起，到模型调用返回为止，包含请求编码、网络与回复校验。可重试错误最多尝试三次，等待可取消。可见正文与思考不改变错误的可重试性；重试前通过 `item/discarded` 清除该次临时输出，使用相同请求输入再次尝试。最终失败或取消的半截内容保存为 `assistant_interrupted` 显示记录，刷新后仍可查看，但不进入后续模型上下文或摘要。成功回复才保存为正式 assistant 消息。
 
 生成和摘要使用同一错误分类与 attempt 预算决定重试；摘要请求不发布对话增量。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。SSE 按帧顺序解析和分派，协议终态一到即完成该次回复，后续无关尾帧不再参与解析或完整性校验；正文提前结束只按截断判定，不再等待连接关闭。未知 `finish_reason`、非法 choice / 工具调用 `index` 明确失败，字段缺失与字段非法不混为一谈。Chat 工具调用分片中的名称或参数为 null 时表示本片段无更新，最终工具身份仍完整校验。工具调用只保存 ID、名称与一个 JSON 参数值；畸形 JSON 保留为字符串值。参数是否为对象、是否符合具体工具要求，统一由工具 preflight 校验并返回工具错误；回复结构和工具身份无效时在 Provider 边界失败。
 
@@ -578,7 +574,7 @@ flowchart LR
 
 请求编码声明输出 token 上限；SSE 按流读取，受读取超时和取消信号控制，到协议终态即结束读取。普通 HTTP 错误响应体由 reqwest 读取，保留读取错误、超时与取消原因。
 
-源码：[Provider 接缝](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [具体 Provider](../crates/model/src/openai/provider.rs) · [Chat 请求](../crates/model/src/openai/chat.rs) · [Chat 流](../crates/model/src/openai/chat/stream.rs) · [Responses 请求](../crates/model/src/openai/responses.rs) · [Responses 流](../crates/model/src/openai/responses/stream.rs) · [传输](../crates/model/src/transport/mod.rs) · [状态与错误体解析](../crates/model/src/error.rs) · [SSE 分帧](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
+源码：[模型调用结果与流事件](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [具体 Provider](../crates/model/src/openai/provider.rs) · [Chat 请求](../crates/model/src/openai/chat.rs) · [Chat 流](../crates/model/src/openai/chat/stream.rs) · [Responses 请求](../crates/model/src/openai/responses.rs) · [Responses 流](../crates/model/src/openai/responses/stream.rs) · [传输](../crates/model/src/transport/mod.rs) · [状态与错误体解析](../crates/model/src/error.rs) · [SSE 分帧](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
 
 <a id="instructions"></a>
 ## 13. Harness 指令、项目指令与技能
@@ -715,8 +711,8 @@ flowchart TB
     Specs --> Preflight
     Preflight -->|"非法参数 / 未知工具"| Rejected["模型可见失败，不启动 worker"]
     Preflight -->|"PreparedTool"| Dispatch["dispatch_tools：按 source order 准入"]
-    Dispatch --> ReadOnly["read<br/>取得 1 份许可，并行执行"]
-    Dispatch --> Barrier["bash / 交互提问 / MCP<br/>取得全部 8 份许可，按声明顺序执行"]
+    Dispatch --> ReadOnly["read<br/>占用 1 个执行位，并行执行"]
+    Dispatch --> Barrier["bash / 交互提问 / MCP<br/>占用全部 8 个执行位，按声明顺序执行"]
     Dispatch -->|"工具内部 panic"| HostFatal["终止后端进程<br/>工作台提示重启"]
     ReadOnly --> Result["ToolExecution<br/>文字、图片、错误与观测信息"]
     Barrier --> Result
@@ -728,7 +724,7 @@ flowchart TB
 
 工具定义由 `ToolRegistrySnapshot` 持有，请求装配与开销计算按需从它派生 schema。准备参数按值交给工具 worker；进度携带公开条目身份，完成结果携带公开身份与 provider 调用身份，派发者直接落盘和发布，不保留另一份准备批次供下标回查。
 
-Agent、请求重试、Provider 网络传输和工具派发共用异步执行链。Provider 的 HTTP 发送、响应块读取及重试等待直接 `await`；文件读取和命令进程管理在 Tokio blocking pool 执行。派发者按模型调用顺序从同一个 Semaphore 取得许可：读取取 1 份，独占工具取全部 8 份；等待期间继续消费工具事件。每轮工具调用最多同时准入 8 个只读工具，结果提交后释放许可，后续读取随即可继续。处理工具完成事件时先提交结果、再释放许可；后续独占工具因此只会在前序结果成功落盘后开始。结果提交失败会停止后续派发，并等待已启动任务结束；内部程序异常直接终止进程。
+Agent、请求重试、Provider 网络传输和工具派发共用异步执行链。Provider 的 HTTP 发送、响应块读取及重试等待直接 `await`；文件读取和命令进程管理在 Tokio blocking pool 执行。准入只由派发循环控制，用一个局部计数维护占用量：读取占 1 个执行位，独占工具占全部 8 个。容量不足时直接消费工具进度与完成事件；完成结果成功落盘后归还空位，再准入后续调用。因此最多同时运行 8 个只读工具，独占工具只会在前序结果成功落盘后开始。结果提交失败会停止后续派发，并排空已启动任务的事件；所有 worker 交付结果并释放发送端后，排空结束。内部程序异常直接终止进程。
 
 ### 15.2 文件与 shell 的内部边界
 

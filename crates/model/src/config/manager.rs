@@ -14,7 +14,7 @@ use super::*;
 
 /// 一次轮次的不可变容量快照：每轮开始时冻结「请求前压缩」和「输出预算」要用的两项容量，
 /// 改设置只产生后续轮次的新快照，不改写正在用的快照。模型身份和协议由 SelectedModel、
-/// OpenAiProviderConfig 和 ProviderAttemptEvent 承载。
+/// OpenAiProviderConfig 和请求记录承载。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelConfigurationSnapshot {
     pub max_context_tokens: u32,

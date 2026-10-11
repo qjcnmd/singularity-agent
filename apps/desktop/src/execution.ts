@@ -72,10 +72,9 @@ function toolCallItem(id: string, name: string, args: unknown): Extract<Executio
 }
 
 /** 工具结果条目：名称与参数取自已配对的调用，输出与状态由结果决定。 */
-function toolResultItem(item: Extract<HistoryItem, { type: 'tool_result' }>, previous: ExecutionItem | undefined): ExecutionItem {
+function toolResultItem(item: Pick<Extract<HistoryItem, { type: 'tool_result' }>, 'output' | 'images' | 'isError' | 'durationMs' | 'readSource'>, previous: ExecutionItem | undefined): ExecutionItem {
   const tool = previous as Extract<ExecutionItem, { kind: 'tool' }>
-  return { ...base(item.id, item.isError ? 'error' : 'ok'), kind: 'tool',
-    name: tool.name, args: tool.args,
+  return { ...tool, status: item.isError ? 'error' : 'ok',
     output: item.output, duration: item.durationMs,
     readSource: item.readSource, images: item.images }
 }
@@ -103,7 +102,7 @@ function historyItemToExecution(item: HistoryItem, previous: ExecutionItem | und
  * 一个 wire page 一次性构建成 execution turns。id→位置与当前 request 的
  * 关联只存在于这次构建内，同 id 的条目就地替换（request 合并 start/end，tool
  * call 与 result 配对），逐项不复制整段 items。结束时发布一次 ExecutionTurn，
- * 并结算助手终态与请求开始时间。字段映射复用单条转换，本函数只保留位置与当前
+ * 运行状态由调用方结合 runtime 统一结算。字段映射复用单条转换，本函数只保留位置与当前
  * request 的更新算法。
  */
 function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
@@ -125,7 +124,7 @@ function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
         items[position] = item
       }
     }
-    return settleAssistantItems({ id: turn.turnId, status: turn.status, error: turn.error, startedAt: turn.startedAt, finishedAt: turn.finishedAt, items })
+    return { id: turn.turnId, status: turn.status, error: turn.error, startedAt: turn.startedAt, finishedAt: turn.finishedAt, items }
   })
 }
 
@@ -186,9 +185,9 @@ function settleFacts(facts: ExecutionFacts, runtime: SessionRuntime): ExecutionF
 
 /** 更早的 page 只转换一次并前插；已加载 turns 保持其身份。 */
 export function prependExecutionHistory(session: SessionView, page: ThreadReadPage): SessionView {
-  const turns = [...pageTurns(page), ...session.facts.history]
+  const turns = pageTurns(page).map(turn => settleRequests(turn, session.runtime))
   return { ...session, nextCursor: page.nextCursor, facts: { ...session.facts,
-    history: turns.map(turn => settleRequests(turn, session.runtime)) } }
+    history: [...turns, ...session.facts.history] } }
 }
 
 function finishTurn(turn: ExecutionTurn, status: TurnStatus): ExecutionTurn {
@@ -238,10 +237,7 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
     }
     case 'tool/execution/end': {
       const p = event.params
-      const tool = turn.items.find(item => item.id === p.item.itemId) as Extract<ExecutionItem, { kind: 'tool' }>
-      turn = upsert(turn, { ...tool, status: p.isError ? 'error' : 'ok',
-        output: p.output, duration: p.durationMs,
-        readSource: p.readSource, images: p.images })
+      turn = upsert(turn, toolResultItem(p, turn.items.find(item => item.id === p.item.itemId)))
       break
     }
     case 'item/discarded':

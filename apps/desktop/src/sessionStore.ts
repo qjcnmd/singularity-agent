@@ -66,11 +66,10 @@ export class SessionStore {
   private queuedFrames: StreamEnvelope[] = []
 
   private resyncing: Promise<void> | null = null
-  private sessionReadRequest = 0
   private selectionRequest = 0
   /** 最近一次 session 读取。被取代的读取等它结束再返回，保证「哪次读取代表当前
    *  基线」只有一个答案，不需要第二套同步控制。 */
-  private latestRead: { request: number; promise: Promise<SessionReadFailure | null> } | null = null
+  private latestRead: { request: symbol; promise: Promise<SessionReadFailure | null> } | null = null
   private createdSessionId: string | null = null
 
   readonly subscribe = (listener: () => void): (() => void) => {
@@ -183,13 +182,13 @@ export class SessionStore {
 
   /** 业务读取失败由 sessionLoad 展示；原始错误返回给 resync，供它处理连接失败。 */
   private readSession(sessionId: string): Promise<SessionReadFailure | null> {
-    const request = ++this.sessionReadRequest
+    const request = Symbol(sessionId)
     const promise = this.performRead(request, sessionId)
     this.latestRead = { request, promise }
     return promise
   }
 
-  private async performRead(request: number, sessionId: string): Promise<SessionReadFailure | null> {
+  private async performRead(request: symbol, sessionId: string): Promise<SessionReadFailure | null> {
     this.patch({ sessionLoad: { status: 'loading', error: null } })
     try {
       const session = await this.transport.rpc('session.read', {
@@ -209,20 +208,20 @@ export class SessionStore {
       })
       return { error }
     } finally {
-      if (request === this.sessionReadRequest && this.resyncing === null) this.flushFrames()
+      if (request === this.latestRead?.request && this.resyncing === null) this.flushFrames()
     }
   }
 
   /** 读取是否仍代表当前选择：一旦有更新的请求或选择，旧读取不得写入状态。 */
-  private readIsCurrent(request: number, sessionId: string): boolean {
-    return request === this.sessionReadRequest
+  private readIsCurrent(request: symbol, sessionId: string): boolean {
+    return request === this.latestRead?.request
       && this.state.selectedSessionId === sessionId
   }
 
   /** 被取代的读取等取代它的那次读取结束再返回，避免旧读取把新读取的连接级失败
    *  覆盖成就绪。取代者是选择变更本身（没有新的读取）时，当前已没有待读取的选择，
    *  本次读取直接结束。 */
-  private async followLatestRead(request: number): Promise<SessionReadFailure | null> {
+  private async followLatestRead(request: symbol): Promise<SessionReadFailure | null> {
     const latest = this.latestRead
     if (latest === null || latest.request === request) return null
     return await latest.promise
@@ -404,7 +403,7 @@ export class SessionStore {
       const workspaceRemoved = workspaceId !== null && !workspaces.has(workspaceId)
       const sessionRemoved = sessionId !== null && !sessions.has(sessionId) && sessionId !== protectedId
       if (workspaceRemoved || sessionRemoved) {
-        this.sessionReadRequest += 1
+        this.latestRead = null
         this.selectionRequest += 1
         patch.selectedWorkspaceId = workspaceRemoved ? null : workspaceId
         patch.selectedSessionId = null

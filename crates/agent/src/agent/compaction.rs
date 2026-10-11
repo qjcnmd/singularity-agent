@@ -44,10 +44,10 @@ impl Agent {
         let Some(summary) = summary else {
             return Ok(false);
         };
-        // 请求层已经做过唯一一次 ProviderCallError→AgentError 分类；压缩只传播结果，
+        // 请求层已经做过唯一一次 ProviderError→AgentError 分类；压缩只传播结果，
         // 不再按取消令牌改写真实失败原因（停止是否被接受由操作层的终态边界裁决）。
         let (response, id) = execute_request(
-            self.provider.as_ref(),
+            &self.provider,
             &self.session,
             &mut self.accounting,
             &summary.request,

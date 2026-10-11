@@ -22,7 +22,9 @@ mod request;
 
 use std::sync::Arc;
 
-use singularity_model::{ModelConfigurationSnapshot, ModelMessage, ModelUsage, Provider, ProviderError};
+use singularity_model::{
+    ModelConfigurationSnapshot, ModelMessage, ModelUsage, OpenAiProvider, ProviderError,
+};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -98,7 +100,7 @@ pub struct Agent {
     developer_instructions: String,
     /// 本轮全局与项目文件指令；压缩后直接用重新读取的内容替换。
     file_instructions: Option<ModelMessage>,
-    provider: Arc<dyn Provider + Send + Sync>,
+    provider: OpenAiProvider,
     /// 从本轮 Provider 冻结的容量配置，供整个执行过程使用。
     model: ModelConfigurationSnapshot,
     config: AgentConfig,
@@ -114,7 +116,7 @@ impl Agent {
     /// 构造 Agent；生命周期所有者绑定输入箱，并在执行前开放本轮接受窗口。
     pub fn new(
         inbox: SteeringInboxHandle,
-        provider: Arc<dyn Provider + Send + Sync>,
+        provider: OpenAiProvider,
         config: AgentConfig,
         session: SessionWriter,
         mcp: Arc<singularity_mcp::McpManager>,

@@ -12,7 +12,7 @@ impl AppServer {
         // 查找或创建 slot 和建立执行预订属于同一段生命周期交接，归档或移除插不进这两步之间。
         let (slot, reservation) = {
             let _lifecycle = self.lock_lifecycle();
-            let slot = self.open_slot(session_id)?;
+            let slot = self.open_action_slot(session_id)?;
             let reservation = slot.conversation().reserve_start(input).map_err(conversation_error)?;
             (slot, reservation)
         };
@@ -30,7 +30,7 @@ impl AppServer {
         answers: Vec<singularity_protocol::UserQuestionAnswer>,
     ) -> Result<(), RpcError> {
         let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(session_id)?;
+        let slot = self.open_action_slot(session_id)?;
         let mut state = slot.lock_state();
         slot.conversation().answer_question(item_id, answers).map_err(invalid_request)?;
         self.publish_session_locked(session_id, &slot, &mut state);
@@ -53,7 +53,7 @@ impl AppServer {
         apply: impl FnOnce(&Conversation) -> Result<T, ConversationControlError>,
     ) -> Result<T, RpcError> {
         let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(session_id)?;
+        let slot = self.open_action_slot(session_id)?;
         let mut state = slot.lock_state();
         let result = apply(slot.conversation()).map_err(control_error)?;
         self.publish_session_locked(session_id, &slot, &mut state);
@@ -90,7 +90,7 @@ impl AppServer {
     pub fn compact(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {
         let (slot, reservation) = {
             let _lifecycle = self.lock_lifecycle();
-            let slot = self.open_slot(session_id)?;
+            let slot = self.open_action_slot(session_id)?;
             let reservation = slot.conversation().reserve_compaction().map_err(conversation_error)?;
             (slot, reservation)
         };
@@ -104,30 +104,34 @@ impl AppServer {
     /// 保存任务展示名称；活动执行继续使用当前写者。
     pub fn rename_session(&self, session_id: &str, name: &str) -> Result<(), RpcError> {
         let lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(session_id)?;
+        let slot = self.open_action_slot(session_id)?;
         slot.conversation().rename(name).map_err(conversation_error)?;
         drop(lifecycle);
         self.publish_app_snapshot();
         Ok(())
     }
 
-    /// 归档无活动操作的任务，并结束其未消费的 steer；历史文件保留。
+    /// 停止目标任务并等到执行结算，再移动日志；等待期间只限制该任务的新操作。
     pub fn archive_session(&self, session_id: &str) -> Result<(), RpcError> {
-        // 占用检查、持久归档和注销 slot 必须在同一个临界区里，否则归档完的旧 slot 还会被启动。
         let lifecycle = self.lock_lifecycle();
         let slot = self.lock_sessions().get(session_id).cloned();
-        if let Some(slot) = slot {
-            slot.conversation()
-                .with_idle_writer(|| {
-                    if slot.conversation().is_occupied() {
-                        return Err(session_busy());
-                    }
-                    self.catalog.archive(session_id).map_err(catalog_error)
-                })
-                .map_err(conversation_error)??;
-        } else {
+        let Some(slot) = slot else {
+            // 尚未加载的任务没有执行要等待；移动完成前保持生命周期锁，阻止新建 slot。
             self.catalog.archive(session_id).map_err(catalog_error)?;
+            drop(lifecycle);
+            self.publish_app_snapshot();
+            return Ok(());
+        };
+        if slot.is_archiving() {
+            return Err(session_busy());
         }
+        let _archive = slot.begin_archive();
+        drop(lifecycle);
+        self.runtime_handle.block_on(self.stop_sessions(std::slice::from_ref(&slot)));
+        let lifecycle = self.lock_lifecycle();
+        slot.conversation()
+            .with_idle_writer(|| self.catalog.archive(session_id).map_err(catalog_error))
+            .map_err(conversation_error)??;
         self.lock_sessions().remove(session_id);
         drop(lifecycle);
         self.publish_app_snapshot();
@@ -135,10 +139,8 @@ impl AppServer {
     }
 
     pub fn update_settings(&self, session_id: &str, selector: &str) -> Result<(), RpcError> {
-        let slot = {
-            let _lifecycle = self.lock_lifecycle();
-            self.open_slot(session_id)?
-        };
+        let _lifecycle = self.lock_lifecycle();
+        let slot = self.open_action_slot(session_id)?;
         slot.conversation().update_settings(selector).map_err(conversation_error)?;
         self.bump_and_emit_session(session_id, &slot);
         Ok(())

@@ -4,7 +4,6 @@ use serde_json::Value;
 use singularity_protocol::{DiscoveredModel, ReasoningVariant};
 
 fn fill(model: &mut DiscoveredModel, known: DiscoveredModel) {
-    let before = model.clone();
     model.display_name = model.display_name.take().or(known.display_name);
     model.max_context_tokens = model.max_context_tokens.or(known.max_context_tokens);
     model.max_output_tokens = model.max_output_tokens.or(known.max_output_tokens);
@@ -14,9 +13,6 @@ fn fill(model: &mut DiscoveredModel, known: DiscoveredModel) {
     if model.reasoning_variants.is_empty() {
         model.reasoning_variants = known.reasoning_variants;
         model.default_variant = known.default_variant;
-    }
-    if *model != before {
-        model.metadata_source = Some("models.dev · 提供方目录".into());
     }
 }
 
@@ -91,6 +87,5 @@ pub(super) fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
             .and_then(Value::as_str)
             == Some("reasoning_content"))
         .then_some(true),
-        metadata_source: None,
     }
 }

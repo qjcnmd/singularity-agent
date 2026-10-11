@@ -147,7 +147,7 @@ impl Agent {
             },
         };
         execute_request(
-            self.provider.as_ref(),
+            &self.provider,
             &self.session,
             &mut self.accounting,
             &request,

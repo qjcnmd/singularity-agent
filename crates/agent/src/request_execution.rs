@@ -1,10 +1,14 @@
 //! 生成与压缩共用的请求生命周期：attempt 循环与重试等待、attempt 的身份、
 //! 必须落盘的记录、传输、用量和部分输出。请求装配在 `agent::request`，压缩编排在 `agent::compaction`。
 
+use std::time::Instant;
+
+use singularity_core::duration_millis;
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelTurnRequest, ModelTurnResponse, ModelUsage, Provider,
-    ProviderAttemptEvent, ProviderCallError, ProviderObserver, ProviderStreamEvent,
+    ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, ModelUsage,
+    OpenAiProvider, ProviderError, ProviderStreamEvent,
 };
+use singularity_protocol::{ProviderAttemptStatus, RequestObservation, RequestPreferences, RequestPurpose};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentError;
@@ -34,75 +38,29 @@ pub(crate) struct RequestAccounting {
     pub usage: ModelUsage,
 }
 
-/// 单次请求尝试：统一持有观测身份、输出身份、流式内容和持久化回调。
+/// 单次请求尝试：编排持久化与传输，持有稳定的输出身份及流式内容。
 struct RequestAttempt<'a> {
     writer: &'a SessionWriter,
-    accounting: &'a mut RequestAccounting,
-    request: &'a ModelTurnRequest,
-    definitions: &'a RequestDefinitions,
     on_event: &'a mut (dyn FnMut(AgentEvent) + Send),
-    purpose: singularity_protocol::RequestPurpose,
-    attempt_id: String,
+    purpose: RequestPurpose,
     /// 流式输出需要在完成前就有稳定的条目 id。
     result_entry_id: String,
     visible_text: String,
     visible_reasoning: String,
 }
 
-impl RequestAttempt<'_> {
-    /// 最终中断时留下的公开内容只用来显示，不会成为模型上下文里的正式消息。
-    async fn finish_interrupted(&mut self) -> Result<(), SessionError> {
-        let message = AgentMessage::Assistant {
-            content: crate::message::public_thinking_text_blocks(
-                std::mem::take(&mut self.visible_reasoning),
-                std::mem::take(&mut self.visible_text),
-            ),
-            provider_reasoning_replay: None,
-        };
-        let items = message.public_items(&self.result_entry_id, ItemScope::Completion);
-        if !items.is_empty() {
-            append_record_async(self.writer, LedgerRecord::AssistantInterrupted { items: items.clone() })
-                .await?;
-        }
-        (self.on_event)(AgentEvent::MessageFinished {
-            message_id: self.result_entry_id.clone(),
-            items,
-            failed: true,
-        });
-        Ok(())
-    }
-}
-
-impl From<ProviderCallError> for AgentError {
-    fn from(error: ProviderCallError) -> Self {
-        match error {
-            ProviderCallError::Provider(error)
-                if error.kind == singularity_model::ModelErrorKind::Cancelled =>
-            {
-                Self::Aborted
-            }
-            ProviderCallError::Provider(error) => Self::Provider(error),
-            ProviderCallError::Recording { execution, storage } => {
-                let storage = match storage.downcast::<SessionError>() {
-                    Ok(error) => error,
-                    Err(error) => SessionError::Io(error),
-                };
-                match execution {
-                    Some(error) => Self::FailureRecording {
-                        execution: Box::new(Self::from(ProviderCallError::Provider(error))),
-                        storage,
-                    },
-                    None => Self::Session(storage),
-                }
-            }
-        }
+fn provider_error(error: ProviderError) -> AgentError {
+    if error.kind == ModelErrorKind::Cancelled {
+        AgentError::Aborted
+    } else {
+        AgentError::Provider(error)
     }
 }
 
 /// 指数退避；Provider 明确返回 Retry-After 时以它的建议为准。
 fn retry_delay_ms(base_delay_ms: u64, attempt: u32, retry_after: Option<std::time::Duration>) -> u64 {
     if let Some(retry_after) = retry_after {
-        return singularity_core::duration_millis(retry_after);
+        return duration_millis(retry_after);
     }
     base_delay_ms * 2u64.pow(attempt - 1)
 }
@@ -120,14 +78,14 @@ async fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool 
 // 参数就是 Agent 已有的字段加上本次请求的事实；直接显式传入，不引入包装对象，也不让调用方自己编排 attempt。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_request(
-    provider: &(dyn Provider + Send + Sync),
+    provider: &OpenAiProvider,
     session: &SessionWriter,
     accounting: &mut RequestAccounting,
     request: &ModelTurnRequest,
     definitions: &RequestDefinitions,
     on_event: &mut (dyn FnMut(AgentEvent) + Send),
     cancellation: &CancellationToken,
-    purpose: singularity_protocol::RequestPurpose,
+    purpose: RequestPurpose,
 ) -> Result<(ModelTurnResponse, String), AgentError> {
     const MAX_ATTEMPTS: u32 = 3;
     const BASE_DELAY_MS: u64 = 2_000;
@@ -138,19 +96,15 @@ pub(crate) async fn execute_request(
         accounting.attempts += 1;
         let mut attempt = RequestAttempt {
             writer: session,
-            accounting,
-            request,
-            definitions,
             on_event,
             purpose,
-            attempt_id: crate::session::new_entry_id(),
             result_entry_id: crate::session::new_entry_id(),
             visible_text: String::new(),
             visible_reasoning: String::new(),
         };
-        let error = match provider.complete_stream(request, cancellation, &mut attempt).await {
+        let error = match attempt.run(provider, request, definitions, accounting, cancellation).await {
             Ok(response) => return Ok((response, attempt.result_entry_id)),
-            Err(error) => AgentError::from(error),
+            Err(error) => error,
         };
         if let AgentError::Provider(provider_error) = &error
             && retry_attempt < MAX_ATTEMPTS
@@ -172,7 +126,7 @@ pub(crate) async fn execute_request(
             continue;
         }
         // 会话写入已失败时不再写中断显示记录。
-        if purpose == singularity_protocol::RequestPurpose::Generation
+        if purpose == RequestPurpose::Generation
             && !matches!(error, AgentError::Session(_) | AgentError::FailureRecording { .. })
             && let Err(storage) = attempt.finish_interrupted().await
         {
@@ -182,9 +136,9 @@ pub(crate) async fn execute_request(
     }
 }
 
-impl ProviderObserver for RequestAttempt<'_> {
+impl RequestAttempt<'_> {
     fn on_stream(&mut self, event: ProviderStreamEvent) {
-        if self.purpose == singularity_protocol::RequestPurpose::Compaction {
+        if self.purpose == RequestPurpose::Compaction {
             return;
         }
         let message_id = self.result_entry_id.clone();
@@ -201,69 +155,111 @@ impl ProviderObserver for RequestAttempt<'_> {
         }
     }
 
-    fn record_attempt<'a>(
-        &'a mut self,
-        event: ProviderAttemptEvent,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let request_head;
-            let mut observation = match event {
-                ProviderAttemptEvent::Started(started) => {
-                    // 持久化线程只接收轨迹定义，不复制对话和私有续接材料。
-                    request_head = Some((self.definitions.clone(), self.request.model_preferences.clone()));
-                    singularity_protocol::RequestObservation {
-                        request_id: self.attempt_id.clone(),
-                        request_head: None,
-                        purpose: self.purpose,
-                        attempt: self.accounting.attempts,
-                        provider: started.provider_name,
-                        model: started.model_name,
-                        status: singularity_protocol::ProviderAttemptStatus::Started,
-                        duration_ms: 0,
-                        ttft_ms: None,
-                        decode_ms: None,
-                        total_tokens: None,
-                        input_tokens: None,
-                        output_tokens: None,
-                        cached_input_tokens: None,
-                        error: None,
-                        diagnostic_code: None,
-                    }
-                }
-                ProviderAttemptEvent::Finished(occurrence) => {
-                    let usage = occurrence.usage.as_ref().filter(|usage| usage.usage_present);
-                    if let Some(usage) = usage {
-                        self.accounting.usage.merge(usage);
-                    }
-                    request_head = None;
-                    singularity_protocol::RequestObservation {
-                        request_id: self.attempt_id.clone(),
-                        request_head: None,
-                        purpose: self.purpose,
-                        attempt: self.accounting.attempts,
-                        provider: occurrence.started.provider_name.clone(),
-                        model: occurrence.started.model_name.clone(),
-                        status: occurrence.terminal_status,
-                        duration_ms: occurrence.attempt_duration_ms,
-                        ttft_ms: occurrence.ttft_ms,
-                        decode_ms: occurrence.decode_ms,
-                        total_tokens: usage.map(|usage| usage.total_tokens),
-                        input_tokens: usage.map(|usage| usage.input_tokens),
-                        output_tokens: usage.map(|usage| usage.output_tokens),
-                        cached_input_tokens: usage.and_then(|usage| usage.cached_input_tokens),
-                        error: occurrence.error_category.as_ref().map(ToString::to_string),
-                        diagnostic_code: occurrence.diagnostic_code.clone(),
-                    }
-                }
-            };
-            let persisted = observation.clone();
-            observation.request_head = with_writer_async(self.writer, move |writer| {
-                writer.append_model_request(persisted, request_head)
+    async fn run(
+        &mut self,
+        provider: &OpenAiProvider,
+        request: &ModelTurnRequest,
+        definitions: &RequestDefinitions,
+        accounting: &mut RequestAccounting,
+        cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, AgentError> {
+        if cancellation.is_cancelled() {
+            return Err(AgentError::Aborted);
+        }
+        let (provider_name, model_name) = provider.model_identity();
+        let mut observation = RequestObservation {
+            request_id: crate::session::new_entry_id(),
+            request_head: None,
+            purpose: self.purpose,
+            attempt: accounting.attempts,
+            provider: provider_name.to_string(),
+            model: model_name.to_string(),
+            status: ProviderAttemptStatus::Started,
+            duration_ms: 0,
+            ttft_ms: None,
+            decode_ms: None,
+            total_tokens: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            error: None,
+            diagnostic_code: None,
+        };
+        let started = Instant::now();
+        // 持久化线程只接收轨迹定义，不复制对话和私有续接材料。
+        self.record(observation.clone(), Some((definitions.clone(), request.model_preferences.clone())))
+            .await?;
+        let mut first_token = None;
+        let completion = provider
+            .complete_stream(request, cancellation, &mut |event| {
+                first_token.get_or_insert_with(Instant::now);
+                self.on_stream(event);
             })
-            .await
-            .map_err(std::io::Error::other)?;
-            (self.on_event)(AgentEvent::ProviderAttempt { observation });
-            Ok(())
+            .await;
+        let finished = Instant::now();
+        let failure = completion.result.as_ref().err();
+        observation.status = match failure {
+            None => ProviderAttemptStatus::Ok,
+            Some(error) if error.kind == ModelErrorKind::Cancelled => ProviderAttemptStatus::Cancelled,
+            Some(_) => ProviderAttemptStatus::Error,
+        };
+        observation.duration_ms = duration_millis(finished.duration_since(started));
+        observation.ttft_ms = first_token.map(|first| duration_millis(first.duration_since(started)));
+        observation.decode_ms = first_token.map(|first| duration_millis(finished.duration_since(first)));
+        if let Some(usage) = &completion.usage {
+            accounting.usage.merge(usage);
+            observation.input_tokens = Some(usage.input_tokens);
+            observation.output_tokens = Some(usage.output_tokens);
+            observation.total_tokens = Some(usage.total_tokens);
+            observation.cached_input_tokens = usage.cached_input_tokens;
+        }
+        observation.error = failure.map(|error| error.category().to_string());
+        observation.diagnostic_code = failure.and_then(|error| error.code.clone());
+        if let Err(storage) = self.record(observation, None).await {
+            return Err(match completion.result {
+                Err(error) => AgentError::FailureRecording {
+                    execution: Box::new(provider_error(error)),
+                    storage,
+                },
+                Ok(_) => AgentError::Session(storage),
+            });
+        }
+        completion.result.map_err(provider_error)
+    }
+
+    async fn record(
+        &mut self,
+        mut observation: RequestObservation,
+        request_head: Option<(RequestDefinitions, RequestPreferences)>,
+    ) -> Result<(), SessionError> {
+        let persisted = observation.clone();
+        observation.request_head = with_writer_async(self.writer, move |writer| {
+            writer.append_model_request(persisted, request_head)
         })
+        .await?;
+        (self.on_event)(AgentEvent::ProviderAttempt { observation });
+        Ok(())
+    }
+
+    /// 最终中断时留下的公开内容只用来显示，不会成为模型上下文里的正式消息。
+    async fn finish_interrupted(&mut self) -> Result<(), SessionError> {
+        let message = AgentMessage::Assistant {
+            content: crate::message::public_thinking_text_blocks(
+                std::mem::take(&mut self.visible_reasoning),
+                std::mem::take(&mut self.visible_text),
+            ),
+            provider_reasoning_replay: None,
+        };
+        let items = message.public_items(&self.result_entry_id, ItemScope::Completion);
+        if !items.is_empty() {
+            append_record_async(self.writer, LedgerRecord::AssistantInterrupted { items: items.clone() })
+                .await?;
+        }
+        (self.on_event)(AgentEvent::MessageFinished {
+            message_id: self.result_entry_id.clone(),
+            items,
+            failed: true,
+        });
+        Ok(())
     }
 }

@@ -16,11 +16,7 @@ export type DirectoryPickResult = { path: string | null, };
 
 export type DiscoverModelsParams = { providerId: string, baseUrl: string, apiKey?: string | null, apiProtocol: string, };
 
-export type DiscoveredModel = { modelId: string, displayName: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, requiresReasoningContentForToolCalls: boolean | null,
-/**
- * 元数据的补充来源；缺省表示仅使用提供方模型目录。
- */
-metadataSource: string | null, };
+export type DiscoveredModel = { modelId: string, displayName: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, requiresReasoningContentForToolCalls: boolean | null, };
 
 export type EmptyParams = Record<string, never>;
 

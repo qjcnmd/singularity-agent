@@ -64,8 +64,7 @@ export function mergeDiscoveredModels(
     if (!picked.has(candidate.modelId)) continue
     const at = next.findIndex(row => row.modelId.trim() === candidate.modelId)
     if (at < 0) {
-      const { metadataSource: _source, ...configuration } = candidate
-      next.push(applyProtocol({ ...blankModel(), ...configuration,
+      next.push(applyProtocol({ ...blankModel(), ...candidate,
         reasoningVariants: candidate.reasoningVariants.length ? candidate.reasoningVariants : null,
       }, protocol))
       continue

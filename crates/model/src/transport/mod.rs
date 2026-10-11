@@ -6,7 +6,5 @@ pub(crate) mod http;
 pub(crate) mod retry;
 pub(crate) mod stream;
 
-pub(crate) use http::{
-    provider_cancelled_error, provider_client, provider_error_from_http_status, provider_future,
-};
+pub(crate) use http::{provider_client, provider_error_from_http_status, provider_future};
 pub(crate) use retry::*;

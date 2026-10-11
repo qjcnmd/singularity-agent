@@ -16,6 +16,7 @@ pub(super) struct ConversationSlot {
 }
 
 pub(super) struct SlotState {
+    archiving: bool,
     history: Option<Arc<ThreadSnapshot>>,
     session_revision: u64,
     active_turn: Option<ActiveTurnRuntimeSnapshot>,
@@ -29,6 +30,7 @@ impl ConversationSlot {
         Self {
             conversation,
             state: Mutex::new(SlotState {
+                archiving: false,
                 history: None,
                 session_revision: 0,
                 active_turn: None,
@@ -47,6 +49,16 @@ impl ConversationSlot {
         self.state.lock().expect("conversation slot lock poisoned (fail-stop)")
     }
 
+    pub(super) fn is_archiving(&self) -> bool {
+        self.lock_state().archiving
+    }
+
+    /// 调用方持有生命周期锁；归档期间保留读取和事件投影，拒绝新的操作。
+    pub(super) fn begin_archive(&self) -> ArchiveGuard<'_> {
+        self.lock_state().archiving = true;
+        ArchiveGuard { slot: self }
+    }
+
     pub(super) fn runtime_from(&self, state: &SlotState) -> SessionRuntime {
         // 会话侧的字段来自同一次读取；Slot 自己的状态由本方法补上。
         let conversation = self.conversation.snapshot();
@@ -60,6 +72,17 @@ impl ConversationSlot {
             active_compaction: state.active_compaction.clone(),
             terminal: state.terminal.clone(),
         }
+    }
+}
+
+/// 归档失败时释放操作限制，原任务仍可继续使用或重试归档。
+pub(super) struct ArchiveGuard<'a> {
+    slot: &'a ConversationSlot,
+}
+
+impl Drop for ArchiveGuard<'_> {
+    fn drop(&mut self) {
+        self.slot.lock_state().archiving = false;
     }
 }
 

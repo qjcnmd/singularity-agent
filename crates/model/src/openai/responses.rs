@@ -8,10 +8,10 @@ use serde_json::{Value, json};
 use crate::config::selection::{OpenAiProviderConfig, SelectedModel};
 use crate::error::{ModelErrorKind, ProviderError, provider_embedded_error, provider_error_fields};
 use crate::openai::parse::{parse_tool_call_arguments, parse_usage};
+use crate::provider::ProviderStreamEvent;
 use crate::provider::contract::{
     finalize_provider_response, provider_content_filter_error, provider_response_validation_error,
 };
-use crate::provider::telemetry::ProviderStreamEvent;
 use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
 use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,

@@ -73,11 +73,6 @@ impl InputImage {
         // 同一份已接受输入在保存失败后可能重新交付，始终写回相同的不可变字节。
         singularity_core::atomic_replace_bytes(&directory.join(&self.attachment.id), &self.bytes)
     }
-
-    /// 给待处理输入的图片预览使用；这时图片尚未进入会话历史。
-    pub fn data_url(&self) -> String {
-        data_url(&self.attachment.mime_type, &self.bytes)
-    }
 }
 
 fn data_url(mime: &str, bytes: &[u8]) -> String {

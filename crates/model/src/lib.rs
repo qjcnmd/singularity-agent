@@ -36,9 +36,5 @@ pub use config::{
 pub use error::*;
 pub use openai::OpenAiProvider;
 pub use provider::contract::ProviderApiProtocol;
-pub use provider::telemetry::{
-    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
-    ProviderStreamEvent,
-};
-pub use provider::{Provider, ProviderCallError, ProviderFuture, ProviderObserver};
+pub use provider::{ProviderCompletion, ProviderStreamEvent};
 pub use types::*;

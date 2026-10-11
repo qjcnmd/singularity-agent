@@ -48,7 +48,7 @@
 .icon-button, .quiet-button, .secondary-button, .primary-button, .stop-button, .expand-button, .header-button,
 .workspace-button, .workspace-empty, .session-main,
 .composer-candidates button, .submit-button,
-.workspace-icon-button, .queue-actions button, .load-older {
+.workspace-icon-button, .load-older {
   transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease, transform 80ms ease, box-shadow 140ms ease;
 }
 .icon-button, .quiet-button, .secondary-button, .primary-button, .stop-button, .expand-button, .header-button {
@@ -114,7 +114,7 @@
 }
 /* 按压反馈在 pointer-down 时生效；orb 控件被有意排除。 */
 .icon-button:active, .quiet-button:active, .secondary-button:active, .primary-button:active, .header-button:active,
-.workspace-icon-button:active, .sg-icon-btn:active, .queue-actions button:active, .load-older:active {
+.workspace-icon-button:active, .sg-icon-btn:active, .load-older:active {
   transform: scale(0.96);
 }
 .icon-button:active, .quiet-button:active, .header-button:active { background: var(--surface-pressed); }

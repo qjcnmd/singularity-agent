@@ -181,6 +181,15 @@ impl AppServer {
         Ok(self.insert_slot(thread))
     }
 
+    /// 生命周期锁内检查操作准入；归档等待只占用目标任务，不阻塞读取或其他任务。
+    fn open_action_slot(&self, session_id: &str) -> Result<Arc<ConversationSlot>, RpcError> {
+        let slot = self.open_slot(session_id)?;
+        if slot.is_archiving() {
+            return Err(session_busy());
+        }
+        Ok(slot)
+    }
+
     /// 在生命周期临界区内登记新 slot；已有任务由 open_slot 在创建前返回。
     fn insert_slot(&self, thread: singularity_protocol::Thread) -> Arc<ConversationSlot> {
         let id = thread.thread_id.clone();

@@ -11,5 +11,3 @@
 .image-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .image-dialog h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 14px; font-weight: 500; }
 .image-dialog > img { display: block; width: 100%; max-height: 78vh; object-fit: contain; }
-.queue-input { flex: 1; min-width: 0; }
-.queue-input .image-list { margin-top: 6px; }

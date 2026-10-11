@@ -1,5 +1,4 @@
 import { acceptExecutionEvent, readExecution, updateExecutionRuntime, type SessionView } from './execution'
-import { eventTurnId } from './protocol'
 import type { SessionReadResult, SessionRuntime, StreamEnvelope, AppBootstrap, TurnEventEnvelope } from './protocol'
 
 export type LiveSessionState = Pick<SessionRuntime, 'sessionRevision' | 'phase' | 'terminal'>
@@ -14,7 +13,7 @@ export const initialSyncState = (): SyncState => ({
 })
 
 /** 列表和所选任务共用同一份运行状态；旧版本的更新不覆盖当前状态。 */
-function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionState): SyncState {
+function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionState, event?: TurnEventEnvelope): SyncState {
   const previous = state.liveSessions[sessionId]
   if (previous && incoming.sessionRevision <= previous.sessionRevision) return state
   const selected = state.session?.summary.threadId === sessionId ? state.session : null
@@ -25,10 +24,12 @@ function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSe
     return { ...state, liveSessions: { ...state.liveSessions, [sessionId]: lifecycle } }
   }
   const runtime: SessionRuntime = { ...selected.runtime, ...incoming }
+  if (event?.method === 'turn/started') runtime.activeTurn = { turnId: event.params.turn.turnId }
+  const session = updateExecutionRuntime(selected, runtime)
   return {
     ...state,
     liveSessions: { ...state.liveSessions, [sessionId]: runtime },
-    session: updateExecutionRuntime(selected, runtime),
+    session: event ? { ...session, facts: acceptExecutionEvent(session.facts, event) } : session,
   }
 }
 
@@ -69,8 +70,14 @@ export function reduceStream(state: SyncState, selectedSessionId: string | null,
       return { state: acceptBootstrap(next, { ...frame.payload, revision: frame.revision }), effects: [] }
     case 'session_changed':
       return { state: acceptLiveSession(next, frame.sessionId, frame.payload), effects: [] }
-    case 'turn_event':
-      return { state: acceptTurnEvent(next, frame.sessionId, frame.payload), effects: [] }
+    case 'turn_event': {
+      const previous = state.liveSessions[frame.sessionId]
+      return { state: acceptLiveSession(next, frame.sessionId, {
+        sessionRevision: frame.payload.sessionRevision,
+        phase: previous?.phase === 'stopping' ? 'stopping' : previous?.phase === 'compacting' ? 'compacting' : 'running',
+        terminal: previous?.terminal ?? null,
+      }, frame.payload), effects: [] }
+    }
     case 'session_settled': {
       const accepted = acceptLiveSession(next, frame.sessionId, frame.payload)
       if (accepted === next) return { state: next, effects: [] }
@@ -79,30 +86,6 @@ export function reduceStream(state: SyncState, selectedSessionId: string | null,
         : ['refresh_bootstrap']
       return { state: accepted, effects }
     }
-  }
-}
-
-/** 先接纳运行状态，再把所选任务的流式内容并入视图。 */
-function acceptTurnEvent(state: SyncState, sessionId: string, event: TurnEventEnvelope): SyncState {
-  const previous = state.liveSessions[sessionId]
-  const accepted = acceptLiveSession(state, sessionId, {
-    sessionRevision: event.sessionRevision,
-    phase: previous?.phase === 'stopping' ? 'stopping' : previous?.phase === 'compacting' ? 'compacting' : 'running',
-    terminal: previous?.terminal ?? null,
-  })
-  if (accepted === state || accepted.session?.summary.threadId !== sessionId) return accepted
-
-  const session = accepted.session
-  const turnId = eventTurnId(event)
-  let activeTurn = session.runtime.activeTurn
-  if (event.method === 'turn/started' && turnId !== null) {
-    activeTurn = { turnId }
-  }
-  const runtime = { ...session.runtime, activeTurn }
-  return {
-    ...accepted,
-    session: { ...session, runtime, facts: acceptExecutionEvent(session.facts, event) },
-    liveSessions: { ...accepted.liveSessions, [sessionId]: runtime },
   }
 }
 

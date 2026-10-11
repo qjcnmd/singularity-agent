@@ -222,8 +222,6 @@ pub struct DiscoveredModel {
     pub reasoning_variants: Vec<ReasoningVariant>,
     pub default_variant: Option<String>,
     pub requires_reasoning_content_for_tool_calls: Option<bool>,
-    /// 元数据的补充来源；缺省表示仅使用提供方模型目录。
-    pub metadata_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

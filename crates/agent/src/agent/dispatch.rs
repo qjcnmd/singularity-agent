@@ -1,11 +1,10 @@
-//! 按模型给出的顺序准入工具。只读调用各占一个许可；命令和文件修改占用全部许可。
+//! 按模型给出的顺序准入工具。只读调用各占一个执行位；独占工具占用全部执行位。
 //! 结果一完成就落盘，随后才发布完成事件。失败后排空已启动的工具，不派发后续调用。
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use singularity_model::ModelToolCall;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{Agent, AgentEvent, Result};
@@ -14,7 +13,7 @@ use crate::session::lock_writer;
 use crate::tools::{PreparedTool, ToolExecution, error_result};
 
 // 只读工具仍在线程池执行文件 I/O，限制同时运行的数量以控制资源竞争。
-const MAX_PARALLEL_TOOL_WORKERS: u32 = 8;
+const MAX_PARALLEL_TOOL_WORKERS: usize = 8;
 const OUTPUT_QUEUE_CAPACITY: usize = 32;
 
 enum WorkerEvent {
@@ -26,13 +25,13 @@ enum WorkerEvent {
         item_id: String,
         tool_call_id: String,
         execution: ToolExecution,
-        _admission: OwnedSemaphorePermit,
+        occupied_slots: usize,
     },
 }
 
 impl Agent {
     /// 准入在派发者中按 source order 等待，后面的独占调用不会越过前面的读取。
-    /// 等待锁期间继续消费结果和进度，避免背压阻止已运行工具释放锁。
+    /// 派发者独占准入计数，等待空位时直接消费结果和进度；完成结果提交后才归还空位。
     pub(super) async fn dispatch_tools(
         &mut self,
         tool_calls: Vec<ModelToolCall>,
@@ -44,9 +43,8 @@ impl Agent {
         // 只为读 cwd 短暂持有会话写者锁，不跨工具执行持锁，否则会阻塞控制接受与
         // 终态落盘（工具 worker 与控制面共用同一写者）。
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let gate = Arc::new(Semaphore::new(MAX_PARALLEL_TOOL_WORKERS as usize));
         let (sender, mut receiver) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
-        let mut active = 0usize;
+        let mut occupied_slots = 0;
         let mut failure = None;
 
         for (index, call) in tool_calls.into_iter().enumerate() {
@@ -60,25 +58,20 @@ impl Agent {
                 self.registry.preflight(&call.tool_name, &call.arguments)
             };
             let parallel = matches!(&prepared, Ok(prepared) if prepared.supports_parallel());
-            let permits = if parallel { 1 } else { MAX_PARALLEL_TOOL_WORKERS };
-            let admission = Arc::clone(&gate).acquire_many_owned(permits);
-            tokio::pin!(admission);
-            let guard = loop {
-                tokio::select! {
-                    guard = &mut admission => break Some(guard.expect("tool admission remains open")),
-                    event = receiver.recv(), if active > 0 => {
-                        let event = event.expect("active tool retains its result sender");
-                        if matches!(event, WorkerEvent::Ended { .. }) {
-                            active -= 1;
-                        }
-                        if let Err(error) = self.process_tool_event(event, on_event).await {
-                            failure = Some(error);
-                            break None;
-                        }
+            let required_slots = if parallel { 1 } else { MAX_PARALLEL_TOOL_WORKERS };
+            while occupied_slots + required_slots > MAX_PARALLEL_TOOL_WORKERS {
+                let event = receiver.recv().await.expect("active tool retains its result sender");
+                match self.process_tool_event(event, on_event).await {
+                    Ok(released_slots) => occupied_slots -= released_slots,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
                     }
                 }
-            };
-            let Some(guard) = guard else { break };
+            }
+            if failure.is_some() {
+                break;
+            }
             on_event(AgentEvent::ToolExecutionStarted {
                 item_id: item_id.clone(),
                 tool_name: call.tool_name,
@@ -113,7 +106,7 @@ impl Agent {
                     let sender = sender.clone();
                     let cwd = cwd.to_path_buf();
                     let signal = cancellation.clone();
-                    active += 1;
+                    occupied_slots += required_slots;
                     tokio::spawn(async move {
                         let started = Instant::now();
                         let updates = sender.clone();
@@ -131,7 +124,7 @@ impl Agent {
                             item_id,
                             tool_call_id: call.tool_call_id,
                             execution,
-                            _admission: guard,
+                            occupied_slots: required_slots,
                         };
                         let _ = sender.send(event).await;
                     });
@@ -144,40 +137,38 @@ impl Agent {
             }
         }
         drop(sender);
-        while active > 0 {
-            let event = receiver.recv().await.expect("active tool retains its result sender");
-            let ended = matches!(event, WorkerEvent::Ended { .. });
+        // worker 持有发送端直到结果交付；通道关闭即表示所有已派发工具都已收尾。
+        while let Some(event) = receiver.recv().await {
             if failure.is_none()
                 && let Err(error) = self.process_tool_event(event, on_event).await
             {
                 failure = Some(error);
             }
-            if ended {
-                active -= 1;
-            }
         }
         failure.map_or(Ok(()), Err)
     }
 
+    /// 发布进度或提交完成结果，返回可供后续调用使用的执行位数量。
     async fn process_tool_event(
         &mut self,
         event: WorkerEvent,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
-    ) -> Result<()> {
+    ) -> Result<usize> {
         match event {
             WorkerEvent::Update { item_id, text } => {
-                on_event(AgentEvent::ToolExecutionUpdate { item_id, partial_result: text })
+                on_event(AgentEvent::ToolExecutionUpdate { item_id, partial_result: text });
+                Ok(0)
             }
             WorkerEvent::Ended {
                 item_id,
                 tool_call_id,
                 execution,
-                _admission: _guard,
+                occupied_slots,
             } => {
                 self.finish_tool(&item_id, &tool_call_id, execution, on_event).await?;
+                Ok(occupied_slots)
             }
         }
-        Ok(())
     }
 
     async fn finish_tool(

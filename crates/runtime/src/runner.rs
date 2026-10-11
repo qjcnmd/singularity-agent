@@ -19,7 +19,7 @@ use singularity_agent::session::{
     turn_usage_from_model_usage,
 };
 use singularity_core::load_agent_instructions;
-use singularity_model::{ModelConfigManager, Provider};
+use singularity_model::{ModelConfigManager, OpenAiProvider};
 
 use crate::assistant_items::AssistantItemEvents;
 use crate::conversation::CancelWindow;
@@ -228,10 +228,7 @@ impl TurnRunner {
 
     /// 解析 Provider 与 AgentConfig；模型容量由 Agent 从 Provider 冻结。
     /// 任何一项失败就直接失败，不留 operation 痕迹。
-    fn resolve_agent_runtime(
-        &self,
-        thread: &Thread,
-    ) -> Result<(Arc<dyn Provider + Send + Sync>, AgentConfig), TurnRunError> {
+    fn resolve_agent_runtime(&self, thread: &Thread) -> Result<(OpenAiProvider, AgentConfig), TurnRunError> {
         let provider = self.resolve_provider(thread)?;
         let config = agent_config_for_thread(
             thread,
@@ -239,12 +236,10 @@ impl TurnRunner {
         )?;
         Ok((provider, config))
     }
-    fn resolve_provider(&self, thread: &Thread) -> Result<Arc<dyn Provider + Send + Sync>, TurnRunError> {
+    fn resolve_provider(&self, thread: &Thread) -> Result<OpenAiProvider, TurnRunError> {
         let snapshot = self.models.snapshot();
-        Ok(Arc::new(
-            singularity_model::OpenAiProvider::from_snapshot(&snapshot, thread.model.as_deref())
-                .map_err(|error| TurnRunError::Preparation(error.to_string()))?,
-        ))
+        OpenAiProvider::from_snapshot(&snapshot, thread.model.as_deref())
+            .map_err(|error| TurnRunError::Preparation(error.to_string()))
     }
 }
 

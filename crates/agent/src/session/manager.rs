@@ -158,11 +158,6 @@ impl SessionData {
 }
 
 impl SessionManager {
-    /// 往线性日志追加一条消息，写盘成功后再保存到内存账本并返回提交信息。
-    pub fn append_message(&mut self, message: AgentMessage) -> Result<CommittedEntry> {
-        self.append_message_with_id(&super::new_entry_id(), message)
-    }
-
     /// 追加一条 compaction 条目并立即写盘（id 是预分配的：本次摘要 attempt 的
     /// result_entry_id 就指向它）。返回已提交条目的身份与时间。
     pub(crate) fn append_compaction_with_id(
