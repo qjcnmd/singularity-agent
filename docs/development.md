@@ -1,6 +1,6 @@
 # 开发与验证
 
-安装依赖和构建发布程序见 [安装与运行](INSTALL.md)。产品方向见 [宪章](constitution.md)，模块关系、运行流程与源码入口见 [架构图谱](architecture.md)。
+本文提供本地运行、检查与发布步骤。开发、验证与交付规则由[项目指令](../AGENTS.md)维护，安装依赖和构建发布程序见[安装与运行](INSTALL.md)。产品方向见[宪章](constitution.md)，技术取舍见[ADR 导航](constitution.md#技术决策导航)，模块关系、运行流程与源码入口见[架构图谱](architecture.md)。
 
 ## 本地运行
 
@@ -28,13 +28,11 @@ cargo run -p singularity_app --locked -- --json "summarize this repository"
 
 该命令会调用已配置模型，每次创建并保存新会话。评估器通过 `SINGULARITY_HOME` 隔离配置与会话，具体配置见安装说明。
 
-页面状态回归按受影响的行为选择，优先复用已有会话和结果；需要写入测试会话或更改配置时使用独立数据目录。模型选择、调用条件和验证范围按[项目指令](../AGENTS.md#验证与交付)执行，临时会话和进程在验证后清理。
+页面回归的范围、模型调用、数据隔离与清理按[项目指令](../AGENTS.md#验证与交付)执行。下面的检查和 E2E 命令用于复现所需行为。
 
 ## 检查
 
-所有任务的检查范围、执行成本和停止条件按 [项目指令](../AGENTS.md#验证与交付) 选择。围绕实际变化选择最小充分检查，复用已有证据；新增检查只用于解决具体缺口，局部修正只复查相关部分，不按技术栈或模块类别固定扩展流程。构建、打包和环境准备按需要执行，目标已核实、必要检查通过后结束。常规局部验证在交付汇报中说明操作与结果；复杂回归或用户要求时保留复现产物。
-
-普通文档检查最终内容、链接与 `git diff --check`。CI 和发布步骤由 `.github/workflows` 维护，不作为日常修改的默认验证清单。
+检查范围、执行成本、产物和停止条件见[项目指令](../AGENTS.md#验证与交付)。本指南提供各检查的运行入口；CI 和发布步骤由 `.github/workflows` 维护。
 
 ## 代码排版
 
@@ -63,7 +61,7 @@ $env:SINGULARITY_E2E_PACKAGED = "$PWD/apps/desktop/release/win-unpacked/Singular
 node apps/desktop/e2e/smoke.mjs
 ```
 
-脚本使用真实 Electron 窗口及 Windows 原生目录对话框，会调用 `bai/deepseek-v4.1-flash`；验证期间不要操作该窗口。输出目录保留 JSON 结果、流事件、会话读取结果与截图。取消 `SINGULARITY_E2E_PACKAGED` 可验证源码启动；`smoke.mjs` 不设置模型和扩展标记时只检查基础桌面行为。Playwright 自身使用的调试连接不属于产品通信；无监听验证须另用普通启动的发布程序执行。`node apps/desktop/e2e/lifecycle.mjs` 使用同一组环境变量验证刚提交任务时退出、重启读取中断历史。`node apps/desktop/e2e/stats-bar.mjs` 验证用量与统计栏，缓存命中率按实际上报的明细核对；这两条脚本均会调用模型。测试完成后删除隔离目录中的凭据副本。
+脚本使用真实 Electron 窗口及 Windows 原生目录对话框；上述模型场景会使用[项目指令](../AGENTS.md#验证与交付)指定的默认模型，可通过 `SINGULARITY_E2E_SELECTOR` 指定本次选择；验证期间不要操作该窗口。输出目录保留 JSON 结果、流事件、会话读取结果与截图。取消 `SINGULARITY_E2E_PACKAGED` 可验证源码启动；`smoke.mjs` 不设置模型和扩展标记时只检查基础桌面行为。Playwright 自身使用的调试连接不属于产品通信；无监听验证须另用普通启动的发布程序执行。`node apps/desktop/e2e/lifecycle.mjs` 使用同一组环境变量验证刚提交任务时退出、重启读取中断历史。`node apps/desktop/e2e/stats-bar.mjs` 验证用量与统计栏，缓存命中率按实际上报的明细核对；这两条脚本均会调用模型。测试完成后删除隔离目录中的凭据副本。
 
 `node apps/desktop/e2e/images.mjs` 检查图片选择、粘贴、拖放、草稿刷新、预览关闭与损坏图片的明确错误；设置 `SINGULARITY_E2E_MODEL=1` 后，使用真实模型检查上传识图、`read` 识图及删除原文件后重启继续识图。图片引导、停止等其他操作按本次变更在运行的 production Electron 工作台中直接验证。涉及模型调用时，使用[项目指令](../AGENTS.md#验证与交付)指定的真实模型。
 
@@ -83,9 +81,7 @@ cargo run -p singularity_protocol --features typescript --example export_types
 
 ## 测试保留与删减
 
-验证范围、模型调用、产物和停止条件由[项目指令](../AGENTS.md#验证与交付)统一维护。测试按其保障的实际行为保留或删减，不因已有测试数量或覆盖率扩大本次验证范围。
-
-绝不在编写实现代码后为覆盖率补写单元测试。隔离测试仅用于具体且重要、现有 E2E 难以检出的故障；新增前说明该故障的实际依据及 E2E 遗漏原因，再编写最少必要的测试与实现代码，不穷举假设场景。现有测试按同一标准保留，接口或格式变化时只维护有价值的覆盖，不顺带增加场景或断言。调查用脚本和临时数据在完成验证后清理。
+新增、保留和删减测试的条件统一见[项目指令](../AGENTS.md#验证与交付)。桌面行为的复现入口见[桌面 E2E](#桌面-e2e)，协议声明的生成入口见[协议更新](#协议更新)。
 
 ## CI 与发布
 

@@ -1,866 +1,514 @@
 # Singularity 架构图谱
 
-这份图谱用于看懂项目、追踪一次操作，以及定位代码和改动影响。图中的英文名对应源码对象或函数，中文说明其用途；每组图下提供源码入口。实线表示调用、传递或拥有，虚线表示派生、引用或边界条件，具体关系以箭头文字为准。状态图描述生命周期，时序图从上到下阅读。
+本文说明当前模块关系、状态归属、执行与恢复流程，并提供源码和改动影响入口。图中英文名对应源码对象；实线表示调用、传递或拥有，虚线表示引用或派生，具体关系以箭头文字为准。产品使用边界由[宪章](constitution.md)维护，控件行为见[工作台交互](desktop-ui.md)，运行命令见[开发指南](development.md)。
 
 ## 导航
 
-| 要回答的问题 | 从这里进入 |
+| 要回答的问题 | 入口 |
 | --- | --- |
-| 程序由哪些部分组成，哪些运行在同一进程？ | [系统总览](#system)、[源码依赖](#modules) |
-| 项目、任务、回合是什么关系，谁拥有状态？ | [对象与所有权](#ownership)、[数据位置](#storage) |
-| 正文、轨迹、草稿从哪里来，刷新怎样恢复？ | [前端视图](#frontend)、[连接与同步](#sync) |
-| 一次发送怎样到模型、工具和最终结果？ | [执行主链](#execution)、[Agent 循环](#agent) |
-| 运行中引导、停止会发生什么？ | [控制与执行窗口](#controls)、[取消与收尾](#cancellation) |
-| 模型设置、协议、重试和用量怎样串起来？ | [模型配置](#models)、[模型请求](#provider)、[请求记录](#requests) |
-| 模型实际看到什么，长任务怎样压缩？ | [指令与技能](#instructions)、[上下文](#context) |
-| 工具怎样并行、改文件和管理进程？ | [工具执行](#tools) |
-| 重启或异常退出后怎样恢复？ | [历史与恢复](#recovery) |
-| 改某个能力，应一起检查哪些地方？ | [改动影响导航](#impact) |
-| 源码怎样成为可运行程序，外部评估怎样接入？ | [构建与入口](#delivery) |
+| 程序由哪些部分组成，依赖方向和状态归属是什么？ | [系统总览](#system)、[模块职责](#modules)、[对象与所有权](#ownership)、[数据位置](#storage) |
+| 正文、轨迹、草稿从哪里来，刷新怎样恢复？ | [前端视图](#frontend)、[协议与同步](#sync) |
+| 发送、引导、停止怎样到模型、工具和最终结果？ | [执行主链](#execution)、[Agent 循环](#agent)、[执行窗口](#controls)、[收尾](#cancellation) |
+| 模型设置、协议、重试和用量怎样串起来？ | [模型配置](#models)、[模型请求](#provider)、[请求观测](#requests) |
+| 模型看到哪些指令、上下文和工具，长任务怎样压缩？ | [指令与技能](#instructions)、[上下文](#context)、[工具与图片](#tools) |
+| 重启后怎样继续，改动影响怎样定位？ | [历史与恢复](#recovery)、[构建与入口](#delivery)、[影响导航](#impact) |
 
 <a id="system"></a>
 ## 1. 系统总览
 
 ```mermaid
 flowchart TB
-    User["用户"] --> Browser["Electron 渲染进程工作台<br/>React：输入、显示、视图状态"]
-    Evaluator["终端 / 外部评估器"] --> Json["--json：单次输入<br/>JSONL 事件与 summary"]
-    subgraph Process["本机 singularity 进程"]
-        Host["stdio Host<br/>私有进程管道"] --> WB["AppServer<br/>工作台操作与投影组装"]
-        WB --> Conversation["Conversation<br/>每个任务的执行与控制协调"]
-        Json --> Conversation
-        Conversation --> Runner["TurnRunner<br/>单回合准备、执行、终态提交"]
-        Runner --> Agent["Agent<br/>模型请求与工具循环"]
-        Agent --> Provider["Provider<br/>Chat / Responses 与 HTTP/SSE"]
-        Agent --> Tools["Tools<br/>读、搜、命令、编辑、写入、技能"]
-        Runner --> Session["SessionManager<br/>唯一会话写者"]
+    User["用户"] --> View["Electron 渲染进程<br/>React 工作台"]
+    View <-->|"隔离 preload IPC"| Main["Electron 主进程<br/>窗口、托盘、原生目录选择"]
+    Main <-->|"私有 stdio：RPC / StreamEnvelope"| Host["Rust transport / rpc"]
+    subgraph Rust["本机 singularity 进程"]
+        Host --> App["AppServer<br/>操作入口与工作台投影"]
+        App --> Conv["Conversation<br/>任务设置、执行窗口、steer 输入箱"]
+        JSON["--json 无交互入口"] --> Conv
+        Conv --> Runner["TurnRunner<br/>单回合准备、执行、终态提交"]
+        Runner --> Agent["Agent<br/>模型与工具循环"]
+        Agent --> Provider["Provider<br/>Chat / Responses、HTTP / SSE"]
+        Agent --> Tools["read / bash / 交互提问 / MCP"]
+        Runner --> Session["SessionManager<br/>会话追加写入"]
         Agent --> Session
     end
-    Browser <-->|"隔离 preload IPC"| Electron["Electron 主进程<br/>窗口、托盘、文件夹选择"]
-    Electron <-->|"stdio：RPC + StreamEnvelope"| Host
-    Provider <-->|"模型请求 / 流式响应"| API["外部模型服务"]
-    Tools <-->|"继承本机进程权限"| Machine["文件系统 / shell / 子进程"]
-    Session --> Ledger[("本机 Session JSONL")]
-    WB --> Config[("项目登记 / 模型配置 / 凭据")]
+    Terminal["终端 / 外部评估器"] --> JSON
+    Provider <-->|"请求 / 流式响应"| API["外部模型服务"]
+    Tools <-->|"本机权限 / MCP 连接"| Resources["文件、shell、子进程、MCP 服务"]
+    Session --> Ledger[("Session JSONL 与图片快照")]
 ```
 
-源码：[程序入口](../crates/app/src/main.rs) · [Host](../crates/app/src/desktop/transport.rs) · [AppServer](../crates/app/src/desktop/app_server.rs) · [共享执行层](../crates/runtime/src/lib.rs)。产品边界见[宪章](constitution.md)。
+同一数据目录只运行一个程序，进程内可并行执行多个任务。项目登记组织上下文与任务列表；文件和命令仍继承本机进程权限。工作台使用本地 production 资源与私有管道，不监听 HTTP / WebSocket 端口。
+
+源码：[程序入口](../crates/app/src/main.rs) · [传输](../crates/app/src/desktop/transport.rs) · [AppServer](../crates/app/src/desktop/app_server.rs) · [JSONL 入口](../crates/app/src/jsonl_mode.rs)。
 
 <a id="modules"></a>
 ## 2. 源码依赖与模块职责
 
-下图只画 Rust crate 的直接生产依赖；箭头从使用方指向被使用方。
+下图画内部 crate 的直接生产依赖，箭头从使用方指向被使用方。
 
 ```mermaid
 flowchart TB
-    App["crates/app<br/>stdio AppServer、JSONL 评估入口"] --> Runtime["crates/runtime<br/>生命周期、控制、目录、历史投影"]
-    App --> Model["crates/model<br/>配置、模型类型、Provider、传输"]
-    App --> Core["crates/core<br/>路径、文件、指令、技能"]
-    App --> Protocol["crates/protocol<br/>执行事件与工作台公共类型"]
-    Runtime --> Agent["crates/agent<br/>Agent、上下文、工具、Session"]
+    App["app：桌面与 JSONL 装配"] --> Runtime["runtime：执行生命周期、历史投影"]
+    App --> Model["model：配置、模型类型、Provider、传输"]
+    App --> MCP["mcp：配置、连接、发现、调用"]
+    App --> Core["core：路径、原子文件、指令、技能"]
+    App --> Protocol["protocol：RPC、事件、公开 DTO"]
+    Runtime --> Agent["agent：模型循环、工具、上下文、Session"]
     Runtime --> Model
+    Runtime --> MCP
     Runtime --> Core
     Runtime --> Protocol
     Agent --> Model
+    Agent --> MCP
     Agent --> Core
     Agent --> Protocol
-    App --> MCP["crates/mcp<br/>用户级配置、连接、工具发现与 MCP 调用"]
-    Runtime --> MCP
-    Agent --> MCP
-    MCP --> Core
-    MCP --> Protocol
     Model --> Core
     Model --> Protocol
+    MCP --> Core
+    MCP --> Protocol
 ```
 
-```mermaid
-flowchart TB
-    subgraph AppSource["crates/app"]
-        Main["src/main.rs<br/>两种启动模式"] --> Setup["src/session_options.rs<br/>配置与共享对象准备"]
-        Main --> DesktopHost["src/desktop/*<br/>stdio、RPC、AppServer"]
-        Main --> JSONL["src/jsonl_mode.rs<br/>事件与 summary 输出"]
-        WS["src/desktop/workspace_store.rs<br/>项目登记"]
-    end
-    Front["apps/desktop/src/*<br/>React 前端"] -. "Electron IPC + stdio" .-> DesktopHost
-    subgraph RuntimeSource["crates/runtime/src"]
-        Conv["conversation.rs + state.rs + execution.rs<br/>执行窗口、引导、控制"] --> Run["runner.rs + compaction.rs<br/>单回合与独立压缩"]
-        Run --> Terminal["runner.rs / error.rs / assistant_items.rs<br/>终态提交 / 公共事件投影"]
-        Catalog["thread_catalog.rs<br/>ThreadCatalog / 历史读取"] --> History["history.rs<br/>Turn 索引、摘要与公开历史"]
-    end
-    subgraph AgentSource["crates/agent/src"]
-        Loop["agent/mod.rs<br/>Agent 循环"] --> Requests["agent/request.rs<br/>请求准备、压力与指令"]
-        Requests --> Reduction["agent/compaction.rs<br/>缩减编排、提交与指令刷新"]
-        Loop --> Dispatch["agent/dispatch.rs<br/>批次准备、准入与结果提交"]
-        Dispatch --> Tool["tools/*<br/>内建工具定义与执行"]
-        Reduction --> Compact["compaction.rs<br/>摘要准备与结果校验"]
-        Requests --> Execute["request_execution.rs<br/>记录、发送、用量与重试"]
-        Compact --> Execute
-        Loop --> Sessions["session/*<br/>日志、上下文与索引"]
-        Compact --> Sessions
-    end
-    DesktopHost --> Conv
-    DesktopHost --> Catalog
-    DesktopHost --> WS
-    Run --> Loop
-    Catalog --> Sessions
-```
+| 边界 | 主要维护入口 |
+| --- | --- |
+| 应用装配与操作 | `app/session_options.rs` 准备共享配置、Runner 和 MCP；`app/desktop` 提供传输、RPC、AppServer 与项目登记。 |
+| 跨回合协调 | `runtime/conversation.rs` 及子模块维护设置、写者窗口、输入箱与执行预订。 |
+| 单次操作 | `runtime/runner.rs` 提交回合终态，`runner/compaction.rs` 执行独立压缩，`assistant_items.rs` 投影公开事件。 |
+| Agent 执行 | `agent/agent/mod.rs` 维护循环；`request.rs` 装配请求；`compaction.rs` 编排缩减；`dispatch.rs` 准入工具并提交结果。 |
+| 会话与历史 | `agent/session` 维护日志与模型视图；`runtime/history.rs` 维护回合索引和公开历史；`thread_catalog.rs` 读取目录、分页与归档。 |
 
-`core` 与 `protocol` 不依赖其他内部 crate。前端通过协议与 Host 通信，与可执行程序同目录维护，不导入 Rust 内部实现。事件与公开对象直接使用 `protocol` 定义。
+`core` 与 `protocol` 不依赖其他内部 crate。模型消息、会话条目和公开 DTO 在各自边界转换；前端通过生成的协议声明通信，不导入 Rust 内部实现。
 
 源码：[Cargo workspace](../Cargo.toml) · [Runtime 导出](../crates/runtime/src/lib.rs) · [Agent 导出](../crates/agent/src/lib.rs) · [Model 导出](../crates/model/src/lib.rs) · [前端依赖](../apps/desktop/package.json)。
 
 <a id="ownership"></a>
 ## 3. 对象、身份与状态所有权
 
-### 3.1 项目、任务、回合与请求
-
 ```mermaid
 flowchart TB
-    Workspace["Workspace / 项目<br/>workspaceId + 规范根目录"] -. "按规范 cwd 分组" .-> Thread["Thread / 任务身份<br/>threadId、cwd、模型选择"]
-    Thread -->|"同一任务的持久事实"| Session["Session JSONL<br/>header.id 与 threadId 相同"]
-    Thread -->|"打开后的运行协调者"| Conversation["Conversation"]
-    Conversation -->|"每次提交启动一个回合"| Turn["Turn / 回合<br/>独立 turnId"]
-    Turn -->|"一到多个模型步"| Step["modelTurnOrdinal"]
-    Step -->|"请求尝试，重试另记"| Request["requestId / attempt<br/>生成或摘要"]
-    Request -->|"成功时写入"| Result["独立的 assistant / compaction 条目 ID"]
-    Step -->|"回复可声明多个"| Call["Tool call"]
-    Call -->|"公开身份"| PublicID["assistant 条目 ID + 调用位置"]
-    Call -->|"模型协议关联"| ProviderID["提供方原始 tool call ID"]
-    Turn -->|"使用同一 turnId"| Operation["执行记录<br/>started → finished"]
-    Conversation -->|"手动压缩，无普通 Turn"| CompactOp["独立 compaction operation"]
+    Workspace["Workspace：ID、名称、规范根目录"] -. "按 cwd 动态分组" .-> Thread["Thread：threadId、cwd、模型选择"]
+    Thread --> Ledger["Session JSONL<br/>header.id = threadId"]
+    App["AppServer"] --> Shared["共享 TurnRunner / ThreadCatalog<br/>WorkspaceStore / ModelConfigManager / McpManager"]
+    App --> Slot["sessionId → ConversationSlot"]
+    Slot --> Conv["Conversation<br/>thread、生命周期、SteeringInbox、最近容量"]
+    Slot --> Projection["SlotState<br/>会话版本、冻结历史、活动事件、终态"]
+    Conv --> Controls["TurnControls<br/>turnId、取消窗口、输入箱句柄、SessionWriter"]
+    Conv --> Reservation["OperationReservation<br/>绑定输入或独立压缩"]
+    Reservation --> Guard["OperationGuard<br/>保持占用直到投影结算"]
+    Controls --> Writer["Arc + Mutex + SessionManager"]
+    Projection -. "phase 从生命周期派生" .-> Conv
+    Projection --> DTO["SessionRuntime / SessionReadResult"]
 ```
 
-公开工具身份用于实时与历史展示，避免提供方重复使用调用 ID 时合并不同工具；模型仍使用原始协议 ID。项目登记保存根目录，任务依据自己的 cwd 动态归组，不另存一份项目内任务清单。
+一个任务同一时刻只执行一个普通回合或独立压缩；一次预订只执行一个回合。普通回合有独立 `turnId`，包含一到多个模型步；每次请求尝试有独立 `requestId`，回复条目另有身份。独立压缩有自己的 operation，事件不绑定普通 turn。
 
-### 3.2 Host 与Electron 渲染进程的状态归属
+公开工具身份由 assistant 条目 ID 与调用位置派生，用于实时和历史展示；模型协议配对使用提供方原始 tool call ID。用户输入在接受时分配固定消息身份，支持保存失败后继续交付。
 
-```mermaid
-flowchart TB
-    WB["AppServer<br/>进程级组装入口"] --> Shared["共享 TurnRunner / ThreadCatalog<br/>WorkspaceStore / ModelConfigManager"]
-    WB --> Order["revision：全局帧序号"]
-    WB --> Slots["sessionId → ConversationSlot"]
-    Slots --> Conv["Conversation<br/>thread 设置、执行窗口、steer 输入箱"]
-    Slots --> Projection["SlotState<br/>session_revision<br/>active_turn / active_compaction、terminal"]
-    Slots --> Stable["回合开始前的 ThreadSnapshot<br/>空闲 slot 释放整份历史<br/>历史投影包含独立压缩结果"]
-    Conv --> Running["当前 TurnControls<br/>turnId、inbox、取消令牌、共享写者"]
-    Conv --> Reservation["OperationReservation<br/>绑定操作与输入，消费式执行"]
-    Reservation --> Guard["OperationGuard<br/>占用窗口直到投影结算"]
-    Running --> Writer["SessionWriter<br/>Arc + Mutex + SessionManager"]
-    Projection -. "phase 由窗口与取消令牌派生" .-> Conv
-    Projection -->|"带版本的协议快照"| Store["Electron 渲染进程 AppStore"]
-    Store --> UIState["选择、草稿、栏宽、滚动锚点<br/>连接状态、动作结果"]
-    Store --> Views["正文 / 轨迹 / 用量 / 任务列表"]
-```
+`Conversation` 拥有 steer 输入箱，活动 `TurnControls` 借用它。`OperationReservation.execute` 消费预订并返回操作结果与守卫；调用方完成投影结算后释放守卫。`last_context_window` 只在回合准备成功时更新，运行中设置修改不改变本轮容量。写者只在读取或追加时短暂加锁，模型等待与工具执行不持锁。
 
-普通 `session_changed` / `session_settled` 的 payload 均直接承载轻量 runtime（生命周期、交互请求、活动身份与终态）；完整活动事件只随 `session.read` 恢复快照传输。终态携带来源（普通回合或独立压缩）：任务状态只跟随回合终态，压缩结果在对话区自成一行。不同任务可并行；一个任务同一时刻只有一个普通回合或独立压缩窗口。`OperationReservation` 在预订时绑定普通输入或独立压缩及其参数，宿主调用消费式 `execute`，取得带操作来源的结果和 `OperationGuard`。守卫保持到调用方完成投影收尾，释放时归还执行窗口。写者只在追加或读取时短暂加锁，不跨模型等待与工具执行持锁。工作台的会话生命周期操作（查找或创建 slot、建立执行或压缩预订、归档与移除）共用一段短临界区：销毁操作不能穿过启动占用尚未打开写者的窗口。`ConversationState.last_context_window` 保存最近一次准备成功的回合容量，和转入 Running 一起更新；准备失败保留旧值，运行中配置变更不影响它，结束后仍可读取。
+AppServer 的生命周期临界区覆盖 slot 查找或创建、预订、归档与项目移除，保护启动和销毁的交接；全局帧序号、完整工作台快照发布和单会话投影分别由对应锁维护。
 
-源码：[AppServer](../crates/app/src/desktop/app_server.rs) · [ConversationSlot / SlotState](../crates/app/src/desktop/app_server/session.rs) · [Conversation / OperationReservation](../crates/runtime/src/conversation.rs) · [TurnControls](../crates/runtime/src/conversation/state.rs) · [SessionWriter](../crates/agent/src/session/mod.rs) · [工具身份](../crates/agent/src/session/format.rs)。
+源码：[Conversation / 预订](../crates/runtime/src/conversation.rs) · [TurnControls / 生命周期](../crates/runtime/src/conversation/state.rs) · [SlotState](../crates/app/src/desktop/app_server/session.rs) · [SessionWriter](../crates/agent/src/session/mod.rs)。
 
 <a id="storage"></a>
-## 4. 数据位置与唯一维护方
+## 4. 数据位置与维护边界
 
-```mermaid
-flowchart LR
-    Home["用户数据根<br/>SINGULARITY_HOME 或默认用户主目录"] --> WorkspaceRegistryFile[("workspaces.json<br/>项目 ID、名称、根目录")]
-    Home --> Config[("config.json<br/>Provider、模型、能力、默认选择")]
-    Home --> Auth[("auth.json<br/>私有 API Key")]
-    Home --> Ledger[("sessions / 任务 ID.jsonl<br/>Session v11")]
-    Ledger -->|"归档移动"| Archive[("sessions / archived / 任务 ID.jsonl")]
-    Home --> Instructions["AGENTS.md / skills<br/>用户级指令来源"]
-    WorkspaceStore["WorkspaceStore"] -->|"锁内读改写，落盘后发布"| WorkspaceRegistryFile
-    ModelManager["ModelConfigManager"] --> Config
-    ModelManager --> Auth
-    Manager["SessionManager + 进程内写者守卫"] -->|"单写者追加"| Ledger
-    Browser["viewPersistence.ts"] --> View[("localStorage：view.v1<br/>选择、外观、布局、滚动锚点")]
-    DraftStore["drafts.ts / DraftStore<br/>加载、编辑、转移与删除"] --> Draft[("IndexedDB：按任务保存文字与图片草稿")]
-    Home --> Images[("sessions / images / 任务 ID / 图片 ID<br/>持久像素快照")]
-    Ledger -.->|"Image 内容块引用"| Images
-    Bash["bash 输出截断"] --> Temp[("系统临时目录<br/>singularity-tool-output / UUID.log")]
-```
+数据根为显式 `SINGULARITY_HOME`，或默认用户主目录下的 `.singularity`。
 
-| 数据 | 维护边界与读取方 |
+| 数据位置 | 唯一维护方与消费方式 |
 | --- | --- |
-| 项目身份 | `CanonicalWorkspacePath` 规范化路径及比较键；`WorkspaceStore` 维护登记；bootstrap 按同一登记快照分组任务。读取历史身份不要求原目录仍存在。 |
-| 模型与凭据 | `ModelConfigManager` 内部串行读取和修改，生成运行快照、脱敏目录；修改结果与修改后的实际目录在同一临界区中取得，部分保存失败也返回当前目录；Electron 渲染进程只写新密钥，不从目录读回密钥。 |
-| 会话事实 | `SessionManager` 写入，`SessionData` 只读；上下文、中断操作恢复、历史、摘要、请求详情均从同一日志派生。未消费的控制输入是内存状态，不由日志恢复。 |
-| 视图与草稿 | `viewPersistence.ts` 保存视图；`drafts.ts` 的 `DraftStore` 拥有草稿快照和加载过程，在 IndexedDB 中按任务保存完整输入。工作台订阅同一份只读快照，编辑、转移、发送后清空及删除均经此入口。 |
-| 图片 | `agent/image.rs` 共用识别、解码与格式转换；用户输入和工具结果共用 Agent 的消息追加入口，先在会话锁外保存像素，再追加引用图片的消息；成功后才发布完成事件。未消费的 steer 图片仍属于进程内输入。 |
-| 临时工具输出 | 工具结果给出实际日志路径；新建输出时清理超过七天的旧输出，保存失败明确反馈。 |
+| `workspaces.json` | `WorkspaceStore` 串行读改写；任务按持久 cwd 动态归组。`CanonicalWorkspacePath` 维护路径身份。 |
+| `config.json` / `auth.json` | `ModelConfigManager` 维护配置和凭据，生成执行快照与脱敏目录；前端只写新密钥。 |
+| `mcp.json` | `McpManager` 经配置模块维护服务器、开关、环境变量和请求头；设置操作与工具发现读取文件。 |
+| `sessions/<threadId>.jsonl` | `SessionManager` 追加当前 v11 会话；`SessionData` 提供只读账本；上下文、历史与请求详情由它派生。 |
+| `sessions/archived/<threadId>.jsonl` | `ThreadCatalog` 在会话写者窗口内移动日志完成归档。 |
+| `sessions/images/<threadId>/<imageId>` | Agent 保存图片像素快照；消息和公开内容块保存引用、名称、格式与尺寸。 |
+| 数据根 `AGENTS.md`、用户与项目技能目录 | `core` 加载文件指令与 Skill 元数据，具体发现目录见[安装约定](INSTALL.md#skills)。 |
+| IndexedDB 草稿 | `DraftStore` 按任务保存文字、图片与技能绑定，统一处理加载、编辑、转移和删除。 |
+| localStorage `view.v1` | `viewPersistence.ts` 保存选择、外观、布局和阅读锚点。 |
+| 临时目录 `singularity-tool-output/<UUID>.log` | `bash` 保存超长输出，新建时清理超过七天的旧日志，结果给出实际路径。 |
 
-移除项目删除登记，归档任务移动日志，二者成功后由前端清理对应草稿和阅读锚点。归档先在生命周期锁内标记目标 slot，阻止新的修改与执行，读取和事件投影继续；随后复用退出时的 `stop_sessions` 等待停止和结算，包括尚未进入 Running 的预订。等待不持有全局生命周期锁；结算后在写者窗口内移动日志并注销 slot。归档失败由守卫解除标记，保留任务供继续使用或重试。项目移除时，ThreadCatalog 根据候选任务的持久 cwd 确定归属，包含已归档任务；前端将返回的任务身份交给 IndexedDB 在一个事务中删除草稿。 会话写入与本地草稿属于不同存储，草稿删除失败时报告已完成的操作和未完成的清理，保留原草稿记录。运行中或仍有待处理输入的任务会阻止移除所属项目。私有配置依赖 Windows 用户目录权限并使用原子替换；Session 追加的“先写后发布”不承诺断电持久性。
+图片先在写者锁外保存，再追加引用它的消息。消息提交成功后才发布完成事件。Session 追加采用“先写后发布”，不承诺断电持久性；配置、日志修复和图片快照使用应用原子文件能力。
 
-源码：[数据根](../crates/core/src/user_home.rs) · [路径身份](../crates/core/src/workspace.rs) · [项目登记](../crates/app/src/desktop/workspace_store.rs) · [配置](../crates/model/src/config/manager.rs) · [会话目录](../crates/runtime/src/thread_catalog.rs) · [视图持久化](../apps/desktop/src/viewPersistence.ts) · [临时输出日志](../crates/agent/src/tools/bash/capture.rs)。文件维护见[安装说明](INSTALL.md#数据更新与卸载)。
+归档标记限制目标任务的新操作，再复用 `stop_sessions` 等待执行与投影结算；等待期间不持有全局生命周期锁。随后移动日志并注销 slot；失败解除标记，任务仍可继续使用。项目移除只删除登记，运行中或仍有待处理输入的任务会阻止移除。
+
+项目移除从前端提供的草稿任务身份中，按持久 cwd 确定归属，包含已归档任务；前端据此在 IndexedDB 事务中删除草稿。归档也清理对应草稿和锚点。业务存储与草稿存储独立，清理失败明确说明已完成的操作并保留原草稿记录。
+
+源码：[数据根](../crates/core/src/user_home.rs) · [项目登记](../crates/app/src/desktop/workspace_store.rs) · [模型配置](../crates/model/src/config/manager.rs) · [MCP 配置](../crates/mcp/src/config.rs) · [草稿](../apps/desktop/src/drafts.ts) · [视图持久化](../apps/desktop/src/viewPersistence.ts)。数据维护见[安装说明](INSTALL.md#数据更新与卸载)。
 
 <a id="frontend"></a>
-## 5. 前端视图、数据派生与交互入口
+## 5. 前端视图与共同状态
 
-### 5.1 页面组件怎样接入共同状态
+`AppStore` 继承 `SessionStore`，前者维护提交、设置与偏好，后者维护任务选择、历史和连接同步。`sync.ts` 接纳协议状态，`execution.ts` 归约历史与实时事实，timeline、trajectory、contextUsage、sessionUsage 和 sessionTitle 派生正文、轨迹与统计；组件读取同一 Store。
 
 ```mermaid
 flowchart TB
-    Root["main.tsx → App<br/>单 React root"] --> Sidebar["Sidebar<br/>项目、任务、切换、重命名、归档"]
-    Root --> Main["MainContent"]
-    Main --> Workspace["WorkspacePicker<br/>选择项目 / 新任务"]
-    Main --> ConversationView["Conversation / TimelineItem<br/>消息、思考、工具、差异"]
-    Main --> Composer["Composer<br/>草稿、发送、引导、停止"]
-    Root --> Trajectory["Trajectory<br/>执行轨迹、请求详情"]
-    Root --> Settings["Settings / directory.pick<br/>模型配置 / 目录选择（Store.openDirectoryPicker）"]
-    Sidebar -->|"动作"| Store["AppStore<br/>共享状态、按字段订阅、动作反馈"]
-    Workspace --> Store
-    Composer --> Store
-    Settings --> Store
-    Trajectory -->|"按需读取请求详情"| Store
-    Store -->|"会话快照与事件"| Derived["timeline.ts / trajectory.ts<br/>contextUsage.ts / sessionTitle.ts"]
-    Derived --> ConversationView
-    Derived --> Trajectory
-    Derived --> Composer
-    Store <--> Persistence["viewPersistence.ts / drafts.ts<br/>视图与输入保存"]
-    Store <--> Connection["RpcClient<br/>preload IPC + stdio"]
-    Store --> Sync["sync.ts<br/>快照、事件与版本水位归约"]
-```
-
-### 5.2 历史与流式内容怎样组成当前画面
-
-```mermaid
-flowchart LR
-    Baseline["SessionReadResult.history<br/>稳定历史页"] --> Facts["execution.ts<br/>消息、请求、工具与用量事实"]
-    Frames["TurnEventEnvelope<br/>当前回合的实时帧"] --> Sync["sync.ts<br/>检查版本水位"]
+    Components["Sidebar / Composer / Conversation<br/>Trajectory / Settings"] <-->|"动作与订阅"| Store["AppStore / SessionStore"]
+    Store <--> Drafts["DraftStore / viewPersistence"]
+    Store <--> RPC["RpcClient"]
+    RPC --> Sync["sync.ts：版本与运行状态归约"]
+    History["history：稳定历史"] --> Facts["execution.ts：共同执行事实"]
     Sync --> Facts
-    Facts --> Timeline["buildTimeline<br/>正文与工具结果布局"]
-    Facts --> Trace["buildTrajectory<br/>请求归组与提示词比较"]
-    Facts --> Usage["contextOccupancy<br/>最近实测与冻结容量"]
-    Timeline --> Render["组件渲染时生成标签和格式文本"]
-    Trace --> Render
+    Facts --> Views["timeline / trajectory<br/>contextUsage / sessionUsage / sessionTitle"]
+    Views --> Components
 ```
 
-执行期间，Host 固定回合开始前的历史，实时投影覆盖当前回合；收尾后从日志刷新历史并清除实时投影。Electron 渲染进程在同步边界将两种输入归约为共同执行事实，展示模块只做布局和格式转换。任务生命周期由同步层统一更新，选中详情引用同一对象；结算立即显示空闲并保留活动内容，历史补读成功后整体替换。用户消息（初始输入与注入输入）经 `turn/userMessage` 携带生产者派生的公开内容块身份（该条目首个文本块，即 `item.itemId`），实时投影与历史重读因此共用同一身份；无 Turn 前导条目保留各自身份。提问状态变化经带类型的事件出口发布为会话快照；steer 保存为用户消息后进入正文投影。分页加载核对会话和分页锚点；刷新尾页只保留连续重叠的已加载前缀。
+执行期间，Host 固定操作开始前的历史，并积累活动事件；收尾清除冻结历史与活动投影，下一次读取从日志生成历史。前端结算时立即显示空闲并暂留活动内容，补读成功后整体替换。用户与助手完成事件使用和历史相同的公开身份，增量与历史因此能在同一入口归约；完成事件的工具事实由独立工具事件承载。
 
-助手消息保存后，完成事件携带与历史相同的公开内容和条目身份；只有最终正文而没有增量的响应也能直接显示。完成事件与历史共用同一套公开块规则，只在范围上不同：完成事件不含工具调用项（工具事实由自己的工具事件承载），历史含。Host 的活动恢复快照用完成内容替换该条目的开始事件与文本、思考增量，实时广播继续发送增量。每个回合独立归约完成或失败，宿主收尾补齐当前尚未闭合的回合。
+Host 的活动恢复快照用正式完成内容替换对应增量，实时广播继续发送增量。普通 `session_changed` / `session_settled` 只传轻量 runtime；完整活动事件随 `session.read` 返回。前端分页检查任务与锚点，尾页刷新只保留连续重叠的前缀。
 
-Electron 渲染进程 Store 逐帧归约协议状态，正文、思考与工具进度的显示通知按 50 毫秒窗口合并；操作、终态和连接变化立即通知最新状态。代码高亮只把异步高亮器的就绪状态存入 React 状态，token 按当前代码派生；已完成代码块通过稳定参数复用渲染结果。
+Store 逐帧归约，正文、思考和工具进度的显示通知合并，操作、终态和连接变化立即通知。组件按字段订阅，时间线与轨迹复用未变化条目的投影；上下文测量从事实尾部查找，遇到成功压缩或模型切换停止。
 
-上下文用量从执行事实尾部反向查找，遇到成功压缩或模型切换即停止，不另存需要同步更新的最近测量。时间线按不可变条目复用投影；轨迹 JSON 呈现按输入身份复用序列化结果，流式更新不重复处理未变化的大输入。
+`inputTrigger.ts` 维护文件和技能候选触发，Composer 持有查询状态并丢弃失效结果。模型目录与推理档位由 `modelChoices.ts` 派生；共享交互由 `interactions.ts` 和 Menu、Dialog、Disclosure 等组件维护；主题变量位于 `styles/tokens.css`。
 
-前端订阅只缓存所需字段，避免无关组件保留完整旧会话。高亮引擎按实际语言加载语法；屏幕外正文使用 Chromium 的 `content-visibility` 跳过内部布局与绘制，保留 DOM 和阅读锚点。轨迹退出动画结束后卸载。Canvas 光栅匹配实际显示像素，固定丝带纹理复用；球体在页面隐藏或减少动态效果时停止动画帧，Rust 执行不受影响。
-
-`inputTrigger.ts` 维护 `@文件`、`/技能` 候选触发，`Composer` 持有候选结果与查询错误；查询显式绑定项目和任务，切换或输入改变后丢弃旧请求的结果。`ModelPicker` 从共同模型目录生成选择，`modelChoices.ts` 维护推理档位排序；`interactions.ts` 与 `Menu`、`Dialog`、`Disclosure` 等组件维护共享交互。主题变量位于 `styles/tokens.css`；`styles/app.css` 按外壳、对话、设置与展开表面依次导入样式，模型选择器样式位于 `styles/model-picker.css`。各面板保留自己的展开与焦点状态，任务正文与列表共用同一任务名称来源。
-
-同步提问沿用回合控制和工具结果链路：桌面装配启用 `ask_user_question`，`TurnControls` 持有当前回合的 `UserQuestions`；Agent 在独占工具准入内等待单次答案或取消。待答请求通过 `SessionRuntime.pendingQuestion` 发布，`session.answerQuestion` 按工具条目身份校验并交付；`QuestionPanel` 展示快照并经 Store 提交。请求是进程内等待状态，调用参数与答案分别由现有 assistant 工具调用和 tool result 账本保存；刷新只重读等待快照，进程重启沿用中断恢复，不重新执行提问或其他工具。
-
-源码：[App](../apps/desktop/src/app.tsx) · [Store 动作与偏好](../apps/desktop/src/appStore.ts) · [Store 状态与连接同步](../apps/desktop/src/sessionStore.ts) · [时间线](../apps/desktop/src/timeline.ts) · [轨迹](../apps/desktop/src/trajectory.ts) · [执行事实](../apps/desktop/src/execution.ts) · [输入候选](../apps/desktop/src/inputTrigger.ts)。具体显示与操作约定见[工作台交互](desktop-ui.md)。
+源码：[App](../apps/desktop/src/app.tsx) · [AppStore](../apps/desktop/src/appStore.ts) · [SessionStore](../apps/desktop/src/sessionStore.ts) · [执行事实](../apps/desktop/src/execution.ts) · [时间线](../apps/desktop/src/timeline.ts) · [轨迹](../apps/desktop/src/trajectory.ts)。
 
 <a id="sync"></a>
-## 6. 桌面协议、进程边界与同步
+## 6. 桌面协议与同步
 
-传输选择与取舍见 [Electron stdio ADR](adr/adr-0001-electron-stdio.md)。
-
-### 6.1 请求怎样到达业务对象
-
-```mermaid
-flowchart TB
-    View["RpcClient"] <-->|"contextBridge"| Preload["sandboxed preload"]
-    Preload <-->|"Electron IPC"| Main["主进程：验证自有主 frame"]
-    Main --> Picker["directory.pick：Electron 原生对话框"]
-    Main <-->|"私有 stdin/stdout JSONL<br/>id + 现有请求/响应"| Dispatch["Rust rpc.rs"]
-    Dispatch --> App["AppServer：项目、任务、模型、文件、技能"]
-    App -->|"StreamEnvelope"| Main
-```
-
-业务方法、具体参数请求枚举和客户端结果类型由 `singularity_protocol` 的同一方法表维护。传输层增加请求关联 ID，并保留原始 JSON 到请求枚举的一次解析；解析错误使用该 ID 返回。响应分别携带成功结果或错误。事件保留 revision、ready 与 resync_required。阻塞磁盘操作仍在 `spawn_blocking` 中执行，模型发现异步运行，互不阻塞停止请求。
-
-Electron 加载 `singularity://app/` 的本地打包资源，不启动 HTTP 服务。渲染进程不具备 Node 能力；preload 仅开放 RPC、连接和事件订阅。主进程禁止外部页面导航进入工作台，HTTP(S) 链接交给系统浏览器。Rust 管道关闭后取消任务并结算；后端失败会显示错误并要求重新启动，不自动重发变更请求。
-
-### 6.2 首次打开、断线与刷新恢复
+Rust `protocol/rpc.rs` 的方法表维护方法、参数和结果关联；前端声明从 Rust DTO 生成。传输增加请求 ID，Rust adapter 一次解析原始 JSON，并按相同 ID 返回结果或错误。阻塞磁盘操作使用 `spawn_blocking`，模型发现异步执行。
 
 ```mermaid
 sequenceDiagram
-    participant View as AppStore
-    participant Conn as RpcClient
-    participant Host as Host / AppServer
-    participant Catalog as ThreadCatalog
-    View->>Conn: start()
-    Conn->>Host: 订阅 IPC 事件并读取 ready
-    Host-->>View: ready 帧（仅传输层信号）
-    View->>View: resync()，缓冲后续帧；connection 保持未就绪
-    View->>Host: app.bootstrap
-    Host->>Catalog: 任务摘要，与 Host 项目和 phase 组装
-    Host-->>View: bootstrap baseline
-    View->>Host: session.read（当前选择）
-    Host-->>View: history + runtime（含 sessionRevision）+ activeEvents
-    View->>View: flushFrames()，缓冲帧交回 reducer 判断是否已被 baseline 覆盖
-    View->>View: 基线与缓冲帧收敛后标记 connection ready，开放按 phase 路由的动作
-    Host-->>View: 连续 turn_event / session_changed
-    View->>View: reduceStream()，推进水位并返回同步动作
-    alt 慢消费者落后
-        Host-->>View: resync_required
-        View->>View: 重新读取权威快照，收敛后恢复就绪
-    else 基线读取失败
-        View->>Conn: 停止事件订阅
-        View->>View: 报告原因并保留草稿，刷新后重新读取
-    else 后端退出
-        Host-->>View: 连接失败，要求重新启动应用
-    end
+    participant Store as SessionStore
+    participant RPC as RpcClient / preload / Electron
+    participant Host as Rust AppServer
+    Store->>RPC: 订阅连接与事件
+    RPC-->>Store: ready（传输已连接）
+    Store->>Store: 缓冲帧，开始 resync
+    Store->>Host: app.bootstrap
+    Host-->>Store: 项目、任务与模型目录基线
+    Store->>Host: session.read（当前选择）
+    Host-->>Store: history + runtime + activeEvents
+    Store->>Store: 按水位接纳缓冲帧，标记 connection ready
+    Host-->>Store: turn_event / session_changed / app_changed
+    Store->>Store: reduceStream，更新状态并执行所需读取
+    Host-->>Store: resync_required（消费者落后时）
+    Store->>Host: 重新读取权威基线
 ```
 
-普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受与消费共同更新 `Conversation` 的当前投影；AppServer 在接受及真实消费边界通过既有 `session_changed` 快照发布该事实，不另存一份控制生命周期。完整工作台替换快照的构造和发布仍串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。
+全局 `revision` 排序流帧，会话 `sessionRevision` 管理投影版本；目录刷新不推进执行事件消费水位。完整工作台快照构造与发布共用 `app_publication` 临界区，配置内容与序号在同一边界绑定。`sync.ts` 统一接纳 runtime 与事件，保持 `stopping`；`sessionStore.ts` 拥有选择序号、读取 Promise、缓冲释放与分页过程，失效读取不能覆盖新选择。
 
-项目、任务目录和模型配置变更通过服务端的 `app_changed` 完整快照发布。RPC 按动作返回所需结果：创建动作返回新身份（`workspace.add` 的 workspaceId、`session.create` 的读取结果），`workspace.remove` 返回草稿清理所需的任务身份，模型保存等操作返回空结果。返回的新任务身份保留到包含它的目录快照被应用。`session_settled` 触发任务终态读取和目录刷新；重同步通知或页面刷新走完整 resync。RPC bootstrap 读取与完整快照发布共用 `app_publication` 临界区，配置内容与序号在同一发布边界内绑定。
+目录变更发布 `app_changed` 完整快照；创建返回新身份并保留到目录快照接纳；`session_settled` 触发历史补读和目录刷新。基线失败停止订阅并报告，草稿保留；后端退出要求重启应用，不自动重发修改请求。动作反馈统一由 `storeActions.ts` 管理，部分保存失败使用同一份原位错误。
 
-`protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`TurnEventEnvelope` 为执行事件补充会话版本号。`sync.ts` 在同一个接纳入口归并会话版本、运行状态与实时条目，再返回所需动作；Store 执行读取、缓冲与基线同步，组件使用生产单例。`sessionStore.ts` 拥有任务选择、创建、历史读取和同步的完整过程：选择序号、读取接纳、身份保护及缓冲释放均在内部维护。当前读取由 `latestRead` 同时持有请求身份和结果 Promise；选择失效时清除它，旧读取不能覆盖新选择。历史页只负责条目配对和转换，运行状态统一结合 runtime 结算；前插旧页时只处理新加载的轮次，实时与历史工具结果共用字段转换。创建任务时由 `DraftStore` 完成草稿转移：目标保存成功才清空源，期间继续编辑的源草稿保留。`appStore.ts` 通过任务身份和操作意图调用导航入口，维护提交、设置和视图偏好等工作台动作。
+Electron 加载 `singularity://app/`，渲染进程无 Node 能力，preload 只开放 RPC、连接和事件订阅。主进程只接受自有主 frame 的 IPC，原生目录选择在主进程处理，外部 HTTP(S) 链接交给系统浏览器。
 
-工作台动作共用忙碌状态与错误反馈。只需判断完成与否的调用使用布尔结果；提供方保存需要区分部分保存失败，直接返回本次 `ActionResult`，其中的错误与原位展示使用同一份反馈。草稿编辑立即更新页面，保存失败保留页面内容并报告；归档或移除后的草稿删除失败保留原记录，错误说明已完成的业务操作与未完成的清理。
-
-源码：[工作台 DTO](../crates/protocol/src/app.rs) · [RPC 合同](../crates/protocol/src/rpc.rs) · [RPC adapter](../crates/app/src/desktop/rpc.rs) · [Electron 主进程](../apps/desktop/desktop/main.ts) · [连接](../apps/desktop/src/rpcClient.ts) · [同步归约](../apps/desktop/src/sync.ts) · [Store 状态与连接同步](../apps/desktop/src/sessionStore.ts)。协议声明的更新步骤见[开发指南](development.md#协议更新)。
+源码：[RPC 合同](../crates/protocol/src/rpc.rs) · [RPC adapter](../crates/app/src/desktop/rpc.rs) · [Electron 主进程](../apps/desktop/desktop/main.ts) · [preload](../apps/desktop/desktop/preload.cts) · [连接](../apps/desktop/src/rpcClient.ts) · [同步归约](../apps/desktop/src/sync.ts)。协议更新步骤见[开发指南](development.md#协议更新)，传输取舍见[ADR](adr/adr-0001-electron-stdio.md)。
 
 <a id="execution"></a>
-## 7. 一次发送的完整执行主链
-
-### 7.1 接受输入并启动后台回合
+## 7. 一次发送的执行主链
 
 ```mermaid
 sequenceDiagram
-    participant UI as Composer / Store
-    participant WB as AppServer
-    participant Conv as Conversation
-    UI->>WB: session.submit<br/>sessionId、text
-    WB->>WB: open_slot（按任务编号查找或恢复）
-    WB->>Conv: reserve_start(input)
-    alt 已有回合或压缩
-        Conv-->>WB: busy 错误
-        WB-->>UI: RPC 错误，保留输入
-    else 取得独占预订
-        WB->>WB: begin_operation<br/>读取持久历史
-        alt 历史读取失败
-            WB->>WB: 释放预订
-            WB-->>UI: RPC 错误，输入保留
-        else 历史读取成功
-            WB->>WB: begin_turn<br/>冻结历史、推进水位并启动 worker
-            WB->>Conv: reservation.execute() → run_single_turn()
-            Conv->>Conv: 准备回合并保存文字、图片
-            alt 本次输入保存失败或准备失败
-                Conv-->>WB: 执行错误
-                WB->>WB: 结算并释放预订
-                WB-->>UI: RPC 错误，保留草稿
-            else 本次输入已保存
-                Conv-->>WB: UserMessage（匹配预订的条目身份）
-                WB-->>UI: 消息事件及 RPC 成功，清空未改动的草稿
-                Conv-->>WB: 模型与工具执行事件持续回传
-                WB-->>UI: StreamEnvelope 实时更新
-                Conv->>Conv: 关闭控制窗口并提交回合终态
-                Conv-->>WB: 当前回合返回
-                WB->>WB: on_session_settled<br/>清空冻结历史、释放预订
-                WB-->>UI: session_settled<br/>读取最终历史
-            end
-        end
-    end
-```
-
-### 7.2 单轮执行与日志、事件的先后关系
-
-```mermaid
-sequenceDiagram
+    participant UI as Composer / AppStore
+    participant App as AppServer
     participant Conv as Conversation
     participant Runner as TurnRunner
     participant Agent as Agent
     participant Log as SessionManager
-    Conv->>Log: 打开写者、修复尾行
-    Conv->>Runner: prepare_turn(thread 快照、controls)
-    Runner->>Runner: 准备 Provider 与首次文件指令
-    Runner->>Agent: 构造 Agent（工具定义、Harness 指令、Skill 目录）
+    UI->>App: session.submit（文字、图片、技能绑定）
+    App->>Conv: 查找 slot，reserve_start(input)
+    App->>App: 读取并冻结历史，启动 worker
+    Conv->>Log: 打开写者，必要时修复尾行
+    Conv->>Runner: prepare_turn
+    Runner->>Runner: 冻结 Provider、容量、文件指令和 Agent
     Runner->>Log: operation_started
-    Runner-->>Conv: 已准备的 Agent 与开始时间
-    Conv->>Conv: 移交本轮输入，开放 Running 控制窗口
-    Conv->>Runner: run(input、controls、已准备的 Agent)
-    Runner-->>Conv: turn/started，转发给调用方
+    Conv->>Conv: 开放 Running 控制窗口
     Runner->>Agent: run(input)
-    Agent->>Log: 用户消息、模型回复、工具结果
-    Agent-->>Runner: AgentEvent
-    Runner-->>Conv: TurnEvent，转发给调用方
-    Agent-->>Runner: 完成、失败或中断结果
-    Runner->>Runner: 关闭控制窗口，冻结取消事实
+    Agent->>Log: 保存较早 steer，再保存本次输入
+    Agent-->>App: UserMessage（本次输入身份）
+    App-->>UI: RPC 成功；仅清空未继续编辑的草稿
+    Agent->>Agent: 模型与工具循环
+    Agent-->>UI: 经 Runner / AppServer 发布执行事件
+    Runner->>Runner: 关闭输入与取消接受窗口，决定终态
     Runner->>Log: operation_finished
-    Runner-->>Conv: 已提交的终态事件<br/>Result：TurnOutcome 或 TurnRunError
+    Runner-->>App: 已提交终态与执行结果
+    App->>App: 结算投影，释放 OperationGuard
+    App-->>UI: session_settled；补读最终历史
 ```
 
-`TurnRunner` 持有单回合生命周期，`Conversation` 持有 steer 输入箱；一个回合可包含多个模型请求。`prepare_turn` 在会话写入窗口内完成模型、指令和 Agent 准备，成功写入 `operation_started` 后才开放 Running 控制窗口。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 直接交回 `Result<TurnOutcome, TurnRunError>`；执行在该回合终态后结束，未消费的 steer 仍由 Conversation 持有。Session 追加成功后返回 `CommittedEntry`（条目 ID 与落盘时间戳），Runner 直接使用提交时间构造开始和终态事件。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。空闲任务的 session.submit 等到本次文字和图片落盘才返回成功，准备或保存失败在操作结算后返回原错误；回执按预订的条目身份匹配 UserMessage，不等待模型或工具。前端仅在成功且草稿未被继续编辑时清空输入。steer RPC 按进程内接受结果返回，保存后的用户消息由事件与历史提供。
+已有操作占用时普通提交返回 busy；历史读取、回合准备或输入保存失败时，释放操作并返回原错误，前端保留草稿。submit 回执按预订的消息身份匹配，不等待模型或工具完成。用户输入保存后发生的模型与工具错误经终态反馈。
 
-源码：[Store.submit](../apps/desktop/src/appStore.ts) · [AppServer.submit](../crates/app/src/desktop/app_server/actions.rs) · [spawn_operation](../crates/app/src/desktop/app_server.rs) · [Conversation.run_single_turn](../crates/runtime/src/conversation/execution.rs) · [TurnRunner.run / 终态提交](../crates/runtime/src/runner.rs)。
+Session 追加返回 `CommittedEntry` 的身份和落盘时间，Runner 用它构造操作事件。用户消息、正式助手消息、工具结果和终态均先提交再发布对应完成事件；正文与工具进度增量可在最终消息保存前显示。
+
+源码：[提交入口](../crates/app/src/desktop/app_server/actions.rs) · [worker 与回执](../crates/app/src/desktop/app_server.rs) · [run_single_turn](../crates/runtime/src/conversation/execution.rs) · [TurnRunner](../crates/runtime/src/runner.rs)。
 
 <a id="agent"></a>
 ## 8. Agent 内部循环
 
 ```mermaid
 flowchart TB
-    Input["Agent.run<br/>先交付较早 steer，再保存新提交"] --> Cancel{"已取消？"}
-    Cancel -->|"是"| Abort["返回 interrupted"]
-    Cancel -->|"否"| Inbox["逐条保存 steer<br/>保存成功后从 inbox 确认移除"]
-    Inbox -->|"保存失败，保留未提交输入"| Failure
-    Inbox -->|"保存成功"| Prepare["prepare_request<br/>刷新指令、计算压力、必要时缩减"]
-    Prepare --> Request["request_execution::execute_request 的显式重试循环<br/>生成与摘要共用执行、记录每次尝试"]
-    Request -->|"错误 / 取消"| Failure["保留具体失败原因或返回中断"]
-    Request -->|"归一回复"| Assistant["保存 assistant 消息并发布完成事件<br/>正文、thinking、工具调用、协议续接数据"]
+    Start["交付较早 steer，再保存本次输入<br/>应用指令、发现工具"] --> Input["检查取消，逐条交付 steer"]
+    Input --> Request["压力处理、装配请求、execute_request"]
+    Request -->|"失败或取消"| End["返回真实错误或 interrupted"]
+    Request -->|"成功"| Assistant["保存 assistant，发布完成事件"]
     Assistant --> Calls{"有工具调用？"}
-    Calls -->|"无"| Stop["记录截断标记，正文已随消息落盘<br/>close_if_empty 原子检查并关闭空箱子"]
-    Stop -->|"仍有输入"| Cancel
-    Stop -->|"没有输入，关闭 inbox"| Completed["聚合用量，返回 completed"]
-    Calls -->|"有，但模型输出截断"| Truncated["工具派发入口提交失败结果<br/>不执行不完整调用"]
-    Truncated --> Cancel
-    Calls -->|"有且回复完整"| Preflight["registry.preflight<br/>解析参数、绑定工具、生成公开条目 ID"]
-    Preflight --> Dispatch["dispatch_tools<br/>Tokio task 与派发者准入计数"]
-    Dispatch --> Results["每项完成即保存结果<br/>随后发布 tool/execution/end"]
-    Results --> Context["SessionManager 追加<br/>提交成功后加入账本<br/>模型结果按调用顺序投影"]
-    Context --> Cancel
+    Calls -->|"有"| Tools["预检与派发<br/>截断调用直接提交失败结果"]
+    Tools --> Commit["逐项保存结果并发布完成"]
+    Commit --> Input
+    Calls -->|"无"| Close{"close_if_empty<br/>原子关闭空输入箱"}
+    Close -->|"仍有 steer"| Input
+    Close -->|"已关闭"| Done["返回 completed 与截断标记"]
 ```
 
-工具自身失败成为 `is_error` 结果供模型决定下一步；会话写入失败通过错误通道停止执行。运行中输入在模型步边界或自然停止窗口注入，已经发出的模型请求不会被改写。
+工具自身失败保存为模型可见的 `is_error` 结果；Session 写入失败结束执行。回复的公开正文和思考、工具调用及私有续接材料随正式 assistant 消息保存。工具日志按完成顺序追加，模型上下文按声明顺序配对。
 
-源码：[Agent.run / inject_controls](../crates/agent/src/agent/mod.rs) · [请求准备 / run_turn](../crates/agent/src/agent/request.rs) · [请求执行](../crates/agent/src/request_execution.rs) · [SteeringInbox](../crates/agent/src/agent/inbox.rs) · [AgentEvent](../crates/agent/src/events.rs) · [公共事件投影](../crates/runtime/src/assistant_items.rs)。
+源码：[Agent.run / 输入交付](../crates/agent/src/agent/mod.rs) · [请求准备](../crates/agent/src/agent/request.rs) · [工具派发](../crates/agent/src/agent/dispatch.rs) · [公共事件投影](../crates/runtime/src/assistant_items.rs)。
 
 <a id="controls"></a>
 ## 9. 引导输入与执行窗口
 
-### 9.1 同一任务的独占窗口
-
 ```mermaid
 stateDiagram-v2
-    state "Idle：可接受新执行" as Idle
-    state "Reserved：持有执行预订" as Reserved
-    state "Running：当前回合执行" as Running
+    state "Idle：可开始操作" as Idle
+    state "Reserved：准备或投影收尾" as Reserved
+    state "Running：普通回合" as Running
     state "Compacting：独立压缩" as Compacting
-    state "Stopping：取消已触发" as Stopping
+    state "Stopping：取消已接受" as Stopping
     [*] --> Idle
     Idle --> Reserved: reserve_start
-    Reserved --> Running: 回合准备成功，移交输入
-    Running --> Reserved: 本轮收尾
-    Reserved --> Idle: 执行与投影收尾后 drop 预订
+    Reserved --> Running: 准备成功
+    Running --> Reserved: 回合执行结束
+    Reserved --> Idle: 释放操作守卫
     Idle --> Compacting: reserve_compaction
-    Compacting --> Idle: 压缩与投影收尾后 drop
-    Running --> Stopping: abort 触发取消令牌
-    Compacting --> Stopping: abort 触发取消令牌
-    Stopping --> Idle: 终态处理、投影收尾、释放窗口
+    Compacting --> Idle: 执行与投影结算，释放守卫
+    Running --> Stopping: abort
+    Compacting --> Stopping: abort
+    Stopping --> Idle: 操作结算，释放守卫
 ```
 
-`Stopping` 是公共 phase，直接由 Running/Compacting 内的取消令牌派生；内部仍持有原操作窗口。同一 Session 的普通提交和压缩共享独占规则。
+`Stopping` 是从取消令牌派生的公共 phase，内部仍持有原操作窗口。普通提交与独立压缩共用独占规则；运行中发送调用 `session.steer`，启动、停止及独立压缩期间不接受发送。
 
-### 9.2 不同输入动作怎样汇合
+steer 在同一生命周期锁内检查窗口、分配 sequence 与消息身份并入箱；RPC 在接受后返回。Agent 在下一模型请求前逐条保存，成功后才确认消费，不改写已发出的模型请求或打断工具批次。保存期间不持输入箱锁。
 
-设计决策见[会话 steer 输入箱](adr/adr-0005-pending-input.md)。
+失败结束当前执行，未消费的 steer 仍在 Conversation；下一次执行先消费较早输入，再纳入新提交。若重开日志已恢复该消息，只确认消费，避免重复保存或发布。输入箱不主动启动新执行。用户明确停止清空未消费的 steer；退出后内存输入不恢复。前端成功回执只清空未继续编辑的草稿。
 
-```mermaid
-flowchart TB
-    Draft["主输入框草稿<br/>文字、图片与 Skill 引用"] -->|"空闲发送"| Start["OperationReservation<br/>开始新回合"]
-    Draft -->|"运行中 Enter 或 Ctrl/Cmd+Enter"| Inbox["SteeringInbox<br/>按接受顺序持有引导"]
-    Inbox -->|"下一次模型请求前"| User["保存用户消息<br/>带入模型请求"]
-    Start --> Prepare{"回合准备成功？"}
-    Prepare -->|"成功"| User
-    Prepare -->|"失败"| Keep["返回错误<br/>保留前端草稿"]
-```
-
-Conversation 持有 SteeringInbox，各次执行借用输入箱处理已经接受的 steer；普通提交直接绑定执行预订。ControlRequest 的 sequence 确定接受顺序，接受时分配的消息身份在保存重试期间保持不变。steer 在会话状态锁内依次加入输入箱，Agent 在不持有输入箱锁的情况下保存文字和图片，保存成功后按身份确认消费；失败时当前及后续未确认输入仍由箱子持有。重开日志已恢复的消息只确认消费，不重复追加或发布到新回合。前端允许在请求期间继续编辑草稿，成功回执只清空未改变的那份输入。
-
-模型请求、准备或存储失败均结束执行。已写入历史的输入随历史保留；未消费的 steer 保留在原输入箱，下一次执行先按接受顺序消费较早的 steer，再纳入新提交。输入箱不主动启动新执行。用户明确停止取消当前尚未消费的 steer；程序退出后不恢复内存输入。
-
-源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制输入类型](../crates/agent/src/agent/inbox.rs) · [AppServer.apply_control](../crates/app/src/desktop/app_server/actions.rs) · [Composer](../apps/desktop/src/components/Composer.tsx)。
+源码：[Conversation 控制](../crates/runtime/src/conversation.rs) · [生命周期](../crates/runtime/src/conversation/state.rs) · [SteeringInbox](../crates/agent/src/agent/inbox.rs) · [Composer](../apps/desktop/src/components/Composer.tsx)。输入箱取舍见[ADR](adr/adr-0005-pending-input.md)。
 
 <a id="cancellation"></a>
 ## 10. 停止、失败与终态提交
 
-```mermaid
-flowchart TB
-    Stop["用户停止 → AppServer.abort<br/>Conversation.abort"] --> Signal["先触发 CancellationToken<br/>再记录停止事实"]
-    Signal --> Model["模型 HTTP/SSE 等待<br/>可取消重试等待"]
-    Signal --> Tools["工具入口、目录遍历、shell 启动前<br/>运行中进程树终止"]
-    Signal --> Unstarted["尚未启动的工具<br/>生成取消结果"]
-    Model --> Finish["TurnRunner 收集执行结果<br/>关闭 inbox 和停止接受窗口"]
-    Tools --> Finish
-    Unstarted --> Finish
-    Normal["自然完成 / 模型失败 / 工具循环结束"] --> Finish
-    Finish --> Commit["Runner 终态提交<br/>唯一 operation_finished<br/>status + error + user_stopped"]
-    Commit -->|"写入成功"| Publish["闭合条目、发布已提交终态<br/>返回 TurnOutcome"]
-    Commit -->|"写入失败"| Fatal["storage_fatal / Terminalization 错误<br/>不发布虚假完成终态"]
-    Publish --> Settled["AppServer.on_session_settled<br/>清空历史快照、活动投影，释放预订"]
-    Fatal --> Settled
-    Panic["内部程序异常 panic"] --> Exit["终止后端进程<br/>工作台提示重启"]
-    Settled -->|"共享状态中毒，无法发布投影"| HostExit["关闭后端通道，要求重启应用"]
-```
+停止接受后触发取消令牌，取消 HTTP / SSE、重试与提问等待，终止 shell 进程树；未启动工具生成取消结果。Runner 冻结停止事实后保存唯一的 `operation_finished`，再发布已提交终态；终态写入失败返回 Terminalization 错误。
 
-追加 I/O 失败后，该写者停止后续写入，避免向半行 JSONL 继续追加；重新打开写者后由既有修复路径处理尾部。进度或客户端输出失败不改写执行事实。`operation_finished` 是回合终态的唯一持久来源；桌面收尾投影中的错误反馈不能代替它。
+停止是否被接受由取消窗口裁决：先接受的停止随本次操作收敛，终态先冻结则后续停止返回不可停止。普通回合与独立压缩共用该规则，成功返回前已接受停止时提交中断终态。停止事实由终态记录，不另写一条停止日志。
 
-Runner 在决定终态前原子关闭本轮取消接受窗口；先接受的停止随本轮收敛，自然终态先关闭窗口则使后续停止明确返回“当前任务不可停止”。停止本身不单独写日志，由回合终态记录用户停止标志。当前执行结束后关闭 steer 接受窗口；请求失败保留未消费的 steer，用户明确停止清空当前尚未消费的 steer。手动压缩与普通回合共用该窗口：Agent 已返回成功但冻结前接受过停止时，落盘终态与调用结果都是中断，不让成功结果穿透。
+追加 I/O 失败后写者拒绝继续追加，重开写者走尾部修复。终态写入失败同时保留执行错误和存储原因；桌面收尾错误不能替代持久终态。进度或客户端输出故障不改写执行事实。
 
-内部程序异常（panic）统一终止后端进程，工作台提示重启。开发与发布构建均使用 Rust `panic = "abort"`，不在工具、执行器或 RPC 层尝试恢复状态。普通网络、模型与文件错误仍通过原有错误出口返回。重启后读取已保存历史，未完成的操作沿用既有中断修复规则；未消费的内存输入不保留。
+内部 panic 由 `panic = "abort"` 终止后端，工作台提示重启；普通模型、网络和文件错误经 Result 传播。关闭窗口隐藏到托盘，刷新保留后台任务；托盘退出关闭管道，Rust 取消并等待结算，Electron 超时后终止后端。重启按已保存事实恢复。
 
-源码：[取消令牌](https://docs.rs/tokio-util/0.7/tokio_util/sync/struct.CancellationToken.html) · [TurnControls.accept_cancel](../crates/runtime/src/conversation/state.rs) · [Conversation.abort](../crates/runtime/src/conversation.rs) · [Runner 收尾](../crates/runtime/src/runner.rs) · [fail_stop_terminalization](../crates/runtime/src/runner/error.rs) · [追加写入](../crates/agent/src/session/manager.rs)。
+源码：[取消窗口](../crates/runtime/src/conversation/state.rs) · [Runner 收尾](../crates/runtime/src/runner.rs) · [终态错误](../crates/runtime/src/runner/error.rs) · [应用退出](../crates/app/src/desktop/app_server/shutdown.rs) · [Electron 生命周期](../apps/desktop/desktop/main.ts)。
 
 <a id="models"></a>
 ## 11. 模型配置与选择
 
 ```mermaid
-flowchart TB
-    Form["Settings 表单草稿<br/>Provider 地址、协议、模型能力、新密钥"] --> Discover["model.discover<br/>用当前地址与新密钥或已存密钥查询"]
-    Discover --> Remote["提供方模型列表与容量 / effort 元数据"]
-    Remote --> Missing["缺失字段从 models.dev 补齐<br/>实际端点与精确模型 ID 匹配"]
-    Missing --> Candidates["候选返回表单<br/>用户保存前不改运行配置"]
-    Form --> Save["model.saveProvider：配置与可选新密钥<br/>ModelConfigManager 内部串行修改"]
-    Candidates --> Save
-    Save --> Disk[("config.json / auth.json")]
-    Save --> Parsed["一次读取 UserConfigData<br/>冻结配置与凭据"]
-    Parsed --> ProviderSnapshot["ProviderConfigSnapshot<br/>刷新 TurnRunner 可用配置"]
-    Parsed --> Catalog["RedactedModelCatalog<br/>不含密钥，不创建客户端"]
-    Catalog --> Picker["modelChoices / ModelPicker<br/>模型与思考变体"]
-    Picker --> Selector["selector：provider/model[#variant]"]
-    Selector --> Settings["Conversation.update_settings<br/>校验 → 写 metadata → 更新内存"]
-    Settings --> Next["下一 Turn / 下一独立压缩"]
-    ProviderSnapshot --> Next
-    Next --> Factory["OpenAiProvider::from_snapshot<br/>解析所选模型并创建执行客户端"]
-    Factory --> Frozen["Agent 从实际 Provider 冻结 ModelConfigurationSnapshot<br/>本轮上下文与输出容量"]
-    Frozen --> Requests["本轮普通请求、重试与摘要共用"]
+flowchart LR
+    Form["Settings：地址、协议、模型、新密钥"] --> Discover["发现：提供方优先<br/>models.dev 补缺失字段"]
+    Discover --> Form
+    Form --> Manager["ModelConfigManager<br/>串行保存并读回实际状态"]
+    Manager --> Snapshot["ProviderConfigSnapshot<br/>冻结 UserConfigData"]
+    Manager --> Catalog["脱敏目录 → ModelPicker"]
+    Catalog --> Select["provider/model#variant<br/>Conversation 校验并写 metadata"]
+    Snapshot --> Provider["OpenAiProvider::from_snapshot"]
+    Select --> Provider
+    Provider --> Frozen["Agent 冻结容量与执行配置<br/>本轮请求和摘要共用"]
 ```
 
-提供方表单通过一个 RPC 保存配置与可选新密钥；Host 完成两份文件的写入后，从一次读取生成执行快照与脱敏目录，只发布一次最终状态。密钥写入失败明确返回部分保存，并按实际磁盘刷新，表单可以重试。快照保留冻结的 `UserConfigData`，校验时直接解析实际 selector；默认选择损坏或其他提供方未完成配置，不妨碍显式选择可用模型。快照本身不携带 Tokio handle，也不创建网络对象：`OpenAiProvider::from_snapshot` 接收快照与 selector，创建由本轮 Agent 独占的模型客户端；Chat 与 Responses 的选择、编码和传输封装在模型模块内。Agent 从客户端取得本轮容量，Runner 的活动容量投影读取同一份冻结结果。
+配置与密钥分文件保存；部分保存失败返回真实状态与原因，Runner 和目录按实际磁盘刷新。快照不创建网络客户端，执行准备才按 selector 创建本轮 Provider。运行中的模型和容量保持冻结，设置变更影响下次操作。
 
-模型目录与保存请求共用 `ModelConfigurationInput`。已有配置缺失或无效的协议保留原值供编辑，保存与执行分别在模型解析边界校验；新建模型的 Chat 默认值属于编辑器。
+模型发现不直接修改配置。提供方元数据优先，models.dev 按实际端点与精确模型 ID 补缺；导入更新智能管理字段并保留用户覆盖。思考开关、budget 与 effort 分别表达，未选变体保留服务端默认。认证、配置、网络、限流与响应格式错误保留各自类别。
 
-发现元数据与执行配置分离：提供方响应优先，公共目录按实际端点与精确模型 ID 补剩余空缺。思考开关、effort 档位与线上字段分别表达；协议在发现请求中明确传入。已保存取值是执行事实，导入只更新智能管理字段，用户覆盖保持不变。元数据解析与补全集中在 `model_metadata.rs`；详见 [模型元数据决策](adr/adr-0002-model-metadata.md)。
+改名和模型设置经 Conversation 共用写者选择规则：运行时复用活动写者，空闲时短开写者，落盘成功才更新内存。相同选择不重复写入；没有默认模型的新任务等待选择。
 
-`base_url` 的含义只由模型层一处解释：保存与查询先规范输入形状（去首尾空白与结尾斜杠，不改写你写明的地址），再剥掉写明的已知端点得到 API 根。根逐字使用，中间层不补版本段；Chat、Responses 与 `/models` 三种地址都由这个根拼出。设置表单不承担地址清理。
-
-新任务在存在默认模型时保存其 selector，无默认时等待用户选择。配置编辑清空失效的默认选择。改名和修改模型设置通过 Conversation 共用写者选择规则，运行时复用当前写者，空闲时短开写者，失败保持原选择；相同选择不重复写入，执行开始不回扫设置历史。每轮捕获自己的模型快照，活动轮不随设置变化。表单地址、凭据、提供方或协议变更后丢弃旧发现结果；公共目录请求不携带用户地址或凭据。发现失败保留认证、网络、限流／过载、请求和响应格式类别：配置与认证问题引导修正设置，暂时不可用或无效目录允许稍后重试或手动添加。缺失元数据不伪造成能力，thinking 开关或 budget 不等同于 effort 档位。
-
-源码：[ModelConfigManager / 快照](../crates/model/src/config/manager.rs) · [selector 与已解析选择](../crates/model/src/config/selection.rs) · [目录请求](../crates/model/src/config/discovery.rs) · [元数据规则](../crates/model/src/config/model_metadata.rs) · [端点与 wire 选项](../crates/model/src/openai/wire.rs) · [具体 Provider](../crates/model/src/openai/provider.rs) · [Settings](../apps/desktop/src/components/Settings.tsx) · [模型选择](../apps/desktop/src/modelChoices.ts)。
+源码：[配置与快照](../crates/model/src/config/manager.rs) · [selector](../crates/model/src/config/selection.rs) · [发现](../crates/model/src/config/discovery.rs) · [元数据](../crates/model/src/config/model_metadata.rs) · [端点与选项](../crates/model/src/openai/wire.rs)。元数据取舍见[ADR](adr/adr-0002-model-metadata.md)。
 
 <a id="provider"></a>
-## 12. 模型请求、协议适配、重试与续接
-
-### 12.1 从模型消息到网络，再回到 Agent
+## 12. 模型协议、重试与续接
 
 ```mermaid
 flowchart TB
-    Request["ModelTurnRequest<br/>messages + tools + preferences"] --> Retry["request_execution::execute_request<br/>取消、退避、尝试次数、RequestAttempt"]
-    Retry --> Start["保存开始记录<br/>RequestObservation + 请求定义"]
-    Start -->|"成功才调用"| Provider["OpenAiProvider.complete_stream<br/>按已选协议编码并发送一次请求"]
-    Provider --> Chat["openai/chat.rs + chat/stream.rs<br/>Chat 请求 / SSE 解码 / 回复终结"]
-    Provider --> Responses["openai/responses.rs + responses/stream.rs<br/>Responses 请求 / SSE 解码 / 回复终结"]
-    Chat --> Transport["transport<br/>HTTP、可取消等待、SSE 分帧"]
-    Responses --> Transport
-    Transport --> Deltas["ProviderStreamEvent<br/>RequestAttempt 计时并发布正文与思考增量"]
-    Transport --> Completion["ProviderCompletion<br/>协议结果或 ProviderError + 已上报用量<br/>回复结构与续接校验仍属于模型层"]
-    Completion --> Finish["RequestAttempt 汇总计时与用量<br/>保存结束记录并发布 RequestObservation"]
-    Finish -->|"成功回复"| Agent["Agent 保存正式消息并执行下一步"]
-    Finish -->|"可重试的 ProviderError"| Retry
-    Start -->|"写盘失败"| StorageError["SessionError / FailureRecording<br/>保留具体原因，停止执行"]
-    Finish -->|"写盘失败"| StorageError
+    Request["ModelTurnRequest<br/>消息、工具、请求偏好"] --> Execute["execute_request：生成与摘要共用"]
+    Execute --> Start["RequestAttempt：保存开始观测"]
+    Start --> Provider["OpenAiProvider：一次协议请求"]
+    Provider --> Codec["Chat / Responses 编码与回复校验"]
+    Codec <--> Transport["HTTP / SSE、超时与取消"]
+    Transport --> Delta["正文与思考增量"]
+    Codec --> End["保存结束观测、错误、用量"]
+    End -->|"可重试，最多三次"| Execute
+    End -->|"成功"| Agent["Agent 保存正式 assistant"]
+    Start -->|"存储失败"| Error["停止执行，保留原始原因"]
+    End -->|"存储失败"| Error
 ```
 
-普通生成和摘要共同调用 `request_execution`，它按“保存开始 → 调用模型 → 保存结束”的顺序编排每次尝试，同时维护计时与用量。模型层只负责协议与传输，返回结果和已上报用量；即使回复因缺少必要续接材料而被拒绝，用量仍会累计。开始记录写入失败时不会发送 HTTP；结束记录写入失败时停止执行，并保留同时发生的模型错误和原始存储错误。请求耗时从保存开始记录前算起，到模型调用返回为止，包含请求编码、网络与回复校验。可重试错误最多尝试三次，等待可取消。可见正文与思考不改变错误的可重试性；重试前通过 `item/discarded` 清除该次临时输出，使用相同请求输入再次尝试。最终失败或取消的半截内容保存为 `assistant_interrupted` 显示记录，刷新后仍可查看，但不进入后续模型上下文或摘要。成功回复才保存为正式 assistant 消息。
+开始观测保存成功后才发送 HTTP；结束观测失败停止执行，同时保留模型错误。耗时从开始记录前到模型返回，包含编码、网络和校验。退避等待可取消；重试复用输入，另分配尝试和输出身份，并以 `item/discarded` 清除临时增量。最终失败或取消的半截内容保存为 `assistant_interrupted` 展示记录，不进入后续模型上下文或摘要。
 
-生成和摘要使用同一错误分类与 attempt 预算决定重试；摘要请求不发布对话增量。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。SSE 按帧顺序解析和分派，协议终态一到即完成该次回复，后续无关尾帧不再参与解析或完整性校验；正文提前结束只按截断判定，不再等待连接关闭。未知 `finish_reason`、非法 choice / 工具调用 `index` 明确失败，字段缺失与字段非法不混为一谈。Chat 工具调用分片中的名称或参数为 null 时表示本片段无更新，最终工具身份仍完整校验。工具调用只保存 ID、名称与一个 JSON 参数值；畸形 JSON 保留为字符串值。参数是否为对象、是否符合具体工具要求，统一由工具 preflight 校验并返回工具错误；回复结构和工具身份无效时在 Provider 边界失败。
+SSE 在协议终态完成该次回复；回复结构与工具身份在 Provider 边界校验，工具 JSON 参数由注册表 preflight 校验。上下文溢出走[缩减恢复](#context)，与网络重试分开。摘要使用同一请求链但不广播对话增量。
 
-### 12.2 可展示思考与私有续接数据
+公开正文和 thinking 可展示；Chat reasoning 原字段、reasoning_details 及 Responses 原输出项和加密 reasoning 作为私有续接材料保存。下次发送核对提供方、模型、协议与工具绑定，兼容时回传；切换不兼容模型时保留公开内容并移除不兼容私有部分。effort 变化不改变历史身份；私有材料不能从可见思考重建。
 
-```mermaid
-flowchart LR
-    Reply["提供方 assistant 回复"] --> Visible["公开正文 / thinking<br/>用户可查看"]
-    Reply --> Private["协议续接数据<br/>Chat reasoning 原字段 / reasoning_details<br/>Responses 原输出项与 encrypted reasoning"]
-    Visible --> Session[("assistant 消息<br/>Session 持久化")]
-    Private --> Session
-    Session --> History["公开历史 / 事件 / 请求详情<br/>不暴露私有续接字段"]
-    Session --> Boundary["下次发送边界<br/>核对 provider、model、协议、工具绑定"]
-    Boundary -->|"身份兼容"| Continue["回传原续接数据"]
-    Boundary -->|"切换到不兼容模型"| PublicOnly["移除不兼容私有部分<br/>保留公开历史"]
-```
-
-改变 effort 不改变历史身份；未选变体时保留服务端默认行为。签名或加密条目按原协议保存，不能从显示出来的思考文本重建。
-
-请求编码声明输出 token 上限；SSE 按流读取，受读取超时和取消信号控制，到协议终态即结束读取。普通 HTTP 错误响应体由 reqwest 读取，保留读取错误、超时与取消原因。
-
-源码：[模型调用结果与流事件](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [具体 Provider](../crates/model/src/openai/provider.rs) · [Chat 请求](../crates/model/src/openai/chat.rs) · [Chat 流](../crates/model/src/openai/chat/stream.rs) · [Responses 请求](../crates/model/src/openai/responses.rs) · [Responses 流](../crates/model/src/openai/responses/stream.rs) · [传输](../crates/model/src/transport/mod.rs) · [状态与错误体解析](../crates/model/src/error.rs) · [SSE 分帧](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
+源码：[请求执行](../crates/agent/src/request_execution.rs) · [Provider 合同](../crates/model/src/provider/contract.rs) · [OpenAI Provider](../crates/model/src/openai/provider.rs) · [Chat](../crates/model/src/openai/chat.rs) · [Responses](../crates/model/src/openai/responses.rs) · [传输](../crates/model/src/transport/mod.rs) · [消息转换](../crates/agent/src/message.rs)。
 
 <a id="instructions"></a>
 ## 13. Harness 指令、项目指令与技能
 
 ```mermaid
 flowchart TB
-    Prompt["prompts.rs<br/>Harness 规则、工具说明、运行环境"] --> Developer["Developer 消息"]
-    Agent["Agent::new"] --> Registry["ToolRegistrySnapshot<br/>内建工具描述与 schema"]
-    Agent --> Prompt
-    Registry --> Developer
-    Registry --> Schemas["请求工具定义"]
-    UserAgents["用户数据目录 AGENTS.md"] --> Loader["core.load_agent_instructions<br/>统一预算与来源路径"]
-    ProjectAgents["项目根到 cwd 的 AGENTS.md"] --> Loader
-    Loader --> Prepared["TurnRunner<br/>准备阶段读取首次指令"]
-    Prepared --> Refresh["Agent.apply_instructions<br/>消费已加载内容"]
-    Loader --> Reload["Agent.refresh_instructions<br/>压缩后重新读取"]
-    Reload --> Refresh
-    Refresh --> Current["Agent 当前文件指令<br/>直接覆盖，不写入会话"]
-    SkillDirs["项目与用户技能目录"] --> Skills["core.skills<br/>每轮及压缩后读取元数据"]
-    Reload --> Skills
-    Skills --> Catalog["Agent 当前 SkillCatalog<br/>模型先看到名称、说明与文件路径"]
-    Catalog --> Developer
-    Catalog --> ModelSkill["模型调用 read 读取技能文件"]
-    Skills --> Candidates["工作台的 /技能 候选"]
-    Candidates --> Selected["草稿绑定技能名与绝对路径<br/>普通提交和 steer 携带同一绑定"]
-    Selected --> User["UserInput.model_text<br/>用户文字中的技能词展开为绝对路径"]
-    User --> ModelSkill
-    User --> History["用户消息保存模型文字<br/>displayText 保留界面文字"]
-    ModelSkill --> ToolResult["read 结果保存为 tool result"]
-    Current --> Prefix["请求指令前缀"]
-    Developer --> Prefix
-    History --> Context["ContextView → 对话历史"]
-    ToolResult --> Context
+    Harness["prompts.rs + 工具名单 + MCP 说明"] --> Developer["Harness Developer 消息"]
+    Files["用户数据根与项目 AGENTS.md"] --> Loader["core：有界读取、来源路径"]
+    Loader --> Current["Agent 本轮文件指令<br/>历史前的 User 消息"]
+    Skills["用户与项目技能目录"] --> Catalog["SkillCatalog：名称、说明、路径"]
+    Catalog --> SkillPrompt["Skill 目录 Developer 消息"]
+    Catalog --> Candidate["Composer /技能 候选"]
+    Candidate --> Binding["草稿：名称与绝对路径绑定"]
+    Binding --> Input["UserInput.model_text<br/>完整技能词展开为路径"]
+    Input --> History["用户消息：模型文字与 displayText"]
+    SkillPrompt --> Read["模型按需调用 read"]
+    History --> Read
+    Read --> Result["Skill 正文作为普通 tool result"]
 ```
 
-用户数据目录与项目指令目录指向同一路径时，该来源只加载一次。文件指令每文件最多读取 32 KiB 加一个截断判定字节、合计 64 KiB，截断有反馈；读取失败和保留前缀中的非法 UTF-8 终止准备，截断后的内容不读取。Harness 规则与 Skill 目录提示是独立的 Developer 消息，本轮读取的项目文件内容作为历史之前的 User 消息。
+Runner 首次准备读取文件指令，Agent 每轮及压缩后发现 Skill 元数据，文件指令在压缩后重读并覆盖本轮值。文件指令作为历史之前的请求前缀，不随对话压缩。用户与项目指令指向同一路径时只读一次。每文件上限 32 KiB、总计 64 KiB，截断有诊断；读取失败或保留内容非法 UTF-8 结束准备。
 
-选择 Skill 时，草稿记录技能名与绝对文件路径的绑定；文字、图片和绑定一起提交或用于 steer。Agent 交付输入时把完整技能词展开为路径，作为 `AgentMessage::User` 保存，`displayText` 仅在文字发生展开时保存原始界面文字。模型、计量、摘要和恢复消费已展开的内容，用户消息和任务标题共用原始文字的展示投影。正文通过模型调用 `read` 取得并保存为普通工具结果，读取失败沿用工具错误反馈。
+选中技能保存名称与路径绑定，普通提交和 steer 共用展开规则；模型、计量、摘要与恢复消费展开后的文字，界面和任务标题使用原始 displayText。Skill 正文由模型调用 `read` 获取，读取结果进入普通历史，加载目录不执行脚本。
 
-文件指令在每轮开始及压缩后重新读取并直接覆盖本轮值，不进行新旧判断；完整请求前缀保存在请求定义快照中，供轨迹查看与手动摘要复用，不作为可压缩的对话消息。旧请求快照没有记录的文件指令无法事后恢复；下一次正常请求会直接读取当前文件。
-
-技能目录在每轮及压缩后发现，只读取 frontmatter；模型按目录或用户输入中的文件路径使用 `read` 获取完整内容，相对资源路径以技能文件所在目录为准。技能加载不自动运行脚本；`user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 隐藏模型目录项，用户手动选择仍能通过绝对路径引用该技能。元数据损坏在发现时按文件报错，不遮蔽其他有效技能。
-
-源码：[提示词](../crates/agent/src/prompts.rs) · [项目指令](../crates/core/src/project_instructions.rs) · [Skills](../crates/core/src/skills.rs) · [输入引用](../crates/agent/src/agent/inbox.rs) · [refresh_instructions](../crates/agent/src/agent/request.rs) · [消息与界面投影](../crates/agent/src/message.rs) · [工具注册](../crates/agent/src/tools/registry.rs)。目录与格式见[Skills 安装约定](INSTALL.md#skills)。
+源码：[提示词](../crates/agent/src/prompts.rs) · [文件指令](../crates/core/src/project_instructions.rs) · [技能发现](../crates/core/src/skills.rs) · [引用展开](../crates/agent/src/agent/inbox.rs) · [请求前缀](../crates/agent/src/agent/request.rs)。目录、元数据与可见性约定见[安装说明](INSTALL.md#skills)。
 
 <a id="context"></a>
 ## 14. 模型上下文与压缩
 
-### 14.1 同一日志派生不同视图
-
-```mermaid
-flowchart LR
-    Ledger[("Session 原始条目<br/>始终保留完整消息")]
-    Ledger --> Context["按需派生 ContextView<br/>有效历史位置、工具剪枝引用<br/>历史估算与压缩切点"]
-    Ledger --> Public["公开历史 / 轨迹<br/>仍可查看原始工具输出"]
-    Message["message"] -->|"追加可压缩历史"| Context
-    Prune["已有 tool_result_pruned 记录"] -->|"在原位置替换已有工具内容"| Context
-    Compact["compaction<br/>summary + firstKeptEntryId"] -->|"替换当前历史前缀"| Context
-    Context --> History["当前可发送历史<br/>普通回复为完整视图，摘要为切点前缀"]
-    History --> Request["build_request / PreparedCompaction<br/>指令前缀 + 所选历史"]
-    Developer["Harness / 当前 Skill 目录提示与冻结工具定义<br/>普通请求与摘要共用"] --> Request
-    Files["Agent 本轮文件指令<br/>压缩后重新读取"] --> Request
-```
-
-### 14.2 请求前压力处理与溢出恢复
-
 ```mermaid
 flowchart TB
-    Start["准备正常请求"] --> Pressure{"达到窗口 90%？"}
-    Pressure -->|"否"| Send["发送正常请求"]
-    Pressure -->|"是"| Active["沿用当前执行的指令和工具定义"]
-    Send -->|"context_length_exceeded：恢复一次"| Active
-    Manual["手动压缩"] --> Saved["复用最近请求的完整指令和工具快照"]
-    Active --> Compact["共同入口 compact_context<br/>保持历史正文原样"]
-    Saved --> Compact
-    Compact --> Cut["直接选择摘要范围<br/>保留至少窗口 10% 的近期内容<br/>切点保护完整消息和工具批次"]
-    Cut --> HasHistory{"有可摘要前缀？"}
-    HasHistory -->|"否"| Finish["结束本次缩减"]
-    HasHistory -->|"是"| Summary["摘要请求保留指令和 schema<br/>只总结选中的历史与已有摘要"]
-    Summary --> Request["共用请求发送、重试和错误展示"]
-    Request -->|"最终失败或停止"| Error["结束操作，不提交摘要"]
-    Request -->|"成功"| Valid{"正文非空且未截断？"}
-    Valid -->|"否"| Error
-    Valid -->|"是"| Commit["保存摘要与保留边界<br/>重建有效历史：摘要＋近期消息"]
-    Commit -->|"保存失败"| Error
-    Commit --> Finish
-    Finish --> Resume["自动：继续原执行<br/>手动：等待下一次输入"]
-    Resume --> Refresh["下一次正常请求前直接读取<br/>当前文件指令、Skill 目录和 MCP 工具"]
-    Refresh --> Send
+    Log["Session 原始账本"] --> Context["按需 ContextView<br/>有效历史、摘要边界、已有剪枝引用"]
+    Context --> Pressure{"正常请求压力达到窗口 90%？"}
+    Pressure -->|"否"| Send["生成请求"]
+    Pressure -->|"是"| Compact["compact_context：选择摘要前缀<br/>至少保留窗口 10% 的近期历史"]
+    Send -->|"精确上下文溢出，恢复一次"| Compact
+    Manual["独立压缩：最近请求定义<br/>无快照时读取当前配置"] --> Compact
+    Compact -->|"有可替换前缀"| Summary["共同摘要请求、校验、保存<br/>summary + firstKeptEntryId"]
+    Compact -->|"没有前缀"| Noop["不发摘要请求，反馈无需压缩"]
+    Summary --> Rebuild["有效历史：摘要 + 近期消息"]
+    Rebuild --> Auto["自动：刷新文件指令、技能与 MCP<br/>继续生成"]
+    Rebuild --> Idle["独立压缩：结算后等待输入"]
+    Log --> Public["公开历史与轨迹保留原消息"]
 ```
 
-生成请求声明的输出上限取模型输出上限与「窗口 − 压力 − 安全余量」的较小者，安全余量为窗口 5%、最多 4096 Token；压缩完成后的重发不再单独校验回答空间。手动、自动和溢出恢复共用摘要、保存和重建过程，均按窗口 10% 保留近期历史，切点保护完整消息和工具单元。摘要前保持历史正文原样，避免改写消息破坏可复用的请求前缀；实际缓存命中由提供方决定。手动压缩走独立 operation，复用取消、模型快照和写者规则。普通回合与独立压缩共用 `TurnRunError` 表达准备、执行期存储故障和终态写入失败；执行期存储故障立即停止追加，未闭合操作由重新打开会话时修复。终态写入失败同时保留已有执行错误和存储原因；Agent 内部通过同一 `AgentError` 传播失败。摘要请求与普通请求共用重试及请求事件展示；最终请求失败、摘要为空或截断、取消、存储或指令读取失败都结束操作，不跳过失败继续正常请求。溢出恢复失败时，最终错误保留恢复失败的真实类型与字段，最初的溢出只作为错误文字与诊断保留，两者不再互相覆盖。
+`SessionManager` 提交成功后在同一写者锁内更新内存账本。请求与缩减按需派生 ContextView，依据摘要锚点、工具调用顺序和已保存的剪枝记录重建；压缩只追加替换记录，不删除原消息或图片，也不生成新的工具剪枝记录。图片加载在写者锁外进行。
 
-独立压缩的结果分三类，都不改变任务本身的状态：成功落盘摘要时反馈就是历史里的压缩条目；没有可替换的内容时不发送摘要请求，只给出不带消息的完成终态，界面显示“没有可压缩的内容”；摘要被校验拒绝或执行失败时给出带真实原因的失败终态，界面在压缩行显示该原因。终态携带来源（普通回合或独立压缩），界面据此决定反馈位置与是否影响任务状态。
+切点保护完整消息与工具调用、结果配对。摘要前保持历史正文原样；首次按目标、约束、进度、决定、下一步和关键上下文生成摘要，再次压缩用新增覆盖消息更新已有摘要。结果必须非空且未截断，成功保存才重建视图。
 
-摘要与生成共用输出预算公式；摘要以所选历史前缀、指令、工具定义与摘要命令的估价计算窗口余量，目标输出最多 8192 Token。这是生产估价，仍由提供方报告真实的上下文溢出。自动压缩和溢出恢复在摘要实际提交后刷新文件指令、Skill 目录、MCP 工具及服务器说明；独立压缩从最近请求的定义快照恢复完整指令前缀与工具 schema，跨重启复用；尚无请求快照时才从当前配置准备。摘要请求包含内置工具与 MCP 工具定义。所有入口共用历史选择、摘要请求构造及结果校验。独立压缩的请求和诊断事件不绑定 turn，复用相同实时展示与重连事件缓存。独立压缩结束后释放 Agent，下次执行读取当前指令。摘要只增加替换记录，不删除原消息。生成摘要时从活动上下文中选择工具调用与结果完整配对的保留边界；重建直接还原保存的边界和剪枝引用。连续压缩不会把已被替换的旧摘要重新带回保留区。
+生成与摘要共用输出预算：模型输出上限、目标上限和窗口剩余空间取较小者；安全余量为窗口 5%、最多 4096 Token，摘要目标最多 8192 Token。压力包含历史、指令、工具 schema 与本轮实测校正；摘要提交或文件指令刷新清零校正。估价只用于请求准备，用量展示取 Provider 实测。
 
-首次摘要按目标、约束、进度、关键决定、下一步和关键上下文生成固定结构；再次压缩时，从有效历史中取出上一份摘要，只用本次新覆盖的消息更新该结构。自动、手动和溢出恢复均复用这条路径。
+自动压缩和溢出恢复沿用当前指令与工具，摘要提交后重读文件指令、技能和 MCP；独立压缩复用最近定义，跨重启可读，无定义才发现当前配置。摘要、取消、存储或文件指令失败结束操作；溢出恢复失败保留真实错误类型，恢复成功后只重发一次。
 
-`SessionManager` 在持久提交成功后、同一写者锁内追加内存账本。请求装配与缩减按需从账本派生 `ContextView`，沿保存的摘要边界、剪枝引用和工具调用顺序还原有效历史，并按这份投影计算估价。写入失败不追加内存账本。Agent 在线程池中读取投影、选择摘要前缀和加载图片，图片读取不持有写者锁；本轮 `usage_correction` 由 Agent 持有，普通追加保留校正，摘要提交或文件指令刷新后清零。
+独立压缩终态标明操作来源，不改变任务回合状态：有摘要时显示持久条目，无可压缩内容时显示完成反馈，失败时显示具体原因。摘要用量计入请求观测与会话汇总，compaction 条目只保存正文和保留锚点。
 
-摘要请求与其他请求一样经统一请求账本计量：其 provider usage 记录在该请求自己的 request observation 上，会话累计与工作台展示都由账本聚合，compaction 条目只保存 summary 与 firstKeptEntryId。
+摘要、指令刷新与请求记录的设计理由见[上下文 ADR](adr/adr-0006-context.md)。
 
-源码：[ContextView](../crates/agent/src/session/context.rs) · [上下文重建](../crates/agent/src/session/context/resolution.rs) · [请求准备与压力](../crates/agent/src/agent/request.rs) · [缩减编排与溢出恢复](../crates/agent/src/agent/compaction.rs) · [请求执行与输出预算](../crates/agent/src/request_execution.rs) · [摘要准备与结果校验](../crates/agent/src/compaction.rs) · [独立压缩入口](../crates/runtime/src/runner/compaction.rs)。
+源码：[ContextView](../crates/agent/src/session/context.rs) · [重建](../crates/agent/src/session/context/resolution.rs) · [压力与溢出](../crates/agent/src/agent/request.rs) · [缩减编排](../crates/agent/src/agent/compaction.rs) · [摘要准备](../crates/agent/src/compaction.rs) · [独立压缩](../crates/runtime/src/runner/compaction.rs)。
 
 <a id="tools"></a>
-## 15. 工具注册、调度与副作用边界
+## 15. 工具、MCP 与图片
 
-### 图片输入与模型投影
-
-用户选择、粘贴、拖入图片后，前端将文字和图片作为同一份草稿保存。RPC 在接受边界解码校验为 `UserInput`；输入复用 Conversation 的普通提交、steer 与停止机制。`read` 依据文件签名识别图片，读到的字节走同一 `InputImage` 处理，不把图片作为文本截断。
-
-图片像素保存在 `sessions/images/<sessionId>/<imageId>`，会话的 `ContentBlock::Image`、历史和实时事件只携带引用、名称、格式和尺寸。图片保存成功后才写入消息，消息提交成功后才发布事件。模型上下文装配和摘要请求按需读取快照，文件 I/O 不占用会话写者锁；工作台通过 `session.imageRead` 按实际历史或待处理输入取得预览，不接受任意文件路径。
-
-Chat 编码器将图片工具结果中的像素放到完整工具结果组之后的 user 消息，保持并行工具配对；Responses 直接使用 `function_call_output.output` 的 `input_image`。配置模型均按支持文本和图像使用，输入、工具结果、历史和摘要共用图片投影。图片 Token 估计仅用于压缩压力判断，用量展示仍来自 provider usage。摘要可以保存图片快照路径供后续 `read`，原始历史和像素不随压缩删除。
-
-源码：[图片准备与快照](../crates/agent/src/image.rs) · [输入](../crates/agent/src/agent/inbox.rs) · [模型投影](../crates/agent/src/session/context.rs) · [图片界面](../apps/desktop/src/components/Images.tsx) · [长期取舍](adr/adr-0003-image-input.md)。
-
-### 15.1 工具定义、执行与结果共用一条路径
-
-`McpManager` 由应用装配层创建，设置 RPC 与共享 TurnRunner 持有同一实例。用户数据目录 `mcp.json` 是配置事实来源，每次设置操作和回合发现读取文件；连接按任务 cwd 和服务器身份复用，配置变化、删除或显式重连后，已有快照继续持有原连接；Agent 在下一回合开始或压缩后刷新时重新发现工具并接纳新配置。每回合开始时通过官方 `rmcp` SDK 完成 stdio/Streamable HTTP 初始化与分页工具发现，并按服务器和工具名称排序。发现结果合入 `ToolRegistrySnapshot`，第一次模型请求即包含全部可用工具，普通连续请求复用当前定义。上下文缩减完成后复用同一工具准备方法；手动摘要沿用最近请求的定义，仅在没有请求快照时发现工具。目录变更在下一回合或压缩后的刷新边界重新发现，连接失败同时产生用户诊断与模型可见的不可用说明。
-
-MCP 工具执行沿用现有独占准入；不根据服务器提供的只读提示扩大并发。SDK 负责 MCP 请求配对和超时，用户停止发送取消通知，调用不自动重试。工具结果在 Agent 边界转换为 `ToolExecution`，图片通过现有校验、保存和投影；停止任务并结算后，退出关闭连接并通过 Windows Job Object 回收本地服务器进程树。配置输入和运行状态走 MCP 设置 RPC，工具定义、调用与结果复用既有请求观测和会话日志。
-
-连接缓存只保存成功连接；首次连接失败由本次发现或检查报告，下一次独立发现会重新尝试建立连接。已经建立的连接仍可通过设置中的“重新连接”替换。
-
-源码：[MCP 管理器](../crates/mcp/src/lib.rs) · [SDK 连接与取消](../crates/mcp/src/client.rs) · [MCP 内容转换](../crates/mcp/src/result.rs) · [Agent 结果接入](../crates/agent/src/tools/mcp.rs) · [设置](../apps/desktop/src/components/McpSettings.tsx) · [设计取舍](adr/adr-0004-mcp-tools.md)。
+### 注册与调度
 
 ```mermaid
 flowchart TB
-    Specs["各工具 spec + ToolRegistrySnapshot"] --> Prompt["系统提示词中的工具名单"]
-    Specs --> Schema["provider_schemas：模型工具定义"]
-    Calls["模型 tool calls，按声明顺序"] --> Preflight["preflight：工具查找与参数解析"]
-    Specs --> Preflight
-    Preflight -->|"非法参数 / 未知工具"| Rejected["模型可见失败，不启动 worker"]
-    Preflight -->|"PreparedTool"| Dispatch["dispatch_tools：按 source order 准入"]
-    Dispatch --> ReadOnly["read<br/>占用 1 个执行位，并行执行"]
-    Dispatch --> Barrier["bash / 交互提问 / MCP<br/>占用全部 8 个执行位，按声明顺序执行"]
-    Dispatch -->|"工具内部 panic"| HostFatal["终止后端进程<br/>工作台提示重启"]
-    ReadOnly --> Result["ToolExecution<br/>文字、图片、错误与观测信息"]
-    Barrier --> Result
-    Rejected --> Result
-    Result --> Persist["完成一项即保存 tool result"]
-    Persist --> Event["发布 tool/execution/end"]
-    Persist --> ModelOrder["ContextView 按调用顺序归组<br/>日志按实际完成顺序保存"]
+    Registry["ToolRegistrySnapshot<br/>read / bash / 可选提问 / MCP"] --> Definitions["提示词名单与请求 schema"]
+    Registry --> Preflight["按声明顺序 preflight<br/>工具查找与参数解析"]
+    Preflight -->|"无效调用或截断"| Reject["提交模型可见失败结果"]
+    Preflight --> Dispatch["派发者准入，最多 8 个执行位"]
+    Dispatch --> Read["read：占 1 位，可并行"]
+    Dispatch --> Exclusive["bash / 提问 / MCP：占全部位<br/>等待前序结果落盘"]
+    Read --> Persist["finish_tool：保存结果与图片"]
+    Exclusive --> Persist
+    Reject --> Persist
+    Persist --> Event["发布 tool/execution/end，归还执行位"]
 ```
 
-工具定义由 `ToolRegistrySnapshot` 持有，请求装配与开销计算按需从它派生 schema。准备参数按值交给工具 worker；进度携带公开条目身份，完成结果携带公开身份与 provider 调用身份，派发者直接落盘和发布，不保留另一份准备批次供下标回查。
+准备参数按值交给 worker，进度与完成携带公开条目身份；结果提交失败停止后续派发并排空已启动任务的事件。只有 `read` 并行，MCP 不凭只读提示扩大并发。模型、重试和派发共用异步链；文件读取与 shell 管理在 blocking pool 执行。
 
-Agent、请求重试、Provider 网络传输和工具派发共用异步执行链。Provider 的 HTTP 发送、响应块读取及重试等待直接 `await`；文件读取和命令进程管理在 Tokio blocking pool 执行。准入只由派发循环控制，用一个局部计数维护占用量：读取占 1 个执行位，独占工具占全部 8 个。容量不足时直接消费工具进度与完成事件；完成结果成功落盘后归还空位，再准入后续调用。因此最多同时运行 8 个只读工具，独占工具只会在前序结果成功落盘后开始。结果提交失败会停止后续派发，并排空已启动任务的事件；所有 worker 交付结果并释放发送端后，排空结束。内部程序异常直接终止进程。
+`read` 提供有界文本、源行范围和图片读取，Skill 正文也使用它。搜索与文件修改通过 `bash` 调用 `rg`、Python 等本机命令，权限、行尾、原子性和并发协调由具体命令负责，工作台呈现命令输出。
 
-### 15.2 文件与 shell 的内部边界
+`bash` 使用 Git Bash 和 Windows Job Object 管理整个进程树，调用结束回收后代；长任务在同一次调用内前台执行。完整输出持续收集，首份进度立即发布，后续累计尾部快照最多每 100 毫秒发布；最终有界结果与截断说明独立完整。收尾读取错误保留退出码、超时或取消原因及已捕获输出。
 
-```mermaid
-flowchart LR
-    Read["read：文本与图片"] --> File["有界读取 / 源行范围<br/>图片校验与快照"]
-    Bash["bash：命令参数与 Git Bash"] --> Exec["exec / capture / pump<br/>进程启动、输出收集、超时与取消"]
-    Exec --> Commands["rg 搜索与文件发现<br/>Python 等命令编辑和写入"]
-    Exec --> Tree["Windows Job Object<br/>每次调用拥有整个子进程树"]
-    Tree --> Finish["调用结束回收后代进程"]
-    Exec --> Truncate["truncate<br/>有界显示 + 超长输出临时日志"]
-```
+### MCP 与交互提问
 
-内建文件能力由 `read` 与 `bash` 提供；交互提问只在交互宿主启用，MCP 工具合入同一注册表。`read` 保留文本分页、真实源行范围和图片输入，Skill 正文也通过它读取。搜索与文件修改由模型通过 `bash` 调用本机命令，写入的权限、行尾、原子性和并发协调由所执行的命令负责。文件修改按命令输出反馈。
+应用装配的 `McpManager` 由设置 RPC 与 Runner 共享。官方 `rmcp` SDK 负责 stdio / Streamable HTTP 初始化、分页发现、请求配对和超时。发现结果按服务器及工具名称排序后合入注册表，首次模型请求携带全部可用工具，连续请求复用当前定义。
 
-Windows 的后台 shell 子进程也在本次调用结束时回收；长任务需在同一次调用内前台执行。找不到文件、参数无效等预期失败仍是模型可见的工具结果；工具任务的 panic 统一终止后端进程，工作台提示重启。
+连接按 cwd 与服务器身份复用，只缓存成功连接。配置变化或显式重连替换后续连接，活动快照仍持原连接；下一回合和压缩后刷新接纳新目录。连接失败同时给出用户诊断与模型可见说明，下一次发现可重新连接。工具调用不自动重试，停止发送取消通知；退出时关闭连接并回收本地服务器进程树。
 
-`bash` 收尾读取失败会与退出码、超时或取消原因一起报告，保留已经捕获的输出。它连续收集完整输出，首份进度立即发布，后续累计尾部快照最多每 100 毫秒发布一次；静默期间由既有输出轮询交付待更新内容。最终工具结果直接携带完整的有界结果与截断说明，不等待进度间隔，也不依赖客户端拼接历史进度。
+交互宿主启用 `ask_user_question`，`TurnControls` 持有 `UserQuestions`。工具在独占准入内等待答案或取消；`pendingQuestion` 经 runtime 快照展示，`session.answerQuestion` 按条目身份交付。调用与答案分别保存在 assistant 和 tool result 中，刷新恢复等待快照，重启按中断历史处理。
 
-应用配置、会话修复和图片快照继续使用 `core` 的原子文件写入，数据完整性由各自持久化边界维护。工具取舍见[文件操作工具边界](adr/adr-0005-file-tools.md)。
+### 图片数据流
 
-源码：[注册与派发](../crates/agent/src/tools/registry.rs) · [异步准入与结果提交](../crates/agent/src/agent/dispatch.rs) · [read](../crates/agent/src/tools/read.rs) · [bash](../crates/agent/src/tools/bash/mod.rs) · [进程树](../crates/agent/src/tools/bash/job_object.rs) · [应用数据原子写入](../crates/core/src/lib.rs)。
+前端选择、粘贴和拖放图片后，将其与文字、技能绑定保存为同一草稿。RPC 接受边界解码为 `UserInput`；`read` 按文件签名识别图片；MCP 图片结果也进入 Agent 图片校验与保存流程。消息引用持久像素，`session.imageRead` 只按实际历史或待处理输入提供预览，不接受任意路径。
+
+模型与摘要按需加载快照。Chat 把工具图片放到完整工具结果组之后的 user 消息，Responses 在 `function_call_output.output` 使用 `input_image`；并行工具配对保持完整。图片估价参与压力计算，原像素与历史不随压缩删除，摘要可保留快照路径供后续 read。
+
+源码：[注册表](../crates/agent/src/tools/registry.rs) · [派发](../crates/agent/src/agent/dispatch.rs) · [read](../crates/agent/src/tools/read.rs) · [bash](../crates/agent/src/tools/bash/mod.rs) · [MCP 管理](../crates/mcp/src/lib.rs) · [MCP 结果](../crates/agent/src/tools/mcp.rs) · [提问](../crates/agent/src/agent/questions.rs) · [图片](../crates/agent/src/image.rs)。取舍见[文件工具 ADR](adr/adr-0005-file-tools.md)、[MCP ADR](adr/adr-0004-mcp-tools.md)、[图片 ADR](adr/adr-0003-image-input.md)。
 
 <a id="requests"></a>
 ## 16. 请求观测与定义快照
 
-```mermaid
-flowchart TB
-    Request["ModelTurnRequest"] --> Definitions["Developer 指令与工具定义"]
-    Definitions --> Snapshot[("request_definitions<br/>连续相同定义复用最近记录")]
-    Request --> Preferences["本次请求选项"]
-    Snapshot --> Reference["RequestContext：定义 ID + 选项"]
-    Reference --> Start[("model_request：开始")]
-    Attempt["RequestAttempt"] --> Start
-    Attempt --> End[("model_request：结束、错误、用量")]
-    Start --> Head["追加成功返回安全请求头<br/>历史读取复用同一构造"]
-    Snapshot --> Head
-    End --> Head
-    Head --> UI["实时事件与历史轨迹"]
-    Attempt --> Usage["RequestAccounting：所有尝试的实测用量"]
-    Usage --> Terminal["轮次或独立压缩终态"]
-```
+请求定义先保存为 `request_definitions`，`RequestContext` 引用定义 ID 与本次选项。`RequestAttempt` 产生开始、结束观测，并向实时事件和持久轨迹交付同一 `RequestObservation`；所有尝试及摘要用量由请求账本汇总。
 
-`ModelTurnRequest` 只含 Provider 无关的模型输入；`execute_request` 为每次发送建立 `RequestAttempt`，其 requestId 配对开始与结束观测，输出另用预分配的会话条目 ID 维持流式展示与最终写入。重试复用同一份输入，但每次有独立的观测与输出身份。请求观测不进入模型上下文，不另存每次请求的完整对话。实时 `provider/attempt` 与持久历史轨迹直接携带同一个 `RequestObservation`；事件自身只补充 threadId 和 turnId，不在后端拆字段、前端再拼回。失败类别与稳定诊断码都随该观测持久化，实时事件从同一份记录派生，重试后最终成功的请求仍能回溯前几次为何失败。请求身份只由该观测承载，内嵌的 context 与展开 header 都不再复制同一个 id。用量未上报时保持未知；回合累计已上报计数，usagePresent 表示至少一次请求完整上报输入和输出；缓存字段缺失与明确零命中有不同含义。历史投影从请求记录的 context 直接解析定义；结束观测保留开始观测的请求头与开始记录时间。请求定义先于引用持久化，历史投影直接使用这一关系。观测追加失败停止执行；请求本身也已失败时，同时保留提供方原因与记录写入原因。
+定义先于引用写入；历史读取从 RequestContext 解析同一请求头，结束观测保留开始时间与请求定义。requestId 由观测统一承载，输出另分配条目 ID。失败类别与诊断码随观测保存，成功前的失败尝试仍可回溯。请求观测不进入模型上下文，也不另存每次请求完整对话。
 
-源码：[请求执行与用量](../crates/agent/src/request_execution.rs) · [请求定义](../crates/agent/src/session/request.rs) · [SessionData](../crates/agent/src/session/manager.rs) · [历史投影](../crates/runtime/src/history.rs)。
+用量缺失保持未知，`usagePresent` 表示至少一次完整上报输入与输出；缓存字段缺失与明确零命中不同。协议结果校验失败仍累计已上报用量。回合终态的持久记录保存状态、错误和停止事实，用量由请求账本聚合。
+
+源码：[RequestAttempt / 计量](../crates/agent/src/request_execution.rs) · [定义与引用](../crates/agent/src/session/request.rs) · [公开历史](../crates/runtime/src/history.rs) · [前端用量](../apps/desktop/src/sessionUsage.ts)。
 
 <a id="recovery"></a>
-## 17. 历史读取、写入与异常恢复
-
-### 17.1 Session 条目与派生对象
+## 17. 历史读取、写入与恢复
 
 ```mermaid
 flowchart TB
-    JSONL[("严格 JSONL v11<br/>header：id、version、cwd、timestamp")]
-    JSONL --> Data["SessionData<br/>原始条目，只读能力"]
-    Data --> Context["ContextView<br/>请求装配与缩减时派生的模型有效历史"]
-    Data --> Turns["index_turn_history<br/>Turn 条目范围、终态与手动停止"]
-    Turns --> Summary["summarize_thread<br/>名称、updatedAt、状态与轮数"]
-    Turns --> Page["IndexedTurn.project<br/>只展开请求的历史页"]
-    Data --> Requests["RequestContext → definitions<br/>遍历请求记录时直接展开系统及工具定义"]
-    Summary --> Catalog["ThreadCatalog<br/>create / list / resume / archive"]
-    Page --> Catalog
-    Requests --> Page
-    Catalog --> WB["AppServer baseline / 历史分页"]
-    Context --> Model["模型输入<br/>缺失工具结果标明未知"]
+    File["Session JSONL v11"] --> Read["SessionData：只读完整行"]
+    Read --> History["回合索引、摘要、请求详情、分页"]
+    File --> Window["Conversation.writer_window<br/>执行、设置、改名、归档"]
+    Window --> Open["SessionManager：校验身份与格式<br/>必要时原子修复尾部"]
+    Open --> Append["追加成功后更新账本"]
+    Append -->|"I/O 失败"| Fail["停止此写者追加，返回原始错误"]
+    Fail -->|"关闭后重新打开"| Open
+    Append --> Context["ContextView：摘要边界与工具配对"]
 ```
 
-`message`、`compaction`、`metadata`、`record` 是日志中的不同条目类型；请求观测属于 record 的具体种类；当前会话格式仍读取已保存的 `tool_result_pruned` 记录，以恢复原有模型视图，压缩不再生成此记录。操作记录决定历史回合状态，模型历史只消费与上下文相关的种类。执行器在工具结果全部落盘后提交终态；缺少终态的历史回合由投影显示为中断。缺失的工具结果只在模型输入中标明未知，原始历史保持不变。
+启动先取得数据根的 `instance.lock` 系统锁。会话 writer window 协调持久修改，活动执行共用同一 SessionWriter；目录和分页直接读取日志构造不可变快照，只读打开不派生模型上下文。
 
-### 17.2 重新打开会话时发生什么
+只读忽略未闭合尾行，写打开时修复撕裂尾部并保留完整条目身份、顺序和内容；非尾部损坏或核心格式无效明确失败。只接受当前 v11，不自动迁移旧格式。RPC 按 sessionId 读取并核对 header.id，执行 cwd 来自会话；历史读取不要求目录仍存在，执行或压缩准备才检查目录。
 
-```mermaid
-flowchart TB
-    Open["打开已存在 Session"] --> Mode{"只读还是写入？"}
-    Mode -->|"只读"| Read["SessionData<br/>解析文件，派生只读投影"]
-    Read -->|"未闭合尾行"| CompleteLines["只投影完整行<br/>写打开时修复尾部"]
-    Mode -->|"写入"| Window["Conversation.writer_window<br/>执行、设置、改名、归档共用"]
-    Window --> Manager["SessionManager<br/>读取、身份与格式校验"]
-    Manager --> Rewrite["需要时原子重写<br/>修复撕裂尾部<br/>保留完整条目的 ID、顺序和内容"]
-    Rewrite --> Ready["可继续的新写者"]
-    Ready --> Append["新操作与消息追加"]
-    Append -->|"I/O 部分失败"| Stop["停止此写者后续追加<br/>保留原始错误"]
-    Stop -->|"关闭后重新打开"| Open
-```
+`message`、`compaction`、`metadata` 与 `record` 分别承载消息、上下文替换、任务设置和操作／请求事实。缺少终态记录的历史回合投影为中断；缺失工具结果在模型视图中标明未知并要求先检查状态，恢复不重放 shell 或文件副作用。已保存的 `tool_result_pruned` 记录仍参与模型视图重建。
 
-程序启动时先取得数据目录的 `instance.lock` 系统锁，退出即释放；单个会话的执行与持久修改由 `Conversation.writer_window` 协调，活动写入复用同一 `SessionWriter`。新历史只接受 v11，旧文件不自动迁移。终态记录保留状态、错误与停止事实；模型用量由请求观测记录汇总，截断反馈只用于本次运行结果。
+ThreadCatalog 从回合索引派生名称、状态、轮数和 updatedAt，按需展开历史页；运行 phase 取 Conversation，空闲结果取日志。归档在写者窗口内移动文件，不解析或修复正文。未消费输入只存在进程内，重启由用户继续已保存历史。
 
-模型上下文按 assistant 声明的调用顺序组合工具结果，缺失结果标明未知并要求先检查当前状态，不重放文件修改或 shell 副作用。更早版本会话被拒绝打开；损坏的核心结构与非尾部非法内容明确失败。目录列表和历史读取统一投影已完整写入的行，暂时忽略未闭合尾行；其他读取错误明确失败。历史读取不要求 cwd 仍可访问，执行与压缩准备时才验证目录。任务归档在会话写入窗口内将文件移入 `archived/`，不解析或修复历史正文；列表按日志派生的 `updatedAt` 排序。当前运行状态由 `Conversation` 提供，工作台优先显示实时阶段，空闲时显示历史结果。
-
-已有任务的 RPC 只提交 sessionId，执行目录来自会话自身的 cwd。打开文件时核对 header id 与请求的任务编号；项目登记用于创建任务与列表分组。文件与技能候选从当前项目根目录查询。
-
-
-目录与分页直接读取当前会话并构造不可变快照；只读打开不派生模型上下文。压缩锚点与已有剪枝记录的引用由各自的写入路径保证有效，请求装配与缩减时直接按这些引用派生上下文。
-
-源码：[Session 格式](../crates/agent/src/session/format.rs) · [SessionData / SessionManager](../crates/agent/src/session/manager.rs) · [JSONL 文件处理](../crates/agent/src/session/file.rs) · [上下文投影](../crates/agent/src/session/context.rs) · [会话写入窗口](../crates/runtime/src/conversation.rs) · [回合索引与摘要](../crates/runtime/src/history.rs) · [目录](../crates/runtime/src/thread_catalog.rs)。
+源码：[Session 格式](../crates/agent/src/session/format.rs) · [账本与写者](../crates/agent/src/session/manager.rs) · [尾部处理](../crates/agent/src/session/file.rs) · [历史索引](../crates/runtime/src/history.rs) · [目录与分页](../crates/runtime/src/thread_catalog.rs)。
 
 <a id="delivery"></a>
 ## 18. 构建、发布与无交互入口
 
-```mermaid
-flowchart TB
-    React["React + CSS + Motion / Canvas"] --> Vite["Vite production dist"]
-    Desktop["Electron main / preload"] --> TS["tsc desktop-dist"]
-    Rust["Rust workspace"] --> Cargo["cargo build"]
-    Cargo --> Binary["singularity.exe"]
-    Binary --> Prepare["prepare:runtime：复制后端"]
-    Vite --> Package["electron-builder：完整 Windows 目录"]
-    TS --> Package
-    Prepare --> Package
-    Package --> Release["ZIP + SHA256"]
-    Binary --> JSON["--json goal / --model"]
-    JSON --> Runtime["Conversation → TurnRunner → Agent"]
-    Runtime --> Summary["JSONL 事件 + summary"]
-```
+React 经 Vite 构建 production dist，Electron main / preload 经 TypeScript 编译为 desktop-dist；`prepare:runtime` 复制 Cargo 构建的后端，Electron Builder 将三者打成完整 Windows 目录，再归档为 ZIP 并生成 SHA256。运行和发布命令由[开发指南](development.md)维护。
 
-JSONL 准备失败也输出 failed summary。stdout 写入失败后，该通道不再能确认行边界，就不再追加任何行（含 summary），执行事实照常持久化；输出故障和准备或任务结果都保留，进程以失败退出。外部强制终止或异常进程退出不保证 summary。评估器属于独立仓库，本项目只维护无交互执行接口。
+JSONL 准备失败也输出 failed summary。stdout 写入失败后无法确认该通道的行边界，因此停止追加所有行（包括 summary）；执行事实仍持久化，输出故障与准备或执行结果均保留，进程以失败退出。外部强制终止或异常进程退出不保证 summary。评估器在独立仓库，本项目维护共享 Agent 的无交互接口。
 
-源码：[前端 build](../apps/desktop/package.json) · [桌面主进程](../apps/desktop/desktop/main.ts) · [打包配置](../apps/desktop/electron-builder.json) · [JSONL 输出](../crates/app/src/jsonl_mode.rs) · [发布 workflow](../.github/workflows/release.yml) · [打包脚本](../.github/scripts/package-release.ps1)。构建、检查与发布命令见[开发指南](development.md)。
+源码：[前端构建](../apps/desktop/package.json) · [后端准备](../apps/desktop/desktop/prepare.mjs) · [打包配置](../apps/desktop/electron-builder.json) · [JSONL](../crates/app/src/jsonl_mode.rs) · [发布工作流](../.github/workflows/release.yml)。命令与单实例启动步骤见[开发指南](development.md)。
 
 <a id="impact"></a>
 ## 19. 按改动目的定位关联代码
 
-| 要改变的行为 | 规则或状态的维护入口 | 需要一起检查的使用方 |
+| 要改变的行为 | 维护入口 | 直接关联的使用方与边界 |
 | --- | --- | --- |
-| 新增或调整工具 | `tools/registry.rs` 与对应工具；并行语义在 `PreparedTool`，批次准备、准入与结果提交在 `agent/dispatch.rs` | 提示词名单、模型 schema、参数预检、取消、结果落盘、公开历史与实时事件；展示规则在 `timeline.ts`、`trajectory.ts`。 |
-| 修改命令执行行为 | `tools/bash` | Git Bash 参数、工作目录、输出、超时、取消与进程树；搜索和文件修改共用此入口。 |
-| 改变发送、引导或停止 | `runtime/conversation.rs`；单轮收尾在 `runner.rs` | 桌面控制 RPC、Composer 发送、steer 输入箱、历史恢复、JSONL 共享执行入口。 |
-| 改变终态或事件字段 | `protocol/event.rs`、`protocol/params.rs` 与 runtime 投影 | JSONL、桌面事件 envelope、活动快照、前端协议、正文、轨迹、用量。 |
-| 修改历史或会话格式 | `agent/session/format.rs`、`manager.rs`、`file.rs` | `ContextView`、工具配对投影、请求定义引用、catalog 摘要、分页与前端历史。 |
-| 改变模型接入或能力 | `model/config`、`provider/contract.rs`、`openai`、`transport` | selector 与冻结快照、重试和摘要、续接身份、请求观测、设置表单、模型选择器。 |
-| 调整上下文预算或摘要 | `agent/request.rs`、`agent/compaction.rs`、`request_execution.rs`、`compaction.rs`、`session/context.rs` | 正常发送、精确溢出恢复、手动压缩、文件指令刷新、用量记录；原历史与工具批次完整性。 |
-| 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs`、`agent/agent/inbox.rs` | 工作台候选、技能引用展开、steer、模型 `read` 结果留存与压缩后文件指令刷新。 |
-| 修改项目或目录行为 | `core/workspace.rs`、`app/desktop/app_server/workspace.rs`、`app/desktop/workspace_files.rs`、[Electron 主进程](../apps/desktop/desktop/main.ts) | 项目登记持久化、任务 cwd 分组投影、RPC 归属验证、文件候选、原生目录选择窗口、离线目录历史、移除条件。 |
-| 改变流式展示或恢复 | `app/desktop/app_server/session.rs` 的单会话投影、`AppServer` 的发布与启动、`rpcClient.ts`、`sessionStore.ts`、`sync.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
-| 调整草稿、布局或滚动 | `viewPersistence.ts`、`drafts.ts`、`appStore.ts`、相关组件与样式 | 分任务状态、新建任务的草稿转交、布局焦点和滚动锚点；具体交互规则见 `desktop-ui.md`。 |
-| 改变构建或发布方式 | [桌面构建](../apps/desktop/package.json)、[后端准备](../apps/desktop/desktop/prepare.mjs)、[打包配置](../apps/desktop/electron-builder.json)、`.github` 脚本与 workflow | production 资源打包、无 Node 的运行环境、Windows 打包与安装文档。 |
+| 工具定义与执行 | [registry](../crates/agent/src/tools/registry.rs)、[dispatch](../crates/agent/src/agent/dispatch.rs) | 提示词、schema、预检、并行准入、取消、结果落盘与公开投影。 |
+| 命令执行 | [bash](../crates/agent/src/tools/bash/mod.rs) | 搜索与文件修改、Git Bash、工作目录、输出、超时与进程树。 |
+| MCP 接入 | [McpManager](../crates/mcp/src/lib.rs)、[Agent MCP 结果](../crates/agent/src/tools/mcp.rs) | 设置、连接生命周期、工具刷新、模型 schema、图片结果与退出。 |
+| 发送、steer、停止或提问 | [Conversation](../crates/runtime/src/conversation.rs)、[Runner](../crates/runtime/src/runner.rs) | 桌面 RPC、输入箱、Composer、QuestionPanel、持久终态、JSONL 入口。 |
+| 事件或 RPC 字段 | [protocol](../crates/protocol/src/lib.rs)、[adapter](../crates/app/src/desktop/rpc.rs) | 生成声明、JSONL、流信封、恢复快照、同步与展示。 |
+| 会话格式或历史 | [session](../crates/agent/src/session/mod.rs)、[history](../crates/runtime/src/history.rs) | 工具配对、摘要锚点、请求引用、目录、分页和前端执行事实。 |
+| 模型能力与协议 | [model](../crates/model/src/lib.rs)、[request_execution](../crates/agent/src/request_execution.rs) | selector、冻结配置、重试、续接身份、摘要、观测、模型设置。 |
+| 上下文与摘要 | [请求准备](../crates/agent/src/agent/request.rs)、[缩减](../crates/agent/src/agent/compaction.rs) | 自动、手动、溢出恢复、历史完整性、指令刷新和用量。 |
+| 指令与技能 | [文件指令](../crates/core/src/project_instructions.rs)、[技能](../crates/core/src/skills.rs)、[引用](../crates/agent/src/agent/inbox.rs) | 候选绑定、普通提交与 steer、read、请求前缀与压缩后刷新。 |
+| 项目与文件候选 | [WorkspaceStore](../crates/app/src/desktop/workspace_store.rs)、[workspace](../crates/app/src/desktop/app_server/workspace.rs)、[候选](../crates/app/src/desktop/workspace_files.rs) | 路径身份、cwd 分组、原生目录选择、离线历史与移除条件。 |
+| 流式显示与恢复 | [SlotState](../crates/app/src/desktop/app_server/session.rs)、[SessionStore](../apps/desktop/src/sessionStore.ts)、[sync](../apps/desktop/src/sync.ts) | 版本水位、历史与活动拼接、phase、分页、正文与轨迹。 |
+| 草稿、布局与滚动 | [drafts](../apps/desktop/src/drafts.ts)、[viewPersistence](../apps/desktop/src/viewPersistence.ts)、[AppStore](../apps/desktop/src/appStore.ts) | 分任务输入、草稿转移与清理、焦点、锚点、组件和样式。 |
+| 构建与发布 | [桌面构建](../apps/desktop/package.json)、[prepare](../apps/desktop/desktop/prepare.mjs)、[发布](../.github/workflows/release.yml) | production 资源、后端复制、Windows 包、运行和安装文档。 |
 
-表中的相对路径以本图谱对应章节的源码链接为入口。交互细节由[工作台交互](desktop-ui.md)维护，操作命令由[开发指南](development.md)和[安装说明](INSTALL.md)维护。
+表中列出理解和修改同类行为所需的入口。验证按本次实际影响选择，原则见[项目指令](../AGENTS.md#验证与交付)；控件约定由[工作台交互](desktop-ui.md)维护。

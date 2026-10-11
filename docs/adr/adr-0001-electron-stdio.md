@@ -12,4 +12,4 @@ Vite production 资源通过应用内 `singularity://app/` 协议读取，该协
 
 未采用 Rust Node 原生插件：会引入 ABI、原生插件构建和进程内故障耦合，当前没有避免 JSON 序列化的性能依据。未采用独立命名管道服务：当前不需要跨进程发现、多个外部客户端或后端独立常驻；需求变化时重新评估。
 
-配置与会话数据继续使用 `SINGULARITY_HOME`。Electron 视图存储按数据目录隔离，原浏览器 localStorage 不自动迁移，升级前需要自行保存尚未发送的浏览器草稿。
+配置与会话数据使用 `SINGULARITY_HOME`，Electron 视图存储按数据目录隔离。浏览器工作台迁移到 Electron 时，旧浏览器 localStorage 不自动迁移，未发送的浏览器草稿需在迁移前自行保存。
