@@ -126,13 +126,7 @@ pub(crate) fn validate_reasoning_variants(
         }
         return Ok(());
     }
-    let Some(default_variant) = default_variant else {
-        return Err(configuration_error(
-            "reasoning_variants require an explicit default_variant",
-            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
-        ));
-    };
-    if !variants.contains_key(default_variant) {
+    if default_variant.is_some_and(|variant| !variants.contains_key(variant)) {
         return Err(configuration_error(
             "default_variant is not declared in reasoning_variants",
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,

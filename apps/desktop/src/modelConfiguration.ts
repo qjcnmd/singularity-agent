@@ -1,5 +1,6 @@
-import type { DiscoveredModel, ModelConfigurationInput } from './protocol'
+import type { DiscoveredModel, ModelConfigurationInput, ReasoningVariant } from './protocol'
 import { modelConfigurationFields } from './protocol.generated'
+import { reasoningGrades } from './modelChoices'
 
 /** 空输入为 null，非法输入为 undefined；保存要求两项容量均为有效数值。 */
 export function parseCapacity(value: string): number | null | undefined {
@@ -52,7 +53,7 @@ export function applyProtocol(model: ModelConfigurationInput, apiProtocol: strin
     requiresReasoningContentForToolCalls: apiProtocol === 'responses' ? null : model.requiresReasoningContentForToolCalls }
 }
 
-/** 投影推荐到仍由智能配置管理的字段；用户覆盖与最近有效值在再次导入时保留。 */
+/** 只更新自动字段；用户覆盖与最近有效值在再次导入时保留。 */
 export function mergeDiscoveredModels(
   rows: ModelConfigurationInput[],
   candidates: DiscoveredModel[],
@@ -66,6 +67,7 @@ export function mergeDiscoveredModels(
     if (at < 0) {
       next.push(applyProtocol({ ...blankModel(), ...candidate,
         reasoningVariants: candidate.reasoningVariants.length ? candidate.reasoningVariants : null,
+        defaultVariant: null,
       }, protocol))
       continue
     }
@@ -84,7 +86,18 @@ export function mergeDiscoveredModel(current: ModelConfigurationInput, candidate
     // 未声明的推荐不擦掉上次已确认的值；手动字段不在自动集合中。
     if (value === null || (field === 'reasoningVariants' && candidate.reasoningVariants.length === 0)) continue
     Object.assign(merged, { [field]: value })
-    if (field === 'reasoningVariants') merged.defaultVariant = candidate.defaultVariant
+    if (field === 'reasoningVariants' && !candidate.reasoningVariants.some(variant => variant.id === merged.defaultVariant)) merged.defaultVariant = null
   }
   return merged
+}
+
+/** 保留目录和已有配置的线上映射；开关模型只提供 off / on。 */
+export function reasoningOptionsFor(variants: readonly ReasoningVariant[], protocol: string): ReasoningVariant[] {
+  const toggle = protocol === 'chat' && variants.some(variant => variant.id === 'on')
+    && variants.every(variant => variant.id === 'off' || variant.id === 'on')
+  // on 不能随选择状态消失，否则保存 off 后无法重新开启。
+  const ids = toggle ? ['off', 'on'] : ['off', ...reasoningGrades, ...(protocol === 'chat' ? ['on'] : [])]
+  const options = new Map(ids.map(id => [id, { id, wireEffort: id === 'off' || id === 'on' ? null : id }]))
+  for (const variant of variants) options.set(variant.id, variant)
+  return [...options.values()]
 }

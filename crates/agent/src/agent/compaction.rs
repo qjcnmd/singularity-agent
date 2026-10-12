@@ -61,7 +61,12 @@ impl Agent {
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
+        let item = singularity_protocol::HistoryItem::Compaction {
+            id: id.clone(),
+            summary: entry.summary.clone(),
+        };
         with_writer_async(&self.session, move |writer| writer.append_compaction_with_id(&id, entry)).await?;
+        on_event(AgentEvent::CompactionFinished { item });
         self.usage_correction = 0;
         Ok(true)
     }

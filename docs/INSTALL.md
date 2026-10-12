@@ -57,6 +57,8 @@ npm --prefix apps/desktop run package
 
 ### 配置文件示例
 
+模型容量可通过“获取模型参数”补齐，也可手动填写。工作台用档位按钮配置可用思考程度，使用时在模型选择器中切换；`default_variant` 可省略，已有配置中的默认档位仍然有效。
+
 `~/.singularity/config.json`：
 ```json
 {

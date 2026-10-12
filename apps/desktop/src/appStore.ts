@@ -9,6 +9,10 @@ import { useRef, useSyncExternalStore } from 'react'
 import { emptyDraft, imageUpload, type Draft } from './drafts'
 import type { ProviderConfigurationInput, RpcMethod, RpcParams, SkillMetadata, ViewportAnchor } from './protocol'
 
+type SessionActionMethod = {
+  [Method in RpcMethod]: RpcParams<Method> extends { sessionId: string } ? Method : never
+}[RpcMethod]
+
 class AppStore extends SessionStore {
   setDraft(text: string, skill?: SkillMetadata): void {
     const id = this.state.selectedSessionId
@@ -69,16 +73,16 @@ class AppStore extends SessionStore {
   }
 
   async stopActive(): Promise<boolean> {
-    return this.sessionAction('session.abort', {})
+    return this.sessionAction('session.abort', sessionId => ({ sessionId }))
   }
 
   answerQuestion(itemId: string, answers: import('./protocol').UserQuestionAnswer[]): Promise<boolean> {
-    return this.sessionAction('session.answerQuestion', { itemId, answers }, itemId)
+    return this.sessionAction('session.answerQuestion', sessionId => ({ sessionId, itemId, answers }), itemId)
   }
 
   async compact(): Promise<boolean> {
     if (!this.modelAvailable()) return false
-    return this.sessionAction('session.compact', {})
+    return this.sessionAction('session.compact', sessionId => ({ sessionId }))
   }
 
   async renameWorkspace(workspaceId: string, name: string): Promise<boolean> {
@@ -102,7 +106,7 @@ class AppStore extends SessionStore {
   }
 
   async updateSettings(selector: string): Promise<boolean> {
-    return this.sessionAction('session.updateSettings', { selector })
+    return this.sessionAction('session.updateSettings', sessionId => ({ sessionId, selector }))
   }
 
   private async addWorkspace(root: string): Promise<boolean> {
@@ -195,16 +199,16 @@ class AppStore extends SessionStore {
     this.saveView({ viewportAnchors })
   }
 
-  private async sessionAction<M extends RpcMethod>(
+  private async sessionAction<M extends SessionActionMethod>(
     method: M,
-    params: Omit<RpcParams<M>, 'sessionId'>,
+    params: (sessionId: string) => RpcParams<M>,
     target?: string,
   ): Promise<boolean> {
     const sessionId = this.state.selectedSessionId
     if (sessionId === null) return false
     const origin = target === undefined ? actionOrigin.session(sessionId) : actionOrigin.control(sessionId, target)
     return this.action(method, origin,
-      () => this.transport.rpc(method, { ...params, sessionId } as RpcParams<M>))
+      () => this.transport.rpc(method, params(sessionId)))
   }
 
   setSidebarView(value: Partial<PersistedView['sidebarView']>): void {

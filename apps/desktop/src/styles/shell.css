@@ -46,7 +46,7 @@
 
 /* 全局按钮与过渡 */
 .icon-button, .quiet-button, .secondary-button, .primary-button, .stop-button, .expand-button, .header-button,
-.workspace-button, .workspace-empty, .session-main,
+.workspace-button, .session-main,
 .composer-candidates button, .submit-button,
 .workspace-icon-button, .load-older {
   transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease, transform 80ms ease, box-shadow 140ms ease;
@@ -165,7 +165,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .workspace-row.is-selected {
   color: var(--ink);
 }
-.workspace-button, .workspace-empty {
+.workspace-button {
   width: 100%;
   display: flex;
   align-items: center;
@@ -193,15 +193,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   font-size: 14px;
   font-weight: 400;
 }
-.workspace-empty {
-  display: grid;
-  padding: 12px;
-  border: 1px dashed var(--line-strong);
-  border-radius: 8px;
-  color: var(--ink-soft);
-}
-.workspace-empty strong { color: var(--ink); font-size: 12.5px; }
-.workspace-empty span { font-size: 11.5px; color: var(--ink-faint); }
 
 .session-list {
   min-height: 0;
@@ -384,17 +375,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .workspace-icon-button { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 8px; background: transparent; cursor: pointer; }
 .workspace-icon-button:hover { background: var(--surface-muted); }
 .workspace-button { padding-left: 0; }
-.workspace-appearance-picker { position: fixed; z-index: 100; width: min(232px, calc(100vw - 16px)); max-height: calc(100vh - 16px); overflow-y: auto; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-lg); animation: content-enter 160ms ease-out; }
-.workspace-color-grid, .workspace-icon-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; }
-.workspace-color-grid button { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; margin: 4px; cursor: pointer; }
+.workspace-dot { display: inline-block; flex: none; width: 13px; height: 13px; border-radius: 50%; }
+.workspace-appearance-picker { position: fixed; z-index: 100; width: max-content; padding: 10px; border: 1px solid var(--line); border-radius: 14px; transform-origin: top left; }
+.workspace-color-grid { display: flex; gap: 8px; }
+.workspace-color-grid button { flex: none; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%; position: relative; cursor: pointer; }
 .workspace-color-grid button[aria-pressed=true] { outline: 2px solid currentColor; outline-offset: 3px; color: var(--ink); }
-.workspace-custom-color { display: flex; align-items: center; gap: 9px; margin: 8px 0 10px; font-size: 13px; cursor: pointer; }
-.workspace-custom-color input { width: 28px; height: 28px; padding: 0; border: 0; background: transparent; cursor: pointer; }
-.workspace-custom-color input::-webkit-color-swatch-wrapper { padding: 2px; }
-.workspace-custom-color input::-webkit-color-swatch { border: 1px solid var(--line); border-radius: 50%; }
-.workspace-icon-grid { padding-top: 10px; border-top: 1px solid var(--line); }
-.workspace-icon-grid button { display: grid; place-items: center; height: 28px; border: 0; border-radius: 7px; background: transparent; color: var(--ink); cursor: pointer; }
-.workspace-icon-grid button:hover, .workspace-icon-grid button[aria-pressed=true] { background: var(--surface-hover); }
+.workspace-color-grid button[aria-pressed=true]::after { content: '✓'; position: absolute; inset: 0; color: white; font-size: 12px; line-height: 20px; text-align: center; }
 @media (max-width: 760px) {
   .sidebar-shell { position: fixed; z-index: 25; inset: 0 auto 0 0; width: min(var(--sidebar-width), calc(100vw - 48px)); transition: width var(--sidebar-duration) var(--sidebar-easing); box-shadow: var(--shadow-floating); }
   .sidebar-shell.is-collapsed { width: 0; box-shadow: none; }

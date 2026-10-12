@@ -106,7 +106,7 @@ export function Conversation({ state, items }: Props) {
         </Empty>
       )
     }
-    return <Empty title="正在读取任务" busy />
+    return <div className="conversation-surface" aria-busy="true" />
   }
 
   const sessionOrigin = actionOrigin.session(sessionId)
@@ -119,9 +119,10 @@ export function Conversation({ state, items }: Props) {
             type="button"
             className="load-older"
             disabled={loadingOlder}
+            aria-busy={loadingOlder}
             onClick={() => void appStore.readOlder()}
           >
-            {loadingOlder ? '正在读取…' : '加载更早的记录'}
+            加载更早的记录
           </button>
         )}
         {items.map(item => <TimelineItem key={item.key} item={item} sessionId={sessionId ?? undefined} />)}
@@ -135,10 +136,9 @@ export function Conversation({ state, items }: Props) {
   )
 }
 
-function Empty({ title, body, busy = false, children }: { title: string; body?: string; busy?: boolean; children?: ReactNode }) {
+function Empty({ title, body, children }: { title: string; body?: string; children?: ReactNode }) {
   return (
     <section className="empty-state" aria-live="polite">
-      {busy && <span className="spinner" aria-hidden="true" />}
       {title && <h2>{title}</h2>}
       {body && <p>{body}</p>}
       {children}

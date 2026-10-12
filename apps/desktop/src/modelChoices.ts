@@ -5,7 +5,11 @@ export function effectiveSelector(selector: string | null | undefined, catalog: 
   return selector ?? catalog?.defaultSelector ?? null
 }
 
-const effortOrder = ['off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+/** 编辑器的常用档位与选择器的展示顺序共用；目录提供的特殊档位另行保留。 */
+export const reasoningGrades = [
+  'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
+] as const
+const effortOrder: readonly string[] = ['off', 'none', ...reasoningGrades, 'ultra', 'on']
 
 /** 所有已配置 variant 都可选；off 控制 thinking 关闭。排序只消费变体数组本身：
  *  返回排序后的副本，不改动输入，未知档位按它们在输入中的稳定次序排在已知档位之后。 */

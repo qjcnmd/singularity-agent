@@ -40,7 +40,9 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
   const variants = sortReasoningVariants(currentChoice?.model.reasoningVariants)
   const resolvedEffort = currentChoice?.effort ?? null
   const resolvedIndex = variants.findIndex((variant) => variant.id === resolvedEffort)
-  const sliderIndex = previewIndex ?? resolvedIndex
+  const sliderIndex = previewIndex ?? Math.max(0, resolvedIndex)
+  const effortSelected = previewIndex !== null || resolvedIndex >= 0
+  const displayedEffort = effortSelected ? variants[Math.round(sliderIndex)]?.id ?? '' : ''
   useEffect(() => {
     if (!committing.current && !dragging.current) setPreviewIndex(null)
   }, [selector, open])
@@ -59,7 +61,7 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
     const enabled = sortReasoningVariants(choice.model.reasoningVariants)
     const effort = enabled.some((variant) => variant.id === resolvedEffort)
       ? resolvedEffort
-      : choice.model.defaultVariant ?? enabled[0]?.id ?? null
+      : choice.model.defaultVariant
     await appStore.updateSettings(composeSelector(choice.provider.providerId, choice.model.modelId, effort))
   }
 
@@ -88,8 +90,8 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
     }
   }
 
-  const modelLabel = currentChoice?.model.displayName ?? currentChoice?.model.modelId ?? '选择模型'
-  const effortLabel = resolvedEffort === null ? null : formatEffort(resolvedEffort)
+  const modelLabel = currentChoice?.model.modelId ?? '选择模型'
+  const effortLabel = resolvedEffort
   const providers = catalog?.providers ?? []
 
   return (
@@ -135,7 +137,7 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
                           void chooseModel({ provider, model })
                         })}
                       >
-                        <span className="sg-modelName">{model.displayName ?? model.modelId}</span>
+                        <span className="sg-modelName">{model.modelId}</span>
                         <span className="sg-check">{isSelected && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>}</span>
                       </button>
                     )
@@ -147,16 +149,16 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
           {variants.length > 0 && <div className="sg-divider" />}
           {variants.length > 0 && (
             <div className="sg-effortPad">
-              <div className="sg-effortHead"><span className="sg-effortTitle">推理等级</span><strong className="sg-effortValue">{formatEffort(variants[Math.round(sliderIndex)]?.id ?? resolvedEffort ?? '默认')}</strong></div>
+              <div className="sg-effortHead"><span className="sg-effortTitle">思考程度</span><strong className="sg-effortValue">{displayedEffort}</strong></div>
               <div className="sg-track">
                 <div className="sg-range" aria-hidden="true">
                   <div className="sg-rail" />
-                  <div className="sg-fill" style={{ width: variants.length === 1 ? 'calc(100% + 12px)' : sliderIndex <= 0 ? '0' : `calc(${sliderIndex / (variants.length - 1) * 100}% + 12px)` }} />
-                  {variants.map((variant, index) => <div key={variant.id} className={`sg-tick${index <= Math.round(sliderIndex) ? ' sg-tick-on' : ''}`} style={{ left: `${variants.length > 1 ? index / (variants.length - 1) * 100 : 100}%` }} />)}
-                  <div className="sg-thumb" style={{ left: `${variants.length > 1 ? sliderIndex / (variants.length - 1) * 100 : 100}%` }} />
+                  <div className="sg-fill" style={{ width: !effortSelected ? '0' : variants.length === 1 ? 'calc(100% + 12px)' : sliderIndex <= 0 ? '0' : `calc(${sliderIndex / (variants.length - 1) * 100}% + 12px)` }} />
+                  {variants.map((variant, index) => <div key={variant.id} className={`sg-tick${effortSelected && index <= Math.round(sliderIndex) ? ' sg-tick-on' : ''}`} style={{ left: `${variants.length > 1 ? index / (variants.length - 1) * 100 : 100}%` }} />)}
+                  <div className="sg-thumb" style={{ left: `${variants.length > 1 ? sliderIndex / (variants.length - 1) * 100 : 100}%`, opacity: effortSelected ? 1 : 0 }} />
                 </div>
                 <input className="sg-native-slider" type="range" min={0} max={Math.max(0, variants.length - 1)} step="any" value={sliderIndex}
-                  aria-label="推理等级" aria-valuetext={formatEffort(variants[Math.round(sliderIndex)]?.id ?? '默认')} aria-busy={pending} disabled={variants.length < 2}
+                  aria-label="思考程度" aria-valuetext={displayedEffort || '未选择'} aria-busy={pending} disabled={variants.length === 1 && resolvedIndex === 0}
                   onChange={event => setPreviewIndex(Number(event.currentTarget.value))}
                   onPointerDown={event => { dragging.current = true; event.currentTarget.setPointerCapture(event.pointerId) }}
                   onPointerCancel={() => { dragging.current = false; setPreviewIndex(null) }}
@@ -165,7 +167,7 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
                     const delta = ['ArrowRight', 'ArrowUp', 'PageUp'].includes(event.key) ? 1 : ['ArrowLeft', 'ArrowDown', 'PageDown'].includes(event.key) ? -1 : 0
                     if (!delta && event.key !== 'Home' && event.key !== 'End') return
                     event.preventDefault()
-                    const next = event.key === 'Home' ? 0 : event.key === 'End' ? variants.length - 1 : Math.max(0, Math.min(variants.length - 1, Math.round(sliderIndex) + delta))
+                    const next = event.key === 'Home' ? 0 : event.key === 'End' ? variants.length - 1 : Math.max(0, Math.min(variants.length - 1, Math.round(previewIndex ?? resolvedIndex) + delta))
                     void chooseEffort(next)
                   }}
                   onBlur={() => { if (dragging.current) { dragging.current = false; void chooseEffort(sliderIndex) } }}
@@ -178,8 +180,4 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
       </PickerSurface>
     </div>
   )
-}
-
-function formatEffort(effort: string): string {
-  return effort.charAt(0).toUpperCase() + effort.slice(1)
 }

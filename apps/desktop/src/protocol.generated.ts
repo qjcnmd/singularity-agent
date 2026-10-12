@@ -58,7 +58,7 @@ export type ModelConfigurationField = "displayName" | "maxContextTokens" | "maxO
 
 export type ModelConfigurationInput = { modelId: string,
 /**
- * 智能配置管理的字段。None 表示未记录归属，编辑器只补空字段；空列表表示全部手动管理。
+ * 目录自动补全的字段。None 表示未记录归属，编辑器只补空字段；空列表表示全部手动管理。
  */
 automaticFields: Array<ModelConfigurationField> | null, displayName: string | null, apiProtocol: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant> | null, defaultVariant: string | null, thinkingWireFormat: string | null,
 /**
@@ -231,21 +231,23 @@ usage: SessionModelUsage, };
 
 export type ThreadTurn = {
 /**
- * 本轮 run operation 的持久化边界时间；前导组或缺失边界为 None。
+ * 回合开始时间戳
  */
-startedAt?: string, finishedAt?: string, turnId: string | null,
+startedAt?: string,
 /**
- * 该轮的终态；只有开始标记、还没结束的轮是 running（崩溃遗留的会被整体
- * 状态投影修正为 interrupted），前导组是 null。
+ * 回合结束时间戳
+ */
+finishedAt?: string, turnId: string | null,
+/**
+ * 回合终态
  */
 status: TurnStatus | null,
 /**
- * 该轮失败终态落盘下来的细节；成功、中断、前导组，以及没记录细节的旧日志都是 None。
- * 它和实时的 `turn/error` 事件表达同一个概念，重读历史时不依赖 runtime 最近一次的错误文本。
+ * 回合失败详情
  */
 error?: TurnErrorDetail,
 /**
- * 该轮的公开条目，按会话顺序排列。
+ * 该回合内的公开历史条目
  */
 items: Array<HistoryItem>, };
 

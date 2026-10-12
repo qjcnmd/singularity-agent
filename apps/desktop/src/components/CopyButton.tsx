@@ -2,24 +2,31 @@ import { useEffect, useRef, useState } from 'react'
 import { useSelectionGuard } from '../interactions'
 
 export function CopyButton({ text, label = '复制' }: { text: string; label?: string }) {
-  const [copied, setCopied] = useState(false)
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle')
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const revision = useRef(0)
   const guard = useSelectionGuard()
   useEffect(() => {
-    setCopied(false)
+    setCopyStatus('idle')
     return () => { revision.current++; clearTimeout(timer.current) }
   }, [text])
   const copy = async () => {
     const current = ++revision.current
     clearTimeout(timer.current)
-    setCopied(false)
+    setCopyStatus('idle')
     try {
       await navigator.clipboard.writeText(text)
       if (current !== revision.current) return
-      setCopied(true)
-      timer.current = setTimeout(() => setCopied(false), 1200)
-    } catch { /* 复制失败不显示成功。 */ }
+      setCopyStatus('copied')
+      timer.current = setTimeout(() => setCopyStatus('idle'), 1200)
+    } catch {
+      if (current === revision.current) setCopyStatus('error')
+    }
   }
-  return <button type="button" className="quiet-button" {...guard(() => { void copy() })}>{copied ? '已复制' : label}</button>
+  return <button type="button" className="quiet-button" aria-live="polite"
+    aria-label={copyStatus === 'error' ? `${label}失败，点击重试` : undefined}
+    title={copyStatus === 'error' ? '请重试或手动选择文字复制。' : undefined}
+    {...guard(() => { void copy() })}>
+    {copyStatus === 'copied' ? '已复制' : copyStatus === 'error' ? '复制失败，重试' : label}
+  </button>
 }

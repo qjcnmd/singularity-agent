@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { navigateList, useSelectionGuard, useDismissOnOutside } from '../interactions'
 import { RpcFailure } from '../rpcClient'
-import type { FileCandidate, SkillCatalog, SkillMetadata, SessionModelUsage } from '../protocol'
+import type { SkillMetadata, SessionModelUsage } from '../protocol'
 import { actionOrigin, appStore, useAppStore, pendingKey, type AppState } from '../appStore'
 import { ModelPicker } from './ModelPicker'
 import { WorkspacePicker } from './WorkspacePicker'
@@ -14,6 +14,7 @@ import { formatTokenCount } from '../copy'
 import { contextOccupancy } from '../contextUsage'
 import { cacheHitPercent, firstTokenLatency, generationRate, sessionUsage } from '../sessionUsage'
 import { inputTrigger } from '../inputTrigger'
+import { useFileCandidates, useSkillCandidates } from '../inputCandidates'
 import { disclosureTransition } from '../motion'
 import { QuestionPanel } from './QuestionPanel'
 import { DraftImages, useImageInput } from './Images'
@@ -34,16 +35,12 @@ function ComposerView({ centered }: { centered: boolean }) {
   const trigger = inputTrigger(draft, caret)
   const fileQuery = trigger?.kind === 'file' ? trigger.query : undefined
   const skillQuery = trigger?.kind === 'skill' ? trigger.query : undefined
-  const [skills, setSkills] = useState<SkillCatalog | null>(null)
-  const [skillError, setSkillError] = useState<string | null>(null)
-  const [files, setFiles] = useState<FileCandidate[] | null>(null)
-  const [fileError, setFileError] = useState<Error | null>(null)
-  const fileStatus = !fileQuery?.trim() || state.connection !== 'ready' || state.selectedWorkspaceId === null ? 'idle'
-    : fileError ? 'error' : files === null ? 'loading' : files.length ? 'ready' : 'empty'
   const skillMenu = skillQuery !== undefined
+  const files = useFileCandidates(fileQuery, state)
+  const skills = useSkillCandidates(skillMenu, state)
   const suggestions: { value: string; description: string; skill?: SkillMetadata }[] = skillMenu
-    ? (skills?.skills ?? []).filter(skill => skill.name.startsWith(skillQuery)).map(skill => ({ value: skill.name, description: skill.description, skill }))
-    : (files ?? []).map(file => ({ value: file.path, description: '任务文件' }))
+    ? (skills.status === 'ready' ? skills.result.skills : []).filter(skill => skill.name.startsWith(skillQuery)).map(skill => ({ value: skill.name, description: skill.description, skill }))
+    : (files.status === 'ready' ? files.result : []).map(file => ({ value: file.path, description: '任务文件' }))
   const [suggestionIndex, setSuggestionIndex] = useState(0)
   const [suggestionsOpen, setSuggestionsOpen] = useState(true)
   const textarea = useRef<HTMLTextAreaElement>(null)
@@ -56,37 +53,6 @@ function ComposerView({ centered }: { centered: boolean }) {
   useEffect(() => {
     setCaret(textarea.current?.selectionStart ?? draft.length)
   }, [draft, state.selectedSessionId, state.selectedWorkspaceId])
-  useLayoutEffect(() => {
-    // 在变化的 task 或 token 变为可交互前清除上一次查询。
-    setFiles(null)
-    setFileError(null)
-    if (!fileQuery?.trim() || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
-    const workspaceId = state.selectedWorkspaceId
-    let active = true
-    // 候选上限属于这次文件补全交互，留在调用处；查询复用 Store 持有的同一条连接。
-    const queryTimer = setTimeout(() => {
-      void appStore.transport.rpc('file.search', {
-        workspaceId,
-        query: fileQuery.trim(),
-        limit: 12,
-      }).then(
-        files => { if (active) setFiles(files) },
-        error => { if (active) setFileError(error instanceof Error ? error : new Error(String(error))) },
-      )
-    }, 150)
-    return () => { active = false; clearTimeout(queryTimer) }
-  }, [fileQuery, state.selectedSessionId, state.selectedWorkspaceId, state.connection])
-  useLayoutEffect(() => {
-    // 在变化的 workspace 或 task 变为可交互前清除上一次查询。
-    setSkills(null)
-    setSkillError(null)
-    if (!skillMenu || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
-    let active = true
-    void appStore.transport.rpc('skills.list', { workspaceId: state.selectedWorkspaceId }).then(catalog => { if (active) setSkills(catalog) }, error => {
-      if (active) setSkillError(error instanceof Error ? error.message : String(error))
-    })
-    return () => { active = false }
-  }, [skillMenu, state.selectedSessionId, state.selectedWorkspaceId, state.connection])
   useEffect(() => setSuggestionIndex((index) => Math.min(index, Math.max(0, suggestions.length - 1))), [suggestions.length])
   const { canSubmit, blockedReason } = appStore.submissionState()
 
@@ -106,7 +72,7 @@ function ComposerView({ centered }: { centered: boolean }) {
   }
 
   const showCandidateSurface = suggestionsOpen
-    && trigger !== null && (skillMenu || suggestions.length > 0 || (fileQuery !== undefined && fileStatus !== 'idle'))
+    && trigger !== null && (skillMenu || suggestions.length > 0 || (fileQuery !== undefined && files.status !== 'idle'))
 
   useLayoutEffect(() => {
     const anchor = candidateAnchor.current
@@ -154,15 +120,13 @@ function ComposerView({ centered }: { centered: boolean }) {
                 <strong>{skillMenu ? '/' : '@'}{candidate.value}</strong><span>{candidate.description}</span>
               </button>
             ))}
-            {skillMenu && skills === null && skillError === null && <p className="candidate-message">正在读取 Skills…</p>}
-            {skillMenu && skills !== null && suggestions.length === 0 && <p className="candidate-message">{skills.skills.length === 0 ? '没有可用的 Skills' : '没有匹配的 Skills'}</p>}
-            {skillMenu && skillError !== null && <p className="candidate-message candidate-error" role="alert">{skillError}</p>}
-            {skillMenu && skills?.diagnostics.map(message => <p className="candidate-message candidate-error" role="alert" key={message}>{message}</p>)}
-            {fileQuery !== undefined && fileStatus === 'loading' && <p className="candidate-message">正在查找任务文件…</p>}
-            {fileQuery !== undefined && fileStatus === 'empty' && <p className="candidate-message">没有匹配的文件</p>}
-            {fileQuery !== undefined && fileStatus === 'error' && fileError !== null && (
+            {skillMenu && skills.status === 'ready' && suggestions.length === 0 && <p className="candidate-message">{skills.result.skills.length === 0 ? '没有可用的 Skills' : '没有匹配的 Skills'}</p>}
+            {skillMenu && skills.status === 'error' && <p className="candidate-message candidate-error" role="alert">{skills.error.message}</p>}
+            {skillMenu && skills.status === 'ready' && skills.result.diagnostics.map(message => <p className="candidate-message candidate-error" role="alert" key={message}>{message}</p>)}
+            {fileQuery !== undefined && files.status === 'ready' && files.result.length === 0 && <p className="candidate-message">没有匹配的文件</p>}
+            {fileQuery !== undefined && files.status === 'error' && (
               <div className="candidate-message candidate-error" role="alert">
-                <strong>{fileError.message}</strong>{fileError instanceof RpcFailure && fileError.recovery && <span>{fileError.recovery}</span>}
+                <strong>{files.error.message}</strong>{files.error instanceof RpcFailure && files.error.recovery && <span>{files.error.recovery}</span>}
               </div>
             )}
           </div>

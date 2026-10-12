@@ -27,6 +27,14 @@ export const turnStatusText: Record<TurnStatus, string> = {
 }
 
 export const compactionTitle = '上下文压缩'
+export const compactionText = {
+  running: '正在压缩上下文…',
+  completed: '上下文已压缩',
+  failed: '上下文压缩失败',
+  stopped: '已停止压缩',
+  unfinished: '压缩未完成',
+  unchanged: '没有可压缩的内容',
+} as const
 
 /** Token 数量的紧凑展示；编辑输入保留精确容量。 */
 export function formatTokenCount(value: number): string {

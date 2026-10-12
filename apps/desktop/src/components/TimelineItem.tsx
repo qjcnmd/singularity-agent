@@ -3,14 +3,14 @@ import { AttachedImages } from './Images'
 import { Disclosure } from './Disclosure'
 import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import Anser from 'anser'
-import { CircleAlert } from 'lucide-react'
+import { CircleAlert, ListCollapse } from 'lucide-react'
 import { motion, useReducedMotion } from 'motion/react'
 import { disclosureTransition } from '../motion'
 import { useSelectionGuard } from '../interactions'
 import { MarkdownBody } from '../markdown'
 import { factStatusText } from '../copy'
 import { readOutputLines } from '../readOutput'
-import { formatTurnDuration, failureSummary, timelineBody, timelineStatus, toolArgument, type TimelineItemModel } from '../timeline'
+import { formatTurnDuration, timelineBody, timelineStatus, toolArgument, type TimelineItemModel } from '../timeline'
 
 const previewLineCount = 8
 
@@ -56,16 +56,16 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
   }
 
   if (item.kind === 'thinking') return <ReasoningRow item={item} />
+  if (item.kind === 'compaction') return <CompactionRow item={item} />
 
   const fact = item.fact
-  const failure = timelineStatus(item) === 'error' ? (fact?.kind === 'tool' ? item.summary : failureSummary(fact?.error ?? timelineBody(item))) : undefined
   return (
     <article className={`timeline-item activity-step timeline-${item.kind} status-${timelineStatus(item)}`} data-item-id={item.key} aria-label={`${item.title}，${factStatusText[timelineStatus(item)]}`}>
       <button type="button" className="activity-toggle" {...selectionGuard(() => setExpanded(value => !value))} aria-expanded={expanded}>
         <StepLabel item={item} icon={<StepIcon item={item} />} />
         <ExpandChevron expanded={expanded} className="step-chevron" />
         <span className="step-separator" aria-hidden="true">·</span>
-        <span className="step-summary">{failure ?? oneLine(timelineBody(item))}</span>
+        <span className="step-summary">{item.summary || oneLine(timelineBody(item))}</span>
         {timelineStatus(item) === 'cancelled' && <span className="item-status">{factStatusText.cancelled}</span>}
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
@@ -106,7 +106,7 @@ function ReasoningRow({ item }: Props) {
   const guard = useSelectionGuard()
   const running = timelineStatus(item) === 'running'
   const text = timelineBody(item).trim().replace(/\n[\t \r]*\n+/g, '\n')
-  const summary = running ? text.slice(text.lastIndexOf('\n') + 1) : text.split('\n')[0]
+  const summary = text.slice(text.lastIndexOf('\n') + 1)
   useLayoutEffect(() => {
     const node = summaryRef.current, measure = measureRef.current
     if (!node || !measure) return
@@ -120,12 +120,31 @@ function ReasoningRow({ item }: Props) {
     observer.observe(measure)
     return () => observer.disconnect()
   }, [text, summary, showFullText])
-  useEffect(() => {
-    if (summaryRef.current !== null) summaryRef.current.scrollLeft = running && !expanded ? summaryRef.current.scrollWidth : 0
-  }, [summary, running, expanded])
-  const Row = canExpand ? motion.button : motion.div
+  useLayoutEffect(() => {
+    const node = summaryRef.current
+    if (!node) return
+    if (showFullText) { node.scrollLeft = 0; return }
+    if (!running) return
+    const start = node.scrollLeft
+    const end = Math.max(0, node.scrollWidth - node.clientWidth)
+    if (reducedMotion || end <= start) { node.scrollLeft = end; return }
+    const started = performance.now()
+    let frame: number
+    const follow = (now: number) => {
+      const progress = Math.min(1, (now - started) / 80)
+      node.scrollLeft = start + (end - start) * (1 - (1 - progress) ** 3)
+      if (progress < 1) frame = requestAnimationFrame(follow)
+    }
+    frame = requestAnimationFrame(follow)
+    return () => cancelAnimationFrame(frame)
+  }, [summary, running, showFullText, reducedMotion])
   return <article className={`timeline-item reasoning-row status-${timelineStatus(item)}${showFullText ? ' is-expanded' : ''}`} data-item-id={item.key}>
-    <Row initial={false} animate={{ height: expanded ? 'auto' : 24 }} transition={disclosureTransition(expanded, reducedMotion)} onAnimationComplete={() => { if (!expanded) setClosing(false) }} type={canExpand ? 'button' : undefined} className="activity-toggle" aria-expanded={canExpand ? expanded : undefined} {...(canExpand ? guard(() => { setClosing(expanded && !reducedMotion); setExpanded(value => !value) }) : {})}>
+    {/* 保持同一个节点，避免溢出状态切换时替换控件、重启光泽动画和丢失测量对象。 */}
+    <motion.button initial={false} animate={{ height: expanded ? 'auto' : 24 }} transition={disclosureTransition(expanded, reducedMotion)} onAnimationComplete={() => { if (!expanded) setClosing(false) }} type="button" className="activity-toggle" tabIndex={canExpand ? 0 : -1} aria-disabled={!canExpand} aria-expanded={canExpand ? expanded : undefined} {...guard(() => {
+      if (!canExpand) return
+      setClosing(expanded && !reducedMotion)
+      setExpanded(value => !value)
+    })}>
       <StepLabel item={item} />
       {canExpand ? <ExpandChevron expanded={expanded} className="step-chevron" /> : <span className="step-chevron" aria-hidden="true" />}
       <span className="step-separator" aria-hidden="true">·</span>
@@ -134,7 +153,24 @@ function ReasoningRow({ item }: Props) {
         <span className="reasoning-summary-measure" aria-hidden="true" ref={measureRef}>{summary}</span>
       </span>
       {running && <span className="sr-only">进行中</span>}
-    </Row>
+    </motion.button>
+  </article>
+}
+
+function CompactionRow({ item }: Props) {
+  const [expanded, setExpanded] = useState(false)
+  const summary = timelineBody(item)
+  const canExpand = summary !== '' && summary !== item.title
+  const guard = useSelectionGuard()
+  const status = timelineStatus(item)
+  return <article className={`timeline-item activity-step timeline-compaction status-${status}`} data-item-id={item.key}>
+    <button type="button" className="activity-toggle compaction-toggle" aria-expanded={canExpand ? expanded : undefined} aria-disabled={!canExpand}
+      {...guard(() => { if (canExpand) setExpanded(value => !value) })}>
+      <ListCollapse size={16} strokeWidth={1.6} aria-hidden="true" />
+      <span className="compaction-label" role="status">{item.title}</span>
+      {canExpand && <ExpandChevron expanded={expanded} size={14} />}
+    </button>
+    <Disclosure open={expanded}><div className="activity-expanded compaction-summary"><MarkdownBody text={summary} /></div></Disclosure>
   </article>
 }
 
@@ -202,7 +238,6 @@ function oneLine(text: string): string {
 
 
 function StepIcon({ item }: Props) {
-  if (timelineStatus(item) === 'error') return <CircleAlert size={15} strokeWidth={1.6} />
   const path = item.title === 'bash' ? 'm4 6 5 6-5 6m8 0h8'
     : 'M14 2H5v20h14V7zM14 2v6h5M8 12h8M8 16h8'
   return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d={path} /></svg>

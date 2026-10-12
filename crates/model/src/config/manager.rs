@@ -251,66 +251,74 @@ impl ModelConfigManager {
 /// 已保存但未在表单中展示的能力标记按模型 id 保留；已移除的模型不参与转换。
 fn model_definitions(
     models: Vec<ModelConfigurationInput>,
-    provider_protocol: Option<&str>,
+    provider_protocol_text: Option<&str>,
     previous_models: Option<&BTreeMap<String, UserConfigModel>>,
 ) -> Result<BTreeMap<String, UserConfigModel>, ProviderError> {
-    let parsed_provider = provider_protocol.map(parse_catalog_protocol).transpose()?;
+    let provider_protocol = provider_protocol_text.map(parse_catalog_protocol).transpose()?;
     let mut definitions = BTreeMap::new();
-    for mut model in models {
-        let protocol = provider_protocol.or(model.api_protocol.as_deref());
-        if let Some(protocol) = parsed_provider {
-            schema::normalize_chat_fields(
-                protocol,
-                &mut model.thinking_wire_format,
-                &mut model.chat_output_tokens_field,
-                &mut model.requires_reasoning_content_for_tool_calls,
-            );
-        }
+    for model in models {
         validate_model_id(&model.model_id, "model id")?;
         if definitions.contains_key(&model.model_id) {
             return Err(user_config_error("provider model ids must be unique"));
         }
-        let declared_variants = model.reasoning_variants.is_some();
-        let mut variants = BTreeMap::new();
-        for variant in model.reasoning_variants.into_iter().flatten() {
-            if variants
-                .insert(variant.id, ModelsFileReasoningVariant { wire_effort: variant.wire_effort })
-                .is_some()
-            {
-                return Err(user_config_error("reasoning variant ids must be unique"));
-            }
-        }
         let previous = previous_models.and_then(|models| models.get(&model.model_id));
-        let is_chat = protocol == Some("chat");
-        let configured = UserConfigModel {
-            automatic_fields: model.automatic_fields,
-            display_name: model.display_name.filter(|name| !name.trim().is_empty()),
-            api_protocol: if provider_protocol.is_some() {
-                None
-            } else {
-                model.api_protocol.clone()
-            },
-            max_context_tokens: model.max_context_tokens,
-            max_output_tokens: model.max_output_tokens,
-            reasoning_variants: declared_variants.then_some(variants),
-            default_variant: model.default_variant,
-            supports_developer_role: previous.and_then(|model| model.supports_developer_role),
-            supports_tool_choice: previous.and_then(|model| model.supports_tool_choice),
-            requires_reasoning_content_for_tool_calls: model.requires_reasoning_content_for_tool_calls,
-            requires_assistant_content_for_tool_calls: previous
-                .is_some_and(|previous| previous.requires_assistant_content_for_tool_calls)
-                && is_chat,
-            chat_output_tokens_field: model.chat_output_tokens_field.filter(|field| !field.is_empty()),
-            thinking_wire_format: model.thinking_wire_format,
-        };
-        let protocol = match parsed_provider {
-            Some(protocol) => Some(protocol),
-            None => protocol.map(parse_catalog_protocol).transpose()?,
-        };
-        resolve_model_definition(&configured, protocol, &model.model_id, None)?;
-        definitions.insert(model.model_id, configured);
+        let (model_id, configured) = model_definition(model, provider_protocol, previous)?;
+        definitions.insert(model_id, configured);
     }
     Ok(definitions)
+}
+
+/// 转换单个模型并检查其完整配置；保留表单没有展示的能力，返回后才允许写入文件。
+fn model_definition(
+    mut model: ModelConfigurationInput,
+    provider_protocol: Option<ProviderApiProtocol>,
+    previous: Option<&UserConfigModel>,
+) -> Result<(String, UserConfigModel), ProviderError> {
+    if let Some(protocol) = provider_protocol {
+        schema::normalize_chat_fields(
+            protocol,
+            &mut model.thinking_wire_format,
+            &mut model.chat_output_tokens_field,
+            &mut model.requires_reasoning_content_for_tool_calls,
+        );
+    }
+    let declared_variants = model.reasoning_variants.is_some();
+    let mut variants = BTreeMap::new();
+    for variant in model.reasoning_variants.into_iter().flatten() {
+        if variants
+            .insert(variant.id, ModelsFileReasoningVariant { wire_effort: variant.wire_effort })
+            .is_some()
+        {
+            return Err(user_config_error("reasoning variant ids must be unique"));
+        }
+    }
+    let model_protocol = match provider_protocol {
+        Some(protocol) => Some(protocol),
+        None => model.api_protocol.as_deref().map(parse_catalog_protocol).transpose()?,
+    };
+    let configured = UserConfigModel {
+        automatic_fields: model.automatic_fields,
+        display_name: model.display_name.filter(|name| !name.trim().is_empty()),
+        api_protocol: if provider_protocol.is_some() {
+            None
+        } else {
+            model.api_protocol
+        },
+        max_context_tokens: model.max_context_tokens,
+        max_output_tokens: model.max_output_tokens,
+        reasoning_variants: declared_variants.then_some(variants),
+        default_variant: model.default_variant,
+        supports_developer_role: previous.and_then(|model| model.supports_developer_role),
+        supports_tool_choice: previous.and_then(|model| model.supports_tool_choice),
+        requires_reasoning_content_for_tool_calls: model.requires_reasoning_content_for_tool_calls,
+        requires_assistant_content_for_tool_calls: previous
+            .is_some_and(|previous| previous.requires_assistant_content_for_tool_calls)
+            && model_protocol == Some(ProviderApiProtocol::Chat),
+        chat_output_tokens_field: model.chat_output_tokens_field.filter(|field| !field.is_empty()),
+        thinking_wire_format: model.thinking_wire_format,
+    };
+    resolve_model_definition(&configured, model_protocol, &model.model_id, None)?;
+    Ok((model.model_id, configured))
 }
 
 // 已指定的模型或显式档位被移除后清空默认选择，由用户重新选择。

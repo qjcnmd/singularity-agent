@@ -1,4 +1,5 @@
 import { eventTurnId } from './protocol'
+import { compactionText } from './copy'
 import type { HistoryItem, ImageAttachment, ReadSource, RequestObservation, SessionReadResult, SessionRuntime, ThreadReadPage, ThreadSummary, TurnErrorDetail, TurnEventEnvelope, TurnStatus } from './protocol'
 
 export type FactStatus = 'stable' | 'running' | 'ok' | 'error' | 'cancelled'
@@ -93,7 +94,7 @@ function historyItemToExecution(item: HistoryItem, previous: ExecutionItem | und
     case 'tool_result': return toolResultItem(item, previous)
     case 'compaction': return { ...base(item.id), kind: 'compaction', text: item.summary }
     case 'compaction_result': return { ...base(item.id, item.status === 'failed' ? 'error' : item.status === 'interrupted' ? 'cancelled' : 'stable'),
-      kind: 'compaction_result', text: item.message ?? (item.status === 'completed' ? '没有可压缩的内容' : item.status === 'interrupted' ? '已停止' : '压缩失败') }
+      kind: 'compaction_result', text: item.message ?? (item.status === 'completed' ? compactionText.unchanged : item.status === 'interrupted' ? compactionText.stopped : compactionText.failed) }
     case 'settings': return { ...base(item.id), kind: 'settings', provider: item.provider, model: item.model, reasoning: item.reasoning }
   }
 }

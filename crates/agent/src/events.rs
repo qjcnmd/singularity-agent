@@ -54,6 +54,8 @@ pub enum AgentEvent {
         items: Vec<singularity_protocol::HistoryItem>,
         failed: bool,
     },
+    /// 摘要已经保存；实时界面与历史读取使用同一条目身份和正文。
+    CompactionFinished { item: singularity_protocol::HistoryItem },
     /// 工具开始执行。
     ToolExecutionStarted {
         item_id: String,

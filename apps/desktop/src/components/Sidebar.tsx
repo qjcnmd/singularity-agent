@@ -1,6 +1,7 @@
 import { Ellipsis, Plus } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { AnimatePresence } from 'motion/react'
 import { useSelectionGuard } from '../interactions'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
 import type { ThreadSummary, Workspace } from '../protocol'
@@ -131,7 +132,6 @@ function SidebarView() {
                 </div></Disclosure>
               </section>
             })}
-            {(state.bootstrap?.workspaces.length ?? 0) === 0 && <button type="button" className="workspace-empty" onClick={() => appStore.openDirectoryPicker()}><strong>添加第一个项目</strong><span>选择一个本地文件夹</span></button>}
           </div>
         </section>
 
@@ -150,7 +150,7 @@ function WorkspaceButton({ workspace, selected, expanded, appearance, onToggle, 
   const anchor = useRef<HTMLButtonElement>(null)
   return (
     <div className={`workspace-row${selected ? ' is-selected' : ''}`} onContextMenu={event => { event.preventDefault(); setMenuOpen(true) }}>
-      <button ref={iconAnchor} type="button" className="workspace-icon-button" aria-label={`更改 ${workspace.name} 的图标`} title="更改项目图标" aria-haspopup="dialog" aria-expanded={appearanceOpen} onClick={() => setAppearanceOpen(value => !value)}><WorkspaceIcon appearance={appearance} /></button>
+      <button ref={iconAnchor} type="button" className="workspace-icon-button" aria-label={`更改 ${workspace.name} 的颜色`} aria-haspopup="dialog" aria-expanded={appearanceOpen} onClick={() => setAppearanceOpen(value => !value)}><WorkspaceIcon appearance={appearance} /></button>
       <button
         type="button"
         className="workspace-button"
@@ -163,8 +163,8 @@ function WorkspaceButton({ workspace, selected, expanded, appearance, onToggle, 
       </button>
       <button type="button" className="icon-button workspace-new" onClick={() => void appStore.createSession(workspace.workspaceId)} aria-label={`在 ${workspace.name} 新建任务`}><Plus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
       <button ref={anchor} type="button" className="icon-button workspace-remove" onClick={() => setMenuOpen(value => !value)} aria-label={`项目菜单 ${workspace.name}`} aria-haspopup="menu" aria-expanded={menuOpen}><Ellipsis size={16} strokeWidth={1.6} aria-hidden="true" /></button>
-      {menuOpen && <Menu anchor={anchor} label="项目菜单" onClose={() => setMenuOpen(false)} entries={[{ id: 'appearance', label: '更改图标', onSelect: () => setAppearanceOpen(true) }, { id: 'rename', label: '重命名', onSelect: onRename }, { id: 'remove', label: '移除项目', danger: true, onSelect: onRemove }]} />}
-      {appearanceOpen && <WorkspaceAppearancePicker anchor={iconAnchor} appearance={appearance} onChange={value => appStore.setWorkspaceAppearance(workspace.workspaceId, value)} onClose={() => { setAppearanceOpen(false); requestAnimationFrame(() => iconAnchor.current?.focus()) }} />}
+      {menuOpen && <Menu anchor={anchor} label="项目菜单" onClose={() => setMenuOpen(false)} entries={[{ id: 'appearance', label: '更改颜色', onSelect: () => setAppearanceOpen(true) }, { id: 'rename', label: '重命名', onSelect: onRename }, { id: 'remove', label: '移除项目', danger: true, onSelect: onRemove }]} />}
+      <AnimatePresence>{appearanceOpen && <WorkspaceAppearancePicker anchor={iconAnchor} appearance={appearance} onChange={value => appStore.setWorkspaceAppearance(workspace.workspaceId, value)} onClose={() => { setAppearanceOpen(false); requestAnimationFrame(() => iconAnchor.current?.focus()) }} />}</AnimatePresence>
     </div>
   )
 }

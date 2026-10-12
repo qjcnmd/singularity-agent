@@ -122,7 +122,7 @@ pub struct SessionRuntime {
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfigurationInput {
     pub model_id: String,
-    /// 智能配置管理的字段。None 表示未记录归属，编辑器只补空字段；空列表表示全部手动管理。
+    /// 目录自动补全的字段。None 表示未记录归属，编辑器只补空字段；空列表表示全部手动管理。
     pub automatic_fields: Option<Vec<ModelConfigurationField>>,
     pub display_name: Option<String>,
     pub api_protocol: Option<String>,

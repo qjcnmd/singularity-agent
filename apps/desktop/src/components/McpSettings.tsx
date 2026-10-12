@@ -64,12 +64,11 @@ export function McpSettings({ workspaceId, active, busy, onBusyChange }: {
     finally { onBusyChange(false) }
   }
 
-  return <section className="mcp-settings" aria-labelledby="mcp-settings-title">
+  return <section className="mcp-settings" aria-labelledby="mcp-settings-title" aria-busy={loading}>
     <header className="sg-view-header">
       <h3 id="mcp-settings-title">MCP</h3>
       <p>更改会在下次运行或压缩后生效。</p>
     </header>
-    {loading && <p role="status">正在读取 MCP 配置…</p>}
     {error && editor === null && removing === null && <p role="alert" className="form-error">{error} <button type="button" className="quiet-button" disabled={busy} onClick={() => void load()}>重新读取</button></p>}
     <div className="sg-provider-list">
       {servers.map(server => {

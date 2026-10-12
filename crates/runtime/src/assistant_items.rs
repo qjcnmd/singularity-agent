@@ -120,6 +120,14 @@ impl AssistantItemEvents {
                     turn_id: Some(self.turn_id.clone()),
                 });
             }
+            AgentEvent::CompactionFinished { item } => {
+                sink(TurnEvent::ItemCompleted {
+                    thread_id: self.thread_id.clone(),
+                    turn_id: self.turn_id.clone(),
+                    item: ItemRef { item_id: item.id().to_string() },
+                    content: Some(item),
+                });
+            }
             AgentEvent::UserMessage { entry_id, text, images } => {
                 sink(TurnEvent::UserMessage {
                     thread_id: self.thread_id.clone(),

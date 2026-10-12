@@ -5,6 +5,7 @@ import type { DiscoveredModel, ProviderConfigurationInput, RedactedProvider } fr
 import { applyProtocol, blankModel, isValidCapacity, mergeDiscoveredModels } from '../modelConfiguration'
 import { ModelEditor } from './ModelEditor'
 import { Dialog } from './Dialog'
+import { ProtocolPicker } from './ProtocolPicker'
 
 type ModelInput = ProviderConfigurationInput['models'][number]
 type ProviderEditorProps = {
@@ -154,14 +155,10 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
               <span>API 地址</span>
               <input className="sg-input" value={baseUrl} onChange={event => setBaseUrl(event.target.value)} placeholder="https://api.example.com/v1" />
             </label>
-            <label className="sg-field">
+            <div className="sg-field">
               <span>API 协议</span>
-              <select aria-label="API 协议" className="sg-input" value={protocol} onChange={event => changeProtocol(event.target.value)}>
-                {!['chat', 'responses'].includes(protocol) && <option value={protocol}>{protocol ? `无效协议：${protocol}` : '请选择协议'}</option>}
-                <option value="chat">Chat Completions</option>
-                <option value="responses">Responses</option>
-              </select>
-            </label>
+              <ProtocolPicker value={protocol} onChange={changeProtocol} />
+            </div>
             <section className="sg-model-catalog" aria-label="模型目录">
               <div className="sg-model-catalog-head">
                 <span className="sg-model-catalog-title">模型目录</span>
@@ -174,7 +171,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
                 {models.map((model, index) => (
                   <div key={index} className="sg-model-entry">
                     <div className="sg-model-row">
-                      <span>{model.displayName || model.modelId}</span>
+                      <span>{model.modelId}</span>
                       <small>{model.maxContextTokens === null ? '' : `${formatTokenCount(model.maxContextTokens)} 上下文`}</small>
                       <button type="button" className="quiet-button" onClick={() => setModelEditor({ index, draft: applyProtocol(model, protocol) })}>编辑</button>
                       <button type="button" className="sg-icon-btn sg-icon-btn-danger" aria-label={`删除模型 ${index + 1}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}>×</button>

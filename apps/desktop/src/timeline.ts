@@ -1,5 +1,4 @@
-import { factStatusText, compactionTitle } from './copy'
-import Anser from 'anser'
+import { factStatusText, compactionText } from './copy'
 import type { ExecutionItem, ExecutionTurn, FactStatus, SessionView } from './execution'
 
 type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'compaction' | 'terminal' | 'duration'
@@ -37,12 +36,22 @@ export function buildTimeline(session: SessionView | null, userHome?: string | n
       && terminal?.source === 'turn' && terminal.status === 'failed'
     for (const item of projectTurn(turn, session.summary.cwd, userHome, active, failureFromRuntime)) result.push(item)
   }
+  // 摘要请求成功不代表摘要已经保存；失败或停止后不能继续显示“正在压缩”。
+  if (session.runtime.phase === 'idle') {
+    for (const [index, item] of result.entries()) {
+      if (item.kind !== 'compaction' || item.status !== 'running') continue
+      const failed = terminal?.status === 'failed'
+      result[index] = { ...item, status: failed ? 'error' : 'cancelled',
+        title: failed ? compactionText.failed : compactionText.unfinished, summary: terminal?.message ?? '' }
+    }
+  }
   // 提取压缩状态：进行中来自 runtime，失败来自终态
-  if (session.runtime.activeCompaction) {
-    result.push(compactionItem('compaction:running', 'running', '正在压缩…'))
-  } else if (session.runtime.terminal?.source === 'compaction') {
+  if (session.runtime.activeCompaction && !session.facts.active.some(turn => turn.items.some(item =>
+    item.kind === 'compaction' || (item.kind === 'request' && item.observation.purpose === 'compaction')))) {
+    result.push(compactionItem('compaction:running', 'running', compactionText.running))
+  } else if (session.runtime.terminal?.source === 'compaction' && !result.some(item => item.kind === 'compaction' && timelineStatus(item) === 'error')) {
     const terminal = session.runtime.terminal
-    result.push(compactionItem('compaction:failed', 'error', terminal.message ?? '压缩失败'))
+    result.push(compactionItem('compaction:failed', 'error', compactionText.failed, terminal.message ?? '压缩失败'))
   }
   const lastTurn = turns.at(-1)
   if (terminal?.source === 'turn' && terminal.status === 'failed'
@@ -62,27 +71,43 @@ function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null |
   // 首部 settings 记录没有 turnId，使用 'leading' 占位 key
   const group = turn.id ?? 'leading'
   let workStartIndex = -1
+  let compactionIndex = -1
   for (const fact of turn.items) {
-    if (fact.kind === 'request' || fact.kind === 'settings' || fact.kind === 'event') continue
+    if (fact.kind === 'request') {
+      if (fact.observation.purpose === 'compaction') {
+        compactionIndex = result.length
+        if (workStartIndex < 0) workStartIndex = result.length
+        const status = fact.status === 'error' || fact.status === 'cancelled' ? fact.status : 'running'
+        result.push(compactionItem(`content:${group}:compaction:${fact.id}`, status,
+          status === 'error' ? compactionText.failed : status === 'cancelled' ? compactionText.stopped : compactionText.running))
+      }
+      continue
+    }
+    if (fact.kind === 'settings' || fact.kind === 'event') continue
     const cached = projectedItems.get(fact)
     let item = cached?.cwd === cwd && cached.userHome === userHome ? cached?.item : undefined
     if (!item) {
       const key = `content:${group}:${fact.id}`
       if (fact.kind === 'tool') {
         const filePath = pathFromArgs(fact.name, fact.args)
-        const summary = fact.status === 'error' ? failureSummary(fact.output)
-          : filePath !== null ? displayPath(filePath, cwd, userHome) : toolSummary(fact.name, fact.args) || firstLine(fact.output)
+        const summary = filePath !== null ? displayPath(filePath, cwd, userHome)
+          : toolSummary(fact.name, fact.args) || firstLine(fact.output)
         item = { key, fact, kind: 'tool', title: fact.name === 'ask_user_question' ? '询问用户' : fact.name,
           summary, filePath }
       } else {
         const kind = fact.kind === 'compaction' || fact.kind === 'compaction_result' ? 'compaction' : fact.kind
-        const title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'compaction' ? compactionTitle : kind
+        let title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'compaction' ? compactionText.completed : kind
+        if (fact.kind === 'compaction_result') title = fact.status === 'error' ? compactionText.failed : fact.text
         item = { key, fact, kind, title, summary: '', filePath: null }
       }
       projectedItems.set(fact, { item, cwd, userHome })
     }
     if (item.kind !== 'user' && workStartIndex < 0) workStartIndex = result.length
-    result.push(item)
+    if (item.kind === 'compaction' && compactionIndex >= 0) {
+      // 摘要和失败、停止结果都替换请求行，保留同一个显示位置和身份。
+      result[compactionIndex] = { ...item, key: result[compactionIndex].key }
+      compactionIndex = -1
+    } else result.push(item)
   }
   if (startedAt && (turn.finishedAt || active)) {
     result.splice(workStartIndex < 0 ? result.length : workStartIndex, 0, {
@@ -99,9 +124,8 @@ function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null |
   return result
 }
 
-/** 压缩反馈行：标题固定，正文是这次压缩的状态或结果。 */
-function compactionItem(key: string, status: FactStatus, text: string): TimelineItemModel {
-  return { key, kind: 'compaction', title: compactionTitle, fact: null, summary: text, filePath: null, status }
+function compactionItem(key: string, status: FactStatus, title: string, summary = ''): TimelineItemModel {
+  return { key, kind: 'compaction', title, fact: null, summary, filePath: null, status }
 }
 
 function stoppedItem(key = 'terminal:interrupted'): TimelineItemModel {
@@ -149,19 +173,6 @@ function pathFromArgs(name: string, args: unknown): string | null {
 
 function firstLine(text: string): string {
   return text.split(/\r?\n/, 1)[0]?.trim() ?? ''
-}
-
-export function failureSummary(output: string): string {
-  const lines = Anser.ansiToText(output).split(/\r?\n/).map(line => line.trim()).filter(Boolean)
-  const diagnostic = lines.findLast(line => /\b[\w.]*(?:error|exception)\b\s*:|:\s*(?:command not found|No such file or directory|Permission denied)\b/i.test(line))
-  const message = diagnostic ?? lines.findLast(line => /^Command (?:exited|timed out|terminated|aborted)\b/.test(line)) ?? lines[0] ?? ''
-  // 提取首行简短错误原因，完整输出与堆栈保留在详情中
-  const reason = message.match(/\b(?:No such file or directory|Permission denied|command not found)\b/i)?.[0]
-  if (reason) return reason
-  if (/^Command timed out\b/.test(message)) return '执行超时'
-  if (/^Command (?:exited|terminated|aborted)\b/.test(message)) return '命令未能完成'
-  const brief = message.replace(/^.*?\b[\w.]*(?:error|exception)\b\s*:\s*/i, '').replace(/^\[Errno \d+\]\s*/, '')
-  return brief && brief.length <= 80 && !/[\\/]|\(os error \d+\)/.test(brief) ? brief : '执行失败，请展开查看'
 }
 
 function record(value: unknown): Record<string, unknown> {

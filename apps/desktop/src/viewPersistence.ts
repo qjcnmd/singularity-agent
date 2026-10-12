@@ -27,7 +27,6 @@ export interface PersistedView {
 }
 
 export interface WorkspaceAppearance {
-  icon: string
   color: string
 }
 

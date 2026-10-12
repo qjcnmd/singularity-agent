@@ -1,0 +1,57 @@
+import { useLayoutEffect, useState } from 'react'
+import { appStore, type AppState } from './appStore'
+import type { FileCandidate, SkillCatalog } from './protocol'
+
+type CandidateQuery<Result> =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'ready'; result: Result }
+  | { status: 'error'; error: Error }
+
+type QueryScope = Pick<AppState, 'selectedWorkspaceId' | 'selectedSessionId' | 'connection'>
+
+export function useFileCandidates(query: string | undefined, scope: QueryScope) {
+  const { selectedWorkspaceId, selectedSessionId, connection } = scope
+  const [files, setFiles] = useState<CandidateQuery<FileCandidate[]>>({ status: 'idle' })
+  useLayoutEffect(() => {
+    // 切换任务或查询时先清除旧候选，避免插入其他任务的文件。
+    if (!query?.trim() || connection !== 'ready' || selectedWorkspaceId === null) {
+      setFiles({ status: 'idle' })
+      return
+    }
+    setFiles({ status: 'loading' })
+    let active = true
+    const queryTimer = setTimeout(() => {
+      void appStore.transport.rpc('file.search', {
+        workspaceId: selectedWorkspaceId,
+        query: query.trim(),
+        limit: 12,
+      }).then(
+        result => { if (active) setFiles({ status: 'ready', result }) },
+        error => { if (active) setFiles({ status: 'error', error: error instanceof Error ? error : new Error(String(error)) }) },
+      )
+    }, 150)
+    return () => { active = false; clearTimeout(queryTimer) }
+  }, [query, selectedSessionId, selectedWorkspaceId, connection])
+  return files
+}
+
+export function useSkillCandidates(enabled: boolean, scope: QueryScope) {
+  const { selectedWorkspaceId, selectedSessionId, connection } = scope
+  const [skills, setSkills] = useState<CandidateQuery<SkillCatalog>>({ status: 'idle' })
+  useLayoutEffect(() => {
+    if (!enabled || connection !== 'ready' || selectedWorkspaceId === null) {
+      setSkills({ status: 'idle' })
+      return
+    }
+    setSkills({ status: 'loading' })
+    let active = true
+    void appStore.transport.rpc('skills.list', { workspaceId: selectedWorkspaceId }).then(
+      result => { if (active) setSkills({ status: 'ready', result }) },
+      error => { if (active) setSkills({ status: 'error', error: error instanceof Error ? error : new Error(String(error)) }) },
+    )
+    // 修改技能前缀只筛选当前目录；切换任务或退出技能输入才使这次读取失效。
+    return () => { active = false }
+  }, [enabled, selectedSessionId, selectedWorkspaceId, connection])
+  return skills
+}

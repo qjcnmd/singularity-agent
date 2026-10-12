@@ -176,7 +176,8 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
           {visibleError !== null && <motion.div key="action-toast" className="action-toast" role="status"
             initial={{ opacity: reducedMotion ? 1 : 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
             transition={{ ...actionToastTransition, duration: reducedMotion ? 0 : actionToastTransition.duration }}>
-            {visibleError.message}
+            <strong>{visibleError.message}</strong>
+            {visibleError.recovery && <span>{visibleError.recovery}</span>}
           </motion.div>}
         </AnimatePresence>
       </main>
