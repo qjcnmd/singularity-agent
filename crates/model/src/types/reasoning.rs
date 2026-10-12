@@ -16,6 +16,9 @@ pub enum ProviderReasoningReplay {
     Chat {
         provider_name: String,
         model_name: String,
+        /// 实际请求地址；旧记录未保存来源地址，不复用其中的私有数据。
+        #[serde(default)]
+        endpoint: String,
         reasoning_content: String,
         /// 保留提供方返回时用的字段名。
         reasoning_field: String,
@@ -26,6 +29,8 @@ pub enum ProviderReasoningReplay {
     Responses {
         provider_name: String,
         model_name: String,
+        #[serde(default)]
+        endpoint: String,
         /// 提供方的完整输出序列，逐字保留；适配器只往后追加 function_call_output 项。
         items: Vec<Value>,
     },
@@ -50,16 +55,18 @@ impl fmt::Debug for ProviderReasoningReplay {
 }
 
 impl ProviderReasoningReplay {
-    /// 判断这段续接数据属于哪个提供方、模型和协议；档位不影响数据身份。
+    /// 续接数据只在原提供方、模型、协议和请求地址下复用；档位不影响数据身份。
     pub(crate) fn is_for_model(
         &self,
         provider_name: &str,
         model_name: &str,
         protocol: ProviderApiProtocol,
+        endpoint: &str,
     ) -> bool {
-        let (provider, model) = self.model_identity();
+        let (provider, model, source_endpoint) = self.model_identity();
         provider == provider_name
             && model == model_name
+            && source_endpoint == endpoint
             && matches!(
                 (self, protocol),
                 (Self::Chat { .. }, ProviderApiProtocol::Chat)
@@ -67,10 +74,12 @@ impl ProviderReasoningReplay {
             )
     }
 
-    fn model_identity(&self) -> (&str, &str) {
+    fn model_identity(&self) -> (&str, &str, &str) {
         match self {
-            Self::Chat { provider_name, model_name, .. }
-            | Self::Responses { provider_name, model_name, .. } => (provider_name, model_name),
+            Self::Chat { provider_name, model_name, endpoint, .. }
+            | Self::Responses { provider_name, model_name, endpoint, .. } => {
+                (provider_name, model_name, endpoint)
+            }
         }
     }
 }

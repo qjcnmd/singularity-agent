@@ -23,10 +23,11 @@ pub(crate) fn openai_chat_stream_request_payload(
     request: &ModelTurnRequest,
     selection: &SelectedModel,
     provider_name: &str,
+    endpoint: &str,
 ) -> Value {
     let mut payload = json!({
         "model": selection.model_name,
-        "messages": openai_messages(&request.messages, selection, provider_name),
+        "messages": openai_messages(&request.messages, selection, provider_name, endpoint),
         "stream": true,
         // provider 实现 OpenAI 兼容的 include_usage 扩展时会在最后一个流块带上 usage；
         // 不支持该扩展的 provider 照样返回合法响应，只是 usage_present=false。
@@ -113,6 +114,7 @@ fn openai_message_payload_with_reasoning(
     message: &ModelMessage,
     selection: &SelectedModel,
     provider_name: &str,
+    endpoint: &str,
 ) -> Value {
     let role = if message.role == ModelRole::Developer && !selection.supports_developer_role {
         json!("system")
@@ -140,7 +142,7 @@ fn openai_message_payload_with_reasoning(
         reasoning_field,
         reasoning_details,
         ..
-    }) = super::reasoning_replay_for(message, selection, provider_name)
+    }) = super::reasoning_replay_for(message, selection, provider_name, endpoint)
     {
         // 续接材料按形态择一发送：有 details 时不再重复发思考文本。
         if !reasoning_details.is_empty() {
@@ -170,14 +172,19 @@ fn openai_message_content(message: &ModelMessage) -> Value {
 }
 
 // Chat 只接受文本工具结果；整批结果闭合后才发送视觉消息，避免拆开并行调用的配对。
-fn openai_messages(messages: &[ModelMessage], selection: &SelectedModel, provider_name: &str) -> Vec<Value> {
+fn openai_messages(
+    messages: &[ModelMessage],
+    selection: &SelectedModel,
+    provider_name: &str,
+    endpoint: &str,
+) -> Vec<Value> {
     let mut result = Vec::new();
     let mut images = Vec::new();
     for message in messages {
         if message.role != ModelRole::Tool && !images.is_empty() {
             result.push(json!({"role": "user", "content": std::mem::take(&mut images)}));
         }
-        result.push(openai_message_payload_with_reasoning(message, selection, provider_name));
+        result.push(openai_message_payload_with_reasoning(message, selection, provider_name, endpoint));
         if message.role == ModelRole::Tool {
             for image in &message.images {
                 images.push(json!({"type": "text", "text": format!("Image from tool call {}:", message.tool_call_id.as_deref().expect("tool result has its call ID"))}));

@@ -199,6 +199,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             Some(ProviderReasoningReplay::Chat {
                 provider_name: config.provider_name.clone(),
                 model_name: model_name.to_string(),
+                endpoint: crate::openai::chat_completions_endpoint(&config.base_url),
                 reasoning_content,
                 reasoning_field,
                 reasoning_details,

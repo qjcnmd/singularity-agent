@@ -78,16 +78,17 @@ impl OpenAiProvider {
         let selection = &self.selected_model;
         let api_protocol = selection.api_protocol;
         let provider_name = &self.config.provider_name;
-        // 一次 attempt 里两种协议的差异只有两处：端点和 payload，都由协议模块提供。
-        let (endpoint, request_payload) = match api_protocol {
-            ProviderApiProtocol::Chat => (
-                chat_completions_endpoint(&self.config.base_url),
-                openai_chat_stream_request_payload(request, selection, provider_name),
-            ),
-            ProviderApiProtocol::Responses => (
-                responses_endpoint(&self.config.base_url),
-                openai_responses_stream_request_payload(request, selection, provider_name),
-            ),
+        let endpoint = match api_protocol {
+            ProviderApiProtocol::Chat => chat_completions_endpoint(&self.config.base_url),
+            ProviderApiProtocol::Responses => responses_endpoint(&self.config.base_url),
+        };
+        let request_payload = match api_protocol {
+            ProviderApiProtocol::Chat => {
+                openai_chat_stream_request_payload(request, selection, provider_name, &endpoint)
+            }
+            ProviderApiProtocol::Responses => {
+                openai_responses_stream_request_payload(request, selection, provider_name, &endpoint)
+            }
         };
         let completion = match provider_future(
             cancellation,

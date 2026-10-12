@@ -10,8 +10,8 @@ mod manager;
 mod request;
 
 pub use format::{
-    CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
-    SessionMetadata, text_item_id, thinking_item_id, tool_item_id, turn_usage_from_model_usage,
+    CURRENT_SESSION_VERSION, CompactionEntry, InterruptedAssistantItem, LedgerRecord, Result, SessionEntry,
+    SessionError, SessionMetadata, text_item_id, thinking_item_id, tool_item_id, turn_usage_from_model_usage,
 };
 pub use manager::{CommittedEntry, SessionData, SessionManager};
 pub use request::RequestContext;

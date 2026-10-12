@@ -29,9 +29,13 @@ const projectedItems = new WeakMap<ExecutionItem, { item: TimelineItemModel; cwd
 export function buildTimeline(session: SessionView | null, userHome?: string | null): TimelineItemModel[] {
   if (!session) return []
   const result: TimelineItemModel[] = []
-  for (const turn of [...session.facts.history, ...session.facts.active]) {
+  const turns = [...session.facts.history, ...session.facts.active]
+  const terminal = session.runtime.terminal
+  for (const turn of turns) {
     const active = session.runtime.activeTurn?.turnId === turn.id
-    for (const item of projectTurn(turn, session.summary.cwd, userHome, active)) result.push(item)
+    const failureFromRuntime = turn === session.facts.active.at(-1)
+      && terminal?.source === 'turn' && terminal.status === 'failed'
+    for (const item of projectTurn(turn, session.summary.cwd, userHome, active, failureFromRuntime)) result.push(item)
   }
   // 提取压缩状态：进行中来自 runtime，失败来自终态
   if (session.runtime.activeCompaction) {
@@ -40,6 +44,11 @@ export function buildTimeline(session: SessionView | null, userHome?: string | n
     const terminal = session.runtime.terminal
     result.push(compactionItem('compaction:failed', 'error', terminal.message ?? '压缩失败'))
   }
+  const lastTurn = turns.at(-1)
+  if (terminal?.source === 'turn' && terminal.status === 'failed'
+    && !(lastTurn?.status === 'failed' && lastTurn.error?.message === (terminal.message ?? '执行失败'))) {
+    result.push(failedItem('terminal:failed', terminal.message ?? '执行失败'))
+  }
   // 若执行被手动中断，末尾追加“已停止”提示
   if (session.runtime.terminal?.source !== 'compaction'
     && session.runtime.terminal?.status === 'interrupted'
@@ -47,7 +56,7 @@ export function buildTimeline(session: SessionView | null, userHome?: string | n
   return result
 }
 
-function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null | undefined, active: boolean): TimelineItemModel[] {
+function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null | undefined, active: boolean, failureFromRuntime: boolean): TimelineItemModel[] {
   const startedAt = turn.startedAt
   const result: TimelineItemModel[] = []
   // 首部 settings 记录没有 turnId，使用 'leading' 占位 key
@@ -83,6 +92,10 @@ function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null |
     })
   }
   if (turn.status === 'interrupted') result.push(stoppedItem(`content:${group}:terminal`))
+  // 保存失败时没有回合错误详情，具体原因由运行状态显示。
+  if (turn.status === 'failed' && (turn.error || !failureFromRuntime)) {
+    result.push(failedItem(`content:${group}:terminal`, turn.error?.message ?? '执行失败'))
+  }
   return result
 }
 
@@ -93,6 +106,10 @@ function compactionItem(key: string, status: FactStatus, text: string): Timeline
 
 function stoppedItem(key = 'terminal:interrupted'): TimelineItemModel {
   return { key, kind: 'terminal', title: factStatusText.cancelled, fact: null, summary: '', filePath: null }
+}
+
+function failedItem(key: string, message: string): TimelineItemModel {
+  return { key, kind: 'terminal', title: '执行失败', fact: null, summary: message, filePath: null, status: 'error' }
 }
 
 export function toolArgument(name: string, args: unknown): string | null {

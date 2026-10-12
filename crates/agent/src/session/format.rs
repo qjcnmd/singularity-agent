@@ -73,9 +73,7 @@ pub enum SessionMetadata {
 #[serde(tag = "recordType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LedgerRecord {
     /// 执行被手动中断前已生成的内容（仅供历史展示，不进入后续模型上下文）。
-    AssistantInterrupted {
-        items: Vec<singularity_protocol::HistoryItem>,
-    },
+    AssistantInterrupted { items: Vec<InterruptedAssistantItem> },
     /// 历史会话中的工具正文裁剪记录（兼容旧数据读取）。
     ToolResultPruned {
         #[serde(rename = "entryId")]
@@ -108,6 +106,26 @@ pub enum LedgerRecord {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         user_stopped: bool,
     },
+}
+
+/// 中断前生成的正文与思考；保存显示身份，避免界面协议变更影响会话格式。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InterruptedAssistantItem {
+    Message { id: String, role: String, text: String },
+    Thinking { id: String, text: String },
+}
+
+impl InterruptedAssistantItem {
+    /// 历史读取与实时完成事件共用同一份公开内容。
+    pub fn into_public_item(self) -> singularity_protocol::HistoryItem {
+        match self {
+            Self::Message { id, role, text } => {
+                singularity_protocol::HistoryItem::Message { id, role, text, images: Vec::new() }
+            }
+            Self::Thinking { id, text } => singularity_protocol::HistoryItem::Thinking { id, text },
+        }
+    }
 }
 
 /// 会话 JSONL 单行条目枚举。物理行顺序对应事件写入顺序。

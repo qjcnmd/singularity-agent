@@ -29,7 +29,12 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
 
   if (item.timing) return <TurnDuration itemKey={item.key} {...item.timing} />
 
-  if (item.kind === 'terminal') return <span className="stopped-marker" data-item-id={item.key}>{item.title}</span>
+  if (item.kind === 'terminal') {
+    if (timelineStatus(item) === 'error') return <div className="turn-error" data-item-id={item.key} role="alert">
+      <CircleAlert size={15} strokeWidth={1.6} aria-hidden="true" /><span>{item.summary}</span>
+    </div>
+    return <span className="stopped-marker" data-item-id={item.key}>{item.title}</span>
+  }
 
   if (item.kind === 'user' || item.kind === 'assistant') {
     const body = canCollapse && !expanded ? preview(timelineBody(item)) : timelineBody(item)

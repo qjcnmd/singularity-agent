@@ -23,8 +23,9 @@ pub(crate) fn openai_responses_stream_request_payload(
     request: &ModelTurnRequest,
     selection: &SelectedModel,
     provider_name: &str,
+    endpoint: &str,
 ) -> Value {
-    let (instructions, input) = openai_responses_input(&request.messages, selection, provider_name);
+    let (instructions, input) = openai_responses_input(&request.messages, selection, provider_name, endpoint);
     let mut payload = json!({
         "model": selection.model_name,
         "input": input,
@@ -172,6 +173,7 @@ pub(crate) fn parse_openai_responses_response(
         Some(ProviderReasoningReplay::Responses {
             provider_name: config.provider_name.clone(),
             model_name: model_name.to_string(),
+            endpoint: crate::openai::responses_endpoint(&config.base_url),
             items: output,
         })
     } else {
@@ -226,6 +228,7 @@ pub(crate) fn openai_responses_input(
     messages: &[ModelMessage],
     selection: &SelectedModel,
     provider_name: &str,
+    endpoint: &str,
 ) -> (Option<String>, Vec<Value>) {
     let instruction_count =
         messages.iter().take_while(|message| message.role == ModelRole::Developer).count();
@@ -247,7 +250,7 @@ pub(crate) fn openai_responses_input(
             }
             ModelRole::Assistant => {
                 if let Some(ProviderReasoningReplay::Responses { items: replay_items, .. }) =
-                    super::reasoning_replay_for(message, selection, provider_name)
+                    super::reasoning_replay_for(message, selection, provider_name, endpoint)
                 {
                     items.extend(replay_items.iter().cloned());
                 } else {

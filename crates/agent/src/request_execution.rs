@@ -13,9 +13,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentError;
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
-use crate::message::{AgentMessage, ItemScope};
 use crate::session::{
-    LedgerRecord, RequestDefinitions, SessionError, SessionWriter, append_record_async, with_writer_async,
+    InterruptedAssistantItem, LedgerRecord, RequestDefinitions, SessionError, SessionWriter,
+    append_record_async, with_writer_async,
 };
 
 /// 声明的输出预算同时受模型上限、请求用途和窗口余量约束。安全余量弥补启发式
@@ -243,21 +243,27 @@ impl RequestAttempt<'_> {
 
     /// 最终中断时留下的公开内容只用来显示，不会成为模型上下文里的正式消息。
     async fn finish_interrupted(&mut self) -> Result<(), SessionError> {
-        let message = AgentMessage::Assistant {
-            content: crate::message::public_thinking_text_blocks(
-                std::mem::take(&mut self.visible_reasoning),
-                std::mem::take(&mut self.visible_text),
-            ),
-            provider_reasoning_replay: None,
-        };
-        let items = message.public_items(&self.result_entry_id, ItemScope::Completion);
+        let mut items = Vec::new();
+        if !self.visible_reasoning.is_empty() {
+            items.push(InterruptedAssistantItem::Thinking {
+                id: crate::session::thinking_item_id(&self.result_entry_id, 0),
+                text: std::mem::take(&mut self.visible_reasoning),
+            });
+        }
+        if !self.visible_text.is_empty() {
+            items.push(InterruptedAssistantItem::Message {
+                id: crate::session::text_item_id(&self.result_entry_id, 0),
+                role: "assistant".into(),
+                text: std::mem::take(&mut self.visible_text),
+            });
+        }
         if !items.is_empty() {
             append_record_async(self.writer, LedgerRecord::AssistantInterrupted { items: items.clone() })
                 .await?;
         }
         (self.on_event)(AgentEvent::MessageFinished {
             message_id: self.result_entry_id.clone(),
-            items,
+            items: items.into_iter().map(InterruptedAssistantItem::into_public_item).collect(),
             failed: true,
         });
         Ok(())

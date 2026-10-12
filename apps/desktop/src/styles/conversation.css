@@ -196,6 +196,8 @@
 
 
 .stopped-marker { align-self: flex-start; padding: 0 6px; border-radius: 6px; background: var(--surface-hover); color: var(--ink-faint); font-size: 11px; line-height: 18px; }
+.turn-error { display: flex; align-items: flex-start; gap: 8px; color: var(--danger); font-size: 13px; line-height: 20px; overflow-wrap: anywhere; }
+.turn-error svg { flex-shrink: 0; margin-top: 2px; }
 
 .code-block { border-radius: 16px; position: relative; margin: 8px 0; overflow: hidden; background: var(--composer-background); border: 1px solid var(--material-edge); }
 .code-block-header { display: flex; align-items: center; justify-content: space-between; padding: 4px 10px; font-size: 12px; color: var(--ink-soft); border-bottom: 1px solid var(--line); }

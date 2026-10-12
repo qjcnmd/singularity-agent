@@ -5,6 +5,7 @@ import type { ConnectionStatus, StreamEnvelope, AppBootstrap, ThreadSummary } fr
 import { actionOrigin, pendingKey } from './storeActions'
 import { DraftStore, DraftStorageError, hasDraft, type DraftSnapshot } from './drafts'
 import { prependExecutionHistory } from './execution'
+import { buildTimeline } from './timeline'
 import { isBlankSession } from './sessionState'
 
 const SESSION_PAGE_SIZE = 40
@@ -197,7 +198,19 @@ export class SessionStore {
         limit: SESSION_PAGE_SIZE,
       })
       if (!this.readIsCurrent(request, sessionId)) return await this.followLatestRead(request)
-      this.applySync(acceptSessionRead(this.state, session))
+      const accepted = acceptSessionRead(this.state, session)
+      let restored = accepted.session
+      const anchor = this.state.viewportAnchors[sessionId]
+      // 保存的阅读位置可能在当前页之前，先补齐历史再显示，避免跳到另一轮。
+      while (restored !== null && restored.nextCursor !== null && anchor?.mode === 'anchored'
+        && anchor.anchorItemId !== null && !buildTimeline(restored).some(item => item.key === anchor.anchorItemId)) {
+        const older = await this.transport.rpc('session.read', {
+          sessionId, beforeTurn: restored.nextCursor, limit: SESSION_PAGE_SIZE,
+        })
+        if (!this.readIsCurrent(request, sessionId)) return await this.followLatestRead(request)
+        restored = prependExecutionHistory(restored, older.history)
+      }
+      this.applySync({ ...accepted, session: restored })
       this.patch({ sessionLoad: { status: 'idle', error: null } })
       return null
     } catch (error) {

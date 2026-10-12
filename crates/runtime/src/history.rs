@@ -5,7 +5,7 @@
 
 use singularity_agent::{
     message::{AgentMessage, ContentBlock, ItemScope},
-    session::{LedgerRecord, SessionData, SessionEntry, SessionMetadata},
+    session::{InterruptedAssistantItem, LedgerRecord, SessionData, SessionEntry, SessionMetadata},
 };
 use singularity_protocol::{HistoryItem, SessionModelUsage, ThreadSummary, ThreadTurn, TurnStatus};
 
@@ -111,7 +111,7 @@ impl IndexedTurn {
                     record: LedgerRecord::AssistantInterrupted { items: interrupted },
                     ..
                 } => {
-                    items.extend(interrupted.iter().cloned());
+                    items.extend(interrupted.iter().cloned().map(InterruptedAssistantItem::into_public_item));
                 }
                 SessionEntry::Record {
                     record: LedgerRecord::OperationStarted { turn_id: None },

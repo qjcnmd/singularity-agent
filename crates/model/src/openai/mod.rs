@@ -18,18 +18,18 @@ pub(crate) use wire::{
 use crate::config::selection::SelectedModel;
 use crate::types::{ModelMessage, ProviderReasoningReplay};
 
-/// 编码边界上挑选「私有续接材料」：只有身份与当前 provider、模型、协议都一致的数据
+/// 编码边界上挑选「私有续接材料」：只有当前 provider、模型、协议和请求地址都一致的数据
 /// 才写进请求；不一致返回 `None` 时调用方只略过这部分私有载荷，公开内容与账本照常。
 /// Chat 与 Responses 共用这一条身份规则，账本消息本身不被复制或改写。
 pub(crate) fn reasoning_replay_for<'a>(
     message: &'a ModelMessage,
     selection: &SelectedModel,
     provider_name: &str,
+    endpoint: &str,
 ) -> Option<&'a ProviderReasoningReplay> {
-    message
-        .provider_reasoning_replay
-        .as_ref()
-        .filter(|replay| replay.is_for_model(provider_name, &selection.model_name, selection.api_protocol))
+    message.provider_reasoning_replay.as_ref().filter(|replay| {
+        replay.is_for_model(provider_name, &selection.model_name, selection.api_protocol, endpoint)
+    })
 }
 
 pub(crate) struct ReasoningWireDecision<'a> {
