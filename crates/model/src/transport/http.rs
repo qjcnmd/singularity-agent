@@ -6,13 +6,19 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{ModelErrorKind, ProviderError, provider_error_kind_for_http_status};
 use crate::{HTTP_STATUS_CONFLICT, PROVIDER_TIMEOUT_SECONDS};
 
+/// 模型调用与目录查询共用 ring；reqwest 的无默认加密实现模式要求先安装 provider。
+pub(crate) fn client_builder() -> reqwest::ClientBuilder {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+}
+
 /// 获取全局共享的 reqwest Client 单例（复用连接池与 TLS 会话）。
 pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     if let Some(client) = CLIENT.get() {
         return Ok(client.clone());
     }
-    let client = reqwest::Client::builder()
+    let client = client_builder()
         // 禁用全局 gzip，保证 SSE 流式响应按原始到达字节即时解析
         .no_gzip()
         .read_timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))

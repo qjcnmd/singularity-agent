@@ -27,6 +27,24 @@ pub struct ModelRequestSnapshot {
     pub model_preferences: RequestPreferences,
 }
 
+/// 一页历史共用的指令与工具；每次读取都携带本页引用的完整定义。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRequestDefinitions {
+    pub messages: Vec<RequestMessage>,
+    pub tools: Vec<RequestTool>,
+}
+
+/// 历史请求引用页内定义；输出偏好仍属于各自的请求。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRequestReference {
+    pub definitions_id: String,
+    pub model_preferences: RequestPreferences,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

@@ -7,7 +7,10 @@ use singularity_agent::{
     message::{AgentMessage, ContentBlock, ItemScope},
     session::{InterruptedAssistantItem, LedgerRecord, SessionData, SessionEntry, SessionMetadata},
 };
-use singularity_protocol::{HistoryItem, SessionModelUsage, ThreadSummary, ThreadTurn, TurnStatus};
+use singularity_protocol::{
+    HistoryItem, ModelRequestDefinitions, ModelRequestReference, SessionModelUsage, ThreadSummary,
+    ThreadTurn, TurnStatus,
+};
 
 /// 会话历史的按轮分组索引。
 pub(crate) struct IndexedTurn {
@@ -27,7 +30,11 @@ impl IndexedTurn {
     }
 
     /// 将持久化条目投影为公开的 `ThreadTurn` 历史视图对象。
-    pub fn project(&self, session: &SessionData) -> ThreadTurn {
+    pub fn project(
+        &self,
+        session: &SessionData,
+        definitions: &mut std::collections::BTreeMap<String, ModelRequestDefinitions>,
+    ) -> ThreadTurn {
         let mut items = Vec::new();
         let mut started_at = None;
         let mut finished_at = None;
@@ -89,13 +96,19 @@ impl IndexedTurn {
                     record: LedgerRecord::ModelRequest { observation, context },
                     ..
                 } => {
-                    let mut observation = observation.clone();
+                    let observation = observation.clone();
                     if let Some(context) = context {
-                        observation.request_head = Some(session.request_head(context));
+                        definitions
+                            .entry(context.definitions.clone())
+                            .or_insert_with(|| session.request_definitions(&context.definitions));
                         request_positions.insert(observation.request_id.clone(), items.len());
                         items.push(HistoryItem::Request {
                             started_at: Some(timestamp.clone()),
                             observation,
+                            context: ModelRequestReference {
+                                definitions_id: context.definitions.clone(),
+                                model_preferences: context.model_preferences.clone(),
+                            },
                         });
                     } else {
                         // 每次请求只有一个终态观测；开始时刻和请求详情保留在原条目。
@@ -103,7 +116,6 @@ impl IndexedTurn {
                         let HistoryItem::Request { observation: previous, .. } = &mut items[position] else {
                             unreachable!()
                         };
-                        observation.request_head = previous.request_head.take();
                         *previous = observation;
                     }
                 }

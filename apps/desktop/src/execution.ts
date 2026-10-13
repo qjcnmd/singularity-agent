@@ -117,7 +117,14 @@ function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
       const id = wire.type === 'request' ? wire.observation.requestId : wire.id
       const position = positions.get(id)
       const previous = position === undefined ? undefined : items[position]
-      const item = historyItemToExecution(wire, previous, currentRequest)
+      let item: ExecutionItem
+      if (wire.type === 'request') {
+        const definition = page.requestDefinitions[wire.context.definitionsId]
+        if (!definition) throw new Error('历史请求缺少对应的指令与工具定义。')
+        item = requestItem({ ...wire.observation, requestHead: { ...wire.context, ...definition } }, previous, wire.startedAt ?? null)
+      } else {
+        item = historyItemToExecution(wire, previous, currentRequest)
+      }
       if (position === undefined) {
         positions.set(id, items.length)
         items.push(item)

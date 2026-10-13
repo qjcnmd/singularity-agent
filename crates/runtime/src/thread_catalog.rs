@@ -253,11 +253,16 @@ impl ThreadSnapshot {
                 .ok_or_else(|| CatalogError::AnchorNotFound(anchor.to_string()))?,
         };
         let start = end.saturating_sub(limit);
-        let turns = self.turns[start..end].iter().map(|turn| turn.project(&self.session)).collect();
+        let mut request_definitions = std::collections::BTreeMap::new();
+        let turns = self.turns[start..end]
+            .iter()
+            .map(|turn| turn.project(&self.session, &mut request_definitions))
+            .collect();
         Ok(ThreadReadPage {
             summary: self.summary.clone(),
             turns,
             next_cursor: (start > 0).then(|| self.turns[start].cursor()),
+            request_definitions,
         })
     }
 }

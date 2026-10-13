@@ -81,6 +81,8 @@ pub enum HistoryItem {
         #[cfg_attr(feature = "typescript", ts(optional))]
         started_at: Option<String>,
         observation: RequestObservation,
+        /// 指令与工具从所属历史页的定义表读取，不逐请求重复传输。
+        context: crate::ModelRequestReference,
     },
     Message {
         id: String,

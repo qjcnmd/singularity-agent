@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(test)]
+mod tests;
+
 impl AppServer {
     pub fn image_data(&self, session_id: &str, image_id: &str) -> Result<String, RpcError> {
         self.catalog.image_data(session_id, image_id).map_err(catalog_error)
@@ -16,7 +19,7 @@ impl AppServer {
             let reservation = slot.conversation().reserve_start(input).map_err(conversation_error)?;
             (slot, reservation)
         };
-        self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
+        let reservation = self.begin_operation(session_id, &slot, reservation, SlotState::begin_turn)?;
         let item_id = reservation.submitted_item_id().expect("reserve_start binds submitted input");
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         self.spawn_operation(session_id, slot, reservation, Some(SubmissionReceipt { item_id, sender }));
@@ -60,18 +63,27 @@ impl AppServer {
         Ok(result)
     }
 
-    /// 预订成立后先读 history，再在同一把状态锁里初始化并发布这次操作的投影。
+    /// 预订成立后读取历史并发布开始状态；读取失败时释放预订并通知等待者。
     fn begin_operation(
         &self,
         session_id: &str,
         slot: &ConversationSlot,
+        reservation: OperationReservation,
         begin: impl FnOnce(&mut SlotState, Arc<singularity_runtime::ThreadSnapshot>),
-    ) -> Result<(), RpcError> {
-        let history = self.read_persisted_history(slot)?;
+    ) -> Result<OperationReservation, RpcError> {
+        let history = match self.read_persisted_history(slot) {
+            Ok(history) => history,
+            Err(error) => {
+                let mut state = slot.lock_state();
+                drop(reservation);
+                self.publish_session_locked(session_id, slot, &mut state);
+                return Err(error);
+            }
+        };
         let mut state = slot.lock_state();
         begin(&mut state, history);
         self.publish_session_locked(session_id, slot, &mut state);
-        Ok(())
+        Ok(reservation)
     }
 
     pub(super) fn publish_session_locked(
@@ -94,7 +106,7 @@ impl AppServer {
             let reservation = slot.conversation().reserve_compaction().map_err(conversation_error)?;
             (slot, reservation)
         };
-        self.begin_operation(session_id, &slot, |state, history| {
+        let reservation = self.begin_operation(session_id, &slot, reservation, |state, history| {
             state.begin_compaction(history, now_iso());
         })?;
         self.spawn_operation(session_id, slot, reservation, None);

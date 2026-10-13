@@ -24,7 +24,11 @@ export type FileCandidate = { path: string, };
 
 export type FileSearchParams = { workspaceId: string, query: string, limit: number, };
 
-export type HistoryItem = { "type": "request", startedAt?: string, observation: RequestObservation, } | { "type": "message", id: string, role: string, text: string, images?: Array<ImageAttachment>, } | { "type": "thinking", id: string, text: string, } | { "type": "tool_call", id: string, name: string, args: JsonValue, } | { "type": "tool_result", id: string, output: string, images?: Array<ImageAttachment>,
+export type HistoryItem = { "type": "request", startedAt?: string, observation: RequestObservation,
+/**
+ * 指令与工具从所属历史页的定义表读取，不逐请求重复传输。
+ */
+context: ModelRequestReference, } | { "type": "message", id: string, role: string, text: string, images?: Array<ImageAttachment>, } | { "type": "thinking", id: string, text: string, } | { "type": "tool_call", id: string, name: string, args: JsonValue, } | { "type": "tool_result", id: string, output: string, images?: Array<ImageAttachment>,
 /**
  * read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
  */
@@ -38,9 +42,11 @@ export type ItemRef = { itemId: string, };
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
 
+export type McpConnectionStatus = "not_connected" | "connecting" | "connected" | "failed" | "disabled";
+
 export type McpInspectParams = { serverId: string, workspaceId: string | null, reconnect: boolean, };
 
-export type McpInspection = { serverId: string, connected: boolean, error: string | null, tools: Array<McpToolInfo>, };
+export type McpInspection = { serverId: string, status: McpConnectionStatus, error: string | null, tools: Array<McpToolInfo>, };
 
 export type McpSaveParams = { server: McpServerInput, };
 
@@ -65,6 +71,10 @@ automaticFields: Array<ModelConfigurationField> | null, displayName: string | nu
  * Chat 输出上限使用的 wire 字段名；`None` 表示发送 `max_tokens`。
  */
 chatOutputTokensField: string | null, requiresReasoningContentForToolCalls: boolean | null, };
+
+export type ModelRequestDefinitions = { messages: Array<RequestMessage>, tools: Array<RequestTool>, };
+
+export type ModelRequestReference = { definitionsId: string, modelPreferences: RequestPreferences, };
 
 export type ModelRequestSnapshot = { definitionsId: string, messages: Array<RequestMessage>, tools: Array<RequestTool>, modelPreferences: RequestPreferences, };
 
@@ -216,7 +226,7 @@ export type SkillMetadata = { name: string, description: string, path: string, }
 
 export type StreamEnvelope = { revision: number, } & ({ "type": "ready" } | { "type": "app_changed", payload: AppBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: TurnEventEnvelope, } | { "type": "session_settled", sessionId: string, payload: SessionRuntime, } | { "type": "resync_required" });
 
-export type ThreadReadPage = { summary: ThreadSummary, turns: Array<ThreadTurn>, nextCursor: string | null, };
+export type ThreadReadPage = { summary: ThreadSummary, turns: Array<ThreadTurn>, nextCursor: string | null, requestDefinitions: { [key in string]: ModelRequestDefinitions }, };
 
 export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, updatedAt: string, title: string | null, status: TurnStatus | null,
 /**

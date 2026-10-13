@@ -1,7 +1,7 @@
 import { reduceUnread, initialSyncState, acceptBootstrap, acceptSessionRead, resetBaseline, reduceStream, type SyncState } from './sync'
 import { loadPersisted, persistView, type PersistedView } from './viewPersistence'
 import { RpcFailure, RpcClient, isConnectionFailure } from './rpcClient'
-import type { ConnectionStatus, StreamEnvelope, AppBootstrap, ThreadSummary } from './protocol'
+import type { ConnectionStatus, StreamEnvelope, AppBootstrap, ThreadSummary, UserQuestionAnswer } from './protocol'
 import { actionOrigin, pendingKey } from './storeActions'
 import { DraftStore, DraftStorageError, hasDraft, type DraftSnapshot } from './drafts'
 import { prependExecutionHistory } from './execution'
@@ -27,8 +27,11 @@ interface SessionLoadState {
 
 interface SessionReadFailure { error: unknown }
 
+export interface QuestionDraft { itemId: string; index: number; answers: UserQuestionAnswer[] }
+
 export interface AppState extends PersistedView, SyncState {
   drafts: DraftSnapshot | null
+  questionDrafts: Readonly<Record<string, QuestionDraft>>
   connection: ConnectionStatus
   sessionLoad: SessionLoadState
   unreadSessions: ReadonlySet<string>
@@ -45,6 +48,7 @@ export class SessionStore {
     ...loadPersisted(),
     ...initialSyncState(),
     drafts: null,
+    questionDrafts: {},
     connection: 'connecting',
     sessionLoad: { status: 'idle', error: null },
     unreadSessions: new Set(),
@@ -54,7 +58,7 @@ export class SessionStore {
     settingsOpen: false,
   }
   private readonly listeners = new Set<() => void>()
-  private notification: ReturnType<typeof setTimeout> | null = null
+  private notification: number | null = null
   private viewSave: ReturnType<typeof setTimeout> | null = null
   /** Store 持有的连接。设置、补全等局部查询直接复用它，不为每个查询维护
    *  专用转发方法；传输生命周期（start/stop）与状态同步仍由 Store 独占。 */
@@ -94,7 +98,7 @@ export class SessionStore {
     this.flushView()
     window.removeEventListener('pagehide', this.flushView)
     this.transport.stop()
-    if (this.notification !== null) clearTimeout(this.notification)
+    if (this.notification !== null) cancelAnimationFrame(this.notification)
     this.notification = null
   }
 
@@ -255,6 +259,10 @@ export class SessionStore {
     this.applySync(state, frame.type === 'turn_event' && (
       frame.payload.method === 'item/agentMessage/delta' || frame.payload.method === 'item/agentThinking/delta'
       || frame.payload.method === 'tool/execution/update'))
+    if ((frame.type === 'session_changed' || frame.type === 'session_settled')
+      && state.liveSessions[frame.sessionId]?.sessionRevision === frame.payload.sessionRevision) {
+      this.retainQuestionDraft(frame.sessionId, frame.payload.pendingQuestion?.itemId)
+    }
     if (effects.includes('resync')) void this.resync()
     if (effects.includes('read_selected') && this.state.selectedSessionId !== null) {
       void this.readSession(this.state.selectedSessionId).then(() => this.refreshBootstrap())
@@ -420,6 +428,9 @@ export class SessionStore {
   }
 
   protected patch(patch: Partial<AppState>, progress = false): void {
+    if (patch.session) patch = { ...patch, questionDrafts: retainedQuestionDrafts(
+      this.state.questionDrafts, patch.session.summary.threadId, patch.session.runtime.pendingQuestion?.itemId,
+    ) }
     if (patch.liveSessions !== undefined || patch.selectedSessionId !== undefined) {
       patch = { ...patch, unreadSessions: reduceUnread(
         this.state.unreadSessions,
@@ -429,15 +440,21 @@ export class SessionStore {
       ) }
     }
     this.state = { ...this.state, ...patch }
-    // 节流优化：高频流式事件合并为 50ms 批量通知，终态与连接状态变化立即通知
-    if (progress) this.notification ??= setTimeout(this.notify, 50)
+    // 同一帧的增量合并通知；终态与连接状态变化立即通知。
+    if (progress) this.notification ??= requestAnimationFrame(this.notify)
     else this.notify()
   }
 
   private readonly notify = (): void => {
-    if (this.notification !== null) clearTimeout(this.notification)
+    if (this.notification !== null) cancelAnimationFrame(this.notification)
     this.notification = null
     for (const listener of this.listeners) listener()
+  }
+
+  /** 切任务时 session 暂为空；只在后端确认问题结束或被替换后丢弃答案。 */
+  protected retainQuestionDraft(sessionId: string, itemId?: string): void {
+    const questionDrafts = retainedQuestionDrafts(this.state.questionDrafts, sessionId, itemId)
+    if (questionDrafts !== this.state.questionDrafts) this.patch({ questionDrafts })
   }
 
   protected saveView(patch: Partial<PersistedView>, continuous = false): void {
@@ -457,4 +474,11 @@ export class SessionStore {
       persistView(this.state)
     } catch { /* 偏好保存失败不阻塞导航。 */ }
   }
+}
+
+function retainedQuestionDrafts(drafts: AppState['questionDrafts'], sessionId: string, itemId?: string): AppState['questionDrafts'] {
+  if (drafts[sessionId] === undefined || drafts[sessionId].itemId === itemId) return drafts
+  const retained = { ...drafts }
+  delete retained[sessionId]
+  return retained
 }

@@ -51,6 +51,8 @@ pub(crate) fn openai_responses_stream_request_payload(
                         "name": tool.name,
                         "description": tool.description,
                         "parameters": tool.parameters_schema,
+                        // 保留工具允许省略的参数，避免 Responses 自动改写为 strict schema。
+                        "strict": false,
                     })
                 })
                 .collect::<Vec<_>>()

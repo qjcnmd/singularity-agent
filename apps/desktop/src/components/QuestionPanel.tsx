@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
+import { useLayoutEffect, useRef, type FormEvent } from 'react'
 import { ChevronLeft, ChevronRight, Pencil } from 'lucide-react'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import type { PendingQuestion, UserQuestionAnswer } from '../protocol'
@@ -6,10 +6,16 @@ import type { PendingQuestion, UserQuestionAnswer } from '../protocol'
 /** Agent 交互提问面板：逐题分页填写，完成后统一提交给等待中的工具调用。 */
 export function QuestionPanel({ request, state }: {
   request: PendingQuestion
-  state: Pick<AppState, 'selectedSessionId' | 'pendingActions' | 'actionErrors' | 'connection'>
+  state: Pick<AppState, 'selectedSessionId' | 'questionDrafts' | 'pendingActions' | 'actionErrors' | 'connection'>
 }) {
-  const [index, setIndex] = useState(0)
-  const [answers, setAnswers] = useState<UserQuestionAnswer[]>(() => request.questions.map(question => ({ id: question.id, selected: [], text: '', skipped: false })))
+  const sessionId = state.selectedSessionId!
+  const saved = state.questionDrafts[sessionId]
+  const draft: AppState['questionDrafts'][string] = saved?.itemId === request.itemId ? saved : {
+    itemId: request.itemId, index: 0,
+    answers: request.questions.map(question => ({ id: question.id, selected: [], text: '', skipped: false })),
+  }
+  const { index, answers } = draft
+  const setIndex = (index: number, values = answers) => appStore.setQuestionDraft(sessionId, { ...draft, answers: values, index })
   const body = useRef<HTMLFieldSetElement>(null)
   const origin = actionOrigin.control(state.selectedSessionId, request.itemId)
   const submitting = state.pendingActions.has(pendingKey('session.answerQuestion', origin))
@@ -24,26 +30,25 @@ export function QuestionPanel({ request, state }: {
   useLayoutEffect(() => {
     body.current?.scrollTo(0, 0)
     body.current?.querySelector<HTMLElement>('button, textarea')?.focus({ preventScroll: true })
-  }, [index])
+  }, [index, sessionId, request.itemId])
 
-  function update(patch: Partial<UserQuestionAnswer>) {
+  function update(patch: Partial<UserQuestionAnswer>, nextIndex = index) {
     const next = answers.map((value, at) => at === index ? { ...value, ...patch } : value)
-    setAnswers(next)
+    setIndex(nextIndex, next)
     return next
   }
 
   function advance(values = answers) {
-    if (!last) { setIndex(index + 1); return }
+    if (!last) { setIndex(index + 1, values); return }
     const missing = values.findIndex(value => !value.skipped && value.selected.length === 0 && !value.text.trim())
-    if (missing >= 0) { setIndex(missing); return }
+    if (missing >= 0) { setIndex(missing, values); return }
     void appStore.answerQuestion(request.itemId, values)
   }
 
   function choose(label: string) {
     update({ selected: question.multiSelect
       ? answer.selected.includes(label) ? answer.selected.filter(value => value !== label) : [...answer.selected, label]
-      : [label], text: question.multiSelect ? answer.text : '', skipped: false })
-    if (!question.multiSelect && !last) setIndex(index + 1)
+      : [label], text: question.multiSelect ? answer.text : '', skipped: false }, !question.multiSelect && !last ? index + 1 : index)
   }
 
   function submit(event: FormEvent) {

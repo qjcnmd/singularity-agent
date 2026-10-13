@@ -44,7 +44,7 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
         data-item-id={item.key}
         aria-label={`${item.title}，${factStatusText[timelineStatus(item)]}`}
       >
-        <div className="timeline-body message-body">{item.kind === 'user' ? <div className="user-text">{body}</div> : <MarkdownBody text={body} />}</div>
+        <div className="timeline-body message-body">{item.kind === 'user' ? <div className="user-text">{body}</div> : <MarkdownBody text={body} streaming={timelineStatus(item) === 'running'} />}</div>
         {sessionId && item.fact?.images && <AttachedImages sessionId={sessionId} images={item.fact.images} />}
         {canCollapse && (
           <button type="button" className="expand-button" aria-expanded={expanded} {...selectionGuard(() => setExpanded((value) => !value))}>
@@ -106,7 +106,7 @@ function ReasoningRow({ item }: Props) {
   const guard = useSelectionGuard()
   const running = timelineStatus(item) === 'running'
   const text = timelineBody(item).trim().replace(/\n[\t \r]*\n+/g, '\n')
-  const summary = text.slice(text.lastIndexOf('\n') + 1)
+  const summary = running ? text.slice(text.lastIndexOf('\n') + 1) : text.split('\n')[0]
   useLayoutEffect(() => {
     const node = summaryRef.current, measure = measureRef.current
     if (!node || !measure) return
@@ -123,8 +123,7 @@ function ReasoningRow({ item }: Props) {
   useLayoutEffect(() => {
     const node = summaryRef.current
     if (!node) return
-    if (showFullText) { node.scrollLeft = 0; return }
-    if (!running) return
+    if (showFullText || !running) { node.scrollLeft = 0; return }
     const start = node.scrollLeft
     const end = Math.max(0, node.scrollWidth - node.clientWidth)
     if (reducedMotion || end <= start) { node.scrollLeft = end; return }

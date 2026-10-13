@@ -1,9 +1,10 @@
 //! 正文渲染：Markdown（GFM、数学公式）与代码块布局。
 //!
 //! 时间线条目与轨迹详情都显示模型正文，渲染规则由本模块统一提供。本模块只承载
-//! 共用渲染与代码块布局，不持有时线条目的编排状态，代码高亮由 highlight 提供。
+//! 共用渲染与代码块布局，不持有时间线条目的编排状态，代码高亮由 highlight 提供。
 
-import { isValidElement, memo, type ReactNode } from 'react'
+import { isValidElement, memo, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { useReducedMotion } from 'motion/react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
@@ -13,7 +14,48 @@ import { CopyButton } from './components/CopyButton'
 import { CodeTokens, useCodeTokens } from './highlight'
 import { useSelectionGuard } from './interactions'
 
-export function MarkdownBody({ text }: { text: string }) {
+export function MarkdownBody({ text, streaming = false }: { text: string; streaming?: boolean }) {
+  return <RenderedMarkdown text={useStreamedText(text, streaming)} />
+}
+
+/** 只平滑正在输出的正文；历史、替换与终态直接显示完整文本。 */
+function useStreamedText(text: string, streaming: boolean) {
+  const reducedMotion = useReducedMotion()
+  const [visible, setVisible] = useState(text)
+  const shown = useRef(text)
+  const lastPaint = useRef(0)
+  useLayoutEffect(() => {
+    if (!streaming || reducedMotion || !text.startsWith(shown.current)) {
+      shown.current = text
+      setVisible(text)
+      return
+    }
+    const start = shown.current.length
+    if (start === text.length) return
+    const started = performance.now()
+    let frame: number
+    const reveal = (now: number) => {
+      // 将服务端成批到达的文字摊到 80ms，避免一截一截跳出。
+      const progress = Math.min(1, (now - started) / 80)
+      // 高刷新率屏幕也不必每帧重新解析 Markdown。
+      if (progress === 1 || now - lastPaint.current >= 1000 / 60) {
+        let end = start + Math.ceil((text.length - start) * progress)
+        // 不在 UTF-16 代理对中间截断 emoji 等字符。
+        const previous = text.charCodeAt(end - 1)
+        if (end < text.length && previous >= 0xd800 && previous <= 0xdbff) end += 1
+        shown.current = text.slice(0, end)
+        lastPaint.current = now
+        setVisible(shown.current)
+      }
+      if (progress < 1) frame = requestAnimationFrame(reveal)
+    }
+    frame = requestAnimationFrame(reveal)
+    return () => cancelAnimationFrame(frame)
+  }, [text, streaming, reducedMotion])
+  return !streaming || reducedMotion || !text.startsWith(visible) ? text : visible
+}
+
+const RenderedMarkdown = memo(function RenderedMarkdown({ text }: { text: string }) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm, remarkMath]}
@@ -23,7 +65,7 @@ export function MarkdownBody({ text }: { text: string }) {
       {text || ' '}
     </ReactMarkdown>
   )
-}
+})
 
 function MarkdownTable({ children }: { children?: ReactNode }) {
   return <div className="markdown-table-scroll"><table>{children}</table></div>

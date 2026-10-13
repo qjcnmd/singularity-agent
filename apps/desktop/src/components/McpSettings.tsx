@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { appStore } from '../appStore'
-import type { McpInspection, McpServerInput } from '../protocol'
+import type { McpConnectionStatus, McpInspection, McpServerInput } from '../protocol'
 import { Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 
-type InspectionState = { loading: true } | { loading: false; result: McpInspection }
+type InspectionState = { loading: boolean; result?: McpInspection }
+
+const connectionLabels: Record<McpConnectionStatus, string> = {
+  not_connected: '尚未连接', connecting: '连接中…', connected: '已连接', failed: '连接失败', disabled: '已关闭',
+}
 
 export function McpSettings({ workspaceId, active, busy, onBusyChange }: {
   workspaceId: string | null; active: boolean; busy: boolean; onBusyChange: (busy: boolean) => void
@@ -20,13 +24,15 @@ export function McpSettings({ workspaceId, active, busy, onBusyChange }: {
   const revision = useRef(0)
 
   const inspect = useCallback(async (serverId: string, reconnect = false, version = revision.current) => {
-    setInspections(current => ({ ...current, [serverId]: { loading: true } }))
+    setInspections(current => ({ ...current, [serverId]: {
+      loading: true, result: reconnect ? undefined : current[serverId]?.result,
+    } }))
     try {
       const result = await appStore.transport.rpc('mcp.inspect', { serverId, workspaceId, reconnect })
       if (revision.current === version) setInspections(current => ({ ...current, [serverId]: { loading: false, result } }))
     } catch (error) {
       if (revision.current === version) setInspections(current => ({ ...current, [serverId]: { loading: false, result: {
-        serverId, connected: false, error: error instanceof Error ? error.message : '连接 MCP 失败。', tools: [],
+        serverId, status: 'failed', error: error instanceof Error ? error.message : '读取 MCP 状态失败。', tools: [],
       } } }))
     }
   }, [workspaceId])
@@ -52,8 +58,20 @@ export function McpSettings({ workspaceId, active, busy, onBusyChange }: {
     if (!active) return
     void load()
     return () => { revision.current += 1 }
-    // 进入 MCP 分类时检查连接；保持挂载让分类切换保留编辑草稿。
+    // 进入 MCP 分类只读取状态；保持挂载让分类切换保留编辑草稿。
   }, [active, load])
+
+  useEffect(() => {
+    if (!active) return
+    const connecting = Object.entries(inspections)
+      .filter(([, state]) => !state.loading && state.result?.status === 'connecting')
+    if (connecting.length === 0) return
+    // 只等正在建立的连接，不启动服务器，也不重叠发送状态查询。
+    const timer = window.setTimeout(() => {
+      for (const [serverId] of connecting) void inspect(serverId)
+    }, 1000)
+    return () => window.clearTimeout(timer)
+  }, [active, inspections, inspect])
 
   async function mutate(action: () => Promise<unknown>) {
     if (busy) return false
@@ -67,18 +85,18 @@ export function McpSettings({ workspaceId, active, busy, onBusyChange }: {
   return <section className="mcp-settings" aria-labelledby="mcp-settings-title" aria-busy={loading}>
     <header className="sg-view-header">
       <h3 id="mcp-settings-title">MCP</h3>
-      <p>更改会在下次运行或压缩后生效。</p>
+      <p>执行任务时自动连接。更改会在下次运行或自动压缩后生效。</p>
     </header>
     {error && editor === null && removing === null && <p role="alert" className="form-error">{error} <button type="button" className="quiet-button" disabled={busy} onClick={() => void load()}>重新读取</button></p>}
     <div className="sg-provider-list">
       {servers.map(server => {
         const inspection = inspections[server.serverId]
-        const result = inspection && !inspection.loading ? inspection.result : null
+        const result = inspection?.result
         const open = expanded === server.serverId
         return <div className="sg-row-card" key={server.serverId}>
           <div className="sg-row-head mcp-row-head">
             <button type="button" className="sg-provider-toggle" aria-expanded={open} aria-controls={`mcp-tools-${server.serverId}`} onClick={() => setExpanded(open ? null : server.serverId)}>
-              <span className="sg-row-identity"><strong>{server.serverId}</strong><span className="mcp-status">{!server.enabled ? '已关闭' : inspection?.loading ? '连接中…' : result?.connected ? `${result.tools.length} 个工具` : result?.error ? '连接失败' : '尚未连接'}</span></span>
+              <span className="sg-row-identity"><strong>{server.serverId}</strong><span className="mcp-status">{!server.enabled ? '已关闭' : result?.status === 'connected' ? `${result.tools.length} 个工具` : result ? connectionLabels[result.status] : inspection?.loading ? '检查中…' : '尚未连接'}</span></span>
               <ExpandChevron expanded={open} size={16} />
             </button>
             <span className="sg-row-actions">
@@ -90,7 +108,7 @@ export function McpSettings({ workspaceId, active, busy, onBusyChange }: {
           <Disclosure open={open}><div id={`mcp-tools-${server.serverId}`} className="mcp-tools">
             <p className="mcp-endpoint">{server.transport.type === 'stdio' ? `${server.transport.command} ${server.transport.args.join(' ')}` : server.transport.url}</p>
             {result?.error && server.enabled && <p role="alert" className="form-error">{result.error}</p>}
-            {server.enabled && <button type="button" className="secondary-button" disabled={busy || inspection?.loading} onClick={() => void inspect(server.serverId, true)}>重新连接</button>}
+            {server.enabled && result?.status === 'failed' && <button type="button" className="secondary-button" disabled={busy} onClick={() => void inspect(server.serverId, true)}>重试连接</button>}
             {result?.tools.map(tool => <div key={tool.name} className="mcp-tool"><strong>{tool.name}</strong><p>{tool.description}</p></div>)}
           </div></Disclosure>
         </div>

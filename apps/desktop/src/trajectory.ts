@@ -34,7 +34,8 @@ const requestTitle = (r: RequestObservation) => `${r.purpose === 'compaction' ? 
 export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
   if (!session) return []
   let previousPrompt: ModelRequestSnapshot | undefined
-  let ordinal = 0
+  // 历史页只含最近几轮；补读更早记录时，同一回合的编号保持不变。
+  let ordinal = session.summary.turnCount - session.facts.history.filter(turn => turn.id !== null).length
   const turns = [...session.facts.history, ...session.facts.active].map(turn => {
     const standalone = turn.id === null && session.facts.active.includes(turn)
     const title = standalone ? '上下文压缩' : turn.id === null ? '会话设置' : `第 ${++ordinal} 轮`

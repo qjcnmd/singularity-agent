@@ -11,16 +11,21 @@ pub use result::McpToolResult;
 use client::Connection;
 use config::{Configuration, ServerConfig};
 use rmcp::model::Tool;
-use singularity_protocol::{McpInspection, McpServerInput, McpToolInfo};
+use singularity_protocol::{McpConnectionStatus, McpInspection, McpServerInput, McpToolInfo};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
-type ConnectionCell = Arc<OnceCell<Arc<Connection>>>;
+type ConnectionCell = Arc<tokio::sync::Mutex<ConnectionState>>;
+
+struct ConnectionState {
+    connection: Option<Arc<Connection>>,
+    // 设置页展示最近一次发现结果，不为读取状态向服务器发请求。
+    catalog: Result<Vec<Tool>, String>,
+}
 
 type Connections = BTreeMap<(PathBuf, String), (ServerConfig, ConnectionCell)>;
 
@@ -152,8 +157,15 @@ impl McpManager {
             if reconnect {
                 connections.remove(&key);
             }
-            let (_, cell) =
-                connections.entry(key).or_insert_with(|| (config.clone(), Arc::new(OnceCell::new())));
+            let (_, cell) = connections.entry(key).or_insert_with(|| {
+                (
+                    config.clone(),
+                    Arc::new(tokio::sync::Mutex::new(ConnectionState {
+                        connection: None,
+                        catalog: Ok(Vec::new()),
+                    })),
+                )
+            });
             let cell = Arc::clone(cell);
             entries.push((id, config, cell));
         }
@@ -165,12 +177,25 @@ impl McpManager {
         config: ServerConfig,
         cell: &ConnectionCell,
     ) -> Result<(Arc<Connection>, Vec<Tool>), String> {
-        let connection = cell
-            .get_or_try_init(|| async { Connection::connect(cwd, config).await.map(Arc::new) })
-            .await?
-            .clone();
-        let tools = connection.tools().await?;
-        Ok((connection, tools))
+        // 同一项目的并发准备共用连接；失败的工具调用不会走这里重放。
+        let mut state = cell.lock().await;
+        let connection = match state.connection.as_ref().filter(|connection| !connection.is_closed()) {
+            Some(connection) => Arc::clone(connection),
+            None => {
+                state.connection = None;
+                match Connection::connect(cwd, config).await {
+                    Ok(connection) => Arc::new(connection),
+                    Err(error) => {
+                        state.catalog = Err(error.clone());
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        let tools = connection.tools().await;
+        state.connection = Some(Arc::clone(&connection));
+        state.catalog = tools.clone();
+        tools.map(|tools| (connection, tools))
     }
 
     /// 在首次模型请求前发现全部已启用工具；BTreeMap 与名称排序保持请求定义顺序稳定。
@@ -227,47 +252,64 @@ impl McpManager {
         result
     }
 
-    /// 设置中的连接测试使用同一连接和发现路径；重连显式丢弃该项目中的旧连接。
+    /// 设置页只读已有状态；用户明确重试时才重建该项目的连接并发现工具。
     pub async fn inspect(&self, id: &str, cwd: &Path, reconnect: bool) -> Result<McpInspection, String> {
-        let mut entries = self.entries(cwd, Some(id), reconnect)?;
-        let Some((_, config, cell)) = entries.pop() else {
-            return Ok(McpInspection {
-                server_id: id.into(),
-                connected: false,
-                error: Some("服务器已关闭。".into()),
-                tools: vec![],
-            });
+        if reconnect && let Some((_, config, cell)) = self.entries(cwd, Some(id), true)?.pop() {
+            // 连接失败保存在状态中，与执行准备失败使用同一份原因。
+            let _ = Self::tools(cwd, config, &cell).await;
+        }
+        let config = config::read(&self.home)?;
+        let config = config.servers.get(id).ok_or("MCP 服务器不存在。")?;
+        let mut inspection = McpInspection {
+            server_id: id.into(),
+            status: McpConnectionStatus::NotConnected,
+            error: None,
+            tools: vec![],
         };
-        Ok(match Self::tools(cwd, config, &cell).await {
-            Ok((_, mut tools)) => {
-                tools.sort_by(|a, b| a.name.cmp(&b.name));
-                McpInspection {
-                    server_id: id.into(),
-                    connected: true,
-                    error: None,
-                    tools: tools
-                        .into_iter()
-                        .map(|tool| McpToolInfo {
-                            name: tool.name.into_owned(),
-                            description: tool.description.unwrap_or_default().into_owned(),
-                        })
-                        .collect(),
-                }
+        if !config.enabled {
+            inspection.status = McpConnectionStatus::Disabled;
+            return Ok(inspection);
+        }
+        let cell = self
+            .lock()
+            .get(&(cwd.to_path_buf(), id.into()))
+            .filter(|(previous, _)| previous == config)
+            .map(|(_, cell)| Arc::clone(cell));
+        let Some(cell) = cell else { return Ok(inspection) };
+        let Ok(state) = cell.try_lock() else {
+            inspection.status = McpConnectionStatus::Connecting;
+            return Ok(inspection);
+        };
+        match (&state.catalog, &state.connection) {
+            (Err(error), _) => {
+                inspection.status = McpConnectionStatus::Failed;
+                inspection.error = Some(error.clone());
             }
-            Err(error) => McpInspection {
-                server_id: id.into(),
-                connected: false,
-                error: Some(error),
-                tools: vec![],
-            },
-        })
+            (Ok(_), Some(connection)) if connection.is_closed() => {
+                inspection.status = McpConnectionStatus::Failed;
+                inspection.error = Some("连接已断开，下次执行任务时会重新连接。".into());
+            }
+            (Ok(tools), Some(_)) => {
+                inspection.status = McpConnectionStatus::Connected;
+                inspection.tools = tools
+                    .iter()
+                    .map(|tool| McpToolInfo {
+                        name: tool.name.to_string(),
+                        description: tool.description.as_deref().unwrap_or_default().into(),
+                    })
+                    .collect();
+                inspection.tools.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+            (Ok(_), None) => {}
+        }
+        Ok(inspection)
     }
 
     /// 任务结算后关闭所有传输，等待 SDK 回收本地进程。
     pub async fn shutdown(&self) {
         let cells = std::mem::take(&mut *self.lock());
         for (_, cell) in cells.into_values() {
-            if let Some(connection) = cell.get() {
+            if let Some(connection) = &cell.lock().await.connection {
                 connection.close().await;
             }
         }

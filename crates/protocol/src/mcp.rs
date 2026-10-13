@@ -68,12 +68,24 @@ pub struct McpToolInfo {
     pub description: String,
 }
 
+/// 区分未启动、正在连接与失败；查看状态不会启动服务器。
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum McpConnectionStatus {
+    NotConnected,
+    Connecting,
+    Connected,
+    Failed,
+    Disabled,
+}
+
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct McpInspection {
     pub server_id: String,
-    pub connected: bool,
+    pub status: McpConnectionStatus,
     pub error: Option<String>,
     pub tools: Vec<McpToolInfo>,
 }

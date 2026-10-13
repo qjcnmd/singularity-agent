@@ -3,7 +3,9 @@ use super::manager::SessionData;
 use super::{LedgerRecord, SessionEntry};
 use serde::{Deserialize, Serialize};
 use singularity_model::{ModelMessage, ModelToolSchema};
-use singularity_protocol::{ModelRequestSnapshot, RequestMessage, RequestPreferences, RequestTool};
+use singularity_protocol::{
+    ModelRequestDefinitions, ModelRequestSnapshot, RequestMessage, RequestPreferences, RequestTool,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,8 +89,8 @@ impl SessionData {
         })
     }
 
-    /// 展开请求记录引用的提示词与工具；不涉及对话内容。
-    pub fn request_head(&self, context: &RequestContext) -> Box<ModelRequestSnapshot> {
+    /// 读取已保存定义的公开快照；调用方可让同页请求共用它。
+    pub fn request_definitions(&self, definitions_id: &str) -> ModelRequestDefinitions {
         // 定义先于引用写入；追加失败后写者不再接受后续记录。
         let definitions = self
             .entries
@@ -99,10 +101,13 @@ impl SessionData {
                     id,
                     record: LedgerRecord::RequestDefinitions { definitions },
                     ..
-                } if id == &context.definitions => Some(definitions),
+                } if id == definitions_id => Some(definitions),
                 _ => None,
             })
             .expect("request references an earlier definition record");
-        definitions.snapshot(&context.definitions, &context.model_preferences)
+        ModelRequestDefinitions {
+            messages: definitions.messages.clone(),
+            tools: definitions.tools.clone(),
+        }
     }
 }

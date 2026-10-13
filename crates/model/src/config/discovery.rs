@@ -8,7 +8,7 @@ use singularity_protocol::DiscoveredModel;
 
 use super::{ProviderError, user_config_error, validate_base_url, validate_model_id};
 use crate::ModelErrorKind;
-use crate::transport::http::transport_error_source;
+use crate::transport::http::{client_builder, transport_error_source};
 
 /// 查询模型目录并补齐元数据：地址解释、请求构造、发送和结果补全都在这里，调用方只提供
 /// 编辑器里的取值和解析好的凭据，不转交 HTTP 的半成品。
@@ -20,7 +20,7 @@ pub async fn discover(
     let protocol = super::parse_catalog_protocol(api_protocol)?;
     let base_url = crate::openai::canonical_base_url(base_url);
     validate_base_url(base_url)?;
-    let client = reqwest::Client::builder()
+    let client = client_builder()
         .timeout(std::time::Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -47,7 +47,7 @@ pub async fn discover(
             || model.reasoning_variants.is_empty()
     }) {
         // 这个公开目录请求不带用户的 endpoint，也不带凭据。
-        if let Ok(client) = reqwest::Client::builder()
+        if let Ok(client) = client_builder()
             .timeout(std::time::Duration::from_secs(15))
             .user_agent("Singularity model discovery")
             .build()
@@ -67,7 +67,7 @@ pub async fn discover(
 }
 
 /// 读响应体分两步：读取字节（传输层面的事实），再自己解码（结构层面的事实），让两类失败各自
-/// 保持原来的类别。reqwest 把 body 读取错误也归到 decode 类（0.12 里 body 断流的 is_decode()
+/// 保持原来的类别。reqwest 把 body 读取错误也归到 decode 类（body 断流的 is_decode()
 /// 同样是 true），只用 Response::json 加一个 map_err 分不开「body 传输超时或断流」和
 /// 「提供方返回了无效 JSON」。
 async fn read_response_body(response: reqwest::Response) -> Result<Value, ProviderError> {

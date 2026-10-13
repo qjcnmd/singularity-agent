@@ -47,6 +47,10 @@ impl ClientHandler for Handler {
 }
 
 impl Connection {
+    pub fn is_closed(&self) -> bool {
+        self.peer.is_transport_closed()
+    }
+
     pub async fn connect(cwd: &Path, config: ServerConfig) -> Result<Self, String> {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let root = url::Url::from_directory_path(cwd)
@@ -102,6 +106,8 @@ impl Connection {
                     // 与现有模型传输使用同一 ring provider，避免两个 TLS 默认实现冲突。
                     let _ = rustls::crypto::ring::default_provider().install_default();
                     let client = reqwest::Client::builder()
+                        // 与模型共用 reqwest 后也可能启用 gzip；MCP 流继续直接读取原始分块。
+                        .no_gzip()
                         .connect_timeout(startup)
                         .build()
                         .map_err(|error| format!("无法建立 MCP HTTP 客户端：{error}"))?;

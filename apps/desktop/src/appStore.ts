@@ -1,4 +1,4 @@
-import { SessionStore, type AppState, type ActionResult } from './sessionStore'
+import { SessionStore, type AppState, type ActionResult, type QuestionDraft } from './sessionStore'
 import { actionOrigin } from './storeActions'
 export { actionOrigin, hasInlineActionError, pendingKey } from './storeActions'
 export type { AppState, ActionError } from './sessionStore'
@@ -76,8 +76,17 @@ class AppStore extends SessionStore {
     return this.sessionAction('session.abort', sessionId => ({ sessionId }))
   }
 
-  answerQuestion(itemId: string, answers: import('./protocol').UserQuestionAnswer[]): Promise<boolean> {
-    return this.sessionAction('session.answerQuestion', sessionId => ({ sessionId, itemId, answers }), itemId)
+  setQuestionDraft(sessionId: string, draft: QuestionDraft): void {
+    this.patch({ questionDrafts: { ...this.state.questionDrafts, [sessionId]: draft } })
+  }
+
+  async answerQuestion(itemId: string, answers: import('./protocol').UserQuestionAnswer[]): Promise<boolean> {
+    const sessionId = this.state.selectedSessionId
+    const accepted = await this.sessionAction('session.answerQuestion', sessionId => ({ sessionId, itemId, answers }), itemId)
+    if (accepted && sessionId !== null && this.state.questionDrafts[sessionId]?.itemId === itemId) {
+      this.retainQuestionDraft(sessionId)
+    }
+    return accepted
   }
 
   async compact(): Promise<boolean> {

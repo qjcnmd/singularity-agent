@@ -41,6 +41,7 @@ pub struct ThreadReadPage {
     pub summary: ThreadSummary,
     pub turns: Vec<ThreadTurn>,
     pub next_cursor: Option<String>,
+    pub request_definitions: BTreeMap<String, crate::ModelRequestDefinitions>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
