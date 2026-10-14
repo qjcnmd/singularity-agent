@@ -8,7 +8,8 @@ pub(super) fn turn_terminal(
             source: SessionTerminalSource::Turn,
             status: outcome.turn_status,
             manually_stopped: outcome.manually_stopped,
-            message: outcome.error.map(|error| error.message),
+            // 已保存的失败由会话历史展示，运行状态只补充未保存的原因。
+            message: None,
         },
         Err(error) => SessionTerminalSnapshot {
             source: SessionTerminalSource::Turn,

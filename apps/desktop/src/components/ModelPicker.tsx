@@ -158,7 +158,9 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
                   <div className="sg-thumb" style={{ left: `${variants.length > 1 ? sliderIndex / (variants.length - 1) * 100 : 100}%`, opacity: effortSelected ? 1 : 0 }} />
                 </div>
                 <input className="sg-native-slider" type="range" min={0} max={Math.max(0, variants.length - 1)} step="any" value={sliderIndex}
-                  aria-label="思考程度" aria-valuetext={displayedEffort || '未选择'} aria-busy={pending} disabled={variants.length === 1 && resolvedIndex === 0}
+                  aria-label="思考程度" aria-valuetext={displayedEffort || '未选择'} aria-busy={pending}
+                  // 档位连续调整由本组件排队；模型切换保存期间等新模型生效后再调整。
+                  disabled={(pending && !committing.current) || (variants.length === 1 && resolvedIndex === 0)}
                   onChange={event => setPreviewIndex(Number(event.currentTarget.value))}
                   onPointerDown={event => { dragging.current = true; event.currentTarget.setPointerCapture(event.pointerId) }}
                   onPointerCancel={() => { dragging.current = false; setPreviewIndex(null) }}

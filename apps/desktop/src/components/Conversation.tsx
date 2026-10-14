@@ -32,6 +32,7 @@ export function Conversation({ state, items }: Props) {
       if (latest.anchorItemId === null) { updateScrollState(node); return }
       const element = node.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(latest.anchorItemId)}"]`)
       if (element !== null) node.scrollTop += element.getBoundingClientRect().top - node.getBoundingClientRect().top - latest.offset
+      else { appStore.setViewportAnchor(defaultAnchor()); node.scrollTop = node.scrollHeight }
       observedTop.current = node.scrollTop
       updateScrollState(node)
     }
@@ -44,13 +45,23 @@ export function Conversation({ state, items }: Props) {
     return () => observer.disconnect()
   }, [itemIdentity, sessionId])
 
+  const saveReadingPosition = (node: HTMLDivElement, element: HTMLElement) => {
+    const index = items.findIndex(item => item.key === element.dataset.itemId)
+    // 重试会撤回流式片段；用它之前最近的已保存条目记录位置。
+    const stable = items.slice(0, index + 1).findLast(item => item.anchorTurnId !== undefined)
+      ?? items.slice(index + 1).find(item => item.anchorTurnId !== undefined)
+    const target = stable && node.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(stable.key)}"]`)
+    if (!stable || !target) { appStore.setViewportAnchor(defaultAnchor()); return }
+    appStore.setViewportAnchor({ mode: 'anchored', anchorItemId: stable.key, turnId: stable.anchorTurnId,
+      offset: target.getBoundingClientRect().top - node.getBoundingClientRect().top })
+  }
+
   const preserveDisclosurePosition = (event: MouseEvent<HTMLDivElement>) => {
     const button = (event.target as Element).closest('button[aria-expanded]')
     const item = button?.closest<HTMLElement>('[data-item-id]')
     const node = viewport.current
     if (item === undefined || item === null || node === null) return
-    appStore.setViewportAnchor({ mode: 'anchored', anchorItemId: item.dataset.itemId ?? null,
-      offset: item.getBoundingClientRect().top - node.getBoundingClientRect().top })
+    saveReadingPosition(node, item)
   }
 
   const onScroll = () => {
@@ -67,22 +78,12 @@ export function Conversation({ state, items }: Props) {
       if (anchor.mode !== 'following') appStore.setViewportAnchor(defaultAnchor())
       return
     }
-    // 本次回调只读一次 viewport 顶部：搜索时命中项的矩形直接用于计算偏移。
     const viewportTop = node.getBoundingClientRect().top
-    let visible: { id: string | null; top: number } | null = null
     for (const item of node.querySelectorAll<HTMLElement>('[data-item-id]')) {
-      const rect = item.getBoundingClientRect()
-      if (rect.bottom >= viewportTop) {
-        visible = { id: item.dataset.itemId ?? null, top: rect.top }
+      if (item.getBoundingClientRect().bottom >= viewportTop) {
+        saveReadingPosition(node, item)
         break
       }
-    }
-    if (visible !== null) {
-      appStore.setViewportAnchor({
-        mode: 'anchored',
-        anchorItemId: visible.id,
-        offset: visible.top - viewportTop,
-      })
     }
   }
 

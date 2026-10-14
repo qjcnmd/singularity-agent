@@ -8,6 +8,7 @@ export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { emptyDraft, imageUpload, type Draft } from './drafts'
 import type { ProviderConfigurationInput, RpcMethod, RpcParams, SkillMetadata, ViewportAnchor } from './protocol'
+import { selectedSessionPhase } from './sessionState'
 
 type SessionActionMethod = {
   [Method in RpcMethod]: RpcParams<Method> extends { sessionId: string } ? Method : never
@@ -44,7 +45,7 @@ class AppStore extends SessionStore {
 
   submissionState() {
     const state = this.state
-    const phase = state.session?.runtime.phase ?? 'idle'
+    const phase = selectedSessionPhase(state)
     const submitPending = ['session.submit', 'session.steer'].some(method => this.isPending(method, actionOrigin.session(state.selectedSessionId)))
     // 按连接、任务读取、运行阶段和在途提交的顺序给出第一项阻止原因。
     let blockedReason: string | null = null
@@ -167,6 +168,10 @@ class AppStore extends SessionStore {
     this.saveView({ sidebarWidth: clampSidebarWidth(sidebarWidth) }, true)
   }
 
+  setTrajectoryWidth(trajectoryWidth: number): void {
+    this.saveView({ trajectoryWidth: clampSidebarWidth(trajectoryWidth) }, true)
+  }
+
   toggleSidebar(): void {
     this.saveView({ sidebarCollapsed: !this.state.sidebarCollapsed })
   }
@@ -183,6 +188,7 @@ class AppStore extends SessionStore {
     if (previous === undefined && anchor.mode === 'following') return
     if (previous?.mode === anchor.mode
       && previous.anchorItemId === anchor.anchorItemId
+      && previous.turnId === anchor.turnId
       && Math.abs(previous.offset - anchor.offset) < 1) return
     const viewportAnchors = { ...this.state.viewportAnchors }
     if (anchor.mode === 'following') delete viewportAnchors[id]

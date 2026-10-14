@@ -5,10 +5,10 @@ use std::time::Instant;
 
 use singularity_core::duration_millis;
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, ModelUsage,
-    OpenAiProvider, ProviderError, ProviderStreamEvent,
+    ModelConfigurationSnapshot, ModelErrorKind, ModelPreferences, ModelTurnRequest, ModelTurnResponse,
+    ModelUsage, OpenAiProvider, ProviderError, ProviderStreamEvent,
 };
-use singularity_protocol::{ProviderAttemptStatus, RequestObservation, RequestPreferences, RequestPurpose};
+use singularity_protocol::{ProviderAttemptStatus, RequestObservation, RequestPurpose};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentError;
@@ -75,7 +75,6 @@ async fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool 
 
 /// 普通回复和摘要共用的完整请求边界：发送、重试、用量和结果身份都在这里；每个
 /// attempt 各自持有 `RequestAttempt`，重试不复用上一次的结果身份，取消在退避等待中生效。
-// 参数就是 Agent 已有的字段加上本次请求的事实；直接显式传入，不引入包装对象，也不让调用方自己编排 attempt。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_request(
     provider: &OpenAiProvider,
@@ -90,7 +89,6 @@ pub(crate) async fn execute_request(
     const MAX_ATTEMPTS: u32 = 3;
     const BASE_DELAY_MS: u64 = 2_000;
     let mut retry_attempt = 0u32;
-    // 每个 attempt 都在循环内构造，成功分支直接带出这次的身份，不需要跨 attempt 复位。
     loop {
         retry_attempt += 1;
         accounting.attempts += 1;
@@ -230,7 +228,7 @@ impl RequestAttempt<'_> {
     async fn record(
         &mut self,
         mut observation: RequestObservation,
-        request_head: Option<(RequestDefinitions, RequestPreferences)>,
+        request_head: Option<(RequestDefinitions, ModelPreferences)>,
     ) -> Result<(), SessionError> {
         let persisted = observation.clone();
         observation.request_head = with_writer_async(self.writer, move |writer| {

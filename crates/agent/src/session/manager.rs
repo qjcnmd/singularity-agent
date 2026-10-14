@@ -181,8 +181,8 @@ impl SessionManager {
         })
     }
 
-    /// 追加一条 operation ledger 记录。记录本身就是持久事实；是否进入模型上下文看
-    /// 类别：操作与请求观测服务查看，工具剪枝记录改变模型视图。
+    /// 追加一条 operation ledger 记录。记录本身就是持久事实，服务查看与统计，
+    /// 不进入模型上下文。
     pub fn append_record(&mut self, record: LedgerRecord) -> Result<CommittedEntry> {
         self.append_entry(SessionEntry::Record {
             id: super::new_entry_id(),
@@ -195,7 +195,7 @@ impl SessionManager {
     pub(crate) fn append_model_request(
         &mut self,
         observation: singularity_protocol::RequestObservation,
-        request: Option<(super::RequestDefinitions, singularity_protocol::RequestPreferences)>,
+        request: Option<(super::RequestDefinitions, singularity_model::ModelPreferences)>,
     ) -> Result<Option<Box<singularity_protocol::ModelRequestSnapshot>>> {
         let (context, head) = if let Some((definitions, model_preferences)) = request {
             let id = match self.latest_request_definitions() {
@@ -206,10 +206,7 @@ impl SessionManager {
                 }
             };
             let head = definitions.snapshot(&id, &model_preferences);
-            (
-                Some(Box::new(super::request::RequestContext { definitions: id, model_preferences })),
-                Some(head),
-            )
+            (Some(Box::new(super::request::RequestContext::new(id, model_preferences))), Some(head))
         } else {
             (None, None)
         };

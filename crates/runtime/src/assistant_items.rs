@@ -139,9 +139,8 @@ impl AssistantItemEvents {
                     images,
                 });
             }
-            // ControlChanged 在 runner 的执行循环里就被截获并更新控制投影，
-            // 到不了条目投影。
-            AgentEvent::ControlChanged => {}
+            // runner 的执行循环先截获问题变化，到不了条目投影。
+            AgentEvent::PendingQuestionChanged => {}
         }
     }
 

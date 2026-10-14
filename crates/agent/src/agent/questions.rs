@@ -77,7 +77,7 @@ impl UserQuestions {
     ) -> ToolExecution {
         let (reply, receive) = oneshot::channel();
         *self.waiting.lock().expect("question lock poisoned") = Some(WaitingQuestion { request, reply });
-        on_event(AgentEvent::ControlChanged);
+        on_event(AgentEvent::PendingQuestionChanged);
         let result = tokio::select! {
             biased;
             () = cancellation.cancelled() => error_result(ABORTED_MESSAGE),
@@ -86,7 +86,7 @@ impl UserQuestions {
             }).to_string()),
         };
         self.waiting.lock().expect("question lock poisoned").take();
-        on_event(AgentEvent::ControlChanged);
+        on_event(AgentEvent::PendingQuestionChanged);
         result
     }
 }

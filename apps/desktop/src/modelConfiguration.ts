@@ -28,6 +28,18 @@ export function automaticFieldsFor(model: ModelConfigurationInput) {
   return model.automaticFields ?? modelConfigurationFields.filter(field => model[field] === null)
 }
 
+/** 模型弹窗和提供方保存共用思考选项规则，切换协议后也能直接指出不适用的档位。 */
+export function reasoningConfigurationError(variants: readonly ReasoningVariant[] | null | undefined, protocol: string): string | null {
+  const declared = variants ?? []
+  if (declared.some(variant => !variant.id || /[\s/#]/.test(variant.id) || (variant.wireEffort !== null && /[\s/#]/.test(variant.wireEffort)))) return '思考档位无效，请重新获取模型参数或取消选择此档位。'
+  if (new Set(declared.map(variant => variant.id)).size !== declared.length) return '思考选项不能重名。'
+  if (declared.some(variant => variant.id === 'off' && variant.wireEffort !== null)) return '关闭思考的参数映射无效，请重新获取模型参数。'
+  if (declared.some(variant => variant.id !== 'off' && variant.wireEffort === null && (protocol === 'responses' || variant.id !== 'on'))) return protocol === 'responses'
+    ? 'Responses 不支持此思考开关，请编辑模型并重新选择思考档位。'
+    : '此协议不支持所选思考开关，请重新获取模型参数或取消选择。'
+  return null
+}
+
 /** 新建草稿的初始值；提供方与协议由调用方补齐。 */
 export function blankModel(): ModelConfigurationInput {
   return {

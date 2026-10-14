@@ -405,11 +405,8 @@ fn catalog_from_data(data: &UserConfigData, selection: Result<(), ProviderError>
     RedactedModelCatalog { error, default_selector, providers }
 }
 
-/// 写配置文件：把当前配置直接序列化成文件字节，只负责序列化和原子替换，不做二次清洗；可选
-/// 字段缺省时不落键（由持久化类型的 `skip_serializing_if` 声明），免得给无关供应商补出 `null`。
-///
-/// 不读文件里已有的内容：条目在不在由类型自身的序列化决定，被删掉的供应商、模型和推理档位会
-/// 随保存一起消失。`Map` 按键排序（本仓没启用 `preserve_order`），与文件里原先的书写顺序无关。
+/// 序列化后原子替换整个文件，不合并文件原有内容：被删掉的供应商、模型和推理档位随保存消失。
+/// 键按 `BTreeMap` 排序，与文件原先的书写顺序无关。
 fn write_json_file(directory: &Path, file_name: &str, value: &impl Serialize) -> Result<(), ProviderError> {
     singularity_core::create_data_dir(directory).map_err(user_config_error)?;
     let path = directory.join(file_name);

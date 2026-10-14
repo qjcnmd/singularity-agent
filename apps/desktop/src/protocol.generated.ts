@@ -30,7 +30,7 @@ export type HistoryItem = { "type": "request", startedAt?: string, observation: 
  */
 context: ModelRequestReference, } | { "type": "message", id: string, role: string, text: string, images?: Array<ImageAttachment>, } | { "type": "thinking", id: string, text: string, } | { "type": "tool_call", id: string, name: string, args: JsonValue, } | { "type": "tool_result", id: string, output: string, images?: Array<ImageAttachment>,
 /**
- * read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
+ * read 工具真实读到的来源范围；其他工具没有这个字段。
  */
 readSource?: ReadSource, isError: boolean, durationMs?: number, } | { "type": "settings", id: string, provider: string, model: string, reasoning: string | null, } | { "type": "compaction", id: string, summary: string, } | { "type": "compaction_result", id: string, status: TurnStatus, message: string | null, };
 
@@ -210,7 +210,11 @@ export type SessionTerminalSnapshot = { source: SessionTerminalSource, status: T
 /**
  * 该回合的中断来自已接受的用户停止，与持久化摘要使用同一事实。
  */
-manuallyStopped: boolean, message: string | null, };
+manuallyStopped: boolean,
+/**
+ * 未保存到会话历史的失败原因；已保存的结果通过历史与执行事件展示。
+ */
+message: string | null, };
 
 export type SessionTerminalSource = "turn" | "compaction";
 
@@ -239,27 +243,7 @@ manuallyStopped: boolean, turnCount: number,
  */
 usage: SessionModelUsage, };
 
-export type ThreadTurn = {
-/**
- * 回合开始时间戳
- */
-startedAt?: string,
-/**
- * 回合结束时间戳
- */
-finishedAt?: string, turnId: string | null,
-/**
- * 回合终态
- */
-status: TurnStatus | null,
-/**
- * 回合失败详情
- */
-error?: TurnErrorDetail,
-/**
- * 该回合内的公开历史条目
- */
-items: Array<HistoryItem>, };
+export type ThreadTurn = { startedAt?: string, finishedAt?: string, turnId: string | null, status: TurnStatus | null, error?: TurnErrorDetail, items: Array<HistoryItem>, };
 
 export type Turn = { turnId: string, threadId: string, status: TurnStatus,
 /**
@@ -276,7 +260,7 @@ export type TurnEventEnvelope = { sessionRevision: number, } & ({ "method": "tur
  */
 item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, images?: Array<ImageAttachment>, isError: boolean, durationMs?: number,
 /**
- * read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
+ * read 工具真实读到的来源范围；其他工具没有这个字段。
  */
 readSource?: ReadSource, } } | { "method": "item/discarded", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string,
 /**
@@ -286,7 +270,7 @@ turnId: string | null, severity: DiagnosticSeverity, code: string, message: stri
 /**
  * 独立压缩不属于回合；普通执行使用实际回合身份。
  */
-turnId: string | null, } } | { "method": "turn/completed", "params": { turn: Turn, finishedAt: string, } } | { "method": "turn/controlChanged", "params": Record<symbol, never> } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, finishedAt: string, } });
+turnId: string | null, } } | { "method": "turn/completed", "params": { turn: Turn, finishedAt: string, } } | { "method": "turn/pendingQuestionChanged", "params": Record<symbol, never> } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, finishedAt: string, } });
 
 export type TurnFailureCause = "store" | "project_instructions" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 

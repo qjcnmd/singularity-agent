@@ -62,9 +62,9 @@ pub enum AgentEvent {
         tool_name: String,
         arguments: Value,
     },
-    /// 工具执行过程中产生的流式增量输出；工具本身的事实由 Started 建立，这里只按 item_id 更新累计进度。
+    /// 工具执行中的累计输出，按 item_id 更新。
     ToolExecutionUpdate { item_id: String, partial_result: String },
-    /// 工具执行完成；工具名称与参数已在 Started 发布，这里不再重复。
+    /// 工具执行完成；名称与参数见 Started。
     ToolExecutionEnded {
         item_id: String,
         execution: ToolExecution,
@@ -82,7 +82,6 @@ pub enum AgentEvent {
         text: String,
         images: Vec<singularity_protocol::ImageAttachment>,
     },
-    /// 当前进程内的控制接受与处置通知；runtime 据此更新并发布当前会话的状态。
-    /// 控制队列不落盘，重启后不会恢复。
-    ControlChanged,
+    /// 等待回答的问题出现或结束；宿主据此重新发布会话状态。问题只在进程内保存。
+    PendingQuestionChanged,
 }

@@ -199,7 +199,7 @@ impl OpenAiProvider {
     }
 }
 
-/// 对真实响应检查续接是否完整；有没有续接材料由解析结果本身决定，不另存存在性标志。
+/// 对真实响应检查续接是否完整。
 fn validate_response_reasoning(
     response: &ModelTurnResponse,
     requires_reasoning_content_for_tool_calls: bool,

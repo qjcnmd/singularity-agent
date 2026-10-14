@@ -48,10 +48,8 @@ fn wait_pipe_readable(handle: HANDLE, timeout: Duration) -> io::Result<bool> {
 
 /// 从管道读取字节流，过滤控制字符，再按块发到通道。
 ///
-/// 读取器自己就持有管道身份：可读性查询用的句柄在函数内取得，调用方不必再把同一个
-/// 管道拆成「读取器 + 裸句柄」两项。每次读取前都有界等待管道可读；stop 置位后线程
-/// 在下一个等待切片内退出，即使后台进程一直握着管道写端，这个线程也一定会结束，
-/// 不会无限阻塞。
+/// 每次读取前都有界等待管道可读；stop 置位后线程在下一个等待切片内退出，即使后台
+/// 进程一直握着管道写端，这个线程也一定会结束。
 pub(super) fn pump_output(
     mut reader: impl Read + Send + AsRawHandle + 'static,
     sender: mpsc::SyncSender<io::Result<String>>,

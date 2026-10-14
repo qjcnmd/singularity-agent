@@ -257,16 +257,6 @@ impl Agent {
         request: &ControlRequest,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        // 正文写完、换行失败时，重开写者会恢复完整记录。按接受时分配的消息身份
-        // 确认已有事实，避免重复追加或把旧消息再发布到当前回合。
-        if lock_writer(&self.session)
-            .entries()
-            .iter()
-            .rev()
-            .any(|entry| entry.id() == request.message_id)
-        {
-            return Ok(());
-        }
         let input = &request.input;
         let images: Vec<_> = input.images.iter().map(|image| image.attachment.clone()).collect();
         let model_text = input.model_text();

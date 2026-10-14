@@ -67,7 +67,7 @@ impl PreparedCompaction {
         messages.push(ModelMessage::text(ModelRole::User, instruction));
         let request = ModelTurnRequest {
             messages,
-            tools: definitions.tools.clone(),
+            tools: definitions.model_tools(),
             model_preferences: ModelPreferences {
                 max_output_tokens: Some(output_budget_tokens(
                     model,

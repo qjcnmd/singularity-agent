@@ -98,6 +98,7 @@ pub struct SessionTerminalSnapshot {
     pub status: TurnStatus,
     /// 该回合的中断来自已接受的用户停止，与持久化摘要使用同一事实。
     pub manually_stopped: bool,
+    /// 未保存到会话历史的失败原因；已保存的结果通过历史与执行事件展示。
     pub message: Option<String>,
 }
 

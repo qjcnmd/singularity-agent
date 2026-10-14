@@ -233,9 +233,8 @@ impl AppServer {
     }
 
     fn on_turn_event(&self, session_id: &str, slot: &ConversationSlot, event: TurnEvent) {
-        // 控制处置的变化一律归到会话快照发布：控制事实只有会话快照这一种表示，
-        // 不进入活动 turn 的事件序列。
-        if let TurnEvent::ControlChanged { .. } = &event {
+        // 等待中的问题只由会话快照表示，不进入活动 turn 的事件序列。
+        if let TurnEvent::PendingQuestionChanged { .. } = &event {
             self.bump_and_emit_session(session_id, slot);
             return;
         }
@@ -349,8 +348,7 @@ impl AppServer {
         self.lifecycle.lock().expect("app_server lifecycle lock poisoned")
     }
 
-    /// 发布一个流事件：全局流序号在这里推进，随 StreamEnvelope 一起交给消费者，
-    /// 不靠函数返回值沿调用链往回传。
+    /// 发布一个流事件：全局流序号在这里推进，随 StreamEnvelope 一起交给消费者。
     fn emit(&self, event: StreamEvent) {
         let mut order = self.revision.lock().expect("stream revision lock poisoned");
         *order += 1;

@@ -20,8 +20,7 @@ impl std::fmt::Debug for OpenAiProviderConfig {
     }
 }
 
-/// 一次从配置解析完成的模型选择。把最终档位和对应的线上档位放在
-/// 一起，免得再有第二张运行时映射表悄悄改掉发给提供方的请求。
+/// 一次从配置解析完成的模型选择，最终档位和对应的线上档位放在一起。
 pub(crate) struct SelectedModel {
     pub(crate) model_name: String,
     pub(crate) api_protocol: ProviderApiProtocol,

@@ -17,6 +17,10 @@ use singularity_protocol::Thread;
 /// 数据目录内保存会话文件的子目录名。
 pub const SESSIONS_DIR_NAME: &str = "sessions";
 
+/// 归档会话的子目录（相对 sessions_dir）。删除改成归档保留；列表和摘要只扫描顶层的
+/// .jsonl，archived/ 下的文件不会进结果，列表过滤依赖这一点，改动扫描方式时要复核。
+pub const ARCHIVED_SESSIONS_DIR_NAME: &str = "archived";
+
 /// Thread 目录操作与只读投影的统一入口。
 pub struct ThreadCatalog {
     sessions_dir: PathBuf,
@@ -27,14 +31,7 @@ impl ThreadCatalog {
     pub fn new(sessions_dir: PathBuf) -> Self {
         Self { sessions_dir }
     }
-}
 
-/// Thread 会话文件的规范位置。
-pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
-    sessions_dir.join(singularity_agent::session::session_file_name(thread_id))
-}
-
-impl ThreadCatalog {
     /// 创建 uuid v7 会话文件并保存模型选择；cwd 由会话层归一为绝对路径。
     /// 初始化设置写入失败时清理新文件，清理失败一并报告。
     pub fn create_thread(&self, cwd: &str, model: Option<String>) -> Result<Thread, CatalogError> {
@@ -68,28 +65,7 @@ impl ThreadCatalog {
         }
         Ok(thread)
     }
-}
 
-/// 在已经打开的会话写者上保存 selector；创建任务和提交设置共用这个入口。
-/// 创建或变更任务时追加一次选择；Thread 没有模型覆盖时不记录。
-pub(crate) fn record_thread_settings_metadata(
-    session: &mut SessionManager,
-    thread: &Thread,
-) -> Result<(), SessionError> {
-    let Some(selector) = thread.model.as_deref() else {
-        return Ok(());
-    };
-    let parts = parse_model_selector(selector).expect("thread model was validated before saving");
-    session
-        .append_metadata(SessionMetadata::ThreadSettings {
-            provider: parts.provider_name.to_string(),
-            model: parts.model_name.to_string(),
-            reasoning: parts.reasoning_variant.map(str::to_string),
-        })
-        .map(|_| ())
-}
-
-impl ThreadCatalog {
     /// 从已保存的历史读取任务目录与模型选择，不修改会话。
     pub fn resume_thread(&self, thread_id: &str) -> Result<Thread, CatalogError> {
         let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
@@ -109,9 +85,7 @@ impl ThreadCatalog {
             model,
         })
     }
-}
 
-impl ThreadCatalog {
     /// 按最近更新时间列出任务；忽略未完成尾行和枚举后已移除的文件，其他读取错误直接返回。
     pub fn list_threads(&self) -> Result<Vec<ThreadSummary>, CatalogError> {
         let entries = match std::fs::read_dir(&self.sessions_dir) {
@@ -132,9 +106,8 @@ impl ThreadCatalog {
             let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) else {
                 continue;
             };
-            let summary = self.read_summary(thread_id);
-            match summary {
-                Ok(summary) => threads.push(summary),
+            match open_thread_read_only(&self.sessions_dir, thread_id) {
+                Ok(session) => threads.push(thread_facts(&session).0),
                 // 目录项还在但文件已经不在：这是确认过的移除，不是读失败。
                 Err(CatalogError::NotFound(_)) => {}
                 Err(error) => return Err(error),
@@ -146,9 +119,7 @@ impl ThreadCatalog {
         });
         Ok(threads)
     }
-}
 
-impl ThreadCatalog {
     /// 从候选任务的持久目录事实中筛选同项目身份，包含已归档任务。
     /// 只读取调用方仍有本地状态的任务；找不到的身份不推定归属。
     pub fn threads_in_workspace(
@@ -179,6 +150,74 @@ impl ThreadCatalog {
         }
         Ok(matching)
     }
+
+    /// 从当前持久历史读取图片，只接受任务实际引用的身份。
+    pub fn image_data(&self, thread_id: &str, image_id: &str) -> Result<String, CatalogError> {
+        // 会话已成功打开；后续读取失败属于图片，不再判断为任务缺失。
+        open_thread_read_only(&self.sessions_dir, thread_id)?
+            .image_data(image_id)
+            .map_err(|source| CatalogError::Session {
+                path: thread_session_path(&self.sessions_dir, thread_id),
+                source,
+            })
+    }
+
+    /// 读取不可变历史快照；活动回合可持有它作为历史与增量事件的共同边界。
+    pub fn read_snapshot(&self, thread_id: &str) -> Result<Arc<ThreadSnapshot>, CatalogError> {
+        let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
+        let (summary, turns) = thread_facts(&session);
+        Ok(Arc::new(ThreadSnapshot { summary, session, turns }))
+    }
+
+    /// 在调用方持有的会话写入窗口内将文件移入归档目录。
+    /// 保留文件内容，归档任务不再出现在活动目录列表中。
+    pub fn archive(&self, thread_id: &str) -> Result<(), CatalogError> {
+        Uuid::parse_str(thread_id).map_err(|error| {
+            self.session_error(thread_id, SessionError::InvalidSession(error.to_string()))
+        })?;
+        let path = thread_session_path(&self.sessions_dir, thread_id);
+        let archived_dir = self.sessions_dir.join(ARCHIVED_SESSIONS_DIR_NAME);
+        std::fs::create_dir_all(&archived_dir)
+            .map_err(|source| CatalogError::Io { path: archived_dir.clone(), source })?;
+        let archived = archived_dir.join(singularity_agent::session::session_file_name(thread_id));
+        if archived
+            .try_exists()
+            .map_err(|source| CatalogError::Io { path: archived.clone(), source })?
+        {
+            return Err(CatalogError::NotFound(thread_id.to_string()));
+        }
+        std::fs::rename(&path, &archived)
+            .map_err(|error| CatalogError::session(thread_id, &path, error.into()))?;
+        Ok(())
+    }
+
+    fn session_error(&self, thread_id: &str, source: SessionError) -> CatalogError {
+        CatalogError::session(thread_id, &thread_session_path(&self.sessions_dir, thread_id), source)
+    }
+}
+
+/// Thread 会话文件的规范位置。
+pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
+    sessions_dir.join(singularity_agent::session::session_file_name(thread_id))
+}
+
+/// 在已经打开的会话写者上保存 selector；创建任务和提交设置共用这个入口。
+/// 创建或变更任务时追加一次选择；Thread 没有模型覆盖时不记录。
+pub(crate) fn record_thread_settings_metadata(
+    session: &mut SessionManager,
+    thread: &Thread,
+) -> Result<(), SessionError> {
+    let Some(selector) = thread.model.as_deref() else {
+        return Ok(());
+    };
+    let parts = parse_model_selector(selector).expect("thread model was validated before saving");
+    session
+        .append_metadata(SessionMetadata::ThreadSettings {
+            provider: parts.provider_name.to_string(),
+            model: parts.model_name.to_string(),
+            reasoning: parts.reasoning_variant.map(str::to_string),
+        })
+        .map(|_| ())
 }
 
 fn open_thread_read_only(sessions_dir: &Path, thread_id: &str) -> Result<SessionData, CatalogError> {
@@ -190,13 +229,10 @@ fn open_thread_read_only(sessions_dir: &Path, thread_id: &str) -> Result<Session
     Ok(session)
 }
 
-impl ThreadCatalog {
-    /// 从会话事实投影任务摘要。
-    fn read_summary(&self, thread_id: &str) -> Result<ThreadSummary, CatalogError> {
-        let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
-        let (summary, _) = thread_facts(&session);
-        Ok(summary)
-    }
+/// 一次遍历同时得到摘要和分页共用的回合事实：轮数、终态和手动停止只有索引这一个来源。
+fn thread_facts(session: &SessionData) -> (ThreadSummary, Vec<IndexedTurn>) {
+    let turns = index_turn_history(session.entries());
+    (summarize_thread(session, &turns), turns)
 }
 
 /// Thread 定位与持久化过程中的错误。
@@ -264,63 +300,5 @@ impl ThreadSnapshot {
             next_cursor: (start > 0).then(|| self.turns[start].cursor()),
             request_definitions,
         })
-    }
-}
-
-impl ThreadCatalog {
-    fn session_error(&self, thread_id: &str, source: SessionError) -> CatalogError {
-        CatalogError::session(thread_id, &thread_session_path(&self.sessions_dir, thread_id), source)
-    }
-
-    /// 从当前持久历史读取图片，只接受任务实际引用的身份。
-    pub fn image_data(&self, thread_id: &str, image_id: &str) -> Result<String, CatalogError> {
-        // 会话已成功打开；后续读取失败属于图片，不再判断为任务缺失。
-        open_thread_read_only(&self.sessions_dir, thread_id)?
-            .image_data(image_id)
-            .map_err(|source| CatalogError::Session {
-                path: thread_session_path(&self.sessions_dir, thread_id),
-                source,
-            })
-    }
-
-    /// 读取不可变历史快照；活动回合可持有它作为历史与增量事件的共同边界。
-    pub fn read_snapshot(&self, thread_id: &str) -> Result<Arc<ThreadSnapshot>, CatalogError> {
-        let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
-        let (summary, turns) = thread_facts(&session);
-        Ok(Arc::new(ThreadSnapshot { summary, session, turns }))
-    }
-}
-
-/// 一次遍历同时得到摘要和分页共用的回合事实：轮数、终态和手动停止只有索引这一个来源。
-fn thread_facts(session: &SessionData) -> (ThreadSummary, Vec<IndexedTurn>) {
-    let turns = index_turn_history(session.entries());
-    (summarize_thread(session, &turns), turns)
-}
-
-/// 归档会话的子目录（相对 sessions_dir）。删除改成归档保留；列表和摘要只扫描顶层的
-/// .jsonl，archived/ 下的文件不会进结果，列表过滤依赖这一点，改动扫描方式时要复核。
-pub const ARCHIVED_SESSIONS_DIR_NAME: &str = "archived";
-
-impl ThreadCatalog {
-    /// 在调用方持有的会话写入窗口内将文件移入归档目录。
-    /// 保留文件内容，归档任务不再出现在活动目录列表中。
-    pub fn archive(&self, thread_id: &str) -> Result<(), CatalogError> {
-        Uuid::parse_str(thread_id).map_err(|error| {
-            self.session_error(thread_id, SessionError::InvalidSession(error.to_string()))
-        })?;
-        let path = thread_session_path(&self.sessions_dir, thread_id);
-        let archived_dir = self.sessions_dir.join(ARCHIVED_SESSIONS_DIR_NAME);
-        std::fs::create_dir_all(&archived_dir)
-            .map_err(|source| CatalogError::Io { path: archived_dir.clone(), source })?;
-        let archived = archived_dir.join(singularity_agent::session::session_file_name(thread_id));
-        if archived
-            .try_exists()
-            .map_err(|source| CatalogError::Io { path: archived.clone(), source })?
-        {
-            return Err(CatalogError::NotFound(thread_id.to_string()));
-        }
-        std::fs::rename(&path, &archived)
-            .map_err(|error| CatalogError::session(thread_id, &path, error.into()))?;
-        Ok(())
     }
 }

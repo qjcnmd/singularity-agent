@@ -1,8 +1,7 @@
 //! 会话消息与内容块的数据模型。
 //!
 //! 内容块覆盖正文、思考链、工具调用与工具结果，一次模型交互的完整语义（推理过程、
-//! 多个工具调用）都能原样落盘并在协议重放时还原；序列化 wire 形状与历史平铺格式
-//! 逐字节一致，由 session 层的持久化读写验证这个契约。
+//! 多个工具调用）都能原样落盘并在协议重放时还原。
 
 use singularity_model::{ModelMessage, ModelToolCall, ModelTurnResponse, ProviderReasoningReplay};
 use std::borrow::Cow;
@@ -23,22 +22,20 @@ pub enum ItemScope {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentBlock {
-    /// 纯文本内容块。
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// 图片像素保存在会话所属目录，消息只保留不可变快照描述。
     Image(singularity_protocol::ImageAttachment),
     /// 只放对外公开的思考文本；provider 私有的续接材料由 Assistant 的
     /// provider_reasoning_replay 单独保存，不混进内容块。
-    Thinking { thinking: String },
-    /// 载荷直接复用模型层的 `ModelToolCall`，不重复定义同义字段。
+    Thinking {
+        thinking: String,
+    },
     ToolCall(ModelToolCall),
 }
 
 /// 核心会话消息结构：以角色为标签的枚举，每个角色只携带自己合法的字段。
-///
-/// 序列化结果形如 {"content":...,"role":"user"} / {"role":"assistant",...,
-/// ...} / {"role":"toolResult":...,"toolCallId":...,"isError":...}。
-/// deny_unknown_fields 让消息里出现未知字段时直接拒绝。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AgentMessage {
@@ -61,7 +58,6 @@ pub enum AgentMessage {
         content: Vec<ContentBlock>,
         /// 对应的工具调用 ID；名称和参数由原始 ToolCall 记录提供，这里不重复。
         tool_call_id: String,
-        /// 工具执行是否失败。
         is_error: bool,
         /// 观测到的工具执行耗时；结果未知或没有执行时缺省。
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,8 +71,6 @@ pub enum AgentMessage {
 impl AgentMessage {
     /// 用户和助手消息的公开内容，历史与完成事件共用；私有续接材料不进入投影，
     /// 工具结果必须由历史归约去绑定对应的调用，不在这里投影。
-    ///
-    /// 筛选在块映射之前完成，所以被排除的块不会产生任何临时对象。
     pub fn public_items(&self, entry_id: &str, scope: ItemScope) -> Vec<singularity_protocol::HistoryItem> {
         use singularity_protocol::HistoryItem;
         let role = match self {
@@ -157,7 +151,7 @@ impl AgentMessage {
         })
     }
 
-    /// 消息里的工具调用载荷；类型已经收窄，调用方不用再自己解包其他内容块。
+    /// 消息里的工具调用载荷。
     pub fn tool_calls(&self) -> impl Iterator<Item = &ModelToolCall> {
         self.content().iter().filter_map(|block| match block {
             ContentBlock::ToolCall(call) => Some(call),
@@ -165,7 +159,7 @@ impl AgentMessage {
         })
     }
 
-    /// 对应的工具调用 ID；返回 Option 只是因为有的角色不带调用身份，ToolResult 本身一定有调用 ID。
+    /// 工具结果对应的调用 ID；其他角色为 None。
     pub fn tool_call_id(&self) -> Option<&str> {
         match self {
             Self::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
@@ -187,9 +181,7 @@ pub const COMPACTION_SUMMARY_PREFIX: &str = "This checkpoint summarizes earlier 
 /// 压缩摘要节点进入模型上下文时加在后面的闭合标记。
 pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</compacted-summary>";
 
-/// 构造公开可见内容块的唯一规则：空思考和空正文各自跳过，顺序固定为 Thinking → Text。
-/// 正常响应和失败时的可见部分都走这条规则，差别只在 tool_calls 和私有续接材料。按值接收
-/// 让正常路径直接移动模型响应里的字符串，失败路径只在确实要持久化时才构造拥有所有权的值。
+/// 公开可见内容块：空思考和空正文各自跳过，顺序固定为 Thinking → Text。
 pub(crate) fn public_thinking_text_blocks(thinking: String, text: String) -> Vec<ContentBlock> {
     let mut content = Vec::with_capacity(2);
     if !thinking.is_empty() {
@@ -202,10 +194,7 @@ pub(crate) fn public_thinking_text_blocks(thinking: String, text: String) -> Vec
 }
 
 /// 把一次模型响应投影成一条 assistant 消息：公开 Thinking → 公开 Text →
-/// 全部 tool_call 块。
-///
-/// 响应按值交接；停止原因由执行循环消费，不属于持久化内容。
-/// usage 由请求观测和 operation 终态统计链记录，不算会话内容。
+/// 全部 tool_call 块。停止原因和 usage 不属于会话内容。
 pub(crate) fn assistant_response_message(response: ModelTurnResponse) -> AgentMessage {
     let ModelTurnResponse { assistant_message, thinking, .. } = response;
     let ModelMessage {

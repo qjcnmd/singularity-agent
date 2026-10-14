@@ -15,12 +15,14 @@ export type RpcResponse<M extends RpcMethod> =
 /** 事件归属的 turn；会话控制状态变更不绑定 turn。 */
 export function eventTurnId(event: TurnEventEnvelope): string | null {
   if ('turn' in event.params) return event.params.turn.turnId
-  if (event.method === 'turn/controlChanged') return null
+  if (event.method === 'turn/pendingQuestionChanged') return null
   return event.params.turnId
 }
 
 export interface ViewportAnchor {
   mode: 'following' | 'anchored'
   anchorItemId: string | null
+  /** 条目所属的历史回合；null 为前导记录，缺省表示旧的阅读位置。 */
+  turnId?: string | null
   offset: number
 }

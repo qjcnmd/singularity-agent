@@ -38,6 +38,31 @@ export function acceptBootstrap(state: SyncState, bootstrap: AppBootstrap): Sync
   return { ...state, bootstrap }
 }
 
+/** 目录快照是任务与工作区存在的权威来源：刷新后剔除已不存在会话的活动状态与
+ *  无效选择。刚创建但尚未进入目录快照的任务由豁免保留，进入目录后豁免结束。 */
+export function pruneStaleSelection(
+  bootstrap: AppBootstrap,
+  state: Pick<SyncState, 'liveSessions' | 'session'> & { selectedWorkspaceId: string | null; selectedSessionId: string | null },
+  createdSessionId: string | null,
+) {
+  const workspaces = new Set(bootstrap.workspaces.map(workspace => workspace.workspaceId))
+  const sessions = new Set(Object.values(bootstrap.sessionsByWorkspace).flat().map(session => session.threadId))
+  const protectedId = createdSessionId !== null && !sessions.has(createdSessionId) ? createdSessionId : null
+  const liveSessions = Object.fromEntries(Object.entries(state.liveSessions).filter(([id]) => sessions.has(id) || id === protectedId))
+  const session = state.session !== null && !sessions.has(state.session.summary.threadId) && state.session.summary.threadId !== protectedId ? null : state.session
+  const workspaceRemoved = state.selectedWorkspaceId !== null && !workspaces.has(state.selectedWorkspaceId)
+  const sessionRemoved = state.selectedSessionId !== null && !sessions.has(state.selectedSessionId) && state.selectedSessionId !== protectedId
+  const selectionDropped = workspaceRemoved || sessionRemoved
+  return {
+    liveSessions,
+    session: selectionDropped ? null : session,
+    selectionDropped,
+    selectedWorkspaceId: workspaceRemoved ? null : state.selectedWorkspaceId,
+    selectedSessionId: selectionDropped ? null : state.selectedSessionId,
+    createdInCatalog: createdSessionId !== null && protectedId === null,
+  }
+}
+
 export function resetBaseline(state: SyncState, bootstrap: AppBootstrap): SyncState {
   const session = state.session
   const liveSessions: SyncState['liveSessions'] = Object.fromEntries(Object.entries(bootstrap.sessionPhases)

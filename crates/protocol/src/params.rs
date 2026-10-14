@@ -55,7 +55,6 @@ pub struct RequestObservation {
 }
 
 /// read 工具真实读到的源文件范围：只有实际起始行和正文行数，不含正文本身。
-/// 展示层直接用它，不再从本地化的说明文本或原始调用参数反推实际范围。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -73,9 +72,8 @@ pub struct ReadSource {
 ///
 /// 一个 turn 的状态和身份归 ThreadTurn 所有，轮内的条目不重复承载同一份事实。
 pub enum HistoryItem {
-    /// 请求条目。身份只由 `observation.request_id` 承载，条目里不再单独保存
-    /// 同一个值；`started_at` 是该请求开始观测时的记录时间，只有终态观测（旧
-    /// 日志，或开始记录缺失）才为 None。不用结束时间去冒充开始时刻。
+    /// 请求条目，身份由 `observation.request_id` 承载；`started_at` 是开始观测的
+    /// 记录时间，开始记录缺失时为 None，不用结束时间代替。
     Request {
         #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
@@ -113,7 +111,7 @@ pub enum HistoryItem {
             ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
         )]
         images: Vec<crate::ImageAttachment>,
-        /// read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
+        /// read 工具真实读到的来源范围；其他工具没有这个字段。
         #[serde(rename = "readSource", skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         read_source: Option<ReadSource>,
@@ -142,9 +140,7 @@ pub enum HistoryItem {
 }
 
 impl HistoryItem {
-    /// 公开 history item 的稳定 id。历史翻页的锚点是轮 cursor
-    /// （`turn:{turnId}`，无归属的前导组是 `turn:leading`），见 runtime 的分页实现。
-    /// 请求条目的身份就是它所观测的 request id，生产者和消费者从同一处拿到同一个值。
+    /// 公开 history item 的稳定 id；请求条目的身份是它所观测的 request id。
     pub fn id(&self) -> &str {
         match self {
             Self::Request { observation, .. } => &observation.request_id,
@@ -162,24 +158,19 @@ impl HistoryItem {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-/// 公开历史中的单回合数据结构（包含回合起止时间、终态状态、错误详情与条目列表）。
+/// 公开历史中的单回合；`turn_id` 为 None 表示首个回合之前的前导条目。
 pub struct ThreadTurn {
-    /// 回合开始时间戳
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub started_at: Option<String>,
-    /// 回合结束时间戳
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub finished_at: Option<String>,
     pub turn_id: Option<String>,
-    /// 回合终态
     pub status: Option<TurnStatus>,
-    /// 回合失败详情
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub error: Option<crate::TurnErrorDetail>,
-    /// 该回合内的公开历史条目
     pub items: Vec<HistoryItem>,
 }
 
@@ -283,7 +274,6 @@ pub struct TerminalSummary {
 }
 
 impl TerminalSummary {
-    /// 构造终态摘要对象。
     pub fn new(
         thread_id: Option<&str>,
         status: TurnStatus,

@@ -25,8 +25,6 @@ impl Agent {
         }
         let keep_recent_tokens =
             (self.model.context_window() as f64 * COMPACTION_RETAIN_RATIO).floor() as u64;
-        // 摘要前保持历史正文原样，避免改写消息破坏可复用的请求前缀。
-        // 历史里没有可替换的前缀（内容太少）：本次无需摘要。
         let summary_definitions = definitions.clone();
         let model = self.model.clone();
         let session = std::sync::Arc::clone(&self.session);
@@ -41,10 +39,10 @@ impl Agent {
         })
         .await
         .expect("image context preparation completes while the runtime is running")?;
+        // 历史里没有可替换的前缀（内容太少）：本次无需摘要。
         let Some(summary) = summary else {
             return Ok(false);
         };
-        // 发起模型摘要请求并向上传播结果
         let (response, id) = execute_request(
             &self.provider,
             &self.session,

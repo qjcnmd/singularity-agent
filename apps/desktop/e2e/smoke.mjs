@@ -58,7 +58,6 @@ try {
   await page.screenshot({ path: join(output, 'sidebar-collapsed.png') })
   await page.getByRole('button', { name: '打开左侧栏', exact: true }).click()
   await page.getByRole('button', { name: '打开右侧栏', exact: true }).click()
-  await page.getByRole('button', { name: '轨迹', exact: true }).click()
   await page.waitForTimeout(400)
   await page.screenshot({ path: join(output, 'trajectory.png') })
   await page.getByRole('button', { name: '关闭右侧栏', exact: true }).click()

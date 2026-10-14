@@ -10,7 +10,7 @@ export const modelSelector = process.env.SINGULARITY_E2E_SELECTOR ?? 'bai/deepse
 export function setupE2E(outputName) {
   const home = process.env.SINGULARITY_HOME
   if (!home || !existsSync(join(home, 'config.json'))) {
-    throw new Error('Set an isolated SINGULARITY_HOME and copy config.json/auth.json into it before running desktop E2E')
+    throw new Error('Set SINGULARITY_HOME to a data directory containing config.json and auth.json (normally $HOME/.singularity) before running desktop E2E')
   }
   const desktop = resolve(fileURLToPath(new URL('..', import.meta.url)))
   const output = resolve(process.env.SINGULARITY_E2E_OUTPUT ?? join(desktop, '../../outputs', outputName))

@@ -5,6 +5,8 @@ type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'compaction' | 
 
 export interface TimelineItemModel {
   key: string
+  /** 可恢复的历史归属；临时输出不提供阅读锚点。 */
+  anchorTurnId?: string | null
   kind: TimelineKind
   title: string
   fact: ExecutionItem | null
@@ -30,11 +32,13 @@ export function buildTimeline(session: SessionView | null, userHome?: string | n
   const result: TimelineItemModel[] = []
   const turns = [...session.facts.history, ...session.facts.active]
   const terminal = session.runtime.terminal
+  let historyTurnId: string | null = null
   for (const turn of turns) {
+    historyTurnId = turn.id ?? historyTurnId
     const active = session.runtime.activeTurn?.turnId === turn.id
     const failureFromRuntime = turn === session.facts.active.at(-1)
       && terminal?.source === 'turn' && terminal.status === 'failed'
-    for (const item of projectTurn(turn, session.summary.cwd, userHome, active, failureFromRuntime)) result.push(item)
+    for (const item of projectTurn(turn, historyTurnId, session.summary.cwd, userHome, active, failureFromRuntime)) result.push(item)
   }
   // 摘要请求成功不代表摘要已经保存；失败或停止后不能继续显示“正在压缩”。
   if (session.runtime.phase === 'idle') {
@@ -42,21 +46,18 @@ export function buildTimeline(session: SessionView | null, userHome?: string | n
       if (item.kind !== 'compaction' || item.status !== 'running') continue
       const failed = terminal?.status === 'failed'
       result[index] = { ...item, status: failed ? 'error' : 'cancelled',
-        title: failed ? compactionText.failed : compactionText.unfinished, summary: terminal?.message ?? '' }
+        title: failed ? compactionText.failed : compactionText.unfinished }
     }
   }
-  // 提取压缩状态：进行中来自 runtime，失败来自终态
+  // 请求发出前也显示压缩进度；完成结果由历史或执行事件替换。
   if (session.runtime.activeCompaction && !session.facts.active.some(turn => turn.items.some(item =>
     item.kind === 'compaction' || (item.kind === 'request' && item.observation.purpose === 'compaction')))) {
     result.push(compactionItem('compaction:running', 'running', compactionText.running))
-  } else if (session.runtime.terminal?.source === 'compaction' && !result.some(item => item.kind === 'compaction' && timelineStatus(item) === 'error')) {
-    const terminal = session.runtime.terminal
-    result.push(compactionItem('compaction:failed', 'error', compactionText.failed, terminal.message ?? '压缩失败'))
   }
-  const lastTurn = turns.at(-1)
-  if (terminal?.source === 'turn' && terminal.status === 'failed'
-    && !(lastTurn?.status === 'failed' && lastTurn.error?.message === (terminal.message ?? '执行失败'))) {
-    result.push(failedItem('terminal:failed', terminal.message ?? '执行失败'))
+  // 后端只在失败原因未保存时提供 message；它属于当前操作，不与历史错误去重。
+  if (terminal?.message) {
+    result.push(failedItem('terminal:failed', terminal.source === 'compaction'
+      ? `${compactionText.failed}：${terminal.message}` : terminal.message))
   }
   // 若执行被手动中断，末尾追加“已停止”提示
   if (session.runtime.terminal?.source !== 'compaction'
@@ -65,7 +66,7 @@ export function buildTimeline(session: SessionView | null, userHome?: string | n
   return result
 }
 
-function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null | undefined, active: boolean, failureFromRuntime: boolean): TimelineItemModel[] {
+function projectTurn(turn: ExecutionTurn, anchorTurnId: string | null, cwd: string, userHome: string | null | undefined, active: boolean, failureFromRuntime: boolean): TimelineItemModel[] {
   const startedAt = turn.startedAt
   const result: TimelineItemModel[] = []
   // 首部 settings 记录没有 turnId，使用 'leading' 占位 key
@@ -78,8 +79,8 @@ function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null |
         compactionIndex = result.length
         if (workStartIndex < 0) workStartIndex = result.length
         const status = fact.status === 'error' || fact.status === 'cancelled' ? fact.status : 'running'
-        result.push(compactionItem(`content:${group}:compaction:${fact.id}`, status,
-          status === 'error' ? compactionText.failed : status === 'cancelled' ? compactionText.stopped : compactionText.running))
+        result.push({ ...compactionItem(`compaction:${fact.id}`, status,
+          status === 'error' ? compactionText.failed : status === 'cancelled' ? compactionText.stopped : compactionText.running), anchorTurnId })
       }
       continue
     }
@@ -100,26 +101,27 @@ function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null |
         if (fact.kind === 'compaction_result') title = fact.status === 'error' ? compactionText.failed : fact.text
         item = { key, fact, kind, title, summary: '', filePath: null }
       }
+      if (fact.status !== 'running' || fact.kind === 'tool') item.anchorTurnId = anchorTurnId
       projectedItems.set(fact, { item, cwd, userHome })
     }
     if (item.kind !== 'user' && workStartIndex < 0) workStartIndex = result.length
     if (item.kind === 'compaction' && compactionIndex >= 0) {
       // 摘要和失败、停止结果都替换请求行，保留同一个显示位置和身份。
-      result[compactionIndex] = { ...item, key: result[compactionIndex].key }
+      result[compactionIndex] = { ...item, key: result[compactionIndex].key, anchorTurnId }
       compactionIndex = -1
     } else result.push(item)
   }
   if (startedAt && (turn.finishedAt || active)) {
     result.splice(workStartIndex < 0 ? result.length : workStartIndex, 0, {
-      key: `content:${group}:duration`, kind: 'duration', title: '',
+      key: `content:${group}:duration`, anchorTurnId, kind: 'duration', title: '',
       timing: { startedAt, finishedAt: turn.finishedAt },
       fact: null, summary: '', filePath: null,
     })
   }
-  if (turn.status === 'interrupted') result.push(stoppedItem(`content:${group}:terminal`))
+  if (turn.status === 'interrupted') result.push({ ...stoppedItem(`content:${group}:terminal`), anchorTurnId })
   // 保存失败时没有回合错误详情，具体原因由运行状态显示。
   if (turn.status === 'failed' && (turn.error || !failureFromRuntime)) {
-    result.push(failedItem(`content:${group}:terminal`, turn.error?.message ?? '执行失败'))
+    result.push({ ...failedItem(`content:${group}:terminal`, turn.error?.message ?? '执行失败'), anchorTurnId })
   }
   return result
 }

@@ -15,8 +15,7 @@ pub mod diagnostic_code {
     pub const STORAGE_FATAL: &str = "storage_fatal";
 }
 
-/// 无字段枚举的 wire 词形来自 serde 的 rename_all = "snake_case" 投影。Display 用它
-/// 把同一个词形呈现到给人读的错误和诊断文本里，不存在第二份手写的词形表。
+/// 无字段枚举的 serde wire 词形；Display 用它让错误和诊断文本与 wire 一致。
 pub fn wire_word<T: Serialize>(value: T) -> String {
     serde_json::to_value(value)
         .expect("fieldless enum serializes")
@@ -57,8 +56,7 @@ pub enum TurnEvent {
     #[serde(rename = "turn/started")]
     TurnStarted { turn: Turn, started_at: String },
     /// 已经落盘的用户消息事实：初始输入和注入输入共用这同一条出口。
-    /// item 是该条目首个文本块的公开内容块 id，与历史投影的派生规则相同，
-    /// 客户端不用自己拼接。
+    /// item 是该条目首个文本块的公开内容块 id，与历史投影的派生规则相同。
     #[serde(rename = "turn/userMessage")]
     UserMessage {
         thread_id: String,
@@ -124,7 +122,7 @@ pub enum TurnEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         duration_ms: Option<u64>,
-        /// read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
+        /// read 工具真实读到的来源范围；其他工具没有这个字段。
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         read_source: Option<crate::ReadSource>,
@@ -164,8 +162,7 @@ pub enum TurnEvent {
         code: String,
         message: String,
     },
-    /// 实时 attempt 事件与持久历史共享同一个 RequestObservation，事件自身只补 turn
-    /// 身份。诊断码只由 observation.diagnostic_code 承载，不在事件外层重复一份。
+    /// 实时 attempt 事件与持久历史共享同一个 RequestObservation，事件自身只补 turn 身份。
     #[serde(rename = "provider/attempt")]
     ProviderAttempt {
         observation: crate::RequestObservation,
@@ -175,9 +172,9 @@ pub enum TurnEvent {
     },
     #[serde(rename = "turn/completed")]
     TurnCompleted { turn: Turn, finished_at: String },
-    /// 输入箱发生变化；工作台据此发布待处理队列快照。
-    #[serde(rename = "turn/controlChanged")]
-    ControlChanged {},
+    /// 等待回答的问题出现或结束；工作台据此重新发布会话快照。
+    #[serde(rename = "turn/pendingQuestionChanged")]
+    PendingQuestionChanged {},
     #[serde(rename = "turn/error")]
     TurnFailed {
         thread_id: String,
@@ -197,7 +194,6 @@ pub enum DiagnosticSeverity {
     Error,
 }
 
-/// 诊断文本用 Display 呈现与 wire 一致的词形，不另写第二份词表。
 impl std::fmt::Display for DiagnosticSeverity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&wire_word(*self))
@@ -234,7 +230,6 @@ pub enum TurnFailureCause {
     Internal,
 }
 
-/// 错误文本通过 Display 呈现与序列化一致的词形。
 impl std::fmt::Display for TurnFailureCause {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&wire_word(*self))

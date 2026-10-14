@@ -2,29 +2,54 @@
 use super::manager::SessionData;
 use super::{LedgerRecord, SessionEntry};
 use serde::{Deserialize, Serialize};
-use singularity_model::{ModelMessage, ModelToolSchema};
+use singularity_model::{ModelMessage, ModelPreferences, ModelRole, ModelToolSchema};
 use singularity_protocol::{
-    ModelRequestDefinitions, ModelRequestSnapshot, RequestMessage, RequestPreferences, RequestTool,
+    ModelRequestDefinitions, ModelRequestReference, ModelRequestSnapshot, RequestMessage, RequestPreferences,
+    RequestTool,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestDefinitions {
-    pub messages: Vec<RequestMessage>,
-    pub tools: Vec<RequestTool>,
+    messages: Vec<SavedInstruction>,
+    tools: Vec<SavedTool>,
+}
+
+// 保持已有 JSONL 字段名；桌面 DTO 或 Provider 输入的变化不改变保存格式。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedInstruction {
+    role: ModelRole,
+    content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedTool {
+    name: String,
+    description: String,
+    parameters_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedPreferences {
+    max_output_tokens: Option<u32>,
 }
 
 impl RequestDefinitions {
     pub(super) fn snapshot(
         &self,
         definitions_id: &str,
-        model_preferences: &RequestPreferences,
+        model_preferences: &ModelPreferences,
     ) -> Box<ModelRequestSnapshot> {
         Box::new(ModelRequestSnapshot {
             definitions_id: definitions_id.to_string(),
-            messages: self.messages.clone(),
-            tools: self.tools.clone(),
-            model_preferences: model_preferences.clone(),
+            messages: self.public_messages(),
+            tools: self.public_tools(),
+            model_preferences: RequestPreferences {
+                max_output_tokens: model_preferences.max_output_tokens,
+            },
         })
     }
 
@@ -32,12 +57,19 @@ impl RequestDefinitions {
         Self {
             messages: messages
                 .iter()
-                .map(|message| RequestMessage {
+                .map(|message| SavedInstruction {
                     role: message.role,
                     content: message.content.clone(),
                 })
                 .collect(),
-            tools,
+            tools: tools
+                .into_iter()
+                .map(|tool| SavedTool {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters_schema: tool.parameters_schema,
+                })
+                .collect(),
         }
     }
 
@@ -65,6 +97,39 @@ impl RequestDefinitions {
             .map(|message| ModelMessage::text(message.role, &message.content))
             .collect()
     }
+
+    /// 从保存的定义恢复压缩请求的工具输入。
+    pub(crate) fn model_tools(&self) -> Vec<ModelToolSchema> {
+        self.tools
+            .iter()
+            .map(|tool| ModelToolSchema {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters_schema: tool.parameters_schema.clone(),
+            })
+            .collect()
+    }
+
+    fn public_messages(&self) -> Vec<RequestMessage> {
+        self.messages
+            .iter()
+            .map(|message| RequestMessage {
+                role: message.role,
+                content: message.content.clone(),
+            })
+            .collect()
+    }
+
+    fn public_tools(&self) -> Vec<RequestTool> {
+        self.tools
+            .iter()
+            .map(|tool| RequestTool {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters_schema: tool.parameters_schema.clone(),
+            })
+            .collect()
+    }
 }
 
 /// 一次请求引用到的定义，以及这次请求的偏好。请求身份只由外层
@@ -73,7 +138,28 @@ impl RequestDefinitions {
 #[serde(deny_unknown_fields)]
 pub struct RequestContext {
     pub definitions: String,
-    pub model_preferences: RequestPreferences,
+    model_preferences: SavedPreferences,
+}
+
+impl RequestContext {
+    pub(super) fn new(definitions: String, preferences: ModelPreferences) -> Self {
+        Self {
+            definitions,
+            model_preferences: SavedPreferences {
+                max_output_tokens: preferences.max_output_tokens,
+            },
+        }
+    }
+
+    /// 将保存的请求偏好转换为桌面轨迹引用。
+    pub fn public_reference(&self) -> ModelRequestReference {
+        ModelRequestReference {
+            definitions_id: self.definitions.clone(),
+            model_preferences: RequestPreferences {
+                max_output_tokens: self.model_preferences.max_output_tokens,
+            },
+        }
+    }
 }
 
 impl SessionData {
@@ -106,8 +192,8 @@ impl SessionData {
             })
             .expect("request references an earlier definition record");
         ModelRequestDefinitions {
-            messages: definitions.messages.clone(),
-            tools: definitions.tools.clone(),
+            messages: definitions.public_messages(),
+            tools: definitions.public_tools(),
         }
     }
 }

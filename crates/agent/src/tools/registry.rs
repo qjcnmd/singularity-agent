@@ -95,20 +95,17 @@ pub(crate) struct ExecuteContext<'a> {
     pub on_update: &'a mut dyn FnMut(String),
 }
 
-/// 取消时给模型看的失败文案。全仓只有这一处来源，各工具不得自己拼一份。
+/// 取消时给模型看的失败文案，各工具共用。
 pub(crate) const ABORTED_MESSAGE: &str = "Operation aborted";
 
 impl ExecuteContext<'_> {
-    /// 取消信号已触发时返回模型可见的 abort 失败结果，未触发则返回 None。
-    /// 各工具在入口和耗时步骤之后统一调用它检查取消，不必自己判断。
+    /// 取消信号已触发时返回模型可见的 abort 失败结果；各工具在入口和耗时步骤之后调用。
     pub(crate) fn abort_if_cancelled(&self) -> Option<ToolExecution> {
         self.signal.is_cancelled().then(|| error_result(ABORTED_MESSAGE))
     }
 }
 
-/// 模型可见的工具元数据：名称、一行简介、描述和 JSON Schema（parameters）。
-/// 参数解析与执行分发不在这个结构上，分别由 [`ToolRegistrySnapshot::preflight`]
-/// 和 [`PreparedTool::execute`] 承担。
+/// 模型可见的工具元数据；参数解析见 [`ToolRegistrySnapshot::preflight`]。
 #[derive(Debug, Clone)]
 pub(crate) struct ToolSpec {
     pub name: &'static str,

@@ -17,11 +17,7 @@ impl TurnRunner {
         let mut agent = tokio::task::spawn_blocking(move || {
             let provider = runner.resolve_provider(&start_thread)?;
             let config = AgentConfig {
-                instruction_home: runner
-                    .sessions_dir
-                    .parent()
-                    .expect("sessions directory is inside the data directory")
-                    .to_path_buf(),
+                instruction_home: runner.instruction_home(),
                 initial_instructions: None,
             };
             let agent = Agent::new(

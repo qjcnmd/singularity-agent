@@ -8,8 +8,7 @@ use singularity_agent::{
     session::{InterruptedAssistantItem, LedgerRecord, SessionData, SessionEntry, SessionMetadata},
 };
 use singularity_protocol::{
-    HistoryItem, ModelRequestDefinitions, ModelRequestReference, SessionModelUsage, ThreadSummary,
-    ThreadTurn, TurnStatus,
+    HistoryItem, ModelRequestDefinitions, SessionModelUsage, ThreadSummary, ThreadTurn, TurnStatus,
 };
 
 /// 会话历史的按轮分组索引。
@@ -105,10 +104,7 @@ impl IndexedTurn {
                         items.push(HistoryItem::Request {
                             started_at: Some(timestamp.clone()),
                             observation,
-                            context: ModelRequestReference {
-                                definitions_id: context.definitions.clone(),
-                                model_preferences: context.model_preferences.clone(),
-                            },
+                            context: context.public_reference(),
                         });
                     } else {
                         // 每次请求只有一个终态观测；开始时刻和请求详情保留在原条目。

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { DiscoveredModel, ModelConfigurationField, ProviderConfigurationInput } from '../protocol'
-import { automaticFieldsFor, blankModel, formatCapacityInput, mergeDiscoveredModel, parseCapacity, reasoningOptionsFor } from '../modelConfiguration'
+import { automaticFieldsFor, blankModel, formatCapacityInput, mergeDiscoveredModel, parseCapacity, reasoningConfigurationError, reasoningOptionsFor } from '../modelConfiguration'
 import { Dialog } from './Dialog'
 import { ReasoningOptions } from './ReasoningOptions'
 
@@ -111,10 +111,8 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
     const output = parseCapacity(draft.outputText)
     if (context == null || output == null) return '上下文窗口和最大输出 Token 应为正整数，可使用 K / M。'
     if (output >= context) return '最大输出 Token 必须小于上下文窗口。'
-    if (variants.some(v => !v.id || /[\s/#]/.test(v.id) || (v.wireEffort !== null && /[\s/#]/.test(v.wireEffort)))) return '思考档位无效，请重新获取模型参数或取消选择此档位。'
-    if (new Set(variants.map(v => v.id)).size !== variants.length) return '思考选项不能重名。'
-    if (variants.some(v => v.id === 'off' && v.wireEffort !== null)) return '关闭思考的参数映射无效，请重新获取模型参数。'
-    if (variants.some(v => v.id !== 'off' && v.wireEffort === null && (draft.apiProtocol === 'responses' || v.id !== 'on'))) return '此协议不支持所选思考开关，请重新获取模型参数或取消选择。'
+    const reasoningError = reasoningConfigurationError(variants, draft.apiProtocol ?? 'chat')
+    if (reasoningError !== null) return reasoningError
     // 文本容量只在此解析一次；列表此后保存数值，展示使用紧凑 token 格式。
     const { contextText, outputText, ...model } = draft
     const next: ModelInput = { ...model, maxContextTokens: context, maxOutputTokens: output }

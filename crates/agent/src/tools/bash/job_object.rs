@@ -166,7 +166,6 @@ pub(crate) fn spawn_in_job(shell: &str, script: &str, cwd: &std::path::Path) -> 
         .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
     let child = command.spawn()?;
     let process = child.as_raw_handle() as HANDLE;
-    // 回收主体先建出来，归属结果初始为 false，只有 assign 成功才改成 true。
     let mut started = ManagedChild { child, job, owned_by_job: false };
     let assigned = started.job.assign(process);
     if assigned.is_ok() {

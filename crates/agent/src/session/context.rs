@@ -11,7 +11,7 @@ use singularity_model::{ModelMessage, ModelRole};
 
 use crate::message::{AgentMessage, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock};
 
-use super::format::{LedgerRecord, SessionEntry};
+use super::format::SessionEntry;
 use super::manager::SessionData;
 
 /// 启发式 Token 估算：按 UTF-16 字符数除以 4 向上取整。
@@ -137,7 +137,7 @@ pub(crate) struct CompactionPrefix {
 }
 
 impl ContextView {
-    /// 按已保存的压缩与剪枝边界还原模型历史；边界在生成记录时确定。
+    /// 按已保存的压缩边界还原模型历史；边界在生成记录时确定。
     pub(crate) fn derive(session: &SessionData) -> Self {
         let entries = resolve_context_entries(session);
         Self { entries }
@@ -182,87 +182,54 @@ impl ContextView {
     }
 }
 
-/// 日志只追加，所以位置在同一份 SessionData 内始终稳定；剪枝正文仍由原始日志持有。
+/// 日志只追加，所以位置在同一份 SessionData 内始终稳定。
 #[derive(Debug, Clone, Copy)]
 struct ContextPosition {
     index: usize,
-    pruned_index: Option<usize>,
 }
 
 impl ContextPosition {
-    fn entry<'a>(&self, session: &'a SessionData) -> &'a SessionEntry {
+    fn entry(self, session: &SessionData) -> &SessionEntry {
         &session.entries()[self.index]
     }
 
-    fn content<'a>(&self, session: &'a SessionData) -> &'a [ContentBlock] {
-        if let Some(index) = self.pruned_index {
-            let SessionEntry::Record {
-                record: LedgerRecord::ToolResultPruned { content, .. },
-                ..
-            } = &session.entries()[index]
-            else {
-                unreachable!("pruned position references its ledger record");
-            };
-            return content;
-        }
-        let SessionEntry::Message { message, .. } = self.entry(session) else {
-            unreachable!("content is only read for messages");
-        };
-        message.content()
-    }
-
-    fn token_estimate(&self, session: &SessionData) -> u64 {
-        match self.entry(session) {
-            SessionEntry::Message { message, .. } => content_token_estimate(
-                self.content(session),
-                matches!(message, AgentMessage::ToolResult { .. }),
-            ),
-            entry => entry_token_estimate(entry),
-        }
+    fn token_estimate(self, session: &SessionData) -> u64 {
+        entry_token_estimate(self.entry(session))
     }
 
     /// 对话历史与摘要前缀共用同一套消息投影；文件指令由 Agent 加入。
-    fn model_message(&self, session: &SessionData) -> ContextMessage {
-        let message = match context_entry(self.entry(session))
-            .expect("context position references a context entry")
-        {
-            ContextEntry::Message(message) => match message {
-                AgentMessage::User { .. } => {
-                    ModelMessage::text(ModelRole::User, crate::message::content_text(self.content(session)))
+    fn model_message(self, session: &SessionData) -> ContextMessage {
+        let message =
+            match context_entry(self.entry(session)).expect("context position references a context entry") {
+                ContextEntry::Message(message) => message,
+                ContextEntry::Summary(summary) => {
+                    return ContextMessage {
+                        message: ModelMessage::text(ModelRole::User, compaction_summary(summary)),
+                        images: Vec::new(),
+                    };
                 }
-                AgentMessage::Assistant { .. } => ModelMessage {
-                    role: ModelRole::Assistant,
-                    content: crate::message::content_text(self.content(session)),
-                    images: Vec::new(),
-                    tool_call_id: None,
-                    tool_calls: message.tool_calls().cloned().collect(),
-                    provider_reasoning_replay: message.provider_reasoning_replay().cloned(),
-                },
-                AgentMessage::ToolResult { tool_call_id, .. } => {
-                    let mut llm = ModelMessage::text(
-                        ModelRole::Tool,
-                        crate::message::content_text(self.content(session)),
-                    );
-                    llm.tool_call_id = Some(tool_call_id.clone());
-                    llm
-                }
+            };
+        let text = message.content_text();
+        let model_message = match message {
+            AgentMessage::User { .. } => ModelMessage::text(ModelRole::User, text),
+            AgentMessage::Assistant { .. } => ModelMessage {
+                role: ModelRole::Assistant,
+                content: text,
+                images: Vec::new(),
+                tool_call_id: None,
+                tool_calls: message.tool_calls().cloned().collect(),
+                provider_reasoning_replay: message.provider_reasoning_replay().cloned(),
             },
-            ContextEntry::Summary(summary) => {
-                ModelMessage::text(ModelRole::User, compaction_summary(summary))
+            AgentMessage::ToolResult { tool_call_id, .. } => {
+                let mut result = ModelMessage::text(ModelRole::Tool, text);
+                result.tool_call_id = Some(tool_call_id.clone());
+                result
             }
         };
-        let images = match self.entry(session) {
-            SessionEntry::Message { .. } => self
-                .content(session)
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Image(image) => Some(image.clone()),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        ContextMessage { message, images }
+        ContextMessage {
+            message: model_message,
+            images: message.images().cloned().collect(),
+        }
     }
 }
 
@@ -297,7 +264,6 @@ pub(crate) fn load_messages(
         .collect()
 }
 
-/// 按日志顺序归约出唯一的活动历史：摘要替换掉前缀，剪枝记录只借用替换后的正文。
 /// 会进入可压缩历史的条目；文件指令由 Agent 直接加入请求。
 pub(crate) fn is_context_entry(entry: &SessionEntry) -> bool {
     context_entry(entry).is_some()

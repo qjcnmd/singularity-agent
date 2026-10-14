@@ -1,7 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use singularity_protocol::RequestTool as ModelToolSchema;
+/// Provider 无关的工具定义；网络请求格式由各 Provider 编码。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelToolSchema {
+    pub name: String,
+    pub description: String,
+    pub parameters_schema: Value,
+}
 
 /// 一次模型工具调用。参数只保存一份原始值，合法性由工具预检环节拒绝。
 ///

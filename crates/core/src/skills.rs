@@ -65,7 +65,7 @@ fn discover_skill(path: &Path) -> Result<Skill, String> {
     if !closed {
         return Err(format!("{}: unclosed YAML frontmatter", path.display()));
     }
-    let meta: Metadata = serde_yaml_ng::from_str(&yaml).map_err(|e| format!("{}: {e}", path.display()))?;
+    let meta: Metadata = serde_saphyr::from_str(&yaml).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.name.is_empty()
         || meta.name.chars().any(|c| c.is_whitespace() || matches!(c, '/' | '\\' | '<' | '>'))
         || meta.description.trim().is_empty()

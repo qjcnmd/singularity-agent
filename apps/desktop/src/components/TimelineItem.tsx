@@ -194,7 +194,7 @@ function ToolOutput({ item }: Props) {
   const hasReadLines = fact.readSource !== undefined && fact.readSource.lineCount > 0
   if (item.filePath !== null && (output !== '' || hasReadLines) && item.title === 'read' && timelineStatus(item) !== 'error') return <div>
     <OutputHeader label={item.filePath} />
-    {/* 只有 producer 记录了真实来源范围才编号；旧记录按普通文本展示，不猜边界。 */}
+    {/* 只有 producer 记录了真实来源范围才编号；否则按普通文本展示，不猜边界。 */}
     {fact.readSource
       ? <div className="tool-lines">{readOutputLines(output, fact.readSource).map((line, index) => (
         <div key={index} className="tool-line">{line.number !== undefined && <span className="tool-line-number">{line.number}</span>}<span>{line.text}</span></div>

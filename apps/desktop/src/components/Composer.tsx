@@ -18,17 +18,18 @@ import { useFileCandidates, useSkillCandidates } from '../inputCandidates'
 import { disclosureTransition } from '../motion'
 import { QuestionPanel } from './QuestionPanel'
 import { DraftImages, useImageInput } from './Images'
+import { selectedSessionPhase } from '../sessionState'
 
 export const Composer = memo(ComposerView)
 
 function ComposerView({ centered }: { centered: boolean }) {
   const reducedMotion = useReducedMotion()
-  const state = useAppStore(['drafts', 'questionDrafts', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'theme', 'workspaceAppearance'])
+  const state = useAppStore(['drafts', 'questionDrafts', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'liveSessions', 'sessionLoad', 'theme', 'workspaceAppearance'])
   const draft = appStore.draft()
   const imageDraft = appStore.inputDraft().images
   const sessionId = state.selectedSessionId
   const imageInput = useImageInput(images => { if (sessionId !== null) appStore.setImages(sessionId, images, true) }, sessionId === null || state.drafts === null)
-  const phase = state.session?.runtime.phase ?? 'idle'
+  const phase = selectedSessionPhase(state)
   const busy = phase === 'running' || phase === 'stopping' || phase === 'compacting'
   const hasTurns = state.session?.facts.history.some(turn => turn.id !== null) ?? false
   const [caret, setCaret] = useState(draft.length)
@@ -78,11 +79,10 @@ function ComposerView({ centered }: { centered: boolean }) {
     const anchor = candidateAnchor.current
     const list = candidateList.current
     if (!showCandidateSurface || !anchor || !list) return
-    const main = anchor.closest('.app-main')!
-    const panelToggle = main.parentElement!.querySelector('.trajectory-toggle')!
-    // 浮层避开顶部按钮，只使用输入框上方的空间；输入高度和视口变化都重新量。
+    // 浮层避开顶部 52px 的标题栏与轨迹开关区，只使用输入框上方的空间；
+    // 输入高度和视口变化都重新量。
     const measure = () => {
-      const available = anchor.getBoundingClientRect().top - panelToggle.getBoundingClientRect().bottom - 8
+      const available = anchor.getBoundingClientRect().top - 52
       list.style.maxHeight = `${Math.max(0, Math.min(240, available))}px`
     }
     measure()

@@ -1,10 +1,17 @@
 import type { ThreadSummary } from './protocol'
-import type { LiveSessionState } from './sync'
+import type { LiveSessionState, SyncState } from './sync'
 import { phaseText, turnStatusText } from './copy'
 
 /** 尚未命名且没有回合记录的任务；活动相位和草稿由各操作另行判断。 */
 export function isBlankSession(session: ThreadSummary): boolean {
   return session.turnCount === 0 && !session.title?.trim()
+}
+
+/** 正文暂未加载或读取失败时，仍使用当前任务已收到的运行状态。 */
+export function selectedSessionPhase(state: Pick<SyncState, 'session' | 'liveSessions'> & { selectedSessionId: string | null }) {
+  return state.session?.runtime.phase
+    ?? (state.selectedSessionId === null ? undefined : state.liveSessions[state.selectedSessionId]?.phase)
+    ?? 'idle'
 }
 
 /**

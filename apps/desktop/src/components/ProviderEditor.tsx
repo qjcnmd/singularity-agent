@@ -2,7 +2,7 @@ import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import { formatTokenCount } from '../copy'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import type { DiscoveredModel, ProviderConfigurationInput, RedactedProvider } from '../protocol'
-import { applyProtocol, blankModel, isValidCapacity, mergeDiscoveredModels } from '../modelConfiguration'
+import { applyProtocol, blankModel, isValidCapacity, mergeDiscoveredModels, reasoningConfigurationError } from '../modelConfiguration'
 import { ModelEditor } from './ModelEditor'
 import { Dialog } from './Dialog'
 import { ProtocolPicker } from './ProtocolPicker'
@@ -49,11 +49,6 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
     return appStore.transport.rpc('model.discover', {
       providerId: providerId.trim(), baseUrl, apiKey: apiKey.trim() || null, apiProtocol,
     })
-  }
-
-  function changeProtocol(next: string) {
-    setProtocol(next)
-    setModels(rows => rows.map(row => applyProtocol(row, next)))
   }
 
   function toggleCandidate(modelId: string) {
@@ -123,6 +118,11 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
         setFailure(`请编辑第 ${index + 1} 行模型，补齐有效的上下文窗口和最大输出 Token。`)
         return
       }
+      const reasoningError = reasoningConfigurationError(model.reasoningVariants, protocol)
+      if (reasoningError !== null) {
+        setFailure(`模型 ${id}：${reasoningError}`)
+        return
+      }
       submitted.push({ ...model, modelId: id, displayName: model.displayName?.trim() || null })
     }
     const result = await appStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl, apiProtocol: protocol, models: submitted }, apiKey.trim())
@@ -157,7 +157,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
             </label>
             <div className="sg-field">
               <span>API 协议</span>
-              <ProtocolPicker value={protocol} onChange={changeProtocol} />
+              <ProtocolPicker value={protocol} onChange={setProtocol} />
             </div>
             <section className="sg-model-catalog" aria-label="模型目录">
               <div className="sg-model-catalog-head">
@@ -168,7 +168,9 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
               </div>
               {models.length === 0 && <p className="sg-model-empty">尚无模型。</p>}
               <div className="sg-model-list">
-                {models.map((model, index) => (
+                {models.map((model, index) => {
+                  const reasoningError = reasoningConfigurationError(model.reasoningVariants, protocol)
+                  return (
                   <div key={index} className="sg-model-entry">
                     <div className="sg-model-row">
                       <span>{model.modelId}</span>
@@ -176,8 +178,10 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
                       <button type="button" className="quiet-button" onClick={() => setModelEditor({ index, draft: applyProtocol(model, protocol) })}>编辑</button>
                       <button type="button" className="sg-icon-btn sg-icon-btn-danger" aria-label={`删除模型 ${index + 1}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}>×</button>
                     </div>
+                    {reasoningError && <p className="form-error" role="alert">{reasoningError}</p>}
                   </div>
-                ))}
+                  )
+                })}
               </div>
               <button type="button" className="sg-add-model-btn" onClick={() => setModelEditor({ index: null, draft: { ...blankModel(), apiProtocol: protocol } })}>＋ 添加模型</button>
             </section>

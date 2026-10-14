@@ -2,7 +2,7 @@
 //!
 //! 当前版本（CURRENT_SESSION_VERSION）的 operation_finished 只持久化终态所需的
 //! 结果、错误与停止事实。请求用量由请求
-//! 观测记录提供；工具剪枝记录改变模型视图，指令与工具定义按内容去重。
+//! 观测记录提供；指令与工具定义按内容去重。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -74,12 +74,6 @@ pub enum SessionMetadata {
 pub enum LedgerRecord {
     /// 执行被手动中断前已生成的内容（仅供历史展示，不进入后续模型上下文）。
     AssistantInterrupted { items: Vec<InterruptedAssistantItem> },
-    /// 历史会话中的工具正文裁剪记录（兼容旧数据读取）。
-    ToolResultPruned {
-        #[serde(rename = "entryId")]
-        entry_id: String,
-        content: Vec<crate::message::ContentBlock>,
-    },
     /// 单次模型调用的请求与结果观测。
     ModelRequest {
         observation: singularity_protocol::RequestObservation,
@@ -202,11 +196,9 @@ pub(super) struct SessionHeader {
     pub(super) cwd: String,
 }
 
-/// 文件头 type 字段固定值。
 const SESSION_HEADER_TYPE: &str = "session";
 
 impl SessionHeader {
-    /// 构造新会话文件头。
     pub(super) fn new(session_id: String, cwd: String, timestamp: String) -> Self {
         Self {
             kind: SESSION_HEADER_TYPE.to_string(),
@@ -238,7 +230,6 @@ impl SessionHeader {
         Ok(header)
     }
 
-    /// 获取规范化后的工作目录路径。
     pub(super) fn canonical_cwd(&self) -> Result<std::path::PathBuf> {
         singularity_core::CanonicalWorkspacePath::from_saved(&self.cwd)
             .map_err(SessionError::InvalidHeader)

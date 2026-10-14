@@ -16,8 +16,7 @@ pub enum ProviderReasoningReplay {
     Chat {
         provider_name: String,
         model_name: String,
-        /// 实际请求地址；旧记录未保存来源地址，不复用其中的私有数据。
-        #[serde(default)]
+        /// 实际请求地址；地址变化后不复用这份私有数据。
         endpoint: String,
         reasoning_content: String,
         /// 保留提供方返回时用的字段名。
@@ -29,7 +28,6 @@ pub enum ProviderReasoningReplay {
     Responses {
         provider_name: String,
         model_name: String,
-        #[serde(default)]
         endpoint: String,
         /// 提供方的完整输出序列，逐字保留；适配器只往后追加 function_call_output 项。
         items: Vec<Value>,

@@ -1,5 +1,16 @@
 // 桌面视图及默认值；运行态由 Store 独立维护。
 import type { ViewportAnchor } from './protocol'
+import type { SessionView } from './execution'
+import { buildTimeline } from './timeline'
+
+/** 找到所属回合后，缺失条目不可能藏在更早的页里。 */
+export function anchorLocation(session: SessionView | null, anchor: ViewportAnchor | undefined): 'found' | 'older' | 'missing' {
+  if (anchor?.mode !== 'anchored') return 'found'
+  if (buildTimeline(session).some(item => item.key === anchor.anchorItemId)) return 'found'
+  if (session === null || session.nextCursor === null || anchor.turnId === undefined
+    || [...session.facts.history, ...session.facts.active].some(turn => turn.id === anchor.turnId)) return 'missing'
+  return 'older'
+}
 
 export const defaultAnchor = (): ViewportAnchor => ({
   mode: 'following', anchorItemId: null, offset: 0,
@@ -20,6 +31,7 @@ export interface PersistedView {
   selectedSessionId: string | null
   sidebarWidth: number
   sidebarCollapsed: boolean
+  trajectoryWidth: number
   sidebarView: { collapsed: string[] }
   trajectoryOpen: boolean
   workspaceAppearance: Record<string, WorkspaceAppearance>
@@ -38,21 +50,23 @@ export function loadPersisted(): PersistedView {
     selectedSessionId: null,
     sidebarWidth: 280,
     sidebarCollapsed: false,
+    trajectoryWidth: 280,
     sidebarView: { collapsed: [] },
     trajectoryOpen: false,
     workspaceAppearance: {},
     viewportAnchors: {},
   }
   try {
-    return (JSON.parse(localStorage.getItem(storageKey) ?? 'null') as PersistedView | null) ?? fallback
+    const stored = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as PersistedView | null
+    return stored === null ? fallback : { ...fallback, ...stored }
   } catch {
     return fallback
   }
 }
 
 export function persistView(value: PersistedView): void {
-  const { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors } = value
-  const view: PersistedView = { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors }
+  const { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, trajectoryWidth, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors } = value
+  const view: PersistedView = { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, trajectoryWidth, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors }
   localStorage.setItem(storageKey, JSON.stringify(view))
 }
 

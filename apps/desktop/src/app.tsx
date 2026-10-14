@@ -13,13 +13,12 @@ import { sessionTitles } from './sessionTitle'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
 export function App() {
-  const state = useAppStore(['theme', 'messageFontSize', 'selectedSessionId', 'selectedWorkspaceId', 'bootstrap', 'sidebarCollapsed', 'sidebarWidth', 'trajectoryOpen', 'settingsOpen', 'actionErrors', 'pendingActions'])
+  const state = useAppStore(['theme', 'messageFontSize', 'selectedSessionId', 'selectedWorkspaceId', 'bootstrap', 'sidebarCollapsed', 'sidebarWidth', 'trajectoryWidth', 'trajectoryOpen', 'settingsOpen', 'actionErrors', 'pendingActions'])
   useLayoutEffect(() => { document.documentElement.dataset.theme = state.theme }, [state.theme])
   useLayoutEffect(() => { document.documentElement.style.setProperty('--message-font-size', `${state.messageFontSize}px`) }, [state.messageFontSize])
   const [compactViewport, setCompactViewport] = useState(() => window.matchMedia('(max-width: 1000px)').matches)
   const trajectoryToggle = useRef<HTMLButtonElement>(null)
   const trajectoryPanel = useRef<HTMLElement>(null)
-  const [rightPanelView, setRightPanelView] = useState<'choices' | 'trajectory'>('choices')
   const reducedMotion = useReducedMotion()
   const panelTransition = { duration: reducedMotion ? 0 : 0.16, ease: 'easeOut' as const }
 
@@ -54,7 +53,7 @@ export function App() {
     <div className="app-shell" style={shellStyle}>
       <Sidebar />
       {!state.sidebarCollapsed ? <ResizeSeparator value={state.sidebarWidth} onChange={(value) => appStore.setSidebarWidth(value)} /> : <div />}
-      <div className="app-content" style={{ '--trajectory-width': `${state.sidebarWidth}px` } as CSSProperties} onKeyDown={event => {
+      <div className="app-content" style={{ '--trajectory-width': `${state.trajectoryWidth}px` } as CSSProperties} onKeyDown={event => {
         if (!state.trajectoryOpen) return
         if (event.key === 'Escape') { event.stopPropagation(); closeTrajectory() }
         if (event.key !== 'Tab' || !compactViewport) return
@@ -72,69 +71,24 @@ export function App() {
           className="trajectory-toggle"
           onClick={() => {
             if (state.trajectoryOpen) closeTrajectory()
-            else {
-              setRightPanelView('choices')
-              appStore.setTrajectoryOpen(true)
-            }
+            else appStore.setTrajectoryOpen(true)
           }}
         />
       <MainContent compactViewport={compactViewport} />
       <aside id="trajectory-panel" className={`trajectory-panel${state.trajectoryOpen ? ' is-open' : ''}`} aria-label="右侧栏" aria-hidden={!state.trajectoryOpen} inert={!state.trajectoryOpen} ref={trajectoryPanel}>
-        <ResizeSeparator side="right" value={state.sidebarWidth} onChange={(value) => appStore.setSidebarWidth(value)} />
-        <header className="trajectory-panel-header">
-          {rightPanelView === 'trajectory' ? <button type="button" className="quiet-button" aria-label="返回侧栏选择" onClick={() => setRightPanelView('choices')}>← 轨迹</button> : <span />}
-        </header>
+        <ResizeSeparator side="right" value={state.trajectoryWidth} onChange={(value) => appStore.setTrajectoryWidth(value)} />
         <AnimatePresence initial={false} mode="wait">
           {state.trajectoryOpen && (
-            rightPanelView === 'choices' ? (
-              <motion.div
-                key="choices"
-                className="right-panel-choices"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                transition={panelTransition}
-                onAnimationComplete={definition => {
-                  if (state.trajectoryOpen && typeof definition === 'object' && 'opacity' in definition && definition.opacity === 1) {
-                    trajectoryPanel.current?.querySelector<HTMLButtonElement>('.right-panel-choice')?.focus()
-                  }
-                }}
-              >
-                <button type="button" className="right-panel-choice" onClick={() => setRightPanelView('trajectory')}>
-                  <svg
-                    width="18"
-                    height="18"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.6"
-                    aria-hidden="true"
-                  >
-                    <path d="M8 6h12M8 12h12M8 18h12" />
-                    <circle cx="3" cy="6" r="1" />
-                    <circle cx="3" cy="12" r="1" />
-                    <circle cx="3" cy="18" r="1" />
-                  </svg>
-                  <span>轨迹</span>
-                </button>
-              </motion.div>
-            ) : (
-              <motion.div
-                key="trajectory"
-                className="right-panel-content"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                transition={panelTransition}
-                onAnimationComplete={definition => {
-                  if (state.trajectoryOpen && typeof definition === 'object' && 'opacity' in definition && definition.opacity === 1) {
-                    trajectoryPanel.current?.querySelector<HTMLButtonElement>('[aria-label="返回侧栏选择"]')?.focus()
-                  }
-                }}
-              >
-                <Trajectory key={state.selectedSessionId} />
-              </motion.div>
-            )
+            <motion.div
+              key="trajectory"
+              className="right-panel-content"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={panelTransition}
+            >
+              <Trajectory key={state.selectedSessionId} />
+            </motion.div>
           )}
         </AnimatePresence>
       </aside>
@@ -145,7 +99,7 @@ export function App() {
 }
 
 const MainContent = memo(function MainContent({ compactViewport }: { compactViewport: boolean }) {
-  const state = useAppStore(['selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'bootstrap', 'sidebarCollapsed', 'trajectoryOpen', 'actionErrors', 'actionErrorOrigin', 'pendingActions'])
+  const state = useAppStore(['selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'trajectoryOpen', 'actionErrors', 'actionErrorOrigin', 'pendingActions'])
   const items = useMemo(() => buildTimeline(state.session, state.bootstrap?.userHome), [state.session, state.bootstrap?.userHome])
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspaceSessions = appStore.sessions()
@@ -164,14 +118,23 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
   }, [visibleError])
 
   return (
-      <main className={`app-main${empty ? ' is-empty' : ''}`} inert={compactViewport && state.trajectoryOpen} onPointerDownCapture={() => {
+      <main className={`app-main${empty && state.bootstrapLoad.status === 'idle' ? ' is-empty' : ''}`} inert={compactViewport && state.trajectoryOpen} onPointerDownCapture={() => {
         if (!state.sidebarCollapsed && window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
       }}>
         {!empty && <header className="conversation-header">
           <h1>{sessionTitle}</h1>
         </header>}
-        {!empty && <Conversation state={state} items={items} />}
-        <Composer centered={empty} />
+        {state.bootstrapLoad.status !== 'idle' ? (
+          <section className="empty-state" aria-live="polite" aria-busy={state.bootstrapLoad.status === 'loading'}>
+            <h2>{state.bootstrapLoad.status === 'loading' ? '正在读取工作台' : '工作台读取失败'}</h2>
+            {state.bootstrapLoad.error && <>
+              <p>{state.bootstrapLoad.error.message}</p>
+              {state.bootstrapLoad.error.recovery && <p className="empty-recovery">{state.bootstrapLoad.error.recovery}</p>}
+              <button type="button" className="secondary-button" onClick={() => void appStore.resync()}>重试读取工作台</button>
+            </>}
+          </section>
+        ) : !empty && <Conversation state={state} items={items} />}
+        <Composer centered={empty && state.bootstrapLoad.status === 'idle'} />
         <AnimatePresence>
           {visibleError !== null && <motion.div key="action-toast" className="action-toast" role="status"
             initial={{ opacity: reducedMotion ? 1 : 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}

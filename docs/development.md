@@ -51,7 +51,7 @@ npm --prefix apps/desktop start
 
 ## 2. 质量检查与代码格式化
 
-在提交代码前，请确保通过以下基本检查：
+检查范围按 [仓库指令](../AGENTS.md#验证与交付) 中本次改动的影响确定。以下命令供对应检查使用。
 
 ### 代码排版与格式化
 仓库根目录下配置了统一的 `rustfmt.toml`（行宽上限 110 字符）：
@@ -73,6 +73,14 @@ cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D w
 cargo check --workspace --all-targets
 ```
 
+### 应用回归测试
+
+CI 会执行现有的应用回归测试，检查历史读取失败后，停止等待是否正常结束：
+
+```powershell
+cargo test -p singularity_app --locked
+```
+
 ---
 
 ## 3. 跨端协议同步 (TypeScript DTO)
@@ -80,7 +88,7 @@ cargo check --workspace --all-targets
 Rust 的 `protocol` crate 维护了后端与前端通信的核心 DTO 与 RPC 方法契约。当修改了 `crates/protocol/src/` 中的结构体或枚举后，需要重新导出 TypeScript 类型声明：
 
 ```powershell
-# 自动重新生成 apps/desktop/src/protocol/ 声明文件
+# 自动重新生成 apps/desktop/src/protocol.generated.ts
 cargo run -p singularity_protocol --features typescript --example export_types
 ```
 
@@ -94,11 +102,10 @@ cargo run -p singularity_protocol --features typescript --example export_types
 
 ### 运行冒烟测试 (Smoke Test)
 
+E2E 默认使用日常数据目录，运行前先退出占用该目录的工作台；测试创建的项目与任务会保留在列表中。需要隔离时，把 `SINGULARITY_HOME` 指向另一个包含 `config.json` 与 `auth.json` 的目录。
+
 ```powershell
-# 设置隔离测试数据目录
-$env:SINGULARITY_HOME = "$PWD/outputs/e2e-home"
-New-Item -ItemType Directory -Force $env:SINGULARITY_HOME | Out-Null
-Copy-Item "$HOME/.singularity/config.json", "$HOME/.singularity/auth.json" $env:SINGULARITY_HOME
+$env:SINGULARITY_HOME = "$HOME/.singularity"
 
 # 运行冒烟测试
 node apps/desktop/e2e/smoke.mjs
@@ -106,12 +113,21 @@ node apps/desktop/e2e/smoke.mjs
 
 ### 专项测试脚本
 
-- **生命周期与重启恢复**：`node apps/desktop/e2e/lifecycle.mjs`（验证应用异常退出或提交后重启的历史还原）
-- **统计与用量指标**：`node apps/desktop/e2e/stats-bar.mjs`（验证 Token 用量、费用统计与缓存命中率）
+- **生命周期与重启恢复**：`node apps/desktop/e2e/lifecycle.mjs`（验证退出时取消任务，以及重启后的历史状态）
+- **统计与用量指标**：`node apps/desktop/e2e/stats-bar.mjs`（验证 Token 用量、输出速度、首 Token 延迟与缓存命中率）
 - **多模态图片管线**：`node apps/desktop/e2e/images.mjs`（验证图片粘贴、拖拽、缩略图预览与模型识图）
 
-> [!TIP]
-> 涉及真实模型调用的测试需要设置 `$env:SINGULARITY_E2E_MODEL = '1'`，测试会调用 `~/.singularity/config.json` 中配置的默认模型。
+| 脚本 | 真实模型调用条件 |
+| --- | --- |
+| `smoke.mjs`、`images.mjs` | 设置 `$env:SINGULARITY_E2E_MODEL = '1'` 后才调用模型；省略时只检查本地交互 |
+| `lifecycle.mjs`、`stats-bar.mjs` | 始终调用真实模型，不受 `SINGULARITY_E2E_MODEL` 控制 |
+
+测试从 `SINGULARITY_HOME` 读取配置和密钥。模型选择由 `SINGULARITY_E2E_SELECTOR` 指定，省略时固定使用 `bai/deepseek-v4.1-flash`；不会读取配置中的 `default_model` 来替换该选择。
+
+```powershell
+# 指定测试模型及思考档位；提供方、模型和档位必须已登记在该数据目录的配置中
+$env:SINGULARITY_E2E_SELECTOR = 'provider/model#reasoning'
+```
 
 ---
 
@@ -132,5 +148,5 @@ npm --prefix apps/desktop run package
 产物输出于 `apps/desktop/release/win-unpacked/`，包含 `Singularity.exe` 与完整运行时依赖。
 
 ### CI 与 GitHub Releases
-- **CI 工作流** (`.github/workflows/ci.yml`)：在每次推送代码时自动运行 Rust 格式化检查、Clippy、编译以及前端依赖审计。
+- **CI 工作流** (`.github/workflows/ci.yml`)：推送到 `main` 时运行 Rust 格式化检查、Clippy、编译、应用回归测试及依赖检查。
 - **发布工作流** (`.github/workflows/release.yml`)：当推送以 `v*` 开头的语义化 Git Tag（如 `v1.2.0`）时，自动编译 Windows x86-64 二进制与绿色分发包，并生成包含 SHA256 校验和的 GitHub Release。

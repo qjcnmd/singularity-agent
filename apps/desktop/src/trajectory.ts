@@ -78,26 +78,15 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
       }
       entries.push({ ...item, status: fact.status, startedAt: fact.startedAt })
     }
-    // 追加回合失败错误条目
     if (turn.error) entries.push({ ...entry(`turn-error:${turn.id ?? 'leading'}`, 'event', '运行错误', turn.error.message),
       status: 'error', error: turn.error })
     const projected = { id: turn.id ?? (standalone ? 'compaction' : 'leading'), title, entries }
     projections.set(turn, { previous, next: previousPrompt, turn: projected })
     return projected
   })
-  // 补齐未持久化到历史中的运行时失败（如独立的上下文压缩失败）
-  const terminal = session.runtime.terminal
-  if (!session.facts.active.length && terminal?.status === 'failed' && terminal.message
-    && (terminal.source === 'compaction' || !turns.at(-1)?.entries.some(entry => entry.error))) {
-    const failure = { ...entry('runtime-error', 'event', terminal.source === 'compaction' ? '压缩失败' : '运行错误', terminal.message), status: 'error' as const }
-    const last = turns.at(-1)
-    if (last) turns[turns.length - 1] = { ...last, entries: [...last.entries, failure] }
-    else turns.push({ id: 'runtime', title: `第 ${++ordinal} 轮`, entries: [failure] } )
-  }
   return turns.filter(turn => turn.entries.length)
 }
 
-/** 格式化显示模型配置信息 */
 function settingsText(settings: { provider: string; model: string; reasoning: string | null }): string {
   return `${settings.provider}/${settings.model}${settings.reasoning ? ` · ${settings.reasoning}` : ''}`
 }

@@ -119,8 +119,8 @@ impl TurnRunner {
         let mut item_events = AssistantItemEvents::new(thread.thread_id.clone(), turn_id.clone());
         let run_result = {
             let mut on_event = |event: AgentEvent| match event {
-                AgentEvent::ControlChanged => {
-                    sink(TurnEvent::ControlChanged {});
+                AgentEvent::PendingQuestionChanged => {
+                    sink(TurnEvent::PendingQuestionChanged {});
                 }
                 event => item_events.project(sink, event),
             };
@@ -209,7 +209,12 @@ impl TurnRunner {
         // 会话写者由 Conversation 在 turn 开始前打开；本函数只做剩下的 fail-fast 准备
         // （provider/config/项目指令），就绪之后才写 operation 状态。
         let writer = controls.writer();
-        let (provider, config) = self.resolve_agent_runtime(thread)?;
+        let provider = self.resolve_provider(thread)?;
+        let instruction_home = self.instruction_home();
+        let initial_instructions =
+            load_agent_instructions(std::path::Path::new(&thread.cwd), &instruction_home)
+                .map_err(TurnRunError::Preparation)?;
+        let config = AgentConfig { instruction_home, initial_instructions };
         // OperationStarted 记录 turn 身份。输入消息由 Agent 单独落盘；
         // 这些追加不是一个原子事务。
         let agent =
@@ -226,33 +231,18 @@ impl TurnRunner {
         Ok((agent, committed.timestamp))
     }
 
-    /// 解析 Provider 与 AgentConfig；模型容量由 Agent 从 Provider 冻结。
-    /// 任何一项失败就直接失败，不留 operation 痕迹。
-    fn resolve_agent_runtime(&self, thread: &Thread) -> Result<(OpenAiProvider, AgentConfig), TurnRunError> {
-        let provider = self.resolve_provider(thread)?;
-        let config = agent_config_for_thread(
-            thread,
-            self.sessions_dir.parent().expect("sessions directory is inside the data directory"),
-        )?;
-        Ok((provider, config))
-    }
+    /// 模型容量由 Agent 从 Provider 冻结；解析失败发生在 operation 开始之前。
     fn resolve_provider(&self, thread: &Thread) -> Result<OpenAiProvider, TurnRunError> {
         let snapshot = self.models.snapshot();
         OpenAiProvider::from_snapshot(&snapshot, thread.model.as_deref())
             .map_err(|error| TurnRunError::Preparation(error.to_string()))
     }
-}
 
-/// 准备首次文件指令；读取失败会在 operation 开始之前报告。
-fn agent_config_for_thread(
-    thread: &Thread,
-    instruction_home: &std::path::Path,
-) -> Result<AgentConfig, TurnRunError> {
-    let cwd = &thread.cwd;
-    let initial_instructions = load_agent_instructions(std::path::Path::new(cwd), instruction_home)
-        .map_err(TurnRunError::Preparation)?;
-    Ok(AgentConfig {
-        instruction_home: instruction_home.to_path_buf(),
-        initial_instructions,
-    })
+    /// 文件指令与 Skill 的用户数据根目录，即会话目录所在的数据目录。
+    fn instruction_home(&self) -> PathBuf {
+        self.sessions_dir
+            .parent()
+            .expect("sessions directory is inside the data directory")
+            .to_path_buf()
+    }
 }

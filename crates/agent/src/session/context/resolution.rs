@@ -1,14 +1,15 @@
 use super::*;
 
+/// 按日志顺序归约出唯一的活动历史：摘要替换掉前缀。
 pub(super) fn resolve_context_entries(session: &SessionData) -> Vec<ContextPosition> {
     let mut context: Vec<ContextPosition> = Vec::new();
     for index in 0..session.entries().len() {
-        apply_context_entry(&mut context, ContextPosition { index, pruned_index: None }, session);
+        apply_context_entry(&mut context, ContextPosition { index }, session);
     }
     context
 }
 
-/// 按账本顺序应用摘要、剪枝和工具结果排序规则。
+/// 按账本顺序应用摘要和工具结果排序规则。
 fn apply_context_entry(context: &mut Vec<ContextPosition>, position: ContextPosition, session: &SessionData) {
     match position.entry(session) {
         SessionEntry::Compaction { compaction, .. } => {
@@ -20,21 +21,10 @@ fn apply_context_entry(context: &mut Vec<ContextPosition>, position: ContextPosi
             context.insert(0, position);
             return;
         }
-        SessionEntry::Record {
-            record: LedgerRecord::ToolResultPruned { entry_id, .. },
-            ..
-        } => {
-            let original = context
-                .iter_mut()
-                .find(|candidate| candidate.entry(session).id() == entry_id)
-                .expect("pruning references an active tool result");
-            original.pruned_index = Some(position.index);
-            return;
-        }
         entry if !is_context_entry(entry) => return,
         _ => {}
     }
-    if let Some(insert_at) = context_insertion_index(context, &session.entries()[position.index], session) {
+    if let Some(insert_at) = context_insertion_index(context, position.entry(session), session) {
         context.insert(insert_at, position);
     } else {
         context.push(position);
