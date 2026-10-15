@@ -12,7 +12,6 @@ fn fill(model: &mut DiscoveredModel, known: DiscoveredModel) {
         .or(known.requires_reasoning_content_for_tool_calls);
     if model.reasoning_variants.is_empty() {
         model.reasoning_variants = known.reasoning_variants;
-        model.default_variant = known.default_variant;
     }
 }
 
@@ -66,11 +65,6 @@ pub(super) fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
             });
         }
     }
-    let default_variant = reasoning_variants
-        .iter()
-        .find(|variant| variant.id == "medium")
-        .or_else(|| reasoning_variants.first())
-        .map(|variant| variant.id.clone());
     DiscoveredModel {
         model_id: id.to_string(),
         display_name: entry
@@ -81,7 +75,6 @@ pub(super) fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
         max_context_tokens: capacity(&["/context_length", "/limit/context"]),
         max_output_tokens: capacity(&["/limit/output", "/top_provider/max_completion_tokens"]),
         reasoning_variants,
-        default_variant,
         requires_reasoning_content_for_tool_calls: (entry
             .pointer("/interleaved/field")
             .and_then(Value::as_str)

@@ -1,45 +1,58 @@
-//! 上下文缩减的编排：触发、摘要提交与继续请求前的指令刷新。
-//! 手动压缩结束后释放 Agent；自动压缩和溢出恢复共用提交后的收尾规则。
+//! 手动和自动共用压缩：总结早期历史、保留近期原文，成功后提交摘要和新定义。
 
 use super::{Agent, AgentError, AgentEvent, Result};
 use crate::compaction::PreparedCompaction;
 use crate::request_execution::execute_request;
-use crate::session::{RequestDefinitions, lock_writer, with_writer_async};
+use crate::session::{context, lock_writer, with_writer_async};
 use tokio_util::sync::CancellationToken;
 
-/// 上下文占用达到窗口的这一比例时触发自动压缩。
 const AUTO_COMPACTION_TRIGGER_RATIO: f64 = 0.9;
-/// 所有压缩入口至少保留窗口的这一比例作为近期历史。
-const COMPACTION_RETAIN_RATIO: f64 = 0.1;
+const KEEP_RECENT_RATIO: f64 = 0.1;
 
 impl Agent {
-    /// 所有触发共用摘要提交；返回是否缩减了上下文。
-    async fn compact_context(
+    pub(super) async fn reduce_context_if_needed(
         &mut self,
-        definitions: &RequestDefinitions,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        let keep_recent_tokens =
-            (self.model.context_window() as f64 * COMPACTION_RETAIN_RATIO).floor() as u64;
-        let summary_definitions = definitions.clone();
-        let model = self.model.clone();
+        if self.context_pressure_tokens()
+            >= (self.model.context_window() as f64 * AUTO_COMPACTION_TRIGGER_RATIO).floor() as u64
+        {
+            self.compact_now(on_event).await?;
+        }
+        Ok(())
+    }
+
+    /// 压缩期间不接受用户停止；请求仍按共同规则处理超时、重试和最终失败。
+    pub async fn compact_now(&mut self, on_event: &mut (dyn FnMut(AgentEvent) + Send)) -> Result<bool> {
+        on_event(AgentEvent::CompactionStateChanged { active: true });
+        let result = self.compact_context(on_event).await;
+        on_event(AgentEvent::CompactionStateChanged { active: false });
+        result
+    }
+
+    async fn compact_context(&mut self, on_event: &mut (dyn FnMut(AgentEvent) + Send)) -> Result<bool> {
+        // 独立令牌只适配共同请求接口，不连接普通任务的停止信号。
+        let cancellation = CancellationToken::new();
+        self.ensure_definitions(on_event, &cancellation).await?;
+        let definitions = self.request_definitions().clone();
         let session = std::sync::Arc::clone(&self.session);
+        let model = self.model.clone();
         let summary = tokio::task::spawn_blocking(move || {
             let prefix = {
                 let writer = lock_writer(&session);
-                writer.context().compaction_prefix(&writer, keep_recent_tokens)
+                let keep_tokens =
+                    (context::estimated_tokens(&writer) as f64 * KEEP_RECENT_RATIO).ceil() as u64;
+                context::compaction_prefix(&writer, keep_tokens)
             };
-            prefix
-                .map(|prefix| PreparedCompaction::new(prefix, &summary_definitions, &model))
-                .transpose()
+            prefix.map(|prefix| PreparedCompaction::new(prefix, &definitions, &model)).transpose()
         })
         .await
-        .expect("image context preparation completes while the runtime is running")?;
-        // 历史里没有可替换的前缀（内容太少）：本次无需摘要。
+        .expect("summary preparation completes while the runtime is running")?;
+        // 保留近期完整消息后没有更早的对话可总结，沿用现有上下文。
         let Some(summary) = summary else {
             return Ok(false);
         };
@@ -48,73 +61,24 @@ impl Agent {
             &self.session,
             &mut self.accounting,
             &summary.request,
-            definitions,
             on_event,
-            cancellation,
+            &cancellation,
             singularity_protocol::RequestPurpose::Compaction,
         )
         .await?;
-        let entry = summary.into_entry(response)?;
-        // 摘要已生成但落盘前被取消：这次摘要不写入会话。
-        if cancellation.is_cancelled() {
-            return Err(AgentError::Aborted);
-        }
+        let mut entry = summary.into_entry(response)?;
+        let (definitions, registry) = self.load_definitions(on_event, &cancellation).await?;
+        entry.definitions = Some(definitions.clone());
         let item = singularity_protocol::HistoryItem::Compaction {
             id: id.clone(),
             summary: entry.summary.clone(),
         };
+        // 一条完整记录同时切换对话与定义；读取或写入失败时旧上下文仍有效。
         with_writer_async(&self.session, move |writer| writer.append_compaction_with_id(&id, entry)).await?;
-        on_event(AgentEvent::CompactionFinished { item });
+        self.definitions = Some(definitions);
+        self.registry = registry;
         self.usage_correction = 0;
+        on_event(AgentEvent::CompactionFinished { item });
         Ok(true)
-    }
-
-    pub(super) async fn reduce_context_if_needed(
-        &mut self,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-        cancellation: &CancellationToken,
-    ) -> Result<()> {
-        if self.context_pressure_tokens()
-            >= (self.model.context_window() as f64 * AUTO_COMPACTION_TRIGGER_RATIO).floor() as u64
-        {
-            self.force_compact(on_event, cancellation).await?;
-        }
-        Ok(())
-    }
-
-    /// 执行中的压缩完成后，直接重读指令和工具，为下一次正常请求准备材料。
-    pub(super) async fn force_compact(
-        &mut self,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-        cancellation: &CancellationToken,
-    ) -> Result<bool> {
-        let changed = self.compact_context(&self.request_definitions(), on_event, cancellation).await?;
-        if changed {
-            self.refresh_instructions(on_event).await?;
-            self.refresh_tools(on_event, cancellation).await;
-        }
-        Ok(changed)
-    }
-
-    /// 独立压缩复用最近请求的完整前缀；没有请求记录时从当前配置准备材料。
-    /// 保存后结束操作，下一次正常执行直接加载当前指令和工具。
-    pub async fn compact_now(
-        &mut self,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-        cancellation: &CancellationToken,
-    ) -> Result<()> {
-        let previous = lock_writer(&self.session)
-            .latest_request_definitions()
-            .map(|(_, definitions)| definitions.clone());
-        let definitions = match previous {
-            Some(definitions) => definitions,
-            None => {
-                self.refresh_instructions(on_event).await?;
-                self.refresh_tools(on_event, cancellation).await;
-                self.request_definitions()
-            }
-        };
-        self.compact_context(&definitions, on_event, cancellation).await?;
-        Ok(())
     }
 }

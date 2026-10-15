@@ -26,3 +26,22 @@ export async function rpc(page, method, params = {}) {
   assert.equal(response.type, 'success', JSON.stringify(response.error))
   return response.result
 }
+
+const workspaceRoot = root => resolve(root.replaceAll('\\', '/').replace(/^\/\/\?\//, '')).toLowerCase()
+
+/** 按完整目录识别项目，同名项目可以同时存在。 */
+export async function findWorkspace(page, root) {
+  const target = workspaceRoot(root)
+  return (await rpc(page, 'app.bootstrap')).workspaces.find(workspace => workspaceRoot(workspace.root) === target)
+}
+
+/** 重跑测试时复用已登记的项目，保留已有任务和草稿。 */
+export async function ensureWorkspace(page, root) {
+  mkdirSync(root, { recursive: true })
+  return await findWorkspace(page, root) ?? await rpc(page, 'workspace.add', { root })
+}
+
+export function workspaceNewSessionButton(page, workspace) {
+  return page.getByTitle(workspace.root, { exact: true }).locator('..')
+    .getByRole('button', { name: `在 ${workspace.name} 新建任务`, exact: true })
+}

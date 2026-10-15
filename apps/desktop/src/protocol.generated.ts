@@ -16,7 +16,7 @@ export type DirectoryPickResult = { path: string | null, };
 
 export type DiscoverModelsParams = { providerId: string, baseUrl: string, apiKey?: string | null, apiProtocol: string, };
 
-export type DiscoveredModel = { modelId: string, displayName: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, requiresReasoningContentForToolCalls: boolean | null, };
+export type DiscoveredModel = { modelId: string, displayName: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, requiresReasoningContentForToolCalls: boolean | null, };
 
 export type EmptyParams = Record<string, never>;
 
@@ -270,7 +270,7 @@ turnId: string | null, severity: DiagnosticSeverity, code: string, message: stri
 /**
  * 独立压缩不属于回合；普通执行使用实际回合身份。
  */
-turnId: string | null, } } | { "method": "turn/completed", "params": { turn: Turn, finishedAt: string, } } | { "method": "turn/pendingQuestionChanged", "params": Record<symbol, never> } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, finishedAt: string, } });
+turnId: string | null, } } | { "method": "turn/completed", "params": { turn: Turn, finishedAt: string, } } | { "method": "turn/sessionStateChanged", "params": Record<symbol, never> } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, finishedAt: string, } });
 
 export type TurnFailureCause = "store" | "project_instructions" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 

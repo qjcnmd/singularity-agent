@@ -15,7 +15,7 @@ export type RpcResponse<M extends RpcMethod> =
 /** 事件归属的 turn；会话控制状态变更不绑定 turn。 */
 export function eventTurnId(event: TurnEventEnvelope): string | null {
   if ('turn' in event.params) return event.params.turn.turnId
-  if (event.method === 'turn/pendingQuestionChanged') return null
+  if (event.method === 'turn/sessionStateChanged') return null
   return event.params.turnId
 }
 

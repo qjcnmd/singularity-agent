@@ -21,13 +21,12 @@ interface Props {
 
 // 性能优化：历史项复用稳定引用跳过重绘，流式更新时仅重新渲染当前活动项。
 export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Props) {
-  const isStep = stepKinds.has(item.kind)
   const hiddenLines = item.kind === 'user' ? Math.max(0, timelineBody(item).trimEnd().split('\n').length - previewLineCount) : 0
   const canCollapse = hiddenLines > 0
-  const [expanded, setExpanded] = useState(!isStep)
+  const [expanded, setExpanded] = useState(item.kind !== 'tool')
   const selectionGuard = useSelectionGuard()
 
-  if (item.timing) return <TurnDuration itemKey={item.key} {...item.timing} />
+  if (item.kind === 'duration') return <TurnDuration itemKey={item.key} {...item.timing} />
 
   if (item.kind === 'terminal') {
     if (timelineStatus(item) === 'error') return <div className="turn-error" data-item-id={item.key} role="alert">
@@ -58,14 +57,13 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
   if (item.kind === 'thinking') return <ReasoningRow item={item} />
   if (item.kind === 'compaction') return <CompactionRow item={item} />
 
-  const fact = item.fact
   return (
     <article className={`timeline-item activity-step timeline-${item.kind} status-${timelineStatus(item)}`} data-item-id={item.key} aria-label={`${item.title}，${factStatusText[timelineStatus(item)]}`}>
       <button type="button" className="activity-toggle" {...selectionGuard(() => setExpanded(value => !value))} aria-expanded={expanded}>
         <StepLabel item={item} icon={<StepIcon item={item} />} />
         <ExpandChevron expanded={expanded} className="step-chevron" />
         <span className="step-separator" aria-hidden="true">·</span>
-        <span className="step-summary">{item.summary || oneLine(timelineBody(item))}</span>
+        <span className="step-summary">{item.summary}</span>
         {timelineStatus(item) === 'cancelled' && <span className="item-status">{factStatusText.cancelled}</span>}
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
@@ -87,11 +85,10 @@ function TurnDuration({ itemKey, startedAt, finishedAt }: { itemKey: string; sta
 }
 
 function StepLabel({ item, icon }: Props & { icon?: ReactNode }) {
-  const animated = item.kind === 'thinking' || item.fact?.kind === 'tool'
   const muted = item.kind === 'thinking' || (item.fact?.kind === 'tool' && item.title === 'read')
   return <span className="step-label">
     {icon !== undefined && <span className="step-icon" aria-hidden="true">{icon}</span>}
-    <span className={`step-title${animated ? ' execution-title' : ''}${muted ? ' muted-execution-title' : ''}`}>{item.title}</span>
+    <span className={`step-title execution-title${muted ? ' muted-execution-title' : ''}`}>{item.title}</span>
   </span>
 }
 
@@ -173,18 +170,8 @@ function CompactionRow({ item }: Props) {
   </article>
 }
 
-function ToolOutput({ item }: Props) {
+function ToolOutput({ item }: { item: Extract<TimelineItemModel, { kind: 'tool' }> }) {
   const fact = item.fact
-  if (fact?.kind !== 'tool') {
-    const body = timelineBody(item)
-    if (!body && !fact?.error) return null
-    return (
-      <div>
-        {body && <ToolSection label="内容"><MarkdownBody text={body} /></ToolSection>}
-        {fact?.error && <ToolSection label="错误"><pre><code>{fact.error}</code></pre></ToolSection>}
-      </div>
-    )
-  }
   const { args: input, output } = fact
   const command = item.title === 'bash' ? toolArgument(item.title, input) : null
   if (command !== null) return <div>
@@ -227,14 +214,6 @@ function ToolSection({ label, children }: { label: string; children: ReactNode }
 function preview(text: string): string {
   return text.split('\n').slice(0, previewLineCount).join('\n')
 }
-
-const stepKinds = new Set<TimelineItemModel['kind']>(['thinking', 'tool', 'compaction'])
-
-function oneLine(text: string): string {
-  return text.replace(/\s+/g, ' ').trim()
-}
-
-
 
 function StepIcon({ item }: Props) {
   const path = item.title === 'bash' ? 'm4 6 5 6-5 6m8 0h8'

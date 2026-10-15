@@ -1,11 +1,10 @@
 import { join } from 'node:path'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { writeFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { setupE2E, rpc, modelSelector } from './support.mjs'
+import { setupE2E, rpc, modelSelector, ensureWorkspace } from './support.mjs'
 
 const { output, launch } = setupE2E('electron-lifecycle')
-mkdirSync(join(output, 'workspace'), { recursive: true })
 let app = await launch()
 let directoryRequested
 const requested = new Promise(resolve => { directoryRequested = resolve })
@@ -15,7 +14,7 @@ await new Promise(resolve => directory.listen(0, '127.0.0.1', resolve))
 try {
   let page = await app.firstWindow()
   await page.waitForSelector('.app-shell')
-  const workspace = await rpc(page, 'workspace.add', { root: join(output, 'workspace') })
+  const workspace = await ensureWorkspace(page, join(output, 'workspace'))
   const session = await rpc(page, 'session.create', { workspaceId: workspace.workspaceId })
   const scope = { sessionId: session.history.summary.threadId }
   await rpc(page, 'session.updateSettings', { ...scope, selector: modelSelector })

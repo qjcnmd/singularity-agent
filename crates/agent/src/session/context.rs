@@ -1,11 +1,7 @@
 //! 上下文视图：从会话 ledger 派生出模型请求的输入，并统一计量。
 //!
-//! 只从持久账本派生对话历史；当前文件指令由 Agent 在请求装配时加入。
+//! 对话和固定定义都来自会话记录；普通请求与摘要请求共用对话投影。
 //! 请求装配、压缩判定与溢出恢复共用这一个视图。原始会话始终由会话 ledger 持有。
-
-mod resolution;
-
-use self::resolution::resolve_context_entries;
 
 use singularity_model::{ModelMessage, ModelRole};
 
@@ -27,21 +23,21 @@ fn compaction_summary(summary: &str) -> String {
 const UNKNOWN_TOOL_OUTCOME: &str = "[previous execution was interrupted; outcome unknown. Inspect the current state before deciding whether to repeat an action with side effects.]";
 
 /// 将会话条目映射为模型消息列表；若工具调用缺少对应结果（如被中断），补充占位提示以保证协议消息闭合。
-fn project_messages(entries: &[ContextPosition], session: &SessionData) -> Vec<ContextMessage> {
+fn project_messages(entries: &[&SessionEntry]) -> Vec<ContextMessage> {
     let mut messages = Vec::new();
-    let mut positions = entries.iter().peekable();
-    while let Some(position) = positions.next() {
-        messages.push(position.model_message(session));
-        let SessionEntry::Message { message, .. } = position.entry(session) else {
+    let mut remaining = entries.iter().peekable();
+    while let Some(entry) = remaining.next() {
+        messages.push(model_message(entry));
+        let SessionEntry::Message { message, .. } = entry else {
             continue;
         };
         for call in message.tool_calls() {
-            let result = positions.next_if(|candidate| {
-                matches!(candidate.entry(session), SessionEntry::Message { message, .. }
+            let result = remaining.next_if(|candidate| {
+                matches!(candidate, SessionEntry::Message { message, .. }
                     if message.tool_call_id() == Some(call.tool_call_id.as_str()))
             });
             messages.push(match result {
-                Some(position) => position.model_message(session),
+                Some(entry) => model_message(entry),
                 None => {
                     let mut result = ModelMessage::text(ModelRole::Tool, UNKNOWN_TOOL_OUTCOME);
                     result.tool_call_id = Some(call.tool_call_id.clone());
@@ -53,13 +49,13 @@ fn project_messages(entries: &[ContextPosition], session: &SessionData) -> Vec<C
     messages
 }
 
-fn context_token_estimate(entries: &[ContextPosition], session: &SessionData) -> u64 {
+fn context_token_estimate(entries: &[&SessionEntry]) -> u64 {
     let mut tokens = 0;
     let mut calls = 0;
     let mut results = 0;
-    for position in entries {
-        tokens += position.token_estimate(session);
-        if let SessionEntry::Message { message, .. } = position.entry(session) {
+    for entry in entries {
+        tokens += entry_token_estimate(entry);
+        if let SessionEntry::Message { message, .. } = entry {
             calls += message.tool_calls().count();
             if message.tool_call_id().is_some() {
                 results += 1;
@@ -99,7 +95,7 @@ pub(crate) fn message_token_estimate(message: &crate::message::AgentMessage) -> 
 }
 
 /// 只估算模型请求真正会带上的内容：公开思考不进入文本投影
-/// （见 `ContextPosition::model_message`），所以计零。
+/// （见 `model_message`），所以计零。
 fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
     let mut tokens = 4u64;
     for block in content {
@@ -121,9 +117,14 @@ fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
     tokens
 }
 
-#[derive(Debug)]
-pub(crate) struct ContextView {
-    entries: Vec<ContextPosition>,
+/// 普通请求按原顺序读取全部有效对话和图片。
+pub(crate) fn messages(session: &SessionData) -> Vec<ContextMessage> {
+    project_messages(&resolve_context_entries(session))
+}
+
+/// 本轮请求开销与实测校正由 Agent 添加。
+pub(crate) fn estimated_tokens(session: &SessionData) -> u64 {
+    context_token_estimate(&resolve_context_entries(session))
 }
 
 /// 已按工具配对边界选好的摘要前缀。
@@ -136,100 +137,95 @@ pub(crate) struct CompactionPrefix {
     pub(crate) first_kept_entry_id: String,
 }
 
-impl ContextView {
-    /// 按已保存的压缩边界还原模型历史；边界在生成记录时确定。
-    pub(crate) fn derive(session: &SessionData) -> Self {
-        let entries = resolve_context_entries(session);
-        Self { entries }
+pub(crate) fn compaction_prefix(session: &SessionData, keep_recent_tokens: u64) -> Option<CompactionPrefix> {
+    let entries = resolve_context_entries(session);
+    let cut = find_cut_point(&entries, keep_recent_tokens);
+    if cut == 0 {
+        return None;
     }
-
-    pub(crate) fn messages(&self, session: &SessionData) -> Vec<ContextMessage> {
-        project_messages(&self.entries, session)
+    // 已有摘要交给更新指令，新摘要的对话前缀从它之后开始。
+    let (previous_summary, conversation_start) = match entries[0] {
+        SessionEntry::Compaction { compaction, .. } => (Some(compaction.summary.clone()), 1),
+        _ => (None, 0),
+    };
+    let selected = &entries[conversation_start..cut];
+    let messages = project_messages(selected);
+    if messages.is_empty() {
+        return None;
     }
-
-    pub(crate) fn compaction_prefix(
-        &self,
-        session: &SessionData,
-        keep_recent_tokens: u64,
-    ) -> Option<CompactionPrefix> {
-        let entries = &self.entries;
-        let cut = find_cut_point(entries, session, keep_recent_tokens);
-        if cut == 0 {
-            return None;
-        }
-        // 已有摘要交给更新指令，新摘要的对话前缀从它之后开始。
-        let (previous_summary, conversation_start) = match entries[0].entry(session) {
-            SessionEntry::Compaction { compaction, .. } => (Some(compaction.summary.clone()), 1),
-            _ => (None, 0),
-        };
-        let selected = &entries[conversation_start..cut];
-        let messages = project_messages(selected, session);
-        if messages.is_empty() {
-            return None;
-        }
-        Some(CompactionPrefix {
-            messages,
-            image_directory: session.image_directory(),
-            estimated_tokens: context_token_estimate(selected, session),
-            previous_summary,
-            first_kept_entry_id: entries[cut].entry(session).id().to_string(),
-        })
-    }
-
-    /// 按当前模型投影估算历史；本轮请求开销与实测校正由 Agent 添加。
-    pub(crate) fn estimated_tokens(&self, session: &SessionData) -> u64 {
-        context_token_estimate(&self.entries, session)
-    }
+    Some(CompactionPrefix {
+        messages,
+        image_directory: session.image_directory(),
+        estimated_tokens: context_token_estimate(selected),
+        previous_summary,
+        first_kept_entry_id: entries[cut].id().to_string(),
+    })
 }
 
-/// 日志只追加，所以位置在同一份 SessionData 内始终稳定。
-#[derive(Debug, Clone, Copy)]
-struct ContextPosition {
-    index: usize,
+/// 从后往前累加到保留预算，再在候选上界之内取最后一个工具对闭合的切点；
+/// 预算为零时仍保留最后一个完整单元。
+fn find_cut_point(entries: &[&SessionEntry], keep_recent_tokens: u64) -> usize {
+    let mut accumulated = 0u64;
+    for index in (0..entries.len()).rev() {
+        accumulated = accumulated.saturating_add(entry_token_estimate(entries[index]));
+        if accumulated >= keep_recent_tokens {
+            return last_balanced_cut(entries, index);
+        }
+    }
+    0
 }
 
-impl ContextPosition {
-    fn entry(self, session: &SessionData) -> &SessionEntry {
-        &session.entries()[self.index]
-    }
-
-    fn token_estimate(self, session: &SessionData) -> u64 {
-        entry_token_estimate(self.entry(session))
-    }
-
-    /// 对话历史与摘要前缀共用同一套消息投影；文件指令由 Agent 加入。
-    fn model_message(self, session: &SessionData) -> ContextMessage {
-        let message =
-            match context_entry(self.entry(session)).expect("context position references a context entry") {
-                ContextEntry::Message(message) => message,
-                ContextEntry::Summary(summary) => {
-                    return ContextMessage {
-                        message: ModelMessage::text(ModelRole::User, compaction_summary(summary)),
-                        images: Vec::new(),
-                    };
+/// 工具结果已经按调用顺序紧随 assistant；切点不能拆开这个工具单元。
+/// 缺失结果由模型投影补齐。
+fn last_balanced_cut(entries: &[&SessionEntry], upper_bound: usize) -> usize {
+    let mut cut = 0usize;
+    for position in 0..upper_bound {
+        let next_is_tool_result = entries.get(position + 1).is_some_and(|next| {
+            matches!(
+                next,
+                SessionEntry::Message {
+                    message: AgentMessage::ToolResult { .. },
+                    ..
                 }
-            };
-        let text = message.content_text();
-        let model_message = match message {
-            AgentMessage::User { .. } => ModelMessage::text(ModelRole::User, text),
-            AgentMessage::Assistant { .. } => ModelMessage {
-                role: ModelRole::Assistant,
-                content: text,
-                images: Vec::new(),
-                tool_call_id: None,
-                tool_calls: message.tool_calls().cloned().collect(),
-                provider_reasoning_replay: message.provider_reasoning_replay().cloned(),
-            },
-            AgentMessage::ToolResult { tool_call_id, .. } => {
-                let mut result = ModelMessage::text(ModelRole::Tool, text);
-                result.tool_call_id = Some(tool_call_id.clone());
-                result
-            }
-        };
-        ContextMessage {
-            message: model_message,
-            images: message.images().cloned().collect(),
+            )
+        });
+        if !next_is_tool_result {
+            cut = position + 1;
         }
+    }
+    cut
+}
+
+fn model_message(entry: &SessionEntry) -> ContextMessage {
+    let message = match context_entry(entry).expect("context contains only messages and summaries") {
+        ContextEntry::Message(message) => message,
+        ContextEntry::Summary(summary) => {
+            return ContextMessage {
+                message: ModelMessage::text(ModelRole::User, compaction_summary(summary)),
+                images: Vec::new(),
+            };
+        }
+    };
+    let text = message.content_text();
+    let model_message = match message {
+        AgentMessage::User { .. } => ModelMessage::text(ModelRole::User, text),
+        AgentMessage::Assistant { .. } => ModelMessage {
+            role: ModelRole::Assistant,
+            content: text,
+            images: Vec::new(),
+            tool_call_id: None,
+            tool_calls: message.tool_calls().cloned().collect(),
+            provider_reasoning_replay: message.provider_reasoning_replay().cloned(),
+        },
+        AgentMessage::ToolResult { tool_call_id, .. } => {
+            let mut result = ModelMessage::text(ModelRole::Tool, text);
+            result.tool_call_id = Some(tool_call_id.clone());
+            result
+        }
+    };
+    ContextMessage {
+        message: model_message,
+        images: message.images().cloned().collect(),
     }
 }
 
@@ -264,41 +260,67 @@ pub(crate) fn load_messages(
         .collect()
 }
 
-/// 会进入可压缩历史的条目；文件指令由 Agent 直接加入请求。
-pub(crate) fn is_context_entry(entry: &SessionEntry) -> bool {
-    context_entry(entry).is_some()
+/// 按日志顺序归约出唯一的活动历史：摘要替换掉前缀。
+fn resolve_context_entries(session: &SessionData) -> Vec<&SessionEntry> {
+    let mut context: Vec<&SessionEntry> = Vec::new();
+    for entry in session.entries() {
+        apply_context_entry(&mut context, entry);
+    }
+    context
 }
 
-/// 从后往前累加到保留预算，再在候选上界之内取最后一个工具对闭合的切点；
-/// 预算为零时仍保留最后一个完整单元。
-fn find_cut_point(entries: &[ContextPosition], session: &SessionData, keep_recent_tokens: u64) -> usize {
-    let mut accumulated = 0u64;
-    for index in (0..entries.len()).rev() {
-        accumulated = accumulated.saturating_add(entries[index].token_estimate(session));
-        if accumulated >= keep_recent_tokens {
-            return last_balanced_cut(entries, session, index);
+/// 按账本顺序应用摘要和工具结果排序规则。
+fn apply_context_entry<'a>(context: &mut Vec<&'a SessionEntry>, entry: &'a SessionEntry) {
+    match entry {
+        SessionEntry::Compaction { compaction, .. } => {
+            let index = context
+                .iter()
+                .position(|candidate| candidate.id() == compaction.first_kept_entry_id)
+                .expect("compaction retains an active context entry");
+            context.drain(..index);
+            context.insert(0, entry);
+            return;
         }
+        entry if context_entry(entry).is_none() => return,
+        _ => {}
     }
-    0
+    if let Some(insert_at) = context_insertion_index(context, entry) {
+        context.insert(insert_at, entry);
+    } else {
+        context.push(entry);
+    }
 }
 
-/// 工具结果已经按调用顺序紧随 assistant；切点不能拆开这个工具单元。
-/// 缺失结果由模型投影补齐。
-fn last_balanced_cut(entries: &[ContextPosition], session: &SessionData, upper_bound: usize) -> usize {
-    let mut cut = 0usize;
-    for position in 0..upper_bound {
-        let next_is_tool_result = entries.get(position + 1).is_some_and(|next| {
-            matches!(
-                next.entry(session),
-                SessionEntry::Message {
-                    message: AgentMessage::ToolResult { .. },
-                    ..
-                }
-            )
-        });
-        if !next_is_tool_result {
-            cut = position + 1;
+fn context_insertion_index(context: &[&SessionEntry], entry: &SessionEntry) -> Option<usize> {
+    let SessionEntry::Message { message, .. } = entry else {
+        return None;
+    };
+    let call_id = message.tool_call_id()?;
+    // 最近一次声明该调用的 assistant 决定工具结果的顺序。
+    for (assistant_index, candidate) in context.iter().enumerate().rev() {
+        let SessionEntry::Message { message: assistant, .. } = candidate else {
+            continue;
+        };
+        let Some(call_ordinal) = assistant.tool_calls().position(|call| call.tool_call_id == *call_id) else {
+            continue;
+        };
+        for (result_index, candidate) in context.iter().enumerate().skip(assistant_index + 1) {
+            let SessionEntry::Message { message: result, .. } = candidate else {
+                continue;
+            };
+            let Some(result_call_id) = result.tool_call_id() else {
+                continue;
+            };
+            let Some(result_ordinal) =
+                assistant.tool_calls().position(|call| call.tool_call_id == *result_call_id)
+            else {
+                continue;
+            };
+            if result_ordinal > call_ordinal {
+                return Some(result_index);
+            }
         }
+        return Some(context.len());
     }
-    cut
+    None
 }

@@ -10,7 +10,7 @@
 mod execution;
 mod state;
 
-pub(crate) use self::state::{CancelWindow, TurnControls};
+pub(crate) use self::state::TurnControls;
 use self::state::{ConversationState, TurnLifecycle};
 
 use std::sync::{Arc, Mutex};
@@ -56,11 +56,7 @@ pub struct OperationGuard {
 
 enum ReservedOperation {
     Turn(ControlRequest),
-    Compaction {
-        thread: Thread,
-        writer: SessionWriter,
-        window: Arc<CancelWindow>,
-    },
+    Compaction { thread: Thread, writer: SessionWriter },
 }
 
 /// 操作结果保留来源；宿主据此展示回合或独立压缩的结果。
@@ -88,11 +84,11 @@ impl OperationReservation {
             ReservedOperation::Turn(input) => OperationResult::Turn(
                 guard.conversation.run_single_turn(input, sink).await.map_err(Into::into),
             ),
-            ReservedOperation::Compaction { thread, writer, window } => OperationResult::Compaction(
+            ReservedOperation::Compaction { thread, writer } => OperationResult::Compaction(
                 guard
                     .conversation
                     .runner
-                    .compact_thread(&thread, &window, writer, sink)
+                    .compact_thread(&thread, writer, sink)
                     .await
                     .map_err(ConversationError::Turn),
             ),
@@ -129,6 +125,8 @@ pub enum ConversationError {
 pub enum ConversationControlError {
     #[error("session is not running")]
     NotRunning,
+    #[error("正在压缩上下文，完成前不能停止。")]
+    Compacting,
     #[error("输入不能为空。")]
     InvalidInput,
 }
@@ -220,14 +218,10 @@ impl Conversation {
             state.thread.clone()
         };
         let writer = self.runner.open_turn_writer(&thread)?;
-        let window = Arc::new(CancelWindow::new());
-        self.lock_state().turn = TurnLifecycle::Compacting {
-            writer: Arc::clone(&writer),
-            window: Arc::clone(&window),
-        };
+        self.lock_state().turn = TurnLifecycle::Compacting { writer: Arc::clone(&writer) };
         Ok(OperationReservation {
             guard: OperationGuard { conversation: Arc::clone(self) },
-            operation: ReservedOperation::Compaction { thread, writer, window },
+            operation: ReservedOperation::Compaction { thread, writer },
         })
     }
 
@@ -268,11 +262,11 @@ impl Conversation {
         }
     }
 
-    /// 停止当前回合或独立压缩，清空尚未消费的引导输入。
+    /// 停止普通任务并清空未消费输入；手动和自动压缩期间都拒绝停止。
     pub fn abort(&self) -> Result<(), ConversationControlError> {
         match &self.lock_state().turn {
             TurnLifecycle::Running(controls) => controls.accept_cancel(),
-            TurnLifecycle::Compacting { window, .. } => window.accept(),
+            TurnLifecycle::Compacting { .. } => Err(ConversationControlError::Compacting),
             _ => Err(ConversationControlError::NotRunning),
         }
     }

@@ -22,9 +22,7 @@ mod request;
 
 use std::sync::Arc;
 
-use singularity_model::{
-    ModelConfigurationSnapshot, ModelMessage, ModelUsage, OpenAiProvider, ProviderError,
-};
+use singularity_model::{ModelConfigurationSnapshot, ModelUsage, OpenAiProvider, ProviderError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -35,15 +33,15 @@ use crate::request_execution::RequestAccounting;
 
 use self::inbox::lock_inbox;
 use crate::message::{AgentMessage, ItemScope, assistant_response_message};
-use crate::session::{SessionError, SessionWriter, lock_writer};
+use crate::session::{SessionError, SessionWriter, context, lock_writer};
 use crate::tools::ToolRegistrySnapshot;
 
-/// Agent 的首次文件指令及后续指令加载目录。
+/// 会话首次加载及压缩后更新指令使用的目录。
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// 文件指令（AGENTS.md 等）的用户数据根目录。
     pub instruction_home: std::path::PathBuf,
-    /// 准备阶段已经读好的首轮文件指令；文件不存在时为 None，每次压缩后重新读取。
+    /// 首次会话在开始记录前读取的文件指令；已有固定定义时无需读取。
     pub initial_instructions: Option<singularity_core::ProjectInstructions>,
 }
 
@@ -96,10 +94,8 @@ pub struct Agent {
     registry: ToolRegistrySnapshot,
     questions: Option<Arc<UserQuestions>>,
     mcp: Arc<singularity_mcp::McpManager>,
-    skill_instructions: String,
-    developer_instructions: String,
-    /// 本轮全局与项目文件指令；压缩后直接用重新读取的内容替换。
-    file_instructions: Option<ModelMessage>,
+    /// 会话固定的请求前缀；只在首次加载和压缩成功后更换。
+    definitions: Option<crate::session::RequestDefinitions>,
     provider: OpenAiProvider,
     /// 从本轮 Provider 冻结的容量配置，供整个执行过程使用。
     model: ModelConfigurationSnapshot,
@@ -122,19 +118,16 @@ impl Agent {
         mcp: Arc<singularity_mcp::McpManager>,
     ) -> Self {
         let model = provider.model_configuration();
-        let cwd = lock_writer(&session).cwd().to_path_buf();
+        let definitions = lock_writer(&session)
+            .latest_request_definitions()
+            .map(|(_, definitions)| definitions.clone());
         let registry = ToolRegistrySnapshot::default();
-        let skill_instructions =
-            singularity_core::skills::SkillCatalog::discover(&cwd, &config.instruction_home).prompt();
         Self {
             session,
             registry,
             questions: None,
             mcp,
-            skill_instructions,
-            // 生成请求前由 refresh_tools 组装当前指令；独立压缩可直接复用历史定义。
-            developer_instructions: String::new(),
-            file_instructions: None,
+            definitions,
             provider,
             model,
             config,
@@ -169,9 +162,19 @@ impl Agent {
         self.inject_controls(Some(input.sequence), on_event).await?;
         self.append_user_input(input, on_event).await?;
 
-        let loaded = self.config.initial_instructions.take();
-        self.apply_instructions(loaded, on_event);
-        self.refresh_tools(on_event, cancellation).await;
+        if self.definitions.is_some() {
+            // 恢复本轮工具连接，不更新模型已保存的指令和 schema。
+            let cwd = lock_writer(&self.session).cwd().to_path_buf();
+            let discovered = self.mcp.discover(&cwd, cancellation).await;
+            self.registry.set_mcp_tools(discovered.tools);
+            for error in discovered.errors {
+                on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning("mcp_connection_failed", error)));
+            }
+        }
+        match self.ensure_definitions(on_event, cancellation).await {
+            Err(AgentError::Aborted) => return Ok(abort_outcome(outcome)),
+            result => result?,
+        }
 
         loop {
             if cancellation.is_cancelled() {
@@ -192,7 +195,7 @@ impl Agent {
             let overhead_tokens = self.request_overhead_tokens();
             let estimated = {
                 let writer = lock_writer(&self.session);
-                writer.context().estimated_tokens(&writer)
+                context::estimated_tokens(&writer)
             }
             .saturating_add(crate::session::context::message_token_estimate(&assistant))
             .saturating_add(overhead_tokens);

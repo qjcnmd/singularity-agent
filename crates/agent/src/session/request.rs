@@ -38,6 +38,9 @@ struct SavedPreferences {
 }
 
 impl RequestDefinitions {
+    pub(crate) fn has_tool(&self, name: &str) -> bool {
+        self.tools.iter().any(|tool| tool.name == name)
+    }
     pub(super) fn snapshot(
         &self,
         definitions_id: &str,
@@ -163,14 +166,17 @@ impl RequestContext {
 }
 
 impl SessionData {
-    /// 最近一次请求实际使用的指令与工具，供独立压缩复用。
-    pub(crate) fn latest_request_definitions(&self) -> Option<(&str, &RequestDefinitions)> {
+    /// 会话固定的指令与工具，跨回合和重启复用；首次请求之前为空，成功压缩后更新。
+    pub fn latest_request_definitions(&self) -> Option<(&str, &RequestDefinitions)> {
         self.entries.iter().rev().find_map(|entry| match entry {
             SessionEntry::Record {
                 id,
                 record: LedgerRecord::RequestDefinitions { definitions },
                 ..
             } => Some((id.as_str(), definitions)),
+            SessionEntry::Compaction { id, compaction, .. } => {
+                compaction.definitions.as_ref().map(|definitions| (id.as_str(), definitions))
+            }
             _ => None,
         })
     }
@@ -188,6 +194,9 @@ impl SessionData {
                     record: LedgerRecord::RequestDefinitions { definitions },
                     ..
                 } if id == definitions_id => Some(definitions),
+                SessionEntry::Compaction { id, compaction, .. } if id == definitions_id => {
+                    compaction.definitions.as_ref()
+                }
                 _ => None,
             })
             .expect("request references an earlier definition record");

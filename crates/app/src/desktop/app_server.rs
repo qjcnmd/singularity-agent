@@ -233,8 +233,8 @@ impl AppServer {
     }
 
     fn on_turn_event(&self, session_id: &str, slot: &ConversationSlot, event: TurnEvent) {
-        // 等待中的问题只由会话快照表示，不进入活动 turn 的事件序列。
-        if let TurnEvent::PendingQuestionChanged { .. } = &event {
+        // 提问和压缩阶段由会话快照表示，不进入活动 turn 的条目序列。
+        if let TurnEvent::SessionStateChanged { .. } = &event {
             self.bump_and_emit_session(session_id, slot);
             return;
         }

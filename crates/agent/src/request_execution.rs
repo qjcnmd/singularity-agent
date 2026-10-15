@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::AgentError;
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
 use crate::session::{
-    InterruptedAssistantItem, LedgerRecord, RequestDefinitions, SessionError, SessionWriter,
-    append_record_async, with_writer_async,
+    InterruptedAssistantItem, LedgerRecord, SessionError, SessionWriter, append_record_async,
+    with_writer_async,
 };
 
 /// 声明的输出预算同时受模型上限、请求用途和窗口余量约束。安全余量弥补启发式
@@ -81,7 +81,6 @@ pub(crate) async fn execute_request(
     session: &SessionWriter,
     accounting: &mut RequestAccounting,
     request: &ModelTurnRequest,
-    definitions: &RequestDefinitions,
     on_event: &mut (dyn FnMut(AgentEvent) + Send),
     cancellation: &CancellationToken,
     purpose: RequestPurpose,
@@ -100,7 +99,7 @@ pub(crate) async fn execute_request(
             visible_text: String::new(),
             visible_reasoning: String::new(),
         };
-        let error = match attempt.run(provider, request, definitions, accounting, cancellation).await {
+        let error = match attempt.run(provider, request, accounting, cancellation).await {
             Ok(response) => return Ok((response, attempt.result_entry_id)),
             Err(error) => error,
         };
@@ -157,7 +156,6 @@ impl RequestAttempt<'_> {
         &mut self,
         provider: &OpenAiProvider,
         request: &ModelTurnRequest,
-        definitions: &RequestDefinitions,
         accounting: &mut RequestAccounting,
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnResponse, AgentError> {
@@ -184,9 +182,8 @@ impl RequestAttempt<'_> {
             diagnostic_code: None,
         };
         let started = Instant::now();
-        // 持久化线程只接收轨迹定义，不复制对话和私有续接材料。
-        self.record(observation.clone(), Some((definitions.clone(), request.model_preferences.clone())))
-            .await?;
+        // 请求记录引用会话已保存的定义，只传入本次输出偏好。
+        self.record(observation.clone(), Some(request.model_preferences.clone())).await?;
         let mut first_token = None;
         let completion = provider
             .complete_stream(request, cancellation, &mut |event| {
@@ -228,7 +225,7 @@ impl RequestAttempt<'_> {
     async fn record(
         &mut self,
         mut observation: RequestObservation,
-        request_head: Option<(RequestDefinitions, ModelPreferences)>,
+        request_head: Option<ModelPreferences>,
     ) -> Result<(), SessionError> {
         let persisted = observation.clone();
         observation.request_head = with_writer_async(self.writer, move |writer| {

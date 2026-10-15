@@ -104,6 +104,8 @@ cargo run -p singularity_protocol --features typescript --example export_types
 
 E2E 默认使用日常数据目录，运行前先退出占用该目录的工作台；测试创建的项目与任务会保留在列表中。需要隔离时，把 `SINGULARITY_HOME` 指向另一个包含 `config.json` 与 `auth.json` 的目录。
 
+测试按完整目录复用已登记的项目，同名项目按各自所在行定位。冒烟测试首次添加项目时检查目录选择，重跑时检查取消选择并复用已有项目。
+
 ```powershell
 $env:SINGULARITY_HOME = "$HOME/.singularity"
 

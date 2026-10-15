@@ -18,11 +18,9 @@ use singularity_agent::session::{
     LedgerRecord, SessionManager, SessionWriter, append_record_async, lock_writer,
     turn_usage_from_model_usage,
 };
-use singularity_core::load_agent_instructions;
 use singularity_model::{ModelConfigManager, OpenAiProvider};
 
 use crate::assistant_items::AssistantItemEvents;
-use crate::conversation::CancelWindow;
 use crate::error::{TurnFailureCause, TurnRunError, provider_turn_cause};
 use singularity_protocol::{
     DiagnosticSeverity, Thread, Turn, TurnErrorDetail, TurnEvent, TurnModelUsage, TurnStatus, diagnostic_code,
@@ -119,8 +117,12 @@ impl TurnRunner {
         let mut item_events = AssistantItemEvents::new(thread.thread_id.clone(), turn_id.clone());
         let run_result = {
             let mut on_event = |event: AgentEvent| match event {
+                AgentEvent::CompactionStateChanged { active } => {
+                    controls.set_compacting(active);
+                    sink(TurnEvent::SessionStateChanged {});
+                }
                 AgentEvent::PendingQuestionChanged => {
-                    sink(TurnEvent::PendingQuestionChanged {});
+                    sink(TurnEvent::SessionStateChanged {});
                 }
                 event => item_events.project(sink, event),
             };
@@ -211,9 +213,12 @@ impl TurnRunner {
         let writer = controls.writer();
         let provider = self.resolve_provider(thread)?;
         let instruction_home = self.instruction_home();
-        let initial_instructions =
-            load_agent_instructions(std::path::Path::new(&thread.cwd), &instruction_home)
-                .map_err(TurnRunError::Preparation)?;
+        let initial_instructions = if lock_writer(&writer).latest_request_definitions().is_none() {
+            singularity_core::load_agent_instructions(std::path::Path::new(&thread.cwd), &instruction_home)
+                .map_err(TurnRunError::Preparation)?
+        } else {
+            None
+        };
         let config = AgentConfig { instruction_home, initial_instructions };
         // OperationStarted 记录 turn 身份。输入消息由 Agent 单独落盘；
         // 这些追加不是一个原子事务。

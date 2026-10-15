@@ -412,7 +412,7 @@ export class SessionStore {
     const { revision, bootstrap, session, liveSessions } = state
     const patch: Partial<AppState> = { revision, bootstrap, session, liveSessions }
     if (bootstrap !== null && bootstrap !== this.state.bootstrap) {
-      const pruned = pruneStaleSelection(bootstrap, this.state, this.createdSessionId)
+      const pruned = pruneStaleSelection(bootstrap, { ...this.state, session, liveSessions }, this.createdSessionId)
       if (pruned.createdInCatalog) this.createdSessionId = null
       patch.liveSessions = pruned.liveSessions
       patch.session = pruned.session

@@ -42,6 +42,8 @@ impl AgentDiagnostic {
 /// 落盘的 toolResult 按完成顺序追加，模型上下文则按调用顺序投影。
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// 压缩及提交新定义期间，宿主关闭停止入口；结束后恢复普通任务控制。
+    CompactionStateChanged { active: bool },
     /// 模型正文的流式增量；message_id 指向它所属的 assistant 消息。
     MessageUpdate { message_id: String, delta: String },
     /// 当前 assistant 消息里对外公开的思考文本的流式增量。

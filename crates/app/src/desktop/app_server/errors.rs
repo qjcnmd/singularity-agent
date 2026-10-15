@@ -117,6 +117,7 @@ pub(super) fn session_busy() -> RpcError {
 pub(super) fn control_error(error: ConversationControlError) -> RpcError {
     match error {
         ConversationControlError::NotRunning => session_busy(),
+        ConversationControlError::Compacting => invalid_request("正在压缩上下文，完成前不能停止。"),
         ConversationControlError::InvalidInput => invalid_request("输入不能为空。"),
     }
 }

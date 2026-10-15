@@ -1,21 +1,27 @@
 import { factStatusText, compactionText } from './copy'
 import type { ExecutionItem, ExecutionTurn, FactStatus, SessionView } from './execution'
 
-type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'compaction' | 'terminal' | 'duration'
-
-export interface TimelineItemModel {
+interface TimelineItemBase {
   key: string
   /** 可恢复的历史归属；临时输出不提供阅读锚点。 */
   anchorTurnId?: string | null
-  kind: TimelineKind
   title: string
   fact: ExecutionItem | null
   summary: string
   filePath: string | null
   /** 条目状态；用于无执行事实的运行时项（如压缩中） */
   status?: FactStatus
-  timing?: { startedAt: string; finishedAt?: string }
 }
+
+export type TimelineItemModel = TimelineItemBase & (
+  | { kind: 'tool'; fact: Extract<ExecutionItem, { kind: 'tool' }> }
+  | { kind: 'duration'; fact: null; timing: { startedAt: string; finishedAt?: string } }
+  | { kind: 'user' }
+  | { kind: 'assistant' }
+  | { kind: 'thinking' }
+  | { kind: 'compaction' }
+  | { kind: 'terminal' }
+)
 
 export function timelineStatus(item: TimelineItemModel): FactStatus {
   return item.status ?? item.fact?.status ?? 'cancelled'
@@ -86,8 +92,10 @@ function projectTurn(turn: ExecutionTurn, anchorTurnId: string | null, cwd: stri
     }
     if (fact.kind === 'settings' || fact.kind === 'event') continue
     const cached = projectedItems.get(fact)
-    let item = cached?.cwd === cwd && cached.userHome === userHome ? cached?.item : undefined
-    if (!item) {
+    let item: TimelineItemModel
+    if (cached?.cwd === cwd && cached.userHome === userHome) {
+      item = cached.item
+    } else {
       const key = `content:${group}:${fact.id}`
       if (fact.kind === 'tool') {
         const filePath = pathFromArgs(fact.name, fact.args)

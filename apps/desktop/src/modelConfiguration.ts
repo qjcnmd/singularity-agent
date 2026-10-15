@@ -76,14 +76,10 @@ export function mergeDiscoveredModels(
   for (const candidate of candidates) {
     if (!picked.has(candidate.modelId)) continue
     const at = next.findIndex(row => row.modelId.trim() === candidate.modelId)
-    if (at < 0) {
-      next.push(applyProtocol({ ...blankModel(), ...candidate,
-        reasoningVariants: candidate.reasoningVariants.length ? candidate.reasoningVariants : null,
-        defaultVariant: null,
-      }, protocol))
-      continue
-    }
-    next[at] = mergeDiscoveredModel(next[at], candidate, protocol)
+    const current = at < 0 ? { ...blankModel(), modelId: candidate.modelId } : next[at]
+    const merged = mergeDiscoveredModel(current, candidate, protocol)
+    if (at < 0) next.push(merged)
+    else next[at] = merged
   }
   return next
 }
@@ -92,7 +88,6 @@ export function mergeDiscoveredModels(
 export function mergeDiscoveredModel(current: ModelConfigurationInput, candidate: DiscoveredModel, protocol: string): ModelConfigurationInput {
   const merged = { ...current, automaticFields: automaticFieldsFor(current) }
   for (const field of merged.automaticFields) {
-    if (current.apiProtocol !== protocol && (field === 'reasoningVariants' || field === 'requiresReasoningContentForToolCalls')) continue
     if (!(field in candidate)) continue
     const value = candidate[field as keyof DiscoveredModel]
     // 未声明的推荐不擦掉上次已确认的值；手动字段不在自动集合中。
@@ -100,7 +95,7 @@ export function mergeDiscoveredModel(current: ModelConfigurationInput, candidate
     Object.assign(merged, { [field]: value })
     if (field === 'reasoningVariants' && !candidate.reasoningVariants.some(variant => variant.id === merged.defaultVariant)) merged.defaultVariant = null
   }
-  return merged
+  return applyProtocol(merged, protocol)
 }
 
 /** 保留目录和已有配置的线上映射；开关模型只提供 off / on。 */

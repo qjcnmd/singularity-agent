@@ -5,7 +5,7 @@
 use super::{Agent, AgentError, Result};
 use crate::events::{AgentDiagnostic, AgentEvent};
 use crate::request_execution::{execute_request, output_budget_tokens};
-use crate::session::{RequestDefinitions, lock_writer};
+use crate::session::{RequestDefinitions, context, lock_writer};
 use singularity_model::{ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnResponse};
 use tokio_util::sync::CancellationToken;
 
@@ -24,75 +24,107 @@ fn file_instruction_message(instructions: &str) -> Option<ModelMessage> {
 }
 
 impl Agent {
-    /// 加载当前 MCP 目录，并将工具定义和服务器说明一起替换。
-    pub(super) async fn refresh_tools(
+    /// 只在会话没有固定定义时加载；已有会话包括重启恢复都沿用保存的定义。
+    pub(super) async fn ensure_definitions(
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
-    ) {
-        let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let discovered = self.mcp.discover(&cwd, cancellation).await;
-        for error in &discovered.errors {
-            on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
-                "mcp_connection_failed",
-                error.clone(),
-            )));
+    ) -> Result<()> {
+        if self.definitions.is_none() {
+            let (definitions, registry) = self.load_definitions(on_event, cancellation).await?;
+            let saved = definitions.clone();
+            crate::session::with_writer_async(&self.session, move |writer| {
+                writer.append_record(crate::session::LedgerRecord::RequestDefinitions { definitions: saved })
+            })
+            .await?;
+            self.definitions = Some(definitions);
+            self.registry = registry;
         }
-        self.registry.set_mcp_tools(discovered.tools);
-        self.developer_instructions = crate::prompts::assemble_developer_instructions(
-            &singularity_core::display_path(&cwd),
-            &self.registry,
-        );
-        if !discovered.instructions.is_empty() {
-            self.developer_instructions
-                .push_str(&format!("\n\n{}", discovered.instructions.join("\n\n")));
-        }
-        if !discovered.errors.is_empty() {
-            self.developer_instructions
-                .push_str(&format!("\n\nUnavailable MCP servers:\n{}", discovered.errors.join("\n")));
-        }
+        Ok(())
     }
 
-    /// 压缩后重新读取文件指令与 Skill 目录，直接替换本轮请求使用的内容。
-    pub(super) async fn refresh_instructions(
+    /// 首次加载和压缩成功后共用；返回新定义，调用方保存成功后才替换当前内容。
+    pub(super) async fn load_definitions(
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
-    ) -> Result<()> {
+        cancellation: &CancellationToken,
+    ) -> Result<(RequestDefinitions, crate::tools::ToolRegistrySnapshot)> {
         let home = self.config.instruction_home.clone();
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let (loaded, skill_instructions) = tokio::task::spawn_blocking(move || {
-            let loaded = singularity_core::load_agent_instructions(&cwd, &home);
-            let skill_instructions = singularity_core::skills::SkillCatalog::discover(&cwd, &home).prompt();
-            (loaded, skill_instructions)
+        let initial = self.definitions.is_none();
+        let initial_instructions = self.config.initial_instructions.take();
+        let instruction_cwd = cwd.clone();
+        let (loaded, skills) = tokio::task::spawn_blocking(move || {
+            let loaded = if initial {
+                Ok(initial_instructions)
+            } else {
+                singularity_core::load_agent_instructions(&instruction_cwd, &home)
+            };
+            let skills = singularity_core::skills::SkillCatalog::discover(&instruction_cwd, &home).prompt();
+            (loaded, skills)
         })
         .await
         .expect("instruction loader completes while the runtime is running");
         let loaded = loaded.map_err(AgentError::Instructions)?;
-        self.skill_instructions = skill_instructions;
-        self.apply_instructions(loaded, on_event);
-        Ok(())
-    }
-
-    pub(super) fn apply_instructions(
-        &mut self,
-        loaded: Option<singularity_core::ProjectInstructions>,
-        on_event: &mut dyn FnMut(AgentEvent),
-    ) {
-        self.file_instructions = loaded
-            .as_ref()
-            .map(singularity_core::ProjectInstructions::content)
-            .and_then(file_instruction_message);
-        self.usage_correction = 0;
         if loaded.as_ref().is_some_and(singularity_core::ProjectInstructions::truncated) {
             on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
                 singularity_protocol::diagnostic_code::PROJECT_INSTRUCTIONS_TRUNCATED,
                 "project instructions were truncated because they exceeded the size budget",
             )));
         }
+        let discovered = self.mcp.discover(&cwd, cancellation).await;
+        if cancellation.is_cancelled() {
+            return Err(AgentError::Aborted);
+        }
+        let mut registry = crate::tools::ToolRegistrySnapshot::default();
+        if self.questions.is_some() {
+            registry.enable_questions();
+        }
+        registry.set_mcp_tools(discovered.tools);
+        let mut developer =
+            crate::prompts::assemble_developer_instructions(&singularity_core::display_path(&cwd), &registry);
+        if !discovered.instructions.is_empty() {
+            developer.push_str(&format!("\n\n{}", discovered.instructions.join("\n\n")));
+        }
+        if !discovered.errors.is_empty() {
+            developer.push_str(&format!("\n\nUnavailable MCP servers:\n{}", discovered.errors.join("\n")));
+        }
+        for error in discovered.errors {
+            on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning("mcp_connection_failed", error)));
+        }
+        let mut messages = vec![ModelMessage::text(ModelRole::Developer, developer)];
+        if !skills.is_empty() {
+            messages.push(ModelMessage::text(ModelRole::Developer, skills));
+        }
+        if let Some(files) = loaded
+            .as_ref()
+            .map(singularity_core::ProjectInstructions::content)
+            .and_then(file_instruction_message)
+        {
+            messages.push(files);
+        }
+        Ok((RequestDefinitions::new(&messages, registry.provider_schemas()), registry))
     }
 
-    pub(super) fn request_definitions(&self) -> RequestDefinitions {
-        RequestDefinitions::new(&self.instruction_prefix(), self.registry.provider_schemas())
+    pub(super) fn request_definitions(&self) -> &RequestDefinitions {
+        self.definitions.as_ref().expect("definitions are loaded before model requests")
+    }
+
+    /// 普通请求读取固定前缀与完整有效对话；组装不会重新发现或刷新定义。
+    pub(super) async fn model_messages(&self) -> Result<Vec<ModelMessage>> {
+        let prefix = self.request_definitions().model_messages();
+        let session = std::sync::Arc::clone(&self.session);
+        Ok(tokio::task::spawn_blocking(move || {
+            let mut messages = prefix;
+            let (materials, directory) = {
+                let writer = lock_writer(&session);
+                (context::messages(&writer), writer.image_directory())
+            };
+            messages.extend(context::load_messages(materials, &directory)?);
+            Ok::<_, crate::session::SessionError>(messages)
+        })
+        .await
+        .expect("context worker completes while the runtime is running")?)
     }
 
     /// 当前指令和工具定义的请求开销。
@@ -107,9 +139,7 @@ impl Agent {
     /// 从账本派生历史估价，本轮 Agent 添加请求定义开销与实测校正。
     fn request_tokens(&self, overhead: u64) -> u64 {
         let writer = lock_writer(&self.session);
-        writer
-            .context()
-            .estimated_tokens(&writer)
+        context::estimated_tokens(&writer)
             .saturating_add(overhead)
             .saturating_add(self.usage_correction)
     }
@@ -120,21 +150,9 @@ impl Agent {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<(ModelTurnResponse, String)> {
-        let prefix = self.instruction_prefix();
-        let tools = self.registry.provider_schemas();
-        let definitions = RequestDefinitions::new(&prefix, tools.clone());
-        let session = std::sync::Arc::clone(&self.session);
-        let messages = tokio::task::spawn_blocking(move || {
-            let mut messages = prefix;
-            let (materials, directory) = {
-                let writer = lock_writer(&session);
-                (writer.context().messages(&writer), writer.image_directory())
-            };
-            messages.extend(crate::session::context::load_messages(materials, &directory)?);
-            Ok::<_, crate::session::SessionError>(messages)
-        })
-        .await
-        .expect("context worker completes while the runtime is running")?;
+        let definitions = self.request_definitions().clone();
+        let tools = definitions.model_tools();
+        let messages = self.model_messages().await?;
         let request = ModelTurnRequest {
             messages,
             tools,
@@ -151,28 +169,11 @@ impl Agent {
             &self.session,
             &mut self.accounting,
             &request,
-            &definitions,
             on_event,
             cancellation,
             singularity_protocol::RequestPurpose::Generation,
         )
         .await
-    }
-
-    /// 开头是 Harness / Skill 目录的 Developer 消息与当前项目指令快照；其后是可压缩
-    /// 对话历史。技能文件引用随用户输入进入历史，正文通过普通工具结果交付。
-    pub(super) fn instruction_prefix(&self) -> Vec<ModelMessage> {
-        let mut messages = Vec::new();
-        // Harness 指令先于 Skill 目录；不支持 Developer 的端点由 Provider 降级。
-        for instruction in [&self.developer_instructions, &self.skill_instructions] {
-            if !instruction.is_empty() {
-                messages.push(ModelMessage::text(ModelRole::Developer, instruction));
-            }
-        }
-        if let Some(files) = &self.file_instructions {
-            messages.push(files.clone());
-        }
-        messages
     }
 }
 
@@ -189,8 +190,11 @@ impl Agent {
             Err(AgentError::Provider(error)) if error.is_context_overflow() => error,
             result => return result,
         };
-        if !self.force_compact(on_event, cancellation).await? {
+        if !self.compact_now(on_event).await? {
             return Err(AgentError::Provider(overflow));
+        }
+        if cancellation.is_cancelled() {
+            return Err(AgentError::Aborted);
         }
         // 恢复只发生一次；重发的结果直接返回，不重新进入压缩决策。
         self.request_response(on_event, cancellation).await

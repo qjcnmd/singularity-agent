@@ -40,7 +40,7 @@ pub async fn run(setup: DesktopSetup) -> Result<(), String> {
     let mut output = tokio::io::stdout();
     let mut requests = JoinSet::new();
     let shutdown = CancellationToken::new();
-    let result = async {
+    let mut result = async {
         write(
             &mut output,
             &app.frame(StreamEvent::Ready),
@@ -81,10 +81,27 @@ pub async fn run(setup: DesktopSetup) -> Result<(), String> {
     }.await;
     // EOF 或管道故障都结束接收；先取消目录查询、收齐已接受的修改，再停止会话。
     shutdown.cancel();
-    while let Some(joined) = requests.join_next().await {
-        joined.expect("accepted RPC task completes before shutdown");
+    let cleanup = async {
+        while let Some(joined) = requests.join_next().await {
+            joined.expect("accepted RPC task completes before shutdown");
+        }
+        app.shutdown().await;
+    };
+    tokio::pin!(cleanup);
+    // 退出时继续发送压缩阶段变化，桌面才能在压缩结束后恢复退出超时。
+    loop {
+        tokio::select! {
+            () = &mut cleanup => break,
+            event = events.recv(), if result.is_ok() => {
+                let frame = match event {
+                    Ok(frame) => frame,
+                    Err(broadcast::error::RecvError::Lagged(_)) => app.frame(StreamEvent::ResyncRequired),
+                    Err(broadcast::error::RecvError::Closed) => continue,
+                };
+                result = write(&mut output, &frame).await;
+            }
+        }
     }
-    app.shutdown().await;
     result
 }
 

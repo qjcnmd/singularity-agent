@@ -188,14 +188,15 @@ function ComposerView({ centered }: { centered: boolean }) {
           </div>
           <div className="composer-actions">
             <ModelPicker state={state} />
-            {busy && (
+            {phase === 'compacting' && <span role="status" className="compaction-status">正在压缩…</span>}
+            {busy && phase !== 'compacting' && (
               <button
                 type="button"
                 className="stop-button"
                 {...selectionGuard(() => { void appStore.stopActive() })}
                 disabled={phase === 'stopping' || state.pendingActions.has(pendingKey('session.abort', sessionOrigin))}
-                aria-label={phase === 'stopping' ? '正在停止' : phase === 'compacting' ? '停止压缩' : '停止当前任务'}
-                title={phase === 'stopping' ? '正在停止' : phase === 'compacting' ? '停止压缩' : '停止'}
+                aria-label={phase === 'stopping' ? '正在停止' : '停止当前任务'}
+                title={phase === 'stopping' ? '正在停止' : '停止'}
               >
                 <ActivityOrb fast />
               </button>

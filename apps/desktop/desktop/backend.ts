@@ -15,6 +15,8 @@ export class Backend extends EventEmitter {
   private readyResolve!: (frame: StreamEnvelope) => void
   private readyReject!: (error: Error) => void
   private exited: Promise<void>
+  private compacting = new Set<string>()
+  private stopTimer: ReturnType<typeof setTimeout> | undefined
 
   constructor(binary: string) {
     super()
@@ -37,6 +39,14 @@ export class Backend extends EventEmitter {
           pending?.resolve(message.response)
         } else {
           const frame = message as StreamEnvelope
+          if (frame.type === 'session_changed' || frame.type === 'session_settled') {
+            if (frame.payload.phase === 'compacting') this.compacting.add(frame.sessionId)
+            else this.compacting.delete(frame.sessionId)
+          } else if (frame.type === 'app_changed') {
+            this.compacting = new Set(Object.entries(frame.payload.sessionPhases)
+              .filter(([, phase]) => phase === 'compacting').map(([id]) => id))
+          }
+          if (this.stopping) this.updateStopTimer()
           if (frame.type === 'ready') {
             this.readyResolve(frame)
           }
@@ -80,9 +90,18 @@ export class Backend extends EventEmitter {
   async stop(): Promise<void> {
     this.stopping = true
     this.child.stdin.end()
-    // EOF 会取消 Rust 侧的工作，让它把终态事实落盘。provider 卡住不能挡住退出。
-    const timer = setTimeout(() => this.child.kill(), 10_000)
+    this.updateStopTimer()
     await this.exited
-    clearTimeout(timer)
+    clearTimeout(this.stopTimer)
+  }
+
+  private updateStopTimer(): void {
+    // 仅压缩期间暂停退出超时；普通任务仍有原来的 10 秒退出上限。
+    if (this.compacting.size > 0) {
+      clearTimeout(this.stopTimer)
+      this.stopTimer = undefined
+    } else if (!this.stopTimer) {
+      this.stopTimer = setTimeout(() => this.child.kill(), 10_000)
+    }
   }
 }

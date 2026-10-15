@@ -1,12 +1,11 @@
-import { mkdirSync, writeFileSync, readFileSync, unlinkSync } from 'node:fs'
+import { writeFileSync, readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import assert from 'node:assert/strict'
-import { setupE2E, rpc as callRpc, modelSelector } from './support.mjs'
+import { setupE2E, rpc as callRpc, modelSelector, ensureWorkspace } from './support.mjs'
 
 const { output, launch } = setupE2E('electron-images')
 const workspacePath = join(output, 'workspace')
-mkdirSync(workspacePath, { recursive: true })
 const checks = []
 const errors = []
 let app = await launch()
@@ -44,7 +43,7 @@ const bindPage = async () => {
 }
 try {
   await bindPage()
-  workspace = (await rpc('app.bootstrap')).workspaces.find(item => item.root.replaceAll('\\', '/').replace(/^\/\/\?\//, '').toLowerCase() === workspacePath.replaceAll('\\', '/').toLowerCase()) ?? await rpc('workspace.add', { root: workspacePath })
+  workspace = await ensureWorkspace(page, workspacePath)
   uploads = await page.evaluate(() => {
     const canvas = document.createElement('canvas'); canvas.width = 400; canvas.height = 240
     const ctx = canvas.getContext('2d')

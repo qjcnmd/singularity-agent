@@ -96,6 +96,7 @@ impl PreparedCompaction {
         Ok(CompactionEntry {
             summary: text,
             first_kept_entry_id: self.first_kept_entry_id,
+            definitions: None,
         })
     }
 }

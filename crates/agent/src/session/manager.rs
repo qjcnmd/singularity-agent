@@ -10,7 +10,6 @@ use singularity_core::now_iso;
 
 use crate::message::AgentMessage;
 
-use super::context::ContextView;
 use super::file::{ParsedSession, TailPolicy, parse_session_file, rewrite_file};
 use super::format::{
     CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError, SessionHeader, SessionMetadata,
@@ -95,11 +94,6 @@ impl SessionManager {
         let data = SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite, Some(expected_id))?;
         Ok(Self { data, append_error: None })
     }
-
-    /// 从已提交账本派生本次使用的模型上下文位置。
-    pub(crate) fn context(&self) -> ContextView {
-        ContextView::derive(&self.data)
-    }
 }
 
 impl SessionData {
@@ -132,7 +126,7 @@ impl SessionData {
     /// 为只读扫描（列表、摘要、分页投影）打开既有会话文件。
     ///
     /// 只读取以换行符结束的完整记录，不写入。执行侧重开写者时
-    /// 修复未完成的尾行，模型上下文由 `ContextView::derive()` 派生。
+    /// 修复未完成的尾行，模型上下文从已保存的记录派生。
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_parsed(path, TailPolicy::CompleteLines, None)
     }
@@ -195,16 +189,12 @@ impl SessionManager {
     pub(crate) fn append_model_request(
         &mut self,
         observation: singularity_protocol::RequestObservation,
-        request: Option<(super::RequestDefinitions, singularity_model::ModelPreferences)>,
+        request: Option<singularity_model::ModelPreferences>,
     ) -> Result<Option<Box<singularity_protocol::ModelRequestSnapshot>>> {
-        let (context, head) = if let Some((definitions, model_preferences)) = request {
-            let id = match self.latest_request_definitions() {
-                Some((id, previous)) if previous == &definitions => id.to_owned(),
-                _ => {
-                    self.append_record(LedgerRecord::RequestDefinitions { definitions: definitions.clone() })?
-                        .id
-                }
-            };
+        let (context, head) = if let Some(model_preferences) = request {
+            let (id, definitions) =
+                self.latest_request_definitions().expect("definitions are saved before requests start");
+            let id = id.to_owned();
             let head = definitions.snapshot(&id, &model_preferences);
             (Some(Box::new(super::request::RequestContext::new(id, model_preferences))), Some(head))
         } else {

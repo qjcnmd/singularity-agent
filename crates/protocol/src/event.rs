@@ -172,9 +172,9 @@ pub enum TurnEvent {
     },
     #[serde(rename = "turn/completed")]
     TurnCompleted { turn: Turn, finished_at: String },
-    /// 等待回答的问题出现或结束；工作台据此重新发布会话快照。
-    #[serde(rename = "turn/pendingQuestionChanged")]
-    PendingQuestionChanged {},
+    /// 提问或压缩阶段变化；工作台据此重新发布会话快照。
+    #[serde(rename = "turn/sessionStateChanged")]
+    SessionStateChanged {},
     #[serde(rename = "turn/error")]
     TurnFailed {
         thread_id: String,

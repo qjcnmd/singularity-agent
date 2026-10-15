@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { resolve, join } from 'node:path'
 import assert from 'node:assert/strict'
-import { setupE2E, rpc as callRpc, modelSelector } from './support.mjs'
+import { setupE2E, rpc as callRpc, modelSelector, findWorkspace, workspaceNewSessionButton } from './support.mjs'
 
 const { desktop, output, env, launch } = setupE2E('electron-e2e')
 const errors = []
@@ -32,11 +32,14 @@ try {
   }
   await nativeDialog(true)
   assert.equal((await rpc('app.bootstrap')).workspaces.length, baseline.workspaces.length)
-  await nativeDialog()
-  await page.waitForFunction(() => document.querySelector('.workspace-new'))
-  const workspace = (await rpc('app.bootstrap')).workspaces.find(item => item.root.replaceAll('\\', '/').endsWith('/workspace'))
+  let workspace = await findWorkspace(page, resolve(output, 'workspace'))
+  if (workspace === undefined) {
+    await nativeDialog()
+    workspace = await findWorkspace(page, resolve(output, 'workspace'))
+  } else record('folder-reuse', workspace.workspaceId)
   assert.ok(workspace)
-  await page.getByRole('button', { name: `在 ${workspace.name} 新建任务`, exact: true }).click()
+  const newSessionButton = workspaceNewSessionButton(page, workspace)
+  await newSessionButton.click()
   const textarea = page.getByRole('textbox', { name: '任务说明' })
   await textarea.fill('desktop draft persistence')
   await page.reload()
@@ -89,13 +92,16 @@ try {
     const selection = await page.evaluate(() => JSON.parse(localStorage.getItem('singularity.app.view.v1')))
     const sessionId = selection.selectedSessionId
     const scope = { sessionId }
+    const runningTitle = `后台刷新验证 ${sessionId}`
+    await rpc('session.rename', { ...scope, name: runningTitle })
     await rpc('session.updateSettings', { ...scope, selector: modelSelector })
     writeFileSync(join(output, 'workspace/fixture.txt'), 'ELECTRON_PIPE_FIXTURE_20260925\n')
     await page.evaluate(() => { window.__frames = []; window.singularity.onFrame(frame => window.__frames.push(frame)) })
     const prompt = '这是桌面端端到端验证，仅在当前目录操作。先使用 bash 执行 sleep 20，然后读取 fixture.txt，把该文件内容原样写入 result.txt。最后用中文简短报告结果，并给出一个包含 ELECTRON_PIPE_OK 的代码块。请实际调用工具，不要只描述步骤。'
     await textarea.fill(prompt)
     await page.getByRole('button', { name: '发送消息', exact: true }).click()
-    await page.waitForFunction(() => window.__frames.some(frame => frame.type === 'turn_event' && frame.payload.method === 'tool/execution/start'), undefined, { timeout: 180_000 })
+    await page.waitForFunction(() => window.__frames.some(frame => frame.type === 'turn_event' && frame.payload.method === 'tool/execution/start'
+      && frame.payload.params.toolName === 'bash' && frame.payload.params.args.command.includes('sleep 20')), undefined, { timeout: 180_000 })
     record('real-model-tool-start', sessionId)
     const steerText = '补充引导：继续完成原任务，最终回复附上 STEER_INPUT_OK。'
     await textarea.fill(steerText)
@@ -105,13 +111,22 @@ try {
     record('steer-accepted', true)
     await page.screenshot({ path: join(output, 'streaming.png') })
     const beforeReload = await page.evaluate(() => window.__frames)
+    await newSessionButton.click()
+    await page.waitForFunction(sessionId => JSON.parse(localStorage.getItem('singularity.app.view.v1')).selectedSessionId !== sessionId, sessionId)
     await window.evaluate(window => window.close())
     await page.waitForTimeout(1500)
     assert.notEqual((await rpc('session.read', { ...scope, limit: 40, beforeTurn: null })).runtime.phase, 'idle')
     await window.evaluate(window => window.show())
     await page.reload()
-    await page.waitForSelector('.app-shell')
+    await page.waitForSelector('.session-row.is-selected')
     await page.evaluate(() => { window.__frames = []; window.singularity.onFrame(frame => window.__frames.push(frame)) })
+    assert.notEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('singularity.app.view.v1')).selectedSessionId), sessionId)
+    assert.equal((await rpc('app.bootstrap')).sessionPhases[sessionId], 'running')
+    const runningTask = page.locator('.session-main').filter({ hasText: runningTitle })
+    assert.equal(await runningTask.locator('.sr-only').innerText(), '正在运行')
+    record('background-running-after-reload', true)
+    await runningTask.click()
+    await page.getByRole('button', { name: '停止当前任务', exact: true }).waitFor()
 
     record('running-hide-and-reload', true)
     const deadline = Date.now() + 180_000

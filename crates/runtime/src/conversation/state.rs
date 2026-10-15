@@ -8,26 +8,34 @@ use tokio_util::sync::CancellationToken;
 use super::ConversationControlError;
 
 /// 停止接受窗口，承载取消令牌和接受标志。接受停止与冻结「是否接受过停止」在同一个
-/// 临界点完成；普通 turn 和独立压缩共用这套规则，冻结前接受的停止进入终态裁决，
+/// 临界点完成；压缩期间不接受停止，其他阶段冻结前接受的停止进入终态裁决，
 /// 冻结后一律报告操作已结束。
 pub(crate) struct CancelWindow {
     pub(crate) cancellation: CancellationToken,
-    accepting: Mutex<bool>,
+    state: Mutex<CancelState>,
+}
+
+struct CancelState {
+    accepting: bool,
+    compacting: bool,
 }
 
 impl CancelWindow {
     pub(super) fn new() -> Self {
         Self {
             cancellation: CancellationToken::new(),
-            accepting: Mutex::new(true),
+            state: Mutex::new(CancelState { accepting: true, compacting: false }),
         }
     }
 
     /// 接受一次停止。窗口冻结后返回 NotRunning，冻结前重复停止没有副作用。取消标记的写入
     /// 和 `accepting` 的读取在同一临界区完成，返回 Ok 的停止必然进入这次冻结的结果。
     pub(super) fn accept(&self) -> Result<(), ConversationControlError> {
-        let accepting = self.accepting.lock().expect("cancel window lock poisoned");
-        if !*accepting {
+        let state = self.state.lock().expect("cancel window lock poisoned");
+        if state.compacting {
+            return Err(ConversationControlError::Compacting);
+        }
+        if !state.accepting {
             return Err(ConversationControlError::NotRunning);
         }
         self.cancellation.cancel();
@@ -36,8 +44,8 @@ impl CancelWindow {
 
     /// 在提交终态之前冻结「是否接受过停止」，并返回这次操作的结果。
     pub(crate) fn freeze(&self) -> bool {
-        let mut accepting = self.accepting.lock().expect("cancel window lock poisoned");
-        *accepting = false;
+        let mut state = self.state.lock().expect("cancel window lock poisoned");
+        state.accepting = false;
         self.cancellation.is_cancelled()
     }
 }
@@ -60,6 +68,14 @@ impl TurnControls {
             questions: Arc::new(singularity_agent::agent::UserQuestions::default()),
             writer,
         }
+    }
+
+    pub(crate) fn set_compacting(&self, active: bool) {
+        self.window.state.lock().expect("cancel window lock poisoned").compacting = active;
+    }
+
+    pub(crate) fn is_compacting(&self) -> bool {
+        self.window.state.lock().expect("cancel window lock poisoned").compacting
     }
 
     pub(crate) fn cancellation(&self) -> &CancellationToken {
@@ -131,10 +147,7 @@ pub(super) enum TurnLifecycle {
     Idle,
     Reserved,
     Running(Arc<TurnControls>),
-    Compacting {
-        writer: SessionWriter,
-        window: Arc<CancelWindow>,
-    },
+    Compacting { writer: SessionWriter },
 }
 
 impl TurnLifecycle {
@@ -147,9 +160,9 @@ impl TurnLifecycle {
         match self {
             Self::Idle => SessionPhase::Idle,
             Self::Reserved => SessionPhase::Reserved,
+            Self::Running(controls) if controls.is_compacting() => SessionPhase::Compacting,
             Self::Running(controls) if controls.cancellation().is_cancelled() => SessionPhase::Stopping,
             Self::Running(_) => SessionPhase::Running,
-            Self::Compacting { window, .. } if window.cancellation.is_cancelled() => SessionPhase::Stopping,
             Self::Compacting { .. } => SessionPhase::Compacting,
         }
     }

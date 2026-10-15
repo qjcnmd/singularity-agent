@@ -54,6 +54,8 @@ impl Agent {
                 Err(error_result(
                     "tool execution failed: model output was truncated before the tool call completed",
                 ))
+            } else if !self.request_definitions().has_tool(&call.tool_name) {
+                Err(error_result(format!("tool execution failed: unknown tool: {}", call.tool_name)))
             } else {
                 self.registry.preflight(&call.tool_name, &call.arguments)
             };

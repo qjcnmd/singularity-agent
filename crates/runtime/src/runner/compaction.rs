@@ -1,13 +1,10 @@
 use super::*;
 
 impl TurnRunner {
-    /// 在 turn 之外压缩已有的 Thread，以独立的 compaction operation 落盘
-    /// （operation_started/operation_finished，不绑定 turn）。`window` 与普通 turn 共用同一个
-    /// 停止接受窗口，冻结前接受的停止进入终态裁决，但不改写真实的失败原因。
+    /// 独立压缩占用会话直到摘要、新定义和操作结果保存完毕，不接受用户停止。
     pub(crate) async fn compact_thread(
         self: &Arc<Self>,
         thread: &Thread,
-        window: &CancelWindow,
         writer: SessionWriter,
         sink: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<(), TurnRunError> {
@@ -16,10 +13,17 @@ impl TurnRunner {
         let start_writer = Arc::clone(&writer);
         let mut agent = tokio::task::spawn_blocking(move || {
             let provider = runner.resolve_provider(&start_thread)?;
-            let config = AgentConfig {
-                instruction_home: runner.instruction_home(),
-                initial_instructions: None,
+            let instruction_home = runner.instruction_home();
+            let initial_instructions = if lock_writer(&start_writer).latest_request_definitions().is_none() {
+                singularity_core::load_agent_instructions(
+                    std::path::Path::new(&start_thread.cwd),
+                    &instruction_home,
+                )
+                .map_err(TurnRunError::Preparation)?
+            } else {
+                None
             };
+            let config = AgentConfig { instruction_home, initial_instructions };
             let agent = Agent::new(
                 SteeringInbox::default_handle(),
                 provider,
@@ -27,6 +31,11 @@ impl TurnRunner {
                 Arc::clone(&start_writer),
                 Arc::clone(&runner.mcp),
             );
+            let agent = if runner.user_questions {
+                agent.with_user_questions(Arc::new(singularity_agent::agent::UserQuestions::default()))
+            } else {
+                agent
+            };
             lock_writer(&start_writer)
                 .append_record(LedgerRecord::OperationStarted { turn_id: None })
                 .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
@@ -49,15 +58,9 @@ impl TurnRunner {
             }),
             _ => {}
         };
-        let outcome = agent.compact_now(&mut on_event, &window.cancellation).await;
-        // 提交边界：先冻结「是否接受过停止」，再落盘终态。已经接受过停止的压缩和
-        // 普通 turn 一样收敛为 Interrupted；取消在 Agent 层已经归约成 Aborted
-        // （provider 的 Cancelled 类型到不了这里），其余失败一律 Failed。
-        let user_stopped = window.freeze();
+        let outcome = agent.compact_now(&mut on_event).await;
         let (terminal_status, error) = match outcome {
-            Ok(_) if user_stopped => (TurnStatus::Interrupted, None),
             Ok(_) => (TurnStatus::Completed, None),
-            Err(AgentError::Aborted) => (TurnStatus::Interrupted, None),
             Err(error) => {
                 let cause = classify_agent_error(&error);
                 let detail = TurnErrorDetail { cause, message: error.to_string() };
@@ -73,14 +76,17 @@ impl TurnRunner {
                 turn_id: None,
                 outcome: terminal_status,
                 error: error.clone(),
-                user_stopped,
+                user_stopped: false,
             },
         )
         .await
         .map_err(|storage| TurnRunError::Terminalization {
-            execution: error,
+            execution: error.clone(),
             storage: storage.to_string(),
         })?;
-        Ok(())
+        match error {
+            Some(error) => Err(TurnRunError::Execution(error)),
+            None => Ok(()),
+        }
     }
 }

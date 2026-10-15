@@ -2,7 +2,7 @@
 //!
 //! 当前版本（CURRENT_SESSION_VERSION）的 operation_finished 只持久化终态所需的
 //! 结果、错误与停止事实。请求用量由请求
-//! 观测记录提供；指令与工具定义按内容去重。
+//! 观测记录提供；指令与工具定义在首次请求和成功压缩时保存。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,13 +33,15 @@ pub enum SessionError {
 
 /// 会话操作的统一返回结果。
 pub type Result<T> = std::result::Result<T, SessionError>;
-/// 上下文压缩记录：包含摘要正文与保留历史的起点 entry_id。
+/// 摘要与压缩后使用的指令、工具一起提交；完整历史仍保留在日志中。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionEntry {
     pub summary: String,
     #[serde(rename = "firstKeptEntryId")]
     pub first_kept_entry_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definitions: Option<super::RequestDefinitions>,
 }
 /// 将模型用量结构体转换为协议通信 DTO。
 pub fn turn_usage_from_model_usage(usage: &ModelUsage) -> TurnModelUsage {

@@ -1,7 +1,7 @@
 import { join, resolve } from 'node:path'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { writeFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
-import { setupE2E, rpc, modelSelector } from './support.mjs'
+import { setupE2E, rpc, modelSelector, ensureWorkspace, workspaceNewSessionButton } from './support.mjs'
 
 // 统计条行为回归：按提供方实际用量决定缓存命中率是否可显示，
 // 运行和取消不把未上报的缓存明细伪装为零命中。
@@ -17,10 +17,8 @@ try {
 
   // 项目通过 RPC 准备；统计从新建任务、输入发送和流式响应的真实 UI 路径验证。
   const workspaceDir = resolve(join(output, 'workspace'))
-  mkdirSync(workspaceDir, { recursive: true })
-  const workspaceEntry = (await rpc(page, 'app.bootstrap')).workspaces.find(item => item.root.replaceAll('\\', '/').replace(/^\/\/\?\//, '').toLowerCase() === workspaceDir.replaceAll('\\', '/').toLowerCase())
-    ?? await rpc(page, 'workspace.add', { root: workspaceDir })
-  await page.getByRole('button', { name: `在 ${workspaceEntry.name} 新建任务`, exact: true }).click()
+  const workspaceEntry = await ensureWorkspace(page, workspaceDir)
+  await workspaceNewSessionButton(page, workspaceEntry).click()
   const textarea = page.getByRole('textbox', { name: '任务说明' })
   await textarea.waitFor({ timeout: 15_000 })
   const created = (await rpc(page, 'app.bootstrap')).sessionsByWorkspace[workspaceEntry.workspaceId][0]

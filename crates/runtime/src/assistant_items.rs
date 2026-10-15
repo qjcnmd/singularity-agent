@@ -140,7 +140,7 @@ impl AssistantItemEvents {
                 });
             }
             // runner 的执行循环先截获问题变化，到不了条目投影。
-            AgentEvent::PendingQuestionChanged => {}
+            AgentEvent::PendingQuestionChanged | AgentEvent::CompactionStateChanged { .. } => {}
         }
     }
 

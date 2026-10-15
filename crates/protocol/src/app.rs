@@ -222,7 +222,6 @@ pub struct DiscoveredModel {
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning_variants: Vec<ReasoningVariant>,
-    pub default_variant: Option<String>,
     pub requires_reasoning_content_for_tool_calls: Option<bool>,
 }
 
