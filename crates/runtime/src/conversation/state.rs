@@ -7,53 +7,16 @@ use tokio_util::sync::CancellationToken;
 
 use super::ConversationControlError;
 
-/// 停止接受窗口，承载取消令牌和接受标志。接受停止与冻结「是否接受过停止」在同一个
-/// 临界点完成；压缩期间不接受停止，其他阶段冻结前接受的停止进入终态裁决，
-/// 冻结后一律报告操作已结束。
-pub(crate) struct CancelWindow {
-    pub(crate) cancellation: CancellationToken,
-    state: Mutex<CancelState>,
-}
-
 struct CancelState {
     accepting: bool,
     compacting: bool,
 }
 
-impl CancelWindow {
-    pub(super) fn new() -> Self {
-        Self {
-            cancellation: CancellationToken::new(),
-            state: Mutex::new(CancelState { accepting: true, compacting: false }),
-        }
-    }
-
-    /// 接受一次停止。窗口冻结后返回 NotRunning，冻结前重复停止没有副作用。取消标记的写入
-    /// 和 `accepting` 的读取在同一临界区完成，返回 Ok 的停止必然进入这次冻结的结果。
-    pub(super) fn accept(&self) -> Result<(), ConversationControlError> {
-        let state = self.state.lock().expect("cancel window lock poisoned");
-        if state.compacting {
-            return Err(ConversationControlError::Compacting);
-        }
-        if !state.accepting {
-            return Err(ConversationControlError::NotRunning);
-        }
-        self.cancellation.cancel();
-        Ok(())
-    }
-
-    /// 在提交终态之前冻结「是否接受过停止」，并返回这次操作的结果。
-    pub(crate) fn freeze(&self) -> bool {
-        let mut state = self.state.lock().expect("cancel window lock poisoned");
-        state.accepting = false;
-        self.cancellation.is_cancelled()
-    }
-}
-
-/// 一个活动 turn 的控制集合；只有在设置变更时才会共享它的写者。
+/// 一轮执行的输入、问答和停止控制；接受停止与冻结结果共用同一把锁。
 pub(crate) struct TurnControls {
     pub(crate) turn_id: String,
-    window: CancelWindow,
+    cancellation: CancellationToken,
+    cancel_state: Mutex<CancelState>,
     pub(crate) inbox: SteeringInboxHandle,
     pub(crate) questions: Arc<singularity_agent::agent::UserQuestions>,
     writer: SessionWriter,
@@ -63,7 +26,8 @@ impl TurnControls {
     pub fn new(turn_id: impl Into<String>, inbox: SteeringInboxHandle, writer: SessionWriter) -> Self {
         Self {
             turn_id: turn_id.into(),
-            window: CancelWindow::new(),
+            cancellation: CancellationToken::new(),
+            cancel_state: Mutex::new(CancelState { accepting: true, compacting: false }),
             inbox,
             questions: Arc::new(singularity_agent::agent::UserQuestions::default()),
             writer,
@@ -71,15 +35,15 @@ impl TurnControls {
     }
 
     pub(crate) fn set_compacting(&self, active: bool) {
-        self.window.state.lock().expect("cancel window lock poisoned").compacting = active;
+        self.cancel_state.lock().expect("cancel window lock poisoned").compacting = active;
     }
 
     pub(crate) fn is_compacting(&self) -> bool {
-        self.window.state.lock().expect("cancel window lock poisoned").compacting
+        self.cancel_state.lock().expect("cancel window lock poisoned").compacting
     }
 
     pub(crate) fn cancellation(&self) -> &CancellationToken {
-        &self.window.cancellation
+        &self.cancellation
     }
 
     pub(crate) fn inbox_handle(&self) -> SteeringInboxHandle {
@@ -100,13 +64,25 @@ impl TurnControls {
     /// 接受一次停止：取消本轮并关闭注入窗口，两者在同一个受保护边界内完成。停止之后到达的
     /// steer 一律被拒绝，尚未消费的引导输入被清空。
     pub(super) fn accept_cancel(&self) -> Result<(), ConversationControlError> {
-        self.window.accept()?;
+        {
+            let state = self.cancel_state.lock().expect("cancel window lock poisoned");
+            if state.compacting {
+                return Err(ConversationControlError::Compacting);
+            }
+            if !state.accepting {
+                return Err(ConversationControlError::NotRunning);
+            }
+            self.cancellation.cancel();
+        }
         self.lock_inbox().cancel();
         Ok(())
     }
 
+    /// 提交终态前关闭停止入口；已接受的停止必然计入本轮结果。
     pub(crate) fn finish_cancel(&self) -> bool {
-        self.window.freeze()
+        let mut state = self.cancel_state.lock().expect("cancel window lock poisoned");
+        state.accepting = false;
+        self.cancellation.is_cancelled()
     }
 
     /// 执行结束后关闭注入窗口，后续操作由会话的空闲状态处理。

@@ -10,10 +10,10 @@ const PROJECT_INSTRUCTIONS_MAX_FILE_BYTES: usize = 32 * 1024;
 const PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES: usize = 64 * 1024;
 const PROJECT_INSTRUCTIONS_SEPARATOR: &str = "\n\n";
 
-/// 当前 workspace 加载到的项目指令：正文以及它有没有被截断。
+/// 加载到的指令正文及截断状态；单文件读取和多文件合并共用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectInstructions {
-    /// 按 workspace root 到 cwd 的顺序合并后的正文，发给模型的就是这一份。
+    /// 已按字节预算截断的有效 UTF-8 正文。
     content: String,
     /// 是否因为单文件超限或合并预算用尽，导致正文被截断。
     truncated: bool,
@@ -72,13 +72,13 @@ fn load_instruction_directories(
             truncated = true;
         }
         // 空文件既不占用预算，也不算截断。
-        if instruction_file.text.trim().is_empty() {
+        if instruction_file.content.trim().is_empty() {
             continue;
         }
         let source_text = format!(
             "# Instructions from {}\n\n{}",
             directory.join(PROJECT_INSTRUCTIONS_FILE_NAME).display(),
-            instruction_file.text
+            instruction_file.content
         );
         let remaining = PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES - content.len();
         let separator_len = if content.is_empty() {
@@ -107,13 +107,6 @@ fn load_instruction_directories(
     }
 }
 
-struct ProjectInstructionFile {
-    /// 进入模型视图的文件文本（已按单文件预算截断为有效 UTF-8 前缀）。
-    text: String,
-    /// 这个文件是否因为超过单文件预算而被截断。
-    truncated: bool,
-}
-
 /// 返回 workspace root 到 cwd 之间需要检查指令的目录，两端都包含。
 fn instruction_directories(workspace_root: &Path, cwd: &Path) -> Vec<PathBuf> {
     // workspace root 是 cwd 的祖先，strip_prefix 一定成功。
@@ -130,7 +123,7 @@ fn instruction_directories(workspace_root: &Path, cwd: &Path) -> Vec<PathBuf> {
 fn read_project_instruction_file(
     directory: &Path,
     relative_path: &Path,
-) -> Result<Option<ProjectInstructionFile>, String> {
+) -> Result<Option<ProjectInstructions>, String> {
     let path = directory.join(PROJECT_INSTRUCTIONS_FILE_NAME);
     let mut bytes = Vec::new();
     match std::fs::File::open(&path)
@@ -155,5 +148,5 @@ fn read_project_instruction_file(
             return Err(format!("project_instruction_invalid_utf8:{}", relative_path.display()));
         }
     };
-    Ok(Some(ProjectInstructionFile { text: text.to_string(), truncated }))
+    Ok(Some(ProjectInstructions { content: text.to_string(), truncated }))
 }

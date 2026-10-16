@@ -22,7 +22,7 @@ mod request;
 
 use std::sync::Arc;
 
-use singularity_model::{ModelConfigurationSnapshot, ModelUsage, OpenAiProvider, ProviderError};
+use singularity_model::{ModelUsage, OpenAiProvider, ProviderError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -97,8 +97,6 @@ pub struct Agent {
     /// 会话固定的请求前缀；只在首次加载和压缩成功后更换。
     definitions: Option<crate::session::RequestDefinitions>,
     provider: OpenAiProvider,
-    /// 从本轮 Provider 冻结的容量配置，供整个执行过程使用。
-    model: ModelConfigurationSnapshot,
     config: AgentConfig,
     /// 借用会话持有的 steer 输入箱，只存在于内存。
     inbox: SteeringInboxHandle,
@@ -117,7 +115,6 @@ impl Agent {
         session: SessionWriter,
         mcp: Arc<singularity_mcp::McpManager>,
     ) -> Self {
-        let model = provider.model_configuration();
         let definitions = lock_writer(&session)
             .latest_request_definitions()
             .map(|(_, definitions)| definitions.clone());
@@ -129,7 +126,6 @@ impl Agent {
             mcp,
             definitions,
             provider,
-            model,
             config,
             inbox,
             usage_correction: 0,
@@ -302,9 +298,9 @@ impl Agent {
         .expect("message writer completes while the runtime is running")?)
     }
 
-    /// 本轮从 Provider 冻结的上下文容量。
+    /// 本轮 Provider 持有的上下文容量。
     pub fn context_window(&self) -> u64 {
-        self.model.context_window()
+        self.provider.model_configuration().context_window()
     }
 
     /// 实测请求用量，包含被拒绝的摘要与失败的尝试。

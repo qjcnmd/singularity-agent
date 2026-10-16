@@ -153,14 +153,15 @@ impl Agent {
         let definitions = self.request_definitions();
         let tools = definitions.model_tools();
         let messages = self.model_messages().await?;
+        let model = self.provider.model_configuration();
         let request = ModelTurnRequest {
             messages,
             tools,
             model_preferences: ModelPreferences {
                 max_output_tokens: output_budget_tokens(
-                    &self.model,
+                    &model,
                     self.request_tokens(definitions.estimated_tokens()),
-                    self.model.max_output_tokens,
+                    model.max_output_tokens,
                 ),
             },
         };

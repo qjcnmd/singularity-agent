@@ -245,7 +245,7 @@ impl TurnRunner {
         Ok(Agent::new(inbox, provider, config, writer, Arc::clone(&self.mcp)))
     }
 
-    /// 模型容量由 Agent 从 Provider 冻结；解析失败发生在 operation 开始之前。
+    /// Provider 持有本轮冻结的模型容量；解析失败发生在 operation 开始之前。
     fn resolve_provider(&self, thread: &Thread) -> Result<OpenAiProvider, TurnRunError> {
         let snapshot = self.models.snapshot();
         OpenAiProvider::from_snapshot(&snapshot, thread.model.as_deref())

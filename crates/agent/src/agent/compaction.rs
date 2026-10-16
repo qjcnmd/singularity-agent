@@ -19,7 +19,7 @@ impl Agent {
             return Err(AgentError::Aborted);
         }
         if self.context_pressure_tokens()
-            >= (self.model.context_window() as f64 * AUTO_COMPACTION_TRIGGER_RATIO).floor() as u64
+            >= (self.context_window() as f64 * AUTO_COMPACTION_TRIGGER_RATIO).floor() as u64
         {
             self.compact_now(on_event).await?;
         }
@@ -40,7 +40,7 @@ impl Agent {
         self.ensure_definitions(on_event, &cancellation).await?;
         let definitions = self.request_definitions().clone();
         let session = std::sync::Arc::clone(&self.session);
-        let model = self.model.clone();
+        let model = self.provider.model_configuration();
         let summary = tokio::task::spawn_blocking(move || {
             let prefix = {
                 let writer = lock_writer(&session);
