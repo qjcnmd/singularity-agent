@@ -1,6 +1,6 @@
 # 安装与配置指南
 
-Singularity 是面向 Windows 平台的本地 Coding Agent，集成 Electron 桌面工作台与高性能 Rust 后端。安装包自带完整运行时，开箱即用。
+Singularity 是面向 Windows 的本地 Coding Agent，由 Electron 桌面工作台和 Rust 后端组成。安装包自带完整运行时。
 
 ---
 

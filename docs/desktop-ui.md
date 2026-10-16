@@ -16,7 +16,7 @@ flowchart TD
 
 ## 1. 项目与会话导航（左侧栏）
 
-侧边栏按**项目（Workspace）**进行物理归组，任务按最近更新时间降序排列。
+侧边栏按**项目（Workspace）**分组，任务按最近更新时间降序排列。
 
 ```mermaid
 flowchart TD

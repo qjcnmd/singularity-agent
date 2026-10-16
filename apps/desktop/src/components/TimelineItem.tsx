@@ -19,7 +19,7 @@ interface Props {
   sessionId?: string
 }
 
-// 性能优化：历史项复用稳定引用跳过重绘，流式更新时仅重新渲染当前活动项。
+// 历史项复用稳定引用跳过重绘；流式更新只重新渲染当前活动项。
 export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Props) {
   const hiddenLines = item.kind === 'user' ? Math.max(0, timelineBody(item).trimEnd().split('\n').length - previewLineCount) : 0
   const canCollapse = hiddenLines > 0

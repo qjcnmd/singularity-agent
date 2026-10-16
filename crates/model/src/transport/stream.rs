@@ -68,13 +68,13 @@ impl SseFrameDecoder {
 /// 协议特定 SSE 解码器接口（由 Chat / Responses 协议模块实现）。
 pub(crate) trait SseStreamDecoder: Sized {
     type Terminal;
-    /// 构造协议格式错误的方法
+    /// 构造协议格式错误
     fn frame_malformed() -> fn(&'static str) -> ProviderError;
 
-    /// 派发处理单个完整的 SSE 数据帧
+    /// 处理一个完整的 SSE 数据帧
     fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError>;
 
-    /// 消费解码器并物化最终响应结果
+    /// 消费解码器，物化终结响应
     fn materialize_terminal(self) -> Result<Self::Terminal, ProviderError>;
 
     /// 当前协议响应是否已达终态
