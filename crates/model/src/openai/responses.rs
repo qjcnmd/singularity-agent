@@ -37,9 +37,7 @@ pub(crate) fn openai_responses_stream_request_payload(
     if let Some(instructions) = instructions {
         payload["instructions"] = json!(instructions);
     }
-    if let Some(max_output_tokens) = request.model_preferences.max_output_tokens {
-        payload["max_output_tokens"] = json!(max_output_tokens);
-    }
+    payload["max_output_tokens"] = json!(request.model_preferences.max_output_tokens);
     if !request.tools.is_empty() {
         payload["tools"] = json!(
             request

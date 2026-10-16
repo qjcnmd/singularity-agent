@@ -35,9 +35,7 @@ pub(crate) fn openai_chat_stream_request_payload(
     });
     let reasoning = super::reasoning_wire_decision(selection);
     // 输出上限用哪个字段名由模型配置决定，本层不猜；Responses 协议用 `max_output_tokens`。
-    if let Some(max_output_tokens) = request.model_preferences.max_output_tokens {
-        payload[selection.chat_output_tokens_field] = json!(max_output_tokens);
-    }
+    payload[selection.chat_output_tokens_field] = json!(request.model_preferences.max_output_tokens);
     if let Some(enabled) = reasoning.enabled {
         apply_thinking_wire(&mut payload, enabled, selection.thinking_wire_format);
         if enabled && let Some(wire_effort) = reasoning.effort {

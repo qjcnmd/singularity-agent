@@ -69,11 +69,7 @@ impl PreparedCompaction {
             messages,
             tools: definitions.model_tools(),
             model_preferences: ModelPreferences {
-                max_output_tokens: Some(output_budget_tokens(
-                    model,
-                    input_tokens,
-                    DEFAULT_SUMMARY_MAX_TOKENS,
-                )),
+                max_output_tokens: output_budget_tokens(model, input_tokens, DEFAULT_SUMMARY_MAX_TOKENS),
             },
         };
         Ok(Self {

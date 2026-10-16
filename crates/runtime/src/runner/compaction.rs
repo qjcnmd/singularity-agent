@@ -12,25 +12,11 @@ impl TurnRunner {
         let start_thread = thread.clone();
         let start_writer = Arc::clone(&writer);
         let mut agent = tokio::task::spawn_blocking(move || {
-            let provider = runner.resolve_provider(&start_thread)?;
-            let instruction_home = runner.instruction_home();
-            let initial_instructions = if lock_writer(&start_writer).latest_request_definitions().is_none() {
-                singularity_core::load_agent_instructions(
-                    std::path::Path::new(&start_thread.cwd),
-                    &instruction_home,
-                )
-                .map_err(TurnRunError::Preparation)?
-            } else {
-                None
-            };
-            let config = AgentConfig { instruction_home, initial_instructions };
-            let agent = Agent::new(
+            let agent = runner.prepare_agent(
+                &start_thread,
                 SteeringInbox::default_handle(),
-                provider,
-                config,
                 Arc::clone(&start_writer),
-                Arc::clone(&runner.mcp),
-            );
+            )?;
             let agent = if runner.user_questions {
                 agent.with_user_questions(Arc::new(singularity_agent::agent::UserQuestions::default()))
             } else {

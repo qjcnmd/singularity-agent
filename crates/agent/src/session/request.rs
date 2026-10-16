@@ -51,7 +51,7 @@ impl RequestDefinitions {
             messages: self.public_messages(),
             tools: self.public_tools(),
             model_preferences: RequestPreferences {
-                max_output_tokens: model_preferences.max_output_tokens,
+                max_output_tokens: Some(model_preferences.max_output_tokens),
             },
         })
     }
@@ -149,7 +149,7 @@ impl RequestContext {
         Self {
             definitions,
             model_preferences: SavedPreferences {
-                max_output_tokens: preferences.max_output_tokens,
+                max_output_tokens: Some(preferences.max_output_tokens),
             },
         }
     }
@@ -182,8 +182,7 @@ impl SessionData {
     }
 
     /// 读取已保存定义的公开快照；调用方可让同页请求共用它。
-    pub fn request_definitions(&self, definitions_id: &str) -> ModelRequestDefinitions {
-        // 定义先于引用写入；追加失败后写者不再接受后续记录。
+    pub fn request_definitions(&self, definitions_id: &str) -> super::Result<ModelRequestDefinitions> {
         let definitions = self
             .entries
             .iter()
@@ -199,10 +198,14 @@ impl SessionData {
                 }
                 _ => None,
             })
-            .expect("request references an earlier definition record");
-        ModelRequestDefinitions {
+            .ok_or_else(|| {
+                super::SessionError::InvalidSession(format!(
+                    "request refers to missing definitions record {definitions_id}"
+                ))
+            })?;
+        Ok(ModelRequestDefinitions {
             messages: definitions.public_messages(),
             tools: definitions.public_tools(),
-        }
+        })
     }
 }

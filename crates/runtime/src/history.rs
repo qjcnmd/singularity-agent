@@ -5,7 +5,9 @@
 
 use singularity_agent::{
     message::{AgentMessage, ContentBlock, ItemScope},
-    session::{InterruptedAssistantItem, LedgerRecord, SessionData, SessionEntry, SessionMetadata},
+    session::{
+        InterruptedAssistantItem, LedgerRecord, SessionData, SessionEntry, SessionError, SessionMetadata,
+    },
 };
 use singularity_protocol::{
     HistoryItem, ModelRequestDefinitions, SessionModelUsage, ThreadSummary, ThreadTurn, TurnStatus,
@@ -33,7 +35,7 @@ impl IndexedTurn {
         &self,
         session: &SessionData,
         definitions: &mut std::collections::BTreeMap<String, ModelRequestDefinitions>,
-    ) -> ThreadTurn {
+    ) -> Result<ThreadTurn, SessionError> {
         let mut items = Vec::new();
         let mut started_at = None;
         let mut finished_at = None;
@@ -60,7 +62,14 @@ impl IndexedTurn {
                         ..
                     } => {
                         // 每个工具结果引用此前已落盘的调用；按调用位置取得展示身份。
-                        let item_id = tool_items[tool_call_id].clone();
+                        let item_id = tool_items
+                            .get(tool_call_id)
+                            .ok_or_else(|| {
+                                SessionError::InvalidSession(format!(
+                                    "tool result {id} refers to missing tool call {tool_call_id}"
+                                ))
+                            })?
+                            .clone();
                         items.push(HistoryItem::ToolResult {
                             id: item_id,
                             output: message.content_text(),
@@ -97,9 +106,11 @@ impl IndexedTurn {
                 } => {
                     let observation = observation.clone();
                     if let Some(context) = context {
-                        definitions
-                            .entry(context.definitions.clone())
-                            .or_insert_with(|| session.request_definitions(&context.definitions));
+                        if let std::collections::btree_map::Entry::Vacant(definition) =
+                            definitions.entry(context.definitions.clone())
+                        {
+                            definition.insert(session.request_definitions(&context.definitions)?);
+                        }
                         request_positions.insert(observation.request_id.clone(), items.len());
                         items.push(HistoryItem::Request {
                             started_at: Some(timestamp.clone()),
@@ -108,7 +119,12 @@ impl IndexedTurn {
                         });
                     } else {
                         // 每次请求只有一个终态观测；开始时刻和请求详情保留在原条目。
-                        let position = request_positions[&observation.request_id];
+                        let position = *request_positions.get(&observation.request_id).ok_or_else(|| {
+                            SessionError::InvalidSession(format!(
+                                "request {} has no start record in this turn",
+                                observation.request_id
+                            ))
+                        })?;
                         let HistoryItem::Request { observation: previous, .. } = &mut items[position] else {
                             unreachable!()
                         };
@@ -149,14 +165,14 @@ impl IndexedTurn {
                 SessionEntry::Record { .. } => {}
             }
         }
-        ThreadTurn {
+        Ok(ThreadTurn {
             started_at,
             finished_at,
             turn_id: self.turn_id.clone(),
             status: self.status,
             error: self.error.clone(),
             items,
-        }
+        })
     }
 }
 
@@ -255,7 +271,7 @@ fn default_title(content: &[ContentBlock]) -> Option<String> {
 /// 与 turn 级 usage 的差异在范围和字段，不是两套重试口径：turn 的 RequestAccounting 只累计
 /// 本轮请求（含本轮的重试）并带总数和思考 token，本视图跨轮次累计输入、输出和耗时。TTFT
 /// 只计实测样本；消费只计上报了 usage 的请求，缺消费记录的请求不影响缓存完整性。
-fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
+fn session_usage(entries: &[SessionEntry]) -> Result<SessionModelUsage, SessionError> {
     let mut usage = SessionModelUsage {
         cache_usage_complete: true,
         ..SessionModelUsage::default()
@@ -278,7 +294,12 @@ fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
         usage.input_tokens += observation.input_tokens.unwrap_or(0);
         usage.cached_input_tokens += observation.cached_input_tokens.unwrap_or(0);
         usage.output_tokens += observation.output_tokens.unwrap_or(0);
-        usage.total_tokens += observation.total_tokens.expect("reported usage has a total");
+        usage.total_tokens += observation.total_tokens.ok_or_else(|| {
+            SessionError::InvalidSession(format!(
+                "request {} reports token usage without a total",
+                observation.request_id
+            ))
+        })?;
         usage.cache_usage_complete &= observation.cached_input_tokens.is_some();
         if let (Some(ms), Some(tokens)) = (observation.decode_ms, observation.output_tokens)
             && ms > 0
@@ -289,11 +310,14 @@ fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
         usage.generation_ms += observation.duration_ms;
         usage.usage_present = true;
     }
-    usage
+    Ok(usage)
 }
 
 /// 从回合索引与元数据/消息条目派生只读目录摘要。
-pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> ThreadSummary {
+pub(crate) fn summarize_thread(
+    session: &SessionData,
+    turns: &[IndexedTurn],
+) -> Result<ThreadSummary, SessionError> {
     let mut title = None;
     let mut turn_count = 0usize;
     let mut status = None;
@@ -331,7 +355,7 @@ pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> 
         .last()
         .map(|entry| entry.timestamp().to_owned())
         .unwrap_or_else(|| created_at.clone());
-    ThreadSummary {
+    Ok(ThreadSummary {
         thread_id: session.session_id().to_string(),
         cwd: session.cwd_string(),
         created_at,
@@ -340,6 +364,6 @@ pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> 
         status,
         manually_stopped,
         turn_count,
-        usage: session_usage(session.entries()),
-    }
+        usage: session_usage(session.entries())?,
+    })
 }

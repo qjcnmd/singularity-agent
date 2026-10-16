@@ -253,6 +253,11 @@ impl SessionManager {
 }
 
 impl SessionData {
+    /// 会话日志路径，供读取错误定位文件。
+    pub fn path(&self) -> &Path {
+        &self.file
+    }
+
     /// 会话头部声明的稳定身份，即会话 id。
     pub fn session_id(&self) -> &str {
         &self.session_id

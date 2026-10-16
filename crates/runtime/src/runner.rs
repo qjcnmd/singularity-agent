@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use singularity_agent::agent::ControlRequest;
-use singularity_agent::agent::SteeringInbox;
 use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, AgentTerminalReason};
+use singularity_agent::agent::{SteeringInbox, SteeringInboxHandle};
 use singularity_agent::session::{
     LedgerRecord, SessionManager, SessionWriter, append_record_async, lock_writer,
     turn_usage_from_model_usage,
@@ -211,19 +211,9 @@ impl TurnRunner {
         // 会话写者由 Conversation 在 turn 开始前打开；本函数只做剩下的 fail-fast 准备
         // （provider/config/项目指令），就绪之后才写 operation 状态。
         let writer = controls.writer();
-        let provider = self.resolve_provider(thread)?;
-        let instruction_home = self.instruction_home();
-        let initial_instructions = if lock_writer(&writer).latest_request_definitions().is_none() {
-            singularity_core::load_agent_instructions(std::path::Path::new(&thread.cwd), &instruction_home)
-                .map_err(TurnRunError::Preparation)?
-        } else {
-            None
-        };
-        let config = AgentConfig { instruction_home, initial_instructions };
+        let agent = self.prepare_agent(thread, controls.inbox_handle(), Arc::clone(&writer))?;
         // OperationStarted 记录 turn 身份。输入消息由 Agent 单独落盘；
         // 这些追加不是一个原子事务。
-        let agent =
-            Agent::new(controls.inbox_handle(), provider, config, writer.clone(), Arc::clone(&self.mcp));
         let agent = if self.user_questions {
             agent.with_user_questions(Arc::clone(&controls.questions))
         } else {
@@ -234,6 +224,25 @@ impl TurnRunner {
             .append_record(LedgerRecord::OperationStarted { turn_id: Some(controls.turn_id.clone()) })
             .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
         Ok((agent, committed.timestamp))
+    }
+
+    /// 普通执行与独立压缩共用准备步骤；已有固定定义时沿用保存的指令。
+    fn prepare_agent(
+        &self,
+        thread: &Thread,
+        inbox: SteeringInboxHandle,
+        writer: SessionWriter,
+    ) -> Result<Agent, TurnRunError> {
+        let provider = self.resolve_provider(thread)?;
+        let instruction_home = self.instruction_home();
+        let initial_instructions = if lock_writer(&writer).latest_request_definitions().is_none() {
+            singularity_core::load_agent_instructions(std::path::Path::new(&thread.cwd), &instruction_home)
+                .map_err(TurnRunError::Preparation)?
+        } else {
+            None
+        };
+        let config = AgentConfig { instruction_home, initial_instructions };
+        Ok(Agent::new(inbox, provider, config, writer, Arc::clone(&self.mcp)))
     }
 
     /// 模型容量由 Agent 从 Provider 冻结；解析失败发生在 operation 开始之前。

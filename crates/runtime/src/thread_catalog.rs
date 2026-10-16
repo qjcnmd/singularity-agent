@@ -107,7 +107,11 @@ impl ThreadCatalog {
                 continue;
             };
             match open_thread_read_only(&self.sessions_dir, thread_id) {
-                Ok(session) => threads.push(thread_facts(&session).0),
+                Ok(session) => {
+                    let (summary, _) =
+                        thread_facts(&session).map_err(|error| self.session_error(thread_id, error))?;
+                    threads.push(summary);
+                }
                 // 目录项还在但文件已经不在：这是确认过的移除，不是读失败。
                 Err(CatalogError::NotFound(_)) => {}
                 Err(error) => return Err(error),
@@ -165,7 +169,8 @@ impl ThreadCatalog {
     /// 读取不可变历史快照；活动回合可持有它作为历史与增量事件的共同边界。
     pub fn read_snapshot(&self, thread_id: &str) -> Result<Arc<ThreadSnapshot>, CatalogError> {
         let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
-        let (summary, turns) = thread_facts(&session);
+        let (summary, turns) =
+            thread_facts(&session).map_err(|error| self.session_error(thread_id, error))?;
         Ok(Arc::new(ThreadSnapshot { summary, session, turns }))
     }
 
@@ -230,9 +235,9 @@ fn open_thread_read_only(sessions_dir: &Path, thread_id: &str) -> Result<Session
 }
 
 /// 一次遍历同时得到摘要和分页共用的回合事实：轮数、终态和手动停止只有索引这一个来源。
-fn thread_facts(session: &SessionData) -> (ThreadSummary, Vec<IndexedTurn>) {
+fn thread_facts(session: &SessionData) -> Result<(ThreadSummary, Vec<IndexedTurn>), SessionError> {
     let turns = index_turn_history(session.entries());
-    (summarize_thread(session, &turns), turns)
+    Ok((summarize_thread(session, &turns)?, turns))
 }
 
 /// Thread 定位与持久化过程中的错误。
@@ -293,7 +298,8 @@ impl ThreadSnapshot {
         let turns = self.turns[start..end]
             .iter()
             .map(|turn| turn.project(&self.session, &mut request_definitions))
-            .collect();
+            .collect::<Result<_, _>>()
+            .map_err(|error| CatalogError::session(&self.summary.thread_id, self.session.path(), error))?;
         Ok(ThreadReadPage {
             summary: self.summary.clone(),
             turns,
