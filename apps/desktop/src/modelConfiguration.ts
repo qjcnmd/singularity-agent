@@ -2,18 +2,24 @@ import type { DiscoveredModel, ModelConfigurationInput, ReasoningVariant } from 
 import { modelConfigurationFields } from './protocol.generated'
 import { reasoningGrades } from './modelChoices'
 
-/** 空输入为 null，非法输入为 undefined；保存要求两项容量均为有效数值。 */
-export function parseCapacity(value: string): number | null | undefined {
-  if (!value.trim()) return null
+/** 空输入和非法输入都没有可保存的容量；表单保留原始文字用于编辑。 */
+export function parseCapacity(value: string): number | null {
   const match = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(value.trim())
-  if (!match) return undefined
+  if (!match) return null
   const parsed = Number(match[1]) * (match[2]?.toLowerCase() === 'm' ? 1_000_000 : match[2] ? 1_000 : 1)
-  return isValidCapacity(parsed) ? parsed : undefined
+  return isValidCapacity(parsed) ? parsed : null
 }
 
 /** 配置容量的数值域；未填写的表单由调用方单独处理。 */
-export function isValidCapacity(value: number): boolean {
+function isValidCapacity(value: number): boolean {
   return Number.isSafeInteger(value) && value > 0 && value <= 0xffffffff
+}
+
+/** 单模型编辑与批量保存共用容量规则；错误由表单补充模型名称。 */
+export function capacityConfigurationError(context: number | null, output: number | null): string | null {
+  if (context === null || output === null || !isValidCapacity(context) || !isValidCapacity(output)) return '上下文窗口和最大输出 Token 应为正整数，可使用 K / M。'
+  if (output >= context) return '最大输出 Token 必须小于上下文窗口。'
+  return null
 }
 
 export function formatCapacityInput(value: number | null): string {

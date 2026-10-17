@@ -30,6 +30,10 @@ pub fn wire_word<T: Serialize>(value: T) -> String {
 pub struct TurnErrorDetail {
     pub cause: TurnFailureCause,
     pub message: String,
+    /// 已展示这次失败的条目；回合结束时只关联它，不再重复显示原因。
+    #[serde(rename = "itemId", default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub item_id: Option<String>,
 }
 
 impl std::fmt::Display for TurnErrorDetail {
@@ -169,6 +173,13 @@ pub enum TurnEvent {
         thread_id: String,
         /// 独立压缩不属于回合；普通执行使用实际回合身份。
         turn_id: Option<String>,
+    },
+    /// 同一次压缩从开始到结束共用条目身份；手动和自动使用同一事件。
+    #[serde(rename = "compaction/updated")]
+    CompactionUpdated {
+        thread_id: String,
+        turn_id: Option<String>,
+        content: crate::HistoryItem,
     },
     #[serde(rename = "turn/completed")]
     TurnCompleted { turn: Turn, finished_at: String },

@@ -192,7 +192,10 @@ impl McpManager {
                 }
             }
         };
-        let tools = connection.tools().await;
+        let tools = connection.tools().await.map(|mut tools| {
+            tools.sort_by(|a, b| a.name.cmp(&b.name));
+            tools
+        });
         state.connection = Some(Arc::clone(&connection));
         state.catalog = tools.clone();
         tools.map(|tools| (connection, tools))
@@ -227,11 +230,10 @@ impl McpManager {
         let mut result = McpDiscovery::default();
         for (id, found) in discovered {
             match found {
-                Ok((connection, mut tools)) => {
+                Ok((connection, tools)) => {
                     if let Some(instructions) = connection.instructions() {
                         result.instructions.push(format!("MCP server {id}:\n{instructions}"));
                     }
-                    tools.sort_by(|a, b| a.name.cmp(&b.name));
                     for tool in tools {
                         result.tools.push(McpTool {
                             name: client::tool_alias(&id, &tool.name),
@@ -298,7 +300,6 @@ impl McpManager {
                         description: tool.description.as_deref().unwrap_or_default().into(),
                     })
                     .collect();
-                inspection.tools.sort_by(|a, b| a.name.cmp(&b.name));
             }
             (Ok(_), None) => {}
         }

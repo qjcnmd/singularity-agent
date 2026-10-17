@@ -191,7 +191,7 @@ impl Agent {
             Err(AgentError::Provider(error)) if error.is_context_overflow() => error,
             result => return result,
         };
-        if !self.compact_now(on_event).await? {
+        if !self.compact_now(on_event).await.into_result()? {
             return Err(AgentError::Provider(overflow));
         }
         if cancellation.is_cancelled() {

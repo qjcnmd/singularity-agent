@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { DiscoveredModel, ModelConfigurationField, ProviderConfigurationInput } from '../protocol'
-import { automaticFieldsFor, blankModel, formatCapacityInput, mergeDiscoveredModel, parseCapacity, reasoningConfigurationError, reasoningOptionsFor } from '../modelConfiguration'
+import { automaticFieldsFor, blankModel, capacityConfigurationError, formatCapacityInput, mergeDiscoveredModel, parseCapacity, reasoningConfigurationError, reasoningOptionsFor } from '../modelConfiguration'
 import { Dialog } from './Dialog'
 import { ReasoningOptions } from './ReasoningOptions'
 
@@ -14,8 +14,8 @@ function toDraft({ maxContextTokens, maxOutputTokens, ...model }: ModelInput): M
 function fillDraft(draft: ModelDraft, discovered: DiscoveredModel): ModelDraft {
   const model = {
     ...draft,
-    maxContextTokens: parseCapacity(draft.contextText) ?? null,
-    maxOutputTokens: parseCapacity(draft.outputText) ?? null,
+    maxContextTokens: parseCapacity(draft.contextText),
+    maxOutputTokens: parseCapacity(draft.outputText),
   }
   const merged = mergeDiscoveredModel(model, discovered, draft.apiProtocol ?? 'chat')
   const resolved = toDraft(merged)
@@ -109,8 +109,8 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
   const validateAndCommit = (): string | null => {
     const context = parseCapacity(draft.contextText)
     const output = parseCapacity(draft.outputText)
-    if (context == null || output == null) return '上下文窗口和最大输出 Token 应为正整数，可使用 K / M。'
-    if (output >= context) return '最大输出 Token 必须小于上下文窗口。'
+    const capacityError = capacityConfigurationError(context, output)
+    if (capacityError !== null) return capacityError
     const reasoningError = reasoningConfigurationError(variants, draft.apiProtocol ?? 'chat')
     if (reasoningError !== null) return reasoningError
     // 文本容量只在此解析一次；列表此后保存数值，展示使用紧凑 token 格式。

@@ -2,7 +2,7 @@ import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import { formatTokenCount } from '../copy'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import type { DiscoveredModel, ProviderConfigurationInput, RedactedProvider } from '../protocol'
-import { applyProtocol, blankModel, isValidCapacity, mergeDiscoveredModels, reasoningConfigurationError } from '../modelConfiguration'
+import { applyProtocol, blankModel, capacityConfigurationError, mergeDiscoveredModels, reasoningConfigurationError } from '../modelConfiguration'
 import { ModelEditor } from './ModelEditor'
 import { Dialog } from './Dialog'
 import { ProtocolPicker } from './ProtocolPicker'
@@ -113,9 +113,9 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
         setFailure(`第 ${index + 1} 行模型 ID 为空、重复或包含无效字符。`)
         return
       }
-      // 检查上下文容量和最大输出 Token 是否为合法正整数
-      if (model.maxContextTokens === null || model.maxOutputTokens === null || !isValidCapacity(model.maxContextTokens) || !isValidCapacity(model.maxOutputTokens)) {
-        setFailure(`请编辑第 ${index + 1} 行模型，补齐有效的上下文窗口和最大输出 Token。`)
+      const capacityError = capacityConfigurationError(model.maxContextTokens, model.maxOutputTokens)
+      if (capacityError !== null) {
+        setFailure(`模型 ${id}：${capacityError}`)
         return
       }
       const reasoningError = reasoningConfigurationError(model.reasoningVariants, protocol)

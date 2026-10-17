@@ -7,12 +7,9 @@ export const actionOrigin = {
   directoryPicker: 'directory:picker',
 }
 
-const inlineActionPrefixes = [actionOrigin.control('', ''), actionOrigin.inline('', '')]
-  .map(key => key.slice(0, key.indexOf(':') + 1))
-
 /** 这些动作在对应控件显示错误；目录选择器的错误仍显示在工作台。 */
 export function hasInlineActionError(origin: string): boolean {
-  return inlineActionPrefixes.some(prefix => origin.startsWith(prefix))
+  return origin.startsWith('control:') || origin.startsWith('inline:')
 }
 
 /** 待处理动作键：方法名与来源。查询方按同一规则在已订阅的 pendingActions

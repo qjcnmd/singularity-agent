@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn turn_terminal(
-    result: Result<singularity_runtime::TurnOutcome, ConversationError>,
+    result: Result<singularity_runtime::TurnOutcome, singularity_runtime::TurnRunError>,
 ) -> SessionTerminalSnapshot {
     match result {
         Ok(outcome) => SessionTerminalSnapshot {
@@ -9,13 +9,13 @@ pub(super) fn turn_terminal(
             status: outcome.turn_status,
             manually_stopped: outcome.manually_stopped,
             // 已保存的失败由会话历史展示，运行状态只补充未保存的原因。
-            message: None,
+            error: None,
         },
         Err(error) => SessionTerminalSnapshot {
             source: SessionTerminalSource::Turn,
             status: TurnStatus::Failed,
             manually_stopped: false,
-            message: Some(error.to_string()),
+            error: Some(error.detail()),
         },
     }
 }

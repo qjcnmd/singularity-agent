@@ -15,7 +15,7 @@ impl Conversation {
     ) -> Result<TurnOutcome, ConversationError> {
         let (result, _guard) = self.reserve_start(input)?.execute(sink).await;
         match result {
-            OperationResult::Turn(result) => result,
+            OperationResult::Turn(result) => result.map_err(Into::into),
             OperationResult::Compaction(_) => unreachable!("reserved a turn"),
         }
     }

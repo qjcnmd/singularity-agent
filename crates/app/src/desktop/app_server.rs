@@ -14,7 +14,6 @@ use self::errors::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use singularity_core::now_iso;
 use singularity_model::{ModelConfigManager, ModelConfigUpdate};
 use singularity_protocol::{
     AppBootstrap, ProviderConfigurationInput, RpcError, RpcErrorCode, SessionReadResult,
@@ -301,7 +300,7 @@ impl AppServer {
                         source: SessionTerminalSource::Compaction,
                         status: TurnStatus::Failed,
                         manually_stopped: false,
-                        message: Some(error.to_string()),
+                        error: Some(error.detail()),
                     }),
                 },
             };

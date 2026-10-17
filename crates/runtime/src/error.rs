@@ -1,27 +1,11 @@
 //! Turn 的失败分类与运行错误。
 //!
-//! cause 和它在 wire 上的取值由 protocol 定义，runtime 直接复用。本模块把 model 的具体
-//! 失败类型归入对应的 provider cause；message 保留真实原因文本，认证材料不进错误文本。
+//! 执行失败的分类由 AgentError 统一提供。本模块表示准备与存储故障，
+//! 并把尚未保存的失败原因交给宿主显示。
 
-use singularity_model::ModelErrorKind;
 use singularity_protocol::TurnErrorDetail;
 pub use singularity_protocol::TurnFailureCause;
 use thiserror::Error;
-
-pub(crate) fn provider_turn_cause(kind: ModelErrorKind) -> TurnFailureCause {
-    use ModelErrorKind::*;
-    match kind {
-        RateLimited => TurnFailureCause::ProviderRateLimited,
-        NetworkError => TurnFailureCause::ProviderNetwork,
-        Timeout => TurnFailureCause::ProviderTimeout,
-        AuthError => TurnFailureCause::ProviderAuth,
-        InvalidRequest | JsonSchemaViolation | ContentFilter => TurnFailureCause::ProviderValidation,
-        ProviderOverloaded => TurnFailureCause::ProviderOverloaded,
-        Cancelled => TurnFailureCause::ProviderCancelled,
-        ContextLengthExceeded => TurnFailureCause::ProviderContextOverflow,
-        UnknownProviderError => TurnFailureCause::ProviderUnknown,
-    }
-}
 
 /// 执行器未提交可信终态时的错误。普通 Agent 错误随 TurnOutcome 返回，
 /// 准备、执行期致命故障和终态落盘失败在本枚举中分别表达。
@@ -38,6 +22,24 @@ pub enum TurnRunError {
         execution: Option<TurnErrorDetail>,
         storage: String,
     },
+}
+
+impl TurnRunError {
+    /// 尚未保存的失败供工作台直接显示，已有条目身份随错误保留。
+    pub fn detail(&self) -> TurnErrorDetail {
+        let (cause, item_id) = match self {
+            Self::Preparation(_) => (TurnFailureCause::Internal, None),
+            Self::Execution(detail) => (detail.cause, detail.item_id.clone()),
+            Self::Terminalization { execution, .. } => {
+                (TurnFailureCause::Store, execution.as_ref().and_then(|error| error.item_id.clone()))
+            }
+        };
+        TurnErrorDetail {
+            cause,
+            message: self.to_string(),
+            item_id,
+        }
+    }
 }
 
 fn terminalization_message(execution: Option<&TurnErrorDetail>, storage: &str) -> String {

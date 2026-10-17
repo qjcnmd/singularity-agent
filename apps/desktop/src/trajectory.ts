@@ -1,4 +1,5 @@
 import { compactionTitle } from './copy'
+import { hasErrorItem } from './execution'
 import type { ExecutionTurn, FactStatus, SessionView } from './execution'
 import type { ModelRequestSnapshot, RequestObservation, TurnErrorDetail } from './protocol'
 
@@ -78,7 +79,7 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
       }
       entries.push({ ...item, status: fact.status, startedAt: fact.startedAt })
     }
-    if (turn.error) entries.push({ ...entry(`turn-error:${turn.id ?? 'leading'}`, 'event', '运行错误', turn.error.message),
+    if (turn.error && !hasErrorItem(turn, turn.error)) entries.push({ ...entry(`turn-error:${turn.id ?? 'leading'}`, 'event', '运行错误', turn.error.message),
       status: 'error', error: turn.error })
     const projected = { id: turn.id ?? (standalone ? 'compaction' : 'leading'), title, entries }
     projections.set(turn, { previous, next: previousPrompt, turn: projected })

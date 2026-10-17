@@ -39,7 +39,7 @@ impl IndexedTurn {
         let mut items = Vec::new();
         let mut started_at = None;
         let mut finished_at = None;
-        let mut compacted = false;
+        let mut compaction_position: Option<usize> = None;
         let mut request_positions = std::collections::HashMap::new();
         let mut tool_items = std::collections::HashMap::new();
         for entry in &session.entries()[self.entries.clone()] {
@@ -81,11 +81,15 @@ impl IndexedTurn {
                     }
                 },
                 SessionEntry::Compaction { compaction, id, .. } => {
-                    compacted = true;
-                    items.push(HistoryItem::Compaction {
-                        id: id.clone(),
+                    let item = HistoryItem::Compaction {
+                        id: compaction_position.map_or_else(|| id.clone(), |at| items[at].id().to_string()),
                         summary: compaction.summary.clone(),
-                    })
+                    };
+                    if let Some(at) = compaction_position {
+                        items[at] = item;
+                    } else {
+                        items.push(item);
+                    }
                 }
                 SessionEntry::Metadata { metadata, id, .. } => match metadata {
                     // thread 名称不作为公开历史条目。
@@ -138,19 +142,36 @@ impl IndexedTurn {
                     items.extend(interrupted.iter().cloned().map(InterruptedAssistantItem::into_public_item));
                 }
                 SessionEntry::Record {
+                    id,
                     record: LedgerRecord::OperationStarted { turn_id: None },
                     ..
-                } => compacted = false,
+                } => {
+                    compaction_position = Some(items.len());
+                    // 没有结束记录的压缩在重启后显示为中断；活动操作使用实时事件。
+                    items.push(HistoryItem::CompactionResult {
+                        id: id.clone(),
+                        status: TurnStatus::Interrupted,
+                        message: None,
+                    });
+                }
                 SessionEntry::Record {
                     id,
                     record: LedgerRecord::OperationFinished { turn_id: None, outcome, error, .. },
                     ..
-                } if !compacted || *outcome != TurnStatus::Completed => {
-                    items.push(HistoryItem::CompactionResult {
-                        id: id.clone(),
+                } => {
+                    let position = compaction_position.take().ok_or_else(|| {
+                        SessionError::InvalidSession(format!("compaction result {id} has no start record"))
+                    })?;
+                    if *outcome == TurnStatus::Completed
+                        && matches!(items[position], HistoryItem::Compaction { .. })
+                    {
+                        continue;
+                    }
+                    items[position] = HistoryItem::CompactionResult {
+                        id: items[position].id().to_string(),
                         status: *outcome,
                         message: error.as_ref().map(|error| error.message.clone()),
-                    });
+                    };
                 }
                 SessionEntry::Record {
                     timestamp,

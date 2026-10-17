@@ -131,7 +131,7 @@ pub enum HistoryItem {
         id: String,
         summary: String,
     },
-    /// 独立压缩的失败、中断或无需压缩结果；成功摘要使用 Compaction 条目。
+    /// 压缩的开始、失败、中断或无需压缩结果；成功摘要使用 Compaction 条目。
     CompactionResult {
         id: String,
         status: TurnStatus,

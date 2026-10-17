@@ -116,6 +116,7 @@ node apps/desktop/e2e/smoke.mjs
 ### 专项测试脚本
 
 - **生命周期与重启恢复**：`node apps/desktop/e2e/lifecycle.mjs`（验证退出时取消任务，以及重启后的历史状态）
+- **压缩执行与恢复**：`node apps/desktop/e2e/compaction.mjs`（验证手动与自动的成功、失败、无内容结果、继续执行、重复操作与刷新恢复；临时提供方使用已有真实端点和凭据，检查后移除）
 - **统计与用量指标**：`node apps/desktop/e2e/stats-bar.mjs`（验证 Token 用量、输出速度、首 Token 延迟与缓存命中率）
 - **多模态图片管线**：`node apps/desktop/e2e/images.mjs`（验证图片粘贴、拖拽、缩略图预览与模型识图）
 
@@ -123,6 +124,7 @@ node apps/desktop/e2e/smoke.mjs
 | --- | --- |
 | `smoke.mjs`、`images.mjs` | 设置 `$env:SINGULARITY_E2E_MODEL = '1'` 后才调用模型；省略时只检查本地交互 |
 | `lifecycle.mjs`、`stats-bar.mjs` | 始终调用真实模型，不受 `SINGULARITY_E2E_MODEL` 控制 |
+| `compaction.mjs` | 始终调用真实模型；失败场景由同一真实提供方拒绝不存在的模型，测试结束移除临时配置 |
 
 测试从 `SINGULARITY_HOME` 读取配置和密钥。模型选择由 `SINGULARITY_E2E_SELECTOR` 指定，省略时固定使用 `bai/deepseek-v4.1-flash`；不会读取配置中的 `default_model` 来替换该选择。
 

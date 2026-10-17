@@ -178,11 +178,16 @@ impl SessionManager {
     /// 追加一条 operation ledger 记录。记录本身就是持久事实，服务查看与统计，
     /// 不进入模型上下文。
     pub fn append_record(&mut self, record: LedgerRecord) -> Result<CommittedEntry> {
-        self.append_entry(SessionEntry::Record {
-            id: super::new_entry_id(),
-            timestamp: now_iso(),
-            record,
-        })
+        self.append_record_with_id(super::new_entry_id(), record)
+    }
+
+    /// 压缩在写入之前分配身份，保存失败时的实时反馈也使用该身份。
+    pub(crate) fn append_record_with_id(
+        &mut self,
+        id: String,
+        record: LedgerRecord,
+    ) -> Result<CommittedEntry> {
+        self.append_entry(SessionEntry::Record { id, timestamp: now_iso(), record })
     }
 
     /// 保存一次 provider 观测；开始记录写成功后就返回可公开的请求头。

@@ -165,20 +165,25 @@ impl RequestContext {
     }
 }
 
+// 首次请求和压缩都能保存定义；恢复执行与历史查看共用这份读取规则。
+fn entry_request_definitions(entry: &SessionEntry) -> Option<(&str, &RequestDefinitions)> {
+    match entry {
+        SessionEntry::Record {
+            id,
+            record: LedgerRecord::RequestDefinitions { definitions },
+            ..
+        } => Some((id.as_str(), definitions)),
+        SessionEntry::Compaction { id, compaction, .. } => {
+            compaction.definitions.as_ref().map(|definitions| (id.as_str(), definitions))
+        }
+        _ => None,
+    }
+}
+
 impl SessionData {
     /// 会话固定的指令与工具，跨回合和重启复用；首次请求之前为空，成功压缩后更新。
     pub fn latest_request_definitions(&self) -> Option<(&str, &RequestDefinitions)> {
-        self.entries.iter().rev().find_map(|entry| match entry {
-            SessionEntry::Record {
-                id,
-                record: LedgerRecord::RequestDefinitions { definitions },
-                ..
-            } => Some((id.as_str(), definitions)),
-            SessionEntry::Compaction { id, compaction, .. } => {
-                compaction.definitions.as_ref().map(|definitions| (id.as_str(), definitions))
-            }
-            _ => None,
-        })
+        self.entries.iter().rev().find_map(entry_request_definitions)
     }
 
     /// 读取已保存定义的公开快照；调用方可让同页请求共用它。
@@ -187,17 +192,9 @@ impl SessionData {
             .entries
             .iter()
             .rev()
-            .find_map(|entry| match entry {
-                SessionEntry::Record {
-                    id,
-                    record: LedgerRecord::RequestDefinitions { definitions },
-                    ..
-                } if id == definitions_id => Some(definitions),
-                SessionEntry::Compaction { id, compaction, .. } if id == definitions_id => {
-                    compaction.definitions.as_ref()
-                }
-                _ => None,
-            })
+            .filter_map(entry_request_definitions)
+            .find(|(id, _)| *id == definitions_id)
+            .map(|(_, definitions)| definitions)
             .ok_or_else(|| {
                 super::SessionError::InvalidSession(format!(
                     "request refers to missing definitions record {definitions_id}"

@@ -42,8 +42,6 @@ impl AgentDiagnostic {
 /// 落盘的 toolResult 按完成顺序追加，模型上下文则按调用顺序投影。
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    /// 压缩及提交新定义期间，宿主关闭停止入口；结束后恢复普通任务控制。
-    CompactionStateChanged { active: bool },
     /// 模型正文的流式增量；message_id 指向它所属的 assistant 消息。
     MessageUpdate { message_id: String, delta: String },
     /// 当前 assistant 消息里对外公开的思考文本的流式增量。
@@ -56,8 +54,8 @@ pub enum AgentEvent {
         items: Vec<singularity_protocol::HistoryItem>,
         failed: bool,
     },
-    /// 摘要已经保存；实时界面与历史读取使用同一条目身份和正文。
-    CompactionFinished { item: singularity_protocol::HistoryItem },
+    /// 压缩开始、完成或失败；运行态与历史读取使用同一条目身份和结果。
+    CompactionUpdated { item: singularity_protocol::HistoryItem },
     /// 工具开始执行。
     ToolExecutionStarted {
         item_id: String,

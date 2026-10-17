@@ -8,15 +8,15 @@ use singularity_protocol::{HistoryItem, ItemRef, TurnEvent};
 
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 
-/// 一次 Agent 调用期间还没结束的条目。
-pub(crate) struct AssistantItemEvents {
+/// 普通回合与独立压缩共用的事件转换；只有消息和工具要求回合身份。
+pub(crate) struct AgentEventProjector {
     thread_id: String,
-    turn_id: String,
+    turn_id: Option<String>,
     open_assistant_items: std::collections::BTreeSet<String>,
 }
 
-impl AssistantItemEvents {
-    pub(crate) fn new(thread_id: String, turn_id: String) -> Self {
+impl AgentEventProjector {
+    pub(crate) fn new(thread_id: String, turn_id: Option<String>) -> Self {
         Self {
             thread_id,
             turn_id,
@@ -31,7 +31,7 @@ impl AssistantItemEvents {
                     self.start_assistant_item(singularity_agent::session::text_item_id(&message_id, 0));
                 sink(TurnEvent::AssistantDelta {
                     thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
+                    turn_id: self.message_turn_id(),
                     item,
                     delta,
                 });
@@ -41,7 +41,7 @@ impl AssistantItemEvents {
                     self.start_assistant_item(singularity_agent::session::thinking_item_id(&message_id, 0));
                 sink(TurnEvent::AssistantThinkingDelta {
                     thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
+                    turn_id: self.message_turn_id(),
                     item,
                     delta,
                 });
@@ -54,7 +54,7 @@ impl AssistantItemEvents {
                     if self.open_assistant_items.remove(&item_id) {
                         sink(TurnEvent::ItemDiscarded {
                             thread_id: self.thread_id.clone(),
-                            turn_id: self.turn_id.clone(),
+                            turn_id: self.message_turn_id(),
                             item: ItemRef { item_id },
                         });
                     }
@@ -77,7 +77,7 @@ impl AssistantItemEvents {
             AgentEvent::ToolExecutionStarted { item_id, tool_name, arguments } => {
                 sink(TurnEvent::ToolExecutionStart {
                     thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
+                    turn_id: self.message_turn_id(),
                     item: ItemRef { item_id },
                     tool_name,
                     args: arguments,
@@ -87,7 +87,7 @@ impl AssistantItemEvents {
             AgentEvent::ToolExecutionUpdate { item_id, partial_result } => {
                 sink(TurnEvent::ToolExecutionUpdate {
                     thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
+                    turn_id: self.message_turn_id(),
                     item: ItemRef { item_id },
                     partial_result,
                 });
@@ -95,7 +95,7 @@ impl AssistantItemEvents {
             AgentEvent::ToolExecutionEnded { item_id, execution } => {
                 sink(TurnEvent::ToolExecutionEnd {
                     thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
+                    turn_id: self.message_turn_id(),
                     item: ItemRef { item_id },
                     output: execution.content,
                     images: execution.images.into_iter().map(|image| image.attachment).collect(),
@@ -107,7 +107,7 @@ impl AssistantItemEvents {
             AgentEvent::Diagnostic(AgentDiagnostic { severity, code, message }) => {
                 sink(TurnEvent::Diagnostic {
                     thread_id: self.thread_id.clone(),
-                    turn_id: Some(self.turn_id.clone()),
+                    turn_id: self.turn_id.clone(),
                     severity,
                     code,
                     message,
@@ -117,21 +117,20 @@ impl AssistantItemEvents {
                 sink(TurnEvent::ProviderAttempt {
                     observation,
                     thread_id: self.thread_id.clone(),
-                    turn_id: Some(self.turn_id.clone()),
+                    turn_id: self.turn_id.clone(),
                 });
             }
-            AgentEvent::CompactionFinished { item } => {
-                sink(TurnEvent::ItemCompleted {
+            AgentEvent::CompactionUpdated { item } => {
+                sink(TurnEvent::CompactionUpdated {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
-                    item: ItemRef { item_id: item.id().to_string() },
-                    content: Some(item),
+                    content: item,
                 });
             }
             AgentEvent::UserMessage { entry_id, text, images } => {
                 sink(TurnEvent::UserMessage {
                     thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
+                    turn_id: self.message_turn_id(),
                     item: ItemRef {
                         item_id: singularity_agent::session::text_item_id(&entry_id, 0),
                     },
@@ -140,8 +139,12 @@ impl AssistantItemEvents {
                 });
             }
             // runner 的执行循环先截获问题变化，到不了条目投影。
-            AgentEvent::PendingQuestionChanged | AgentEvent::CompactionStateChanged { .. } => {}
+            AgentEvent::PendingQuestionChanged => {}
         }
+    }
+
+    fn message_turn_id(&self) -> String {
+        self.turn_id.clone().expect("messages and tools belong to a conversation turn")
     }
 
     fn start_assistant_item(&mut self, item_id: String) -> ItemRef {
@@ -163,7 +166,7 @@ impl AssistantItemEvents {
         sink(if failed {
             TurnEvent::ItemFailed {
                 thread_id: self.thread_id.clone(),
-                turn_id: self.turn_id.clone(),
+                turn_id: self.message_turn_id(),
                 item,
                 content,
                 error: SAFE_ASSISTANT_ITEM_FAILURE.to_string(),
@@ -171,7 +174,7 @@ impl AssistantItemEvents {
         } else {
             TurnEvent::ItemCompleted {
                 thread_id: self.thread_id.clone(),
-                turn_id: self.turn_id.clone(),
+                turn_id: self.message_turn_id(),
                 item,
                 content,
             }

@@ -26,6 +26,7 @@ use singularity_model::{ModelUsage, OpenAiProvider, ProviderError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+pub use self::compaction::CompactionOutcome;
 pub use self::inbox::{ControlRequest, SteeringInbox, SteeringInboxHandle, UserInput};
 pub use self::questions::UserQuestions;
 pub use crate::events::{AgentDiagnostic, AgentEvent};
@@ -66,6 +67,53 @@ pub enum AgentError {
     /// 文件指令读取失败。首轮加载与压缩后刷新共用这一个来源。
     #[error("file instructions unavailable: {0}")]
     Instructions(String),
+    /// 压缩已发布自己的失败条目；外层只决定是否继续任务。
+    #[error("{source}")]
+    Compaction {
+        item_id: String,
+        source: Box<AgentError>,
+    },
+}
+
+impl AgentError {
+    /// 普通执行与压缩共用失败分类；存储故障不能再追加可信终态。
+    pub fn cause(&self) -> singularity_protocol::TurnFailureCause {
+        use singularity_model::ModelErrorKind;
+        use singularity_protocol::TurnFailureCause as Cause;
+        match self {
+            Self::Provider(error) => match error.kind {
+                ModelErrorKind::RateLimited => Cause::ProviderRateLimited,
+                ModelErrorKind::NetworkError => Cause::ProviderNetwork,
+                ModelErrorKind::Timeout => Cause::ProviderTimeout,
+                ModelErrorKind::AuthError => Cause::ProviderAuth,
+                ModelErrorKind::InvalidRequest
+                | ModelErrorKind::JsonSchemaViolation
+                | ModelErrorKind::ContentFilter => Cause::ProviderValidation,
+                ModelErrorKind::ProviderOverloaded => Cause::ProviderOverloaded,
+                ModelErrorKind::Cancelled => Cause::ProviderCancelled,
+                ModelErrorKind::ContextLengthExceeded => Cause::ProviderContextOverflow,
+                ModelErrorKind::UnknownProviderError => Cause::ProviderUnknown,
+            },
+            Self::Session(_) | Self::FailureRecording { .. } => Cause::Store,
+            Self::Instructions(_) => Cause::ProjectInstructions,
+            Self::Aborted | Self::InvalidSummary(_) => Cause::Internal,
+            Self::Compaction { source, .. } => source.cause(),
+        }
+    }
+
+    /// 保存和发布同一份失败原因；关联条目让回合与压缩不会重复报错。
+    pub fn detail(&self) -> singularity_protocol::TurnErrorDetail {
+        let item_id = match self {
+            Self::Compaction { item_id, .. } => Some(item_id.clone()),
+            Self::FailureRecording { execution, .. } => execution.detail().item_id,
+            _ => None,
+        };
+        singularity_protocol::TurnErrorDetail {
+            cause: self.cause(),
+            message: self.to_string(),
+            item_id,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;

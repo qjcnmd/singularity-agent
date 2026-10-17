@@ -21,6 +21,11 @@ export interface SessionView {
   runtime: SessionRuntime
   facts: ExecutionFacts
 }
+
+/** 回合错误关联到一个已有失败条目时，显示端只展示该条目的原因。 */
+export function hasErrorItem(turn: ExecutionTurn, error: TurnErrorDetail | null | undefined): boolean {
+  return error?.itemId !== undefined && turn.items.some(item => item.id === error.itemId && item.status === 'error')
+}
 const base = (id: string, status: FactStatus = 'stable'): FactBase => ({ id, status, startedAt: null })
 const lastRequest = (turn: ExecutionTurn) => turn.items.findLast(item => item.kind === 'request')?.id
 
@@ -93,8 +98,8 @@ function historyItemToExecution(item: HistoryItem, previous: ExecutionItem | und
     case 'tool_call': return toolCallItem(item.id, item.name, item.args)
     case 'tool_result': return toolResultItem(item, previous)
     case 'compaction': return { ...base(item.id), kind: 'compaction', text: item.summary }
-    case 'compaction_result': return { ...base(item.id, item.status === 'failed' ? 'error' : item.status === 'interrupted' ? 'cancelled' : 'stable'),
-      kind: 'compaction_result', text: item.message ?? (item.status === 'completed' ? compactionText.unchanged : item.status === 'interrupted' ? compactionText.stopped : compactionText.failed) }
+    case 'compaction_result': return { ...base(item.id, item.status === 'running' ? 'running' : item.status === 'failed' ? 'error' : item.status === 'interrupted' ? 'cancelled' : 'stable'),
+      kind: 'compaction_result', text: item.message ?? (item.status === 'running' ? compactionText.running : item.status === 'completed' ? compactionText.unchanged : item.status === 'interrupted' ? compactionText.unfinished : compactionText.failed) }
     case 'settings': return { ...base(item.id), kind: 'settings', provider: item.provider, model: item.model, reasoning: item.reasoning }
   }
 }
@@ -136,21 +141,20 @@ function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
   })
 }
 
-/** 被杀死进程持久化的 request start 不能证明当前仍存活。 */
-function settleRequests(turn: ExecutionTurn, runtime: SessionRuntime, active = false): ExecutionTurn {
+/** 历史里未结束的请求和压缩不能证明仍在运行；活动状态只来自当前执行。 */
+function settlePendingItems(turn: ExecutionTurn, runtime: SessionRuntime, active = false): ExecutionTurn {
   let changed = false
   const items = turn.items.map(item => {
-    if (item.kind !== 'request' || item.observation.status !== 'started') return item
-    const compaction = runtime.activeCompaction
-    const belongsToTurn = turn.id === runtime.activeTurn?.turnId
-    const belongsToCompaction = item.observation.purpose === 'compaction'
-      && compaction !== null && ((active && turn.id === null) || (item.startedAt !== null
-        && Date.parse(item.startedAt) >= Date.parse(compaction.startedAt)))
-    const live = runtime.phase !== 'idle' && (belongsToTurn || belongsToCompaction)
+    const unfinishedRequest = item.kind === 'request' && item.observation.status === 'started'
+    const unfinishedCompaction = item.kind === 'compaction_result' && item.status === 'running'
+    if (!unfinishedRequest && !unfinishedCompaction) return item
+    const live = active && runtime.phase !== 'idle'
     const status: FactStatus = live ? 'running' : 'cancelled'
     if (item.status === status) return item
     changed = true
-    return { ...item, status }
+    return item.kind === 'compaction_result' && !live
+      ? { ...item, status, text: compactionText.unfinished }
+      : { ...item, status }
   })
   return settleAssistantItems(changed ? { ...turn, items } : turn)
 }
@@ -174,7 +178,7 @@ export function readExecution(source: SessionReadResult, previous: SessionView |
 
 export function updateExecutionRuntime(session: SessionView, runtime: SessionRuntime): SessionView {
   if (session.runtime.phase === runtime.phase && session.runtime.activeTurn?.turnId === runtime.activeTurn?.turnId
-    && session.runtime.activeCompaction?.startedAt === runtime.activeCompaction?.startedAt && session.runtime.terminal === runtime.terminal) {
+    && session.runtime.terminal === runtime.terminal) {
     return { ...session, runtime }
   }
   return { ...session, runtime, facts: settleFacts(session.facts, runtime) }
@@ -182,18 +186,18 @@ export function updateExecutionRuntime(session: SessionView, runtime: SessionRun
 
 function settleFacts(facts: ExecutionFacts, runtime: SessionRuntime): ExecutionFacts {
   return {
-    history: facts.history.map(turn => settleRequests(turn, runtime)),
+    history: facts.history.map(turn => settlePendingItems(turn, runtime)),
     active: facts.active.map(turn => {
       if (turn.status !== null) return turn
       if (runtime.phase === 'idle' && runtime.terminal?.source === 'turn' && turn.id === facts.active.at(-1)?.id) return finishTurn(turn, runtime.terminal.status)
-      return settleRequests(turn, runtime, true)
+      return settlePendingItems(turn, runtime, true)
     }),
   }
 }
 
 /** 更早的 page 只转换一次并前插；已加载 turns 保持其身份。 */
 export function prependExecutionHistory(session: SessionView, page: ThreadReadPage): SessionView {
-  const turns = pageTurns(page).map(turn => settleRequests(turn, session.runtime))
+  const turns = pageTurns(page).map(turn => settlePendingItems(turn, session.runtime))
   return { ...session, nextCursor: page.nextCursor, facts: { ...session.facts,
     history: [...turns, ...session.facts.history] } }
 }
@@ -218,6 +222,11 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
     case 'provider/attempt': {
       const observation = event.params.observation
       turn = upsert(turn, requestItem(observation, turn.items.find(item => item.id === observation.requestId), null))
+      break
+    }
+    case 'compaction/updated': {
+      const item = event.params.content
+      turn = upsert(turn, historyItemToExecution(item, undefined, undefined))
       break
     }
     case 'item/agentMessage/delta':

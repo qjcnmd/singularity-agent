@@ -8,7 +8,7 @@ mod conversation;
 mod error;
 mod runner;
 
-mod assistant_items;
+mod event_projection;
 mod history;
 mod thread_catalog;
 

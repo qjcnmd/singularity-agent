@@ -31,7 +31,6 @@ export const compactionText = {
   running: '正在压缩上下文…',
   completed: '上下文已压缩',
   failed: '上下文压缩失败',
-  stopped: '已停止压缩',
   unfinished: '压缩未完成',
   unchanged: '没有可压缩的内容',
 } as const

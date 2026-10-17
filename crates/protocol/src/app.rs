@@ -73,13 +73,6 @@ pub struct ActiveTurnRuntimeSnapshot {
     pub turn_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct ActiveCompactionSnapshot {
-    pub started_at: String,
-}
-
 /// 产生了终态反馈的操作：普通回合，或一次独立的压缩。界面按来源决定反馈放在哪里。
 /// 回合终态描述任务本身，压缩终态只描述那次压缩，不改变任务状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -99,11 +92,11 @@ pub struct SessionTerminalSnapshot {
     /// 该回合的中断来自已接受的用户停止，与持久化摘要使用同一事实。
     pub manually_stopped: bool,
     /// 未保存到会话历史的失败原因；已保存的结果通过历史与执行事件展示。
-    pub message: Option<String>,
+    pub error: Option<crate::TurnErrorDetail>,
 }
 
-/// 普通 `session_changed` / `session_settled` 使用的精简运行态载荷：带着活动 turn/compaction 的
-/// 身份、终态和冻结窗口，但不携带活动事件；完整事件只在 `session.read` 的恢复快照里传输。
+/// `session_changed` / `session_settled` 携带活动回合、终态与冻结窗口；
+/// 压缩条目来自共同执行事件，完整活动事件在 `session.read` 的恢复快照里传输。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -114,7 +107,6 @@ pub struct SessionRuntime {
     pub model_context_window: Option<u64>,
     pub pending_question: Option<crate::PendingQuestion>,
     pub active_turn: Option<ActiveTurnRuntimeSnapshot>,
-    pub active_compaction: Option<ActiveCompactionSnapshot>,
     pub terminal: Option<SessionTerminalSnapshot>,
 }
 

@@ -61,8 +61,8 @@ enum ReservedOperation {
 
 /// 操作结果保留来源；宿主据此展示回合或独立压缩的结果。
 pub enum OperationResult {
-    Turn(Result<TurnOutcome, ConversationError>),
-    Compaction(Result<(), ConversationError>),
+    Turn(Result<TurnOutcome, TurnRunError>),
+    Compaction(Result<singularity_agent::agent::CompactionOutcome, TurnRunError>),
 }
 
 impl OperationReservation {
@@ -81,16 +81,11 @@ impl OperationReservation {
     ) -> (OperationResult, OperationGuard) {
         let Self { guard, operation } = self;
         let result = match operation {
-            ReservedOperation::Turn(input) => OperationResult::Turn(
-                guard.conversation.run_single_turn(input, sink).await.map_err(Into::into),
-            ),
+            ReservedOperation::Turn(input) => {
+                OperationResult::Turn(guard.conversation.run_single_turn(input, sink).await)
+            }
             ReservedOperation::Compaction { thread, writer } => OperationResult::Compaction(
-                guard
-                    .conversation
-                    .runner
-                    .compact_thread(&thread, writer, sink)
-                    .await
-                    .map_err(ConversationError::Turn),
+                guard.conversation.runner.compact_thread(&thread, writer, sink).await,
             ),
         };
         (result, guard)

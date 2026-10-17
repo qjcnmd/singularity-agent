@@ -88,7 +88,7 @@ pub enum LedgerRecord {
     },
     /// 回合或压缩操作开始记录。
     OperationStarted {
-        /// 回合 ID；独立压缩无回合 ID。
+        /// 回合 ID；压缩自己的开始记录不绑定回合，自动压缩位于当前回合的记录范围内。
         #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },

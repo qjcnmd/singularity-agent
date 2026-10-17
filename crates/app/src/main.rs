@@ -58,8 +58,8 @@ fn run(cli: Arguments) -> Result<(), String> {
         }
     };
     if !cli.json {
+        let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
         let setup = session_options::prepare_desktop(&home)?;
-        let runtime = Arc::clone(&setup.runtime);
         return runtime.block_on(desktop::run(setup));
     }
     if let Err(error) = singularity_runtime::ensure_bash_available() {
@@ -67,12 +67,16 @@ fn run(cli: Arguments) -> Result<(), String> {
     }
     // clap 的 requires 约束保证带 --json 时一定带着目标。
     let goal = cli.goal.expect("--json requires a goal");
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => return preparation_failure(error.to_string()),
+    };
     let setup = match session_options::prepare(&home, cli.model.as_deref()) {
         Ok(setup) => setup,
         Err(error) => return preparation_failure(error),
     };
     let renderer = JsonlRenderer::stdout(Some(setup.conversation.thread().thread_id));
-    setup.runtime.block_on(async {
+    runtime.block_on(async {
         let result = execute_headless(&setup.conversation, &goal, renderer).await;
         setup.mcp.shutdown().await;
         result

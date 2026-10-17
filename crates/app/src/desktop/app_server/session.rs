@@ -5,8 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use singularity_protocol::{
-    ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, SessionRuntime, SessionTerminalSnapshot, TurnEvent,
-    TurnEventEnvelope,
+    ActiveTurnRuntimeSnapshot, SessionRuntime, SessionTerminalSnapshot, TurnEvent, TurnEventEnvelope,
 };
 use singularity_runtime::{Conversation, ThreadSnapshot};
 
@@ -21,7 +20,6 @@ pub(super) struct SlotState {
     session_revision: u64,
     active_turn: Option<ActiveTurnRuntimeSnapshot>,
     events: Vec<TurnEventEnvelope>,
-    active_compaction: Option<ActiveCompactionSnapshot>,
     terminal: Option<SessionTerminalSnapshot>,
 }
 
@@ -35,7 +33,6 @@ impl ConversationSlot {
                 session_revision: 0,
                 active_turn: None,
                 events: Vec::new(),
-                active_compaction: None,
                 terminal: None,
             }),
         }
@@ -69,7 +66,6 @@ impl ConversationSlot {
             model_context_window: conversation.model_context_window,
             pending_question: conversation.pending_question,
             active_turn: state.active_turn.clone(),
-            active_compaction: state.active_compaction.clone(),
             terminal: state.terminal.clone(),
         }
     }
@@ -92,12 +88,6 @@ impl SlotState {
     pub(super) fn begin_turn(&mut self, history: Arc<ThreadSnapshot>) {
         self.history = Some(history);
         self.terminal = None;
-    }
-
-    /// 开始一次独立压缩：和回合一样冻结 history，另外留下一个活动压缩标记。
-    pub(super) fn begin_compaction(&mut self, history: Arc<ThreadSnapshot>, started_at: String) {
-        self.begin_turn(history);
-        self.active_compaction = Some(ActiveCompactionSnapshot { started_at });
     }
 
     /// 折叠一条回合事件：推进会话 revision，维护活动回合，并把已完成的内容替换进去。
@@ -140,7 +130,6 @@ impl SlotState {
     /// 结算：保存本次执行结果或错误反馈，清空活动回合与冻结的 history，
     /// 让下一次读取重新读盘；同时推进会话 revision。
     pub(super) fn settle(&mut self, terminal: Option<SessionTerminalSnapshot>) {
-        self.active_compaction = None;
         self.terminal = terminal;
         self.active_turn = None;
         self.events.clear();

@@ -33,17 +33,13 @@ pub fn lock_data_directory() -> Result<(PathBuf, std::fs::File), String> {
 }
 
 /// 一次执行（无交互或桌面）用到的全部运行时句柄。
-///
-/// Tokio runtime 全程存活，provider 的 HTTP 请求靠它运行。
 pub struct SessionSetup {
     pub conversation: Arc<Conversation>,
-    pub runtime: Arc<tokio::runtime::Runtime>,
     pub mcp: Arc<singularity_mcp::McpManager>,
 }
 
 /// 本地桌面工作台的进程级持有者；所有 Session 共用同一个 runner、目录和 runtime。
 pub struct DesktopSetup {
-    pub runtime: Arc<tokio::runtime::Runtime>,
     pub runner: Arc<TurnRunner>,
     pub catalog: ThreadCatalog,
     pub workspaces: WorkspaceStore,
@@ -55,10 +51,9 @@ pub struct DesktopSetup {
 }
 
 pub fn prepare_desktop(home: &Path) -> Result<DesktopSetup, String> {
-    let RuntimeParts { runtime, models, runner, catalog, mcp } = prepare_runtime(home, true)?;
+    let RuntimeParts { models, runner, catalog, mcp } = prepare_runtime(home, true)?;
     let workspaces = WorkspaceStore::open(home)?;
     Ok(DesktopSetup {
-        runtime,
         runner,
         catalog,
         workspaces,
@@ -69,7 +64,7 @@ pub fn prepare_desktop(home: &Path) -> Result<DesktopSetup, String> {
 }
 
 pub fn prepare(home: &Path, model: Option<&str>) -> Result<SessionSetup, String> {
-    let RuntimeParts { runtime, models, runner, catalog, mcp } = prepare_runtime(home, false)?;
+    let RuntimeParts { models, runner, catalog, mcp } = prepare_runtime(home, false)?;
     let default_selector = models.snapshot().resolved_default_selector();
 
     let current =
@@ -80,14 +75,13 @@ pub fn prepare(home: &Path, model: Option<&str>) -> Result<SessionSetup, String>
         .map_err(|error| error.to_string())?;
 
     let conversation = Conversation::new(runner, thread);
-    Ok(SessionSetup { conversation, runtime, mcp })
+    Ok(SessionSetup { conversation, mcp })
 }
 
-/// 两个入口共用的进程级装配：tokio runtime、模型配置持有者、runner 及其目录。
+/// 两个入口共用的进程级装配：模型配置持有者、runner 及其目录。
 ///
 /// 各入口的差异留给自己：桌面 额外登记 workspace，无交互入口额外创建会话。
 struct RuntimeParts {
-    runtime: Arc<tokio::runtime::Runtime>,
     models: Arc<ModelConfigManager>,
     runner: Arc<TurnRunner>,
     catalog: ThreadCatalog,
@@ -96,7 +90,6 @@ struct RuntimeParts {
 
 /// Runner 和 ThreadCatalog 共用会话目录，装配层不把执行器当成目录的依赖容器。
 fn prepare_runtime(home: &Path, user_questions: bool) -> Result<RuntimeParts, String> {
-    let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
     let sessions_dir = home.join(SESSIONS_DIR_NAME);
     singularity_core::create_data_dir(&sessions_dir)?;
     let models = Arc::new(ModelConfigManager::open(home.to_path_buf()));
@@ -108,5 +101,5 @@ fn prepare_runtime(home: &Path, user_questions: bool) -> Result<RuntimeParts, St
         runner
     });
     let catalog = ThreadCatalog::new(sessions_dir);
-    Ok(RuntimeParts { runtime, models, runner, catalog, mcp })
+    Ok(RuntimeParts { models, runner, catalog, mcp })
 }

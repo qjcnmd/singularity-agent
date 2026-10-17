@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use singularity_agent::agent::ControlRequest;
-use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, AgentTerminalReason};
+use singularity_agent::agent::{Agent, AgentConfig, AgentEvent, AgentTerminalReason};
 use singularity_agent::agent::{SteeringInbox, SteeringInboxHandle};
 use singularity_agent::session::{
     LedgerRecord, SessionManager, SessionWriter, append_record_async, lock_writer,
@@ -20,8 +20,8 @@ use singularity_agent::session::{
 };
 use singularity_model::{ModelConfigManager, OpenAiProvider};
 
-use crate::assistant_items::AssistantItemEvents;
-use crate::error::{TurnFailureCause, TurnRunError, provider_turn_cause};
+use crate::error::{TurnFailureCause, TurnRunError};
+use crate::event_projection::AgentEventProjector;
 use singularity_protocol::{
     DiagnosticSeverity, Thread, Turn, TurnErrorDetail, TurnEvent, TurnModelUsage, TurnStatus, diagnostic_code,
 };
@@ -114,11 +114,19 @@ impl TurnRunner {
         };
         sink(TurnEvent::TurnStarted { turn, started_at });
 
-        let mut item_events = AssistantItemEvents::new(thread.thread_id.clone(), turn_id.clone());
+        let mut item_events = AgentEventProjector::new(thread.thread_id.clone(), Some(turn_id.clone()));
         let run_result = {
             let mut on_event = |event: AgentEvent| match event {
-                AgentEvent::CompactionStateChanged { active } => {
+                AgentEvent::CompactionUpdated { ref item } => {
+                    let active = matches!(
+                        item,
+                        singularity_protocol::HistoryItem::CompactionResult {
+                            status: TurnStatus::Running,
+                            ..
+                        }
+                    );
                     controls.set_compacting(active);
+                    item_events.project(sink, event);
                     sink(TurnEvent::SessionStateChanged {});
                 }
                 AgentEvent::PendingQuestionChanged => {
@@ -144,9 +152,8 @@ impl TurnRunner {
             // 执行期的存储/宿主故障不写可信终态，历史把未闭合的 operation 投影为中断；
             // 链条到此停止。
             Err(error) => {
-                let cause = classify_agent_error(&error);
-                let detail = TurnErrorDetail { cause, message: error.to_string() };
-                if cause == TurnFailureCause::Store {
+                let detail = error.detail();
+                if detail.cause == TurnFailureCause::Store {
                     return Err(fail_stop_execution(&thread.thread_id, &turn_id, detail, sink));
                 }
                 (TurnStatus::Failed, false, Some(detail))

@@ -106,9 +106,7 @@ impl AppServer {
             let reservation = slot.conversation().reserve_compaction().map_err(conversation_error)?;
             (slot, reservation)
         };
-        let reservation = self.begin_operation(session_id, &slot, reservation, |state, history| {
-            state.begin_compaction(history, now_iso());
-        })?;
+        let reservation = self.begin_operation(session_id, &slot, reservation, SlotState::begin_turn)?;
         self.spawn_operation(session_id, slot, reservation, None);
         Ok(())
     }
