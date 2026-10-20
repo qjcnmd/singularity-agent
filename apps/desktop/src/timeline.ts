@@ -1,4 +1,4 @@
-import { factStatusText, compactionText } from './copy'
+import { interruptionText, compactionText } from './copy'
 import { hasErrorItem } from './execution'
 import type { ExecutionItem, ExecutionTurn, FactStatus, SessionView } from './execution'
 
@@ -19,6 +19,7 @@ export type TimelineItemModel = TimelineItemBase & (
   | { kind: 'duration'; fact: null; timing: { startedAt: string; finishedAt?: string } }
   | { kind: 'user' }
   | { kind: 'assistant' }
+  | { kind: 'context' }
   | { kind: 'thinking' }
   | { kind: 'compaction' }
   | { kind: 'terminal' }
@@ -37,13 +38,14 @@ const projectedItems = new WeakMap<ExecutionItem, { item: TimelineItemModel; cwd
 export function buildTimeline(session: SessionView | null, userHome?: string | null): TimelineItemModel[] {
   if (!session) return []
   const result: TimelineItemModel[] = []
-  const turns = [...session.facts.history, ...session.facts.active]
+  const turns = session.facts
   const terminal = session.runtime.terminal
+  const activeTurn = session.runtime.phase === 'idle' ? undefined : session.facts.findLast(turn => turn.id !== null)
   let historyTurnId: string | null = null
   for (const turn of turns) {
     historyTurnId = turn.id ?? historyTurnId
-    const active = session.runtime.activeTurn?.turnId === turn.id
-    const failureFromRuntime = turn === session.facts.active.at(-1)
+    const active = turn === activeTurn
+    const failureFromRuntime = turn === session.facts.at(-1)
       && terminal?.source === 'turn' && terminal.status === 'failed'
     for (const item of projectTurn(turn, historyTurnId, session.summary.cwd, userHome, active, failureFromRuntime)) result.push(item)
   }
@@ -52,10 +54,20 @@ export function buildTimeline(session: SessionView | null, userHome?: string | n
     result.push(failedItem('terminal:failed', terminal.source === 'compaction'
       ? `${compactionText.failed}：${terminal.error.message}` : terminal.error.message))
   }
-  // 若执行被手动中断，末尾追加“已停止”提示
+  // 终态可能先于历史补读到达；按后端保存的停止来源显示反馈。
   if (session.runtime.terminal?.source !== 'compaction'
     && session.runtime.terminal?.status === 'interrupted'
-    && result[result.length - 1]?.kind !== 'terminal') result.push(stoppedItem())
+    && result[result.length - 1]?.kind !== 'terminal') result.push(interruptedItem('terminal:interrupted', session.runtime.terminal.manuallyStopped))
+  if (session.runtime.pendingMessages.length === 0) return result
+  // 用户消息落盘的事件可能先于下一份运行快照到达，按身份判断，不重复显示。
+  const savedMessages = new Set(turns.flatMap(turn => turn.items.filter(item => item.kind === 'user').map(item => item.id)))
+  for (const message of session.runtime.pendingMessages) {
+    if (savedMessages.has(message.itemId)) continue
+    result.push({
+      key: `pending:${message.itemId}`, kind: 'user', title: '你', summary: '', filePath: null,
+      fact: { id: message.itemId, kind: 'user', status: 'stable', text: message.text, images: message.images },
+    })
+  }
   return result
 }
 
@@ -66,7 +78,7 @@ function projectTurn(turn: ExecutionTurn, anchorTurnId: string | null, cwd: stri
   const group = turn.id ?? 'leading'
   let workStartIndex = -1
   for (const fact of turn.items) {
-    if (fact.kind === 'request' || fact.kind === 'settings' || fact.kind === 'event') continue
+    if (fact.kind === 'request' || fact.kind === 'settings') continue
     const cached = projectedItems.get(fact)
     let item: TimelineItemModel
     if (cached?.cwd === cwd && cached.userHome === userHome) {
@@ -78,11 +90,12 @@ function projectTurn(turn: ExecutionTurn, anchorTurnId: string | null, cwd: stri
         const filePath = pathFromArgs(fact.name, fact.args)
         const summary = filePath !== null ? displayPath(filePath, cwd, userHome)
           : toolSummary(fact.name, fact.args) || firstLine(fact.output)
-        item = { key, fact, kind: 'tool', title: fact.name === 'ask_user_question' ? '询问用户' : fact.name,
+        item = { key, fact, kind: 'tool', title: fact.name === 'ask_user_question' ? '询问用户' : filePath?.replace(/\\/g, '/').endsWith('/SKILL.md') ? '读取技能' : fact.name,
           summary, filePath }
       } else {
         const kind = fact.kind === 'compaction' || fact.kind === 'compaction_result' ? 'compaction' : fact.kind
         let title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'compaction' ? compactionText.completed : kind
+        if (fact.kind === 'context') title = `${fact.name} · 已注入`
         if (fact.kind === 'compaction_result') title = fact.status === 'error' ? compactionText.failed : fact.text
         item = { key, fact, kind, title, summary: '', filePath: null }
       }
@@ -99,7 +112,7 @@ function projectTurn(turn: ExecutionTurn, anchorTurnId: string | null, cwd: stri
       fact: null, summary: '', filePath: null,
     })
   }
-  if (turn.status === 'interrupted') result.push({ ...stoppedItem(`content:${group}:terminal`), anchorTurnId })
+  if (turn.status === 'interrupted') result.push({ ...interruptedItem(`content:${group}:terminal`, turn.manuallyStopped), anchorTurnId })
   // 保存失败时没有回合错误详情，具体原因由运行状态显示。
   const failureShown = hasErrorItem(turn, turn.error)
   if (turn.status === 'failed' && !failureShown && (turn.error || !failureFromRuntime)) {
@@ -108,8 +121,10 @@ function projectTurn(turn: ExecutionTurn, anchorTurnId: string | null, cwd: stri
   return result
 }
 
-function stoppedItem(key = 'terminal:interrupted'): TimelineItemModel {
-  return { key, kind: 'terminal', title: factStatusText.cancelled, fact: null, summary: '', filePath: null }
+function interruptedItem(key: string, manuallyStopped: boolean): TimelineItemModel {
+  const title = interruptionText(manuallyStopped)
+  return { key, kind: 'terminal', title, fact: null, summary: manuallyStopped ? '' : title,
+    filePath: null, status: manuallyStopped ? 'cancelled' : 'error' }
 }
 
 function failedItem(key: string, message: string): TimelineItemModel {
@@ -122,7 +137,17 @@ export function toolArgument(name: string, args: unknown): string | null {
   return typeof value === 'string' ? value : null
 }
 
+export function backgroundToolSummary(name: string, args: unknown): string | null {
+  if (name === 'task_list') return '列出后台命令'
+  if (name !== 'task_output' && name !== 'task_stop') return null
+  const taskId = record(args).task_id
+  const action = name === 'task_output' ? '查看后台命令输出' : '停止后台命令'
+  return typeof taskId === 'string' ? `${action} · ${taskId}` : action
+}
+
 function toolSummary(name: string, args: unknown): string {
+  const background = backgroundToolSummary(name, args)
+  if (background !== null) return background
   if (name === 'ask_user_question') {
     const questions = record(args).questions
     const question = Array.isArray(questions) ? record(questions[0]).question : undefined

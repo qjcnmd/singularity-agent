@@ -22,27 +22,31 @@ fn compaction_summary(summary: &str) -> String {
 
 const UNKNOWN_TOOL_OUTCOME: &str = "[previous execution was interrupted; outcome unknown. Inspect the current state before deciding whether to repeat an action with side effects.]";
 
-/// 将会话条目映射为模型消息列表；若工具调用缺少对应结果（如被中断），补充占位提示以保证协议消息闭合。
+/// 将会话条目映射为模型消息列表；工具调用缺少对应结果（如被中断）时补一条占位消息，让调用配对闭合。
 fn project_messages(entries: &[&SessionEntry]) -> Vec<ContextMessage> {
     let mut messages = Vec::new();
-    let mut remaining = entries.iter().peekable();
+    let mut remaining = entries.iter().copied().peekable();
     while let Some(entry) = remaining.next() {
         messages.push(model_message(entry));
         let SessionEntry::Message { message, .. } = entry else {
             continue;
         };
-        for call in message.tool_calls() {
-            let result = remaining.next_if(|candidate| {
-                matches!(candidate, SessionEntry::Message { message, .. }
-                    if message.tool_call_id() == Some(call.tool_call_id.as_str()))
+        let mut calls = message.tool_calls().peekable();
+        if calls.peek().is_none() {
+            continue;
+        }
+        for call in calls {
+            let next_matches = remaining.peek().is_some_and(|entry| {
+                matches!(entry,
+                SessionEntry::Message { message: AgentMessage::ToolResult { tool_call_id, .. }, .. }
+                    if tool_call_id == &call.tool_call_id)
             });
-            messages.push(match result {
-                Some(entry) => model_message(entry),
-                None => {
-                    let mut result = ModelMessage::text(ModelRole::Tool, UNKNOWN_TOOL_OUTCOME);
-                    result.tool_call_id = Some(call.tool_call_id.clone());
-                    ContextMessage { message: result, images: Vec::new() }
-                }
+            messages.push(if next_matches {
+                model_message(remaining.next().expect("matching result exists"))
+            } else {
+                let mut result = ModelMessage::text(ModelRole::Tool, UNKNOWN_TOOL_OUTCOME);
+                result.tool_call_id = Some(call.tool_call_id.clone());
+                ContextMessage { message: result, images: Vec::new() }
             });
         }
     }
@@ -117,9 +121,10 @@ fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
     tokens
 }
 
-/// 普通请求按原顺序读取全部有效对话和图片。
-pub(crate) fn messages(session: &SessionData) -> Vec<ContextMessage> {
-    project_messages(&resolve_context_entries(session))
+/// 普通请求共用一次历史整理，生成消息材料和对应估价；图片仍由调用方在锁外读取。
+pub(crate) fn prepare_context(session: &SessionData) -> (Vec<ContextMessage>, u64) {
+    let entries = resolve_context_entries(session);
+    (project_messages(&entries), context_token_estimate(&entries))
 }
 
 /// 本轮请求开销与实测校正由 Agent 添加。
@@ -137,8 +142,9 @@ pub(crate) struct CompactionPrefix {
     pub(crate) first_kept_entry_id: String,
 }
 
-pub(crate) fn compaction_prefix(session: &SessionData, keep_recent_tokens: u64) -> Option<CompactionPrefix> {
+pub(crate) fn compaction_prefix(session: &SessionData, keep_recent_ratio: f64) -> Option<CompactionPrefix> {
     let entries = resolve_context_entries(session);
+    let keep_recent_tokens = (context_token_estimate(&entries) as f64 * keep_recent_ratio).ceil() as u64;
     let cut = find_cut_point(&entries, keep_recent_tokens);
     if cut == 0 {
         return None;
@@ -162,38 +168,25 @@ pub(crate) fn compaction_prefix(session: &SessionData, keep_recent_tokens: u64) 
     })
 }
 
-/// 从后往前累加到保留预算，再在候选上界之内取最后一个工具对闭合的切点；
+/// 从后往前累加到保留预算；若当前记录是工具结果，继续退到整组调用之前。
 /// 预算为零时仍保留最后一个完整单元。
 fn find_cut_point(entries: &[&SessionEntry], keep_recent_tokens: u64) -> usize {
     let mut accumulated = 0u64;
     for index in (0..entries.len()).rev() {
         accumulated = accumulated.saturating_add(entry_token_estimate(entries[index]));
-        if accumulated >= keep_recent_tokens {
-            return last_balanced_cut(entries, index);
-        }
-    }
-    0
-}
-
-/// 工具结果已经按调用顺序紧随 assistant；切点不能拆开这个工具单元。
-/// 缺失结果由模型投影补齐。
-fn last_balanced_cut(entries: &[&SessionEntry], upper_bound: usize) -> usize {
-    let mut cut = 0usize;
-    for position in 0..upper_bound {
-        let next_is_tool_result = entries.get(position + 1).is_some_and(|next| {
-            matches!(
-                next,
+        if accumulated >= keep_recent_tokens
+            && !matches!(
+                entries[index],
                 SessionEntry::Message {
                     message: AgentMessage::ToolResult { .. },
                     ..
                 }
             )
-        });
-        if !next_is_tool_result {
-            cut = position + 1;
+        {
+            return index;
         }
     }
-    cut
+    0
 }
 
 fn model_message(entry: &SessionEntry) -> ContextMessage {
@@ -208,7 +201,9 @@ fn model_message(entry: &SessionEntry) -> ContextMessage {
     };
     let text = message.content_text();
     let model_message = match message {
-        AgentMessage::User { .. } => ModelMessage::text(ModelRole::User, text),
+        AgentMessage::User { .. } | AgentMessage::Notification { .. } => {
+            ModelMessage::text(ModelRole::User, text)
+        }
         AgentMessage::Assistant { .. } => ModelMessage {
             role: ModelRole::Assistant,
             content: text,
@@ -260,67 +255,21 @@ pub(crate) fn load_messages(
         .collect()
 }
 
-/// 按日志顺序归约出唯一的活动历史：摘要替换掉前缀。
+/// 最新摘要替换此前的摘要和历史前缀，保留位置之后的消息仍按日志顺序排列。
 fn resolve_context_entries(session: &SessionData) -> Vec<&SessionEntry> {
-    let mut context: Vec<&SessionEntry> = Vec::new();
-    for entry in session.entries() {
-        apply_context_entry(&mut context, entry);
-    }
-    context
-}
-
-/// 按账本顺序应用摘要和工具结果排序规则。
-fn apply_context_entry<'a>(context: &mut Vec<&'a SessionEntry>, entry: &'a SessionEntry) {
-    match entry {
-        SessionEntry::Compaction { compaction, .. } => {
-            let index = context
-                .iter()
-                .position(|candidate| candidate.id() == compaction.first_kept_entry_id)
-                .expect("compaction retains an active context entry");
-            context.drain(..index);
-            context.insert(0, entry);
-            return;
-        }
-        entry if context_entry(entry).is_none() => return,
-        _ => {}
-    }
-    if let Some(insert_at) = context_insertion_index(context, entry) {
-        context.insert(insert_at, entry);
-    } else {
+    let entries = session.entries();
+    let mut context = Vec::new();
+    let start = if let Some(entry @ SessionEntry::Compaction { compaction, .. }) =
+        entries.iter().rev().find(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+    {
         context.push(entry);
-    }
-}
-
-fn context_insertion_index(context: &[&SessionEntry], entry: &SessionEntry) -> Option<usize> {
-    let SessionEntry::Message { message, .. } = entry else {
-        return None;
+        entries
+            .iter()
+            .position(|candidate| candidate.id() == compaction.first_kept_entry_id)
+            .expect("compaction retains an active context entry")
+    } else {
+        0
     };
-    let call_id = message.tool_call_id()?;
-    // 最近一次声明该调用的 assistant 决定工具结果的顺序。
-    for (assistant_index, candidate) in context.iter().enumerate().rev() {
-        let SessionEntry::Message { message: assistant, .. } = candidate else {
-            continue;
-        };
-        let Some(call_ordinal) = assistant.tool_calls().position(|call| call.tool_call_id == *call_id) else {
-            continue;
-        };
-        for (result_index, candidate) in context.iter().enumerate().skip(assistant_index + 1) {
-            let SessionEntry::Message { message: result, .. } = candidate else {
-                continue;
-            };
-            let Some(result_call_id) = result.tool_call_id() else {
-                continue;
-            };
-            let Some(result_ordinal) =
-                assistant.tool_calls().position(|call| call.tool_call_id == *result_call_id)
-            else {
-                continue;
-            };
-            if result_ordinal > call_ordinal {
-                return Some(result_index);
-            }
-        }
-        return Some(context.len());
-    }
-    None
+    context.extend(entries[start..].iter().filter(|entry| matches!(entry, SessionEntry::Message { .. })));
+    context
 }

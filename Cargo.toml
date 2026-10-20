@@ -54,7 +54,6 @@ unnecessary_sort_by = "deny"
 unnecessary_to_owned = "deny"
 
 [workspace.dependencies]
-clap = { version = "4.5", features = ["derive"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "gzip"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 regex = "1.11"

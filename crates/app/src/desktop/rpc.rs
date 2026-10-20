@@ -24,13 +24,19 @@ pub async fn handle(
         if let RpcRequest::ModelDiscover(params) = request {
             let models = tokio::select! {
                 result = app.discover_models(
-                    &params.provider_id, &params.base_url, params.api_key.as_deref(), &params.api_protocol,
+                    &params.provider_id, &params.base_url, params.api_key.as_deref(), params.api_protocol,
                 ) => result?,
                 () = shutdown.cancelled() => return Err(RpcError::new(
                     RpcErrorCode::Internal, "工作台正在退出。", "重新启动桌面应用。",
                 )),
             };
             return value(models);
+        }
+        if let RpcRequest::BackgroundTaskStop(params) = request {
+            return value(app.stop_background_task(&params.session_id, &params.task_id).await?);
+        }
+        if let RpcRequest::SessionArchive(params) = request {
+            return value(app.archive_session(&params.session_id).await?);
         }
         let app = Arc::clone(app);
         tokio::task::spawn_blocking(move || dispatch(&app, request))
@@ -47,21 +53,18 @@ pub async fn handle(
 fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError> {
     match request {
         RpcRequest::AppBootstrap(_) => value(app.bootstrap()?),
-        // 目录选择由 Electron 接收；模型发现由 handle 异步执行。
-        RpcRequest::DirectoryPick(_) | RpcRequest::ModelDiscover(_) | RpcRequest::McpInspect(_) => {
-            Err(invalid_request("该方法不由同步 AppServer 分发。"))
-        }
+        // 目录选择由 Electron 接收；网络查询和归档等待由 handle 异步执行。
+        RpcRequest::DirectoryPick(_)
+        | RpcRequest::ModelDiscover(_)
+        | RpcRequest::McpInspect(_)
+        | RpcRequest::BackgroundTaskStop(_)
+        | RpcRequest::SessionArchive(_) => Err(invalid_request("该方法不由同步 AppServer 分发。")),
         RpcRequest::SkillsList(params) => value(app.skills(&params.workspace_id)?),
         RpcRequest::FileSearch(params) => {
             value(app.file_search(&params.workspace_id, &params.query, params.limit)?)
         }
         RpcRequest::WorkspaceAdd(params) => value(app.add_workspace(&params.root)?),
-        RpcRequest::WorkspaceRename(params) => {
-            value(app.rename_workspace(&params.workspace_id, &params.name)?)
-        }
-        RpcRequest::WorkspaceRemove(params) => {
-            value(app.remove_workspace(&params.workspace_id, &params.draft_session_ids)?)
-        }
+        RpcRequest::WorkspaceRemove(params) => value(app.remove_workspace(&params.workspace_id)?),
         RpcRequest::ModelSaveProvider(params) => {
             value(app.save_provider(params.provider, params.api_key.as_deref())?)
         }
@@ -72,18 +75,18 @@ fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError
         RpcRequest::McpToggle(params) => {
             value(app.mcp.toggle(&params.server_id, params.enabled).map_err(invalid_request)?)
         }
-        RpcRequest::SessionCreate(params) => value(app.create_session(&params.workspace_id)?),
+        RpcRequest::SessionStart(params) => value(app.start_session(
+            &params.workspace_id,
+            params.selector,
+            input(params.text, params.images, params.skills)?,
+        )?),
         RpcRequest::SessionRead(params) => {
             value(app.read_session(&params.session_id, params.limit, params.before_turn.as_deref())?)
         }
         RpcRequest::SessionImageRead(params) => value(app.image_data(&params.session_id, &params.image_id)?),
         RpcRequest::SessionRename(params) => value(app.rename_session(&params.session_id, &params.name)?),
-        RpcRequest::SessionArchive(params) => value(app.archive_session(&params.session_id)?),
         RpcRequest::SessionSubmit(params) => {
             value(app.submit(&params.session_id, input(params.text, params.images, params.skills)?)?)
-        }
-        RpcRequest::SessionSteer(params) => {
-            value(app.steer(&params.session_id, input(params.text, params.images, params.skills)?)?)
         }
         RpcRequest::SessionAnswerQuestion(params) => {
             value(app.answer_question(&params.session_id, &params.item_id, params.answers)?)

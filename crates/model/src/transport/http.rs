@@ -1,10 +1,40 @@
 use std::future::Future;
 use std::time::Duration;
 
+use reqwest::header::HeaderMap;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc2822;
+
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{ModelErrorKind, ProviderError, provider_error_kind_for_http_status};
-use crate::{HTTP_STATUS_CONFLICT, PROVIDER_TIMEOUT_SECONDS};
+use crate::{HTTP_STATUS_CONFLICT, MAX_RETRY_AFTER_MS, PROVIDER_TIMEOUT_SECONDS};
+
+pub(crate) fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
+    headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .or_else(|| {
+            headers
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after_value)
+        })
+        .map(|delay| delay.min(Duration::from_millis(MAX_RETRY_AFTER_MS)))
+}
+
+fn parse_retry_after_value(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    // 无效或已过期的 HTTP-date 不触发立即重发，交给调用方使用有上限的指数退避。
+    let target = OffsetDateTime::parse(value, &Rfc2822).ok()?;
+    let remaining = Duration::try_from(target - OffsetDateTime::now_utc()).ok()?;
+    (!remaining.is_zero()).then_some(remaining)
+}
 
 /// 模型调用与目录查询共用 ring；reqwest 的无默认加密实现模式要求先安装 provider。
 pub(crate) fn client_builder() -> reqwest::ClientBuilder {
@@ -19,7 +49,7 @@ pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
         return Ok(client.clone());
     }
     let client = client_builder()
-        // 禁用全局 gzip，保证 SSE 流式响应按原始到达字节即时解析
+        // 禁用全局 gzip，SSE 流按到达字节即时解析
         .no_gzip()
         .read_timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
         .user_agent(format!("singularity-agent/{}", env!("CARGO_PKG_VERSION")))
@@ -38,7 +68,7 @@ pub(crate) fn provider_error_from_http_status(status: u16) -> ProviderError {
     ProviderError::new(kind, message).with_code("provider_http_status")
 }
 
-/// 提取网络传输异常的最内层错误原因（剥离 URL 保证安全，并限制最大字符长度）。
+/// 提取网络传输异常的最内层错误原因；剥离可能含凭据的 URL，并限制最大长度。
 pub(crate) fn transport_error_source(error: reqwest::Error) -> String {
     let error = error.without_url();
     let mut source: &(dyn std::error::Error + 'static) = &error;

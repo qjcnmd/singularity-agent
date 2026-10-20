@@ -3,7 +3,7 @@ import { PickerSurface } from './PickerSurface'
 import { ExpandChevron } from './ExpandChevron'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useDismissOnOutside, useSelectionGuard, useTransientFocus, focusableElements, navigateList } from '../interactions'
-import { effectiveSelector, sortReasoningVariants, selectedModel, composeSelector } from '../modelChoices'
+import { sortReasoningVariants, selectedModel, composeSelector } from '../modelChoices'
 import type { ModelConfigurationInput, RedactedProvider } from '../protocol'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 
@@ -18,18 +18,16 @@ interface ModelPickerProps {
 }
 
 export function ModelPicker({ state }: ModelPickerProps) {
-  const [open, setOpen] = useState(false)
-  const selector = effectiveSelector(state.session?.runtime.selector, state.bootstrap?.modelCatalog)
-  // 切换任务隔离待处理的滑块编辑；同一任务切换模型保留浮层，避免重播入场动画。
+  const selector = appStore.modelSelector()
+  // 切换任务关闭浮层并丢弃待处理的滑块编辑；同一任务切换模型保留浮层。
   const scope = JSON.stringify([state.selectedWorkspaceId, state.selectedSessionId])
-  return <ModelPickerControls key={scope} state={state} selector={selector} open={open} onOpenChange={setOpen} />
+  return <ModelPickerControls key={scope} state={state} selector={selector} />
 }
 
-function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPickerProps & {
+function ModelPickerControls({ state, selector }: ModelPickerProps & {
   selector: string | null
-  open: boolean
-  onOpenChange: (open: boolean) => void
 }) {
+  const [open, setOpen] = useState(false)
   const root = useRef<HTMLDivElement>(null)
   const [previewIndex, setPreviewIndex] = useState<number | null>(null)
   const committing = useRef(false)
@@ -50,16 +48,13 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
   const selectionGuard = useSelectionGuard()
   const sessionId = state.selectedSessionId
   const origin = actionOrigin.session(sessionId)
-  const pending = sessionId === null
-    ? state.selectedWorkspaceId !== null && state.pendingActions.has(pendingKey('session.create', actionOrigin.workspace(state.selectedWorkspaceId)))
-    : state.pendingActions.has(pendingKey('session.updateSettings', origin))
+  const pending = state.pendingActions.has(pendingKey('session.updateSettings', origin))
 
-  useTransientFocus(open, () => onOpenChange(false), root, node => node.querySelector<HTMLElement>('.sg-native-slider:not(:disabled), .sg-menu button:not(:disabled)'))
-  useDismissOnOutside(root, open, () => onOpenChange(false))
+  useTransientFocus(open, () => setOpen(false), root, node => node.querySelector<HTMLElement>('.sg-native-slider:not(:disabled), .sg-menu button:not(:disabled)'))
+  useDismissOnOutside(root, open, () => setOpen(false))
 
   const chooseModel = async (choice: ModelChoice) => {
-    const enabled = sortReasoningVariants(choice.model.reasoningVariants)
-    const effort = enabled.some((variant) => variant.id === resolvedEffort)
+    const effort = choice.model.reasoningVariants?.some((variant) => variant.id === resolvedEffort)
       ? resolvedEffort
       : choice.model.defaultVariant
     await appStore.updateSettings(composeSelector(choice.provider.providerId, choice.model.modelId, effort))
@@ -107,7 +102,7 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
         aria-haspopup="dialog"
         aria-expanded={open}
         title={effortLabel ? `${modelLabel} · ${effortLabel}` : modelLabel}
-        {...selectionGuard(() => { onOpenChange(!open) })}
+        {...selectionGuard(() => { setOpen(!open) })}
       >
         <span className="sg-triggerLabel">{modelLabel}</span>
         {effortLabel !== null && <span className="sg-triggerEffort">{effortLabel}</span>}

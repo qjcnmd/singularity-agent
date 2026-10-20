@@ -78,38 +78,12 @@ impl WorkspaceStore {
                     return Err(WorkspaceError::InvalidInput("此项目已经添加。".into()));
                 }
             }
-            let name = canonical
-                .as_path()
-                .file_name()
-                .and_then(|value| value.to_str())
-                .filter(|value| !value.is_empty())
-                .unwrap_or(canonical.display())
-                .to_string();
             let workspace = Workspace {
                 workspace_id: Uuid::new_v4().to_string(),
-                name,
                 root: canonical.display().to_string(),
             };
             registry.workspaces.push(workspace.clone());
             Ok(workspace)
-        })
-    }
-
-    /// 改名不影响 root，也不影响会话归属。名称只用于展示：工作区身份由
-    /// workspace_id 和 root 决定，所以和 add 一样允许重名。
-    pub fn rename(&self, workspace_id: &str, name: &str) -> Result<(), WorkspaceError> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(WorkspaceError::InvalidInput("项目名称不能为空。".into()));
-        }
-        self.update(|registry| {
-            let workspace = registry
-                .workspaces
-                .iter_mut()
-                .find(|item| item.workspace_id == workspace_id)
-                .ok_or(WorkspaceError::NotFound)?;
-            workspace.name = name.to_string();
-            Ok(())
         })
     }
 
@@ -126,8 +100,7 @@ impl WorkspaceStore {
         })
     }
 
-    // 只有持久化成功之后才发布编辑后的 registry。整个读/改/写过程串行化，
-    // 避免并发修改互相覆盖。
+    // 持久化成功后才发布编辑后的 registry。读/改/写全程串行，并发修改不会互相覆盖。
     fn update<T>(
         &self,
         edit: impl FnOnce(&mut RegistryFile) -> Result<T, WorkspaceError>,
@@ -135,9 +108,7 @@ impl WorkspaceStore {
         let mut registry = self.lock();
         let mut next = registry.clone();
         let result = edit(&mut next)?;
-        let mut bytes = serde_json::to_vec_pretty(&next).expect("workspace registry is serializable");
-        bytes.push(b'\n');
-        singularity_core::atomic_replace_bytes(&self.path, &bytes)
+        singularity_core::write_json_atomic(&self.path, &next)
             .map_err(|source| WorkspaceError::Storage { path: self.path.clone(), source })?;
         *registry = next;
         Ok(result)

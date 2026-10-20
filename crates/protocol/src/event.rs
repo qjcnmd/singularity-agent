@@ -1,19 +1,11 @@
 //! 执行事件的定义，以及它到 wire 格式的投影。
 //! TurnEvent 用 serde 的 method/params 标签序列化，方法名和载荷都由事件声明定义，
-//! TurnEventEnvelope 只补工作台的数据版本。诊断 code 中 agent 内部的由 agent 的事件
-//! 模块定义，runtime 的由 diagnostic_code 定义。
+//! TurnEventEnvelope 只补工作台的数据版本。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::params::Turn;
-
-/// agent/diagnostic 事件携带的稳定诊断代码词表。
-pub mod diagnostic_code {
-    pub const PROJECT_INSTRUCTIONS_TRUNCATED: &str = "project_instructions_truncated";
-    /// 存储故障导致可信终态无法落盘（执行期写入失败，或终态提交失败）。
-    pub const STORAGE_FATAL: &str = "storage_fatal";
-}
 
 /// 无字段枚举的 serde wire 词形；Display 用它让错误和诊断文本与 wire 一致。
 pub fn wire_word<T: Serialize>(value: T) -> String {
@@ -55,6 +47,12 @@ pub struct ItemRef {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "method", content = "params", rename_all_fields = "camelCase")]
 pub enum TurnEvent {
+    /// 会话中显示实际注入的内容及后续变化。
+    #[serde(rename = "context/injected")]
+    ContextInjected {
+        turn_id: Option<String>,
+        content: crate::HistoryItem,
+    },
     /// turn 的用户输入由 turn/userMessage 携带：turn/started 只负责 turn 身份
     /// 和开始时刻，不重复消息正文。
     #[serde(rename = "turn/started")]
@@ -63,7 +61,6 @@ pub enum TurnEvent {
     /// item 是该条目首个文本块的公开内容块 id，与历史投影的派生规则相同。
     #[serde(rename = "turn/userMessage")]
     UserMessage {
-        thread_id: String,
         turn_id: String,
         item: ItemRef,
         text: String,
@@ -76,7 +73,6 @@ pub enum TurnEvent {
     },
     #[serde(rename = "item/agentMessage/delta")]
     AssistantDelta {
-        thread_id: String,
         turn_id: String,
         item: ItemRef,
         delta: String,
@@ -85,7 +81,6 @@ pub enum TurnEvent {
     /// 增量，与终态的思考块使用同一个 item 身份。
     #[serde(rename = "item/agentThinking/delta")]
     AssistantThinkingDelta {
-        thread_id: String,
         turn_id: String,
         item: ItemRef,
         delta: String,
@@ -93,18 +88,15 @@ pub enum TurnEvent {
     /// 工具名称和参数只在 Start 事件发布一次，之后按同一个 item 身份更新。
     #[serde(rename = "tool/execution/start")]
     ToolExecutionStart {
-        thread_id: String,
         turn_id: String,
         /// 与历史共享的公开 occurrence 身份；provider 的 wire 调用 ID 不在协议里。
         item: ItemRef,
         tool_name: String,
         args: Value,
-        started_at: String,
     },
     /// 累计的有界进度文本，每条整体替换；恢复快照与实时投影读到的内容一致。
     #[serde(rename = "tool/execution/update")]
     ToolExecutionUpdate {
-        thread_id: String,
         turn_id: String,
         item: ItemRef,
         partial_result: String,
@@ -112,35 +104,16 @@ pub enum TurnEvent {
     /// 最终的工具结果：输出、失败标志与观测信息。
     #[serde(rename = "tool/execution/end")]
     ToolExecutionEnd {
-        thread_id: String,
         turn_id: String,
         item: ItemRef,
-        output: String,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        #[cfg_attr(
-            feature = "typescript",
-            ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
-        )]
-        images: Vec<crate::ImageAttachment>,
-        is_error: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "typescript", ts(optional))]
-        duration_ms: Option<u64>,
-        /// read 工具真实读到的来源范围；其他工具没有这个字段。
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "typescript", ts(optional))]
-        read_source: Option<crate::ReadSource>,
+        #[serde(flatten)]
+        result: crate::ToolResult,
     },
     /// 重试之前移除临时的输出条目。
     #[serde(rename = "item/discarded")]
-    ItemDiscarded {
-        thread_id: String,
-        turn_id: String,
-        item: ItemRef,
-    },
+    ItemDiscarded { turn_id: String, item: ItemRef },
     #[serde(rename = "item/completed")]
     ItemCompleted {
-        thread_id: String,
         turn_id: String,
         item: ItemRef,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,66 +122,47 @@ pub enum TurnEvent {
     },
     #[serde(rename = "item/failed")]
     ItemFailed {
-        thread_id: String,
         turn_id: String,
         item: ItemRef,
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         content: Option<crate::HistoryItem>,
-        error: String,
-    },
-    #[serde(rename = "agent/diagnostic")]
-    Diagnostic {
-        thread_id: String,
-        /// 独立压缩不属于回合；普通执行使用实际回合身份。
-        turn_id: Option<String>,
-        severity: DiagnosticSeverity,
-        code: String,
-        message: String,
     },
     /// 实时 attempt 事件与持久历史共享同一个 RequestObservation，事件自身只补 turn 身份。
     #[serde(rename = "provider/attempt")]
     ProviderAttempt {
         observation: crate::RequestObservation,
-        thread_id: String,
         /// 独立压缩不属于回合；普通执行使用实际回合身份。
         turn_id: Option<String>,
     },
     /// 同一次压缩从开始到结束共用条目身份；手动和自动使用同一事件。
     #[serde(rename = "compaction/updated")]
     CompactionUpdated {
-        thread_id: String,
+        turn_id: Option<String>,
+        content: crate::HistoryItem,
+    },
+    /// 已保存的模型设置，直接更新当前显示中的历史条目。
+    #[serde(rename = "session/settingsUpdated")]
+    SettingsUpdated {
         turn_id: Option<String>,
         content: crate::HistoryItem,
     },
     #[serde(rename = "turn/completed")]
-    TurnCompleted { turn: Turn, finished_at: String },
-    /// 提问或压缩阶段变化；工作台据此重新发布会话快照。
+    TurnCompleted {
+        turn: Turn,
+        manually_stopped: bool,
+        finished_at: String,
+    },
+    /// 提问或压缩阶段变化；宿主截获后重新发布会话快照，不直接发送给客户端。
     #[serde(rename = "turn/sessionStateChanged")]
+    #[cfg_attr(feature = "typescript", ts(skip))]
     SessionStateChanged {},
     #[serde(rename = "turn/error")]
     TurnFailed {
-        thread_id: String,
         turn_id: String,
         error: TurnErrorDetail,
         finished_at: String,
     },
-}
-
-/// agent/diagnostic 的稳定严重级别词形。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum DiagnosticSeverity {
-    Info,
-    Warning,
-    Error,
-}
-
-impl std::fmt::Display for DiagnosticSeverity {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&wire_word(*self))
-    }
 }
 
 /// provider/attempt 的稳定进度与终态词形。
@@ -228,7 +182,6 @@ pub enum ProviderAttemptStatus {
 #[serde(rename_all = "snake_case")]
 pub enum TurnFailureCause {
     Store,
-    ProjectInstructions,
     ProviderRateLimited,
     ProviderNetwork,
     ProviderTimeout,

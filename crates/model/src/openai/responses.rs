@@ -55,9 +55,6 @@ pub(crate) fn openai_responses_stream_request_payload(
                 })
                 .collect::<Vec<_>>()
         );
-        if selection.supports_tool_choice {
-            payload["tool_choice"] = serde_json::json!("auto");
-        }
     }
     match reasoning.enabled {
         Some(true) => {
@@ -77,6 +74,7 @@ pub(crate) fn parse_openai_responses_response(
     config: &OpenAiProviderConfig,
     mut payload: Value,
     model_name: &str,
+    endpoint: &str,
 ) -> Result<ModelTurnResponse, ProviderError> {
     if let Some(error) = payload.get("error").filter(|error| !error.is_null()) {
         return Err(provider_embedded_error(
@@ -173,7 +171,7 @@ pub(crate) fn parse_openai_responses_response(
         Some(ProviderReasoningReplay::Responses {
             provider_name: config.provider_name.clone(),
             model_name: model_name.to_string(),
-            endpoint: crate::openai::responses_endpoint(&config.base_url),
+            endpoint: endpoint.to_string(),
             items: output,
         })
     } else {
@@ -191,7 +189,6 @@ pub(crate) fn parse_openai_responses_response(
             "input_tokens",
             "output_tokens",
             "/input_tokens_details/cached_tokens",
-            "/output_tokens_details/reasoning_tokens",
         ),
         stop_reason: if length_truncated {
             ModelStopReason::Length

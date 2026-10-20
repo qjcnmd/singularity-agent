@@ -15,13 +15,11 @@ export class Backend extends EventEmitter {
   private readyResolve!: (frame: StreamEnvelope) => void
   private readyReject!: (error: Error) => void
   private exited: Promise<void>
-  private compacting = new Set<string>()
-  private stopTimer: ReturnType<typeof setTimeout> | undefined
 
   constructor(binary: string) {
     super()
     this.ready = new Promise((resolve, reject) => { this.readyResolve = resolve; this.readyReject = reject })
-    this.child = spawn(binary, ['--app-server'], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+    this.child = spawn(binary, [], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
     this.exited = new Promise(resolve => this.child.once('close', () => resolve()))
     this.child.on('error', error => this.fail(error))
     this.child.stdin.on('error', error => this.fail(error))
@@ -39,14 +37,6 @@ export class Backend extends EventEmitter {
           pending?.resolve(message.response)
         } else {
           const frame = message as StreamEnvelope
-          if (frame.type === 'session_changed' || frame.type === 'session_settled') {
-            if (frame.payload.phase === 'compacting') this.compacting.add(frame.sessionId)
-            else this.compacting.delete(frame.sessionId)
-          } else if (frame.type === 'app_changed') {
-            this.compacting = new Set(Object.entries(frame.payload.sessionPhases)
-              .filter(([, phase]) => phase === 'compacting').map(([id]) => id))
-          }
-          if (this.stopping) this.updateStopTimer()
           if (frame.type === 'ready') {
             this.readyResolve(frame)
           }
@@ -90,18 +80,9 @@ export class Backend extends EventEmitter {
   async stop(): Promise<void> {
     this.stopping = true
     this.child.stdin.end()
-    this.updateStopTimer()
+    const stopTimer = setTimeout(() => this.child.kill(), 10_000)
     await this.exited
-    clearTimeout(this.stopTimer)
+    clearTimeout(stopTimer)
   }
 
-  private updateStopTimer(): void {
-    // 仅压缩期间暂停退出超时；普通任务仍有原来的 10 秒退出上限。
-    if (this.compacting.size > 0) {
-      clearTimeout(this.stopTimer)
-      this.stopTimer = undefined
-    } else if (!this.stopTimer) {
-      this.stopTimer = setTimeout(() => this.child.kill(), 10_000)
-    }
-  }
 }

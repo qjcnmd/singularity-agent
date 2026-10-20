@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! 用户级 MCP 配置、按工作目录复用的连接，以及回合开始和压缩后发现的工具目录。
+//! 用户级 MCP 配置，以及按工作目录复用的连接和成功发现的工具目录。
 
 mod client;
 mod config;
@@ -23,7 +23,7 @@ type ConnectionCell = Arc<tokio::sync::Mutex<ConnectionState>>;
 
 struct ConnectionState {
     connection: Option<Arc<Connection>>,
-    // 设置页展示最近一次发现结果，不为读取状态向服务器发请求。
+    // 健康连接复用成功目录；设置页也从这里读取状态，不另发发现请求。
     catalog: Result<Vec<Tool>, String>,
 }
 
@@ -180,7 +180,12 @@ impl McpManager {
         // 同一项目的并发准备共用连接；失败的工具调用不会走这里重放。
         let mut state = cell.lock().await;
         let connection = match state.connection.as_ref().filter(|connection| !connection.is_closed()) {
-            Some(connection) => Arc::clone(connection),
+            Some(connection) => {
+                if let Ok(tools) = &state.catalog {
+                    return Ok((Arc::clone(connection), tools.clone()));
+                }
+                Arc::clone(connection)
+            }
             None => {
                 state.connection = None;
                 match Connection::connect(cwd, config).await {
@@ -201,8 +206,12 @@ impl McpManager {
         tools.map(|tools| (connection, tools))
     }
 
-    /// 在首次模型请求前发现全部已启用工具；BTreeMap 与名称排序保持请求定义顺序稳定。
+    /// 获取全部已启用工具；健康连接复用成功目录，首连、重连或上次发现失败时重新发现。
+    /// BTreeMap 与名称排序保持请求定义顺序稳定。
     pub async fn discover(&self, cwd: &Path, signal: &CancellationToken) -> McpDiscovery {
+        if signal.is_cancelled() {
+            return McpDiscovery::default();
+        }
         let entries = match self.entries(cwd, None, false) {
             Ok(entries) => entries,
             Err(error) => {
@@ -260,6 +269,7 @@ impl McpManager {
             // 连接失败保存在状态中，与执行准备失败使用同一份原因。
             let _ = Self::tools(cwd, config, &cell).await;
         }
+        // 重连等待期间设置可能已修改，返回时读取当前配置和连接。
         let config = config::read(&self.home)?;
         let config = config.servers.get(id).ok_or("MCP 服务器不存在。")?;
         let mut inspection = McpInspection {

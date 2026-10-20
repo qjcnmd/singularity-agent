@@ -1,4 +1,4 @@
-import { Ellipsis, Plus } from 'lucide-react'
+import { Ellipsis, FolderMinus, Plus } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { AnimatePresence } from 'motion/react'
@@ -6,7 +6,8 @@ import { useSelectionGuard } from '../interactions'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
 import type { ThreadSummary, Workspace } from '../protocol'
 import { sessionTitles } from '../sessionTitle'
-import { isBlankSession, sessionState } from '../sessionState'
+import { workspaceName } from '../copy'
+import { sessionState } from '../sessionState'
 import { Dialog } from './Dialog'
 import { Menu } from './Menu'
 import { Disclosure } from './Disclosure'
@@ -17,7 +18,6 @@ import type { WorkspaceAppearance } from '../appStore'
 type PendingDialog =
   | { kind: 'none' }
   | { kind: 'rename'; session: ThreadSummary }
-  | { kind: 'workspace-rename'; workspace: Workspace }
   | { kind: 'remove'; workspace: Workspace }
 
 export const Sidebar = memo(SidebarView)
@@ -82,14 +82,8 @@ function SidebarView() {
           </div>
           <div className="workspace-list">
             {state.bootstrap?.workspaces.map((item) => {
-              // 派生展示标题，并过滤隐藏未选中的空白未命名会话
-              const all = state.bootstrap?.sessionsByWorkspace[item.workspaceId] ?? []
-              const titleOf = sessionTitles(all)
-              const sessions = all.filter(session => {
-                const blank = isBlankSession(session)
-                const active = state.liveSessions[session.threadId]?.phase
-                return !blank || session.threadId === state.selectedSessionId || (active !== undefined && active !== 'idle')
-              })
+              const sessions = state.bootstrap?.sessionsByWorkspace[item.workspaceId] ?? []
+              const titleOf = sessionTitles(sessions)
               const expanded = !collapsed.has(item.workspaceId)
               const visible = showAll.has(item.workspaceId) ? sessions : sessions.slice(0, 5)
               return <section key={item.workspaceId}>
@@ -110,7 +104,6 @@ function SidebarView() {
                     } else next.add(item.workspaceId)
                     appStore.setSidebarView({ collapsed: [...next] })
                   }}
-                  onRename={() => setDialog({ kind: 'workspace-rename', workspace: item })}
                   onRemove={() => setDialog({ kind: 'remove', workspace: item })}
                 />
                 <Disclosure open={expanded}><div className="session-list">
@@ -142,15 +135,14 @@ function SidebarView() {
   )
 }
 
-function WorkspaceButton({ workspace, selected, expanded, appearance, onToggle, onRename, onRemove }: { workspace: Workspace; selected: boolean; expanded: boolean; appearance: WorkspaceAppearance; onToggle: () => void; onRename: () => void; onRemove: () => void }) {
+function WorkspaceButton({ workspace, selected, expanded, appearance, onToggle, onRemove }: { workspace: Workspace; selected: boolean; expanded: boolean; appearance: WorkspaceAppearance; onToggle: () => void; onRemove: () => void }) {
   const guard = useSelectionGuard()
-  const [menuOpen, setMenuOpen] = useState(false)
   const [appearanceOpen, setAppearanceOpen] = useState(false)
   const iconAnchor = useRef<HTMLButtonElement>(null)
-  const anchor = useRef<HTMLButtonElement>(null)
+  const name = workspaceName(workspace)
   return (
-    <div className={`workspace-row${selected ? ' is-selected' : ''}`} onContextMenu={event => { event.preventDefault(); setMenuOpen(true) }}>
-      <button ref={iconAnchor} type="button" className="workspace-icon-button" aria-label={`更改 ${workspace.name} 的颜色`} aria-haspopup="dialog" aria-expanded={appearanceOpen} onClick={() => setAppearanceOpen(value => !value)}><WorkspaceIcon appearance={appearance} /></button>
+    <div className={`workspace-row${selected ? ' is-selected' : ''}`}>
+      <button ref={iconAnchor} type="button" className="workspace-icon-button" aria-label={`更改 ${name} 的颜色`} aria-haspopup="dialog" aria-expanded={appearanceOpen} onClick={() => setAppearanceOpen(value => !value)}><WorkspaceIcon appearance={appearance} /></button>
       <button
         type="button"
         className="workspace-button"
@@ -158,12 +150,11 @@ function WorkspaceButton({ workspace, selected, expanded, appearance, onToggle, 
         aria-expanded={expanded}
         title={workspace.root}
       >
-        <span className="workspace-name"><strong>{workspace.name}</strong></span>
+        <span className="workspace-name"><strong>{name}</strong></span>
         <ExpandChevron expanded={expanded} className="workspace-chevron" />
       </button>
-      <button type="button" className="icon-button workspace-new" onClick={() => void appStore.createSession(workspace.workspaceId)} aria-label={`在 ${workspace.name} 新建任务`}><Plus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
-      <button ref={anchor} type="button" className="icon-button workspace-remove" onClick={() => setMenuOpen(value => !value)} aria-label={`项目菜单 ${workspace.name}`} aria-haspopup="menu" aria-expanded={menuOpen}><Ellipsis size={16} strokeWidth={1.6} aria-hidden="true" /></button>
-      {menuOpen && <Menu anchor={anchor} label="项目菜单" onClose={() => setMenuOpen(false)} entries={[{ id: 'appearance', label: '更改颜色', onSelect: () => setAppearanceOpen(true) }, { id: 'rename', label: '重命名', onSelect: onRename }, { id: 'remove', label: '移除项目', danger: true, onSelect: onRemove }]} />}
+      <button type="button" className="icon-button workspace-new" onClick={() => void appStore.newTask(workspace.workspaceId)} aria-label={`在 ${name} 新建任务`}><Plus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
+      <button type="button" className="icon-button workspace-remove" onClick={onRemove} aria-label={`移除项目 ${name}`} title="移除项目" aria-haspopup="dialog"><FolderMinus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
       <AnimatePresence>{appearanceOpen && <WorkspaceAppearancePicker anchor={iconAnchor} appearance={appearance} onChange={value => appStore.setWorkspaceAppearance(workspace.workspaceId, value)} onClose={() => { setAppearanceOpen(false); requestAnimationFrame(() => iconAnchor.current?.focus()) }} />}</AnimatePresence>
     </div>
   )
@@ -212,27 +203,26 @@ function SessionButton({
 function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () => void }) {
   const [name, setName] = useState('')
   const { actionErrors, pendingActions } = useAppStore(['actionErrors', 'pendingActions'])
-  const method = state.kind === 'rename' ? 'session.rename' : state.kind === 'workspace-rename' ? 'workspace.rename' : 'workspace.remove'
+  const method = state.kind === 'rename' ? 'session.rename' : 'workspace.remove'
   const origin = state.kind === 'none' ? null : actionOrigin.inline(method, state.kind === 'rename' ? state.session.threadId : state.workspace.workspaceId)
   const busy = origin !== null && pendingActions.has(pendingKey(method, origin))
   const close = () => { if (!busy) onClose() }
-  const initialName = state.kind === 'rename' ? state.session.title ?? '' : state.kind === 'workspace-rename' ? state.workspace.name : ''
+  const initialName = state.kind === 'rename' ? state.session.title ?? '' : ''
   useEffect(() => {
     setName(initialName)
     if (origin !== null) appStore.clearError(origin)
   }, [initialName, origin])
   const failure = origin === null ? undefined : actionErrors[origin]
   if (state.kind === 'none') return null
-  if (state.kind === 'rename' || state.kind === 'workspace-rename') {
-    const title = state.kind === 'rename' ? '重命名任务' : '重命名项目'
+  if (state.kind === 'rename') {
     const submit = async () => {
       if (name.trim() === '') return
-      const accepted = state.kind === 'rename' ? await appStore.renameSession(state.session.threadId, name.trim()) : await appStore.renameWorkspace(state.workspace.workspaceId, name.trim())
+      const accepted = await appStore.renameSession(state.session.threadId, name.trim())
       if (accepted) onClose()
     }
     return (
       <Dialog open onClose={close} labelledBy="rename-title" className="confirm-modal">
-        <header className="modal-header"><div><span>任务</span><h2 id="rename-title">{title}</h2></div><button type="button" className="icon-button" disabled={busy} onClick={close} aria-label="关闭">×</button></header>
+        <header className="modal-header"><div><span>任务</span><h2 id="rename-title">重命名任务</h2></div><button type="button" className="icon-button" disabled={busy} onClick={close} aria-label="关闭">×</button></header>
         <form className="confirm-body" onSubmit={(event) => { event.preventDefault(); void submit() }}>
           <label><span>名称</span><input data-autofocus disabled={busy} value={name} onChange={(event) => setName(event.target.value)} /></label>
           {failure && <p className="form-error" role="alert">{failure.message}</p>}
@@ -242,7 +232,7 @@ function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () =
     )
   }
   const title = '移除项目'
-  const targetName = state.workspace.name
+  const targetName = workspaceName(state.workspace)
   const confirm = async () => { if (await appStore.removeWorkspace(state.workspace.workspaceId)) onClose() }
   return (
     <Dialog open onClose={close} labelledBy="confirm-title" className="confirm-modal">

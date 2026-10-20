@@ -1,8 +1,8 @@
 import type { ImageUpload } from './protocol'
 
-export interface Draft { text: string; images: File[]; skills?: Record<string, string> }
+export interface Draft { text: string; images: File[]; skills?: Record<string, string>; selector?: string }
 export const emptyDraft: Draft = { text: '', images: [] }
-export const hasDraft = (draft: Draft | undefined) => draft !== undefined && (draft.text !== '' || draft.images.length > 0)
+const hasDraft = (draft: Draft | undefined) => draft !== undefined && (draft.text !== '' || draft.images.length > 0 || draft.selector !== undefined)
 
 export type DraftSnapshot = Readonly<Record<string, Draft>>
 
@@ -55,16 +55,9 @@ export class DraftStore {
     }
   }
 
-  /** 发送或转移期间继续编辑的内容仍保留。 */
+  /** 发送期间继续编辑的内容仍保留。 */
   async clearIfUnchanged(sessionId: string, submitted: Draft): Promise<void> {
     if (this.snapshot?.[sessionId] === submitted) await this.set(sessionId, emptyDraft)
-  }
-
-  /** 目标保存成功后才清空源；保存期间源草稿有新编辑时保留新内容。 */
-  async transfer(sourceId: string, targetId: string): Promise<void> {
-    if (sourceId === targetId) return
-    const draft = this.get(sourceId)
-    if (hasDraft(draft) && await this.set(targetId, draft)) await this.clearIfUnchanged(sourceId, draft)
   }
 
   /** 归档或移除已成功；草稿删除成功后才更新快照，失败保留原记录并说明部分完成。 */

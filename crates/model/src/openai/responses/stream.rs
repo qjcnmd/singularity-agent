@@ -7,9 +7,10 @@ pub(crate) async fn read_responses_sse_stream(
     on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     config: &OpenAiProviderConfig,
     selection: &SelectedModel,
+    endpoint: &str,
 ) -> Result<ModelTurnResponse, ProviderError> {
     let payload = read_sse_stream(cancellation, response, ResponsesSseDecoder::new(on_event)).await?;
-    parse_openai_responses_response(config, payload, &selection.model_name)
+    parse_openai_responses_response(config, payload, &selection.model_name, endpoint)
 }
 
 /// 按 Responses 事件契约增量解析的 SSE 解码器。

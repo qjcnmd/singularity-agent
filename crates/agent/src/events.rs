@@ -1,47 +1,18 @@
-//! Agent 运行事件的出口：生命周期事件与脱敏后的诊断。
+//! Agent 运行事件的出口：生命周期事件。
 //!
 //! 事件通过调用方传入的 `&mut dyn FnMut(AgentEvent)` 回调流式送出。投递尽力而为，
 //! 消费方自己吸收失败，不影响轮次结果；不需要观察事件的调用方传空闭包。
 
 use serde_json::Value;
-use singularity_protocol::DiagnosticSeverity;
 
 use crate::tools::ToolExecution;
-
-pub(crate) mod diagnostic_code {
-    pub const PROVIDER_RETRY_SCHEDULED: &str = "provider_retry_scheduled";
-}
-
-/// 安全且不落盘的诊断。code 对消费方保持稳定；message 不含 provider 的原始 payload。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentDiagnostic {
-    pub severity: DiagnosticSeverity,
-    pub code: String,
-    pub message: String,
-}
-
-impl AgentDiagnostic {
-    pub fn info(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            severity: DiagnosticSeverity::Info,
-            code: code.into(),
-            message: message.into(),
-        }
-    }
-
-    pub fn warning(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            severity: DiagnosticSeverity::Warning,
-            code: code.into(),
-            message: message.into(),
-        }
-    }
-}
 
 /// 工具 Started 事件按调用顺序投递，Update/Ended 按实际完成顺序投递；
 /// 落盘的 toolResult 按完成顺序追加，模型上下文则按调用顺序投影。
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// 本轮已保存的指令、Skills 目录或工具定义。
+    ContextInjected { item: singularity_protocol::HistoryItem },
     /// 模型正文的流式增量；message_id 指向它所属的 assistant 消息。
     MessageUpdate { message_id: String, delta: String },
     /// 当前 assistant 消息里对外公开的思考文本的流式增量。
@@ -69,8 +40,6 @@ pub enum AgentEvent {
         item_id: String,
         execution: ToolExecution,
     },
-    /// 非致命且已脱敏的 Agent 诊断；不会写入 Session 的 JSONL。
-    Diagnostic(AgentDiagnostic),
     /// 一次 provider HTTP attempt 的生命周期观测，身份在请求开始时分配。
     ProviderAttempt {
         observation: singularity_protocol::RequestObservation,

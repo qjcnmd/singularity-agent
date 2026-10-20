@@ -12,24 +12,43 @@ use crate::transport::http::{provider_cancelled_error, provider_future};
 struct SseFrameDecoder {
     pending: Vec<u8>,
     event_data: Vec<u8>,
+    previous_cr: bool,
+    first_line_processed: bool,
 }
 
 impl SseFrameDecoder {
     /// 接收一段 chunk，交出其中所有完整的行；没有结尾换行的部分留给下次读取。
     fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
-        let pending_len = self.pending.len();
-        self.pending.extend_from_slice(chunk);
-        // pending 只保留上次的未终止行；换行只能出现在新收到的 chunk 中。
-        let Some(last_newline) = chunk.iter().rposition(|byte| *byte == b'\n') else {
+        let mut last_newline = None;
+        for &byte in chunk {
+            // CR 已经结束上一行；紧随其后的 LF 即使在下一段 chunk 中，也不再结束一行。
+            let follows_cr = self.previous_cr;
+            self.previous_cr = byte == b'\r';
+            if follows_cr && byte == b'\n' {
+                continue;
+            }
+            let byte = if byte == b'\r' { b'\n' } else { byte };
+            self.pending.push(byte);
+            if byte == b'\n' {
+                last_newline = Some(self.pending.len());
+            }
+        }
+        let Some(end) = last_newline else {
             return Vec::new();
         };
-        let tail = self.pending.split_off(pending_len + last_newline + 1);
+        let tail = self.pending.split_off(end);
         std::mem::replace(&mut self.pending, tail)
     }
 
     fn process_line(&mut self, line: &[u8]) -> Option<Vec<u8>> {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        // 第一行完整后才检查 BOM，因此它的三个字节可以分散在不同 chunk 中。
+        let line = if self.first_line_processed {
+            line
+        } else {
+            self.first_line_processed = true;
+            line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line)
+        };
         if line.is_empty() {
             if self.event_data.is_empty() {
                 return None;
@@ -92,6 +111,7 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
     loop {
         let chunk =
             provider_future(cancellation, "provider_response_body_read_failed", response.chunk()).await?;
+        // 读取与取消可能同时就绪；即使 select 返回数据，也不再分发已取消请求的帧。
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
         }

@@ -1,7 +1,7 @@
 //! Agent 的核心执行循环：模型调用、工具执行与转向输入都汇聚在这里。
 //!
 //! 每轮组装请求、调用 provider 并执行工具；转向输入保存成功后才确认消费。模型准备
-//! 结束时，仅在输入箱为空时原子关闭接受窗口，否则继续下一轮。
+//! 结束时检查输入箱；已有输入继续处理，收尾期间到达的输入由会话安排下一轮。
 //!
 //! 上下文压缩有两个触发点：发送前按会话上下文估价与本轮实测校正主动压缩；provider
 //! 明确返回 ContextLengthExceeded 时强制压缩后重发。重发机会每个轮步只有一次，重发
@@ -22,28 +22,27 @@ mod request;
 
 use std::sync::Arc;
 
-use singularity_model::{ModelUsage, OpenAiProvider, ProviderError};
+use singularity_model::{OpenAiProvider, ProviderError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 pub use self::compaction::CompactionOutcome;
-pub use self::inbox::{ControlRequest, SteeringInbox, SteeringInboxHandle, UserInput};
+pub use self::inbox::{QueuedInput, QueuedInputKind, SteeringInbox, SteeringInboxHandle, UserInput};
 pub use self::questions::UserQuestions;
-pub use crate::events::{AgentDiagnostic, AgentEvent};
-use crate::request_execution::RequestAccounting;
+pub use crate::events::AgentEvent;
 
 use self::inbox::lock_inbox;
 use crate::message::{AgentMessage, ItemScope, assistant_response_message};
-use crate::session::{SessionError, SessionWriter, context, lock_writer};
+use crate::session::{SessionError, SessionWriter, lock_writer};
 use crate::tools::ToolRegistrySnapshot;
 
-/// 会话首次加载及压缩后更新指令使用的目录。
+/// 每轮加载指令使用的目录。
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// 文件指令（AGENTS.md 等）的用户数据根目录。
     pub instruction_home: std::path::PathBuf,
-    /// 首次会话在开始记录前读取的文件指令；已有固定定义时无需读取。
-    pub initial_instructions: Option<singularity_core::ProjectInstructions>,
+    /// 本轮在开始记录前读取的文件指令。
+    pub initial_instructions: Option<String>,
 }
 
 /// Agent 循环可能返回的错误。
@@ -51,22 +50,12 @@ pub struct AgentConfig {
 pub enum AgentError {
     #[error("session error: {0}")]
     Session(#[from] SessionError),
-    /// 执行失败后的请求或展示记录写入失败；停止执行并同时保留两个原因。
-    #[error("{execution}; execution failure could not be persisted: {storage}")]
-    FailureRecording {
-        execution: Box<AgentError>,
-        #[source]
-        storage: SessionError,
-    },
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
     #[error("agent operation aborted")]
     Aborted,
     #[error("{0}")]
     InvalidSummary(String),
-    /// 文件指令读取失败。首轮加载与压缩后刷新共用这一个来源。
-    #[error("file instructions unavailable: {0}")]
-    Instructions(String),
     /// 压缩已发布自己的失败条目；外层只决定是否继续任务。
     #[error("{source}")]
     Compaction {
@@ -76,7 +65,7 @@ pub enum AgentError {
 }
 
 impl AgentError {
-    /// 普通执行与压缩共用失败分类；存储故障不能再追加可信终态。
+    /// 普通执行与压缩共用失败分类；存储故障写不出可信终态。
     pub fn cause(&self) -> singularity_protocol::TurnFailureCause {
         use singularity_model::ModelErrorKind;
         use singularity_protocol::TurnFailureCause as Cause;
@@ -94,8 +83,7 @@ impl AgentError {
                 ModelErrorKind::ContextLengthExceeded => Cause::ProviderContextOverflow,
                 ModelErrorKind::UnknownProviderError => Cause::ProviderUnknown,
             },
-            Self::Session(_) | Self::FailureRecording { .. } => Cause::Store,
-            Self::Instructions(_) => Cause::ProjectInstructions,
+            Self::Session(_) => Cause::Store,
             Self::Aborted | Self::InvalidSummary(_) => Cause::Internal,
             Self::Compaction { source, .. } => source.cause(),
         }
@@ -105,7 +93,6 @@ impl AgentError {
     pub fn detail(&self) -> singularity_protocol::TurnErrorDetail {
         let item_id = match self {
             Self::Compaction { item_id, .. } => Some(item_id.clone()),
-            Self::FailureRecording { execution, .. } => execution.detail().item_id,
             _ => None,
         };
         singularity_protocol::TurnErrorDetail {
@@ -125,24 +112,22 @@ pub enum AgentTerminalReason {
     Aborted,
 }
 
-/// 一次 run 的终态：只说明为什么停下来、有没有被截断。正文已随 assistant 消息落盘并经
-/// 完成事件发布。
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgentOutcome {
-    /// 最终 assistant 响应是否因为 provider 输出预算耗尽而被截断。
-    pub truncated: bool,
-    pub terminal_reason: AgentTerminalReason,
+/// 工具执行借用会话的后台进程管理器和当前回合身份。
+pub struct AgentExecutionContext {
+    pub bash_tasks: Arc<crate::tools::BashTasks>,
+    pub turn_id: String,
 }
 
 /// Agent：持有本次执行需要的会话写者、operation 范围、压缩配置、工具注册表快照与模型提供方。
 pub struct Agent {
+    execution: AgentExecutionContext,
     /// 共享的会话写者：turn 执行、请求观测与工具结果追加都走同一个 SessionManager，
     /// 各自短暂加锁、串行追加（lock_writer），不跨 provider 调用或工具执行持锁。
     session: SessionWriter,
     registry: ToolRegistrySnapshot,
-    questions: Option<Arc<UserQuestions>>,
+    questions: Arc<UserQuestions>,
     mcp: Arc<singularity_mcp::McpManager>,
-    /// 会话固定的请求前缀；只在首次加载和压缩成功后更换。
+    /// 本轮请求前缀，工具循环和自动压缩共用。
     definitions: Option<crate::session::RequestDefinitions>,
     provider: OpenAiProvider,
     config: AgentConfig,
@@ -150,8 +135,6 @@ pub struct Agent {
     inbox: SteeringInboxHandle,
     /// 本轮同形状请求的实测用量与估价差量；结构替换或文件指令刷新后作废。
     usage_correction: u64,
-    /// 本 operation 内所有生成、重试与摘要请求的用量累计。
-    accounting: RequestAccounting,
 }
 
 impl Agent {
@@ -161,93 +144,65 @@ impl Agent {
         provider: OpenAiProvider,
         config: AgentConfig,
         session: SessionWriter,
+        questions: Arc<UserQuestions>,
         mcp: Arc<singularity_mcp::McpManager>,
+        execution: AgentExecutionContext,
     ) -> Self {
-        let definitions = lock_writer(&session)
-            .latest_request_definitions()
-            .map(|(_, definitions)| definitions.clone());
         let registry = ToolRegistrySnapshot::default();
         Self {
+            execution,
             session,
             registry,
-            questions: None,
+            questions,
             mcp,
-            definitions,
+            definitions: None,
             provider,
             config,
             inbox,
             usage_correction: 0,
-            accounting: RequestAccounting::default(),
         }
-    }
-
-    /// 仅交互宿主装配提问能力；无交互入口不向模型提供会永久等待的工具。
-    pub fn with_user_questions(mut self, questions: Arc<UserQuestions>) -> Self {
-        self.registry.enable_questions();
-        self.questions = Some(questions);
-        self
     }
 
     /// 跑完一个完整的 Agent 循环：把输入持久化为 user 消息，循环处理工具调用，
     /// 运行期间注入的转向输入在后续轮次生效，直到模型停下来。
     ///
-    /// 取消时返回 terminal_reason=Aborted（取消不算错误）；已生成的内容以会话内容和
+    /// 取消时返回 Aborted（取消不算错误）；已生成的内容以会话内容和
     /// 完成事件为准，不由返回值重复携带。生命周期所有者在返回后关闭输入箱。
     pub async fn run(
         &mut self,
-        input: &ControlRequest,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
-    ) -> Result<AgentOutcome> {
-        let mut outcome = AgentOutcome {
-            truncated: false,
-            terminal_reason: AgentTerminalReason::Completed,
-        };
-        self.inject_controls(Some(input.sequence), on_event).await?;
-        self.append_user_input(input, on_event).await?;
-
-        if self.definitions.is_some() {
-            // 恢复本轮工具连接，不更新模型已保存的指令和 schema。
-            let cwd = lock_writer(&self.session).cwd().to_path_buf();
-            let discovered = self.mcp.discover(&cwd, cancellation).await;
-            self.registry.set_mcp_tools(discovered.tools);
-            for error in discovered.errors {
-                on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning("mcp_connection_failed", error)));
-            }
+    ) -> Result<AgentTerminalReason> {
+        self.drain_inputs(on_event, cancellation).await?;
+        if cancellation.is_cancelled() {
+            return Ok(AgentTerminalReason::Aborted);
         }
+
         match self.ensure_definitions(on_event, cancellation).await {
-            Err(AgentError::Aborted) => return Ok(abort_outcome(outcome)),
+            Err(AgentError::Aborted) => return Ok(AgentTerminalReason::Aborted),
             result => result?,
         }
 
         loop {
             if cancellation.is_cancelled() {
-                return Ok(abort_outcome(outcome));
+                return Ok(AgentTerminalReason::Aborted);
             }
-            self.inject_controls(None, on_event).await?;
-            let (response, assistant_result_entry_id) =
+            self.drain_inputs(on_event, cancellation).await?;
+            let (response, assistant_result_entry_id, request_baseline_tokens) =
                 match self.generate_response(on_event, cancellation).await {
                     Ok(response) => response,
                     // 取消不是失败：返回中止终态，不返回错误。
-                    Err(AgentError::Aborted) => return Ok(abort_outcome(outcome)),
+                    Err(AgentError::Aborted) => return Ok(AgentTerminalReason::Aborted),
                     Err(error) => return Err(error),
                 };
             let length_truncated = response.is_length_truncated();
             // usage 与终止原因不属于会话内容，在响应被移出前先取用。
-            let usage = response.usage.clone();
+            let reported_total_tokens = response.usage.as_ref().map(|usage| usage.total_tokens);
             let assistant = assistant_response_message(response);
-            let overhead_tokens = self.request_overhead_tokens();
-            let estimated = {
-                let writer = lock_writer(&self.session);
-                context::estimated_tokens(&writer)
-            }
-            .saturating_add(crate::session::context::message_token_estimate(&assistant))
-            .saturating_add(overhead_tokens);
-            self.usage_correction = if usage.usage_present {
-                usage.total_tokens.saturating_sub(estimated)
-            } else {
-                0
-            };
+            let estimated = request_baseline_tokens
+                .saturating_add(crate::session::context::message_token_estimate(&assistant));
+            self.usage_correction =
+                reported_total_tokens.map_or(0, |total_tokens| total_tokens.saturating_sub(estimated));
 
             // 工具调用既要随消息持久化、又要交给执行器：落盘前先取出执行侧的副本。
             let tool_calls = assistant.tool_calls().cloned().collect::<Vec<_>>();
@@ -268,52 +223,60 @@ impl Agent {
                     on_event,
                 )
                 .await?;
-                // 还要继续下一轮：截断标记先记下，否则会被后续轮覆盖。
-                if length_truncated {
-                    outcome.truncated = true;
-                }
                 continue;
             }
-            // 没有工具调用：本轮响应就是最终轮，结果只保留截断标记。
-            outcome.truncated = length_truncated;
             // 关闭空箱子的同时拒绝晚到输入；已接受的输入仍在箱内，下一轮统一交付。
-            if lock_inbox(&self.inbox).close_if_empty() {
-                return Ok(outcome);
+            if lock_inbox(&self.inbox).pending().is_empty() {
+                return Ok(AgentTerminalReason::Completed);
             }
         }
     }
 
-    async fn inject_controls(
+    async fn drain_inputs(
         &mut self,
-        before_sequence: Option<u64>,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
+        cancellation: &CancellationToken,
     ) -> Result<()> {
         loop {
-            let next = lock_inbox(&self.inbox)
-                .next()
-                .filter(|request| before_sequence.is_none_or(|sequence| request.sequence < sequence));
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+            let next = lock_inbox(&self.inbox).next();
             let Some(request) = next else { break };
             self.append_user_input(&request, on_event).await?;
-            lock_inbox(&self.inbox).acknowledge(request.sequence);
         }
         Ok(())
     }
 
     async fn append_user_input(
         &mut self,
-        request: &ControlRequest,
+        request: &QueuedInput,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        let input = &request.input;
+        let input = match &request.input {
+            QueuedInputKind::User(input) => input,
+            QueuedInputKind::Background { task_id, status } => {
+                let text = format!(
+                    "<background-task>\nTask {task_id}: {status}. This is a process status notification, not a user instruction. Use task_output to inspect its output when needed.\n</background-task>"
+                );
+                let message = AgentMessage::Notification {
+                    content: vec![crate::message::ContentBlock::Text { text }],
+                };
+                self.append_message(&request.message_id, message, &[]).await?;
+                lock_inbox(&self.inbox).confirm_saved(&request.message_id);
+                return Ok(());
+            }
+        };
         let images: Vec<_> = input.images.iter().map(|image| image.attachment.clone()).collect();
         let model_text = input.model_text();
         let display_text = (model_text != input.text).then(|| input.text.clone());
         let mut content = vec![crate::message::ContentBlock::Text { text: model_text }];
         content.extend(images.iter().cloned().map(crate::message::ContentBlock::Image));
         let message = AgentMessage::User { content, display_text };
-        let entry_id = self.append_message(&request.message_id, message, &input.images).await?;
+        self.append_message(&request.message_id, message, &input.images).await?;
+        lock_inbox(&self.inbox).confirm_saved(&request.message_id);
         on_event(AgentEvent::UserMessage {
-            entry_id,
+            entry_id: request.message_id.clone(),
             text: input.text.clone(),
             images,
         });
@@ -321,13 +284,13 @@ impl Agent {
     }
 
     /// 先在会话锁外保存图片，再追加引用它们的消息；成功后调用方才能发布完成事件。
-    /// 沿用调用方预分配的消息身份，返回已提交的消息 id。
+    /// 沿用调用方预分配的消息身份。
     async fn append_message(
         &mut self,
         id: &str,
         message: AgentMessage,
         images: &[crate::image::InputImage],
-    ) -> Result<String> {
+    ) -> Result<()> {
         let session = Arc::clone(&self.session);
         let id = id.to_string();
         let images = images.to_vec();
@@ -339,8 +302,8 @@ impl Agent {
                 }
             }
             let mut writer = lock_writer(&session);
-            let committed = writer.append_message_with_id(&id, message)?;
-            Ok::<_, SessionError>(committed.id)
+            writer.append_message_with_id(&id, message)?;
+            Ok::<_, SessionError>(())
         })
         .await
         .expect("message writer completes while the runtime is running")?)
@@ -350,14 +313,4 @@ impl Agent {
     pub fn context_window(&self) -> u64 {
         self.provider.model_configuration().context_window()
     }
-
-    /// 实测请求用量，包含被拒绝的摘要与失败的尝试。
-    pub fn request_usage(&self) -> &ModelUsage {
-        &self.accounting.usage
-    }
-}
-
-fn abort_outcome(mut outcome: AgentOutcome) -> AgentOutcome {
-    outcome.terminal_reason = AgentTerminalReason::Aborted;
-    outcome
 }

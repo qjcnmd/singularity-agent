@@ -8,7 +8,7 @@ import type { DirectoryPickResult, RpcResponse } from '../src/protocol.generated
 
 const entry = 'singularity://app/'
 const home = resolve(process.env.SINGULARITY_HOME || join(homedir(), '.singularity'))
-// 不同数据目录不得共用 Electron 的 Chromium profile 锁和视图状态。
+// 数据目录决定 Chromium profile：不同目录各用各的锁和视图状态。
 app.setPath('userData', join(app.getPath('appData'), 'Singularity', createHash('sha256').update(home.toLowerCase()).digest('hex').slice(0, 16)))
 protocol.registerSchemesAsPrivileged([{ scheme: 'singularity', privileges: { standard: true, secure: true, supportFetchAPI: true } }])
 let window: BrowserWindow

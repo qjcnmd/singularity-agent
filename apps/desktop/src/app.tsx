@@ -6,25 +6,30 @@ import { Composer } from './components/Composer'
 import { Conversation } from './components/Conversation'
 import { Settings } from './components/Settings'
 import { Sidebar } from './components/Sidebar'
-import { Trajectory } from './components/Trajectory'
+import { BackgroundTasks, BackgroundTasksButton } from './components/BackgroundTasks'
 import { hasInlineActionError, useAppStore, appStore } from './appStore'
 import { buildTimeline } from './timeline'
 import { sessionTitles } from './sessionTitle'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
 export function App() {
-  const state = useAppStore(['theme', 'messageFontSize', 'selectedSessionId', 'selectedWorkspaceId', 'bootstrap', 'sidebarCollapsed', 'sidebarWidth', 'trajectoryWidth', 'trajectoryOpen', 'settingsOpen', 'actionErrors', 'pendingActions'])
+  const state = useAppStore(['theme', 'messageFontSize', 'selectedSessionId', 'sidebarCollapsed', 'sidebarWidth', 'backgroundWidth', 'backgroundOpen'])
   useLayoutEffect(() => { document.documentElement.dataset.theme = state.theme }, [state.theme])
   useLayoutEffect(() => { document.documentElement.style.setProperty('--message-font-size', `${state.messageFontSize}px`) }, [state.messageFontSize])
   const [compactViewport, setCompactViewport] = useState(() => window.matchMedia('(max-width: 1000px)').matches)
-  const trajectoryToggle = useRef<HTMLButtonElement>(null)
-  const trajectoryPanel = useRef<HTMLElement>(null)
+  const detailOpener = useRef<HTMLButtonElement | null>(null)
+  const backgroundToggle = useRef<HTMLButtonElement>(null)
+  const backgroundPanel = useRef<HTMLElement>(null)
   const reducedMotion = useReducedMotion()
   const panelTransition = { duration: reducedMotion ? 0 : 0.16, ease: 'easeOut' as const }
 
-  const closeTrajectory = () => {
-    appStore.setTrajectoryOpen(false)
-    requestAnimationFrame(() => trajectoryToggle.current?.focus())
+  const closeBackground = () => {
+    appStore.setBackgroundOpen(false)
+    requestAnimationFrame(() => {
+      const opener = detailOpener.current
+      if (opener?.isConnected) opener.focus()
+      else backgroundToggle.current?.focus()
+    })
   }
   useEffect(() => {
     const media = window.matchMedia('(max-width: 1000px)')
@@ -33,10 +38,10 @@ export function App() {
     return () => media.removeEventListener('change', update)
   }, [])
   useEffect(() => {
-    if (!state.trajectoryOpen) return
-    let frame = requestAnimationFrame(() => { frame = requestAnimationFrame(() => trajectoryPanel.current?.querySelector<HTMLButtonElement>('button')?.focus()) })
+    if (!state.backgroundOpen) return
+    let frame = requestAnimationFrame(() => { frame = requestAnimationFrame(() => backgroundPanel.current?.querySelector<HTMLButtonElement>('button')?.focus()) })
     return () => cancelAnimationFrame(frame)
-  }, [state.trajectoryOpen, compactViewport])
+  }, [state.backgroundOpen, compactViewport])
 
   useEffect(() => {
     appStore.start()
@@ -53,11 +58,11 @@ export function App() {
     <div className="app-shell" style={shellStyle}>
       <Sidebar />
       {!state.sidebarCollapsed ? <ResizeSeparator value={state.sidebarWidth} onChange={(value) => appStore.setSidebarWidth(value)} /> : <div />}
-      <div className="app-content" style={{ '--trajectory-width': `${state.trajectoryWidth}px` } as CSSProperties} onKeyDown={event => {
-        if (!state.trajectoryOpen) return
-        if (event.key === 'Escape') { event.stopPropagation(); closeTrajectory() }
+      <div className="app-content" style={{ '--background-width': `${state.backgroundWidth}px` } as CSSProperties} onKeyDown={event => {
+        if (!state.backgroundOpen) return
+        if (event.key === 'Escape') { event.stopPropagation(); closeBackground() }
         if (event.key !== 'Tab' || !compactViewport) return
-        const nodes = [trajectoryToggle.current, ...(trajectoryPanel.current ? focusableElements(trajectoryPanel.current) : [])]
+        const nodes = [backgroundToggle.current, ...(backgroundPanel.current ? focusableElements(backgroundPanel.current) : [])]
           .filter((node): node is HTMLElement => node !== null && node.getClientRects().length > 0)
         const first = nodes[0], last = nodes.at(-1)
         if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
@@ -65,41 +70,52 @@ export function App() {
       }}>
         <SidebarToggle
           side="right"
-          expanded={state.trajectoryOpen}
-          controls="trajectory-panel"
-          buttonRef={trajectoryToggle}
-          className="trajectory-toggle"
+          expanded={state.backgroundOpen}
+          controls="background-panel"
+          buttonRef={backgroundToggle}
+          className="background-toggle"
           onClick={() => {
-            if (state.trajectoryOpen) closeTrajectory()
-            else appStore.setTrajectoryOpen(true)
+            if (state.backgroundOpen) closeBackground()
+            else {
+              detailOpener.current = backgroundToggle.current
+              appStore.setBackgroundOpen(true)
+            }
           }}
         />
-      <MainContent compactViewport={compactViewport} />
-      <aside id="trajectory-panel" className={`trajectory-panel${state.trajectoryOpen ? ' is-open' : ''}`} aria-label="右侧栏" aria-hidden={!state.trajectoryOpen} inert={!state.trajectoryOpen} ref={trajectoryPanel}>
-        <ResizeSeparator side="right" value={state.trajectoryWidth} onChange={(value) => appStore.setTrajectoryWidth(value)} />
+      <MainContent compactViewport={compactViewport} onOpenBackground={button => {
+        detailOpener.current = button
+        appStore.setBackgroundOpen(true)
+        requestAnimationFrame(() => backgroundPanel.current?.querySelector<HTMLButtonElement>('button')?.focus())
+      }} />
+      <aside id="background-panel" className={`background-panel${state.backgroundOpen ? ' is-open' : ''}`} aria-label="后台命令" aria-hidden={!state.backgroundOpen} inert={!state.backgroundOpen} ref={backgroundPanel}>
+        <ResizeSeparator side="right" value={state.backgroundWidth} onChange={(value) => appStore.setBackgroundWidth(value)} />
         <AnimatePresence initial={false} mode="wait">
-          {state.trajectoryOpen && (
+          {state.backgroundOpen && (
             <motion.div
-              key="trajectory"
+              key="background"
               className="right-panel-content"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={panelTransition}
             >
-              <Trajectory key={state.selectedSessionId} />
+              <h2 className="detail-heading">后台命令</h2>
+              <div className="detail-section"><BackgroundTasks /></div>
             </motion.div>
           )}
         </AnimatePresence>
       </aside>
       </div>
-      <Settings state={state} />
+      <Settings />
     </div>
   )
 }
 
-const MainContent = memo(function MainContent({ compactViewport }: { compactViewport: boolean }) {
-  const state = useAppStore(['selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'trajectoryOpen', 'actionErrors', 'actionErrorOrigin', 'pendingActions'])
+const MainContent = memo(function MainContent({ compactViewport, onOpenBackground }: {
+  compactViewport: boolean
+  onOpenBackground: (button: HTMLButtonElement) => void
+}) {
+  const state = useAppStore(['selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'backgroundOpen', 'actionErrors', 'actionErrorOrigin', 'pendingActions'])
   const items = useMemo(() => buildTimeline(state.session, state.bootstrap?.userHome), [state.session, state.bootstrap?.userHome])
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspaceSessions = appStore.sessions()
@@ -112,25 +128,27 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
     ? state.actionErrors[state.actionErrorOrigin]
     : null
   useEffect(() => {
-    if (visibleError === null) return
-    const timer = window.setTimeout(() => appStore.clearError(visibleError.origin), 5000)
+    const origin = state.actionErrorOrigin
+    if (visibleError === null || origin === null) return
+    const timer = window.setTimeout(() => appStore.clearError(origin), 5000)
     return () => window.clearTimeout(timer)
-  }, [visibleError])
+  }, [visibleError, state.actionErrorOrigin])
 
   return (
-      <main className={`app-main${empty && state.bootstrapLoad.status === 'idle' ? ' is-empty' : ''}`} inert={compactViewport && state.trajectoryOpen} onPointerDownCapture={() => {
+      <main className={`app-main${empty && state.bootstrapLoad.status === 'idle' ? ' is-empty' : ''}`} inert={compactViewport && state.backgroundOpen} onPointerDownCapture={() => {
         if (!state.sidebarCollapsed && window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
       }}>
         {!empty && <header className="conversation-header">
           <h1>{sessionTitle}</h1>
+          <BackgroundTasksButton onOpen={onOpenBackground} />
         </header>}
         {state.bootstrapLoad.status !== 'idle' ? (
           <section className="empty-state" aria-live="polite" aria-busy={state.bootstrapLoad.status === 'loading'}>
-            <h2>{state.bootstrapLoad.status === 'loading' ? '正在读取工作台' : '工作台读取失败'}</h2>
+            <h2>{state.bootstrapLoad.status === 'loading' ? '正在读取项目列表' : '项目列表无法读取'}</h2>
             {state.bootstrapLoad.error && <>
               <p>{state.bootstrapLoad.error.message}</p>
               {state.bootstrapLoad.error.recovery && <p className="empty-recovery">{state.bootstrapLoad.error.recovery}</p>}
-              <button type="button" className="secondary-button" onClick={() => void appStore.resync()}>重试读取工作台</button>
+              <button type="button" className="secondary-button" onClick={() => void appStore.resync()}>重试</button>
             </>}
           </section>
         ) : !empty && <Conversation state={state} items={items} />}
@@ -151,9 +169,9 @@ function ResizeSeparator({ value, onChange, side = 'left' }: { value: number; on
   const start = useRef<{ x: number; value: number } | null>(null)
   return (
     <div
-      className={`resize-separator ${side === 'left' ? 'separator-sidebar' : 'separator-trajectory'}`}
+      className={`resize-separator ${side === 'left' ? 'separator-sidebar' : 'separator-background'}`}
       role="separator"
-      aria-label={side === 'left' ? '调整侧栏宽度' : '调整轨迹侧栏宽度'}
+      aria-label={side === 'left' ? '调整侧栏宽度' : '调整后台命令侧栏宽度'}
       aria-orientation="vertical"
       aria-valuenow={value}
       tabIndex={0}

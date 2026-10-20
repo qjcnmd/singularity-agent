@@ -10,16 +10,10 @@ use singularity_core::now_iso;
 
 use crate::message::AgentMessage;
 
-use super::file::{ParsedSession, TailPolicy, parse_session_file, rewrite_file};
+use super::file::{ParsedSession, TailPolicy, parse_session_file, repair_tail};
 use super::format::{
     CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError, SessionHeader, SessionMetadata,
 };
-
-/// 已成功追加到会话的条目身份与时间；与日志中的值一致。
-pub struct CommittedEntry {
-    pub id: String,
-    pub timestamp: String,
-}
 
 /// JSONL 会话管理器。会话是严格的线性序列，entries 的物理顺序就是事实来源的顺序；
 /// 执行入口负责交接单个写者，turn 内通过 SessionWriter 串行追加。
@@ -30,6 +24,7 @@ pub struct SessionManager {
 
 /// 已解析出来的会话事实。只读扫描与写者共用同一套解析、索引和投影，写入
 /// 能力只属于 SessionManager；只读打开已有会话不会修改文件。
+#[derive(Clone)]
 pub struct SessionData {
     pub(super) file: PathBuf,
     pub(super) cwd: PathBuf,
@@ -65,6 +60,10 @@ impl std::fmt::Debug for SessionData {
 }
 
 impl SessionManager {
+    /// 当前已保存记录的不可变快照。
+    pub fn data_snapshot(&self) -> SessionData {
+        self.data.clone()
+    }
     /// 新建会话：文件名与 header id 都用调用方指定的 UUID，创建时间在写入文件头时生成。
     pub fn create_with_id(cwd: &Path, sessions_dir: &Path, session_id: &str) -> Result<Self> {
         let cwd = singularity_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
@@ -91,7 +90,7 @@ impl SessionManager {
     /// 调用方须在执行入口持有该会话的写入所有权。
     pub fn open_existing(path: &Path, expected_id: &str) -> Result<Self> {
         let file = path.to_path_buf();
-        let data = SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite, Some(expected_id))?;
+        let data = SessionData::open_parsed(&file, TailPolicy::RepairTail, Some(expected_id))?;
         Ok(Self { data, append_error: None })
     }
 }
@@ -134,12 +133,12 @@ impl SessionData {
     /// 两条打开路径共用解析与索引；写打开时修复尾行。
     fn open_parsed(path: &Path, tail_policy: TailPolicy, expected_id: Option<&str>) -> Result<Self> {
         let file = path.to_path_buf();
-        let ParsedSession { header, cwd, entries, needs_repair } = parse_session_file(&file, tail_policy)?;
+        let ParsedSession { header, cwd, entries, repair } = parse_session_file(&file, tail_policy)?;
         if let Some(expected_id) = expected_id {
             verify_header_id(&header.id, expected_id)?;
         }
-        if matches!(tail_policy, TailPolicy::RepairAndRewrite) && needs_repair {
-            rewrite_file(&file, &header, &entries)?;
+        if let Some((offset, add_newline)) = repair {
+            repair_tail(&file, offset, add_newline)?;
         }
         Ok(Self {
             file,
@@ -153,12 +152,12 @@ impl SessionData {
 
 impl SessionManager {
     /// 追加一条 compaction 条目并立即写盘（id 是预分配的：本次摘要 attempt 的
-    /// result_entry_id 就指向它）。返回已提交条目的身份与时间。
+    /// result_entry_id 就指向它）。返回已提交条目的时间。
     pub(crate) fn append_compaction_with_id(
         &mut self,
         id: &str,
         compaction: CompactionEntry,
-    ) -> Result<CommittedEntry> {
+    ) -> Result<String> {
         self.append_entry(SessionEntry::Compaction {
             id: id.to_string(),
             timestamp: now_iso(),
@@ -166,8 +165,8 @@ impl SessionManager {
         })
     }
 
-    /// 追加一条不进入模型上下文的 metadata。
-    pub fn append_metadata(&mut self, metadata: SessionMetadata) -> Result<CommittedEntry> {
+    /// 追加一条不进入模型上下文的 metadata，返回实际保存的时间。
+    pub fn append_metadata(&mut self, metadata: SessionMetadata) -> Result<String> {
         self.append_entry(SessionEntry::Metadata {
             id: super::new_entry_id(),
             timestamp: now_iso(),
@@ -176,45 +175,18 @@ impl SessionManager {
     }
 
     /// 追加一条 operation ledger 记录。记录本身就是持久事实，服务查看与统计，
-    /// 不进入模型上下文。
-    pub fn append_record(&mut self, record: LedgerRecord) -> Result<CommittedEntry> {
+    /// 不进入模型上下文。返回实际保存的时间。
+    pub fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
         self.append_record_with_id(super::new_entry_id(), record)
     }
 
-    /// 压缩在写入之前分配身份，保存失败时的实时反馈也使用该身份。
-    pub(crate) fn append_record_with_id(
-        &mut self,
-        id: String,
-        record: LedgerRecord,
-    ) -> Result<CommittedEntry> {
+    /// 沿用执行器预分配的身份，让保存内容与实时反馈对应同一条目。
+    pub(crate) fn append_record_with_id(&mut self, id: String, record: LedgerRecord) -> Result<String> {
         self.append_entry(SessionEntry::Record { id, timestamp: now_iso(), record })
     }
 
-    /// 保存一次 provider 观测；开始记录写成功后就返回可公开的请求头。
-    pub(crate) fn append_model_request(
-        &mut self,
-        observation: singularity_protocol::RequestObservation,
-        request: Option<singularity_model::ModelPreferences>,
-    ) -> Result<Option<Box<singularity_protocol::ModelRequestSnapshot>>> {
-        let (context, head) = if let Some(model_preferences) = request {
-            let (id, definitions) =
-                self.latest_request_definitions().expect("definitions are saved before requests start");
-            let id = id.to_owned();
-            let head = definitions.snapshot(&id, &model_preferences);
-            (Some(Box::new(super::request::RequestContext::new(id, model_preferences))), Some(head))
-        } else {
-            (None, None)
-        };
-        self.append_record(LedgerRecord::ModelRequest { observation, context })?;
-        Ok(head)
-    }
-
     /// 追加执行器为本次回答或工具结果预分配身份的消息。
-    pub(crate) fn append_message_with_id(
-        &mut self,
-        id: &str,
-        message: AgentMessage,
-    ) -> Result<CommittedEntry> {
+    pub(crate) fn append_message_with_id(&mut self, id: &str, message: AgentMessage) -> Result<String> {
         self.append_entry(SessionEntry::Message {
             id: id.to_string(),
             timestamp: now_iso(),
@@ -222,7 +194,7 @@ impl SessionManager {
         })
     }
 
-    pub(super) fn append_entry(&mut self, entry: SessionEntry) -> Result<CommittedEntry> {
+    pub(super) fn append_entry(&mut self, entry: SessionEntry) -> Result<String> {
         // 上次追加已经失败：文件尾部可能残缺，重开修复前不再接受任何写入。
         if let Some(error) = &self.append_error {
             return Err(SessionError::Io(std::io::Error::new(
@@ -230,16 +202,13 @@ impl SessionManager {
                 format!("previous session append failed; reopen the writer to repair its tail: {error}"),
             )));
         }
-        let committed = CommittedEntry {
-            id: entry.id().to_string(),
-            timestamp: entry.timestamp().to_string(),
-        };
+        let timestamp = entry.timestamp().to_string();
         let serialized = serde_json::to_string(&entry)?;
         let mut handle = OpenOptions::new().append(true).open(&self.file)?;
         let bytes_to_write = serialized.as_bytes();
         self.write_append(&mut handle, bytes_to_write)?;
         self.data.entries.push(entry);
-        Ok(committed)
+        Ok(timestamp)
     }
 
     fn write_append(&mut self, handle: &mut impl Write, bytes: &[u8]) -> Result<()> {

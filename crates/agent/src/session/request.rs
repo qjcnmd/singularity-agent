@@ -1,79 +1,28 @@
-//! 轨迹里提示词与工具定义的快照及引用解析。
-use super::manager::SessionData;
-use super::{LedgerRecord, SessionEntry};
-use serde::{Deserialize, Serialize};
-use singularity_model::{ModelMessage, ModelPreferences, ModelRole, ModelToolSchema};
-use singularity_protocol::{
-    ModelRequestDefinitions, ModelRequestReference, ModelRequestSnapshot, RequestMessage, RequestPreferences,
-    RequestTool,
-};
+//! 模型使用的指令、工具定义，以及会话内可展开的注入记录。
+use super::LedgerRecord;
+use super::manager::SessionManager;
+use singularity_model::ModelMessage;
+use singularity_protocol::{RequestMessage, RequestTool};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// 本轮模型使用的固定请求内容；模型投影与 Token 估价由这里负责。
+#[derive(Debug, Clone)]
 pub struct RequestDefinitions {
-    messages: Vec<SavedInstruction>,
-    tools: Vec<SavedTool>,
-}
-
-// 保持已有 JSONL 字段名；桌面 DTO 或 Provider 输入的变化不改变保存格式。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SavedInstruction {
-    role: ModelRole,
-    content: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SavedTool {
-    name: String,
-    description: String,
-    parameters_schema: serde_json::Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SavedPreferences {
-    max_output_tokens: Option<u32>,
+    pub(crate) messages: Vec<RequestMessage>,
+    pub(crate) tools: Vec<RequestTool>,
 }
 
 impl RequestDefinitions {
-    pub(crate) fn has_tool(&self, name: &str) -> bool {
-        self.tools.iter().any(|tool| tool.name == name)
-    }
-    pub(super) fn snapshot(
-        &self,
-        definitions_id: &str,
-        model_preferences: &ModelPreferences,
-    ) -> Box<ModelRequestSnapshot> {
-        Box::new(ModelRequestSnapshot {
-            definitions_id: definitions_id.to_string(),
-            messages: self.public_messages(),
-            tools: self.public_tools(),
-            model_preferences: RequestPreferences {
-                max_output_tokens: Some(model_preferences.max_output_tokens),
-            },
-        })
-    }
-
-    pub(crate) fn new(messages: &[ModelMessage], tools: Vec<ModelToolSchema>) -> Self {
-        Self {
-            messages: messages
-                .iter()
-                .map(|message| SavedInstruction {
-                    role: message.role,
-                    content: message.content.clone(),
-                })
-                .collect(),
-            tools: tools
-                .into_iter()
-                .map(|tool| SavedTool {
-                    name: tool.name,
-                    description: tool.description,
-                    parameters_schema: tool.parameters_schema,
-                })
-                .collect(),
-        }
+    pub(crate) fn sections(&self) -> Vec<(String, String)> {
+        let mut sections: Vec<_> = self
+            .messages
+            .iter()
+            .map(|message| (message.name.clone(), message.content.clone()))
+            .collect();
+        sections.push((
+            "工具定义".into(),
+            serde_json::to_string_pretty(&self.tools).expect("tool schemas are serializable"),
+        ));
+        sections
     }
 
     /// 指令和工具定义共同占用的输入预算。
@@ -93,116 +42,33 @@ impl RequestDefinitions {
         instructions + tools
     }
 
-    /// 从已解析的定义恢复完整指令前缀。
+    /// 生成本轮模型请求的指令前缀。
     pub(crate) fn model_messages(&self) -> Vec<ModelMessage> {
         self.messages
             .iter()
             .map(|message| ModelMessage::text(message.role, &message.content))
             .collect()
     }
-
-    /// 从保存的定义恢复压缩请求的工具输入。
-    pub(crate) fn model_tools(&self) -> Vec<ModelToolSchema> {
-        self.tools
-            .iter()
-            .map(|tool| ModelToolSchema {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters_schema: tool.parameters_schema.clone(),
-            })
-            .collect()
-    }
-
-    fn public_messages(&self) -> Vec<RequestMessage> {
-        self.messages
-            .iter()
-            .map(|message| RequestMessage {
-                role: message.role,
-                content: message.content.clone(),
-            })
-            .collect()
-    }
-
-    fn public_tools(&self) -> Vec<RequestTool> {
-        self.tools
-            .iter()
-            .map(|tool| RequestTool {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters_schema: tool.parameters_schema.clone(),
-            })
-            .collect()
-    }
 }
 
-/// 一次请求引用到的定义，以及这次请求的偏好。请求身份只由外层
-/// `RequestObservation` 保存，读 header 的调用方因此只需维持一处一致。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RequestContext {
-    pub definitions: String,
-    model_preferences: SavedPreferences,
-}
-
-impl RequestContext {
-    pub(super) fn new(definitions: String, preferences: ModelPreferences) -> Self {
-        Self {
-            definitions,
-            model_preferences: SavedPreferences {
-                max_output_tokens: Some(preferences.max_output_tokens),
-            },
+impl SessionManager {
+    /// 每轮保存实际注入的内容，直接供会话展示。
+    pub(crate) fn record_context(
+        &mut self,
+        sections: Vec<(String, String)>,
+    ) -> super::Result<Vec<singularity_protocol::HistoryItem>> {
+        let mut items = Vec::new();
+        for (name, content) in sections {
+            let id = super::new_entry_id();
+            self.append_record_with_id(
+                id.clone(),
+                LedgerRecord::ContextInjected {
+                    name: name.clone(),
+                    content: content.clone(),
+                },
+            )?;
+            items.push(singularity_protocol::HistoryItem::Context { id, name, content });
         }
-    }
-
-    /// 将保存的请求偏好转换为桌面轨迹引用。
-    pub fn public_reference(&self) -> ModelRequestReference {
-        ModelRequestReference {
-            definitions_id: self.definitions.clone(),
-            model_preferences: RequestPreferences {
-                max_output_tokens: self.model_preferences.max_output_tokens,
-            },
-        }
-    }
-}
-
-// 首次请求和压缩都能保存定义；恢复执行与历史查看共用这份读取规则。
-fn entry_request_definitions(entry: &SessionEntry) -> Option<(&str, &RequestDefinitions)> {
-    match entry {
-        SessionEntry::Record {
-            id,
-            record: LedgerRecord::RequestDefinitions { definitions },
-            ..
-        } => Some((id.as_str(), definitions)),
-        SessionEntry::Compaction { id, compaction, .. } => {
-            compaction.definitions.as_ref().map(|definitions| (id.as_str(), definitions))
-        }
-        _ => None,
-    }
-}
-
-impl SessionData {
-    /// 会话固定的指令与工具，跨回合和重启复用；首次请求之前为空，成功压缩后更新。
-    pub fn latest_request_definitions(&self) -> Option<(&str, &RequestDefinitions)> {
-        self.entries.iter().rev().find_map(entry_request_definitions)
-    }
-
-    /// 读取已保存定义的公开快照；调用方可让同页请求共用它。
-    pub fn request_definitions(&self, definitions_id: &str) -> super::Result<ModelRequestDefinitions> {
-        let definitions = self
-            .entries
-            .iter()
-            .rev()
-            .filter_map(entry_request_definitions)
-            .find(|(id, _)| *id == definitions_id)
-            .map(|(_, definitions)| definitions)
-            .ok_or_else(|| {
-                super::SessionError::InvalidSession(format!(
-                    "request refers to missing definitions record {definitions_id}"
-                ))
-            })?;
-        Ok(ModelRequestDefinitions {
-            messages: definitions.public_messages(),
-            tools: definitions.public_tools(),
-        })
+        Ok(items)
     }
 }

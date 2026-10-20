@@ -1,6 +1,5 @@
-//! 用户配置的保存、脱敏目录和执行快照。文件读取在 user，模型解析在 selection。
+//! 用户配置的保存、脱敏目录和执行快照。文件读写在 user，模型解析在 selection。
 
-use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -31,20 +30,18 @@ impl ModelConfigurationSnapshot {
 /// 服务级配置快照：一次读取就冻结配置和密钥，之后按实际 selector 解析；它只保存配置事实，
 /// 不持有 Tokio handle，也不创建任何网络执行对象，因此不实现 Debug。
 pub struct ProviderConfigSnapshot {
-    data: Result<Option<UserConfigData>, ProviderError>,
+    data: Result<Option<UserConfigFile>, ProviderError>,
 }
 
 impl ProviderConfigSnapshot {
     fn read(directory: &Path) -> Self {
-        Self {
-            data: read_user_config_data_from_directory(directory),
-        }
+        Self { data: read_user_config_file(directory) }
     }
 
     fn redacted_catalog(&self) -> RedactedModelCatalog {
         match &self.data {
             Ok(Some(data)) => {
-                let selection = match data.config.default_model.as_deref() {
+                let selection = match data.default_model.as_deref() {
                     Some(selector) => self.validate_selector(Some(selector)),
                     None => Ok(()),
                 };
@@ -55,7 +52,7 @@ impl ProviderConfigSnapshot {
         }
     }
 
-    pub(crate) fn config(&self) -> Result<&UserConfigData, ProviderError> {
+    pub(crate) fn config(&self) -> Result<&UserConfigFile, ProviderError> {
         self.data
             .as_ref()
             .map_err(Clone::clone)?
@@ -89,13 +86,7 @@ impl ProviderConfigSnapshot {
     }
 }
 
-/// 一次配置修改的结果及修改后的实际目录；部分保存失败也返回当前磁盘事实。
-pub struct ModelConfigUpdate {
-    pub result: Result<(), ProviderError>,
-    pub catalog: RedactedModelCatalog,
-}
-
-/// 数据目录内的模型配置与凭据入口；读取、修改及修改后的目录快照在内部串行化。
+/// 数据目录内的模型配置与凭据入口；每次读取与修改在内部串行化。
 pub struct ModelConfigManager {
     directory: PathBuf,
     access: Mutex<()>,
@@ -103,34 +94,15 @@ pub struct ModelConfigManager {
 
 impl ModelConfigManager {
     /// 把提供方从后续的模型选择里移除。正在跑的轮次仍用它自己的快照。
-    pub fn remove_provider(&self, provider_id: &str) -> ModelConfigUpdate {
-        self.update(|manager| manager.delete_provider(provider_id))
-    }
-
-    fn delete_provider(&self, provider_id: &str) -> Result<(), ProviderError> {
-        let mut data = read_user_config_data_from_directory(&self.directory)?
-            .ok_or_else(|| user_config_error("provider configuration is missing"))?;
-        let removed = data.config.providers.remove(provider_id).is_some();
-        // 配置已删、只剩凭据时仍算这个提供方存在，好让删除可以重试补完。
-        if !removed && !data.auth.providers.contains_key(provider_id) {
-            return Err(user_config_error("provider does not exist"));
+    pub fn remove_provider(&self, provider_id: &str) -> Result<(), ProviderError> {
+        let _access = self.lock();
+        let mut data =
+            read_user_config_file(&self.directory)?.ok_or_else(|| user_config_error("尚未配置模型提供方"))?;
+        if data.providers.remove(provider_id).is_none() {
+            return Err(user_config_error("模型提供方不存在"));
         }
-        if removed {
-            clear_invalid_default_selection(&mut data.config);
-            write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &data.config)?;
-        }
-        // 顺序上先让提供方不再可选、再删凭据：上次删除没做完时，重试会补上剩下的凭据删除。
-        if data.auth.providers.remove(provider_id).is_some() {
-            write_json_file(&self.directory, crate::USER_AUTH_FILE_NAME, &data.auth).map_err(
-                |mut error| {
-                    error.message =
-                        format!("提供方配置已删除，但 API 密钥删除失败；请重试删除：{}", error.message);
-                    // 与保存失败一样标成半成品状态：界面据此提示重试这一步，不提示笼统的配置错误。
-                    error.with_code(crate::CREDENTIAL_DELETE_FAILED_CODE)
-                },
-            )?;
-        }
-        Ok(())
+        clear_invalid_default_selection(&mut data);
+        write_user_config_file(&self.directory, &data)
     }
 
     /// 决定这次模型发现查询用哪份凭据：本次显式提交的密钥优先，否则回退到该
@@ -146,10 +118,8 @@ impl ModelConfigManager {
                 validate_provider_value(key, "api_key")?;
                 Ok(key.to_string())
             }
-            None => Ok(read_user_auth_file(&self.directory)?
-                .providers
-                .get(provider_id)
-                .map(|auth| auth.api_key.clone())
+            None => Ok(read_user_config_file(&self.directory)?
+                .and_then(|config| config.providers.get(provider_id).map(|provider| provider.api_key.clone()))
                 .unwrap_or_default()),
         }
     }
@@ -171,52 +141,32 @@ impl ModelConfigManager {
     }
 
     /// 保存提供方配置，需要时同时替换密钥；密钥省略表示保留原值。
-    /// 先写配置再写密钥：密钥写失败会返回「部分保存」错误，已写入的配置依然生效。
+    /// 配置和密钥一起原子提交，失败时保留原文件。
     pub fn save_provider(
         &self,
         input: ProviderConfigurationInput,
         api_key: Option<&str>,
-    ) -> ModelConfigUpdate {
-        self.update(|manager| manager.write_provider(input, api_key))
-    }
-
-    /// 修改和目录读取共用临界区；失败不能跳过读取，因为配置和凭据可能部分提交。
-    fn update(&self, change: impl FnOnce(&Self) -> Result<(), ProviderError>) -> ModelConfigUpdate {
-        let _access = self.lock();
-        let result = change(self);
-        let catalog = ProviderConfigSnapshot::read(&self.directory).redacted_catalog();
-        ModelConfigUpdate { result, catalog }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.access.lock().expect("model configuration lock poisoned")
-    }
-
-    fn write_provider(
-        &self,
-        input: ProviderConfigurationInput,
-        api_key: Option<&str>,
     ) -> Result<(), ProviderError> {
-        validate_identifier(&input.provider_id, "provider id")?;
-        // 密钥是本次请求的纯输入，在任何文件读写之前先校验：非法密钥会先写下
-        // config.json，再以「配置已保存、密钥保存失败」结束，白白留下持久化改动。
+        let _access = self.lock();
+        validate_identifier(&input.provider_id, "提供方标识")?;
         if let Some(key) = api_key {
             validate_provider_value(key, "api_key")?;
         }
         // 这里只规范输入形状（去掉空白和结尾斜杠）：地址怎么解释统一交给
-        // openai::wire，已写明的端点原样保留，免得给自定义前缀拼出错误路由。
+        // openai::wire，已写明的端点原样保留，不给自定义前缀拼出错误路由。
         let base_url = crate::openai::canonical_base_url(&input.base_url).to_string();
         validate_base_url(&base_url)?;
         let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
         // 先只构造模型映射，任何一项校验失败都发生在写配置和凭据之前。
-        let models = model_definitions(
-            input.models,
-            input.api_protocol.as_deref(),
-            config.providers.get(&input.provider_id).map(|provider| &provider.models),
-        )?;
+        let models = model_definitions(input.models, input.api_protocol)?;
+        let key = api_key
+            .map(str::to_string)
+            .or_else(|| config.providers.get(&input.provider_id).map(|provider| provider.api_key.clone()))
+            .unwrap_or_default();
         config.providers.insert(
-            input.provider_id.clone(),
+            input.provider_id,
             UserConfigProvider {
+                api_key: key,
                 api_protocol: input.api_protocol,
                 display_name: input.display_name.filter(|name| !name.trim().is_empty()),
                 base_url,
@@ -224,24 +174,11 @@ impl ModelConfigManager {
             },
         );
         clear_invalid_default_selection(&mut config);
-        write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &config)?;
-        // 输入已经验证完毕；配置和密钥分别提交，保留第二个文件写入失败的反馈。
-        if let Some(key) = api_key {
-            self.write_api_key(&input.provider_id, key).map_err(|mut error| {
-                error.message =
-                    format!("提供方配置已保存，但 API 密钥保存失败；请重试保存：{}", error.message);
-                error.with_code(crate::CREDENTIAL_SAVE_FAILED_CODE)
-            })?;
-        }
-        Ok(())
+        write_user_config_file(&self.directory, &config)
     }
 
-    fn write_api_key(&self, provider_id: &str, api_key: &str) -> Result<(), ProviderError> {
-        let mut auth = read_user_auth_file(&self.directory)?;
-        auth.providers
-            .insert(provider_id.to_string(), UserAuthProvider { api_key: api_key.to_string() });
-        write_json_file(&self.directory, crate::USER_AUTH_FILE_NAME, &auth)?;
-        Ok(())
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.access.lock().expect("model configuration lock poisoned")
     }
 }
 
@@ -251,18 +188,15 @@ impl ModelConfigManager {
 /// 已保存但未在表单中展示的能力标记按模型 id 保留；已移除的模型不参与转换。
 fn model_definitions(
     models: Vec<ModelConfigurationInput>,
-    provider_protocol_text: Option<&str>,
-    previous_models: Option<&BTreeMap<String, UserConfigModel>>,
+    provider_protocol: ProviderApiProtocol,
 ) -> Result<BTreeMap<String, UserConfigModel>, ProviderError> {
-    let provider_protocol = provider_protocol_text.map(parse_catalog_protocol).transpose()?;
     let mut definitions = BTreeMap::new();
     for model in models {
-        validate_model_id(&model.model_id, "model id")?;
+        validate_model_id(&model.model_id, "模型标识")?;
         if definitions.contains_key(&model.model_id) {
-            return Err(user_config_error("provider model ids must be unique"));
+            return Err(user_config_error("同一提供方的模型标识不能重复"));
         }
-        let previous = previous_models.and_then(|models| models.get(&model.model_id));
-        let (model_id, configured) = model_definition(model, provider_protocol, previous)?;
+        let (model_id, configured) = model_definition(model, provider_protocol)?;
         definitions.insert(model_id, configured);
     }
     Ok(definitions)
@@ -271,16 +205,12 @@ fn model_definitions(
 /// 转换单个模型并检查其完整配置；保留表单没有展示的能力，返回后才允许写入文件。
 fn model_definition(
     mut model: ModelConfigurationInput,
-    provider_protocol: Option<ProviderApiProtocol>,
-    previous: Option<&UserConfigModel>,
+    provider_protocol: ProviderApiProtocol,
 ) -> Result<(String, UserConfigModel), ProviderError> {
-    if let Some(protocol) = provider_protocol {
-        schema::normalize_chat_fields(
-            protocol,
-            &mut model.thinking_wire_format,
-            &mut model.chat_output_tokens_field,
-            &mut model.requires_reasoning_content_for_tool_calls,
-        );
+    if provider_protocol == ProviderApiProtocol::Responses {
+        model.thinking_wire_format = None;
+        model.chat_output_tokens_field = None;
+        model.requires_reasoning_content_for_tool_calls = None;
     }
     let declared_variants = model.reasoning_variants.is_some();
     let mut variants = BTreeMap::new();
@@ -289,35 +219,19 @@ fn model_definition(
             .insert(variant.id, ModelsFileReasoningVariant { wire_effort: variant.wire_effort })
             .is_some()
         {
-            return Err(user_config_error("reasoning variant ids must be unique"));
+            return Err(user_config_error("推理档位标识不能重复"));
         }
     }
-    let model_protocol = match provider_protocol {
-        Some(protocol) => Some(protocol),
-        None => model.api_protocol.as_deref().map(parse_catalog_protocol).transpose()?,
-    };
     let configured = UserConfigModel {
-        automatic_fields: model.automatic_fields,
-        display_name: model.display_name.filter(|name| !name.trim().is_empty()),
-        api_protocol: if provider_protocol.is_some() {
-            None
-        } else {
-            model.api_protocol
-        },
         max_context_tokens: model.max_context_tokens,
         max_output_tokens: model.max_output_tokens,
         reasoning_variants: declared_variants.then_some(variants),
         default_variant: model.default_variant,
-        supports_developer_role: previous.and_then(|model| model.supports_developer_role),
-        supports_tool_choice: previous.and_then(|model| model.supports_tool_choice),
         requires_reasoning_content_for_tool_calls: model.requires_reasoning_content_for_tool_calls,
-        requires_assistant_content_for_tool_calls: previous
-            .is_some_and(|previous| previous.requires_assistant_content_for_tool_calls)
-            && model_protocol == Some(ProviderApiProtocol::Chat),
         chat_output_tokens_field: model.chat_output_tokens_field.filter(|field| !field.is_empty()),
         thinking_wire_format: model.thinking_wire_format,
     };
-    resolve_model_definition(&configured, model_protocol, &model.model_id, None)?;
+    resolve_model_definition(&configured, provider_protocol, &model.model_id, None)?;
     Ok((model.model_id, configured))
 }
 
@@ -351,37 +265,29 @@ fn empty_catalog(error: Option<String>) -> RedactedModelCatalog {
     }
 }
 
-fn catalog_from_data(data: &UserConfigData, selection: Result<(), ProviderError>) -> RedactedModelCatalog {
-    if data.config.providers.is_empty() {
+fn catalog_from_data(data: &UserConfigFile, selection: Result<(), ProviderError>) -> RedactedModelCatalog {
+    if data.providers.is_empty() {
         return empty_catalog(None);
     }
     let (error, default_selector) = match selection {
-        _ if data.config.providers.values().all(|provider| provider.models.is_empty()) => (None, None),
-        Ok(()) => (None, data.config.default_model.clone()),
-        Err(error) => (Some(error.to_string()), data.config.default_model.clone()),
+        _ if data.providers.values().all(|provider| provider.models.is_empty()) => (None, None),
+        Ok(()) => (None, data.default_model.clone()),
+        Err(error) => (Some(error.to_string()), data.default_model.clone()),
     };
     let providers = data
-        .config
         .providers
         .iter()
         .map(|(provider_id, provider)| RedactedProvider {
-            api_protocol: provider.api_protocol.clone(),
+            api_protocol: provider.api_protocol,
             provider_id: provider_id.clone(),
             display_name: provider.display_name.clone(),
             base_url: provider.base_url.clone(),
-            credential_configured: data
-                .auth
-                .providers
-                .get(provider_id)
-                .is_some_and(|credential| !credential.api_key.is_empty()),
+            credential_configured: !provider.api_key.is_empty(),
             models: provider
                 .models
                 .iter()
                 .map(|(model_id, model)| ModelConfigurationInput {
-                    automatic_fields: model.automatic_fields.clone(),
                     model_id: model_id.clone(),
-                    display_name: model.display_name.clone(),
-                    api_protocol: provider.api_protocol.clone().or_else(|| model.api_protocol.clone()),
                     max_context_tokens: model.max_context_tokens,
                     max_output_tokens: model.max_output_tokens,
                     reasoning_variants: model.reasoning_variants.as_ref().map(|variants| {
@@ -403,15 +309,4 @@ fn catalog_from_data(data: &UserConfigData, selection: Result<(), ProviderError>
         })
         .collect();
     RedactedModelCatalog { error, default_selector, providers }
-}
-
-/// 序列化后原子替换整个文件，不合并文件原有内容：被删掉的供应商、模型和推理档位随保存消失。
-/// 键按 `BTreeMap` 排序，与文件原先的书写顺序无关。
-fn write_json_file(directory: &Path, file_name: &str, value: &impl Serialize) -> Result<(), ProviderError> {
-    singularity_core::create_data_dir(directory).map_err(user_config_error)?;
-    let path = directory.join(file_name);
-    let mut bytes = serde_json::to_vec_pretty(value).expect("provider configuration is JSON serializable");
-    bytes.push(b'\n');
-    singularity_core::atomic_replace_bytes(&path, &bytes)
-        .map_err(|error| user_config_error(format!("could not update {}: {error}", path.display())))
 }

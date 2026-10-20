@@ -1,97 +1,84 @@
-//! bash 的 stdout/stderr 输出泵：有界读、控制字符过滤与 UTF-8 安全解码。
+//! Bash 两条输出流的异步读取与 UTF-8 解码。
 
-use std::io::{self, Read};
-use std::os::windows::io::AsRawHandle;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::io;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{ChildStderr, ChildStdout};
 
-use windows_sys::Win32::Foundation::HANDLE;
-
-/// 输出泵的默认缓冲容量。
 const PIPE_BUFFER_BYTES: usize = 64 * 1024;
 
-/// pump 有界读的等待切片：没有数据且还没 EOF 时，按这个周期醒来检查停止标志。
-pub(super) const OUTPUT_PIPE_READ_TIMEOUT: Duration = Duration::from_millis(200);
-
-/// 有界地等待管道变为可读。Windows 上不能靠 WaitForSingleObject：匿名管道句柄不是
-/// 可靠的可等待对象，句柄不可等待时调用会直接失败，pump 就永远等不到数据。这里改用
-/// PeekNamedPipe，非破坏性地查询待读字节数和是否已断开。
-#[allow(unsafe_code)] // Windows 管道可读性经 PeekNamedPipe 查询，与平台的底层能力一致。
-fn wait_pipe_readable(handle: HANDLE, timeout: Duration) -> io::Result<bool> {
-    use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA, GetLastError};
-    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-    let mut available: u32 = 0;
-    let peek_result = unsafe {
-        let ok = PeekNamedPipe(
-            handle,
-            core::ptr::null_mut(),
-            0,
-            core::ptr::null_mut(),
-            &mut available,
-            core::ptr::null_mut(),
-        ) != 0;
-        if ok { Ok(available) } else { Err(GetLastError()) }
-    };
-    match peek_result {
-        Ok(available) if available > 0 => return Ok(true),
-        // 写端已关闭或管道正在关闭：直接放行，让 read() 去报 EOF 或真实错误。
-        Err(error) if error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA => return Ok(true),
-        Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
-        _ => {}
-    }
-    // 既没数据也没断开：按切片周期轮询，让 stop 标志能在一个周期内收敛。
-    std::thread::sleep(timeout);
-    Ok(false)
+pub(super) struct OutputStreams {
+    stdout: OutputReader<ChildStdout>,
+    stderr: OutputReader<ChildStderr>,
 }
 
-/// 从管道读取字节流，过滤控制字符，再按块发到通道。
-///
-/// 每次读取前都有界等待管道可读；stop 置位后线程在下一个等待切片内退出，即使后台
-/// 进程一直握着管道写端，这个线程也一定会结束。
-pub(super) fn pump_output(
-    mut reader: impl Read + Send + AsRawHandle + 'static,
-    sender: mpsc::SyncSender<io::Result<String>>,
-    stop: Arc<AtomicBool>,
+impl OutputStreams {
+    pub(super) fn new(stdout: ChildStdout, stderr: ChildStderr) -> Self {
+        Self {
+            stdout: OutputReader::new(stdout, "stdout"),
+            stderr: OutputReader::new(stderr, "stderr"),
+        }
+    }
+
+    pub(super) fn is_open(&self) -> bool {
+        !self.stdout.closed || !self.stderr.closed
+    }
+
+    /// 两条流都结束才返回 None；一条流关闭后继续读取另一条。
+    pub(super) async fn next(&mut self) -> Option<io::Result<String>> {
+        loop {
+            let chunk = tokio::select! {
+                chunk = self.stdout.next(), if !self.stdout.closed => chunk,
+                chunk = self.stderr.next(), if !self.stderr.closed => chunk,
+                else => return None,
+            };
+            if chunk.is_some() {
+                return chunk;
+            }
+        }
+    }
+}
+
+struct OutputReader<R> {
+    reader: R,
     stream: &'static str,
-) {
-    let handle = reader.as_raw_handle() as HANDLE;
-    let mut decoder = Utf8Decoder::default();
-    let mut buffer = [0u8; PIPE_BUFFER_BYTES];
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            break;
+    decoder: Utf8Decoder,
+    buffer: Vec<u8>,
+    closed: bool,
+}
+
+impl<R: AsyncRead + Unpin> OutputReader<R> {
+    fn new(reader: R, stream: &'static str) -> Self {
+        Self {
+            reader,
+            stream,
+            decoder: Utf8Decoder::default(),
+            buffer: vec![0; PIPE_BUFFER_BYTES],
+            closed: false,
         }
-        let read = match wait_pipe_readable(handle, OUTPUT_PIPE_READ_TIMEOUT) {
-            Ok(false) => continue,
-            Ok(true) => reader.read(&mut buffer),
-            Err(error) => Err(error),
-        };
-        match read {
-            // 读到 EOF：把上次留下的半个多字节字符收尾，避免丢字节。
-            Ok(0) => {
-                let text = decoder.decode(&[], true);
-                if !text.is_empty() && sender.send(Ok(text)).is_err() {
-                    break;
+    }
+
+    async fn next(&mut self) -> Option<io::Result<String>> {
+        while !self.closed {
+            match self.reader.read(&mut self.buffer).await {
+                Ok(read) => {
+                    self.closed = read == 0;
+                    // 只有 EOF 才补全末尾残缺字符；取消读取不会伪造输出。
+                    let text = self.decoder.decode(&self.buffer[..read], self.closed);
+                    if !text.is_empty() {
+                        return Some(Ok(text));
+                    }
                 }
-                break;
-            }
-            Ok(read) => {
-                let text = decoder.decode(&buffer[..read], false);
-                if !text.is_empty() && sender.send(Ok(text)).is_err() {
-                    break;
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    self.closed = true;
+                    return Some(Err(io::Error::new(
+                        error.kind(),
+                        format!("failed to read {}: {error}", self.stream),
+                    )));
                 }
-            }
-            // 读错误不等于真正的 EOF：保留本流未完成的多字节残留，
-            // 不为被中断或异常关闭的管道合成替换字节。
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                let _ = sender
-                    .send(Err(io::Error::new(error.kind(), format!("failed to read {stream}: {error}"))));
-                break;
             }
         }
+        None
     }
 }
 
@@ -118,7 +105,7 @@ impl Utf8Decoder {
                 Err(error) => {
                     let valid = error.valid_up_to();
                     if valid > 0 {
-                        // from_utf8 保证 valid_up_to 之前的前缀合法（std 文档的承诺）。
+                        // valid_up_to 之前的前缀是合法 UTF-8。
                         let text = std::str::from_utf8(&self.pending[consumed..consumed + valid])
                             .expect("valid_up_to must describe valid UTF-8");
                         push_visible(&mut output, text);

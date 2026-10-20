@@ -3,18 +3,23 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// 文件与设置接口共用的 MCP 连接配置；省略的参数、环境变量和请求头按空值处理。
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum McpTransportInput {
+pub enum McpTransportConfig {
     Stdio {
         command: String,
+        #[serde(default)]
         args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         env: BTreeMap<String, String>,
     },
     Http {
         url: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
     },
 }
@@ -27,7 +32,7 @@ pub struct McpServerInput {
     pub enabled: bool,
     pub startup_timeout_sec: u64,
     pub tool_timeout_sec: u64,
-    pub transport: McpTransportInput,
+    pub transport: McpTransportConfig,
 }
 
 #[derive(Debug, Deserialize)]

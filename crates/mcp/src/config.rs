@@ -1,7 +1,7 @@
 //! 私有 mcp.json 的持久化模型与设置边界转换。
 
 use serde::{Deserialize, Serialize};
-use singularity_protocol::{McpServerInput, McpTransportInput};
+use singularity_protocol::{McpServerInput, McpTransportConfig};
 use std::{collections::BTreeMap, path::Path};
 
 #[derive(Default, Serialize, Deserialize)]
@@ -21,26 +21,7 @@ pub(crate) struct ServerConfig {
     #[serde(default = "tool_timeout")]
     pub tool_timeout_sec: u64,
     #[serde(flatten)]
-    pub transport: TransportConfig,
-}
-
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum TransportConfig {
-    Stdio {
-        command: String,
-        #[serde(default)]
-        args: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cwd: Option<String>,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        env: BTreeMap<String, String>,
-    },
-    Http {
-        url: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        headers: BTreeMap<String, String>,
-    },
+    pub transport: McpTransportConfig,
 }
 
 fn enabled() -> bool {
@@ -59,12 +40,7 @@ impl ServerConfig {
             enabled: input.enabled,
             startup_timeout_sec: input.startup_timeout_sec,
             tool_timeout_sec: input.tool_timeout_sec,
-            transport: match input.transport {
-                McpTransportInput::Stdio { command, args, cwd, env } => {
-                    TransportConfig::Stdio { command, args, cwd, env }
-                }
-                McpTransportInput::Http { url, headers } => TransportConfig::Http { url, headers },
-            },
+            transport: input.transport,
         }
     }
 
@@ -74,12 +50,7 @@ impl ServerConfig {
             enabled: self.enabled,
             startup_timeout_sec: self.startup_timeout_sec,
             tool_timeout_sec: self.tool_timeout_sec,
-            transport: match self.transport {
-                TransportConfig::Stdio { command, args, cwd, env } => {
-                    McpTransportInput::Stdio { command, args, cwd, env }
-                }
-                TransportConfig::Http { url, headers } => McpTransportInput::Http { url, headers },
-            },
+            transport: self.transport,
         }
     }
 
@@ -93,7 +64,7 @@ impl ServerConfig {
             return Err("MCP 超时必须大于零秒。".into());
         }
         match &self.transport {
-            TransportConfig::Stdio { command, args, cwd, env } => {
+            McpTransportConfig::Stdio { command, args, cwd, env } => {
                 if command.trim().is_empty()
                     || command.contains('\0')
                     || args.iter().any(|arg| arg.contains('\0'))
@@ -110,7 +81,7 @@ impl ServerConfig {
                     return Err("MCP 环境变量无效。".into());
                 }
             }
-            TransportConfig::Http { url, headers } => {
+            McpTransportConfig::Http { url, headers } => {
                 let parsed = url::Url::parse(url).map_err(|_| "MCP 地址必须是有效的 HTTP 或 HTTPS URL。")?;
                 if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
                     return Err("MCP 地址必须是有效的 HTTP 或 HTTPS URL。".into());
@@ -128,8 +99,8 @@ impl ServerConfig {
     /// 网络异常、服务器 stderr 和服务端错误可能含令牌，发布前去掉配置中的敏感值。
     pub fn redact(&self, mut error: String) -> String {
         let mut values: Vec<&str> = match &self.transport {
-            TransportConfig::Stdio { env, .. } => env.values().map(String::as_str).collect(),
-            TransportConfig::Http { url, headers } => {
+            McpTransportConfig::Stdio { env, .. } => env.values().map(String::as_str).collect(),
+            McpTransportConfig::Http { url, headers } => {
                 let mut values = vec![url.as_str()];
                 values.extend(headers.values().map(String::as_str));
                 for (name, value) in headers {
@@ -143,7 +114,7 @@ impl ServerConfig {
                 values
             }
         };
-        // 先替换完整长值，避免短值覆盖后留下另一个凭据的后缀。
+        // 先替换完整长值：短值先匹配会留下另一个凭据的后缀。
         values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
         for value in values {
             if !value.is_empty() {
@@ -174,8 +145,6 @@ pub(crate) fn read(home: &Path) -> Result<Configuration, String> {
 
 pub(crate) fn write(home: &Path, config: &Configuration) -> Result<(), String> {
     singularity_core::create_data_dir(home)?;
-    let mut bytes = serde_json::to_vec_pretty(config).expect("MCP configuration is JSON serializable");
-    bytes.push(b'\n');
-    singularity_core::atomic_replace_bytes(&home.join("mcp.json"), &bytes)
+    singularity_core::write_json_atomic(&home.join("mcp.json"), config)
         .map_err(|error| format!("无法保存 mcp.json：{error}"))
 }

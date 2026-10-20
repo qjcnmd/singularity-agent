@@ -1,8 +1,14 @@
-import { createOrbCanvas } from './orbCanvas'
-
 /** 玻璃球体内粉白色的半透明丝带。 */
 export function createPearlRenderer(canvas: HTMLCanvasElement) {
-  const { ctx, size, dpr } = createOrbCanvas(canvas, 'Pearl')
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Pearl orb requires a 2D canvas context')
+  const size = 128
+  // 逻辑坐标保持不变，光栅尺寸对应实际显示像素，避免小球使用整幅 128px 画布。
+  const pixels = Math.max(1, Math.ceil(canvas.getBoundingClientRect().width * window.devicePixelRatio))
+  const dpr = pixels / size
+  canvas.width = pixels
+  canvas.height = pixels
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   const radius = size * 0.435
   // 丝带形状与配色固定，运行时只变换两张纹理；渐变与路径不再每帧重建。
   const ribbons = [0, 1].map(index => {

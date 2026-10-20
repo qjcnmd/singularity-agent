@@ -1,37 +1,23 @@
-//! 按模型给出的顺序准入工具。只读调用各占一个执行位；独占工具占用全部执行位。
-//! 结果一完成就落盘，随后才发布完成事件。失败后排空已启动的工具，不派发后续调用。
-
-use std::time::Instant;
-
-use singularity_model::ModelToolCall;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
+//! 全批工具均允许并行时，每组最多运行八个；包含独占工具时整批顺序执行。
+//! 进度实时发布，结果按模型调用顺序保存，随后开始下一组。
 
 use super::{Agent, AgentEvent, Result};
 use crate::message::tool_result_message;
 use crate::session::lock_writer;
 use crate::tools::{PreparedTool, ToolExecution, error_result};
+use singularity_model::ModelToolCall;
+use std::{sync::Arc, time::Instant};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
-// 只读工具仍在线程池执行文件 I/O，限制同时运行的数量以控制资源竞争。
-const MAX_PARALLEL_TOOL_WORKERS: usize = 8;
-const OUTPUT_QUEUE_CAPACITY: usize = 32;
+const MAX_PARALLEL_TOOLS: usize = 8;
 
 enum WorkerEvent {
-    Update {
-        item_id: String,
-        text: String,
-    },
-    Ended {
-        item_id: String,
-        tool_call_id: String,
-        execution: ToolExecution,
-        occupied_slots: usize,
-    },
+    Update { item_id: String, text: String },
+    Ended { index: usize, execution: ToolExecution },
 }
 
 impl Agent {
-    /// 准入在派发者中按 source order 等待，后面的独占调用不会越过前面的读取。
-    /// 派发者独占准入计数，等待空位时直接消费结果和进度；完成结果提交后才归还空位。
     pub(super) async fn dispatch_tools(
         &mut self,
         tool_calls: Vec<ModelToolCall>,
@@ -40,149 +26,113 @@ impl Agent {
         cancellation: &CancellationToken,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        // 只为读 cwd 短暂持有会话写者锁，不跨工具执行持锁，否则会阻塞控制接受与
-        // 终态落盘（工具 worker 与控制面共用同一写者）。
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let (sender, mut receiver) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
-        let mut occupied_slots = 0;
-        let mut failure = None;
-
-        for (index, call) in tool_calls.into_iter().enumerate() {
-            let item_id = crate::session::tool_item_id(assistant_result_entry_id, index);
-            // 参数形状合法不代表截断响应里的工具决策已经完成；整批不执行副作用。
-            let prepared = if length_truncated {
-                Err(error_result(
-                    "tool execution failed: model output was truncated before the tool call completed",
-                ))
-            } else if !self.request_definitions().has_tool(&call.tool_name) {
-                Err(error_result(format!("tool execution failed: unknown tool: {}", call.tool_name)))
-            } else {
-                self.registry.preflight(&call.tool_name, &call.arguments)
-            };
-            let parallel = matches!(&prepared, Ok(prepared) if prepared.supports_parallel());
-            let required_slots = if parallel { 1 } else { MAX_PARALLEL_TOOL_WORKERS };
-            while occupied_slots + required_slots > MAX_PARALLEL_TOOL_WORKERS {
-                let event = receiver.recv().await.expect("active tool retains its result sender");
-                match self.process_tool_event(event, on_event).await {
-                    Ok(released_slots) => occupied_slots -= released_slots,
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
+        let prepared: Vec<_> = tool_calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, call)| {
+                let prepared = if length_truncated {
+                    Err(error_result(
+                        "tool execution failed: model output was truncated before the tool call completed",
+                    ))
+                } else {
+                    self.registry.preflight(&call.tool_name, &call.arguments)
+                };
+                (crate::session::tool_item_id(assistant_result_entry_id, index), call, prepared)
+            })
+            .collect();
+        let parallelism = if prepared
+            .iter()
+            .all(|(_, _, tool)| tool.as_ref().map_or(true, PreparedTool::supports_parallel))
+        {
+            MAX_PARALLEL_TOOLS
+        } else {
+            1
+        };
+        let mut pending = prepared.into_iter();
+        loop {
+            let batch: Vec<_> = pending.by_ref().take(parallelism).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let (sender, mut receiver) = mpsc::channel(32);
+            let mut results: Vec<Option<ToolExecution>> = (0..batch.len()).map(|_| None).collect();
+            let mut identities = Vec::with_capacity(batch.len());
+            for (index, (item_id, call, prepared)) in batch.into_iter().enumerate() {
+                identities.push((item_id.clone(), call.tool_call_id));
+                on_event(AgentEvent::ToolExecutionStarted {
+                    item_id: item_id.clone(),
+                    tool_name: call.tool_name,
+                    arguments: call.arguments,
+                });
+                let prepared = if cancellation.is_cancelled() {
+                    Err(error_result(crate::tools::ABORTED_MESSAGE))
+                } else {
+                    prepared
+                };
+                match prepared {
+                    Err(execution) => results[index] = Some(execution),
+                    Ok(PreparedTool::Question(args)) => {
+                        let started = Instant::now();
+                        let mut execution = self
+                            .questions
+                            .ask(
+                                singularity_protocol::PendingQuestion { item_id, questions: args.questions },
+                                cancellation,
+                                on_event,
+                            )
+                            .await;
+                        execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
+                        results[index] = Some(execution);
+                    }
+                    Ok(tool) => {
+                        let sender = sender.clone();
+                        let context = crate::tools::ToolContext {
+                            cwd: cwd.clone(),
+                            signal: cancellation.clone(),
+                            bash_tasks: Arc::clone(&self.execution.bash_tasks),
+                            turn_id: self.execution.turn_id.clone(),
+                            item_id: item_id.clone(),
+                        };
+                        tokio::spawn(async move {
+                            let started = Instant::now();
+                            let progress = sender.clone();
+                            let mut execution = tool
+                                .execute(context, move |text| {
+                                    let progress = progress.clone();
+                                    let item_id = item_id.clone();
+                                    async move {
+                                        let _ = progress.send(WorkerEvent::Update { item_id, text }).await;
+                                    }
+                                })
+                                .await;
+                            execution.duration_ms =
+                                Some(singularity_core::duration_millis(started.elapsed()));
+                            let _ = sender.send(WorkerEvent::Ended { index, execution }).await;
+                        });
                     }
                 }
             }
-            if failure.is_some() {
-                break;
-            }
-            on_event(AgentEvent::ToolExecutionStarted {
-                item_id: item_id.clone(),
-                tool_name: call.tool_name,
-                arguments: call.arguments,
-            });
-            let prepared = if cancellation.is_cancelled() {
-                Err(error_result(crate::tools::ABORTED_MESSAGE))
-            } else {
-                prepared
-            };
-            let execution = match prepared {
-                Err(execution) => execution,
-                Ok(PreparedTool::Question(args)) => {
-                    let started = Instant::now();
-                    let mut execution = self
-                        .questions
-                        .as_ref()
-                        .expect("question tool has a host")
-                        .ask(
-                            singularity_protocol::PendingQuestion {
-                                item_id: item_id.clone(),
-                                questions: args.questions,
-                            },
-                            cancellation,
-                            on_event,
-                        )
-                        .await;
-                    execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
-                    execution
+            drop(sender);
+            while let Some(event) = receiver.recv().await {
+                match event {
+                    WorkerEvent::Update { item_id, text } => {
+                        on_event(AgentEvent::ToolExecutionUpdate { item_id, partial_result: text })
+                    }
+                    WorkerEvent::Ended { index, execution } => results[index] = Some(execution),
                 }
-                Ok(prepared) => {
-                    let sender = sender.clone();
-                    let cwd = cwd.to_path_buf();
-                    let signal = cancellation.clone();
-                    occupied_slots += required_slots;
-                    tokio::spawn(async move {
-                        let started = Instant::now();
-                        let updates = sender.clone();
-                        let progress_id = item_id.clone();
-                        let mut execution = prepared
-                            .execute(cwd, signal, move |text| {
-                                let _ = updates.blocking_send(WorkerEvent::Update {
-                                    item_id: progress_id.clone(),
-                                    text,
-                                });
-                            })
-                            .await;
-                        execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
-                        let event = WorkerEvent::Ended {
-                            item_id,
-                            tool_call_id: call.tool_call_id,
-                            execution,
-                            occupied_slots: required_slots,
-                        };
-                        let _ = sender.send(event).await;
-                    });
-                    continue;
-                }
-            };
-            if let Err(error) = self.finish_tool(&item_id, &call.tool_call_id, execution, on_event).await {
-                failure = Some(error);
-                break;
+            }
+            for ((item_id, tool_call_id), execution) in identities.into_iter().zip(results) {
+                let execution = execution.expect("each completed worker returns its result");
+                self.append_message(
+                    &item_id,
+                    tool_result_message(&tool_call_id, &execution),
+                    &execution.images,
+                )
+                .await?;
+                on_event(AgentEvent::ToolExecutionEnded { item_id, execution });
             }
         }
-        drop(sender);
-        // worker 持有发送端直到结果交付；通道关闭即表示所有已派发工具都已收尾。
-        while let Some(event) = receiver.recv().await {
-            if failure.is_none()
-                && let Err(error) = self.process_tool_event(event, on_event).await
-            {
-                failure = Some(error);
-            }
-        }
-        failure.map_or(Ok(()), Err)
-    }
-
-    /// 发布进度或提交完成结果，返回可供后续调用使用的执行位数量。
-    async fn process_tool_event(
-        &mut self,
-        event: WorkerEvent,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-    ) -> Result<usize> {
-        match event {
-            WorkerEvent::Update { item_id, text } => {
-                on_event(AgentEvent::ToolExecutionUpdate { item_id, partial_result: text });
-                Ok(0)
-            }
-            WorkerEvent::Ended {
-                item_id,
-                tool_call_id,
-                execution,
-                occupied_slots,
-            } => {
-                self.finish_tool(&item_id, &tool_call_id, execution, on_event).await?;
-                Ok(occupied_slots)
-            }
-        }
-    }
-
-    async fn finish_tool(
-        &mut self,
-        item_id: &str,
-        tool_call_id: &str,
-        execution: ToolExecution,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-    ) -> Result<()> {
-        self.append_message(item_id, tool_result_message(tool_call_id, &execution), &execution.images)
-            .await?;
-        on_event(AgentEvent::ToolExecutionEnded { item_id: item_id.to_string(), execution });
         Ok(())
     }
 }

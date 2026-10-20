@@ -29,8 +29,8 @@ pub(crate) fn search_files(directory: &str, query: &str, limit: usize) -> Result
         for entry in directory_entries {
             match entry {
                 Ok(entry) => entries.push(entry),
-                // 遍历期间条目消失属于可接受的瞬时情况，按没有候选跳过；
-                // 其他读取失败必须上报，否则调用方会把漏项当成一次完整搜索。
+                // 遍历期间条目消失是正常瞬时情况，按没有候选跳过；
+                // 其他读取失败要上报：静默跳过会让调用方把漏项当成一次完整搜索。
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(format!("workspace directory entry could not be read: {error}"));

@@ -5,8 +5,8 @@ use crate::tools::ToolRegistrySnapshot;
 /// 文件指令与 Skill 目录提示由 Agent 请求装配。
 pub(crate) fn assemble_developer_instructions(cwd: &str, registry: &ToolRegistrySnapshot) -> String {
     let mut prompt = base_prompt(&registry.prompt_lines());
-    // 平台和命令 shell 是稳定事实，必须写清楚：不说明时模型会自己猜方言（比如在 Git Bash
-    // 上写 cmd 的 `cd /d`、`2>nul`），猜错的代价是输出被重定向吞掉，模型还查不出来。
+    // 平台和 shell 是稳定事实，直接写进提示词：不写时模型会自己猜方言（比如在 Git Bash
+    // 上写 cmd 的 `cd /d`、`2>nul`），输出可能被重定向吞掉。
     prompt.push_str("\n\nEnvironment:\n- Platform: ");
     prompt.push_str(std::env::consts::OS);
     prompt.push_str("\n- Command shell: bash (Git Bash on Windows).");

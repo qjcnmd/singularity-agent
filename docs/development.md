@@ -28,6 +28,8 @@ npm --prefix apps/desktop start
 
 ### 日常迭代流程
 
+Rust 后端启动后直接通过标准输入/输出处理 RPC，Electron 启动它时不传模式参数。
+
 - **纯前端修改**：重新运行 `npm --prefix apps/desktop run build`，在工作台窗口中按 <kbd>Ctrl</kbd> + <kbd>R</kbd> 即可即时看到最新界面变更。
 - **Rust 后端修改**：
   1. 在系统托盘右键退出正在运行的 Singularity 实例（同一数据目录仅允许单一实例运行）。
@@ -75,7 +77,7 @@ cargo check --workspace --all-targets
 
 ### 应用回归测试
 
-CI 会执行现有的应用回归测试，检查历史读取失败后，停止等待是否正常结束：
+应用回归测试检查消息入队后立即返回、准备失败后保留输入、停止清空队列，以及冷打开损坏历史时报告读取错误：
 
 ```powershell
 cargo test -p singularity_app --locked
@@ -96,42 +98,11 @@ cargo run -p singularity_protocol --features typescript --example export_types
 
 ---
 
-## 4. 桌面 E2E 测试
+## 4. 现场验证
 
-项目在 `apps/desktop/e2e/` 下提供了基于真实 Electron 窗口的端到端自动化测试脚本。
+功能完成后，在构建后的 Electron 工作台中实际操作本次改动涉及的功能。按影响检查结果、出错、停止、重复操作和重读历史后的表现，只检查受影响部分。
 
-### 运行冒烟测试 (Smoke Test)
-
-E2E 默认使用日常数据目录，运行前先退出占用该目录的工作台；测试创建的项目与任务会保留在列表中。需要隔离时，把 `SINGULARITY_HOME` 指向另一个包含 `config.json` 与 `auth.json` 的目录。
-
-测试按完整目录复用已登记的项目，同名项目按各自所在行定位。冒烟测试首次添加项目时检查目录选择，重跑时检查取消选择并复用已有项目。
-
-```powershell
-$env:SINGULARITY_HOME = "$HOME/.singularity"
-
-# 运行冒烟测试
-node apps/desktop/e2e/smoke.mjs
-```
-
-### 专项测试脚本
-
-- **生命周期与重启恢复**：`node apps/desktop/e2e/lifecycle.mjs`（验证退出时取消任务，以及重启后的历史状态）
-- **压缩执行与恢复**：`node apps/desktop/e2e/compaction.mjs`（验证手动与自动的成功、失败、无内容结果、继续执行、重复操作与刷新恢复；临时提供方使用已有真实端点和凭据，检查后移除）
-- **统计与用量指标**：`node apps/desktop/e2e/stats-bar.mjs`（验证 Token 用量、输出速度、首 Token 延迟与缓存命中率）
-- **多模态图片管线**：`node apps/desktop/e2e/images.mjs`（验证图片粘贴、拖拽、缩略图预览与模型识图）
-
-| 脚本 | 真实模型调用条件 |
-| --- | --- |
-| `smoke.mjs`、`images.mjs` | 设置 `$env:SINGULARITY_E2E_MODEL = '1'` 后才调用模型；省略时只检查本地交互 |
-| `lifecycle.mjs`、`stats-bar.mjs` | 始终调用真实模型，不受 `SINGULARITY_E2E_MODEL` 控制 |
-| `compaction.mjs` | 始终调用真实模型；失败场景由同一真实提供方拒绝不存在的模型，测试结束移除临时配置 |
-
-测试从 `SINGULARITY_HOME` 读取配置和密钥。模型选择由 `SINGULARITY_E2E_SELECTOR` 指定，省略时固定使用 `bai/deepseek-v4.1-flash`；不会读取配置中的 `default_model` 来替换该选择。
-
-```powershell
-# 指定测试模型及思考档位；提供方、模型和档位必须已登记在该数据目录的配置中
-$env:SINGULARITY_E2E_SELECTOR = 'provider/model#reasoning'
-```
+数据目录、模型调用和临时文件处理按[仓库指令](../AGENTS.md#验证与交付)执行。
 
 ---
 
@@ -151,6 +122,5 @@ npm --prefix apps/desktop run package
 
 产物输出于 `apps/desktop/release/win-unpacked/`，包含 `Singularity.exe` 与完整运行时依赖。
 
-### CI 与 GitHub Releases
+### CI
 - **CI 工作流** (`.github/workflows/ci.yml`)：推送到 `main` 时运行 Rust 格式化检查、Clippy、编译、应用回归测试及依赖检查。
-- **发布工作流** (`.github/workflows/release.yml`)：当推送以 `v*` 开头的语义化 Git Tag（如 `v1.2.0`）时，自动编译 Windows x86-64 二进制与绿色分发包，并生成包含 SHA256 校验和的 GitHub Release。

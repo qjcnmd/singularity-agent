@@ -1,42 +1,9 @@
-//! 模型目录的能力投影与补全；未知取值保持未知，不把 reasoning 布尔值当作档位列表。
+//! 解析提供方返回的模型能力；未知取值保持未知，不把 reasoning 布尔值当作档位列表。
 use super::validate_identifier;
 use serde_json::Value;
-use singularity_protocol::{DiscoveredModel, ReasoningVariant};
+use singularity_protocol::{DiscoveredModel, ProviderApiProtocol, ReasoningVariant};
 
-fn fill(model: &mut DiscoveredModel, known: DiscoveredModel) {
-    model.display_name = model.display_name.take().or(known.display_name);
-    model.max_context_tokens = model.max_context_tokens.or(known.max_context_tokens);
-    model.max_output_tokens = model.max_output_tokens.or(known.max_output_tokens);
-    model.requires_reasoning_content_for_tool_calls = model
-        .requires_reasoning_content_for_tool_calls
-        .or(known.requires_reasoning_content_for_tool_calls);
-    if model.reasoning_variants.is_empty() {
-        model.reasoning_variants = known.reasoning_variants;
-    }
-}
-
-/// 公共目录只按实际端点与精确模型 ID 提供推荐资料。
-pub(super) fn supplement(models: &mut [DiscoveredModel], base_url: &str, directory: &Value) {
-    let Some(providers) = directory.as_object() else {
-        return;
-    };
-    let endpoint = crate::openai::api_root(base_url);
-    let Some(provider) = providers.values().find(|provider| {
-        provider
-            .get("api")
-            .and_then(Value::as_str)
-            .is_some_and(|api| crate::openai::api_root(api) == endpoint)
-    }) else {
-        return;
-    };
-    for model in models {
-        if let Some(entry) = provider.get("models").and_then(|models| models.get(&model.model_id)) {
-            fill(model, metadata(&model.model_id, entry));
-        }
-    }
-}
-
-pub(super) fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
+pub(super) fn metadata(id: &str, entry: &Value, protocol: ProviderApiProtocol) -> DiscoveredModel {
     let capacity = |paths: &[&str]| {
         paths
             .iter()
@@ -67,18 +34,11 @@ pub(super) fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
     }
     DiscoveredModel {
         model_id: id.to_string(),
-        display_name: entry
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.is_empty())
-            .map(str::to_string),
         max_context_tokens: capacity(&["/context_length", "/limit/context"]),
         max_output_tokens: capacity(&["/limit/output", "/top_provider/max_completion_tokens"]),
         reasoning_variants,
-        requires_reasoning_content_for_tool_calls: (entry
-            .pointer("/interleaved/field")
-            .and_then(Value::as_str)
-            == Some("reasoning_content"))
+        requires_reasoning_content_for_tool_calls: (protocol == ProviderApiProtocol::Chat
+            && entry.pointer("/interleaved/field").and_then(Value::as_str) == Some("reasoning_content"))
         .then_some(true),
     }
 }

@@ -1,5 +1,4 @@
-import type { DiscoveredModel, ModelConfigurationInput, ReasoningVariant } from './protocol'
-import { modelConfigurationFields } from './protocol.generated'
+import type { DiscoveredModel, ModelConfigurationInput, ProviderApiProtocol, ReasoningVariant } from './protocol'
 import { reasoningGrades } from './modelChoices'
 
 /** 空输入和非法输入都没有可保存的容量；表单保留原始文字用于编辑。 */
@@ -29,13 +28,8 @@ export function formatCapacityInput(value: number | null): string {
   return String(value)
 }
 
-/** 未记录字段归属的配置保留已有值，仅补齐空字段。 */
-export function automaticFieldsFor(model: ModelConfigurationInput) {
-  return model.automaticFields ?? modelConfigurationFields.filter(field => model[field] === null)
-}
-
 /** 模型弹窗和提供方保存共用思考选项规则，切换协议后也能直接指出不适用的档位。 */
-export function reasoningConfigurationError(variants: readonly ReasoningVariant[] | null | undefined, protocol: string): string | null {
+export function reasoningConfigurationError(variants: readonly ReasoningVariant[] | null | undefined, protocol: ProviderApiProtocol): string | null {
   const declared = variants ?? []
   if (declared.some(variant => !variant.id || /[\s/#]/.test(variant.id) || (variant.wireEffort !== null && /[\s/#]/.test(variant.wireEffort)))) return '思考档位无效，请重新获取模型参数或取消选择此档位。'
   if (new Set(declared.map(variant => variant.id)).size !== declared.length) return '思考选项不能重名。'
@@ -46,13 +40,10 @@ export function reasoningConfigurationError(variants: readonly ReasoningVariant[
   return null
 }
 
-/** 新建草稿的初始值；提供方与协议由调用方补齐。 */
+/** 新建模型草稿的初始值；协议由所属提供方统一设置。 */
 export function blankModel(): ModelConfigurationInput {
   return {
     modelId: '',
-    automaticFields: [...modelConfigurationFields],
-    displayName: null,
-    apiProtocol: 'chat',
     maxContextTokens: null,
     maxOutputTokens: null,
     reasoningVariants: null,
@@ -63,20 +54,20 @@ export function blankModel(): ModelConfigurationInput {
   }
 }
 
-/** 模型协议决定线上参数的适用范围；编辑和发现导入共用此边界。 */
-export function applyProtocol(model: ModelConfigurationInput, apiProtocol: string): ModelConfigurationInput {
-  return { ...model, apiProtocol,
+/** 提供方协议决定模型参数的适用范围；编辑和发现导入共用此边界。 */
+export function applyProtocol(model: ModelConfigurationInput, apiProtocol: ProviderApiProtocol): ModelConfigurationInput {
+  return { ...model,
     thinkingWireFormat: apiProtocol === 'responses' ? null : model.thinkingWireFormat,
     chatOutputTokensField: apiProtocol === 'responses' ? null : model.chatOutputTokensField,
     requiresReasoningContentForToolCalls: apiProtocol === 'responses' ? null : model.requiresReasoningContentForToolCalls }
 }
 
-/** 只更新自动字段；用户覆盖与最近有效值在再次导入时保留。 */
+/** 只补空字段，保留已有设置。 */
 export function mergeDiscoveredModels(
   rows: ModelConfigurationInput[],
   candidates: DiscoveredModel[],
   picked: ReadonlySet<string>,
-  protocol: string,
+  protocol: ProviderApiProtocol,
 ): ModelConfigurationInput[] {
   const next = [...rows]
   for (const candidate of candidates) {
@@ -90,13 +81,14 @@ export function mergeDiscoveredModels(
   return next
 }
 
-/** 单模型编辑与批量导入共用自动字段合并规则。 */
-export function mergeDiscoveredModel(current: ModelConfigurationInput, candidate: DiscoveredModel, protocol: string): ModelConfigurationInput {
-  const merged = { ...current, automaticFields: automaticFieldsFor(current) }
-  for (const field of merged.automaticFields) {
+/** 单模型编辑与批量导入共用补全规则。 */
+export function mergeDiscoveredModel(current: ModelConfigurationInput, candidate: DiscoveredModel, protocol: ProviderApiProtocol): ModelConfigurationInput {
+  const merged = { ...current }
+  for (const field of ['maxContextTokens', 'maxOutputTokens', 'reasoningVariants', 'requiresReasoningContentForToolCalls'] as const) {
+    if (current[field] !== null) continue
     if (!(field in candidate)) continue
-    const value = candidate[field as keyof DiscoveredModel]
-    // 未声明的推荐不擦掉上次已确认的值；手动字段不在自动集合中。
+    const value = candidate[field]
+    // 未返回的值保持为空。
     if (value === null || (field === 'reasoningVariants' && candidate.reasoningVariants.length === 0)) continue
     Object.assign(merged, { [field]: value })
     if (field === 'reasoningVariants' && !candidate.reasoningVariants.some(variant => variant.id === merged.defaultVariant)) merged.defaultVariant = null
@@ -105,10 +97,10 @@ export function mergeDiscoveredModel(current: ModelConfigurationInput, candidate
 }
 
 /** 保留目录和已有配置的线上映射；开关模型只提供 off / on。 */
-export function reasoningOptionsFor(variants: readonly ReasoningVariant[], protocol: string): ReasoningVariant[] {
+export function reasoningOptionsFor(variants: readonly ReasoningVariant[], protocol: ProviderApiProtocol): ReasoningVariant[] {
   const toggle = protocol === 'chat' && variants.some(variant => variant.id === 'on')
     && variants.every(variant => variant.id === 'off' || variant.id === 'on')
-  // on 不能随选择状态消失，否则保存 off 后无法重新开启。
+  // on 不随选择状态消失：保存 off 后还要能重新开启。
   const ids = toggle ? ['off', 'on'] : ['off', ...reasoningGrades, ...(protocol === 'chat' ? ['on'] : [])]
   const options = new Map(ids.map(id => [id, { id, wireEffort: id === 'off' || id === 'on' ? null : id }]))
   for (const variant of variants) options.set(variant.id, variant)

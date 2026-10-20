@@ -35,13 +35,16 @@ export function QuestionPanel({ request, state }: {
   function update(patch: Partial<UserQuestionAnswer>, nextIndex = index) {
     const next = answers.map((value, at) => at === index ? { ...value, ...patch } : value)
     setIndex(nextIndex, next)
-    return next
   }
 
-  function advance(values = answers) {
+  function advance(skip = false) {
+    const values = skip ? answers.map((value, at) => at === index
+      ? { ...value, selected: [], text: '', skipped: true } : value) : answers
     if (!last) { setIndex(index + 1, values); return }
     const missing = values.findIndex(value => !value.skipped && value.selected.length === 0 && !value.text.trim())
     if (missing >= 0) { setIndex(missing, values); return }
+    // 提交失败时仍保留本题的跳过状态，方便继续填写或重试。
+    if (skip) setIndex(index, values)
     void appStore.answerQuestion(request.itemId, values)
   }
 
@@ -59,7 +62,7 @@ export function QuestionPanel({ request, state }: {
   return <form className="question-panel" aria-label="回答问题" onSubmit={submit} onKeyDown={event => {
     if (event.key === 'Escape' && index > 0) { event.preventDefault(); event.stopPropagation(); setIndex(index - 1) }
   }}>
-    <header><strong id="current-question">{question.question}</strong><button type="button" className="quiet-button" disabled={stopping} onClick={() => void appStore.stopActive()}>{stopping ? '正在停止…' : '停止任务'}</button></header>
+    <header><strong id="current-question">{question.question}</strong></header>
     <fieldset ref={body} className="question-panel-body" aria-labelledby="current-question" disabled={disabled}>
       {question.options.length > 0 && <div className="question-options" role={question.multiSelect ? 'group' : 'radiogroup'} aria-label="答案选项">
         {question.options.map((option, at) => <button key={option.label} type="button" className="question-answer-row"
@@ -88,14 +91,14 @@ export function QuestionPanel({ request, state }: {
       </label>
     </fieldset>
     <footer>
-      <nav className="question-pager" aria-label="问题分页">
+      {request.questions.length > 1 && <nav className="question-pager" aria-label="问题分页">
         <button type="button" className="icon-button" aria-label="上一题" disabled={index === 0 || disabled} onClick={() => setIndex(index - 1)}><ChevronLeft size={16} /></button>
         <span aria-live="polite">{index + 1} / {request.questions.length}</span>
         <button type="button" className="icon-button" aria-label="下一题" disabled={last || disabled} onClick={() => setIndex(index + 1)}><ChevronRight size={16} /></button>
-      </nav>
+      </nav>}
       {error && <p role="alert" className="form-error">{error.message}</p>}
       <div className="question-actions">
-        <button type="button" className="quiet-button" disabled={disabled} onClick={() => advance(update({ selected: [], text: '', skipped: true }))}>跳过</button>
+        <button type="button" className="quiet-button" disabled={disabled} onClick={() => advance(true)}>跳过</button>
         <button type="submit" className="primary-button" disabled={!answered || disabled}>{submitting ? '提交中…' : last ? '提交回答' : '继续'}</button>
       </div>
     </footer>

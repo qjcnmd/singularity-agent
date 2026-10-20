@@ -9,10 +9,9 @@ use crate::{SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Workspace {
     pub workspace_id: String,
-    pub name: String,
     pub root: String,
 }
 
@@ -30,7 +29,7 @@ pub struct ThreadSummary {
     pub manually_stopped: bool,
     pub turn_count: usize,
     /// 整份账本的累计模型用量。它只在生成快照时更新，运行中回合的增量要调用方从活动
-    /// 事件里另算（读盘的冻结窗口保证两者不重叠），因此不是实时值。
+    /// 事件累计，实时值由 SessionRuntime 提供。
     pub usage: SessionModelUsage,
 }
 
@@ -41,7 +40,6 @@ pub struct ThreadReadPage {
     pub summary: ThreadSummary,
     pub turns: Vec<ThreadTurn>,
     pub next_cursor: Option<String>,
-    pub request_definitions: BTreeMap<String, crate::ModelRequestDefinitions>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -55,7 +53,7 @@ pub enum SessionPhase {
     Stopping,
 }
 
-/// 给原始执行事件附加工作台的数据版本号；开始时间由执行事件自己携带。
+/// 给执行事件附加会话版本和真实运行阶段，客户端不从事件类型推断阶段。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -63,14 +61,11 @@ pub struct TurnEventEnvelope {
     #[serde(flatten)]
     pub event: TurnEvent,
     pub session_revision: u64,
-}
-
-/// 普通会话变更里携带的精简活动 turn 身份；事件本身只走增量通道或完整恢复快照。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct ActiveTurnRuntimeSnapshot {
-    pub turn_id: String,
+    pub phase: SessionPhase,
+    /// 请求观测改变合计时携带完整用量，客户端无需重算。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub usage: Option<SessionModelUsage>,
 }
 
 /// 产生了终态反馈的操作：普通回合，或一次独立的压缩。界面按来源决定反馈放在哪里。
@@ -95,8 +90,17 @@ pub struct SessionTerminalSnapshot {
     pub error: Option<crate::TurnErrorDetail>,
 }
 
-/// `session_changed` / `session_settled` 携带活动回合、终态与冻结窗口；
-/// 压缩条目来自共同执行事件，完整活动事件在 `session.read` 的恢复快照里传输。
+/// 已接收、尚未保存为用户消息的输入；身份在交付后保持不变。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct PendingUserMessage {
+    pub item_id: String,
+    pub text: String,
+    pub images: Vec<crate::ImageAttachment>,
+}
+
+/// 会话当前运行阶段、待处理输入、后台命令与用量。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -106,8 +110,11 @@ pub struct SessionRuntime {
     pub selector: Option<String>,
     pub model_context_window: Option<u64>,
     pub pending_question: Option<crate::PendingQuestion>,
-    pub active_turn: Option<ActiveTurnRuntimeSnapshot>,
+    pub pending_messages: Vec<PendingUserMessage>,
+    pub background_tasks: Vec<crate::BackgroundTask>,
     pub terminal: Option<SessionTerminalSnapshot>,
+    /// 活动执行累计到的完整用量；尚未执行时从历史摘要读取。
+    pub usage: Option<SessionModelUsage>,
 }
 
 /// 可编辑的模型取值；取值是否合法由 runtime 的配置解析负责校验。
@@ -116,10 +123,6 @@ pub struct SessionRuntime {
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfigurationInput {
     pub model_id: String,
-    /// 目录自动补全的字段。None 表示未记录归属，编辑器只补空字段；空列表表示全部手动管理。
-    pub automatic_fields: Option<Vec<ModelConfigurationField>>,
-    pub display_name: Option<String>,
-    pub api_protocol: Option<String>,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning_variants: Option<Vec<ReasoningVariant>>,
@@ -130,37 +133,11 @@ pub struct ModelConfigurationInput {
     pub requires_reasoning_content_for_tool_calls: Option<bool>,
 }
 
-/// 思考选项与默认选项共同作为一个覆盖单元。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub enum ModelConfigurationField {
-    DisplayName,
-    MaxContextTokens,
-    MaxOutputTokens,
-    ReasoningVariants,
-    ThinkingWireFormat,
-    ChatOutputTokensField,
-    RequiresReasoningContentForToolCalls,
-}
-
-impl ModelConfigurationField {
-    pub const ALL: [Self; 7] = [
-        Self::DisplayName,
-        Self::MaxContextTokens,
-        Self::MaxOutputTokens,
-        Self::ReasoningVariants,
-        Self::ThinkingWireFormat,
-        Self::ChatOutputTokensField,
-        Self::RequiresReasoningContentForToolCalls,
-    ];
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct RedactedProvider {
-    pub api_protocol: Option<String>,
+    pub api_protocol: ProviderApiProtocol,
     pub provider_id: String,
     pub display_name: Option<String>,
     pub base_url: String,
@@ -179,6 +156,7 @@ pub struct RedactedModelCatalog {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApiProtocol {
     Chat,
@@ -197,7 +175,7 @@ pub struct ReasoningVariant {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfigurationInput {
-    pub api_protocol: Option<String>,
+    pub api_protocol: ProviderApiProtocol,
     pub provider_id: String,
     pub display_name: Option<String>,
     pub base_url: String,
@@ -210,7 +188,6 @@ pub struct ProviderConfigurationInput {
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredModel {
     pub model_id: String,
-    pub display_name: Option<String>,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning_variants: Vec<ReasoningVariant>,
@@ -236,7 +213,6 @@ pub struct AppBootstrap {
 pub struct SessionReadResult {
     pub history: ThreadReadPage,
     pub runtime: SessionRuntime,
-    pub active_events: Vec<TurnEventEnvelope>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -249,7 +225,6 @@ pub enum RpcErrorCode {
     SessionNotFound,
     SessionBusy,
     ConfigurationInvalid,
-    ConfigurationPartiallySaved,
     ProviderUnavailable,
     Internal,
 }
@@ -307,6 +282,11 @@ pub enum StreamEvent {
         session_id: String,
         payload: SessionRuntime,
     },
+    BackgroundTaskUpdated {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        payload: Box<crate::BackgroundTaskUpdate>,
+    },
     ResyncRequired,
 }
 
@@ -317,4 +297,13 @@ pub struct StreamEnvelope {
     pub revision: u64,
     #[serde(flatten)]
     pub event: StreamEvent,
+}
+
+/// 首次发送确认已接收输入；工作台按返回的身份打开任务。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStartResult {
+    pub session_id: String,
+    pub bootstrap: AppBootstrap,
 }

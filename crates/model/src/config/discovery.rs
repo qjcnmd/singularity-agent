@@ -1,23 +1,21 @@
-//! 配置编辑器用的只读模型元数据。补全只填缺失值，不覆盖已保存的配置。
+//! 从用户配置的提供方查询模型列表与元数据。
 
 use std::collections::BTreeMap;
 
-use super::model_metadata::{metadata, supplement};
+use super::model_metadata::metadata;
 use serde_json::Value;
-use singularity_protocol::DiscoveredModel;
+use singularity_protocol::{DiscoveredModel, ProviderApiProtocol};
 
 use super::{ProviderError, user_config_error, validate_base_url, validate_model_id};
 use crate::ModelErrorKind;
 use crate::transport::http::{client_builder, transport_error_source};
 
-/// 查询模型目录并补齐元数据：地址解释、请求构造、发送和结果补全都在这里，调用方只提供
-/// 编辑器里的取值和解析好的凭据，不转交 HTTP 的半成品。
+/// 查询提供方的模型列表与元数据；调用方只提供编辑器里的取值和解析好的凭据。
 pub async fn discover(
     base_url: &str,
     api_key: &str,
-    api_protocol: &str,
+    protocol: ProviderApiProtocol,
 ) -> Result<Vec<DiscoveredModel>, ProviderError> {
-    let protocol = super::parse_catalog_protocol(api_protocol)?;
     let base_url = crate::openai::canonical_base_url(base_url);
     validate_base_url(base_url)?;
     let client = client_builder()
@@ -40,30 +38,7 @@ pub async fn discover(
         return Err(discovery_http_error(response.status().as_u16()));
     }
     let body: Value = read_response_body(response).await?;
-    let mut models = read_listing(&body)?;
-    if models.iter().any(|model| {
-        model.max_context_tokens.is_none()
-            || model.max_output_tokens.is_none()
-            || model.reasoning_variants.is_empty()
-    }) {
-        // 这个公开目录请求不带用户的 endpoint，也不带凭据。
-        if let Ok(client) = client_builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .user_agent("Singularity model discovery")
-            .build()
-            && let Ok(response) = client.get("https://models.dev/api.json").send().await
-            && response.status().is_success()
-            && let Ok(directory) = read_response_body(response).await
-        {
-            supplement(&mut models, base_url, &directory);
-        }
-    }
-    if protocol == singularity_protocol::ProviderApiProtocol::Responses {
-        for model in &mut models {
-            model.requires_reasoning_content_for_tool_calls = None;
-        }
-    }
-    Ok(models)
+    read_listing(&body, protocol)
 }
 
 /// 读响应体分两步：读取字节（传输层面的事实），再自己解码（结构层面的事实），让两类失败各自
@@ -90,7 +65,7 @@ fn discovery_transport_error(error: reqwest::Error) -> ProviderError {
     .with_code("model_discovery_transport_failed")
 }
 
-fn read_listing(body: &Value) -> Result<Vec<DiscoveredModel>, ProviderError> {
+fn read_listing(body: &Value, protocol: ProviderApiProtocol) -> Result<Vec<DiscoveredModel>, ProviderError> {
     let entries: Vec<(&str, &Value)> = if let Some(data) = body.get("data").and_then(Value::as_array) {
         data.iter().filter_map(|entry| Some((entry.get("id")?.as_str()?, entry))).collect()
     } else if let Some(models) = body.get("models").and_then(Value::as_object) {
@@ -102,7 +77,7 @@ fn read_listing(body: &Value) -> Result<Vec<DiscoveredModel>, ProviderError> {
     for (id, entry) in entries {
         // 形状不对或 id 不合法的条目直接跳过，不让整次发现失败。
         if entry.is_object() && validate_model_id(id, "model id").is_ok() {
-            models.entry(id.to_string()).or_insert_with(|| metadata(id, entry));
+            models.entry(id.to_string()).or_insert_with(|| metadata(id, entry, protocol));
         }
     }
     Ok(models.into_values().collect())

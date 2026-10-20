@@ -30,7 +30,7 @@ pub(crate) fn openai_chat_stream_request_payload(
         "messages": openai_messages(&request.messages, selection, provider_name, endpoint),
         "stream": true,
         // provider 实现 OpenAI 兼容的 include_usage 扩展时会在最后一个流块带上 usage；
-        // 不支持该扩展的 provider 照样返回合法响应，只是 usage_present=false。
+        // 不支持该扩展的 provider 照样返回合法响应，用量留空。
         "stream_options": {"include_usage": true},
     });
     let reasoning = super::reasoning_wire_decision(selection);
@@ -44,9 +44,6 @@ pub(crate) fn openai_chat_stream_request_payload(
     }
     if !request.tools.is_empty() {
         payload["tools"] = json!(request.tools.iter().map(openai_tool_payload).collect::<Vec<_>>());
-        if selection.supports_tool_choice {
-            payload["tool_choice"] = serde_json::json!("auto");
-        }
     }
     payload
 }
@@ -114,16 +111,12 @@ fn openai_message_payload_with_reasoning(
     provider_name: &str,
     endpoint: &str,
 ) -> Value {
-    let role = if message.role == ModelRole::Developer && !selection.supports_developer_role {
+    let role = if message.role == ModelRole::Developer {
         json!("system")
     } else {
         json!(message.role)
     };
-    let mut content = openai_message_content(message);
-    // 该端点的工具调用消息必须带 content 字段，用空串补齐。
-    if selection.requires_assistant_content_for_tool_calls && content.is_null() {
-        content = json!("");
-    }
+    let content = openai_message_content(message);
     let mut payload = json!({
         "role": role,
         "content": content,
@@ -154,9 +147,7 @@ fn openai_message_payload_with_reasoning(
 
 fn openai_message_content(message: &ModelMessage) -> Value {
     let text = &message.content;
-    if message.role == ModelRole::Assistant && !message.tool_calls.is_empty() && text.is_empty() {
-        Value::Null
-    } else if message.images.is_empty() || message.role == ModelRole::Tool {
+    if message.images.is_empty() || message.role == ModelRole::Tool {
         json!(text)
     } else {
         let mut content = vec![json!({"type": "text", "text": text})];

@@ -2,10 +2,11 @@ import { useId, useRef, useState } from 'react'
 import { navigateList, useDismissOnOutside, useTransientFocus } from '../interactions'
 import { ExpandChevron } from './ExpandChevron'
 import { Disclosure } from './Disclosure'
+import type { ProviderApiProtocol } from '../protocol'
 
 const protocols = [['chat', 'Chat Completions'], ['responses', 'Responses']] as const
 
-export function ProtocolPicker({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+export function ProtocolPicker({ value, onChange }: { value: ProviderApiProtocol; onChange: (value: ProviderApiProtocol) => void }) {
   const [open, setOpen] = useState(false)
   const root = useRef<HTMLDivElement>(null)
   const anchor = useRef<HTMLButtonElement>(null)

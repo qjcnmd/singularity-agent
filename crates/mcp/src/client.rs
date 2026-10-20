@@ -1,6 +1,6 @@
 //! SDK 传输、进程生命周期及可取消的 MCP 调用。
 
-use crate::config::{ServerConfig, TransportConfig};
+use crate::config::ServerConfig;
 use rmcp::{
     ClientHandler, RoleClient, ServiceExt,
     model::*,
@@ -11,6 +11,7 @@ use rmcp::{
     },
 };
 use sha2::{Digest, Sha256};
+use singularity_protocol::McpTransportConfig;
 use std::{
     path::Path,
     sync::{Arc, Mutex},
@@ -60,7 +61,7 @@ impl Connection {
         let startup = Duration::from_secs(config.startup_timeout_sec);
         let connect = async {
             let service = match &config.transport {
-                TransportConfig::Stdio { command, args, cwd: configured_cwd, env } => {
+                McpTransportConfig::Stdio { command, args, cwd: configured_cwd, env } => {
                     let mut command =
                         which_command(command).map_err(|error| format!("无法启动 MCP：{error}"))?;
                     command.args(args).envs(env).current_dir(
@@ -71,11 +72,13 @@ impl Connection {
                     );
                     #[cfg(windows)]
                     let command = {
-                        use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject};
+                        use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
                         let mut wrapped = CommandWrap::from(command);
+                        // 后端异常退出时也由 Windows 回收服务器的整棵进程树。
                         wrapped
                             .wrap(CreationFlags(windows::Win32::System::Threading::CREATE_NO_WINDOW))
-                            .wrap(JobObject);
+                            .wrap(JobObject)
+                            .wrap(KillOnDrop);
                         wrapped
                     };
                     let (transport, stderr) = TokioChildProcess::builder(command)
@@ -102,7 +105,7 @@ impl Connection {
                     }
                     handler.serve(transport).await.map_err(|error| format!("MCP 初始化失败：{error}"))?
                 }
-                TransportConfig::Http { url, headers } => {
+                McpTransportConfig::Http { url, headers } => {
                     // 与现有模型传输使用同一 ring provider，避免两个 TLS 默认实现冲突。
                     let _ = rustls::crypto::ring::default_provider().install_default();
                     let client = reqwest::Client::builder()
@@ -152,7 +155,7 @@ impl Connection {
     }
 
     pub async fn tools(&self) -> Result<Vec<Tool>, String> {
-        // 回合开始及压缩后重新发现；Agent 在两次发现之间复用同一份 schema。
+        // 管理器只在首连、重连或发现失败后重试时调用。
         tokio::time::timeout(Duration::from_secs(self.config.startup_timeout_sec), self.peer.list_all_tools())
             .await
             .map_err(|_| "MCP 工具发现超时。".to_string())?

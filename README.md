@@ -1,6 +1,6 @@
 # Singularity
 
-Singularity 是以 Rust 实现的本地 coding-agent harness。日常工作通过 Electron 桌面工作台进行；`--json` 用同一套 Agent 能力提供单次评估入口。Workspace、Session、模型配置和执行状态由本机 Host 管理，React 渲染进程负责呈现与控制。
+Singularity 是以 Rust 实现的本地 coding-agent harness。日常工作通过 Electron 桌面工作台进行。Workspace、Session、模型配置和执行状态由本机 Host 管理，React 渲染进程负责呈现与控制。
 
 当前发布目标为 Windows x86-64。
 
@@ -10,7 +10,6 @@ Singularity 是以 Rust 实现的本地 coding-agent harness。日常工作通�
 Singularity.exe（Electron：窗口、托盘、原生文件夹选择）
   └─ preload IPC → 主进程 → stdio → Rust AppServer
        └─ crates/runtime → AgentLoop → 工具与 Provider
-resources/runtime/singularity.exe --json（单次评估，共用 runtime）
 ```
 
 完整运行流程见 [HTML 架构图](architecture.html)；模块职责、状态归属与源码入口见[架构说明](docs/architecture.md)。
@@ -29,17 +28,9 @@ resources/runtime/singularity.exe --json（单次评估，共用 runtime）
 
 空闲时发送启动新回合；运行中按 Enter 或 Ctrl/Cmd+Enter 发送 steer，引导当前回合在下一次模型请求时继续执行。会话日志保存历史，Host 维护执行状态，刷新或关闭页面不会停止后台任务。详细操作见 [工作台交互](docs/desktop-ui.md)。
 
-评估入口：
-
-```powershell
-resources/runtime/singularity.exe --json "修复失败测试" --model provider/model#reasoning
-```
-
-`--json` 输出逐行事件并以终态 `summary` 行收尾，每次新建并保存一份会话。评估器通过 `SINGULARITY_HOME` 隔离数据，并负责超时和进程终止。`--app-server` 为桌面内部入口，不能与评估参数混用。
-
 ## 本地数据与权限
 
-用户数据目录默认是 `%USERPROFILE%\.singularity`，保存模型配置、凭据、已登记项目与会话日志；设置 `SINGULARITY_HOME` 可改用别的绝对路径（例如让并行的第二个实例或评估任务使用独立数据）。取值无效时程序明确报错，不会把数据写到别的位置。目录内容和备份方式见 [数据存储与目录维护](docs/INSTALL.md#6-数据存储与目录维护)。
+用户数据目录默认是 `%USERPROFILE%\.singularity`，保存模型配置、凭据、已登记项目与会话日志；设置 `SINGULARITY_HOME` 可改用别的绝对路径（例如让并行的第二个实例或自动化任务使用独立数据）。取值无效时程序明确报错，不会把数据写到别的位置。目录内容和备份方式见 [数据存储与目录维护](docs/INSTALL.md#6-数据存储与目录维护)。
 
 工作台从打包资源加载，RPC 与事件走私有进程管道，不监听 HTTP 或 WebSocket 端口。渲染进程通过隔离的 preload 调用桌面能力。
 
@@ -50,13 +41,13 @@ Agent 继承 `singularity.exe` 的本机权限，可读取、编辑文件并运�
 | 文档 | 用途 |
 | --- | --- |
 | [安装与运行](docs/INSTALL.md) | 发布包安装、源码构建、模型和技能配置、数据维护 |
-| [工作台交互](docs/desktop-ui.md) | 项目、任务、输入、轨迹与显示约定 |
+| [工作台交互](docs/desktop-ui.md) | 项目、任务、输入、注入内容与显示约定 |
 | [开发指南](docs/development.md) | 本地运行、相关检查、测试组织和发布流程 |
 | [架构图](architecture.html) | 完整运行流程、执行顺序与条件分支 |
 | [架构说明](docs/architecture.md) | 模块职责、状态归属与源码导航 |
 | [宪章](docs/constitution.md) | 产品方向与边界 |
 
-发布包附带同目录的 `INSTALL.md`；上表按源码仓库的文档路径组织。
+安装说明见源码仓库的 `docs/INSTALL.md`。
 
 ## 许可证
 

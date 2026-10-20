@@ -12,7 +12,20 @@ pub enum RequestPurpose {
     Compaction,
 }
 
-/// 请求的检查信息：持久化会话、轨迹视图和实时的 provider/attempt 事件共用。
+/// 提供方单次请求上报的真实 Token 数与缓存计数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// 供应商上报总量，缺失时由协议解析器将输入输出相加得到。
+    pub total_tokens: u64,
+    /// None 为未上报；Some(0) 为明确上报零缓存用量。
+    pub cached_input_tokens: Option<u64>,
+}
+
+/// 请求用量与结果：持久化会话和实时 provider/attempt 事件共用。
 /// 请求本身与 provider 无关；鉴权信息和私有的重放数据都不在这里。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -21,12 +34,7 @@ pub struct RequestObservation {
     /// 查找请求详情并配对开始、结束观测的键；每次 provider attempt 生成一个，
     /// 与 assistant 或 compaction 的会话条目身份无关。
     pub request_id: String,
-    /// 请求前缀的检查投影：完整指令、工具和偏好，不包含对话历史。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub request_head: Option<Box<crate::ModelRequestSnapshot>>,
     pub purpose: RequestPurpose,
-    pub attempt: u32,
     pub provider: String,
     pub model: String,
     pub status: crate::ProviderAttemptStatus,
@@ -39,19 +47,8 @@ pub struct RequestObservation {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub decode_ms: Option<u64>,
-    /// 供应商上报总量，缺失时由已知输入输出相加得到。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub total_tokens: Option<u64>,
-    pub input_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
-    pub cached_input_tokens: Option<u64>,
-    pub error: Option<String>,
-    /// 这次 attempt 的稳定诊断码，与 `error` 类别一起构成可以持久回放的失败事实；
-    /// 实时事件和历史读取都从这一份记录派生。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub diagnostic_code: Option<String>,
+    /// 未上报时为 None；有用量时输入、输出和总数始终齐全。
+    pub usage: Option<ModelUsage>,
 }
 
 /// read 工具真实读到的源文件范围：只有实际起始行和正文行数，不含正文本身。
@@ -65,6 +62,36 @@ pub struct ReadSource {
     pub line_count: u64,
 }
 
+/// 工具已经保存的结果；历史条目把它与调用放在一起，未完成时为空。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ToolResult {
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(
+        feature = "typescript",
+        ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
+    )]
+    pub images: Vec<crate::ImageAttachment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub read_source: Option<ReadSource>,
+    pub is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub duration_ms: Option<u64>,
+}
+
+/// 历史中可展示为消息的角色；工具调用和请求各有独立条目。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryMessageRole {
+    User,
+    Assistant,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -72,19 +99,20 @@ pub struct ReadSource {
 ///
 /// 一个 turn 的状态和身份归 ThreadTurn 所有，轮内的条目不重复承载同一份事实。
 pub enum HistoryItem {
-    /// 请求条目，身份由 `observation.request_id` 承载；`started_at` 是开始观测的
-    /// 记录时间，开始记录缺失时为 None，不用结束时间代替。
+    /// 请求状态与计量，身份来自 request_id。
     Request {
-        #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "typescript", ts(optional))]
-        started_at: Option<String>,
         observation: RequestObservation,
-        /// 指令与工具从所属历史页的定义表读取，不逐请求重复传输。
-        context: crate::ModelRequestReference,
+    },
+    /// 本轮实际注入的内容。
+    Context {
+        id: String,
+        name: String,
+        content: String,
     },
     Message {
         id: String,
-        role: String,
+        running: bool,
+        role: HistoryMessageRole,
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[cfg_attr(
@@ -95,31 +123,15 @@ pub enum HistoryItem {
     },
     Thinking {
         id: String,
+        running: bool,
         text: String,
     },
-    ToolCall {
+    Tool {
         id: String,
+        running: bool,
         name: String,
         args: Value,
-    },
-    ToolResult {
-        id: String,
-        output: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        #[cfg_attr(
-            feature = "typescript",
-            ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
-        )]
-        images: Vec<crate::ImageAttachment>,
-        /// read 工具真实读到的来源范围；其他工具没有这个字段。
-        #[serde(rename = "readSource", skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "typescript", ts(optional))]
-        read_source: Option<ReadSource>,
-        #[serde(rename = "isError")]
-        is_error: bool,
-        #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "typescript", ts(optional))]
-        duration_ms: Option<u64>,
+        result: Option<ToolResult>,
     },
     Settings {
         id: String,
@@ -144,10 +156,10 @@ impl HistoryItem {
     pub fn id(&self) -> &str {
         match self {
             Self::Request { observation, .. } => &observation.request_id,
-            Self::Message { id, .. }
+            Self::Context { id, .. }
+            | Self::Message { id, .. }
             | Self::Thinking { id, .. }
-            | Self::ToolCall { id, .. }
-            | Self::ToolResult { id, .. }
+            | Self::Tool { id, .. }
             | Self::Settings { id, .. }
             | Self::Compaction { id, .. }
             | Self::CompactionResult { id, .. } => id,
@@ -168,6 +180,8 @@ pub struct ThreadTurn {
     pub finished_at: Option<String>,
     pub turn_id: Option<String>,
     pub status: Option<TurnStatus>,
+    /// 中断是否来自用户主动停止；未完成的历史操作为 false。
+    pub manually_stopped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub error: Option<crate::TurnErrorDetail>,
@@ -188,36 +202,14 @@ pub struct Thread {
 /// 持久化 turn 的公开摘要。
 pub struct Turn {
     pub turn_id: String,
-    pub thread_id: String,
     pub status: TurnStatus,
-    /// provider usage 的投影（评估工具的数据来源）。provider 可能不报告 usage；缺失时本字段是
-    /// None，不把未知伪装成零。请求观测写入 JSONL，重启后可聚合历史用量。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub usage: Option<TurnModelUsage>,
-}
-
-/// 一轮执行中已上报的累计模型用量，供 CLI 评估入口消费。
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct TurnModelUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub total_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub reasoning_tokens: u64,
-    /// 这次聚合里是否至少有一个请求完整上报了输入和输出计数。为 false 时各计数表示
-    /// 未知，不能当零消费或计费依据。
-    pub usage_present: bool,
 }
 
 /// 整份账本里 provider 请求观测的合计，供工作台展示成本和速度。
 ///
 /// requestId 每次 attempt 各生成一个，按它归并同一请求的 started 与终态观测（取末次），
 /// 重试计入合计，该规则与工作台历史的请求投影一致。TTFT 只统计有实测计时的请求，token
-/// 与消费只统计上报了 usage 的请求；与 TurnModelUsage 的区别是范围，后者按轮计费
-/// （`--json` 与评估口径，含该轮全部重试），本类型跨轮累计输入、输出和耗时。
+/// 与消费只统计上报了 usage 的请求，跨轮累计输入、输出和耗时。
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -251,47 +243,4 @@ pub enum TurnStatus {
     Completed,
     Failed,
     Interrupted,
-}
-
-/// `--json` 终态摘要中的回合结果信息。
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SummaryTurn {
-    pub status: TurnStatus,
-    #[serde(rename = "threadId", skip_serializing_if = "Option::is_none")]
-    pub thread_id: Option<String>,
-    pub usage: Option<TurnModelUsage>,
-    /// 是否由于达到截断限制而结束
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub truncated: bool,
-}
-
-/// `--json` 终态摘要对象 `{"summary": {"turn": ...}}`。
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TerminalSummary {
-    pub turn: SummaryTurn,
-}
-
-impl TerminalSummary {
-    pub fn new(
-        thread_id: Option<&str>,
-        status: TurnStatus,
-        usage: Option<TurnModelUsage>,
-        truncated: bool,
-    ) -> Self {
-        Self {
-            turn: SummaryTurn {
-                status,
-                thread_id: thread_id.map(str::to_string),
-                usage,
-                truncated,
-            },
-        }
-    }
-
-    /// 序列化为终态输出的 JSON 行。
-    pub fn to_line(&self) -> serde_json::Value {
-        serde_json::json!({ "summary": self })
-    }
 }

@@ -4,7 +4,6 @@
 //! 多个工具调用）都能原样落盘并在协议重放时还原。
 
 use singularity_model::{ModelMessage, ModelToolCall, ModelTurnResponse, ProviderReasoningReplay};
-use std::borrow::Cow;
 
 use crate::tools::ToolExecution;
 
@@ -39,6 +38,8 @@ pub enum ContentBlock {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AgentMessage {
+    /// 后台任务的完成事实；不投影成用户气泡。
+    Notification { content: Vec<ContentBlock> },
     #[serde(rename_all = "camelCase")]
     User {
         content: Vec<ContentBlock>,
@@ -70,46 +71,56 @@ pub enum AgentMessage {
 
 impl AgentMessage {
     /// 用户和助手消息的公开内容，历史与完成事件共用；私有续接材料不进入投影，
-    /// 工具结果必须由历史归约去绑定对应的调用，不在这里投影。
+    /// 工具结果由历史归约绑定到对应调用，这里不投影。
     pub fn public_items(&self, entry_id: &str, scope: ItemScope) -> Vec<singularity_protocol::HistoryItem> {
         use singularity_protocol::HistoryItem;
         let role = match self {
-            Self::User { .. } => "user",
-            Self::Assistant { .. } => "assistant",
-            Self::ToolResult { .. } => return Vec::new(),
+            Self::User { .. } => singularity_protocol::HistoryMessageRole::User,
+            Self::Assistant { .. } => singularity_protocol::HistoryMessageRole::Assistant,
+            Self::ToolResult { .. } | Self::Notification { .. } => return Vec::new(),
         };
         let include_tool_calls = matches!(scope, ItemScope::History);
         let mut images = self.images().cloned().collect::<Vec<_>>();
         let (mut text_index, mut thinking_index, mut call_index) = (0, 0, 0);
-        self.display_content()
+        self.content()
             .iter()
-            .filter_map(|block| {
+            .enumerate()
+            .filter_map(|(index, block)| {
                 Some(match block {
-                    ContentBlock::Text { text }
-                        if !text.is_empty() || (text_index == 0 && !images.is_empty()) =>
-                    {
+                    ContentBlock::Text { text } => {
+                        let text = self.text_for_display(index, text);
+                        if text.is_empty() && (text_index != 0 || images.is_empty()) {
+                            return None;
+                        }
                         let id = crate::session::text_item_id(entry_id, text_index);
                         text_index += 1;
                         HistoryItem::Message {
+                            running: false,
                             id,
-                            role: role.into(),
-                            text: text.clone(),
+                            role,
+                            text: text.to_string(),
                             images: std::mem::take(&mut images),
                         }
                     }
                     ContentBlock::Thinking { thinking } if !thinking.is_empty() => {
                         let id = crate::session::thinking_item_id(entry_id, thinking_index);
                         thinking_index += 1;
-                        HistoryItem::Thinking { id, text: thinking.clone() }
+                        HistoryItem::Thinking {
+                            id,
+                            text: thinking.clone(),
+                            running: false,
+                        }
                     }
                     ContentBlock::ToolCall(_) if !include_tool_calls => return None,
                     ContentBlock::ToolCall(call) => {
                         let id = crate::session::tool_item_id(entry_id, call_index);
                         call_index += 1;
-                        HistoryItem::ToolCall {
+                        HistoryItem::Tool {
+                            running: false,
                             id,
                             name: call.tool_name.clone(),
                             args: call.arguments.clone(),
+                            result: None,
                         }
                     }
                     _ => return None,
@@ -120,22 +131,18 @@ impl AgentMessage {
 
     pub fn content(&self) -> &[ContentBlock] {
         match self {
-            Self::User { content, .. }
+            Self::Notification { content }
+            | Self::User { content, .. }
             | Self::Assistant { content, .. }
             | Self::ToolResult { content, .. } => content,
         }
     }
 
-    /// 用户消息和任务标题共用的展示内容；模型仍消费原始 content。
-    pub fn display_content(&self) -> Cow<'_, [ContentBlock]> {
+    /// 用户消息和任务标题共用展示文字；借用原文，模型仍消费 content。
+    pub fn text_for_display<'a>(&'a self, index: usize, text: &'a str) -> &'a str {
         match self {
-            Self::User { content, display_text: Some(text) } => {
-                // displayText 只随输入交付保存；该消息的首块就是用户文字。
-                let mut displayed = content.clone();
-                displayed[0] = ContentBlock::Text { text: text.clone() };
-                Cow::Owned(displayed)
-            }
-            _ => Cow::Borrowed(self.content()),
+            Self::User { display_text: Some(display), .. } if index == 0 => display,
+            _ => text,
         }
     }
 

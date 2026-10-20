@@ -21,14 +21,13 @@
   border: 1px solid var(--material-edge);
   border-radius: var(--radius-xl);
   background: var(--composer-background);
-  backdrop-filter: blur(32px) saturate(160%);
-  box-shadow: var(--material-shadow);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 4%);
 }
 
 /* Workspace 胶囊徽标 */
 
 .composer-card.is-unavailable { border-style: dashed; }
-.composer-card textarea {
+.composer-card > textarea {
   field-sizing: content;
   width: 100%;
   min-height: 48px;
@@ -62,7 +61,8 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 0 8px;
   width: min(100%, 780px);
   margin: 0 auto;
   padding: 8px 4px 0;
@@ -243,6 +243,7 @@
 
 @media (prefers-reduced-motion: reduce) {
   .t-morph, .t-morph-plus, .t-morph-menu { transition: none !important; }
+  .t-morph-plus svg { transition: none; }
 }
 
 /* 工具栏容器与定位 */
@@ -257,7 +258,6 @@
 .composer-tools-item:hover { background: var(--surface-hover); }
 .composer-tools-item[aria-disabled=true], .composer-tools-item:disabled { color: var(--ink-faint); cursor: default; }
 .composer-tools > .context-tooltip[data-open=true] { display: block; }
-@media (prefers-reduced-motion: reduce) { .t-morph-plus svg { transition: none; } }
 
 @media (max-width: 760px) {
   .composer-region { padding: 0 10px 10px; }

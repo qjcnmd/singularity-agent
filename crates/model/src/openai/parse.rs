@@ -22,30 +22,22 @@ pub(crate) fn parse_tool_arguments(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
-/// 解析上游返回的 Token 用量（输入、输出、缓存命中与思考消耗）。
+/// 解析上游返回的 Token 用量（输入、输出、总数与缓存命中）。
 pub(crate) fn parse_usage(
     usage: Option<&Value>,
     input_field: &str,
     output_field: &str,
     cached_path: &str,
-    reasoning_path: &str,
-) -> ModelUsage {
-    let Some(usage) = usage else {
-        return ModelUsage::default();
-    };
+) -> Option<ModelUsage> {
+    let usage = usage?;
     let count = |value: Option<&Value>| value.and_then(Value::as_u64);
-    let (Some(input_tokens), Some(output_tokens)) =
-        (count(usage.get(input_field)), count(usage.get(output_field)))
-    else {
-        return ModelUsage::default();
-    };
-    ModelUsage {
+    let input_tokens = count(usage.get(input_field))?;
+    let output_tokens = count(usage.get(output_field))?;
+    Some(ModelUsage {
         input_tokens,
         output_tokens,
         total_tokens: count(usage.get("total_tokens"))
             .unwrap_or_else(|| input_tokens.saturating_add(output_tokens)),
         cached_input_tokens: count(usage.pointer(cached_path)),
-        reasoning_tokens: count(usage.pointer(reasoning_path)).unwrap_or_default(),
-        usage_present: true,
-    }
+    })
 }

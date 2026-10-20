@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import type { DiscoveredModel, ModelConfigurationField, ProviderConfigurationInput } from '../protocol'
-import { automaticFieldsFor, blankModel, capacityConfigurationError, formatCapacityInput, mergeDiscoveredModel, parseCapacity, reasoningConfigurationError, reasoningOptionsFor } from '../modelConfiguration'
+import type { DiscoveredModel, ProviderApiProtocol, ProviderConfigurationInput } from '../protocol'
+import { capacityConfigurationError, formatCapacityInput, mergeDiscoveredModel, parseCapacity, reasoningConfigurationError, reasoningOptionsFor } from '../modelConfiguration'
 import { Dialog } from './Dialog'
 import { ReasoningOptions } from './ReasoningOptions'
 
@@ -10,36 +10,37 @@ function toDraft({ maxContextTokens, maxOutputTokens, ...model }: ModelInput): M
   return { ...model, contextText: formatCapacityInput(maxContextTokens), outputText: formatCapacityInput(maxOutputTokens) }
 }
 
-/** 查询完成时采纳自动字段；保留手工容量的原始文本，供保存时校验。 */
-function fillDraft(draft: ModelDraft, discovered: DiscoveredModel): ModelDraft {
+/** 查询只补空字段；非空容量保留原始文本，供保存时校验。 */
+function fillDraft(draft: ModelDraft, discovered: DiscoveredModel, protocol: ProviderApiProtocol): ModelDraft {
   const model = {
     ...draft,
     maxContextTokens: parseCapacity(draft.contextText),
     maxOutputTokens: parseCapacity(draft.outputText),
   }
-  const merged = mergeDiscoveredModel(model, discovered, draft.apiProtocol ?? 'chat')
+  const merged = mergeDiscoveredModel(model, discovered, protocol)
   const resolved = toDraft(merged)
   return {
     ...resolved,
-    contextText: draft.automaticFields?.includes('maxContextTokens') ? resolved.contextText : draft.contextText,
-    outputText: draft.automaticFields?.includes('maxOutputTokens') ? resolved.outputText : draft.outputText,
+    contextText: draft.contextText.trim() ? draft.contextText : resolved.contextText,
+    outputText: draft.outputText.trim() ? draft.outputText : resolved.outputText,
   }
 }
 
 type ModelEditorProps = {
   index: number | null
   initial: ModelInput
+  protocol: ProviderApiProtocol
   onConfirm: (model: ModelInput) => string | null
   onClose: () => void
-  discover: (protocol: string) => Promise<DiscoveredModel[]>
+  discover: () => Promise<DiscoveredModel[]>
 }
 
-/** 模型编辑弹窗：拥有自动能力、手工草稿与校验；父级仅确认模型身份和列表写入。 */
-export function ModelEditor({ index, initial, onConfirm, onClose, discover }: ModelEditorProps) {
-  const [draft, setDraft] = useState(() => toDraft({ ...initial, automaticFields: automaticFieldsFor(initial) }))
+/** 模型编辑弹窗负责草稿与校验；父级确认身份并更新列表。 */
+export function ModelEditor({ index, initial, protocol, onConfirm, onClose, discover }: ModelEditorProps) {
+  const [draft, setDraft] = useState(() => toDraft(initial))
   const [error, setError] = useState<string | null>(null)
   const variants = draft.reasoningVariants ?? []
-  const [options, setOptions] = useState(() => reasoningOptionsFor(variants, initial.apiProtocol ?? 'chat'))
+  const [options, setOptions] = useState(() => reasoningOptionsFor(variants, protocol))
   const draftRef = useRef(draft)
   draftRef.current = draft
   const revision = useRef(0)
@@ -51,16 +52,7 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
   function patch(change: Partial<ModelDraft>) {
     setError(null)
     setFeedback(null)
-    setDraft(current => {
-      const mapping: Record<string, ModelConfigurationField> = {
-        contextText: 'maxContextTokens', outputText: 'maxOutputTokens', defaultVariant: 'reasoningVariants',
-      }
-      const changed = Object.keys(change).map(key => mapping[key] ?? key)
-      const fields = current.automaticFields?.filter(field => !changed.includes(field)) ?? []
-      if (change.contextText === '') fields.push('maxContextTokens')
-      if (change.outputText === '') fields.push('maxOutputTokens')
-      return { ...current, ...change, automaticFields: fields }
-    })
+    setDraft(current => ({ ...current, ...change }))
   }
 
   function changeModelId(modelId: string) {
@@ -68,17 +60,7 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
     setLoading(false)
     setFeedback(null)
     setError(null)
-    const current = draftRef.current
-    const blank = toDraft({ ...blankModel(), modelId, apiProtocol: current.apiProtocol })
-    const next = { ...current, modelId }
-    for (const field of current.automaticFields ?? []) {
-      if (field === 'maxContextTokens') next.contextText = ''
-      else if (field === 'maxOutputTokens') next.outputText = ''
-      else Object.assign(next, { [field]: blank[field] })
-      if (field === 'reasoningVariants') next.defaultVariant = null
-    }
-    setDraft(next)
-    setOptions(reasoningOptionsFor(next.reasoningVariants ?? [], next.apiProtocol ?? 'chat'))
+    setDraft(current => ({ ...current, modelId }))
   }
 
   const lookup = async () => {
@@ -88,7 +70,7 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
     setLoading(true)
     setFeedback(null)
     try {
-      const found = (await discover(draft.apiProtocol ?? 'chat')).find(model => model.modelId === id)
+      const found = (await discover()).find(model => model.modelId === id)
       if (current !== revision.current) return
       if (!found) {
         setFeedback('未获取模型参数')
@@ -96,9 +78,9 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
       }
       setError(null)
       const previous = draftRef.current
-      const next = fillDraft(previous, found)
+      const next = fillDraft(previous, found, protocol)
       setDraft(next)
-      setOptions(reasoningOptionsFor([...found.reasoningVariants, ...(next.reasoningVariants ?? [])], next.apiProtocol ?? 'chat'))
+      setOptions(reasoningOptionsFor([...found.reasoningVariants, ...(next.reasoningVariants ?? [])], protocol))
       if (found.maxContextTokens === null && found.maxOutputTokens === null && found.reasoningVariants.length === 0) setFeedback('未获取模型参数')
     } catch {
       if (current === revision.current) setFeedback('未获取模型参数')
@@ -111,7 +93,7 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
     const output = parseCapacity(draft.outputText)
     const capacityError = capacityConfigurationError(context, output)
     if (capacityError !== null) return capacityError
-    const reasoningError = reasoningConfigurationError(variants, draft.apiProtocol ?? 'chat')
+    const reasoningError = reasoningConfigurationError(variants, protocol)
     if (reasoningError !== null) return reasoningError
     // 文本容量只在此解析一次；列表此后保存数值，展示使用紧凑 token 格式。
     const { contextText, outputText, ...model } = draft
@@ -154,7 +136,7 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
         {error && <p className="form-error model-editor-error" role="alert">{error}</p>}
         <footer className="sg-editor-actions">
           <button type="button" className="sg-secondary-btn" onClick={onClose}>取消</button>
-          <button type="submit" disabled={!canSave} className="sg-primary-btn">保存</button>
+          <button type="submit" disabled={!canSave} className="sg-primary-btn">确定</button>
         </footer>
       </form>
     </Dialog>

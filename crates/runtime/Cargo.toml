@@ -17,6 +17,5 @@ singularity_model = { path = "../model" }
 singularity_mcp = { path = "../mcp" }
 singularity_protocol = { path = "../protocol" }
 thiserror.workspace = true
-# 执行器持有 provider 的执行环境句柄，因此运行期依赖是生产依赖。
 tokio.workspace = true
 uuid = { workspace = true, features = ["v7"] }

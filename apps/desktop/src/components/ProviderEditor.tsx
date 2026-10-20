@@ -19,10 +19,9 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
   const [name, setName] = useState(provider?.displayName ?? '')
   const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? '')
   const [apiKey, setApiKey] = useState('')
-  const [protocol, setProtocol] = useState(provider?.apiProtocol ?? provider?.models[0]?.apiProtocol ?? 'chat')
+  const [protocol, setProtocol] = useState<ProviderConfigurationInput['apiProtocol']>(provider?.apiProtocol ?? 'chat')
   const [models, setModels] = useState<ModelInput[]>(() => provider?.models ?? [])
   const [modelEditor, setModelEditor] = useState<{ index: number | null; draft: ModelInput } | null>(null)
-  const [saved, setSaved] = useState(false)
   const origin = actionOrigin.inline('model.saveProvider', providerId.trim())
   const busy = state.pendingActions.has(pendingKey('model.saveProvider', origin))
   const [fetching, setFetching] = useState(false)
@@ -45,9 +44,9 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
     return null
   }
 
-  function queryModels(apiProtocol: string) {
+  function queryModels() {
     return appStore.transport.rpc('model.discover', {
-      providerId: providerId.trim(), baseUrl, apiKey: apiKey.trim() || null, apiProtocol,
+      providerId: providerId.trim(), baseUrl, apiKey: apiKey.trim() || null, apiProtocol: protocol,
     })
   }
 
@@ -65,7 +64,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
     setFetching(true)
     try {
       // 复用当前 RPC 传输通道执行模型发现
-      const found = await queryModels(protocol)
+      const found = await queryModels()
       if (revision !== discoveryRevision.current) return
       if (found.length === 0) {
         setFailure('提供方没有返回可用模型，仍可手动添加。')
@@ -91,7 +90,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
       setFailure('请输入不含空格、/ 或 # 的提供方 ID。')
       return
     }
-    if (!provider && !saved && state.bootstrap?.modelCatalog.providers.some(p => p.providerId === providerId.trim())) {
+    if (!provider && state.bootstrap?.modelCatalog.providers.some(p => p.providerId === providerId.trim())) {
       setFailure('该提供方 ID 已存在，请编辑已有提供方。')
       return
     }
@@ -123,22 +122,20 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
         setFailure(`模型 ${id}：${reasoningError}`)
         return
       }
-      submitted.push({ ...model, modelId: id, displayName: model.displayName?.trim() || null })
+      submitted.push({ ...model, modelId: id })
     }
     const result = await appStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl, apiProtocol: protocol, models: submitted }, apiKey.trim())
-    if (result.ok) {
+    if (result) {
       setApiKey('')
       onDone()
-    } else if (result.error?.code === 'configuration_partially_saved') {
-      setSaved(true)
     }
   }
   return (
     <>
       <form className="sg-editor" onSubmit={event => void save(event)} noValidate>
         <fieldset disabled={busy} className="provider-fields">
-          {provider || saved ? <strong>{name || providerId} <small className="provider-id">{providerId}</small></strong>
-            : <label className="sg-field">
+          {provider?.displayName && provider.displayName !== providerId && <span className="provider-id">提供方 ID：{providerId}</span>}
+          {!provider && <label className="sg-field">
               <span>提供方 ID</span>
               <input className="sg-input" autoFocus value={providerId} onChange={event => setProviderId(event.target.value)} placeholder="例如 my-provider" />
             </label>}
@@ -183,19 +180,19 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
                   )
                 })}
               </div>
-              <button type="button" className="sg-add-model-btn" onClick={() => setModelEditor({ index: null, draft: { ...blankModel(), apiProtocol: protocol } })}>＋ 添加模型</button>
+              <button type="button" className="sg-add-model-btn" onClick={() => setModelEditor({ index: null, draft: blankModel() })}>＋ 添加模型</button>
             </section>
           </div>
           {failure && <p className="form-error" role="alert">{failure}</p>}
           {saveError && <p className="form-error" role="alert">{saveError.message}</p>}
           <footer className="sg-editor-actions">
             <button type="button" className="sg-secondary-btn" onClick={onDone}>取消</button>
-            <button type="submit" className="sg-primary-btn">{busy ? '保存中…' : '保存'}</button>
+            <button type="submit" className="sg-primary-btn">{busy ? '保存中…' : '保存配置'}</button>
           </footer>
         </fieldset>
       </form>
       {modelEditor && <ModelEditor
-        index={modelEditor.index} initial={modelEditor.draft} discover={queryModels}
+        index={modelEditor.index} initial={modelEditor.draft} protocol={protocol} discover={queryModels}
         onConfirm={draft => commitModel(modelEditor.index, draft)} onClose={() => setModelEditor(null)}
       />}
       <Dialog open={candidates !== null} onClose={() => setCandidates(null)} labelledBy="discovered-models-title" className="confirm-modal model-discovery-modal">

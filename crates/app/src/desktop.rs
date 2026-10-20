@@ -6,4 +6,5 @@ mod transport;
 mod workspace_files;
 pub(crate) mod workspace_store;
 
+pub(crate) use app_server::AppServer;
 pub use transport::run;

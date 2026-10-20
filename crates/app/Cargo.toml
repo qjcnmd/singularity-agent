@@ -14,7 +14,6 @@ name = "singularity"
 path = "src/main.rs"
 
 [dependencies]
-clap.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 singularity_core = { path = "../core" }

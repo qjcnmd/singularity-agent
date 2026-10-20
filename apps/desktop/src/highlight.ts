@@ -45,14 +45,11 @@ function loadHighlighter(): Promise<Highlighter> {
     import('@shikijs/engine-javascript'),
     import('@shikijs/themes/github-light'),
     import('@shikijs/themes/github-dark'),
-  ]).then(async ([core, engine, theme, darkTheme]) => {
-    const highlighter = await core.createHighlighterCore({
-      themes: [theme.default, darkTheme.default],
-      langs: [],
-      engine: engine.createJavaScriptRegexEngine(),
-    })
-    return highlighter
-  })
+  ]).then(([core, engine, theme, darkTheme]) => core.createHighlighterCore({
+    themes: [theme.default, darkTheme.default],
+    langs: [],
+    engine: engine.createJavaScriptRegexEngine(),
+  }))
   return highlighterPromise
 }
 

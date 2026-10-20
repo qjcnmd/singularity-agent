@@ -13,7 +13,6 @@
 .context-menu { position: fixed; z-index: 100; min-width: 210px; max-width: min(360px, calc(100vw - 16px)); max-height: min(420px, calc(100vh - 16px)); overflow: auto; padding: 5px; border: 1px solid var(--line); border-radius: 16px; animation: menu-enter 120ms ease-out; }
 .context-menu button { display: flex; justify-content: space-between; gap: 24px; width: 100%; padding: 8px 11px; border: 0; text-align: left; background: transparent; color: var(--ink); border-radius: 10px; }
 .context-menu button:hover, .context-menu button:focus-visible { background: var(--surface-hover); }
-.context-menu button.danger { color: var(--danger); }
 /* 折叠面板高度过渡动画 */
 .content-disclosure { overflow: hidden; height: 0; transition: height var(--disclosure-collapse-duration) var(--disclosure-collapse-ease); }
 .content-disclosure.is-open { height: auto; transition: height var(--disclosure-duration) var(--disclosure-ease); }
@@ -45,7 +44,6 @@
   .picker-disclosure.is-open { opacity: 0; transform: translateY(6px) scale(.96); }
 }
 .picker-disclosure > div { overflow: hidden; background: var(--surface); border-radius: 12px; box-shadow: inset 0 0 0 1px var(--line), var(--shadow-floating); }
-@keyframes content-enter { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes menu-enter { from { opacity: 0; } to { opacity: 1; } }
 
 @media (prefers-reduced-motion: reduce) {

@@ -1,22 +1,20 @@
 //! 生成与压缩共用的请求生命周期：attempt 循环与重试等待、attempt 的身份、
-//! 必须落盘的记录、传输、用量和部分输出。请求装配在 `agent::request`，压缩编排在 `agent::compaction`。
+//! 落盘的记录、传输、用量和部分输出。请求装配在 `agent::request`，压缩编排在 `agent::compaction`。
 
 use std::time::Instant;
 
 use singularity_core::duration_millis;
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelErrorKind, ModelPreferences, ModelTurnRequest, ModelTurnResponse,
-    ModelUsage, OpenAiProvider, ProviderError, ProviderStreamEvent,
+    ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, OpenAiProvider,
+    ProviderError, ProviderStreamEvent,
 };
 use singularity_protocol::{ProviderAttemptStatus, RequestObservation, RequestPurpose};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentError;
-use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
-use crate::session::{
-    InterruptedAssistantItem, LedgerRecord, SessionError, SessionWriter, append_record_async,
-    with_writer_async,
-};
+use crate::events::AgentEvent;
+use crate::message::{AgentMessage, ItemScope, public_thinking_text_blocks};
+use crate::session::{LedgerRecord, SessionError, SessionWriter, with_writer_async};
 
 /// 声明的输出预算同时受模型上限、请求用途和窗口余量约束。安全余量弥补启发式
 /// 估价与端点实际 tokenization 的差异；生成与摘要各自提供本次请求的输入估价。
@@ -29,13 +27,6 @@ pub(crate) fn output_budget_tokens(
     let window = model.context_window();
     let room = window.saturating_sub(input_tokens).saturating_sub(OUTPUT_SAFETY_TOKENS.min(window / 20));
     model.max_output_tokens.min(requested_output_tokens).min(room as u32)
-}
-
-/// 本次执行的请求次数与已上报用量。
-#[derive(Default)]
-pub(crate) struct RequestAccounting {
-    pub attempts: u32,
-    pub usage: ModelUsage,
 }
 
 /// 单次请求尝试：编排持久化与传输，持有稳定的输出身份及流式内容。
@@ -75,11 +66,9 @@ async fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool 
 
 /// 普通回复和摘要共用的完整请求边界：发送、重试、用量和结果身份都在这里；每个
 /// attempt 各自持有 `RequestAttempt`，重试不复用上一次的结果身份，取消在退避等待中生效。
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_request(
     provider: &OpenAiProvider,
     session: &SessionWriter,
-    accounting: &mut RequestAccounting,
     request: &ModelTurnRequest,
     on_event: &mut (dyn FnMut(AgentEvent) + Send),
     cancellation: &CancellationToken,
@@ -90,7 +79,6 @@ pub(crate) async fn execute_request(
     let mut retry_attempt = 0u32;
     loop {
         retry_attempt += 1;
-        accounting.attempts += 1;
         let mut attempt = RequestAttempt {
             writer: session,
             on_event,
@@ -99,7 +87,7 @@ pub(crate) async fn execute_request(
             visible_text: String::new(),
             visible_reasoning: String::new(),
         };
-        let error = match attempt.run(provider, request, accounting, cancellation).await {
+        let error = match attempt.run(provider, request, cancellation).await {
             Ok(response) => return Ok((response, attempt.result_entry_id)),
             Err(error) => error,
         };
@@ -111,12 +99,6 @@ pub(crate) async fn execute_request(
                 message_id: attempt.result_entry_id.clone(),
             });
             let delay_ms = retry_delay_ms(BASE_DELAY_MS, retry_attempt, provider_error.retry_after);
-            (attempt.on_event)(AgentEvent::Diagnostic(AgentDiagnostic::info(
-                diagnostic_code::PROVIDER_RETRY_SCHEDULED,
-                format!(
-                    "provider request failed with a retryable error; retrying in {delay_ms} ms (attempt {retry_attempt} of {MAX_ATTEMPTS})",
-                ),
-            )));
             if !sleep_abortable(delay_ms, cancellation).await {
                 return Err(AgentError::Aborted);
             }
@@ -124,10 +106,12 @@ pub(crate) async fn execute_request(
         }
         // 会话写入已失败时不再写中断显示记录。
         if purpose == RequestPurpose::Generation
-            && !matches!(error, AgentError::Session(_) | AgentError::FailureRecording { .. })
+            && !matches!(error, AgentError::Session(_))
             && let Err(storage) = attempt.finish_interrupted().await
         {
-            return Err(AgentError::FailureRecording { execution: Box::new(error), storage });
+            return Err(AgentError::Session(SessionError::InvalidSession(format!(
+                "{error}; 保存失败：{storage}"
+            ))));
         }
         return Err(error);
     }
@@ -156,7 +140,6 @@ impl RequestAttempt<'_> {
         &mut self,
         provider: &OpenAiProvider,
         request: &ModelTurnRequest,
-        accounting: &mut RequestAccounting,
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnResponse, AgentError> {
         if cancellation.is_cancelled() {
@@ -165,25 +148,17 @@ impl RequestAttempt<'_> {
         let (provider_name, model_name) = provider.model_identity();
         let mut observation = RequestObservation {
             request_id: crate::session::new_entry_id(),
-            request_head: None,
             purpose: self.purpose,
-            attempt: accounting.attempts,
             provider: provider_name.to_string(),
             model: model_name.to_string(),
             status: ProviderAttemptStatus::Started,
             duration_ms: 0,
             ttft_ms: None,
             decode_ms: None,
-            total_tokens: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            error: None,
-            diagnostic_code: None,
+            usage: None,
         };
         let started = Instant::now();
-        // 请求记录引用会话已保存的定义，只传入本次输出偏好。
-        self.record(observation.clone(), Some(request.model_preferences.clone())).await?;
+        (self.on_event)(AgentEvent::ProviderAttempt { observation: observation.clone() });
         let mut first_token = None;
         let completion = provider
             .complete_stream(request, cancellation, &mut |event| {
@@ -201,35 +176,22 @@ impl RequestAttempt<'_> {
         observation.duration_ms = duration_millis(finished.duration_since(started));
         observation.ttft_ms = first_token.map(|first| duration_millis(first.duration_since(started)));
         observation.decode_ms = first_token.map(|first| duration_millis(finished.duration_since(first)));
-        if let Some(usage) = &completion.usage {
-            accounting.usage.merge(usage);
-            observation.input_tokens = Some(usage.input_tokens);
-            observation.output_tokens = Some(usage.output_tokens);
-            observation.total_tokens = Some(usage.total_tokens);
-            observation.cached_input_tokens = usage.cached_input_tokens;
-        }
-        observation.error = failure.map(|error| error.category().to_string());
-        observation.diagnostic_code = failure.and_then(|error| error.code.clone());
-        if let Err(storage) = self.record(observation, None).await {
+        observation.usage = completion.usage;
+        if let Err(storage) = self.record(observation).await {
             return Err(match completion.result {
-                Err(error) => AgentError::FailureRecording {
-                    execution: Box::new(provider_error(error)),
-                    storage,
-                },
+                Err(error) => {
+                    AgentError::Session(SessionError::InvalidSession(format!("{error}; 保存失败：{storage}")))
+                }
                 Ok(_) => AgentError::Session(storage),
             });
         }
         completion.result.map_err(provider_error)
     }
 
-    async fn record(
-        &mut self,
-        mut observation: RequestObservation,
-        request_head: Option<ModelPreferences>,
-    ) -> Result<(), SessionError> {
+    async fn record(&mut self, observation: RequestObservation) -> Result<(), SessionError> {
         let persisted = observation.clone();
-        observation.request_head = with_writer_async(self.writer, move |writer| {
-            writer.append_model_request(persisted, request_head)
+        with_writer_async(self.writer, move |writer| {
+            writer.append_record(LedgerRecord::ModelRequest { observation: persisted })
         })
         .await?;
         (self.on_event)(AgentEvent::ProviderAttempt { observation });
@@ -238,27 +200,22 @@ impl RequestAttempt<'_> {
 
     /// 最终中断时留下的公开内容只用来显示，不会成为模型上下文里的正式消息。
     async fn finish_interrupted(&mut self) -> Result<(), SessionError> {
-        let mut items = Vec::new();
-        if !self.visible_reasoning.is_empty() {
-            items.push(InterruptedAssistantItem::Thinking {
-                id: crate::session::thinking_item_id(&self.result_entry_id, 0),
-                text: std::mem::take(&mut self.visible_reasoning),
-            });
-        }
-        if !self.visible_text.is_empty() {
-            items.push(InterruptedAssistantItem::Message {
-                id: crate::session::text_item_id(&self.result_entry_id, 0),
-                role: "assistant".into(),
-                text: std::mem::take(&mut self.visible_text),
-            });
-        }
+        let content = public_thinking_text_blocks(
+            std::mem::take(&mut self.visible_reasoning),
+            std::mem::take(&mut self.visible_text),
+        );
+        let message = AgentMessage::Assistant { content, provider_reasoning_replay: None };
+        let items = message.public_items(&self.result_entry_id, ItemScope::Completion);
         if !items.is_empty() {
-            append_record_async(self.writer, LedgerRecord::AssistantInterrupted { items: items.clone() })
-                .await?;
+            let id = self.result_entry_id.clone();
+            with_writer_async(self.writer, move |writer| {
+                writer.append_record_with_id(id, LedgerRecord::AssistantInterrupted { message })
+            })
+            .await?;
         }
         (self.on_event)(AgentEvent::MessageFinished {
             message_id: self.result_entry_id.clone(),
-            items: items.into_iter().map(InterruptedAssistantItem::into_public_item).collect(),
+            items,
             failed: true,
         });
         Ok(())

@@ -53,10 +53,6 @@ pub fn client_types() -> String {
     output.push_str(&bindings.declarations.into_values().collect::<Vec<_>>().join("\n\n"));
     output.push_str("\n\n");
     output.push_str(&rpc_contract);
-    // 固定枚举的字符串序列没有可失败的 JSON 值，生成器与运行时共享同一份字段清单。
-    let field_names =
-        serde_json::to_string(&crate::ModelConfigurationField::ALL).expect("field names serialize");
-    output.push_str(&format!("\n\nexport const modelConfigurationFields = {field_names} as const\n"));
     // ts_rs 在折行的声明上可能留下行尾空格。
     let mut normalized = output.lines().map(str::trim_end).collect::<Vec<_>>().join("\n");
     normalized.push('\n');

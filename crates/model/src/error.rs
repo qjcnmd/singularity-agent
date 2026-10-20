@@ -3,7 +3,8 @@ use serde_json::Value;
 use std::time::Duration;
 
 /// 从提供方边界保留下来的具体失败类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ModelErrorKind {
     Cancelled,
     NetworkError,
@@ -18,33 +19,11 @@ pub enum ModelErrorKind {
     UnknownProviderError,
 }
 
-/// 供调用方判断状态和恢复行为的粗粒度错误类别。请求观测与持久化的
-/// `model_request` 使用相同的 Display 词形（serde snake_case 是唯一来源）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelErrorCategory {
-    Cancelled,
-    Authentication,
-    Network,
-    ModelConfiguration,
-    InvalidRequest,
-    ContextLengthExceeded,
-    JsonSchema,
-    ContentFilter,
-    ProviderUnavailable,
-    UnknownProviderError,
-}
-
-impl std::fmt::Display for ModelErrorCategory {
+impl std::fmt::Display for ModelErrorKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&singularity_protocol::wire_word(self))
     }
 }
-
-/// 提供方配置已落盘、但 API 密钥写失败：配置可用而凭据缺失，可以重试保存。
-pub const CREDENTIAL_SAVE_FAILED_CODE: &str = "provider_credential_save_failed";
-/// 提供方配置已删除、但 API 密钥删失败：选择已失效而凭据文件里还留着旧值，可以重试删除。
-pub const CREDENTIAL_DELETE_FAILED_CODE: &str = "provider_credential_delete_failed";
 
 /// 提供方配置没有通过校验。
 pub(crate) const PROVIDER_CONFIGURATION_INVALID_CODE: &str = "provider_configuration_invalid";
@@ -101,31 +80,6 @@ impl ProviderError {
         Self::new(kind, message).with_code(code)
     }
 
-    /// 归到对外的公共错误类别。
-    pub fn category(&self) -> ModelErrorCategory {
-        match self.kind {
-            ModelErrorKind::Cancelled => ModelErrorCategory::Cancelled,
-            ModelErrorKind::AuthError => ModelErrorCategory::Authentication,
-            ModelErrorKind::NetworkError | ModelErrorKind::Timeout => ModelErrorCategory::Network,
-            ModelErrorKind::InvalidRequest
-                if matches!(
-                    self.code.as_deref(),
-                    Some(PROVIDER_CONFIGURATION_MISSING_CODE | PROVIDER_CONFIGURATION_INVALID_CODE)
-                ) =>
-            {
-                ModelErrorCategory::ModelConfiguration
-            }
-            ModelErrorKind::InvalidRequest => ModelErrorCategory::InvalidRequest,
-            ModelErrorKind::ContextLengthExceeded => ModelErrorCategory::ContextLengthExceeded,
-            ModelErrorKind::JsonSchemaViolation => ModelErrorCategory::JsonSchema,
-            ModelErrorKind::ContentFilter => ModelErrorCategory::ContentFilter,
-            ModelErrorKind::RateLimited | ModelErrorKind::ProviderOverloaded => {
-                ModelErrorCategory::ProviderUnavailable
-            }
-            ModelErrorKind::UnknownProviderError => ModelErrorCategory::UnknownProviderError,
-        }
-    }
-
     /// 提供方是否明确拒绝了这次请求的上下文规模（会触发强制压缩）。
     pub fn is_context_overflow(&self) -> bool {
         self.kind == ModelErrorKind::ContextLengthExceeded
@@ -147,7 +101,7 @@ impl ProviderError {
     }
 }
 
-/// 提供方错误响应体里精确表示上下文超限的线上错误码；必须全等匹配，不做模糊推断。
+/// 提供方错误响应体里表示上下文超限的线上错误码；只做全等匹配。
 const PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
 /// 限流类线上错误码：仍算可重试，和按状态码归类的结果一致（RateLimited）。
 const PROVIDER_RATE_LIMIT_EXCEEDED_CODE: &str = "rate_limit_exceeded";

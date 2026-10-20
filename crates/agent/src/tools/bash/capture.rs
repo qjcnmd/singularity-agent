@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, format_size, truncate_tail};
 
-/// 内存里保留的尾部缓冲字节上限（100KB），防止超大的单行输出耗尽内存。
+/// 尾部缓冲的内存上限（100KB）：单行再长的输出也不会占满内存。
 const INTERNAL_TAIL_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;
 
 /// 截断发生时，用来保存完整输出的临时文件写入器。位置在
@@ -59,7 +59,7 @@ fn cleanup_old_spills(root: &Path) {
 
 /// 累计输出的状态：尾部缓冲（上限 2×50KB）以及行数和字节数统计。超出展示上限的
 /// 输出只保留尾部缓冲；第一次丢弃字节之前先建 spill 文件保存完整输出，之后每个
-/// chunk 都同步追加；保存失败时把原因留下来，不再声称有完整输出。
+/// chunk 同步追加；保存失败时记下原因，结果里不再报完整输出路径。
 #[derive(Default)]
 pub(super) struct CaptureState {
     tail: String,
@@ -70,8 +70,8 @@ pub(super) struct CaptureState {
 }
 
 impl CaptureState {
-    /// 累计行数：尾部缓冲只裁掉前缀、保留末尾，所以看「是否以换行结尾」就能判断有没有
-    /// 开行。未闭合行的完整长度无法从裁剪后的尾部还原，截断说明里也不得声称它。
+    /// 累计行数：尾部缓冲只裁前缀、保留末尾，看「是否以换行结尾」就知道有没有未闭合
+    /// 行。未闭合行的完整长度没法从裁剪后的尾部还原，截断说明里也不报它。
     fn total_lines(&self) -> usize {
         let has_open_line = !self.tail.is_empty() && !self.tail.ends_with('\n');
         self.completed_lines + usize::from(has_open_line)
@@ -81,8 +81,8 @@ impl CaptureState {
         self.total_lines() > DEFAULT_MAX_LINES || self.total_bytes > DEFAULT_MAX_BYTES
     }
 
-    /// 确保完整输出已经进入落盘通道：成功一次之后就是空操作，失败一次之后不再重试。
-    /// 必须在尾部缓冲丢弃任何字节之前调用，写进去的才是完整输出。
+    /// 确保完整输出已进入落盘通道：成功一次后是空操作，失败一次后不再重试。
+    /// 在尾部缓冲丢弃字节之前调用，写进去的才是完整输出。
     fn ensure_spill(&mut self) {
         if self.spill.is_none() {
             let root = std::env::temp_dir().join("singularity-tool-output");
@@ -112,15 +112,15 @@ impl CaptureState {
     /// 吸收一个清洗过的 chunk：更新计数和尾部缓冲。空 chunk 不改变任何状态。
     ///
     /// spill 的 I/O 也在这里：spill 启用后每个 chunk 都同步追加写入；尾部缓冲第一次
-    /// 超出内部上限之前先建 spill，这样写进去的才是丢弃前的完整输出；追加失败就放弃
-    /// 这个 spill（不再声称有完整输出），文件本身留在临时目录按保留期清理。
+    /// 超出内部上限之前先建 spill，写进去的才是丢弃前的完整输出；追加失败就放弃这个
+    /// spill（结果里不再报完整输出路径），文件本身留在临时目录按保留期清理。
     pub(super) fn ingest(&mut self, text: &str) {
         self.total_bytes += text.len();
         self.completed_lines += text.bytes().filter(|byte| *byte == b'\n').count();
         if let Some(Ok(spill)) = &mut self.spill
             && let Err(error) = spill.file.write_all(text.as_bytes())
         {
-            // 追加失败之后完整输出已经无法恢复：放弃这个 spill，后续不再输出假路径。
+            // 追加失败后完整输出已经不全：放弃这个 spill，结果里不再报文件路径。
             self.spill = Some(Err(error));
         }
         self.tail.push_str(text);
@@ -149,9 +149,9 @@ impl CaptureState {
 
     /// 最终的展示文本：没截断时就是完整输出，截断时已经带上说明。
     ///
-    /// 说明只讲能证实的事实：展示了多少尾部字节、处在哪些行、触发了哪个限制。单行超限时
-    /// 尾部缓冲里只剩该行的末尾，完整行长已经丢了，报告不出「这一行有多少字节」；说明在
-    /// 这里拼接完成，调用方拿到的就是最终文本。
+    /// 说明只写确实掌握的信息：展示了尾部多少字节、在哪些行、触发了哪个限制。单行超限时
+    /// 尾部缓冲只剩该行末尾，完整行长已经丢了，报不出这一行的字节总数。说明在这里拼好，
+    /// 调用方拿到最终文本。
     fn final_output(&self) -> String {
         if !self.is_truncated() {
             return self.tail.clone();

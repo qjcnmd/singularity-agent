@@ -2,12 +2,11 @@
 //!
 //! 当前版本（CURRENT_SESSION_VERSION）的 operation_finished 只持久化终态所需的
 //! 结果、错误与停止事实。请求用量由请求
-//! 观测记录提供；指令与工具定义在首次请求和成功压缩时保存。
+//! 观测记录提供；指令与工具定义在每轮首次请求前保存。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use singularity_model::ModelUsage;
-use singularity_protocol::{TurnModelUsage, TurnStatus};
+use singularity_protocol::TurnStatus;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -33,28 +32,14 @@ pub enum SessionError {
 
 /// 会话操作的统一返回结果。
 pub type Result<T> = std::result::Result<T, SessionError>;
-/// 摘要与压缩后使用的指令、工具一起提交；完整历史仍保留在日志中。
+/// 摘要与保留位置一同提交；完整历史仍保留在日志中。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionEntry {
     pub summary: String,
     #[serde(rename = "firstKeptEntryId")]
     pub first_kept_entry_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub definitions: Option<super::RequestDefinitions>,
 }
-/// 将模型用量结构体转换为协议通信 DTO。
-pub fn turn_usage_from_model_usage(usage: &ModelUsage) -> TurnModelUsage {
-    TurnModelUsage {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        total_tokens: usage.total_tokens,
-        cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
-        reasoning_tokens: usage.reasoning_tokens,
-        usage_present: usage.usage_present,
-    }
-}
-
 /// 会话元数据条目（如模型配置覆盖、自定义名称）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "metadataType", rename_all = "snake_case", deny_unknown_fields)]
@@ -74,54 +59,34 @@ pub enum SessionMetadata {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "recordType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LedgerRecord {
-    /// 执行被手动中断前已生成的内容（仅供历史展示，不进入后续模型上下文）。
-    AssistantInterrupted { items: Vec<InterruptedAssistantItem> },
+    /// 后台命令的开始和终态；进度只在内存中发布。
+    BackgroundTaskUpdated {
+        task: singularity_protocol::BackgroundTask,
+    },
+    /// 请求中断前已生成的正文和思考；仅供显示，不进入后续模型上下文。
+    AssistantInterrupted { message: AgentMessage },
     /// 单次模型调用的请求与结果观测。
     ModelRequest {
         observation: singularity_protocol::RequestObservation,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        context: Option<Box<super::request::RequestContext>>,
     },
-    /// 规范化的请求消息与工具定义快照。
-    RequestDefinitions {
-        definitions: super::request::RequestDefinitions,
-    },
-    /// 回合或压缩操作开始记录。
+    /// 每轮实际注入的内容，直接供会话展示。
+    ContextInjected { name: String, content: String },
+    /// 回合开始记录。
     OperationStarted {
-        /// 回合 ID；压缩自己的开始记录不绑定回合，自动压缩位于当前回合的记录范围内。
-        #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
-        turn_id: Option<String>,
+        /// 回合 ID。
+        #[serde(rename = "turnId")]
+        turn_id: String,
     },
-    /// 回合或压缩操作终态记录，包含成功/失败/中断状态与错误详情。
+    /// 回合终态记录，包含成功/失败/中断状态与错误详情。
     OperationFinished {
-        #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
-        turn_id: Option<String>,
+        #[serde(rename = "turnId")]
+        turn_id: String,
         outcome: TurnStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<singularity_protocol::TurnErrorDetail>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         user_stopped: bool,
     },
-}
-
-/// 中断前生成的正文与思考；保存显示身份，避免界面协议变更影响会话格式。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum InterruptedAssistantItem {
-    Message { id: String, role: String, text: String },
-    Thinking { id: String, text: String },
-}
-
-impl InterruptedAssistantItem {
-    /// 历史读取与实时完成事件共用同一份公开内容。
-    pub fn into_public_item(self) -> singularity_protocol::HistoryItem {
-        match self {
-            Self::Message { id, role, text } => {
-                singularity_protocol::HistoryItem::Message { id, role, text, images: Vec::new() }
-            }
-            Self::Thinking { id, text } => singularity_protocol::HistoryItem::Thinking { id, text },
-        }
-    }
 }
 
 /// 会话 JSONL 单行条目枚举。物理行顺序对应事件写入顺序。

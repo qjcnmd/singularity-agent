@@ -3,8 +3,6 @@
 //! 只提供它们共用的传输能力。
 
 pub(crate) mod http;
-pub(crate) mod retry;
 pub(crate) mod stream;
 
-pub(crate) use http::{provider_client, provider_error_from_http_status, provider_future};
-pub(crate) use retry::*;
+pub(crate) use http::{provider_client, provider_error_from_http_status, provider_future, retry_after_delay};

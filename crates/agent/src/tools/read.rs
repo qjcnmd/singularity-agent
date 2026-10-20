@@ -2,13 +2,14 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::sync::LazyLock;
 
 use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
+use super::registry::{ABORTED_MESSAGE, ToolExecution, error_result};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, default_cap_summary, default_max_kb};
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
@@ -47,8 +48,11 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
     }
 }
 
-pub(crate) fn execute(args: &ReadArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
-    let full_path = ctx.cwd.join(&args.path);
+pub(crate) fn execute(args: &ReadArgs, cwd: &Path, signal: &CancellationToken) -> ToolExecution {
+    if signal.is_cancelled() {
+        return error_result(ABORTED_MESSAGE);
+    }
+    let full_path = cwd.join(&args.path);
     let file = match File::open(&full_path) {
         Ok(file) => file,
         Err(error) => return error_result(format!("Could not read file: {}. {error}", args.path)),
@@ -63,8 +67,8 @@ pub(crate) fn execute(args: &ReadArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             Ok(image) => image,
             Err(error) => return error_result(error),
         };
-        if let Some(aborted) = ctx.abort_if_cancelled() {
-            return aborted;
+        if signal.is_cancelled() {
+            return error_result(ABORTED_MESSAGE);
         }
         let mut result = ToolExecution::text(format!(
             "Read image: {} ({} × {})",
@@ -73,7 +77,7 @@ pub(crate) fn execute(args: &ReadArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         result.images.push(image);
         return result;
     }
-    execute_reader(&args.path, args.offset, args.limit, &mut reader, ctx.signal)
+    execute_reader(&args.path, args.offset, args.limit, &mut reader, signal)
 }
 
 fn execute_reader(

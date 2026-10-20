@@ -7,14 +7,14 @@ pub mod skills;
 mod user_home;
 pub mod workspace;
 
-pub use project_instructions::{ProjectInstructions, load_agent_instructions};
-pub use user_home::{HomeOrigin, ResolvedHome, resolve_home};
+pub use project_instructions::load_agent_instructions;
+pub use user_home::resolve_home;
 pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace, saved_directory_matches};
 
 /// 项目根目录标记文件名（`.git`）。
 pub(crate) const PROJECT_ROOT_MARKER: &str = ".git";
 
-/// 将 Duration 转换为毫秒数（防止超出 u64 范围）。
+/// 将 Duration 转换为毫秒数，溢出时封顶 u64::MAX。
 pub fn duration_millis(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -40,7 +40,7 @@ pub fn display_path(path: &std::path::Path) -> String {
     }
 }
 
-/// 按字节预算截取有效的 UTF-8 字符串前缀（保证字符完整性），返回切片与是否截断。
+/// 按字节预算截取 UTF-8 字符串前缀，按字符边界对齐；返回切片与是否截断。
 pub fn utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
     if text.len() <= max_bytes {
         return (text, false);
@@ -65,6 +65,17 @@ pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
 /// 原子覆盖写入：先写入同目录临时文件并刷盘，再原子替换目标文件。
 pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     atomic_write(path, bytes, true)
+}
+
+/// 将值写成缩进 JSON 并追加一个 LF，刷盘后原子替换目标文件。
+/// 调用方负责创建父目录；序列化或文件操作失败时保留原错误原因。
+pub fn write_json_atomic<T: serde::Serialize + ?Sized>(
+    path: &std::path::Path,
+    value: &T,
+) -> std::io::Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    atomic_replace_bytes(path, &bytes)
 }
 
 /// 原子创建文件：先写入同目录临时文件，成功后再原子移动至目标位置（目标已存在时失败）。

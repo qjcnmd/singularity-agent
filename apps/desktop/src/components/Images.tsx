@@ -9,11 +9,15 @@ const accept = '.png,.jpg,.jpeg,.webp,.gif,.bmp'
 /** 粘贴、拖入和文件选择共用 File 草稿；编码发生在发送边界。 */
 export function useImageInput(add: (images: File[]) => void, disabled = false) {
   const input = useRef<HTMLInputElement>(null)
-  const receive = (files: File[]) => { if (!disabled && files.length) add(files) }
+  const receive = (files: File[]) => {
+    const images = files.filter(file => file.type.startsWith('image/'))
+    if (disabled || images.length === 0) return false
+    add(images)
+    return true
+  }
   const handlers = {
     onPaste(event: ClipboardEvent) {
-      const files = [...event.clipboardData.files].filter(file => file.type.startsWith('image/'))
-      if (files.length) { event.preventDefault(); receive(files) }
+      if (receive([...event.clipboardData.files])) event.preventDefault()
     },
     onDragOver(event: DragEvent) {
       if (event.dataTransfer.types.includes('Files')) { event.preventDefault(); event.dataTransfer.dropEffect = disabled ? 'none' : 'copy' }

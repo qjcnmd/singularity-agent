@@ -5,12 +5,34 @@ impl AppServer {
     /// 管道 EOF 释放数据目录锁之前，先停掉已接受的工作。
     pub async fn shutdown(&self) {
         let slots: Vec<_> = self.lock_sessions().values().cloned().collect();
-        self.stop_sessions(&slots).await;
+        if let Err(error) = self.stop_sessions(&slots).await {
+            eprintln!("{}", error.message);
+        }
         self.mcp.shutdown().await;
     }
 
-    /// 归档与退出共用停止和等待结算：先订阅，避免漏掉预订开始或释放占用的通知。
-    pub(super) async fn stop_sessions(&self, slots: &[Arc<ConversationSlot>]) {
+    /// 先关闭自动续跑并等待前台交接，再回收后台；监听持续确认更新直到回收结束。
+    pub(super) async fn stop_sessions(&self, slots: &[Arc<ConversationSlot>]) -> Result<(), RpcError> {
+        for slot in slots {
+            slot.conversation().set_closing(true);
+        }
+        self.stop_foreground(slots).await;
+        self.stop_background(slots).await
+    }
+
+    async fn stop_background(&self, slots: &[Arc<ConversationSlot>]) -> Result<(), RpcError> {
+        let mut failure = None;
+        for slot in slots {
+            if let Err(message) = slot.conversation().bash_tasks().shutdown().await {
+                self.background_shutdown_error(slot, message.clone());
+                failure = Some(invalid_request(message));
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// 先订阅，避免漏掉预订开始或释放占用的通知。
+    async fn stop_foreground(&self, slots: &[Arc<ConversationSlot>]) {
         let mut events = self.subscribe();
         loop {
             let mut busy = false;
@@ -29,8 +51,6 @@ impl AppServer {
             if !busy {
                 break;
             }
-            // 刚接下的预订可能还没开始跑，它的首个事件让取消能生效；结算事件跟在释放之后。
-            // 接收滞后时也要重新读一次状态。
             let _ = events.recv().await;
         }
     }

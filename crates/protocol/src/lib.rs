@@ -3,6 +3,7 @@
 //! 执行事件的合同与公共协议对象。
 
 mod app;
+mod background;
 mod event;
 mod image;
 mod inspection;
@@ -14,6 +15,7 @@ mod rpc;
 pub mod typescript;
 
 pub use app::*;
+pub use background::*;
 pub use event::*;
 pub use image::*;
 pub use inspection::*;

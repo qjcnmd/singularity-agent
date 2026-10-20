@@ -1,11 +1,6 @@
-//! 用户配置的持久化类型与读取；认证文件的读取由 `auth` 子模块维护。
-//! 配置和凭据的修改都收在 `ModelConfigManager`。
-pub(crate) mod auth;
-
-pub(crate) use auth::*;
+//! 模型配置与密钥的文件读写；ModelConfigManager 决定修改内容，本模块原子提交。
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -14,7 +9,7 @@ use crate::USER_CONFIG_FILE_NAME;
 use crate::config::schema::ModelsFileReasoningVariant;
 use crate::error::ProviderError;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UserConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -23,11 +18,12 @@ pub(crate) struct UserConfigFile {
     pub(crate) providers: BTreeMap<String, UserConfigProvider>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UserConfigProvider {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) api_protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) api_key: String,
+    pub(crate) api_protocol: singularity_protocol::ProviderApiProtocol,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) display_name: Option<String>,
     pub(crate) base_url: String,
@@ -39,12 +35,6 @@ pub(crate) struct UserConfigProvider {
 #[serde(deny_unknown_fields)]
 pub(crate) struct UserConfigModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) automatic_fields: Option<Vec<singularity_protocol::ModelConfigurationField>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) display_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) api_protocol: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_context_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_output_tokens: Option<u32>,
@@ -53,15 +43,9 @@ pub(crate) struct UserConfigModel {
     pub(crate) reasoning_variants: Option<BTreeMap<String, ModelsFileReasoningVariant>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_variant: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) supports_developer_role: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) supports_tool_choice: Option<bool>,
-    /// 缺省就是「不需要」；未声明时保存不写回，免得给无关模型补出这个字段。
+    /// 缺省就是「不需要」；未声明时不写回，不给无关模型补这个字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) requires_reasoning_content_for_tool_calls: Option<bool>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) requires_assistant_content_for_tool_calls: bool,
     /// Chat 端点输出上限所用的线上字段名，缺省是 `max_tokens`，
     /// 另一选项是 `max_completion_tokens`。Responses 不用它。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,47 +58,43 @@ pub(crate) fn user_config_error(message: impl Into<String>) -> ProviderError {
     super::configuration_error(message, crate::error::PROVIDER_CONFIGURATION_INVALID_CODE)
 }
 
-#[derive(Clone)]
-pub(crate) struct UserConfigData {
-    pub(crate) config: UserConfigFile,
-    pub(crate) auth: UserAuthFile,
-}
-
-/// 完整快照：配置和密钥各读各自的文件再合起来；只有确实需要两份数据的操作（快照捕获、
-/// 删除提供方）才走这里。
-pub(crate) fn read_user_config_data_from_directory(
-    directory: &Path,
-) -> Result<Option<UserConfigData>, ProviderError> {
-    let Some(config) = read_user_config_file(directory)? else {
-        return Ok(None);
-    };
-    let auth = read_user_auth_file(directory)?;
-    Ok(Some(UserConfigData { config, auth }))
-}
-
-/// 只读 config.json；文件不存在时返回 None，不依赖密钥文件。
+/// 读取完整配置；文件不存在时返回 None。
 pub(crate) fn read_user_config_file(directory: &Path) -> Result<Option<UserConfigFile>, ProviderError> {
     let path = directory.join(USER_CONFIG_FILE_NAME);
     let Some(config_text) = read_optional_config_text(&path)? else {
         return Ok(None);
     };
-    let config: UserConfigFile = serde_json::from_str(&config_text)
-        .map_err(|error| user_config_error(format!("invalid JSON in {}: {error}", path.display())))?;
+    let config: UserConfigFile = serde_json::from_str(&config_text).map_err(|error| {
+        let reason = match error.classify() {
+            serde_json::error::Category::Io => "读取失败",
+            serde_json::error::Category::Syntax => "JSON 语法错误",
+            serde_json::error::Category::Data => "配置字段无效",
+            serde_json::error::Category::Eof => "内容不完整",
+        };
+        user_config_error(format!(
+            "模型配置无效（{reason}）：{}，第 {} 行，第 {} 列",
+            path.display(),
+            error.line(),
+            error.column()
+        ))
+    })?;
     Ok(Some(config))
 }
 
-/// 两个配置文件共用的可选读取：一次打开就能区分「文件不存在」和「读不出来」。不先探测文件
-/// 是否存在：探测既保证不了原子性（探测通过后文件照样可能消失），也不会改变错误分类。
-pub(super) fn read_optional_config_text(path: &Path) -> Result<Option<String>, ProviderError> {
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(user_config_error(format!("could not open {}: {error}", path.display())));
-        }
-    };
-    let mut text = String::new();
-    file.read_to_string(&mut text)
-        .map_err(|error| user_config_error(format!("could not read {}: {error}", path.display())))?;
-    Ok(Some(text))
+/// 文件不存在时返回 None，其他读取错误保留路径与系统原因。
+fn read_optional_config_text(path: &Path) -> Result<Option<String>, ProviderError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(user_config_error(format!("无法读取模型配置 {}：{error}", path.display()))),
+    }
+}
+
+/// 序列化后原子替换整个配置：被删掉的提供方、模型和推理档位随保存消失。
+/// 键按 `BTreeMap` 排序，与文件原先的书写顺序无关。
+pub(crate) fn write_user_config_file(directory: &Path, config: &UserConfigFile) -> Result<(), ProviderError> {
+    singularity_core::create_data_dir(directory).map_err(user_config_error)?;
+    let path = directory.join(USER_CONFIG_FILE_NAME);
+    singularity_core::write_json_atomic(&path, config)
+        .map_err(|error| user_config_error(format!("无法保存模型配置 {}：{error}", path.display())))
 }

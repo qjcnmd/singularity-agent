@@ -16,7 +16,6 @@
     "@shikijs/langs": "4.4.3",
     "@shikijs/themes": "4.4.3",
     "anser": "2.3.5",
-    "diff": "9.0.0",
     "katex": "0.18.7",
     "lucide-react": "1.42.0",
     "motion": "13.2.0",
@@ -34,7 +33,6 @@
     "@vitejs/plugin-react": "6.1.1",
     "electron": "44.4.5",
     "electron-builder": "26.15.3",
-    "playwright": "1.58.2",
     "typescript": "7.0.2",
     "vite": "8.2.2"
   },

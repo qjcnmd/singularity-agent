@@ -3,17 +3,14 @@ import type { ViewportAnchor } from './protocol'
 import type { SessionView } from './execution'
 import { buildTimeline } from './timeline'
 
-/** 找到所属回合后，缺失条目不可能藏在更早的页里。 */
-export function anchorLocation(session: SessionView | null, anchor: ViewportAnchor | undefined): 'found' | 'older' | 'missing' {
-  if (anchor?.mode !== 'anchored') return 'found'
-  if (buildTimeline(session).some(item => item.key === anchor.anchorItemId)) return 'found'
-  if (session === null || session.nextCursor === null || anchor.turnId === undefined
-    || [...session.facts.history, ...session.facts.active].some(turn => turn.id === anchor.turnId)) return 'missing'
-  return 'older'
+/** 只恢复当前已加载的阅读位置；更早历史由用户按需加载。 */
+export function anchorLocation(session: SessionView | null, anchor: ViewportAnchor | undefined): 'found' | 'missing' {
+  return anchor?.mode !== 'anchored' || buildTimeline(session).some(item => item.key === anchor.anchorItemId)
+    ? 'found' : 'missing'
 }
 
 export const defaultAnchor = (): ViewportAnchor => ({
-  mode: 'following', anchorItemId: null, offset: 0,
+  mode: 'following', anchorItemId: null, turnId: null, offset: 0,
 })
 
 export const messageFontSize = { min: 12, max: 24, default: 16 }
@@ -31,9 +28,9 @@ export interface PersistedView {
   selectedSessionId: string | null
   sidebarWidth: number
   sidebarCollapsed: boolean
-  trajectoryWidth: number
+  backgroundWidth: number
   sidebarView: { collapsed: string[] }
-  trajectoryOpen: boolean
+  backgroundOpen: boolean
   workspaceAppearance: Record<string, WorkspaceAppearance>
   viewportAnchors: Record<string, ViewportAnchor>
 }
@@ -50,9 +47,9 @@ export function loadPersisted(): PersistedView {
     selectedSessionId: null,
     sidebarWidth: 280,
     sidebarCollapsed: false,
-    trajectoryWidth: 280,
+    backgroundWidth: 280,
     sidebarView: { collapsed: [] },
-    trajectoryOpen: false,
+    backgroundOpen: false,
     workspaceAppearance: {},
     viewportAnchors: {},
   }
@@ -65,8 +62,8 @@ export function loadPersisted(): PersistedView {
 }
 
 export function persistView(value: PersistedView): void {
-  const { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, trajectoryWidth, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors } = value
-  const view: PersistedView = { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, trajectoryWidth, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors }
+  const { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, backgroundWidth, sidebarView, backgroundOpen, workspaceAppearance, viewportAnchors } = value
+  const view: PersistedView = { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, backgroundWidth, sidebarView, backgroundOpen, workspaceAppearance, viewportAnchors }
   localStorage.setItem(storageKey, JSON.stringify(view))
 }
 

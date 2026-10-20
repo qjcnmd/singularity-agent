@@ -25,13 +25,15 @@ export const Composer = memo(ComposerView)
 function ComposerView({ centered }: { centered: boolean }) {
   const reducedMotion = useReducedMotion()
   const state = useAppStore(['drafts', 'questionDrafts', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'liveSessions', 'sessionLoad', 'theme', 'workspaceAppearance'])
-  const draft = appStore.draft()
-  const imageDraft = appStore.inputDraft().images
+  const { text: draft, images: imageDraft } = appStore.inputDraft()
   const sessionId = state.selectedSessionId
-  const imageInput = useImageInput(images => { if (sessionId !== null) appStore.setImages(sessionId, images, true) }, sessionId === null || state.drafts === null)
+  const draftKey = appStore.draftKey()
+  const pendingQuestion = state.session?.runtime.pendingQuestion
+  const inputDisabled = draftKey === null || state.drafts === null
+  const imageInput = useImageInput(images => { if (draftKey !== null) appStore.setImages(draftKey, images, true) }, inputDisabled || !!pendingQuestion)
   const phase = selectedSessionPhase(state)
-  const busy = phase === 'running' || phase === 'stopping' || phase === 'compacting'
-  const hasTurns = state.session?.facts.history.some(turn => turn.id !== null) ?? false
+  const busy = phase === 'running' || phase === 'compacting' || phase === 'stopping'
+  const hasTurns = state.session?.facts.some(turn => turn.id !== null) ?? false
   const [caret, setCaret] = useState(draft.length)
   const trigger = inputTrigger(draft, caret)
   const fileQuery = trigger?.kind === 'file' ? trigger.query : undefined
@@ -39,6 +41,7 @@ function ComposerView({ centered }: { centered: boolean }) {
   const skillMenu = skillQuery !== undefined
   const files = useFileCandidates(fileQuery, state)
   const skills = useSkillCandidates(skillMenu, state)
+  const candidates = skillMenu ? skills : files
   const suggestions: { value: string; description: string; skill?: SkillMetadata }[] = skillMenu
     ? (skills.status === 'ready' ? skills.result.skills : []).filter(skill => skill.name.startsWith(skillQuery)).map(skill => ({ value: skill.name, description: skill.description, skill }))
     : (files.status === 'ready' ? files.result : []).map(file => ({ value: file.path, description: '任务文件' }))
@@ -47,6 +50,7 @@ function ComposerView({ centered }: { centered: boolean }) {
   const textarea = useRef<HTMLTextAreaElement>(null)
   const candidateAnchor = useRef<HTMLDivElement>(null)
   const candidateList = useRef<HTMLDivElement>(null)
+  const candidateRetry = useRef<HTMLButtonElement>(null)
   const selectionGuard = useSelectionGuard()
   const sessionOrigin = actionOrigin.session(sessionId)
   const occupancy = useMemo(() => contextOccupancy(state.session, state.bootstrap?.modelCatalog), [state.session, state.bootstrap?.modelCatalog])
@@ -79,7 +83,7 @@ function ComposerView({ centered }: { centered: boolean }) {
     const anchor = candidateAnchor.current
     const list = candidateList.current
     if (!showCandidateSurface || !anchor || !list) return
-    // 浮层避开顶部 52px 的标题栏与轨迹开关区，只使用输入框上方的空间；
+    // 浮层避开顶部 52px 的标题栏与侧栏开关区，只使用输入框上方的空间；
     // 输入高度和视口变化都重新量。
     const measure = () => {
       const available = anchor.getBoundingClientRect().top - 52
@@ -100,12 +104,18 @@ function ComposerView({ centered }: { centered: boolean }) {
     <motion.section className="composer-region" aria-label="任务输入区"
       layout={reducedMotion ? false : 'position'} layoutDependency={centered}
       transition={{ layout: disclosureTransition(true, reducedMotion) }}>
-      {state.session?.runtime.pendingQuestion && <QuestionPanel key={state.session.runtime.pendingQuestion.itemId} request={state.session.runtime.pendingQuestion} state={state} />}
-      {!state.session?.runtime.pendingQuestion && <>
+      {!pendingQuestion &&
       <div ref={candidateAnchor} className="composer-candidate-anchor">
         {centered && <div className="composer-project" hidden={showCandidateSurface}><WorkspacePicker state={state} /></div>}
         <PickerSurface open={showCandidateSurface}>
-          <div ref={candidateList} className="composer-candidates" id="composer-suggestions" role="listbox" aria-label="输入建议">
+          <div ref={candidateList} className="composer-candidates" onKeyDown={event => {
+            if (event.key === 'Escape') {
+              event.preventDefault()
+              setSuggestionsOpen(false)
+              textarea.current?.focus()
+            }
+          }}>
+            <div id="composer-suggestions" role="listbox" aria-label="输入建议" aria-busy={candidates.status === 'loading'}>
             {suggestions.map((candidate, index) => (
               <button
                 type="button"
@@ -120,23 +130,30 @@ function ComposerView({ centered }: { centered: boolean }) {
                 <strong>{skillMenu ? '/' : '@'}{candidate.value}</strong><span>{candidate.description}</span>
               </button>
             ))}
+            </div>
+            {candidates.status === 'loading' && <p className="candidate-message" role="status">{skillMenu ? '正在读取 Skills…' : '正在搜索文件…'}</p>}
             {skillMenu && skills.status === 'ready' && suggestions.length === 0 && <p className="candidate-message">{skills.result.skills.length === 0 ? '没有可用的 Skills' : '没有匹配的 Skills'}</p>}
-            {skillMenu && skills.status === 'error' && <p className="candidate-message candidate-error" role="alert">{skills.error.message}</p>}
             {skillMenu && skills.status === 'ready' && skills.result.diagnostics.map(message => <p className="candidate-message candidate-error" role="alert" key={message}>{message}</p>)}
             {fileQuery !== undefined && files.status === 'ready' && files.result.length === 0 && <p className="candidate-message">没有匹配的文件</p>}
-            {fileQuery !== undefined && files.status === 'error' && (
+            {candidates.status === 'error' && (
               <div className="candidate-message candidate-error" role="alert">
-                <strong>{files.error.message}</strong>{files.error instanceof RpcFailure && files.error.recovery && <span>{files.error.recovery}</span>}
+                <strong>{candidates.error.message}</strong>{candidates.error instanceof RpcFailure && candidates.error.recovery && <span>{candidates.error.recovery}</span>}
+                <button ref={candidateRetry} type="button" className="secondary-button" onClick={() => {
+                  candidates.retry()
+                  textarea.current?.focus()
+                }}>{skillMenu ? '重试读取 Skills' : '重试搜索文件'}</button>
               </div>
             )}
           </div>
         </PickerSurface>
-      </div>
-      <div {...imageInput.handlers} className={`composer-card${state.selectedWorkspaceId === null ? ' is-unavailable' : ''}`}>
-        <DraftImages images={imageDraft} remove={index => { if (sessionId !== null) appStore.setImages(sessionId, imageDraft.filter((_, at) => at !== index)) }} />
+      </div>}
+      <div {...imageInput.handlers} className={`composer-card${inputDisabled ? ' is-unavailable' : ''}`}>
+        {pendingQuestion ? <QuestionPanel key={pendingQuestion.itemId} request={pendingQuestion} state={state} /> : <>
+        <DraftImages images={imageDraft} remove={index => { if (draftKey !== null) appStore.setImages(draftKey, imageDraft.filter((_, at) => at !== index)) }} />
         <textarea
           ref={textarea}
-          disabled={state.selectedWorkspaceId === null || state.drafts === null}
+          disabled={inputDisabled}
+          placeholder={state.selectedWorkspaceId === null ? '请先选择项目' : undefined}
           value={draft}
           onSelect={event => { setCaret(event.currentTarget.selectionStart) }}
           onChange={(event) => {
@@ -152,6 +169,11 @@ function ComposerView({ centered }: { centered: boolean }) {
               event.preventDefault()
               const direction = event.key === 'ArrowDown' ? 1 : -1
               setSuggestionIndex((index) => (index + direction + suggestions.length) % suggestions.length)
+              return
+            }
+            if (showCandidateSurface && candidates.status === 'error' && event.key === 'Tab' && !event.shiftKey) {
+              event.preventDefault()
+              candidateRetry.current?.focus()
               return
             }
             if (showCandidateSurface && suggestions.length > 0 && event.key === 'Tab') {
@@ -176,27 +198,29 @@ function ComposerView({ centered }: { centered: boolean }) {
           rows={1}
           aria-label="任务说明"
           aria-controls={showCandidateSurface ? 'composer-suggestions' : undefined}
-          aria-activedescendant={suggestionsOpen && suggestions.length > 0 ? `composer-suggestion-${suggestionIndex}` : undefined}
+          aria-activedescendant={showCandidateSurface && suggestions.length > 0 ? `composer-suggestion-${suggestionIndex}` : undefined}
         />
+        </>}
         <div className="composer-toolbar">
           <div className="composer-context">
+            {!pendingQuestion && <>
             {imageInput.picker}
             <ComposerTools key={state.selectedSessionId ?? state.selectedWorkspaceId} imageInput={imageInput}
               theme={state.theme} occupancy={occupancy}
-              compactDisabled={!appStore.modelAvailable() || state.session === null || !hasTurns || state.connection !== 'ready' || phase !== 'idle' || state.pendingActions.has(pendingKey('session.compact', sessionOrigin))} />
+              compactDisabled={!appStore.modelAvailable() || !hasTurns || state.connection !== 'ready' || phase !== 'idle' || state.pendingActions.has(pendingKey('session.compact', sessionOrigin))} />
+            </>}
 
           </div>
           <div className="composer-actions">
-            <ModelPicker state={state} />
-            {phase === 'compacting' && <span role="status" className="compaction-status">正在压缩…</span>}
-            {busy && phase !== 'compacting' && (
+            {!pendingQuestion && <ModelPicker state={state} />}
+            {busy && (
               <button
                 type="button"
                 className="stop-button"
                 {...selectionGuard(() => { void appStore.stopActive() })}
                 disabled={phase === 'stopping' || state.pendingActions.has(pendingKey('session.abort', sessionOrigin))}
-                aria-label={phase === 'stopping' ? '正在停止' : '停止当前任务'}
-                title={phase === 'stopping' ? '正在停止' : '停止'}
+                aria-label={phase === 'stopping' ? '正在停止当前回合' : '停止当前回合'}
+                title={phase === 'stopping' ? '正在停止当前回合，后台命令继续运行' : '停止当前回合；后台命令继续运行，发送下一条消息后恢复自动续跑'}
               >
                 <ActivityOrb fast />
               </button>
@@ -214,7 +238,6 @@ function ComposerView({ centered }: { centered: boolean }) {
           </div>
         </div>
       </div>
-      </>}
       {usage !== null && <ComposerStats usage={usage} />}
     </motion.section>
   )

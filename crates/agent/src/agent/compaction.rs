@@ -1,10 +1,10 @@
-//! 手动和自动共用压缩：总结早期历史、保留近期原文，成功后提交摘要和新定义。
+//! 手动和自动共用压缩：总结早期历史、保留近期原文，成功后提交摘要与保留位置。
 
 use super::{Agent, AgentError, AgentEvent, Result};
-use crate::compaction::PreparedCompaction;
+use crate::compaction::{PreparedCompaction, validate_summary};
 use crate::request_execution::execute_request;
-use crate::session::{LedgerRecord, append_record_async, context, lock_writer, with_writer_async};
-use singularity_protocol::{HistoryItem, TurnFailureCause, TurnStatus};
+use crate::session::{CompactionEntry, context, lock_writer, with_writer_async};
+use singularity_protocol::{HistoryItem, TurnStatus};
 use tokio_util::sync::CancellationToken;
 
 const AUTO_COMPACTION_TRIGGER_RATIO: f64 = 0.9;
@@ -41,13 +41,17 @@ impl Agent {
         if self.context_pressure_tokens()
             >= (self.context_window() as f64 * AUTO_COMPACTION_TRIGGER_RATIO).floor() as u64
         {
-            self.compact_now(on_event).await.into_result()?;
+            self.compact_now(on_event, cancellation).await.into_result()?;
         }
         Ok(())
     }
 
-    /// 压缩期间不接受用户停止；请求仍按共同规则处理超时、重试和最终失败。
-    pub async fn compact_now(&mut self, on_event: &mut (dyn FnMut(AgentEvent) + Send)) -> CompactionOutcome {
+    /// 压缩响应停止；摘要保存成功前保留原上下文。
+    pub async fn compact_now(
+        &mut self,
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
+        cancellation: &CancellationToken,
+    ) -> CompactionOutcome {
         let item_id = crate::session::new_entry_id();
         on_event(AgentEvent::CompactionUpdated {
             item: HistoryItem::CompactionResult {
@@ -56,16 +60,7 @@ impl Agent {
                 message: None,
             },
         });
-        let saved_id = item_id.clone();
-        let result = match with_writer_async(&self.session, move |writer| {
-            writer.append_record_with_id(saved_id, LedgerRecord::OperationStarted { turn_id: None })
-        })
-        .await
-        {
-            Ok(_) => self.compact_context(on_event).await,
-            Err(error) => Err(error.into()),
-        };
-        let result = self.save_compaction_result(result).await;
+        let result = self.compact_context(&item_id, on_event, cancellation).await;
         let (outcome, item) = match result {
             Ok(Some(summary)) => {
                 (CompactionOutcome::Compacted, HistoryItem::Compaction { id: item_id, summary })
@@ -75,6 +70,14 @@ impl Agent {
                 HistoryItem::CompactionResult {
                     id: item_id,
                     status: TurnStatus::Completed,
+                    message: None,
+                },
+            ),
+            Err(AgentError::Aborted) => (
+                CompactionOutcome::Failed(AgentError::Aborted),
+                HistoryItem::CompactionResult {
+                    id: item_id,
+                    status: TurnStatus::Interrupted,
                     message: None,
                 },
             ),
@@ -94,73 +97,53 @@ impl Agent {
         outcome
     }
 
-    /// 所有触发方式在同一处保存终态；存储已失败时停止写入，同时保留原始原因。
-    async fn save_compaction_result(&self, result: Result<Option<String>>) -> Result<Option<String>> {
-        if result.as_ref().err().is_some_and(|error| error.cause() == TurnFailureCause::Store) {
-            return result;
-        }
-        let record = LedgerRecord::OperationFinished {
-            turn_id: None,
-            outcome: if result.is_ok() {
-                TurnStatus::Completed
-            } else {
-                TurnStatus::Failed
-            },
-            error: result.as_ref().err().map(AgentError::detail),
-            user_stopped: false,
-        };
-        if let Err(storage) = append_record_async(&self.session, record).await {
-            return Err(match result {
-                Err(execution) => AgentError::FailureRecording { execution: Box::new(execution), storage },
-                Ok(_) => AgentError::Session(storage),
-            });
-        }
-        result
-    }
-
     async fn compact_context(
         &mut self,
+        item_id: &str,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
+        cancellation: &CancellationToken,
     ) -> Result<Option<String>> {
-        // 独立令牌只适配共同请求接口，不连接普通任务的停止信号。
-        let cancellation = CancellationToken::new();
-        self.ensure_definitions(on_event, &cancellation).await?;
-        let definitions = self.request_definitions().clone();
+        if cancellation.is_cancelled() {
+            return Err(AgentError::Aborted);
+        }
         let session = std::sync::Arc::clone(&self.session);
-        let model = self.provider.model_configuration();
-        let summary = tokio::task::spawn_blocking(move || {
-            let prefix = {
-                let writer = lock_writer(&session);
-                let keep_tokens =
-                    (context::estimated_tokens(&writer) as f64 * KEEP_RECENT_RATIO).ceil() as u64;
-                context::compaction_prefix(&writer, keep_tokens)
-            };
-            prefix.map(|prefix| PreparedCompaction::new(prefix, &definitions, &model)).transpose()
+        let prefix = tokio::task::spawn_blocking(move || {
+            let writer = lock_writer(&session);
+            context::compaction_prefix(&writer, KEEP_RECENT_RATIO)
         })
         .await
-        .expect("summary preparation completes while the runtime is running")?;
-        // 保留近期完整消息后没有更早的对话可总结，沿用现有上下文。
-        let Some(summary) = summary else {
+        .expect("summary selection completes while the runtime is running");
+        // 没有更早的对话可总结时，也无需首次加载指令、技能和 MCP 定义。
+        let Some(prefix) = prefix else {
             return Ok(None);
         };
-        let (response, id) = execute_request(
+        self.ensure_definitions(on_event, cancellation).await?;
+        let definitions = self.request_definitions().clone();
+        let model = self.provider.model_configuration();
+        let prepared =
+            tokio::task::spawn_blocking(move || PreparedCompaction::new(prefix, &definitions, &model))
+                .await
+                .expect("summary preparation completes while the runtime is running")?;
+        let (response, _) = execute_request(
             &self.provider,
             &self.session,
-            &mut self.accounting,
-            &summary.request,
+            &prepared.request,
             on_event,
-            &cancellation,
+            cancellation,
             singularity_protocol::RequestPurpose::Compaction,
         )
         .await?;
-        let mut entry = summary.into_entry(response)?;
-        let (definitions, registry) = self.load_definitions(on_event, &cancellation).await?;
-        entry.definitions = Some(definitions.clone());
-        let summary = entry.summary.clone();
-        // 一条完整记录同时切换对话与定义；读取或写入失败时旧上下文仍有效。
+        let summary = validate_summary(response)?;
+        if cancellation.is_cancelled() {
+            return Err(AgentError::Aborted);
+        }
+        let entry = CompactionEntry {
+            summary: summary.clone(),
+            first_kept_entry_id: prepared.first_kept_entry_id,
+        };
+        // 摘要与保留位置一同保存；写入失败时旧上下文仍有效。
+        let id = item_id.to_owned();
         with_writer_async(&self.session, move |writer| writer.append_compaction_with_id(&id, entry)).await?;
-        self.definitions = Some(definitions);
-        self.registry = registry;
         self.usage_correction = 0;
         Ok(Some(summary))
     }

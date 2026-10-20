@@ -2,11 +2,6 @@
 
 use std::path::Path;
 
-/// 在进程入口处，用与 bash 工具相同的发现规则一次性校验 shell 是否可用。
-pub fn ensure_available() -> Result<(), String> {
-    bash_path().map(|_| ())
-}
-
 /// 可用的 Bash 路径；找不到就给出安装与 PATH 的指引。查找顺序和排除规则见
 /// [`find_bash_on_windows`]。
 pub(super) fn bash_path() -> Result<String, String> {
@@ -18,11 +13,11 @@ pub(super) fn bash_path() -> Result<String, String> {
 
 /// 判断候选路径是不是 System32 下的 bash 启动器存根。
 ///
-/// System32 下的 bash.exe 是 WSL 的启动器存根：路径语义和进程模型与 Unix shell 完全
-/// 不同，在没有安装发行版或服务没运行时还会静默无输出，不能当作执行后端。
+/// System32 下的 bash.exe 是 WSL 的启动器存根：路径语义和进程模型与 Unix shell 不同，
+/// 没装发行版或服务没运行时还会静默无输出，不算执行后端。
 ///
 /// Windows 路径不区分大小写，而 `Path` 的组件比较是逐字节的，所以这里显式折叠 ASCII
-/// 大小写：PATH 里的 `C:\windows\system32` 必须和 `C:\Windows\System32` 一样被排除。
+/// 大小写：PATH 里的 `C:\windows\system32` 和 `C:\Windows\System32` 一样要排除。
 /// `SystemRoot` 缺失时没法做前缀比较，就只按 `System32\bash.exe` 后缀判断。
 fn is_system32_bash_launcher(candidate: &Path, system_root: &str) -> bool {
     if !system_root.is_empty() && !starts_with_ignore_ascii_case(candidate, Path::new(system_root)) {

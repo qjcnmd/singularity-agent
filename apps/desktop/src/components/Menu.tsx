@@ -6,7 +6,6 @@ interface MenuEntry {
   /** 列表 key；动作由条目自己的 onSelect 承担，不再由调用方按 ID 分派。 */
   id: string
   label: string
-  danger?: boolean
   onSelect: () => void
 }
 
@@ -23,5 +22,5 @@ export function Menu({ anchor, entries, onClose, label }: {
 
   return createPortal(<div ref={container} className="context-menu" role="menu" aria-label={label} onKeyDown={event => {
     if (navigateList(event.key, focusableElements(event.currentTarget))) event.preventDefault()
-  }}>{entries.map(entry => <button key={entry.id} type="button" role="menuitem" className={entry.danger ? 'danger' : ''} onClick={() => { onClose(); entry.onSelect() }}><span>{entry.label}</span></button>)}</div>, document.body)
+  }}>{entries.map(entry => <button key={entry.id} type="button" role="menuitem" onClick={() => { onClose(); entry.onSelect() }}><span>{entry.label}</span></button>)}</div>, document.body)
 }

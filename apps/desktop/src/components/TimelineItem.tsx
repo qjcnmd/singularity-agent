@@ -2,7 +2,7 @@ import { ExpandChevron } from './ExpandChevron'
 import { AttachedImages } from './Images'
 import { Disclosure } from './Disclosure'
 import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
-import Anser from 'anser'
+import { CommandOutput } from './CommandOutput'
 import { CircleAlert, ListCollapse } from 'lucide-react'
 import { motion, useReducedMotion } from 'motion/react'
 import { disclosureTransition } from '../motion'
@@ -21,7 +21,8 @@ interface Props {
 
 // 历史项复用稳定引用跳过重绘；流式更新只重新渲染当前活动项。
 export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Props) {
-  const hiddenLines = item.kind === 'user' ? Math.max(0, timelineBody(item).trimEnd().split('\n').length - previewLineCount) : 0
+  const userLines = item.kind === 'user' ? timelineBody(item).trimEnd().split('\n') : []
+  const hiddenLines = Math.max(0, userLines.length - previewLineCount)
   const canCollapse = hiddenLines > 0
   const [expanded, setExpanded] = useState(item.kind !== 'tool')
   const selectionGuard = useSelectionGuard()
@@ -36,7 +37,7 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
   }
 
   if (item.kind === 'user' || item.kind === 'assistant') {
-    const body = canCollapse && !expanded ? preview(timelineBody(item)) : timelineBody(item)
+    const body = canCollapse && !expanded ? userLines.slice(0, previewLineCount).join('\n') : timelineBody(item)
     return (
       <article
         className={`timeline-item message-item timeline-${item.kind} status-${timelineStatus(item)}`}
@@ -55,6 +56,7 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
   }
 
   if (item.kind === 'thinking') return <ReasoningRow item={item} />
+  if (item.kind === 'context') return <ContextRow item={item} />
   if (item.kind === 'compaction') return <CompactionRow item={item} />
 
   return (
@@ -67,6 +69,7 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
         {timelineStatus(item) === 'cancelled' && <span className="item-status">{factStatusText.cancelled}</span>}
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
+        {item.fact.duration !== undefined && <div className="tool-duration">耗时 {formatTurnDuration(item.fact.duration)}</div>}
         <div className="timeline-body activity-output"><ToolOutput item={item} />{sessionId && item.fact?.images && <AttachedImages sessionId={sessionId} images={item.fact.images} />}</div>
       </div></Disclosure>
     </article>
@@ -81,7 +84,7 @@ function TurnDuration({ itemKey, startedAt, finishedAt }: { itemKey: string; sta
     return () => window.clearInterval(timer)
   }, [finishedAt])
   const elapsed = (finishedAt ? Date.parse(finishedAt) : now) - Date.parse(startedAt)
-  return <div className="turn-duration" data-item-id={itemKey} role={finishedAt ? undefined : 'timer'} aria-label="本轮执行时间">{formatTurnDuration(elapsed)}</div>
+  return <div className="turn-duration" data-item-id={itemKey} role={finishedAt ? undefined : 'timer'} aria-label="本轮执行时间">{finishedAt ? '本轮耗时' : '执行中'} · {formatTurnDuration(elapsed)}</div>
 }
 
 function StepLabel({ item, icon }: Props & { icon?: ReactNode }) {
@@ -170,17 +173,28 @@ function CompactionRow({ item }: Props) {
   </article>
 }
 
+function ContextRow({ item }: Props) {
+  const [expanded, setExpanded] = useState(false)
+  const guard = useSelectionGuard()
+  const text = timelineBody(item)
+  return <article className="timeline-item activity-step timeline-context" data-item-id={item.key}>
+    <button type="button" className="activity-toggle" aria-expanded={expanded}
+      {...guard(() => setExpanded(value => !value))}>
+      <span className="step-title">{item.title}</span>
+      <ExpandChevron expanded={expanded} size={14} />
+    </button>
+    <Disclosure open={expanded}><div className="activity-expanded context-content"><pre>{text}</pre></div></Disclosure>
+  </article>
+}
+
 function ToolOutput({ item }: { item: Extract<TimelineItemModel, { kind: 'tool' }> }) {
   const fact = item.fact
   const { args: input, output } = fact
   const command = item.title === 'bash' ? toolArgument(item.title, input) : null
-  if (command !== null) return <div>
-    <div className="terminal-command"><span aria-hidden="true">$</span><code>{command}</code></div>
-    {output !== '' && <><OutputHeader label="输出" /><pre>{Anser.ansiToJson(output, { remove_empty: true }).map((part, index) => <span key={index} style={{ color: part.fg ? `rgb(${part.fg})` : undefined, backgroundColor: part.bg ? `rgb(${part.bg})` : undefined, fontWeight: part.decorations.includes('bold') ? 700 : undefined }}>{part.content}</span>)}</pre></>}
-  </div>
+  if (command !== null) return <CommandOutput command={command} output={output} />
   const hasReadLines = fact.readSource !== undefined && fact.readSource.lineCount > 0
-  if (item.filePath !== null && (output !== '' || hasReadLines) && item.title === 'read' && timelineStatus(item) !== 'error') return <div>
-    <OutputHeader label={item.filePath} />
+  if (item.filePath !== null && (output !== '' || hasReadLines) && fact.name === 'read' && timelineStatus(item) !== 'error') return <div>
+    <div className="tool-output-header">{item.filePath}</div>
     {/* 只有 producer 记录了真实来源范围才编号；否则按普通文本展示，不猜边界。 */}
     {fact.readSource
       ? <div className="tool-lines">{readOutputLines(output, fact.readSource).map((line, index) => (
@@ -200,19 +214,11 @@ function ToolOutput({ item }: { item: Extract<TimelineItemModel, { kind: 'tool' 
   )
 }
 
-function OutputHeader({ label }: { label: string }) {
-  return <div className="tool-output-header">{label}</div>
-}
-
 function ToolSection({ label, children }: { label: string; children: ReactNode }) {
   return <section className="timeline-section">
     <h4>{label}</h4>
     {children}
   </section>
-}
-
-function preview(text: string): string {
-  return text.split('\n').slice(0, previewLineCount).join('\n')
 }
 
 function StepIcon({ item }: Props) {

@@ -33,52 +33,39 @@ pub(super) fn configuration_error(message: impl Into<String>) -> RpcError {
 }
 
 pub(super) fn model_error(error: singularity_model::ProviderError) -> RpcError {
-    match error.code.as_deref() {
-        Some(singularity_model::CREDENTIAL_SAVE_FAILED_CODE) => partially_saved(error, "重试保存 API 密钥。"),
-        Some(singularity_model::CREDENTIAL_DELETE_FAILED_CODE) => {
-            partially_saved(error, "重试删除 API 密钥。")
-        }
-        _ => configuration_error(error.to_string()),
-    }
-}
-
-/// 配置已经部分生效、剩下凭据没写成功：界面按同一分类提示重试这次操作。
-pub(super) fn partially_saved(error: singularity_model::ProviderError, recovery: &str) -> RpcError {
-    RpcError::new(RpcErrorCode::ConfigurationPartiallySaved, error.to_string(), recovery)
+    configuration_error(error.to_string())
 }
 
 pub(super) fn model_discovery_error(error: singularity_model::ProviderError) -> RpcError {
-    use singularity_model::ModelErrorCategory;
-    match error.category() {
-        ModelErrorCategory::ModelConfiguration | ModelErrorCategory::InvalidRequest => {
-            configuration_error(error.to_string())
-        }
-        ModelErrorCategory::Authentication => RpcError::new(
+    use singularity_model::ModelErrorKind;
+    match error.kind {
+        ModelErrorKind::InvalidRequest => configuration_error(error.to_string()),
+        ModelErrorKind::AuthError => RpcError::new(
             RpcErrorCode::ConfigurationInvalid,
             error.to_string(),
             "检查 API 地址和密钥；也可以手动添加模型。",
         ),
-        ModelErrorCategory::Network
-        | ModelErrorCategory::ProviderUnavailable
-        | ModelErrorCategory::UnknownProviderError
-        | ModelErrorCategory::JsonSchema => RpcError::new(
+        ModelErrorKind::NetworkError
+        | ModelErrorKind::Timeout
+        | ModelErrorKind::RateLimited
+        | ModelErrorKind::ProviderOverloaded
+        | ModelErrorKind::UnknownProviderError
+        | ModelErrorKind::JsonSchemaViolation => RpcError::new(
             RpcErrorCode::ProviderUnavailable,
             error.to_string(),
             "稍后重试；也可以手动添加模型。",
         ),
-        ModelErrorCategory::Cancelled
-        | ModelErrorCategory::ContextLengthExceeded
-        | ModelErrorCategory::ContentFilter => internal_error(error.to_string()),
+        ModelErrorKind::Cancelled | ModelErrorKind::ContextLengthExceeded | ModelErrorKind::ContentFilter => {
+            internal_error(error.to_string())
+        }
     }
 }
 
 pub(super) fn conversation_error(error: ConversationError) -> RpcError {
     match error {
-        ConversationError::TurnAlreadyActive => session_busy(),
-        ConversationError::Control(error) => control_error(error),
+        ConversationError::Busy => session_busy(),
         ConversationError::InvalidName => invalid_request(error.to_string()),
         ConversationError::Configuration(message) => configuration_error(message),
-        ConversationError::Turn(error) => internal_error(error.to_string()),
         ConversationError::Session(error) => internal_error(error.to_string()),
     }
 }
@@ -112,13 +99,4 @@ pub(super) fn session_busy() -> RpcError {
         "当前任务正在处理另一项操作。",
         "等待状态变为空闲，或使用当前阶段提供的控制动作。",
     )
-}
-
-pub(super) fn control_error(error: ConversationControlError) -> RpcError {
-    match error {
-        ConversationControlError::NotRunning => session_busy(),
-        ConversationControlError::Compacting | ConversationControlError::InvalidInput => {
-            invalid_request(error.to_string())
-        }
-    }
 }

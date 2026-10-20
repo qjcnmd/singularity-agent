@@ -4,10 +4,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use singularity_protocol::{
-    ActiveTurnRuntimeSnapshot, SessionRuntime, SessionTerminalSnapshot, TurnEvent, TurnEventEnvelope,
-};
-use singularity_runtime::{Conversation, ThreadSnapshot};
+use super::activity::Activity;
+use singularity_protocol::{SessionRuntime, SessionTerminalSnapshot, TurnEvent, TurnEventEnvelope};
+use singularity_runtime::Conversation;
 
 pub(super) struct ConversationSlot {
     conversation: Arc<Conversation>,
@@ -16,11 +15,10 @@ pub(super) struct ConversationSlot {
 
 pub(super) struct SlotState {
     archiving: bool,
-    history: Option<Arc<ThreadSnapshot>>,
     session_revision: u64,
-    active_turn: Option<ActiveTurnRuntimeSnapshot>,
-    events: Vec<TurnEventEnvelope>,
+    activity: Activity,
     terminal: Option<SessionTerminalSnapshot>,
+    usage: Option<singularity_protocol::SessionModelUsage>,
 }
 
 impl ConversationSlot {
@@ -29,11 +27,10 @@ impl ConversationSlot {
             conversation,
             state: Mutex::new(SlotState {
                 archiving: false,
-                history: None,
                 session_revision: 0,
-                active_turn: None,
-                events: Vec::new(),
+                activity: Activity::default(),
                 terminal: None,
+                usage: None,
             }),
         }
     }
@@ -51,9 +48,10 @@ impl ConversationSlot {
     }
 
     /// 调用方持有生命周期锁；归档期间保留读取和事件投影，拒绝新的操作。
-    pub(super) fn begin_archive(&self) -> ArchiveGuard<'_> {
+    pub(super) fn begin_archive(self: &Arc<Self>) -> ArchiveGuard {
         self.lock_state().archiving = true;
-        ArchiveGuard { slot: self }
+        self.conversation.set_closing(true);
+        ArchiveGuard { slot: Arc::clone(self) }
     }
 
     pub(super) fn runtime_from(&self, state: &SlotState) -> SessionRuntime {
@@ -65,75 +63,80 @@ impl ConversationSlot {
             selector: conversation.selector,
             model_context_window: conversation.model_context_window,
             pending_question: conversation.pending_question,
-            active_turn: state.active_turn.clone(),
+            pending_messages: conversation.pending_messages,
             terminal: state.terminal.clone(),
+            usage: state.usage.clone(),
+            background_tasks: self.conversation.background_tasks(),
         }
     }
 }
 
 /// 归档失败时释放操作限制，原任务仍可继续使用或重试归档。
-pub(super) struct ArchiveGuard<'a> {
-    slot: &'a ConversationSlot,
+pub(super) struct ArchiveGuard {
+    slot: Arc<ConversationSlot>,
 }
 
-impl Drop for ArchiveGuard<'_> {
+impl Drop for ArchiveGuard {
     fn drop(&mut self) {
         self.slot.lock_state().archiving = false;
+        self.slot.conversation.set_closing(false);
     }
 }
 
 impl SlotState {
-    /// 开始一次回合：冻结刚读出来的持久化 history，清掉上一次的终态。
-    /// 调用方必须在同一次加锁内把发布做完，事件和读取才会看到同一个瞬间。
-    pub(super) fn begin_turn(&mut self, history: Arc<ThreadSnapshot>) {
-        self.history = Some(history);
+    pub(super) fn background_error(&mut self, message: String) {
+        self.terminal = Some(SessionTerminalSnapshot {
+            source: singularity_protocol::SessionTerminalSource::Turn,
+            status: singularity_protocol::TurnStatus::Failed,
+            manually_stopped: false,
+            error: Some(singularity_protocol::TurnErrorDetail {
+                cause: singularity_protocol::TurnFailureCause::Store,
+                message,
+                item_id: None,
+            }),
+        });
+    }
+
+    /// 开始一次操作：读取已保存用量，清掉上一次显示状态。
+    /// 调用方在同一次加锁内完成发布，事件和读取才看到同一个瞬间。
+    pub(super) fn begin_turn(&mut self, usage: singularity_protocol::SessionModelUsage) {
+        self.usage = Some(usage);
+        self.activity = Activity::default();
         self.terminal = None;
     }
 
-    /// 折叠一条回合事件：推进会话 revision，维护活动回合，并把已完成的内容替换进去。
+    /// 折叠一条执行事件：推进会话 revision，并用完整内容替换相应的进度记录。
     /// 返回要广播的 envelope，调用方只负责按自己的顺序发出去。
-    pub(super) fn apply_turn_event(&mut self, event: TurnEvent) -> TurnEventEnvelope {
+    pub(super) fn apply_turn_event(
+        &mut self,
+        event: TurnEvent,
+        phase: singularity_protocol::SessionPhase,
+    ) -> TurnEventEnvelope {
         self.bump_revision();
-        if let TurnEvent::TurnStarted { turn, .. } = &event {
-            let snapshot = ActiveTurnRuntimeSnapshot { turn_id: turn.turn_id.clone() };
-            self.active_turn = Some(snapshot);
-        }
+        let usage = if let TurnEvent::ProviderAttempt { observation, .. } = &event {
+            let usage = self.usage.as_mut().expect("execution starts with saved usage");
+            singularity_runtime::accumulate_request_usage(usage, observation);
+            Some(usage.clone())
+        } else {
+            None
+        };
         let envelope = TurnEventEnvelope {
             event,
             session_revision: self.session_revision,
+            phase,
+            usage,
         };
-        // 恢复快照里已完成的内容要顶掉它的进度记录；实时广播的增量不受影响。
-        let replaced = match &envelope.event {
-            TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
-            | TurnEvent::ToolExecutionEnd { turn_id, item, .. }
-            | TurnEvent::ItemCompleted { turn_id, item, content: Some(_), .. }
-            | TurnEvent::ItemFailed { turn_id, item, content: Some(_), .. } => Some((turn_id, &item.item_id)),
-            _ => None,
-        };
-        if let Some((turn, item_id)) = replaced {
-            self.events.retain(|previous| {
-                let progress = match &previous.event {
-                    TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
-                    | TurnEvent::AssistantDelta { turn_id, item, .. }
-                    | TurnEvent::AssistantThinkingDelta { turn_id, item, .. } => {
-                        Some((turn_id, &item.item_id))
-                    }
-                    _ => None,
-                };
-                progress != Some((turn, item_id))
-            });
+        if phase != singularity_protocol::SessionPhase::Idle {
+            self.activity.apply(&envelope.event);
         }
-        self.events.push(envelope.clone());
         envelope
     }
 
-    /// 结算：保存本次执行结果或错误反馈，清空活动回合与冻结的 history，
-    /// 让下一次读取重新读盘；同时推进会话 revision。
+    /// 结算：保存本次执行结果或错误反馈，清空当前操作条目，
+    /// 让下一次读取使用会话内存记录；同时推进会话 revision。
     pub(super) fn settle(&mut self, terminal: Option<SessionTerminalSnapshot>) {
         self.terminal = terminal;
-        self.active_turn = None;
-        self.events.clear();
-        self.history = None;
+        self.activity = Activity::default();
         self.bump_revision();
     }
 
@@ -142,11 +145,11 @@ impl SlotState {
         self.session_revision += 1;
     }
 
-    pub(super) fn frozen_history(&self) -> Option<Arc<ThreadSnapshot>> {
-        self.history.clone()
+    pub(super) fn revision(&self) -> u64 {
+        self.session_revision
     }
 
-    pub(super) fn active_events(&self) -> &[TurnEventEnvelope] {
-        &self.events
+    pub(super) fn merge_activity(&self, page: &mut singularity_protocol::ThreadReadPage) {
+        self.activity.merge(page);
     }
 }

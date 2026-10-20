@@ -10,11 +10,10 @@ mod manager;
 mod request;
 
 pub use format::{
-    CURRENT_SESSION_VERSION, CompactionEntry, InterruptedAssistantItem, LedgerRecord, Result, SessionEntry,
-    SessionError, SessionMetadata, text_item_id, thinking_item_id, tool_item_id, turn_usage_from_model_usage,
+    CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
+    SessionMetadata, text_item_id, thinking_item_id, tool_item_id,
 };
-pub use manager::{CommittedEntry, SessionData, SessionManager};
-pub use request::RequestContext;
+pub use manager::{SessionData, SessionManager};
 pub(crate) use request::RequestDefinitions;
 
 /// 生成会话 JSONL 文件名：`{session_id}.jsonl`。
@@ -34,8 +33,8 @@ pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionM
     writer.lock().expect("session writer lock poisoned (fail-stop)")
 }
 
-/// 在阻塞任务线程池中异步追加一条账本记录。
-pub async fn append_record_async(writer: &SessionWriter, record: LedgerRecord) -> Result<CommittedEntry> {
+/// 在阻塞任务线程池中异步追加一条账本记录，返回实际保存的时间。
+pub async fn append_record_async(writer: &SessionWriter, record: LedgerRecord) -> Result<String> {
     with_writer_async(writer, move |writer| writer.append_record(record)).await
 }
 

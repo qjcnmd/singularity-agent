@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef, useState, type ReactNode, type MouseEvent } from 'react'
+import { useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import { type TimelineItemModel } from '../timeline'
 import { TimelineItem } from './TimelineItem'
@@ -29,7 +29,6 @@ export function Conversation({ state, items }: Props) {
         updateScrollState(node)
         return
       }
-      if (latest.anchorItemId === null) { updateScrollState(node); return }
       const element = node.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(latest.anchorItemId)}"]`)
       if (element !== null) node.scrollTop += element.getBoundingClientRect().top - node.getBoundingClientRect().top - latest.offset
       else { appStore.setViewportAnchor(defaultAnchor()); node.scrollTop = node.scrollHeight }
@@ -51,7 +50,7 @@ export function Conversation({ state, items }: Props) {
     const stable = items.slice(0, index + 1).findLast(item => item.anchorTurnId !== undefined)
       ?? items.slice(index + 1).find(item => item.anchorTurnId !== undefined)
     const target = stable && node.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(stable.key)}"]`)
-    if (!stable || !target) { appStore.setViewportAnchor(defaultAnchor()); return }
+    if (!stable || stable.anchorTurnId === undefined || !target) { appStore.setViewportAnchor(defaultAnchor()); return }
     appStore.setViewportAnchor({ mode: 'anchored', anchorItemId: stable.key, turnId: stable.anchorTurnId,
       offset: target.getBoundingClientRect().top - node.getBoundingClientRect().top })
   }
@@ -101,10 +100,12 @@ export function Conversation({ state, items }: Props) {
   if (state.session === null) {
     if (state.sessionLoad.status === 'error' && state.sessionLoad.error !== null) {
       return (
-        <Empty title="任务读取失败" body={state.sessionLoad.error.message}>
+        <section className="empty-state" aria-live="polite">
+          <h2>任务读取失败</h2>
+          {state.sessionLoad.error.message && <p>{state.sessionLoad.error.message}</p>}
           {state.sessionLoad.error.recovery && <p className="empty-recovery">{state.sessionLoad.error.recovery}</p>}
           <button type="button" className="secondary-button" onClick={() => appStore.retrySession()}>重试读取</button>
-        </Empty>
+        </section>
       )
     }
     return <div className="conversation-surface" aria-busy="true" />
@@ -126,7 +127,7 @@ export function Conversation({ state, items }: Props) {
             加载更早的记录
           </button>
         )}
-        {items.map(item => <TimelineItem key={item.key} item={item} sessionId={sessionId ?? undefined} />)}
+        {items.map(item => <TimelineItem key={item.fact?.id ?? item.key} item={item} sessionId={sessionId ?? undefined} />)}
       </div>
 
     </div>
@@ -134,15 +135,5 @@ export function Conversation({ state, items }: Props) {
         <span aria-hidden="true"><i /><i /><i /></span>
       </button>}
     </div>
-  )
-}
-
-function Empty({ title, body, children }: { title: string; body?: string; children?: ReactNode }) {
-  return (
-    <section className="empty-state" aria-live="polite">
-      {title && <h2>{title}</h2>}
-      {body && <p>{body}</p>}
-      {children}
-    </section>
   )
 }

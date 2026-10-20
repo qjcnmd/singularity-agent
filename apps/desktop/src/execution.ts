@@ -1,19 +1,20 @@
 import { eventTurnId } from './protocol'
 import { compactionText } from './copy'
-import type { HistoryItem, ImageAttachment, ReadSource, RequestObservation, SessionReadResult, SessionRuntime, ThreadReadPage, ThreadSummary, TurnErrorDetail, TurnEventEnvelope, TurnStatus } from './protocol'
+import type { HistoryItem, ImageAttachment, ReadSource, RequestObservation, SessionReadResult, SessionRuntime, ThreadReadPage, ThreadSummary, TurnErrorDetail, TurnEventEnvelope, TurnStatus, ToolResult } from './protocol'
 
 export type FactStatus = 'stable' | 'running' | 'ok' | 'error' | 'cancelled'
-interface FactBase { id: string; status: FactStatus; startedAt: string | null; error?: string; images?: ImageAttachment[] }
+interface FactBase { id: string; status: FactStatus; images?: ImageAttachment[] }
 export type ExecutionItem = FactBase & (
   | { kind: 'user' | 'assistant' | 'thinking'; text: string; requestId?: string }
   | { kind: 'tool'; name: string; args: unknown; output: string; duration?: number; readSource?: ReadSource }
+  | { kind: 'context'; name: string; text: string }
   | { kind: 'request'; observation: RequestObservation }
   | { kind: 'settings'; provider: string; model: string; reasoning: string | null }
-  | { kind: 'compaction' | 'compaction_result' | 'event'; text: string }
+  | { kind: 'compaction' | 'compaction_result'; text: string }
 )
 /** `null` 表示持久前导组，或不属于回合的活动压缩。 */
-export interface ExecutionTurn { startedAt?: string; finishedAt?: string; id: string | null; status: TurnStatus | null; error?: TurnErrorDetail; items: ExecutionItem[] }
-interface ExecutionFacts { history: ExecutionTurn[]; active: ExecutionTurn[] }
+export interface ExecutionTurn { startedAt?: string; finishedAt?: string; id: string | null; status: TurnStatus | null; manuallyStopped: boolean; error?: TurnErrorDetail; items: ExecutionItem[] }
+type ExecutionFacts = ExecutionTurn[]
 /** 已加载的 history 只保存事实；wire page 是读取边界，不是常驻状态。 */
 export interface SessionView {
   summary: ThreadSummary
@@ -26,7 +27,7 @@ export interface SessionView {
 export function hasErrorItem(turn: ExecutionTurn, error: TurnErrorDetail | null | undefined): boolean {
   return error?.itemId !== undefined && turn.items.some(item => item.id === error.itemId && item.status === 'error')
 }
-const base = (id: string, status: FactStatus = 'stable'): FactBase => ({ id, status, startedAt: null })
+const base = (id: string, status: FactStatus = 'stable'): FactBase => ({ id, status })
 const lastRequest = (turn: ExecutionTurn) => turn.items.findLast(item => item.kind === 'request')?.id
 
 /** 配对身份并结算执行状态，先于任何显示投影。 */
@@ -63,13 +64,10 @@ function settleAssistantItems(turn: ExecutionTurn): ExecutionTurn {
   return changed ? { ...turn, items } : turn
 }
 
-/** 请求条目：开始观测是 running。已知的开始时间与请求头不因终态观测被清空，
- *  没有开始记录时保持未知，不用结束时间补。实时与批量构建共用这条规则。 */
-function requestItem(observation: RequestObservation, previous: ExecutionItem | undefined, startedAt: string | null): ExecutionItem {
-  const prior = previous?.kind === 'request' ? previous.observation : undefined
+/** 请求只保留状态与计量，开始、结束使用同一个请求身份。 */
+function requestItem(observation: RequestObservation): ExecutionItem {
   return { ...base(observation.requestId, observation.status === 'started' ? 'running' : observation.status),
-    kind: 'request', observation: { ...observation, requestHead: observation.requestHead ?? prior?.requestHead },
-    startedAt: startedAt ?? (previous?.kind === 'request' ? previous.startedAt : null) }
+    kind: 'request', observation }
 }
 
 /** 工具调用条目：名称与参数属于调用本身，结果随后按同一 id 就地替换。 */
@@ -78,25 +76,26 @@ function toolCallItem(id: string, name: string, args: unknown): Extract<Executio
 }
 
 /** 工具结果条目：名称与参数取自已配对的调用，输出与状态由结果决定。 */
-function toolResultItem(item: Pick<Extract<HistoryItem, { type: 'tool_result' }>, 'output' | 'images' | 'isError' | 'durationMs' | 'readSource'>, previous: ExecutionItem | undefined): ExecutionItem {
+function toolResultItem(item: ToolResult, previous: ExecutionItem | undefined): ExecutionItem {
   const tool = previous as Extract<ExecutionItem, { kind: 'tool' }>
   return { ...tool, status: item.isError ? 'error' : 'ok',
     output: item.output, duration: item.durationMs,
     readSource: item.readSource, images: item.images }
 }
 
-/** 单条 wire HistoryItem → ExecutionItem 的字段映射：批量页与实时 content
- *  共用同一份字段归属规则。previous 是同 id 的既有条目，请求从它取开始时间与
- *  请求头，工具结果从它取名称与参数。requestId 是助手/思考片段归属的请求，
- *  更新算法由调用方决定。 */
-function historyItemToExecution(item: HistoryItem, previous: ExecutionItem | undefined, requestId: string | undefined): ExecutionItem {
+/** 历史和实时内容共用条目映射；助手片段关联产出它的请求。 */
+function historyItemToExecution(item: HistoryItem, requestId: string | undefined): ExecutionItem {
   switch (item.type) {
-    case 'request': return requestItem(item.observation, previous, item.startedAt ?? null)
-    case 'message': return { ...base(item.id), kind: item.role === 'user' ? 'user' : 'assistant', text: item.text, images: item.images,
+    case 'request': return requestItem(item.observation)
+    case 'context': return { ...base(item.id), kind: 'context', name: item.name, text: item.content }
+    case 'message': return { ...base(item.id, item.running ? 'running' : 'stable'), kind: item.role === 'user' ? 'user' : 'assistant', text: item.text, images: item.images,
       requestId: item.role === 'assistant' ? requestId : undefined }
-    case 'thinking': return { ...base(item.id), kind: 'thinking', text: item.text, requestId }
-    case 'tool_call': return toolCallItem(item.id, item.name, item.args)
-    case 'tool_result': return toolResultItem(item, previous)
+    case 'thinking': return { ...base(item.id, item.running ? 'running' : 'stable'), kind: 'thinking', text: item.text, requestId }
+    case 'tool': {
+      const tool = toolCallItem(item.id, item.name, item.args)
+      const result = item.result ? toolResultItem(item.result, tool) : tool
+      return item.running ? { ...result, status: 'running' } : result
+    }
     case 'compaction': return { ...base(item.id), kind: 'compaction', text: item.summary }
     case 'compaction_result': return { ...base(item.id, item.status === 'running' ? 'running' : item.status === 'failed' ? 'error' : item.status === 'interrupted' ? 'cancelled' : 'stable'),
       kind: 'compaction_result', text: item.message ?? (item.status === 'running' ? compactionText.running : item.status === 'completed' ? compactionText.unchanged : item.status === 'interrupted' ? compactionText.unfinished : compactionText.failed) }
@@ -104,59 +103,18 @@ function historyItemToExecution(item: HistoryItem, previous: ExecutionItem | und
   }
 }
 
-/**
- * 一个 wire page 一次性构建成 execution turns。id→位置与当前 request 的
- * 关联只存在于这次构建内，同 id 的条目就地替换（request 合并 start/end，tool
- * call 与 result 配对），逐项不复制整段 items。结束时发布一次 ExecutionTurn，
- * 运行状态由调用方结合 runtime 统一结算。字段映射复用单条转换，本函数只保留位置与当前
- * request 的更新算法。
- */
+/** 后端已经合并当前内容；前端转换条目并关联助手所属请求。 */
 function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
   return page.turns.map(turn => {
     const items: ExecutionItem[] = []
-    const positions = new Map<string, number>()
     let currentRequest: string | undefined
     for (const wire of turn.items) {
       if (wire.type === 'request') currentRequest = wire.observation.requestId
-      // 请求条目的身份是其观测的 request id，其余条目自带 id。
-      const id = wire.type === 'request' ? wire.observation.requestId : wire.id
-      const position = positions.get(id)
-      const previous = position === undefined ? undefined : items[position]
-      let item: ExecutionItem
-      if (wire.type === 'request') {
-        const definition = page.requestDefinitions[wire.context.definitionsId]
-        if (!definition) throw new Error('历史请求缺少对应的指令与工具定义。')
-        item = requestItem({ ...wire.observation, requestHead: { ...wire.context, ...definition } }, previous, wire.startedAt ?? null)
-      } else {
-        item = historyItemToExecution(wire, previous, currentRequest)
-      }
-      if (position === undefined) {
-        positions.set(id, items.length)
-        items.push(item)
-      } else {
-        items[position] = item
-      }
+      const item = historyItemToExecution(wire, currentRequest)
+      items.push(item)
     }
-    return { id: turn.turnId, status: turn.status, error: turn.error, startedAt: turn.startedAt, finishedAt: turn.finishedAt, items }
+    return { id: turn.turnId, status: turn.status, manuallyStopped: turn.manuallyStopped, error: turn.error, startedAt: turn.startedAt, finishedAt: turn.finishedAt, items }
   })
-}
-
-/** 历史里未结束的请求和压缩不能证明仍在运行；活动状态只来自当前执行。 */
-function settlePendingItems(turn: ExecutionTurn, runtime: SessionRuntime, active = false): ExecutionTurn {
-  let changed = false
-  const items = turn.items.map(item => {
-    const unfinishedRequest = item.kind === 'request' && item.observation.status === 'started'
-    const unfinishedCompaction = item.kind === 'compaction_result' && item.status === 'running'
-    if (!unfinishedRequest && !unfinishedCompaction) return item
-    const live = active && runtime.phase !== 'idle'
-    const status: FactStatus = live ? 'running' : 'cancelled'
-    if (item.status === status) return item
-    changed = true
-    return item.kind === 'compaction_result' && !live
-      ? { ...item, status, text: compactionText.unfinished }
-      : { ...item, status }
-  })
-  return settleAssistantItems(changed ? { ...turn, items } : turn)
 }
 
 /**
@@ -165,19 +123,17 @@ function settlePendingItems(turn: ExecutionTurn, runtime: SessionRuntime, active
  */
 export function readExecution(source: SessionReadResult, previous: SessionView | null = null): SessionView {
   const first = source.history.turns[0]
-  const overlap = previous === null || first === undefined ? -1 : previous.facts.history.findIndex(turn => turn.id === first.turnId)
-  const prefix = previous !== null && overlap >= 0 ? previous.facts.history.slice(0, overlap) : []
+  const overlap = previous === null || first === undefined ? -1 : previous.facts.findIndex(turn => turn.id === first.turnId)
+  const prefix = previous !== null && overlap >= 0 ? previous.facts.slice(0, overlap) : []
   const turns = [...prefix, ...pageTurns(source.history)]
-  let facts: ExecutionFacts = { history: turns, active: [] }
-  for (const event of source.activeEvents) facts = acceptExecutionEvent(facts, event)
   const runtime = source.runtime
   return { summary: source.history.summary,
     nextCursor: previous !== null && overlap >= 0 ? previous.nextCursor : source.history.nextCursor,
-    runtime, facts: settleFacts(facts, runtime) }
+    runtime, facts: settleFacts(turns, runtime) }
 }
 
 export function updateExecutionRuntime(session: SessionView, runtime: SessionRuntime): SessionView {
-  if (session.runtime.phase === runtime.phase && session.runtime.activeTurn?.turnId === runtime.activeTurn?.turnId
+  if (session.runtime.phase === runtime.phase
     && session.runtime.terminal === runtime.terminal) {
     return { ...session, runtime }
   }
@@ -185,48 +141,45 @@ export function updateExecutionRuntime(session: SessionView, runtime: SessionRun
 }
 
 function settleFacts(facts: ExecutionFacts, runtime: SessionRuntime): ExecutionFacts {
-  return {
-    history: facts.history.map(turn => settlePendingItems(turn, runtime)),
-    active: facts.active.map(turn => {
-      if (turn.status !== null) return turn
-      if (runtime.phase === 'idle' && runtime.terminal?.source === 'turn' && turn.id === facts.active.at(-1)?.id) return finishTurn(turn, runtime.terminal.status)
-      return settlePendingItems(turn, runtime, true)
-    }),
-  }
+  return facts.map(turn => {
+    if ((turn.status === null || turn.status === 'running') && turn.id !== null && runtime.phase === 'idle' && runtime.terminal?.source === 'turn') {
+      return finishTurn(turn, runtime.terminal.status, runtime.terminal.manuallyStopped)
+    }
+    return settleAssistantItems(turn)
+  })
 }
 
 /** 更早的 page 只转换一次并前插；已加载 turns 保持其身份。 */
 export function prependExecutionHistory(session: SessionView, page: ThreadReadPage): SessionView {
-  const turns = pageTurns(page).map(turn => settlePendingItems(turn, session.runtime))
-  return { ...session, nextCursor: page.nextCursor, facts: { ...session.facts,
-    history: [...turns, ...session.facts.history] } }
+  const turns = pageTurns(page).map(settleAssistantItems)
+  return { ...session, nextCursor: page.nextCursor, facts: [...turns, ...session.facts] }
 }
 
-function finishTurn(turn: ExecutionTurn, status: TurnStatus): ExecutionTurn {
-  return settleAssistantItems({ ...turn, status, items: turn.items.map(item => item.status === 'running'
+function finishTurn(turn: ExecutionTurn, status: TurnStatus, manuallyStopped = false): ExecutionTurn {
+  return settleAssistantItems({ ...turn, status, manuallyStopped, items: turn.items.map(item => item.status === 'running'
     ? { ...item, status: status === 'interrupted' ? 'cancelled' : status === 'failed' ? 'error' : 'ok' } : item) })
 }
 
 /** delta 的工作量只按可见 items 计算，与更早 delta 的数量无关。 */
 export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnvelope): ExecutionFacts {
-  const id = eventTurnId(event)
-  const index = facts.active.findIndex(turn => turn.id === id)
-  let turn: ExecutionTurn = index < 0 ? { id, status: null, items: [] } : facts.active[index]
+  const id = eventTurnId(event) ?? facts.at(-1)?.id ?? null
+  const index = facts.findIndex(turn => turn.id === id)
+  let turn: ExecutionTurn = index < 0 ? { id, status: null, manuallyStopped: false, items: [] } : facts[index]
   switch (event.method) {
     case 'turn/started':
-      turn = { ...turn, startedAt: event.params.startedAt }
+      turn = { ...turn, status: 'running', startedAt: event.params.startedAt }
       break
-    case 'turn/sessionStateChanged':
-      return facts
     case 'turn/userMessage': turn = upsert(turn, { ...base(event.params.item.itemId), kind: 'user', text: event.params.text, images: event.params.images }); break
     case 'provider/attempt': {
       const observation = event.params.observation
-      turn = upsert(turn, requestItem(observation, turn.items.find(item => item.id === observation.requestId), null))
+      turn = upsert(turn, requestItem(observation))
       break
     }
+    case 'context/injected':
+    case 'session/settingsUpdated':
     case 'compaction/updated': {
       const item = event.params.content
-      turn = upsert(turn, historyItemToExecution(item, undefined, undefined))
+      turn = upsert(turn, historyItemToExecution(item, undefined))
       break
     }
     case 'item/agentMessage/delta':
@@ -243,7 +196,7 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
     case 'tool/execution/start': {
       const p = event.params
       turn = upsert(turn, { ...toolCallItem(p.item.itemId, p.toolName, p.args),
-        status: 'running', startedAt: p.startedAt })
+        status: 'running' })
       break
     }
     case 'tool/execution/update': {
@@ -262,34 +215,30 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
       break
     case 'item/completed':
     case 'item/failed': {
-      if (event.params.content) {
-        const content = event.params.content
-        const id = content.type === 'request' ? content.observation.requestId : content.id
-        turn = upsert(turn, historyItemToExecution(content, turn.items.find(item => item.id === id), lastRequest(turn)))
-      }
+      // 完成事件只来自助手正文与思考；完整内容和最终状态一起写回。
+      const content = event.params.content
       const previous = turn.items.find(item => item.id === event.params.item.itemId)
-      if (!previous || previous.kind === 'tool') break
-      turn = upsert(turn, { ...previous,
-        status: event.method === 'item/failed' ? 'error' : 'ok',
-        error: event.method === 'item/failed' ? event.params.error : undefined })
+      const item = content ? historyItemToExecution(content, lastRequest(turn)) : previous
+      if (!item) break
+      turn = upsert(turn, { ...item,
+        status: event.method === 'item/failed' ? 'error' : 'ok' })
       break
     }
-    case 'agent/diagnostic': turn = upsert(turn, { ...base(`event-${event.sessionRevision}`, event.params.severity === 'error' ? 'error' : 'stable'), kind: 'event', text: event.params.message }); break
     case 'turn/error':
       // 失败细节是类型化事实：只有关联的 turn 保存它，不编码成说明文本。
       turn = { ...finishTurn(turn, 'failed'), error: event.params.error, finishedAt: event.params.finishedAt }
       break
     case 'turn/completed': {
       const status = event.params.turn.status
-      turn = { ...finishTurn(turn, status), finishedAt: event.params.finishedAt }
+      turn = { ...finishTurn(turn, status, event.params.manuallyStopped), finishedAt: event.params.finishedAt }
       break
     }
     default: {
       event satisfies never
     }
   }
-  const active = [...facts.active]
+  const active = [...facts]
   if (index < 0) active.push(turn)
   else active[index] = turn
-  return { ...facts, active }
+  return active
 }

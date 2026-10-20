@@ -8,9 +8,14 @@ pub(crate) async fn read_chat_sse_stream(
     on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     config: &OpenAiProviderConfig,
     selection: &SelectedModel,
+    endpoint: &str,
 ) -> Result<ModelTurnResponse, ProviderError> {
-    read_sse_stream(cancellation, response, ChatSseDecoder::new(on_event, config, &selection.model_name))
-        .await
+    read_sse_stream(
+        cancellation,
+        response,
+        ChatSseDecoder::new(on_event, config, &selection.model_name, endpoint),
+    )
+    .await
 }
 
 #[derive(Default)]
@@ -25,6 +30,7 @@ struct ChatToolAccumulator {
 struct ChatSseDecoder<'a> {
     config: &'a OpenAiProviderConfig,
     model_name: &'a str,
+    endpoint: &'a str,
     content: String,
     reasoning_content: String,
     reasoning_field: Option<String>,
@@ -122,11 +128,6 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
                     self.receive_tool_call_fragment(call)?;
-                    if ["/function/name", "/function/arguments"].iter().any(|path| {
-                        call.pointer(path).and_then(Value::as_str).is_some_and(|text| !text.is_empty())
-                    }) {
-                        (self.on_event)(ProviderStreamEvent::ToolCallDelta);
-                    }
                 }
             }
         }
@@ -155,6 +156,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         let Self {
             config,
             model_name,
+            endpoint,
             content,
             reasoning_content,
             reasoning_field,
@@ -169,37 +171,34 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             "prompt_tokens",
             "completion_tokens",
             "/prompt_tokens_details/cached_tokens",
-            "/completion_tokens_details/reasoning_tokens",
         );
-        if finish_reason == "content_filter" {
-            return Err(provider_content_filter_error(
-                "provider Chat response was stopped by content filter",
-            ));
-        }
-        if finish_reason == "network_error" {
-            return Err(provider_finish_network_error("provider Chat response reported a network error"));
-        }
+        // 未知原因按协议失败处理，不会当成正常完成。
+        let stop_reason = match finish_reason.as_str() {
+            "length" => ModelStopReason::Length,
+            "stop" | "tool_calls" | "function_call" => ModelStopReason::Stop,
+            "content_filter" => {
+                return Err(provider_content_filter_error(
+                    "provider Chat response was stopped by content filter",
+                ));
+            }
+            "network_error" => {
+                return Err(provider_finish_network_error("provider Chat response reported a network error"));
+            }
+            unknown => return Err(provider_chat_finish_reason_unsupported(unknown)),
+        };
         let thinking = if !reasoning_content.is_empty() {
             reasoning_content.clone()
         } else {
             reasoning_details
                 .iter()
                 .filter_map(|detail| detail.as_object().and_then(chat_reasoning_detail_text))
-                .collect::<Vec<_>>()
-                .join("")
-        };
-        // 未识别的 finish_reason 不能当成「没有停止原因」：宿主无法判断这是正常完成、截断
-        // 还是出错，所以按协议失败结束，不走进正常完成或工具执行路径。
-        let stop_reason = match finish_reason.as_str() {
-            "length" => ModelStopReason::Length,
-            "stop" | "tool_calls" | "function_call" => ModelStopReason::Stop,
-            unknown => return Err(provider_chat_finish_reason_unsupported(unknown)),
+                .collect()
         };
         let replay = if !reasoning_content.is_empty() || !reasoning_details.is_empty() {
             Some(ProviderReasoningReplay::Chat {
                 provider_name: config.provider_name.clone(),
                 model_name: model_name.to_string(),
-                endpoint: crate::openai::chat_completions_endpoint(&config.base_url),
+                endpoint: endpoint.to_string(),
                 reasoning_content,
                 reasoning_field,
                 reasoning_details,
@@ -229,10 +228,12 @@ impl<'a> ChatSseDecoder<'a> {
         on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send),
         config: &'a OpenAiProviderConfig,
         model_name: &'a str,
+        endpoint: &'a str,
     ) -> Self {
         Self {
             config,
             model_name,
+            endpoint,
             content: String::new(),
             reasoning_content: String::new(),
             reasoning_field: None,
@@ -263,7 +264,7 @@ impl<'a> ChatSseDecoder<'a> {
         Ok(())
     }
 
-    /// 接收一个工具调用分片：校验形状后按 index 归入聚合槽，名称和参数继续往后拼。
+    /// 校验并拼接工具调用分片；名称或参数有增量时，通知调用方已收到输出。
     fn receive_tool_call_fragment(&mut self, call: &Value) -> Result<(), ProviderError> {
         // 空串等同于「本分片没有声明类型」：部分提供方只在第一个分片声明 function，
         // 后续参数分片重复该字段但留空。不是字符串的仍然拒绝。
@@ -272,17 +273,22 @@ impl<'a> ChatSseDecoder<'a> {
         {
             return Err(provider_chat_stream_malformed_error("tool_call_type_invalid"));
         }
-        if call.get("function").is_some_and(|function| !function.is_null() && !function.is_object()) {
+        let function = call.get("function");
+        if function.is_some_and(|function| !function.is_null() && !function.is_object()) {
             return Err(provider_chat_stream_malformed_error("tool_function_invalid"));
         }
-        if let Some(function) = call.get("function").and_then(Value::as_object)
-            && ["name", "arguments"]
-                .iter()
-                .any(|key| function.get(*key).is_some_and(|value| !value.is_null() && !value.is_string()))
+        let name = function.and_then(|function| function.get("name"));
+        let arguments = function.and_then(|function| function.get("arguments"));
+        if [name, arguments]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_null() && !value.is_string())
         {
             return Err(provider_chat_stream_malformed_error("tool_function_field_invalid"));
         }
-        // 工具分片归到哪个调用必须没有歧义：省略 index 的单个调用按兼容保留，非法
+        let name = name.and_then(Value::as_str).unwrap_or_default();
+        let arguments = arguments.and_then(Value::as_str).unwrap_or_default();
+        // 工具分片要能唯一归到一个调用：省略 index 的单个调用按兼容保留，非法
         // 索引直接拒绝，不把不同调用拼进同一个聚合槽。
         let index = stream_index(call.get("index"), "tool_call_index_invalid")?;
         let entry = self.tool_calls.entry(index).or_default();
@@ -291,13 +297,10 @@ impl<'a> ChatSseDecoder<'a> {
         {
             entry.id = id.to_string();
         }
-        if let Some(function) = call.get("function").and_then(Value::as_object) {
-            if let Some(name) = function.get("name").and_then(Value::as_str) {
-                entry.name.push_str(name);
-            }
-            if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                entry.arguments.push_str(arguments);
-            }
+        entry.name.push_str(name);
+        entry.arguments.push_str(arguments);
+        if !name.is_empty() || !arguments.is_empty() {
+            (self.on_event)(ProviderStreamEvent::ToolCallDelta);
         }
         Ok(())
     }

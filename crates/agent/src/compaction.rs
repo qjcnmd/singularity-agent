@@ -1,16 +1,15 @@
 //! 上下文缩减策略、摘要请求的构造与结果校验。
 //!
-//! 摘要只替换早期历史；请求执行、取消和持久提交统一由 Agent 负责，文件指令在压缩后会重新加载。
+//! 摘要只替换早期历史；请求执行、取消和持久提交统一由 Agent 负责，文件指令由每轮准备负责。
 
 use crate::request_execution::output_budget_tokens;
+use crate::session::RequestDefinitions;
 use crate::session::context::CompactionPrefix;
 use crate::session::context::estimate_tokens_of;
-use crate::session::{CompactionEntry, RequestDefinitions};
 
 use crate::agent::{AgentError, Result};
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest,
-    ModelTurnResponse,
+    ModelConfigurationSnapshot, ModelMessage, ModelRole, ModelTurnRequest, ModelTurnResponse,
 };
 
 /// 摘要请求的目标输出上限；实际值还受模型上限与本次请求的窗口余量约束。
@@ -43,7 +42,7 @@ Use "(none)" for an empty section. Preserve exact paths, identifiers, commands, 
 /// 摘要请求和它要替换的历史边界；响应只有通过校验才能生成落盘条目。
 pub(crate) struct PreparedCompaction {
     pub(crate) request: ModelTurnRequest,
-    first_kept_entry_id: String,
+    pub(crate) first_kept_entry_id: String,
 }
 impl PreparedCompaction {
     /// 摘要请求沿用生成请求的指令前缀与工具定义；只替换选中的对话历史前缀。
@@ -67,8 +66,8 @@ impl PreparedCompaction {
         messages.push(ModelMessage::text(ModelRole::User, instruction));
         let request = ModelTurnRequest {
             messages,
-            tools: definitions.model_tools(),
-            model_preferences: ModelPreferences {
+            tools: definitions.tools.clone(),
+            model_preferences: singularity_protocol::RequestPreferences {
                 max_output_tokens: output_budget_tokens(model, input_tokens, DEFAULT_SUMMARY_MAX_TOKENS),
             },
         };
@@ -77,22 +76,18 @@ impl PreparedCompaction {
             first_kept_entry_id: prefix.first_kept_entry_id,
         })
     }
+}
 
-    pub(crate) fn into_entry(self, response: ModelTurnResponse) -> Result<CompactionEntry> {
-        if response.is_length_truncated() {
-            return Err(AgentError::InvalidSummary(
-                "summary reached the output limit (incomplete checkpoint)".into(),
-            ));
-        }
-        let text = response.assistant_message.content;
-        if text.trim().is_empty() {
-            return Err(AgentError::InvalidSummary("summary contains no text".into()));
-        }
-        // 摘要请求的用量由统一请求账本记录（会话累计与展示都从那里读），这里只保留正文和保留锚点。
-        Ok(CompactionEntry {
-            summary: text,
-            first_kept_entry_id: self.first_kept_entry_id,
-            definitions: None,
-        })
+/// 摘要通过校验后才由 Agent 保存并替换早期对话。
+pub(crate) fn validate_summary(response: ModelTurnResponse) -> Result<String> {
+    if response.is_length_truncated() {
+        return Err(AgentError::InvalidSummary(
+            "summary reached the output limit (incomplete checkpoint)".into(),
+        ));
     }
+    let text = response.assistant_message.content;
+    if text.trim().is_empty() {
+        return Err(AgentError::InvalidSummary("summary contains no text".into()));
+    }
+    Ok(text)
 }

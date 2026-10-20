@@ -8,6 +8,15 @@ use serde::Deserialize;
 #[cfg_attr(feature = "typescript", ts(type = "Record<string, never>"))]
 pub struct EmptyParams {}
 
+/// 停止当前会话内的指定后台命令。
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTaskParams {
+    pub session_id: String,
+    pub task_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -35,15 +44,6 @@ pub struct WorkspaceParams {
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRemoveParams {
     pub workspace_id: String,
-    pub draft_session_ids: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceRenameParams {
-    pub workspace_id: String,
-    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,7 +71,7 @@ pub struct DiscoverModelsParams {
     pub base_url: String,
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub api_key: Option<String>,
-    pub api_protocol: String,
+    pub api_protocol: ProviderApiProtocol,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +89,18 @@ pub struct SessionReadParams {
 #[serde(rename_all = "camelCase")]
 pub struct SessionParams {
     pub session_id: String,
+}
+
+/// 首次发送时创建会话，空白页只保存在工作台草稿中。
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStartParams {
+    pub workspace_id: String,
+    pub selector: Option<String>,
+    pub text: String,
+    pub images: Vec<crate::ImageUpload>,
+    pub skills: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,8 +172,7 @@ rpc_methods! {
     FileSearch => "file.search" (FileSearchParams) -> Vec<FileCandidate>,
     SkillsList => "skills.list" (WorkspaceParams) -> SkillCatalog,
     WorkspaceAdd => "workspace.add" (WorkspaceAddParams) -> Workspace,
-    WorkspaceRemove => "workspace.remove" (WorkspaceRemoveParams) -> Vec<String>,
-    WorkspaceRename => "workspace.rename" (WorkspaceRenameParams) -> (),
+    WorkspaceRemove => "workspace.remove" (WorkspaceRemoveParams) -> (),
     ModelSaveProvider => "model.saveProvider" (ProviderSaveParams) -> (),
     ModelDiscover => "model.discover" (DiscoverModelsParams) -> Vec<DiscoveredModel>,
     ModelRemoveProvider => "model.removeProvider" (ProviderParams) -> (),
@@ -170,15 +181,15 @@ rpc_methods! {
     McpRemove => "mcp.remove" (McpServerParams) -> (),
     McpToggle => "mcp.toggle" (McpToggleParams) -> (),
     McpInspect => "mcp.inspect" (McpInspectParams) -> McpInspection,
-    SessionCreate => "session.create" (WorkspaceParams) -> SessionReadResult,
+    SessionStart => "session.start" (SessionStartParams) -> SessionStartResult,
     SessionRead => "session.read" (SessionReadParams) -> SessionReadResult,
     SessionImageRead => "session.imageRead" (SessionImageParams) -> String,
     SessionRename => "session.rename" (SessionRenameParams) -> (),
     SessionArchive => "session.archive" (SessionParams) -> (),
     SessionSubmit => "session.submit" (SessionTextParams) -> (),
-    SessionSteer => "session.steer" (SessionTextParams) -> (),
     SessionAnswerQuestion => "session.answerQuestion" (crate::QuestionAnswerParams) -> (),
     SessionAbort => "session.abort" (SessionParams) -> (),
     SessionCompact => "session.compact" (SessionParams) -> (),
+    BackgroundTaskStop => "session.stopBackgroundTask" (BackgroundTaskParams) -> (),
     SessionUpdateSettings => "session.updateSettings" (UpdateSettingsParams) -> (),
 }

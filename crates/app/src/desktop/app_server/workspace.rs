@@ -48,20 +48,10 @@ impl AppServer {
         Ok(workspace)
     }
 
-    pub fn rename_workspace(&self, workspace_id: &str, name: &str) -> Result<(), RpcError> {
-        self.workspaces.rename(workspace_id, name).map_err(workspace_error)?;
-        self.publish_app_snapshot();
-        Ok(())
-    }
-
-    pub fn remove_workspace(
-        &self,
-        workspace_id: &str,
-        draft_session_ids: &[String],
-    ) -> Result<Vec<String>, RpcError> {
+    pub fn remove_workspace(&self, workspace_id: &str) -> Result<(), RpcError> {
         let workspace = self.workspace(workspace_id)?;
         // 占用情况只看已登记的 slot，不靠可能失败、可能不全的磁盘目录枚举：会话属于谁由
-        // 它的规范 cwd 决定，忙不忙由它的运行阶段和待处理输入决定。生命周期临界区和启动
+        // 它的规范 cwd 决定，忙不忙由普通执行、后台命令和待处理输入决定。生命周期临界区和启动
         // 占用共用同一条边界，检查和注销之间插不进新的占用。
         let lifecycle = self.lock_lifecycle();
         let busy =
@@ -74,23 +64,25 @@ impl AppServer {
                     ),
                     Ok(true)
                 );
-                belongs && slot.conversation().is_occupied()
+                if !belongs {
+                    return false;
+                }
+                // 完成发布与通知入箱共用 slot 锁：不能在后台变为终态、通知尚未入箱时移除。
+                slot.conversation().bash_tasks().list().iter().any(|task| task.state.is_running())
+                    || slot.conversation().is_occupied()
+                    || slot.conversation().has_pending_input()
             });
         if busy {
             return Err(RpcError::new(
                 singularity_protocol::RpcErrorCode::WorkspaceBusy,
-                format!("项目 {} 仍有活动任务或待处理输入。", workspace.name),
-                "先停止项目中正在运行的任务。",
+                format!("项目 {} 仍有运行中的任务、后台命令或待处理输入。", workspace.root),
+                "等待处理完成，或停止后台命令并归档相关任务后重试。",
             ));
         }
-        let removed_drafts = self
-            .catalog
-            .threads_in_workspace(draft_session_ids, &workspace.root)
-            .map_err(catalog_error)?;
         self.workspaces.remove(workspace_id).map_err(workspace_error)?;
         drop(lifecycle);
         self.publish_app_snapshot();
-        Ok(removed_drafts)
+        Ok(())
     }
 
     pub fn workspace(&self, workspace_id: &str) -> Result<Workspace, RpcError> {

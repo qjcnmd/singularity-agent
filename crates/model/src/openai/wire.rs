@@ -49,17 +49,14 @@ pub(crate) fn canonical_base_url(value: &str) -> &str {
     value.trim().trim_end_matches('/')
 }
 
-/// `base_url` 里的 API 根：三种端点都从这一个根拼出来。规则只有一条：剥掉末尾已知的
-/// 端点后剩下的路径就是根，逐字使用；裸主机、版本根和自定义前缀都按用户写的那样用。
-/// 中间层不给调用方偷偷补版本段，否则同一个 `base_url` 在推理和目录之间会有两种含义。
-/// 返回值始终是 `base_url` 的切片，只有需要持有端点 URL 的调用方才分配。
-pub(crate) fn api_root(base_url: &str) -> &str {
-    let base = canonical_base_url(base_url);
-    KNOWN_ENDPOINTS
-        .iter()
-        .find_map(|endpoint| base.strip_suffix(endpoint))
-        .filter(|root| !root.is_empty())
-        .unwrap_or(base)
+/// 已通过配置校验的 `base_url` 的 API 根：只剥掉路径末尾的三种已知端点。
+/// 裸主机、版本根和自定义前缀都保留；推理与目录共用同一个根，不额外补版本段。
+pub(crate) fn api_root(base_url: &str) -> String {
+    // 配置入口已验证 URL；只处理路径，避免把主机名当作端点。
+    let url = reqwest::Url::parse(canonical_base_url(base_url)).expect("base_url must be validated");
+    let path = url.path().trim_end_matches('/');
+    let root = KNOWN_ENDPOINTS.iter().find_map(|endpoint| path.strip_suffix(endpoint)).unwrap_or(path);
+    format!("{}{root}", url.origin().ascii_serialization())
 }
 
 pub(crate) fn chat_completions_endpoint(base_url: &str) -> String {

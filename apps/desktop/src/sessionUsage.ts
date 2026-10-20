@@ -1,36 +1,10 @@
 import type { SessionView } from './execution'
 import type { SessionModelUsage } from './protocol'
 
-/**
- * 汇总会话累计模型用量与延迟指标：
- * 将服务端提供的历史统计与当前进行中回合的实时请求观测累加。
- * 若无有效用量或 TTFT 样本则返回 null。
- */
+/** 后端统一累计历史和活动请求；没有用量或计时样本时不显示统计。 */
 export function sessionUsage(session: SessionView | null): SessionModelUsage | null {
   if (session === null) return null
-  const usage = { ...session.summary.usage }
-  for (const turn of session.facts.active) {
-    for (const item of turn.items) {
-      if (item.kind !== 'request') continue
-      const observation = item.observation
-      if (observation.ttftMs !== undefined) {
-        usage.ttftMs += observation.ttftMs
-        usage.ttftRequests += 1
-      }
-      if (observation.inputTokens === null && observation.outputTokens === null) continue
-      usage.inputTokens += observation.inputTokens ?? 0
-      usage.cachedInputTokens += observation.cachedInputTokens ?? 0
-      usage.outputTokens += observation.outputTokens ?? 0
-      usage.totalTokens += observation.totalTokens!
-      usage.cacheUsageComplete &&= observation.cachedInputTokens !== null
-      if (observation.decodeMs !== undefined && observation.decodeMs > 0 && observation.outputTokens !== null) {
-        usage.decodeMs += observation.decodeMs
-        usage.decodeTokens += observation.outputTokens
-      }
-      usage.generationMs += observation.durationMs
-      usage.usagePresent = true
-    }
-  }
+  const usage = session.runtime.usage ?? session.summary.usage
   return usage.usagePresent || usage.ttftRequests > 0 ? usage : null
 }
 

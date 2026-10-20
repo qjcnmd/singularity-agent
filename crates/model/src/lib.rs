@@ -8,8 +8,6 @@ pub(crate) const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 pub(crate) const RESPONSES_PATH: &str = "/responses";
 pub(crate) const MODELS_PATH: &str = "/models";
 pub(crate) const USER_CONFIG_FILE_NAME: &str = "config.json";
-/// 用户凭据唯一的文件：写入先落临时文件、再在同卷内原子改名，读取只认这个名字。
-pub(crate) const USER_AUTH_FILE_NAME: &str = "auth.json";
 /// 一次提供方响应的空闲读超时（秒）。reqwest 把它用在每次读操作上，读到数据就重置，
 /// 它不限制一次长生成的总时长，只在连接静默时快速失败。这个值留出了首个增量到来前的静默
 /// 思考时间，较慢的推理响应不会被当成网络失败。
@@ -30,8 +28,8 @@ mod transport;
 mod types;
 
 pub use config::{
-    ModelConfigManager, ModelConfigUpdate, ModelConfigurationSnapshot, ParsedModelSelector,
-    ProviderConfigSnapshot, compose_model_selector, discover_models, parse_model_selector,
+    ModelConfigManager, ModelConfigurationSnapshot, ParsedModelSelector, ProviderConfigSnapshot,
+    compose_model_selector, discover_models, parse_model_selector,
 };
 pub use error::*;
 pub use openai::OpenAiProvider;

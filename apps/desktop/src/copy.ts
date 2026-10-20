@@ -1,7 +1,12 @@
 import type { FactStatus } from './execution'
-import type { SessionPhase, TurnStatus } from './protocol'
+import type { SessionPhase, TurnStatus, Workspace } from './protocol'
 
-/// 执行事实状态的统一词表：时间线与轨迹共用一份。展示差异（例如时间线不显示
+/** 项目路径由后端统一为正斜杠；盘符根目录直接显示完整路径。 */
+export function workspaceName(workspace: Workspace): string {
+  return workspace.root.slice(workspace.root.lastIndexOf('/') + 1) || workspace.root
+}
+
+/// 执行事实状态的统一词表：会话显示共用一份。展示差异（例如时间线不显示
 /// stable 标签）由各组件自己决定，不通过复制整张映射实现。
 export const factStatusText: Record<FactStatus, string> = {
   stable: '已记录',
@@ -24,6 +29,11 @@ export const turnStatusText: Record<TurnStatus, string> = {
   completed: '任务已完成',
   failed: '任务失败',
   interrupted: '任务已停止',
+}
+
+/** 用户停止与异常中断共用同一判断，正文和侧栏不能各自推断来源。 */
+export function interruptionText(manuallyStopped: boolean): string {
+  return manuallyStopped ? factStatusText.cancelled : '任务异常中断'
 }
 
 export const compactionTitle = '上下文压缩'

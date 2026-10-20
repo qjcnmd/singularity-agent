@@ -3,6 +3,8 @@
 //! 终态归并在 `session` 子模块；本模块负责装配、会话查找、操作启动、发布和全局事件顺序。
 
 mod actions;
+mod activity;
+mod background;
 mod errors;
 mod session;
 mod shutdown;
@@ -14,15 +16,15 @@ use self::errors::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use singularity_model::{ModelConfigManager, ModelConfigUpdate};
+use singularity_model::{ModelConfigManager, ProviderError};
 use singularity_protocol::{
-    AppBootstrap, ProviderConfigurationInput, RpcError, RpcErrorCode, SessionReadResult,
+    AppBootstrap, ProviderApiProtocol, ProviderConfigurationInput, RpcError, RpcErrorCode, SessionReadResult,
     SessionTerminalSnapshot, SessionTerminalSource, StreamEnvelope, StreamEvent, TurnEvent, TurnStatus,
 };
 use singularity_runtime::UserInput;
 use singularity_runtime::{
-    CatalogError, Conversation, ConversationControlError, ConversationError, OperationGuard,
-    OperationReservation, OperationResult, ThreadCatalog, TurnRunner,
+    CatalogError, Conversation, ConversationError, OperationReservation, OperationResult, ThreadCatalog,
+    TurnRunner,
 };
 use tokio::sync::broadcast;
 
@@ -31,13 +33,9 @@ use session::{ConversationSlot, SlotState};
 
 const STREAM_CAPACITY: usize = 512;
 
-/// 首次提交的 RPC 在对应用户消息落盘后才成功；尚未保存的失败直接交回提交方。
-struct SubmissionReceipt {
-    item_id: String,
-    sender: std::sync::mpsc::SyncSender<Result<(), RpcError>>,
-}
-
+/// 提交 RPC 在消息入队后返回；后续准备、保存和执行状态通过会话事件发布。
 pub struct AppServer {
+    weak: std::sync::Weak<Self>,
     revision: Mutex<u64>,
     /// 管住完整工作台快照的构造和发布顺序；不插手会话执行，也不管普通增量事件。
     app_publication: Mutex<()>,
@@ -46,7 +44,6 @@ pub struct AppServer {
     /// 写者打开之间；它只保护这几步短操作，不会横跨模型请求、工具执行或整个任务。
     lifecycle: Mutex<()>,
     runner: Arc<TurnRunner>,
-    runtime_handle: tokio::runtime::Handle,
     catalog: ThreadCatalog,
     workspaces: WorkspaceStore,
     /// 和 runner 共用的磁盘配置入口；每次读取都在短临界区里完成。
@@ -61,7 +58,6 @@ pub struct AppServer {
 impl AppServer {
     pub fn new(
         runner: Arc<TurnRunner>,
-        runtime_handle: tokio::runtime::Handle,
         catalog: ThreadCatalog,
         workspaces: WorkspaceStore,
         models: Arc<ModelConfigManager>,
@@ -69,12 +65,12 @@ impl AppServer {
         home: std::path::PathBuf,
     ) -> Arc<Self> {
         let (stream, _) = broadcast::channel(STREAM_CAPACITY);
-        Arc::new(Self {
+        Arc::new_cyclic(|weak| Self {
+            weak: weak.clone(),
             revision: Mutex::new(0),
             app_publication: Mutex::new(()),
             lifecycle: Mutex::new(()),
             runner,
-            runtime_handle,
             catalog,
             workspaces,
             models,
@@ -117,11 +113,11 @@ impl AppServer {
 
     fn update_models(
         &self,
-        update: impl FnOnce(&ModelConfigManager) -> ModelConfigUpdate,
+        update: impl FnOnce(&ModelConfigManager) -> Result<(), ProviderError>,
     ) -> Result<(), RpcError> {
         let _publication = self.lock_app_publication();
-        let ModelConfigUpdate { result, catalog } = update(&self.models);
-        self.publish_app_result(self.bootstrap_with_catalog(catalog));
+        let result = update(&self.models);
+        self.publish_app_snapshot_locked();
         result.map_err(model_error)
     }
 
@@ -130,7 +126,7 @@ impl AppServer {
         provider_id: &str,
         base_url: &str,
         api_key: Option<&str>,
-        api_protocol: &str,
+        api_protocol: ProviderApiProtocol,
     ) -> Result<Vec<singularity_protocol::DiscoveredModel>, RpcError> {
         // 配置入口返回本次查询使用的凭据，网络等待不占配置的临界区。
         let api_key =
@@ -140,19 +136,32 @@ impl AppServer {
             .map_err(model_discovery_error)
     }
 
-    /// 创建并登记任务，返回包含首次历史读取的运行态快照。
-    pub fn create_session(&self, workspace_id: &str) -> Result<SessionReadResult, RpcError> {
-        // 创建、登记和首次读取都在同一个生命周期临界区里做完：新会话不能在
-        // 登记和读取之间被归档或移除。
+    /// 收到第一条消息才建立会话；空白页没有后端身份或日志文件。
+    pub fn start_session(
+        self: &Arc<Self>,
+        workspace_id: &str,
+        selector: Option<String>,
+        input: UserInput,
+    ) -> Result<singularity_protocol::SessionStartResult, RpcError> {
         let lifecycle = self.lock_lifecycle();
         let workspace = self.workspace(workspace_id)?;
-        let selector = self.models.snapshot().resolved_default_selector();
+        let selector = selector.or_else(|| self.models.snapshot().resolved_default_selector());
         let thread = self.catalog.create_thread(&workspace.root, selector).map_err(catalog_error)?;
         let slot = self.insert_slot(thread);
-        let result = self.read_from_slot(&slot, 100, None)?;
+        let id = slot.conversation().thread().thread_id;
+        // 先完成目录读取，再接受输入和预订执行。
+        let mut bootstrap = self.bootstrap()?;
+        let reservation = slot
+            .conversation()
+            .submit(&input)
+            .map_err(conversation_error)?
+            .expect("new session reserves its first turn");
+        slot.lock_state().begin_turn(slot.conversation().usage());
+        bootstrap.session_phases.insert(id.clone(), slot.conversation().phase());
         drop(lifecycle);
-        self.publish_app_snapshot();
-        Ok(result)
+        self.emit(StreamEvent::AppChanged { payload: bootstrap.clone() });
+        self.spawn_operation(&id, slot, reservation);
+        Ok(singularity_protocol::SessionStartResult { session_id: id, bootstrap })
     }
 
     pub fn read_session(
@@ -161,7 +170,7 @@ impl AppServer {
         limit: usize,
         before_turn: Option<&str>,
     ) -> Result<SessionReadResult, RpcError> {
-        // 只有「查找或创建 slot」这一段算生命周期交接；整份历史的读盘不占这个临界区。
+        // 只有「查找或创建 slot」这一段算生命周期交接；历史投影不占这个临界区。
         let slot = {
             let _lifecycle = self.lock_lifecycle();
             self.open_slot(session_id)?
@@ -176,7 +185,7 @@ impl AppServer {
             return Ok(slot);
         }
         // 首次打开恢复未结束的操作，并登记会话。
-        let thread = self.catalog.resume_thread(session_id).map_err(catalog_error)?;
+        let thread = self.catalog.open_session(session_id).map_err(catalog_error)?;
         Ok(self.insert_slot(thread))
     }
 
@@ -190,19 +199,16 @@ impl AppServer {
     }
 
     /// 在生命周期临界区内登记新 slot；已有任务由 open_slot 在创建前返回。
-    fn insert_slot(&self, thread: singularity_protocol::Thread) -> Arc<ConversationSlot> {
-        let id = thread.thread_id.clone();
-        let conversation = Conversation::new(Arc::clone(&self.runner), thread);
+    fn insert_slot(&self, session: singularity_runtime::SessionManager) -> Arc<ConversationSlot> {
+        let id = session.session_id().to_owned();
+        let (conversation, updates) = Conversation::new(Arc::clone(&self.runner), session);
         let slot = Arc::new(ConversationSlot::new(conversation));
-        self.lock_sessions().insert(id, Arc::clone(&slot));
+        self.lock_sessions().insert(id.clone(), Arc::clone(&slot));
+        self.listen_background(id, Arc::clone(&slot), updates);
         slot
     }
 
-    /// history、活动事件和运行态在同一把 slot 锁内读取，冷路径的读盘也不例外，回合开始
-    /// 和结算也在同一把锁里提交，所以锁内读到的三样必属同一个瞬间，不用比对 revision
-    /// 重新取样；代价是读盘期间 worker 的事件投影要等这次读盘做完。
-    ///
-    /// 读取只取投影：它不建立、不修复，也不清空活动回合。
+    /// 在同一把 slot 锁内读取执行快照和后续事件，避免读取跨过操作结算。
     fn read_from_slot(
         &self,
         slot: &ConversationSlot,
@@ -210,25 +216,14 @@ impl AppServer {
         before_turn: Option<&str>,
     ) -> Result<SessionReadResult, RpcError> {
         let state = slot.lock_state();
-        let history = match state.frozen_history() {
-            // 回合进行中（含结算前的重复读取）：内存里冻结的 history 就是当前状态，不用读盘。
-            Some(history) => history,
-            None => self.read_persisted_history(slot)?,
-        };
-        let runtime = slot.runtime_from(&state);
-        let active_events = state.active_events().to_vec();
-        drop(state);
-        let history = history.page(limit, before_turn).map_err(catalog_error)?;
-        Ok(SessionReadResult { history, runtime, active_events })
-    }
-
-    /// 读取最新的持久化 history。启动路径在 slot 锁外调用：预订成立时上一个
-    /// worker 已经结算完，读盘不会和事件投影抢；会话读取路径则在它自己那把锁里调用。
-    fn read_persisted_history(
-        &self,
-        slot: &ConversationSlot,
-    ) -> Result<Arc<singularity_runtime::ThreadSnapshot>, RpcError> {
-        self.catalog.read_snapshot(&slot.conversation().thread().thread_id).map_err(catalog_error)
+        let snapshot = slot.conversation().history();
+        let mut runtime = slot.runtime_from(&state);
+        runtime.usage = Some(snapshot.summary.usage.clone());
+        let mut history = snapshot.page(limit, before_turn).map_err(catalog_error)?;
+        if before_turn.is_none() {
+            state.merge_activity(&mut history);
+        }
+        Ok(SessionReadResult { history, runtime })
     }
 
     fn on_turn_event(&self, session_id: &str, slot: &ConversationSlot, event: TurnEvent) {
@@ -240,7 +235,7 @@ impl AppServer {
         // 单会话的投影（活动回合、进度替换、revision）由 slot 做；本层在同一把锁里
         // 拿到 envelope 就广播，折叠和广播之间插不进别的事件。
         let mut state = slot.lock_state();
-        let envelope = state.apply_turn_event(event);
+        let envelope = state.apply_turn_event(event, slot.conversation().phase());
         self.emit(StreamEvent::TurnEvent {
             session_id: session_id.to_string(),
             payload: Box::new(envelope),
@@ -252,50 +247,34 @@ impl AppServer {
         session_id: &str,
         slot: &ConversationSlot,
         terminal: Option<SessionTerminalSnapshot>,
-        guard: OperationGuard,
     ) {
         let mut state = slot.lock_state();
-        // 保存本次执行结果或错误反馈；后续历史读取失败不会覆盖它。清空冻结的
-        // history 后，下一次会话读取会重新尝试读盘并单独呈现读取错误。
+        // 发布结果前清空当前操作内容；下一次读取直接使用保存记录。
         state.settle(terminal);
-        // 发布结算之前释放占用守卫；新操作的开始投影要等这把锁。
-        drop(guard);
+        // 结算和新提交共用这把锁，当前操作释放后才能开始下一轮。
+        slot.conversation().finish_operation();
         self.emit(StreamEvent::SessionSettled {
             session_id: session_id.to_string(),
             payload: slot.runtime_from(&state),
         });
     }
 
-    /// 将执行交给 Tokio task；占用守卫由 task 持有直到投影结算。
+    /// 交给 Tokio 执行，完成后统一结算并处理待运行输入。
     fn spawn_operation(
         self: &Arc<Self>,
         session_id: &str,
         slot: Arc<ConversationSlot>,
         reservation: OperationReservation,
-        mut receipt: Option<SubmissionReceipt>,
     ) {
         let app_server = Arc::clone(self);
         let session_id = session_id.to_string();
-        self.runtime_handle.spawn(async move {
-            let mut event_sink = |event| {
-                let committed = matches!(&event, TurnEvent::UserMessage { item, .. }
-                    if receipt.as_ref().is_some_and(|receipt| receipt.item_id == item.item_id));
-                app_server.on_turn_event(&session_id, &slot, event);
-                if committed {
-                    let _ = receipt.take().expect("matched submitted message").sender.send(Ok(()));
-                }
-            };
-            let (result, guard) = reservation.execute(&mut event_sink).await;
-            let uncommitted = receipt.map(|receipt| {
-                let OperationResult::Turn(Err(error)) = &result else {
-                    unreachable!("an uncommitted submitted input must fail execution");
-                };
-                (receipt.sender, internal_error(error.to_string()))
-            });
+        tokio::spawn(async move {
+            let mut event_sink = |event| app_server.on_turn_event(&session_id, &slot, event);
+            let result = reservation.execute(&mut event_sink).await;
             let terminal = match result {
                 OperationResult::Turn(result) => Some(turn_terminal(result)),
                 OperationResult::Compaction(result) => match result {
-                    Ok(_) => None,
+                    Ok(()) => None,
                     Err(error) => Some(SessionTerminalSnapshot {
                         source: SessionTerminalSource::Compaction,
                         status: TurnStatus::Failed,
@@ -304,10 +283,11 @@ impl AppServer {
                     }),
                 },
             };
-            app_server.on_session_settled(&session_id, &slot, terminal, guard);
-            if let Some((sender, error)) = uncommitted {
-                let _ = sender.send(Err(error));
+            if terminal.as_ref().is_some_and(|terminal| terminal.status == TurnStatus::Failed) {
+                slot.conversation().pause_background_resume();
             }
+            app_server.on_session_settled(&session_id, &slot, terminal);
+            app_server.start_background_turn(&session_id, &slot);
         });
     }
 
@@ -320,6 +300,11 @@ impl AppServer {
     /// 生命周期变更提交并释放其锁后调用，目录读盘期间其他任务仍可接受控制。
     fn publish_app_snapshot(&self) {
         let _publication = self.lock_app_publication();
+        self.publish_app_snapshot_locked();
+    }
+
+    /// 配置修改已持有发布锁；失败后也重读实际目录，避免界面保留过时设置。
+    fn publish_app_snapshot_locked(&self) {
         self.publish_app_result(self.bootstrap_with_catalog(self.models.redacted_catalog()));
     }
 
@@ -328,8 +313,8 @@ impl AppServer {
             Ok(payload) => {
                 self.emit(StreamEvent::AppChanged { payload });
             }
-            // 操作已保存，RPC 仍返回其真实结果；基线重读失败由客户端已有的
-            // 列表错误状态呈现，避免无提示地保留旧列表。
+            // 操作已保存，RPC 仍返回其真实结果；基线重读失败交给客户端已有的
+            // 列表错误状态呈现，不静默留旧列表。
             Err(_) => self.emit(StreamEvent::ResyncRequired),
         }
     }

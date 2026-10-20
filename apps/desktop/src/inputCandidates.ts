@@ -13,6 +13,7 @@ type QueryScope = Pick<AppState, 'selectedWorkspaceId' | 'selectedSessionId' | '
 export function useFileCandidates(query: string | undefined, scope: QueryScope) {
   const { selectedWorkspaceId, selectedSessionId, connection } = scope
   const [files, setFiles] = useState<CandidateQuery<FileCandidate[]>>({ status: 'idle' })
+  const [reload, setReload] = useState(0)
   useLayoutEffect(() => {
     // 切换任务或查询时先清除旧候选，避免插入其他任务的文件。
     if (!query?.trim() || connection !== 'ready' || selectedWorkspaceId === null) {
@@ -32,13 +33,14 @@ export function useFileCandidates(query: string | undefined, scope: QueryScope) 
       )
     }, 150)
     return () => { active = false; clearTimeout(queryTimer) }
-  }, [query, selectedSessionId, selectedWorkspaceId, connection])
-  return files
+  }, [query, selectedSessionId, selectedWorkspaceId, connection, reload])
+  return { ...files, retry: () => setReload(value => value + 1) }
 }
 
 export function useSkillCandidates(enabled: boolean, scope: QueryScope) {
   const { selectedWorkspaceId, selectedSessionId, connection } = scope
   const [skills, setSkills] = useState<CandidateQuery<SkillCatalog>>({ status: 'idle' })
+  const [reload, setReload] = useState(0)
   useLayoutEffect(() => {
     if (!enabled || connection !== 'ready' || selectedWorkspaceId === null) {
       setSkills({ status: 'idle' })
@@ -52,6 +54,6 @@ export function useSkillCandidates(enabled: boolean, scope: QueryScope) {
     )
     // 修改技能前缀只筛选当前目录；切换任务或退出技能输入才使这次读取失效。
     return () => { active = false }
-  }, [enabled, selectedSessionId, selectedWorkspaceId, connection])
-  return skills
+  }, [enabled, selectedSessionId, selectedWorkspaceId, connection, reload])
+  return { ...skills, retry: () => setReload(value => value + 1) }
 }

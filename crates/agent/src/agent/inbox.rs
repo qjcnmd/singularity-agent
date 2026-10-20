@@ -1,11 +1,11 @@
-//! 会话持有的 steer 输入箱，活动 turn 借用它的接受窗口。
+//! 用户消息和后台完成通知共用的内存输入箱，活动 turn 借用它的接受窗口。
 //!
 //! 接受、确认消费与停止窗口的关闭都在同一把 Mutex 内执行；保存期间不持锁。
-//! 请求失败关闭当前接受窗口，尚未消费的输入留待下一次执行。用户停止取消当前 steer。
-//! 输入仅随进程存在，交付时才保存为普通用户消息。
+//! 请求失败保留未消费输入。用户停止清掉用户输入，完成通知留到下一条用户消息后处理。
+//! 输入仅随进程存在，交付时按来源保存为用户消息或内部通知。
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, LazyLock, Mutex},
 };
 
@@ -18,22 +18,6 @@ pub struct UserInput {
     pub skills: BTreeMap<String, String>,
 }
 
-impl From<String> for UserInput {
-    fn from(text: String) -> Self {
-        Self {
-            text,
-            images: Vec::new(),
-            skills: BTreeMap::new(),
-        }
-    }
-}
-
-impl From<&str> for UserInput {
-    fn from(text: &str) -> Self {
-        text.to_string().into()
-    }
-}
-
 impl UserInput {
     /// 工作台输入的信任边界，图片只在这里识别和解码一次。
     pub fn from_uploads(
@@ -41,6 +25,9 @@ impl UserInput {
         images: Vec<singularity_protocol::ImageUpload>,
         skills: BTreeMap<String, String>,
     ) -> Result<Self, String> {
+        if text.trim().is_empty() && images.is_empty() {
+            return Err("输入不能为空。".into());
+        }
         Ok(Self {
             text,
             skills,
@@ -68,79 +55,83 @@ impl UserInput {
     }
 }
 
-/// 进程内已接受的输入：序号确定控制顺序和身份，消息身份在重试期间保持不变。
+/// 队列中的完整输入；消息身份在保存失败后的重试期间保持不变。
 #[derive(Debug, Clone, PartialEq)]
-pub struct ControlRequest {
-    pub sequence: u64,
-    pub input: UserInput,
+pub struct QueuedInput {
+    pub input: QueuedInputKind,
     pub(super) message_id: String,
 }
 
-impl ControlRequest {
+/// 区分用户意图与进程完成事实，内部通知不会显示为用户输入。
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueuedInputKind {
+    User(UserInput),
+    Background { task_id: String, status: String },
+}
+
+impl QueuedInput {
     /// 接受输入时分配消息身份，复制与保存失败后的重试沿用同一身份。
-    pub fn new(sequence: u64, input: UserInput) -> Self {
+    pub fn new(input: UserInput) -> Self {
         Self {
-            sequence,
-            input,
+            input: QueuedInputKind::User(input),
             message_id: crate::session::new_entry_id(),
         }
     }
 
-    /// 输入落盘后发布的用户消息条目身份，供宿主确认这一次输入已保存。
+    /// 后台完成事实只携带身份和终态，完整日志由 task_output 按需读取。
+    pub fn background(task_id: String, status: String) -> Self {
+        Self {
+            input: QueuedInputKind::Background { task_id, status },
+            message_id: crate::session::new_entry_id(),
+        }
+    }
+
+    /// 用户输入才出现在待处理消息和图片中。
+    pub fn user_input(&self) -> Option<&UserInput> {
+        match &self.input {
+            QueuedInputKind::User(input) => Some(input),
+            QueuedInputKind::Background { .. } => None,
+        }
+    }
+
+    /// 待处理状态与正式用户消息共用的界面条目身份。
     pub fn item_id(&self) -> String {
         crate::session::text_item_id(&self.message_id, 0)
     }
 }
 
-/// 会话的转向输入箱；条目按协调器分配的接受序号交付。
+/// 会话的输入箱；首条和追加消息按入队顺序交付。
 #[derive(Debug, Default)]
 pub struct SteeringInbox {
-    closed: bool,
-    entries: Vec<ControlRequest>,
+    entries: VecDeque<QueuedInput>,
 }
 
 impl SteeringInbox {
-    /// 开始新的执行时开放接受窗口，已有输入保持原位。
-    pub fn open(&mut self) {
-        self.closed = false;
-    }
-
-    /// 用户明确停止当前执行时取消其尚未消费的 steer。
+    /// 用户明确停止当前执行时取消尚未消费的输入。
     pub fn cancel(&mut self) {
-        self.close();
-        self.entries.clear();
+        self.entries.retain(|entry| entry.user_input().is_none());
     }
 
-    pub fn enqueue(&mut self, request: ControlRequest) -> bool {
-        if self.closed {
-            return false;
-        }
-        self.entries.push(request);
-        true
+    /// 调用方已确认当前会话状态允许接收输入。
+    pub fn enqueue(&mut self, request: QueuedInput) {
+        self.entries.push_back(request);
+    }
+
+    /// 按接受顺序借出尚未交付的输入，供会话快照和压缩后的执行读取。
+    pub fn pending(&self) -> &VecDeque<QueuedInput> {
+        &self.entries
     }
 
     /// 借出最早输入的保存副本；原输入一直归箱子持有，直到保存成功。
-    pub(super) fn next(&self) -> Option<ControlRequest> {
-        self.entries.first().cloned()
+    pub(super) fn next(&self) -> Option<QueuedInput> {
+        self.entries.front().cloned()
     }
 
-    /// 保存期间允许停止清空箱子，因此按身份确认，而非移除队首。
-    pub(super) fn acknowledge(&mut self, sequence: u64) {
-        self.entries.retain(|request| request.sequence != sequence);
-    }
-
-    /// 自然停止处的原子屏障：仅在箱子为空时关闭窗口，有输入则留给下一轮消费。
-    pub(super) fn close_if_empty(&mut self) -> bool {
-        if !self.entries.is_empty() {
-            return false;
+    /// 只有当前 Agent 消费队首；保存期间停止可能已清空队列，下一轮会等当前回合结束。
+    pub(super) fn confirm_saved(&mut self, message_id: &str) {
+        if self.entries.front().is_some_and(|entry| entry.message_id == message_id) {
+            self.entries.pop_front();
         }
-        self.closed = true;
-        true
-    }
-
-    /// 关闭注入箱：此后的输入被拒绝；已收下但未保存的条目留待下次执行。
-    pub fn close(&mut self) {
-        self.closed = true;
     }
 }
 
@@ -154,8 +145,7 @@ impl SteeringInbox {
     }
 }
 
-/// 给活动 turn 的 inbox 加锁。共享状态被毒化时直接 fail-stop：可能已损坏的队列
-/// 不能继续用。
+/// 给活动 turn 的 inbox 加锁；锁被毒化时直接 fail-stop。
 pub(super) fn lock_inbox(queue: &Mutex<SteeringInbox>) -> std::sync::MutexGuard<'_, SteeringInbox> {
     queue.lock().expect("turn inbox lock poisoned")
 }

@@ -22,7 +22,7 @@
   gap: 10px;
 }
 .sidebar-brand {
-  height: 74px;
+  height: 56px;
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -135,10 +135,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   justify-content: space-between;
   padding: 0 6px;
   color: var(--ink-faint);
-  font-size: 11px;
-  font-weight: 650;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 500;
 }
 .section-action {
   height: 22px;
@@ -170,7 +168,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 0 8px;
+  padding: 0 8px 0 0;
   height: 34px;
   border: 0;
   background: transparent;
@@ -246,7 +244,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   font-size: 12px;
 }
 .session-row:hover time, .session-row:focus-within time, .session-row:has(.session-actions [aria-expanded="true"]) time { visibility: hidden; }
-.session-status.status-idle, .session-status.status-stopped, .session-status.status-running, .session-status.status-reserved, .session-status.status-compacting, .session-status.status-stopping { visibility: hidden; }
+.session-status.status-idle, .session-status.status-stopped { visibility: hidden; }
 .session-status.status-completed { background: var(--positive); }
 .session-status {
   position: absolute;
@@ -310,6 +308,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   gap: 16px;
   overflow: hidden;
   padding: 0 64px 0 24px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
 }
 .conversation-header h1 {
   min-width: 0;
@@ -374,7 +374,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .sidebar-shell.is-collapsed > .sidebar-rail { opacity: 1; visibility: visible; pointer-events: auto; position: fixed; top: 10px; left: 16px; bottom: auto; width: 32px; height: 32px; padding: 0; border: 0; z-index: 22; }
 .workspace-icon-button { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 8px; background: transparent; cursor: pointer; }
 .workspace-icon-button:hover { background: var(--surface-muted); }
-.workspace-button { padding-left: 0; }
 .workspace-dot { display: inline-block; flex: none; width: 13px; height: 13px; border-radius: 50%; }
 .workspace-appearance-picker { position: fixed; z-index: 100; width: max-content; padding: 10px; border: 1px solid var(--line); border-radius: 14px; transform-origin: top left; }
 .workspace-color-grid { display: flex; gap: 8px; }
@@ -408,7 +407,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .header-button { min-width: 29px; padding: 0 6px; }
 }
 
-/* 常驻对话与单个可调整大小的轨迹面板共享工作区。 */
+/* 常驻对话与单个可调整大小的后台命令面板共享工作区。 */
 .app-content { display: flex; min-width: 0; min-height: 0; position: relative; overflow: hidden; }
 
 .sidebar-toggle[aria-expanded=true] { background: var(--surface-hover); }

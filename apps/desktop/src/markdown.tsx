@@ -1,6 +1,6 @@
 //! 正文渲染：Markdown（GFM、数学公式）与代码块布局。
 //!
-//! 时间线条目与轨迹详情都显示模型正文，渲染规则由本模块统一提供。本模块只承载
+//! 会话条目显示模型正文，渲染规则由本模块统一提供。本模块只承载
 //! 共用渲染与代码块布局，不持有时间线条目的编排状态，代码高亮由 highlight 提供。
 
 import { isValidElement, memo, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
@@ -35,7 +35,7 @@ function useStreamedText(text: string, streaming: boolean) {
     const started = performance.now()
     let frame: number
     const reveal = (now: number) => {
-      // 将服务端成批到达的文字摊到 80ms，避免一截一截跳出。
+      // 把服务端成批到达的文字摊到 80ms 里送完，不一截一截跳出。
       const progress = Math.min(1, (now - started) / 80)
       // 高刷新率屏幕也不必每帧重新解析 Markdown。
       if (progress === 1 || now - lastPaint.current >= 1000 / 60) {

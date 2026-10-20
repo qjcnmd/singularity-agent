@@ -5,25 +5,28 @@ mod tests;
 
 impl AppServer {
     pub fn image_data(&self, session_id: &str, image_id: &str) -> Result<String, RpcError> {
+        let slot = self.lock_sessions().get(session_id).cloned();
+        if let Some(data) = slot.and_then(|slot| slot.conversation().pending_image(image_id)) {
+            return Ok(data);
+        }
         self.catalog.image_data(session_id, image_id).map_err(catalog_error)
     }
 
-    /// 启动后台执行并等待本次输入保存；RPC 阻塞线程只等本地提交，不等待模型或工具。
-    /// 返回失败时前端保留草稿，执行终态仍通过会话事件发布。
+    /// 输入直接进入会话队列；启动和收尾期间同样接受，按顺序执行。
     pub fn submit(self: &Arc<Self>, session_id: &str, input: UserInput) -> Result<(), RpcError> {
-        singularity_runtime::validate_input(&input).map_err(control_error)?;
-        // 查找或创建 slot 和建立执行预订属于同一段生命周期交接，归档或移除插不进这两步之间。
-        let (slot, reservation) = {
-            let _lifecycle = self.lock_lifecycle();
-            let slot = self.open_action_slot(session_id)?;
-            let reservation = slot.conversation().reserve_start(input).map_err(conversation_error)?;
-            (slot, reservation)
-        };
-        let reservation = self.begin_operation(session_id, &slot, reservation, SlotState::begin_turn)?;
-        let item_id = reservation.submitted_item_id().expect("reserve_start binds submitted input");
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        self.spawn_operation(session_id, slot, reservation, Some(SubmissionReceipt { item_id, sender }));
-        receiver.recv().expect("operation reports submitted input commit or failure")
+        let _lifecycle = self.lock_lifecycle();
+        let slot = self.open_action_slot(session_id)?;
+        let mut state = slot.lock_state();
+        let reservation = slot.conversation().submit(&input).map_err(conversation_error)?;
+        if reservation.is_some() {
+            state.begin_turn(slot.conversation().usage());
+        }
+        self.publish_session_locked(session_id, &slot, &mut state);
+        drop(state);
+        if let Some(reservation) = reservation {
+            self.spawn_operation(session_id, slot, reservation);
+        }
+        Ok(())
     }
 
     pub fn answer_question(
@@ -32,58 +35,28 @@ impl AppServer {
         item_id: &str,
         answers: Vec<singularity_protocol::UserQuestionAnswer>,
     ) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_action_slot(session_id)?;
-        let mut state = slot.lock_state();
-        slot.conversation().answer_question(item_id, answers).map_err(invalid_request)?;
-        self.publish_session_locked(session_id, &slot, &mut state);
-        Ok(())
-    }
-
-    pub fn steer(&self, session_id: &str, input: UserInput) -> Result<(), RpcError> {
-        self.apply_control(session_id, move |conversation| conversation.steer(input))
+        self.apply_control(session_id, |conversation| {
+            conversation.answer_question(item_id, answers).map_err(invalid_request)
+        })
     }
 
     pub fn abort(&self, session_id: &str) -> Result<(), RpcError> {
-        self.apply_control(session_id, Conversation::abort)
+        self.apply_control(session_id, |conversation| conversation.abort().map_err(conversation_error))
     }
 
     /// 会话查找和控制接受共用生命周期锁，公开投影和发布共用 SlotState 顺序。
-    /// 闭包里只做 Conversation 的短控制操作，不能覆盖 Agent 执行或调用事件 sink。
-    fn apply_control<T>(
+    /// 闭包里只做 Conversation 的短控制操作，不覆盖 Agent 执行或事件 sink。
+    fn apply_control(
         &self,
         session_id: &str,
-        apply: impl FnOnce(&Conversation) -> Result<T, ConversationControlError>,
-    ) -> Result<T, RpcError> {
+        apply: impl FnOnce(&Conversation) -> Result<(), RpcError>,
+    ) -> Result<(), RpcError> {
         let _lifecycle = self.lock_lifecycle();
         let slot = self.open_action_slot(session_id)?;
         let mut state = slot.lock_state();
-        let result = apply(slot.conversation()).map_err(control_error)?;
+        apply(slot.conversation())?;
         self.publish_session_locked(session_id, &slot, &mut state);
-        Ok(result)
-    }
-
-    /// 预订成立后读取历史并发布开始状态；读取失败时释放预订并通知等待者。
-    fn begin_operation(
-        &self,
-        session_id: &str,
-        slot: &ConversationSlot,
-        reservation: OperationReservation,
-        begin: impl FnOnce(&mut SlotState, Arc<singularity_runtime::ThreadSnapshot>),
-    ) -> Result<OperationReservation, RpcError> {
-        let history = match self.read_persisted_history(slot) {
-            Ok(history) => history,
-            Err(error) => {
-                let mut state = slot.lock_state();
-                drop(reservation);
-                self.publish_session_locked(session_id, slot, &mut state);
-                return Err(error);
-            }
-        };
-        let mut state = slot.lock_state();
-        begin(&mut state, history);
-        self.publish_session_locked(session_id, slot, &mut state);
-        Ok(reservation)
+        Ok(())
     }
 
     pub(super) fn publish_session_locked(
@@ -103,11 +76,18 @@ impl AppServer {
         let (slot, reservation) = {
             let _lifecycle = self.lock_lifecycle();
             let slot = self.open_action_slot(session_id)?;
+            let mut state = slot.lock_state();
+            if slot.conversation().is_occupied() {
+                return Err(session_busy());
+            }
+            // 与提交共用锁顺序，固定执行前快照。
             let reservation = slot.conversation().reserve_compaction().map_err(conversation_error)?;
+            state.begin_turn(slot.conversation().usage());
+            self.publish_session_locked(session_id, &slot, &mut state);
+            drop(state);
             (slot, reservation)
         };
-        let reservation = self.begin_operation(session_id, &slot, reservation, SlotState::begin_turn)?;
-        self.spawn_operation(session_id, slot, reservation, None);
+        self.spawn_operation(session_id, slot, reservation);
         Ok(())
     }
 
@@ -122,36 +102,53 @@ impl AppServer {
     }
 
     /// 停止目标任务并等到执行结算，再移动日志；等待期间只限制该任务的新操作。
-    pub fn archive_session(&self, session_id: &str) -> Result<(), RpcError> {
-        let lifecycle = self.lock_lifecycle();
-        let slot = self.lock_sessions().get(session_id).cloned();
-        let Some(slot) = slot else {
-            // 尚未加载的任务没有执行要等待；移动完成前保持生命周期锁，阻止新建 slot。
-            self.catalog.archive(session_id).map_err(catalog_error)?;
-            drop(lifecycle);
-            self.publish_app_snapshot();
-            return Ok(());
-        };
-        if slot.is_archiving() {
-            return Err(session_busy());
+    pub async fn archive_session(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {
+        let app = Arc::clone(self);
+        let id = session_id.to_string();
+        let pending = tokio::task::spawn_blocking(move || {
+            let _lifecycle = app.lock_lifecycle();
+            let slot = app.lock_sessions().get(&id).cloned();
+            match slot {
+                Some(slot) => {
+                    if slot.is_archiving() {
+                        return Err(session_busy());
+                    }
+                    let archive = slot.begin_archive();
+                    Ok(Some((slot, archive)))
+                }
+                None => {
+                    // 未加载的任务直接归档；移动前保持生命周期锁，阻止新建 slot。
+                    app.catalog.archive(&id).map_err(catalog_error)?;
+                    Ok(None)
+                }
+            }
+        })
+        .await
+        .expect("archive preparation completes while the backend is running")?;
+        if let Some((slot, _)) = &pending {
+            self.stop_sessions(std::slice::from_ref(slot)).await?;
         }
-        let _archive = slot.begin_archive();
-        drop(lifecycle);
-        self.runtime_handle.block_on(self.stop_sessions(std::slice::from_ref(&slot)));
-        let lifecycle = self.lock_lifecycle();
-        slot.conversation()
-            .with_idle_writer(|| self.catalog.archive(session_id).map_err(catalog_error))
-            .map_err(conversation_error)??;
-        self.lock_sessions().remove(session_id);
-        drop(lifecycle);
-        self.publish_app_snapshot();
-        Ok(())
+        let app = Arc::clone(self);
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            if let Some((_slot, _archive)) = pending {
+                let _lifecycle = app.lock_lifecycle();
+                app.catalog.archive(&id).map_err(catalog_error)?;
+                app.lock_sessions().remove(&id);
+            }
+            app.publish_app_snapshot();
+            Ok(())
+        })
+        .await
+        .expect("archive completion finishes while the backend is running")
     }
 
     pub fn update_settings(&self, session_id: &str, selector: &str) -> Result<(), RpcError> {
         let _lifecycle = self.lock_lifecycle();
         let slot = self.open_action_slot(session_id)?;
-        slot.conversation().update_settings(selector).map_err(conversation_error)?;
+        if let Some(content) = slot.conversation().update_settings(selector).map_err(conversation_error)? {
+            self.on_turn_event(session_id, &slot, TurnEvent::SettingsUpdated { turn_id: None, content });
+        }
         self.bump_and_emit_session(session_id, &slot);
         Ok(())
     }

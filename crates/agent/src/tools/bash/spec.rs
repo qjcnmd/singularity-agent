@@ -1,64 +1,136 @@
-//! bash 的参数解析与工具规格：参数结构、JSON schema、说明文本和默认超时都在这里，
-//! 执行环（exec）只消费这里的参数和默认值，声明与执行之间是单向依赖。
+//! Bash 与后台任务工具的参数和说明。
 
-use std::sync::LazyLock;
+use std::{num::NonZeroU64, sync::LazyLock};
 
-use serde::{Deserialize, Deserializer, de::Error as _};
-use serde_json::{Value, json};
+use serde::Deserialize;
+use serde_json::json;
 
-/// 没有显式给出 timeout_ms 时生效的执行上限：一次工具调用不能无限期占住整个 turn，
-/// 否则模型既拿不到反馈，也没法收尾。到点后终止整棵进程树，并把已捕获的输出连同
-/// 原因一起返回给模型；需要更久的命令就显式传更大的 timeout_ms（该参数不设上限）。
-/// 这个取值覆盖了实测中最长的合法单次调用（数百秒的测试套件），只拦住不会返回的计算。
-pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 300_000;
+use crate::tools::registry::{ToolExecution, ToolSpec, error_result};
 
-pub(crate) static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+pub(super) const DEFAULT_TIMEOUT_MS: u64 = 300_000;
+pub(super) const MAX_WAIT_MS: u64 = 30_000;
+
+static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "Execute a bash command in the current working directory. Returns stdout and stderr. The command runs under bash (Git Bash on Windows); every call starts in the working directory, so changing directory first is unnecessary. Use POSIX syntax: `2>/dev/null` discards stderr, whereas `2>nul` and `>nul` create a real file named `nul` in the workspace. Output is truncated to last {} (whichever is hit first); when truncated, the full output is saved to a temp file and its path is appended as a `Full output:` line. Commands are bounded by {DEFAULT_TIMEOUT_MS} ms unless timeout_ms says otherwise; a bounded command is terminated and its output so far is returned, so pass a larger timeout_ms for long-running work. On Windows, all descendant processes are terminated when this tool call ends, including processes started with & or nohup. Run tests and other work in the foreground within one call; a later call cannot wait for a background process from an earlier call.",
+        "Execute a Bash command in the current working directory (Git Bash on Windows). Use POSIX syntax; `2>nul` creates a file named nul. Returns stdout and stderr, truncated to the last {}; full truncated output is saved to a file. Independent commands may run in parallel; send dependent commands in order. Each command starts exactly once. run_in_background returns immediately; otherwise commands still running after yield_time_ms continue in the background. Use task_list, task_output and task_stop to manage them. Background completion notifies you automatically: do not repeatedly poll. timeout_ms limits total execution time, not just foreground waiting. Foreground calls default to {DEFAULT_TIMEOUT_MS} ms; explicit background calls have no default timeout. Stopping a task terminates its entire process tree. No interactive stdin or PTY is available.",
         crate::tools::truncate::default_cap_summary()
     )
 });
 
+/// 已解析的 Bash 调用；由工具注册表检查等待时间。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BashArgs {
     pub(crate) command: String,
-    #[serde(default, rename = "description")]
-    pub(crate) _description: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_timeout_ms")]
-    pub(crate) timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    #[serde(default)]
+    pub(crate) timeout_ms: Option<NonZeroU64>,
+    #[serde(default)]
+    pub(crate) run_in_background: bool,
+    #[serde(default = "default_yield_time_ms")]
+    pub(crate) yield_time_ms: NonZeroU64,
 }
 
-fn deserialize_timeout_ms<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Value::deserialize(deserializer)?;
-    value
-        .as_u64()
-        .filter(|timeout| *timeout > 0)
-        .map(Some)
-        .ok_or_else(|| D::Error::custom("invalid timeout_ms: must be a positive integer"))
+impl BashArgs {
+    pub(crate) fn validate(self) -> Result<Self, ToolExecution> {
+        if self.yield_time_ms.get() > MAX_WAIT_MS {
+            return Err(error_result("yield_time_ms must be between 1 and 30000"));
+        }
+        Ok(self)
+    }
+
+    pub(super) fn total_timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms
+            .map(NonZeroU64::get)
+            .or_else(|| (!self.run_in_background).then_some(DEFAULT_TIMEOUT_MS))
+    }
 }
 
-pub(crate) fn spec() -> super::super::registry::ToolSpec {
-    super::super::registry::ToolSpec {
+fn default_yield_time_ms() -> NonZeroU64 {
+    NonZeroU64::new(10_000).expect("default wait is positive")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskIdArgs {
+    pub(crate) task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskOutputArgs {
+    pub(crate) task_id: String,
+    #[serde(default)]
+    pub(crate) wait_ms: u64,
+}
+
+impl TaskOutputArgs {
+    pub(crate) fn validate(self) -> Result<Self, ToolExecution> {
+        if self.wait_ms > MAX_WAIT_MS {
+            return Err(error_result("wait_ms must be between 0 and 30000"));
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskListArgs {}
+
+pub(crate) fn spec() -> ToolSpec {
+    ToolSpec {
         name: "bash",
-        snippet: "Run commands, search with rg, and edit or write files with Python or other commands",
+        snippet: "Run commands, optionally continuing in the background",
         description: &DESCRIPTION,
         parameters: json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Bash command to execute" },
-                "description": { "type": "string", "minLength": 1, "description": "Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples: \"ls\" → \"List files in current directory\"; \"git status\" → \"Show working tree status\"; \"npm install\" → \"Install package dependencies\"." },
-                "timeout_ms": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": format!("Timeout in milliseconds for this command (default: {DEFAULT_TIMEOUT_MS})")
-                },
+                "description": { "type": "string", "minLength": 1, "description": "Short description of this command" },
+                "timeout_ms": { "type": "integer", "minimum": 1, "description": "Total execution timeout in milliseconds" },
+                "run_in_background": { "type": "boolean", "default": false },
+                "yield_time_ms": { "type": "integer", "minimum": 1, "maximum": MAX_WAIT_MS, "default": 10000 }
             },
             "required": ["command", "description"],
-            "additionalProperties": false,
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(crate) fn task_list_spec() -> ToolSpec {
+    ToolSpec {
+        name: "task_list",
+        snippet: "List this session's background commands and their states",
+        description: "List actual background commands in this session. Completion notifies you automatically; do not repeatedly poll.",
+        parameters: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+    }
+}
+
+pub(crate) fn task_output_spec() -> ToolSpec {
+    ToolSpec {
+        name: "task_output",
+        snippet: "Read a background command's accumulated output and state",
+        description: "Read the bounded accumulated output tail and current state. wait_ms waits for completion for at most 30000 ms; it does not restart the command or reset its timeout. Completion notifies you automatically, so avoid short polling loops.",
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string" },
+                "wait_ms": { "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "default": 0 }
+            },
+            "required": ["task_id"], "additionalProperties": false
+        }),
+    }
+}
+
+pub(crate) fn task_stop_spec() -> ToolSpec {
+    ToolSpec {
+        name: "task_stop",
+        snippet: "Stop a background command and wait for its process tree to exit",
+        description: "Stop this background command and all descendants, then wait for cleanup. Stopping an already finished command returns its existing result.",
+        parameters: json!({
+            "type": "object", "properties": { "task_id": { "type": "string" } },
+            "required": ["task_id"], "additionalProperties": false
         }),
     }
 }

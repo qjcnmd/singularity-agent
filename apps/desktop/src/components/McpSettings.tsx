@@ -85,7 +85,7 @@ export function McpSettings({ workspaceId, active, busy, onBusyChange }: {
   return <section className="mcp-settings" aria-labelledby="mcp-settings-title" aria-busy={loading}>
     <header className="sg-view-header">
       <h3 id="mcp-settings-title">MCP</h3>
-      <p>执行任务时自动连接。更改会在下次运行或自动压缩后生效。</p>
+      <p>执行任务时自动连接，连接配置和开关在下次运行时更新。每轮运行读取当前指令和工具清单，轮内保持一致。</p>
     </header>
     {error && editor === null && removing === null && <p role="alert" className="form-error">{error} <button type="button" className="quiet-button" disabled={busy} onClick={() => void load()}>重新读取</button></p>}
     <div className="sg-provider-list">
@@ -161,7 +161,7 @@ function McpEditor({ server, busy, error, onSave }: { server?: McpServerInput; b
   }
 
   return <form className="sg-editor mcp-editor" onSubmit={event => void save(event)}>
-    <div className="mcp-editor-scroll">
+    <fieldset className="mcp-editor-scroll" disabled={busy}>
       <label className="sg-field"><span>名称</span><input className="sg-input" aria-label="MCP 名称" required pattern="[A-Za-z0-9_-]+" disabled={!!server} value={id} onChange={event => setId(event.target.value)} placeholder="chrome_devtools" /></label>
       <label className="sg-field"><span>连接方式</span><select className="sg-input" aria-label="MCP 连接方式" value={type} onChange={event => setType(event.target.value as typeof type)}><option value="stdio">本地进程（stdio）</option><option value="http">远程服务（Streamable HTTP）</option></select></label>
       {type === 'stdio' ? <>
@@ -202,7 +202,7 @@ function McpEditor({ server, busy, error, onSave }: { server?: McpServerInput; b
         </label>
       </div>
       {(failure || error) && <p role="alert" className="form-error">{failure || error}</p>}
-    </div>
+    </fieldset>
     <footer><button type="submit" className="primary-button" disabled={busy}>{busy ? '保存中…' : '保存 MCP'}</button></footer>
   </form>
 }

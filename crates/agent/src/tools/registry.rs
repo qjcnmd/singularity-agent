@@ -1,6 +1,6 @@
 //! 工具注册表的快照：工具描述与 schema、参数预检和执行分派。
 
-use std::path::Path;
+use std::future::Future;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -40,70 +40,67 @@ impl ToolExecution {
     }
 }
 
+/// 当前工具调用的目录、取消范围和后台任务归属。
+pub(crate) struct ToolContext {
+    pub cwd: std::path::PathBuf,
+    pub signal: CancellationToken,
+    pub bash_tasks: std::sync::Arc<bash::BashTasks>,
+    pub turn_id: String,
+    pub item_id: String,
+}
+
 /// 预检并解析参数后的待执行工具实例。
 #[derive(Debug)]
 pub(crate) enum PreparedTool {
     Read(read::ReadArgs),
     Question(super::question::QuestionArgs),
     Bash(bash::BashArgs),
+    TaskList(bash::TaskListArgs),
+    TaskOutput(bash::TaskOutputArgs),
+    TaskStop(bash::TaskIdArgs),
     Mcp(singularity_mcp::McpTool, serde_json::Map<String, Value>),
 }
 
 impl PreparedTool {
-    /// 是否支持并行执行（目前仅只读工具 `read` 支持并行）。
+    /// 独立的读文件、命令和任务管理调用共用调度器的并行位。
     pub(crate) fn supports_parallel(&self) -> bool {
-        matches!(self, Self::Read(_))
+        matches!(
+            self,
+            Self::Read(_) | Self::Bash(_) | Self::TaskList(_) | Self::TaskOutput(_) | Self::TaskStop(_)
+        )
     }
 
     /// 执行预检完毕的工具调用，执行失败转换为 `ToolExecution::is_error = true`。
-    pub(crate) async fn execute(
+    pub(crate) async fn execute<F: Future<Output = ()> + Send>(
         self,
-        cwd: std::path::PathBuf,
-        signal: CancellationToken,
-        mut on_update: impl FnMut(String) + Send + 'static,
+        context: ToolContext,
+        on_update: impl FnMut(String) -> F + Send,
     ) -> ToolExecution {
-        if let Self::Mcp(tool, args) = self {
-            return super::mcp::execute(tool, args, &signal).await;
+        let ToolContext {
+            cwd,
+            signal,
+            bash_tasks,
+            turn_id,
+            item_id,
+        } = context;
+        match self {
+            Self::Mcp(tool, args) => super::mcp::execute(tool, args, &signal).await,
+            Self::Bash(args) => bash_tasks.execute(args, cwd, turn_id, item_id, signal, on_update).await,
+            Self::TaskList(_) => ToolExecution::text(
+                serde_json::to_string(&bash_tasks.list()).expect("background tasks serialize"),
+            ),
+            Self::TaskOutput(args) => bash_tasks.output(&args.task_id, args.wait_ms, &signal).await,
+            Self::TaskStop(args) => bash_tasks.stop(&args.task_id).await,
+            Self::Read(args) => tokio::task::spawn_blocking(move || read::execute(&args, &cwd, &signal))
+                .await
+                .expect("tool worker completes while the runtime is running"),
+            Self::Question(_) => unreachable!("questions execute on the turn control plane"),
         }
-        tokio::task::spawn_blocking(move || {
-            let ctx = ExecuteContext {
-                cwd: &cwd,
-                signal: &signal,
-                on_update: &mut on_update,
-            };
-            if let Some(aborted) = ctx.abort_if_cancelled() {
-                return aborted;
-            }
-            match &self {
-                Self::Read(args) => read::execute(args, ctx),
-                Self::Bash(args) => bash::execute(args, ctx),
-                Self::Question(_) => unreachable!("questions execute on the turn control plane"),
-                Self::Mcp(..) => unreachable!("MCP tools execute asynchronously"),
-            }
-        })
-        .await
-        .expect("tool worker completes while the runtime is running")
     }
-}
-
-/// 工具执行的上下文：工作目录、中断信号和流式输出回调。
-pub(crate) struct ExecuteContext<'a> {
-    pub cwd: &'a Path,
-    pub signal: &'a CancellationToken,
-    /// 流式进度回调接收 owned 文本。捕获方每次更新本来就会产生新字符串，这里直接
-    /// 移交所有权，省掉在借用边界上回拷整段输出。
-    pub on_update: &'a mut dyn FnMut(String),
 }
 
 /// 取消时给模型看的失败文案，各工具共用。
 pub(crate) const ABORTED_MESSAGE: &str = "Operation aborted";
-
-impl ExecuteContext<'_> {
-    /// 取消信号已触发时返回模型可见的 abort 失败结果；各工具在入口和耗时步骤之后调用。
-    pub(crate) fn abort_if_cancelled(&self) -> Option<ToolExecution> {
-        self.signal.is_cancelled().then(|| error_result(ABORTED_MESSAGE))
-    }
-}
 
 /// 模型可见的工具元数据；参数解析见 [`ToolRegistrySnapshot::preflight`]。
 #[derive(Debug, Clone)]
@@ -119,7 +116,7 @@ pub(crate) struct ToolSpec {
 type ToolParser = fn(&Value) -> Result<PreparedTool, ToolExecution>;
 
 /// 回合开始及压缩后更新、连续请求间复用的工具注册表快照；Default 注册默认工具集
-/// （bash/read）。提示词名单、provider schema、参数
+/// （bash、后台任务管理、read、ask_user_question）。提示词名单、provider schema、参数
 /// 校验和执行分发都由本模块维护；哪些调用可以并行由 PreparedTool 决定。
 #[derive(Debug)]
 pub(crate) struct ToolRegistrySnapshot {
@@ -132,22 +129,28 @@ impl Default for ToolRegistrySnapshot {
         Self {
             mcp: Vec::new(),
             tools: vec![
-                (bash::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Bash)),
+                (bash::spec(), |args| {
+                    deserialize_args_or_error::<bash::BashArgs>(args)?.validate().map(PreparedTool::Bash)
+                }),
+                (bash::task_list_spec(), |args| deserialize_args_or_error(args).map(PreparedTool::TaskList)),
+                (bash::task_output_spec(), |args| {
+                    deserialize_args_or_error::<bash::TaskOutputArgs>(args)?
+                        .validate()
+                        .map(PreparedTool::TaskOutput)
+                }),
+                (bash::task_stop_spec(), |args| deserialize_args_or_error(args).map(PreparedTool::TaskStop)),
                 (read::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Read)),
+                (super::question::spec(), |args| {
+                    deserialize_args_or_error::<super::question::QuestionArgs>(args)?
+                        .validate()
+                        .map(PreparedTool::Question)
+                }),
             ],
         }
     }
 }
 
 impl ToolRegistrySnapshot {
-    pub(crate) fn enable_questions(&mut self) {
-        self.tools.push((super::question::spec(), |args| {
-            deserialize_args_or_error::<super::question::QuestionArgs>(args)?
-                .validate()
-                .map(PreparedTool::Question)
-        }));
-    }
-
     /// Developer 指令用的工具名单：(名称, 一行简介)。顺序确定，且与 provider schema
     /// 出自同一份快照。
     pub fn prompt_lines(&self) -> Vec<(&str, &str)> {
@@ -184,11 +187,8 @@ impl ToolRegistrySnapshot {
                 args.as_object().ok_or_else(|| error_result("MCP tool arguments must be a JSON object"))?;
             return Ok(PreparedTool::Mcp(tool.clone(), args.clone()));
         }
-        let (_, parse) = self
-            .tools
-            .iter()
-            .find(|(spec, _)| spec.name == name)
-            .ok_or_else(|| error_result(format!("tool execution failed: unknown tool: {name}")))?;
+        let (_, parse) =
+            self.tools.iter().find(|(spec, _)| spec.name == name).ok_or_else(|| unknown_tool(name))?;
         parse(args)
     }
 
@@ -202,6 +202,11 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
     let mut execution = ToolExecution::text(message);
     execution.is_error = true;
     execution
+}
+
+/// 固定定义和本轮目录中的未知工具使用同一种拒绝结果。
+pub(crate) fn unknown_tool(name: &str) -> ToolExecution {
+    error_result(format!("tool execution failed: unknown tool: {name}"))
 }
 
 /// 反序列化工具参数；失败时把错误文本包成模型可见的 is_error 结果，调用方把它当作

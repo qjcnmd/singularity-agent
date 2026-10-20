@@ -1,24 +1,20 @@
 //! 把 Agent 事件投影成工作台条目，并管理条目的生命周期。
 //!
-//! assistant 的第一个增量打开条目，完成或丢弃事件闭合已打开的条目；工具条目复用持久
-//! 结果的 ID，工具结果由 Agent 直接发布。
+//! assistant 的第一个增量打开条目；完整内容直接完成条目，其余已打开条目在完成或丢弃时
+//! 关闭。工具条目复用持久结果的 ID，工具结果由 Agent 直接发布。
 
-use singularity_agent::agent::{AgentDiagnostic, AgentEvent};
+use singularity_agent::agent::AgentEvent;
 use singularity_protocol::{HistoryItem, ItemRef, TurnEvent};
-
-const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 
 /// 普通回合与独立压缩共用的事件转换；只有消息和工具要求回合身份。
 pub(crate) struct AgentEventProjector {
-    thread_id: String,
     turn_id: Option<String>,
     open_assistant_items: std::collections::BTreeSet<String>,
 }
 
 impl AgentEventProjector {
-    pub(crate) fn new(thread_id: String, turn_id: Option<String>) -> Self {
+    pub(crate) fn new(turn_id: Option<String>) -> Self {
         Self {
-            thread_id,
             turn_id,
             open_assistant_items: std::collections::BTreeSet::new(),
         }
@@ -26,11 +22,14 @@ impl AgentEventProjector {
 
     pub(crate) fn project(&mut self, sink: &mut dyn FnMut(TurnEvent), event: AgentEvent) {
         match event {
+            AgentEvent::ContextInjected { item } => sink(TurnEvent::ContextInjected {
+                turn_id: self.turn_id.clone(),
+                content: item,
+            }),
             AgentEvent::MessageUpdate { message_id, delta } => {
                 let item =
                     self.start_assistant_item(singularity_agent::session::text_item_id(&message_id, 0));
                 sink(TurnEvent::AssistantDelta {
-                    thread_id: self.thread_id.clone(),
                     turn_id: self.message_turn_id(),
                     item,
                     delta,
@@ -40,7 +39,6 @@ impl AgentEventProjector {
                 let item =
                     self.start_assistant_item(singularity_agent::session::thinking_item_id(&message_id, 0));
                 sink(TurnEvent::AssistantThinkingDelta {
-                    thread_id: self.thread_id.clone(),
                     turn_id: self.message_turn_id(),
                     item,
                     delta,
@@ -53,7 +51,6 @@ impl AgentEventProjector {
                 ] {
                     if self.open_assistant_items.remove(&item_id) {
                         sink(TurnEvent::ItemDiscarded {
-                            thread_id: self.thread_id.clone(),
                             turn_id: self.message_turn_id(),
                             item: ItemRef { item_id },
                         });
@@ -64,8 +61,8 @@ impl AgentEventProjector {
                 // 完成事件只含正文和思考，生产侧已按 ItemScope::Completion 物化过，
                 // 投影里无需再筛。
                 for content in items {
-                    let item = self.start_assistant_item(content.id().to_string());
-                    self.finish_assistant_item(sink, &item.item_id, failed, Some(content));
+                    let item_id = content.id().to_string();
+                    self.finish_assistant_item(sink, &item_id, failed, Some(content));
                 }
                 for item_id in [
                     singularity_agent::session::thinking_item_id(&message_id, 0),
@@ -76,17 +73,14 @@ impl AgentEventProjector {
             }
             AgentEvent::ToolExecutionStarted { item_id, tool_name, arguments } => {
                 sink(TurnEvent::ToolExecutionStart {
-                    thread_id: self.thread_id.clone(),
                     turn_id: self.message_turn_id(),
                     item: ItemRef { item_id },
                     tool_name,
                     args: arguments,
-                    started_at: singularity_core::now_iso(),
                 });
             }
             AgentEvent::ToolExecutionUpdate { item_id, partial_result } => {
                 sink(TurnEvent::ToolExecutionUpdate {
-                    thread_id: self.thread_id.clone(),
                     turn_id: self.message_turn_id(),
                     item: ItemRef { item_id },
                     partial_result,
@@ -94,42 +88,31 @@ impl AgentEventProjector {
             }
             AgentEvent::ToolExecutionEnded { item_id, execution } => {
                 sink(TurnEvent::ToolExecutionEnd {
-                    thread_id: self.thread_id.clone(),
                     turn_id: self.message_turn_id(),
                     item: ItemRef { item_id },
-                    output: execution.content,
-                    images: execution.images.into_iter().map(|image| image.attachment).collect(),
-                    is_error: execution.is_error,
-                    duration_ms: execution.duration_ms,
-                    read_source: execution.read_source,
-                });
-            }
-            AgentEvent::Diagnostic(AgentDiagnostic { severity, code, message }) => {
-                sink(TurnEvent::Diagnostic {
-                    thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
-                    severity,
-                    code,
-                    message,
+                    result: singularity_protocol::ToolResult {
+                        output: execution.content,
+                        images: execution.images.into_iter().map(|image| image.attachment).collect(),
+                        is_error: execution.is_error,
+                        duration_ms: execution.duration_ms,
+                        read_source: execution.read_source,
+                    },
                 });
             }
             AgentEvent::ProviderAttempt { observation } => {
                 sink(TurnEvent::ProviderAttempt {
                     observation,
-                    thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
                 });
             }
             AgentEvent::CompactionUpdated { item } => {
                 sink(TurnEvent::CompactionUpdated {
-                    thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
                     content: item,
                 });
             }
             AgentEvent::UserMessage { entry_id, text, images } => {
                 sink(TurnEvent::UserMessage {
-                    thread_id: self.thread_id.clone(),
                     turn_id: self.message_turn_id(),
                     item: ItemRef {
                         item_id: singularity_agent::session::text_item_id(&entry_id, 0),
@@ -159,21 +142,19 @@ impl AgentEventProjector {
         failed: bool,
         content: Option<HistoryItem>,
     ) {
-        if !self.open_assistant_items.remove(item_id) {
+        // 完整内容可能没有流式增量；只有补发空终态时才要求条目已打开。
+        if !self.open_assistant_items.remove(item_id) && content.is_none() {
             return;
         }
         let item = ItemRef { item_id: item_id.to_string() };
         sink(if failed {
             TurnEvent::ItemFailed {
-                thread_id: self.thread_id.clone(),
                 turn_id: self.message_turn_id(),
                 item,
                 content,
-                error: SAFE_ASSISTANT_ITEM_FAILURE.to_string(),
             }
         } else {
             TurnEvent::ItemCompleted {
-                thread_id: self.thread_id.clone(),
                 turn_id: self.message_turn_id(),
                 item,
                 content,

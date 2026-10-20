@@ -1,5 +1,5 @@
+use super::ModelUsage;
 use super::message::ModelMessage;
-use super::usage::ModelUsage;
 
 /// 把 Chat Completions 与 Responses 两种协议统一后的停止原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,7 +17,8 @@ pub struct ModelTurnResponse {
     pub assistant_message: ModelMessage,
     /// 提供方明确返回、可以展示的思考文本或推理摘要，与不透明的续接数据和本轮是否发生工具调用无关。
     pub thinking: String,
-    pub usage: ModelUsage,
+    /// 输入与输出计数都有效上报时才有值；未知用量不当成零。
+    pub usage: Option<ModelUsage>,
     pub stop_reason: ModelStopReason,
 }
 

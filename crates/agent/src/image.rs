@@ -16,6 +16,11 @@ pub struct InputImage {
 }
 
 impl InputImage {
+    /// 排队中的图片尚未保存到历史，工作台按需读取这份已校验的内容。
+    pub fn data_url(&self) -> String {
+        data_url(&self.attachment.mime_type, &self.bytes)
+    }
+
     /// 接收工作台 data URL，声明的 MIME 不作为格式依据。
     pub fn upload(upload: ImageUpload) -> Result<Self, String> {
         let (header, data) = upload.data_url.split_once(',').ok_or("图片数据无效。")?;

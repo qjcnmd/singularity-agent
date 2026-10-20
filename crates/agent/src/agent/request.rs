@@ -3,178 +3,159 @@
 //! 生成请求与摘要请求共用那个入口。
 
 use super::{Agent, AgentError, Result};
-use crate::events::{AgentDiagnostic, AgentEvent};
+use crate::events::AgentEvent;
 use crate::request_execution::{execute_request, output_budget_tokens};
 use crate::session::{RequestDefinitions, context, lock_writer};
-use singularity_model::{ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnResponse};
+use singularity_model::{ModelRole, ModelTurnRequest, ModelTurnResponse};
+use singularity_protocol::{RequestMessage, RequestPreferences};
 use tokio_util::sync::CancellationToken;
 
-fn file_instruction_message(instructions: &str) -> Option<ModelMessage> {
-    if instructions.is_empty() {
-        return None;
-    }
-    // 文件正文不能提前关闭来源边界。
+fn file_instruction_message(instructions: &str) -> RequestMessage {
+    // 文件正文自带的闭合标签会提前截断这条消息。
     let instructions = instructions.replace("</file-instructions>", "<\\/file-instructions>");
-    Some(ModelMessage::text(
-        ModelRole::User,
-        format!(
+    RequestMessage {
+        name: "文件指令".into(),
+        role: ModelRole::User,
+        content: format!(
             "<file-instructions>\nThese global and project file instructions apply to the current workspace. More specific files take precedence. Direct user instructions take precedence over these file instructions.\n{instructions}\n</file-instructions>"
         ),
-    ))
+    }
 }
 
 impl Agent {
-    /// 只在会话没有固定定义时加载；已有会话包括重启恢复都沿用保存的定义。
+    /// 本轮首次请求前加载并保存定义，后续请求复用。
     pub(super) async fn ensure_definitions(
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<()> {
         if self.definitions.is_none() {
-            let (definitions, registry) = self.load_definitions(on_event, cancellation).await?;
-            let saved = definitions.clone();
-            crate::session::with_writer_async(&self.session, move |writer| {
-                writer.append_record(crate::session::LedgerRecord::RequestDefinitions { definitions: saved })
+            let definitions = self.load_definitions(cancellation).await?;
+            let sections = definitions.sections();
+            let injected = crate::session::with_writer_async(&self.session, move |writer| {
+                writer.record_context(sections)
             })
             .await?;
+            for item in injected {
+                on_event(AgentEvent::ContextInjected { item });
+            }
             self.definitions = Some(definitions);
-            self.registry = registry;
         }
         Ok(())
     }
 
-    /// 首次加载和压缩成功后共用；返回新定义，调用方保存成功后才替换当前内容。
+    /// 读取本轮技能与工具目录，组装模型收到的定义。
     pub(super) async fn load_definitions(
         &mut self,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
-    ) -> Result<(RequestDefinitions, crate::tools::ToolRegistrySnapshot)> {
+    ) -> Result<RequestDefinitions> {
         let home = self.config.instruction_home.clone();
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let initial = self.definitions.is_none();
-        let initial_instructions = self.config.initial_instructions.take();
-        let instruction_cwd = cwd.clone();
-        let (loaded, skills) = tokio::task::spawn_blocking(move || {
-            let loaded = if initial {
-                Ok(initial_instructions)
-            } else {
-                singularity_core::load_agent_instructions(&instruction_cwd, &home)
-            };
-            let skills = singularity_core::skills::SkillCatalog::discover(&instruction_cwd, &home).prompt();
-            (loaded, skills)
+        let loaded = self.config.initial_instructions.take();
+        let skills = tokio::task::spawn_blocking(move || {
+            singularity_core::skills::SkillCatalog::discover(&cwd, &home).prompt()
         })
         .await
-        .expect("instruction loader completes while the runtime is running");
-        let loaded = loaded.map_err(AgentError::Instructions)?;
-        if loaded.as_ref().is_some_and(singularity_core::ProjectInstructions::truncated) {
-            on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
-                singularity_protocol::diagnostic_code::PROJECT_INSTRUCTIONS_TRUNCATED,
-                "project instructions were truncated because they exceeded the size budget",
-            )));
-        }
+        .expect("skill discovery completes while the runtime is running");
+        let cwd = lock_writer(&self.session).cwd().to_path_buf();
         let discovered = self.mcp.discover(&cwd, cancellation).await;
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        let mut registry = crate::tools::ToolRegistrySnapshot::default();
-        if self.questions.is_some() {
-            registry.enable_questions();
-        }
-        registry.set_mcp_tools(discovered.tools);
+        self.registry.set_mcp_tools(discovered.tools);
+        let registry = &self.registry;
         let mut developer =
-            crate::prompts::assemble_developer_instructions(&singularity_core::display_path(&cwd), &registry);
+            crate::prompts::assemble_developer_instructions(&singularity_core::display_path(&cwd), registry);
         if !discovered.instructions.is_empty() {
             developer.push_str(&format!("\n\n{}", discovered.instructions.join("\n\n")));
         }
         if !discovered.errors.is_empty() {
             developer.push_str(&format!("\n\nUnavailable MCP servers:\n{}", discovered.errors.join("\n")));
         }
-        for error in discovered.errors {
-            on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning("mcp_connection_failed", error)));
-        }
-        let mut messages = vec![ModelMessage::text(ModelRole::Developer, developer)];
+        let mut messages = vec![RequestMessage {
+            name: "Harness 指令".into(),
+            role: ModelRole::Developer,
+            content: developer,
+        }];
         if !skills.is_empty() {
-            messages.push(ModelMessage::text(ModelRole::Developer, skills));
+            messages.push(RequestMessage {
+                name: "Skills 目录".into(),
+                role: ModelRole::Developer,
+                content: skills,
+            });
         }
-        if let Some(files) = loaded
-            .as_ref()
-            .map(singularity_core::ProjectInstructions::content)
-            .and_then(file_instruction_message)
-        {
+        if let Some(files) = loaded.as_deref().map(file_instruction_message) {
             messages.push(files);
         }
-        Ok((RequestDefinitions::new(&messages, registry.provider_schemas()), registry))
+        Ok(RequestDefinitions {
+            messages,
+            tools: registry.provider_schemas(),
+        })
     }
 
     pub(super) fn request_definitions(&self) -> &RequestDefinitions {
         self.definitions.as_ref().expect("definitions are loaded before model requests")
     }
 
-    /// 普通请求读取固定前缀与完整有效对话；组装不会重新发现或刷新定义。
-    pub(super) async fn model_messages(&self) -> Result<Vec<ModelMessage>> {
-        let prefix = self.request_definitions().model_messages();
-        let session = std::sync::Arc::clone(&self.session);
-        Ok(tokio::task::spawn_blocking(move || {
-            let mut messages = prefix;
-            let (materials, directory) = {
-                let writer = lock_writer(&session);
-                (context::messages(&writer), writer.image_directory())
-            };
-            messages.extend(context::load_messages(materials, &directory)?);
-            Ok::<_, crate::session::SessionError>(messages)
-        })
-        .await
-        .expect("context worker completes while the runtime is running")?)
-    }
-
-    /// 当前指令和工具定义的请求开销。
-    pub(super) fn request_overhead_tokens(&self) -> u64 {
-        self.request_definitions().estimated_tokens()
-    }
-
+    /// 生成预算与自动压缩共用：有效对话加上固定定义和本轮实测校正。
     pub(super) fn context_pressure_tokens(&self) -> u64 {
-        self.request_tokens(self.request_overhead_tokens())
-    }
-
-    /// 从账本派生历史估价，本轮 Agent 添加请求定义开销与实测校正。
-    fn request_tokens(&self, overhead: u64) -> u64 {
         let writer = lock_writer(&self.session);
         context::estimated_tokens(&writer)
-            .saturating_add(overhead)
+            .saturating_add(self.request_definitions().estimated_tokens())
             .saturating_add(self.usage_correction)
     }
 
-    /// 组装并发送一次生成请求；发送、预算和观测共用同一份指令与工具定义。
+    /// 发送、预算和观测共用同一份定义；返回未校正估价，响应后无需重新扫描会话。
     async fn request_response(
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
-    ) -> Result<(ModelTurnResponse, String)> {
+    ) -> Result<(ModelTurnResponse, String, u64)> {
+        // 压缩期间收到的新消息在摘要保存后交给下一次生成请求。
+        self.drain_inputs(on_event, cancellation).await?;
         let definitions = self.request_definitions();
-        let tools = definitions.model_tools();
-        let messages = self.model_messages().await?;
+        let tools = definitions.tools.clone();
+        let mut messages = definitions.model_messages();
+        let overhead_tokens = definitions.estimated_tokens();
+        let usage_correction = self.usage_correction;
+        let session = std::sync::Arc::clone(&self.session);
         let model = self.provider.model_configuration();
-        let request = ModelTurnRequest {
-            messages,
-            tools,
-            model_preferences: ModelPreferences {
-                max_output_tokens: output_budget_tokens(
-                    &model,
-                    self.request_tokens(definitions.estimated_tokens()),
-                    model.max_output_tokens,
-                ),
-            },
-        };
+        let (request, baseline_tokens) = tokio::task::spawn_blocking(move || {
+            let (materials, context_tokens, directory) = {
+                let writer = lock_writer(&session);
+                let (materials, tokens) = context::prepare_context(&writer);
+                (materials, tokens, writer.image_directory())
+            };
+            messages.extend(context::load_messages(materials, &directory)?);
+            let baseline_tokens = context_tokens.saturating_add(overhead_tokens);
+            let input_tokens = baseline_tokens.saturating_add(usage_correction);
+            Ok::<_, crate::session::SessionError>((
+                ModelTurnRequest {
+                    messages,
+                    tools,
+                    model_preferences: RequestPreferences {
+                        max_output_tokens: output_budget_tokens(
+                            &model,
+                            input_tokens,
+                            model.max_output_tokens,
+                        ),
+                    },
+                },
+                baseline_tokens,
+            ))
+        })
+        .await
+        .expect("context worker completes while the runtime is running")?;
         execute_request(
             &self.provider,
             &self.session,
-            &mut self.accounting,
             &request,
             on_event,
             cancellation,
             singularity_protocol::RequestPurpose::Generation,
         )
         .await
+        .map(|(response, id)| (response, id, baseline_tokens))
     }
 }
 
@@ -185,13 +166,13 @@ impl Agent {
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
-    ) -> Result<(ModelTurnResponse, String)> {
+    ) -> Result<(ModelTurnResponse, String, u64)> {
         self.reduce_context_if_needed(on_event, cancellation).await?;
         let overflow = match self.request_response(on_event, cancellation).await {
             Err(AgentError::Provider(error)) if error.is_context_overflow() => error,
             result => return result,
         };
-        if !self.compact_now(on_event).await.into_result()? {
+        if !self.compact_now(on_event, cancellation).await.into_result()? {
             return Err(AgentError::Provider(overflow));
         }
         if cancellation.is_cancelled() {

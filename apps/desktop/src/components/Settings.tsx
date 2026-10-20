@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
+import { actionOrigin, appStore, pendingKey, useAppStore } from '../appStore'
 import type { RedactedProvider } from '../protocol'
 import { messageFontSize } from '../viewPersistence'
 import { ProviderEditor } from './ProviderEditor'
@@ -9,26 +9,30 @@ import { ExpandChevron } from './ExpandChevron'
 import { McpSettings } from './McpSettings'
 import { Palette, Boxes, Plug } from 'lucide-react'
 
-/** 设置面板组件所需的状态切片。 */
-type SettingsState = Pick<AppState, 'bootstrap' | 'settingsOpen' | 'messageFontSize' | 'actionErrors' | 'pendingActions' | 'selectedWorkspaceId'>
+type ProviderEditorState = null | 'new' | RedactedProvider
 
-type ProviderEditorState = null | { kind: 'new' } | { kind: 'existing'; provider: RedactedProvider }
-
-export function Settings({ state }: { state: SettingsState }) {
+export function Settings() {
+  const state = useAppStore(['bootstrap', 'settingsOpen', 'messageFontSize', 'actionErrors', 'pendingActions', 'selectedWorkspaceId'])
   const [page, setPage] = useState<'appearance' | 'models' | 'mcp'>('appearance')
   const [editor, setEditor] = useState<ProviderEditorState>(null)
-  const [removing, setRemoving] = useState<{ provider: RedactedProvider } | null>(null)
+  const [editorVersion, setEditorVersion] = useState(0)
+  const [removing, setRemoving] = useState<RedactedProvider | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [mcpBusy, setMcpBusy] = useState(false)
   const busy = mcpBusy || [...state.pendingActions].some(key =>
     ['model.saveProvider', 'model.removeProvider'].some(method => key.startsWith(pendingKey(method, ''))))
   const catalog = state.bootstrap?.modelCatalog
   const providers = catalog?.providers ?? []
-  // 正在编辑的 Provider 优先显示在列表中，避免保存或读取失败时表单被冲掉
-  const editingProvider = editor?.kind === 'existing' ? editor.provider : null
+  // 正在编辑的 Provider 优先显示在列表中，保存或读取失败时表单不被新数据冲掉
+  const editingProvider = editor === 'new' ? null : editor
   const providerRows = editingProvider && !providers.some(provider => provider.providerId === editingProvider.providerId)
     ? [...providers, editingProvider] : providers
   const unreadable = Boolean(catalog?.error && providers.length === 0)
+  function openEditor(next: Exclude<ProviderEditorState, null>) {
+    // 收起动画尚未结束就重新打开时，也从已保存配置开始编辑。
+    setEditorVersion(version => version + 1)
+    setEditor(next)
+  }
   function close() {
     if (busy) return
     setEditor(null)
@@ -38,13 +42,13 @@ export function Settings({ state }: { state: SettingsState }) {
 
   function requestRemoval(provider: RedactedProvider) {
     appStore.clearError(actionOrigin.inline('model.removeProvider', provider.providerId))
-    setRemoving({ provider })
+    setRemoving(provider)
   }
 
   async function removeProvider() {
-    if (removing && await appStore.removeProvider(removing.provider.providerId)) {
-      setEditor(current => current?.kind === 'existing' && current.provider.providerId === removing.provider.providerId ? null : current)
-      setRemoving(current => current === removing ? null : current)
+    if (removing && await appStore.removeProvider(removing.providerId)) {
+      setEditor(current => current !== 'new' && current?.providerId === removing.providerId ? null : current)
+      setRemoving(null)
     }
   }
 
@@ -101,7 +105,8 @@ export function Settings({ state }: { state: SettingsState }) {
                     <div className="sg-row-head">
                       <button type="button" className="sg-provider-toggle" disabled={busy} aria-expanded={expanded} aria-controls={`provider-editor-${provider.providerId}`} onClick={() => {
                         appStore.clearError(actionOrigin.inline('model.saveProvider', provider.providerId))
-                        setEditor(expanded ? null : { kind: 'existing', provider })
+                        if (expanded) setEditor(null)
+                        else openEditor(provider)
                       }}>
                         <span className="sg-row-identity">
                           <strong>{provider.displayName || provider.providerId}</strong>
@@ -115,7 +120,7 @@ export function Settings({ state }: { state: SettingsState }) {
                     </div>
                     <Disclosure open={expanded}>
                       <div id={`provider-editor-${provider.providerId}`}>
-                        <ProviderEditor key={provider.providerId} state={state} provider={provider} onDone={() => setEditor(current => current === editor ? null : current)} />
+                        <ProviderEditor key={`${provider.providerId}:${editorVersion}`} state={state} provider={provider} onDone={() => setEditor(null)} />
                       </div>
                     </Disclosure>
                   </div>
@@ -123,10 +128,10 @@ export function Settings({ state }: { state: SettingsState }) {
               {editor === null && catalog && !catalog.error && providers.length === 0 && <p className="sg-provider-empty">尚未配置模型提供方。</p>}
               {editor === null && providers.length > 0 && providers.every(provider => provider.models.length === 0) && <p className="sg-model-empty">尚未配置模型。</p>}
             </div>
-            {editor?.kind !== 'new' ? <div className="sg-add-actions">
-              <button type="button" className="sg-add-card-btn" disabled={unreadable || busy} onClick={() => setEditor({ kind: 'new' })}>＋ 添加提供方</button>
+            {editor !== 'new' ? <div className="sg-add-actions">
+              <button type="button" className="sg-add-card-btn" disabled={unreadable || busy} onClick={() => openEditor('new')}>＋ 添加提供方</button>
             </div> : null}
-            <Disclosure open={editor?.kind === 'new'}><ProviderEditor state={state} onDone={() => setEditor(current => current === editor ? null : current)} /></Disclosure>
+            <Disclosure open={editor === 'new'}><ProviderEditor key={editorVersion} state={state} onDone={() => setEditor(null)} /></Disclosure>
           </section>
           <section className="sg-settings-page" aria-label="MCP 设置" hidden={page !== 'mcp'}>
             {state.settingsOpen && <McpSettings workspaceId={state.selectedWorkspaceId} active={page === 'mcp'} busy={mcpBusy} onBusyChange={setMcpBusy} />}
@@ -136,8 +141,8 @@ export function Settings({ state }: { state: SettingsState }) {
       <Dialog open={removing !== null} onClose={() => { if (!busy) setRemoving(null) }} labelledBy="remove-provider-title" className="confirm-modal">
         <header className="modal-header"><h2 id="remove-provider-title">删除提供方</h2></header>
         <div className="confirm-body">
-          <p>删除“{removing?.provider.displayName || removing?.provider.providerId}”及其模型配置和 API 密钥？已经运行的回合会继续；使用它的任务下次发送前需要重新选择模型。</p>
-          {removing && state.actionErrors[actionOrigin.inline('model.removeProvider', removing.provider.providerId)] && <p role="alert" className="form-error">{state.actionErrors[actionOrigin.inline('model.removeProvider', removing.provider.providerId)].message}</p>}
+          <p>删除“{removing?.displayName || removing?.providerId}”及其模型配置和 API 密钥？已经运行的回合会继续；使用它的任务下次发送前需要重新选择模型。</p>
+          {removing && state.actionErrors[actionOrigin.inline('model.removeProvider', removing.providerId)] && <p role="alert" className="form-error">{state.actionErrors[actionOrigin.inline('model.removeProvider', removing.providerId)].message}</p>}
           <footer>
             <button type="button" className="secondary-button" data-autofocus disabled={busy} onClick={() => setRemoving(null)}>取消</button>
             <button type="button" className="danger-button" disabled={busy} onClick={() => void removeProvider()}>删除</button>

@@ -8,9 +8,7 @@ pub(crate) mod selection;
 pub(crate) mod user;
 
 pub use discovery::discover as discover_models;
-pub use manager::{
-    ModelConfigManager, ModelConfigUpdate, ModelConfigurationSnapshot, ProviderConfigSnapshot,
-};
+pub use manager::{ModelConfigManager, ModelConfigurationSnapshot, ProviderConfigSnapshot};
 pub(crate) use schema::*;
 pub(crate) use user::*;
 
@@ -25,15 +23,11 @@ pub(crate) fn configuration_error(message: impl Into<String>, code: &'static str
 }
 
 pub(crate) fn missing_provider_config_error(name: &str) -> ProviderError {
-    configuration_error(
-        format!("required provider configuration is missing: {name}"),
-        crate::error::PROVIDER_CONFIGURATION_MISSING_CODE,
-    )
+    configuration_error(format!("缺少提供方配置：{name}"), crate::error::PROVIDER_CONFIGURATION_MISSING_CODE)
 }
 
 pub(crate) fn missing_provider_auth_error() -> ProviderError {
-    ProviderError::new(ModelErrorKind::AuthError, "required provider authentication is missing".to_string())
-        .with_code("provider_auth_missing")
+    ProviderError::new(ModelErrorKind::AuthError, "缺少提供方 API 密钥").with_code("provider_auth_missing")
 }
 
 pub(crate) fn validate_provider_value(value: &str, name: &str) -> Result<(), ProviderError> {
@@ -41,9 +35,7 @@ pub(crate) fn validate_provider_value(value: &str, name: &str) -> Result<(), Pro
         || value.chars().next_back().is_some_and(char::is_whitespace);
     if value.chars().any(|character| matches!(character, '\r' | '\n' | '\0')) || invalid_boundary_whitespace {
         return Err(configuration_error(
-            format!(
-                "invalid model configuration: {name} contains forbidden control characters or boundary whitespace"
-            ),
+            format!("模型配置无效：{name} 不能包含换行、空字符或首尾空白"),
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
@@ -54,13 +46,13 @@ pub(crate) fn validate_base_url(value: &str) -> Result<(), ProviderError> {
     validate_provider_value(value, "base_url")?;
     if value.is_empty() {
         return Err(configuration_error(
-            "invalid model configuration: base_url must not be empty",
+            "模型配置无效：base_url 不能为空",
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
     let url = reqwest::Url::parse(value).map_err(|_| {
         configuration_error(
-            "invalid model configuration: base_url must be an absolute URL",
+            "模型配置无效：base_url 须填写完整的网址",
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         )
     })?;
@@ -72,7 +64,7 @@ pub(crate) fn validate_base_url(value: &str) -> Result<(), ProviderError> {
         || url.fragment().is_some()
     {
         return Err(configuration_error(
-            "invalid model configuration: base_url must be an http/https URL with a host, path only, and no credentials, query, or fragment",
+            "模型配置无效：base_url 须使用 http/https 并包含主机，只能附带路径，不能包含用户名、密码、查询参数或片段",
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }

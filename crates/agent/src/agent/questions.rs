@@ -41,11 +41,8 @@ impl UserQuestions {
             return Err("请回答所有问题。".into());
         }
         for question in &waiting.request.questions {
-            let matching: Vec<_> = answers.iter().filter(|answer| answer.id == question.id).collect();
-            if matching.len() != 1 {
-                return Err("答案与问题不匹配。".into());
-            }
-            let answer = matching[0];
+            let answer =
+                answers.iter().find(|answer| answer.id == question.id).ok_or("答案与问题不匹配。")?;
             if answer.skipped {
                 if !answer.selected.is_empty() || !answer.text.is_empty() {
                     return Err("跳过的问题不能同时包含答案。".into());

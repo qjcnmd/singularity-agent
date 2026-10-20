@@ -98,12 +98,7 @@ impl SkillCatalog {
             root.join(".agents/skills"),
             home.join("skills"),
         ];
-        // 只有取自默认位置的数据根才和真实用户主目录共享技能：显式指定 SINGULARITY_HOME 的数据
-        // 目录自成一体，哪怕它的路径正好就是默认位置；调用方传入别的 home（评估、测试）时同样不引入。
-        if let Ok(resolved) = crate::resolve_home()
-            && resolved.path == home
-            && let crate::HomeOrigin::Default(os_home) = resolved.origin
-        {
+        if let Some(os_home) = std::env::home_dir() {
             roots.push(os_home.join(".agents/skills"));
         }
         let mut catalog = Self::from_roots(&roots);
@@ -131,8 +126,8 @@ impl SkillCatalog {
                 match entry {
                     Ok(entry) => {
                         let path = entry.path();
-                        // 访问子路径元数据失败时，不能当成「不存在」或「不是目录」：每个检查点都
-                        // 保留真实原因并写进诊断。metadata 跟随符号链接，发现范围与 is_dir() 一致。
+                        // 子路径元数据访问失败不等于「不存在」或「不是目录」，真实原因
+                        // 写进诊断。metadata 跟随符号链接，发现范围与 is_dir() 一致。
                         match path.metadata() {
                             Ok(metadata) if metadata.is_dir() => {
                                 let skill = path.join("SKILL.md");

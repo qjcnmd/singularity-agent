@@ -76,41 +76,10 @@ impl OpenAiProvider {
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     ) -> ProviderCompletion {
         let selection = &self.selected_model;
-        let api_protocol = selection.api_protocol;
-        let provider_name = &self.config.provider_name;
-        let endpoint = match api_protocol {
-            ProviderApiProtocol::Chat => chat_completions_endpoint(&self.config.base_url),
-            ProviderApiProtocol::Responses => responses_endpoint(&self.config.base_url),
-        };
-        let request_payload = match api_protocol {
-            ProviderApiProtocol::Chat => {
-                openai_chat_stream_request_payload(request, selection, provider_name, &endpoint)
-            }
-            ProviderApiProtocol::Responses => {
-                openai_responses_stream_request_payload(request, selection, provider_name, &endpoint)
-            }
-        };
-        let completion = match provider_future(
-            cancellation,
-            "provider_request_send_failed",
-            self.client.post(endpoint).bearer_auth(&self.config.api_key).json(&request_payload).send(),
-        )
-        .await
-        {
-            Ok(response) if response.status().is_success() => {
-                self.read_streamed_response(cancellation, response, on_event).await
-            }
-            Ok(response) => Err(self.read_http_failure(response, cancellation).await),
-            Err(error) => Err(error),
-        };
+        let completion = self.complete_protocol_stream(request, cancellation, on_event).await;
 
         // 即使响应随后因缺少续接材料被拒绝，它上报的用量也已经产生了。
-        let usage = completion
-            .as_ref()
-            .ok()
-            .map(|response| &response.usage)
-            .filter(|usage| usage.usage_present)
-            .cloned();
+        let usage = completion.as_ref().ok().and_then(|response| response.usage.clone());
         let completion = completion.and_then(|response| {
             validate_response_reasoning(&response, selection.requires_reasoning_content_for_tool_calls)?;
             Ok(response)
@@ -118,21 +87,58 @@ impl OpenAiProvider {
         ProviderCompletion { result: completion, usage }
     }
 
-    /// 按本次选择分派到协议模块读取流式响应；解码和终结都在那里完成。
-    async fn read_streamed_response(
+    /// 一次选择协议，让请求编码、端点和响应解码始终配套。
+    async fn complete_protocol_stream(
         &self,
+        request: &ModelTurnRequest,
         cancellation: &CancellationToken,
-        response: reqwest::Response,
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     ) -> Result<ModelTurnResponse, ProviderError> {
         let selection = &self.selected_model;
+        let provider_name = &self.config.provider_name;
         match selection.api_protocol {
             ProviderApiProtocol::Chat => {
-                read_chat_sse_stream(cancellation, response, on_event, &self.config, selection).await
+                let endpoint = chat_completions_endpoint(&self.config.base_url);
+                let payload =
+                    openai_chat_stream_request_payload(request, selection, provider_name, &endpoint);
+                let response = self.send_request(&endpoint, &payload, cancellation).await?;
+                read_chat_sse_stream(cancellation, response, on_event, &self.config, selection, &endpoint)
+                    .await
             }
             ProviderApiProtocol::Responses => {
-                read_responses_sse_stream(cancellation, response, on_event, &self.config, selection).await
+                let endpoint = responses_endpoint(&self.config.base_url);
+                let payload =
+                    openai_responses_stream_request_payload(request, selection, provider_name, &endpoint);
+                let response = self.send_request(&endpoint, &payload, cancellation).await?;
+                read_responses_sse_stream(
+                    cancellation,
+                    response,
+                    on_event,
+                    &self.config,
+                    selection,
+                    &endpoint,
+                )
+                .await
             }
+        }
+    }
+
+    async fn send_request(
+        &self,
+        endpoint: &str,
+        payload: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let response = provider_future(
+            cancellation,
+            "provider_request_send_failed",
+            self.client.post(endpoint).bearer_auth(&self.config.api_key).json(payload).send(),
+        )
+        .await?;
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            Err(self.read_http_failure(response, cancellation).await)
         }
     }
 

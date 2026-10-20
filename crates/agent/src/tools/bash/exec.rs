@@ -1,189 +1,179 @@
-//! bash 工具的执行环：进程树管理、主等待与排空循环，以及退出状态的投影。
+//! 持有进程、作业对象和输出，前台转后台时整体转交，不重新启动命令。
 
-use std::process::ExitStatus;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::time::Duration;
 
-use crate::tools::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
+use singularity_protocol::BackgroundTaskState;
+use tokio::time::{Instant, Interval};
+use tokio_util::sync::CancellationToken;
+
+use crate::tools::registry::{ABORTED_MESSAGE, ToolExecution};
 
 use super::capture::CaptureState;
-use super::job_object;
-use super::pump::pump_output;
+use super::job_object::{self, ManagedChild};
+use super::pump::OutputStreams;
 use super::shell::bash_path;
-use super::spec::{BashArgs, DEFAULT_TIMEOUT_MS};
+use super::spec::BashArgs;
 
-/// 输出分块管道的容量上限。
-const OUTPUT_QUEUE_CAPACITY: usize = 32;
-/// 主等待环和排空阶段的轮询切片：recv_timeout 每隔这么久醒来一次，检查取消、超时与退出。
-const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
-/// 子进程退出后，排空管道里残留输出的宽限时间；超过就停止 pump 并标记为截断。
-const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(2_000);
-/// 后台进程仍握着管道写端、导致输出被截断时给模型看的标记。
-pub(super) const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
-    "[output truncated: a background process is still writing]";
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
+    "[output truncated: a descendant process was still writing when the command exited]";
 
-pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
-    let ExecuteContext { cwd, signal, mut on_update, .. } = ctx;
-    let command = args.command.as_str();
-    let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
-    let shell = match bash_path() {
-        Ok(shell) => shell,
-        Err(error) => return error_result(error),
-    };
-    if signal.is_cancelled() {
-        return error_result(ABORTED_MESSAGE);
+pub(super) enum ProcessEvent {
+    Progress(String),
+    Finished(Outcome),
+}
+
+pub(super) enum Outcome {
+    Exited(i32),
+    Stopped,
+    Failed(String),
+    CleanupFailed(String),
+}
+
+impl Outcome {
+    pub(super) fn state(&self, duration_ms: u64) -> BackgroundTaskState {
+        let finished_at = singularity_core::now_iso();
+        match self {
+            Self::Exited(exit_code) => BackgroundTaskState::Exited {
+                exit_code: *exit_code,
+                finished_at,
+                duration_ms,
+            },
+            Self::Stopped => BackgroundTaskState::Stopped { finished_at, duration_ms },
+            Self::Failed(message) | Self::CleanupFailed(message) => BackgroundTaskState::Failed {
+                message: message.clone(),
+                finished_at,
+                duration_ms,
+            },
+        }
     }
-    let mut managed = match job_object::spawn_in_job(&shell, command, cwd) {
-        Ok(child) => child,
-        Err(error) => {
-            return error_result(format!("failed to spawn shell {shell}: {error}"));
-        }
-    };
-    // spawn_in_job 已把 stdout/stderr 配成管道，take 一定拿到 Some。
-    let stdout = managed.child.stdout.take().expect("bash stdout is piped");
-    let stderr = managed.child.stderr.take().expect("bash stderr is piped");
-    let stop = Arc::new(AtomicBool::new(false));
-    let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
-    let stderr_sender = sender.clone();
-    {
-        let stdout_stop = Arc::clone(&stop);
-        let stderr_stop = Arc::clone(&stop);
-        thread::spawn(move || pump_output(stdout, sender, stdout_stop, "stdout"));
-        thread::spawn(move || pump_output(stderr, stderr_sender, stderr_stop, "stderr"));
+}
+
+pub(super) struct Process {
+    managed: ManagedChild,
+    output: OutputStreams,
+    capture: CaptureState,
+    progress: Interval,
+    started: Instant,
+    deadline: Option<Instant>,
+    timeout_ms: Option<u64>,
+}
+
+impl Process {
+    pub(super) async fn spawn(args: &BashArgs, cwd: &Path) -> Result<Self, String> {
+        let shell = bash_path()?;
+        let started = Instant::now();
+        let mut managed = job_object::spawn_in_job(&shell, &args.command, cwd)
+            .map_err(|error| format!("failed to spawn shell {shell}: {error}"))?;
+        let output = OutputStreams::new(
+            managed.child.stdout().take().expect("bash stdout is piped"),
+            managed.child.stderr().take().expect("bash stderr is piped"),
+        );
+        let mut progress = tokio::time::interval(Duration::from_millis(100));
+        progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let timeout_ms = args.total_timeout_ms();
+        Ok(Self {
+            managed,
+            output,
+            capture: CaptureState::default(),
+            progress,
+            started,
+            deadline: timeout_ms.map(|ms| started + Duration::from_millis(ms)),
+            timeout_ms,
+        })
     }
 
-    let mut state = CaptureState::default();
-    let started = Instant::now();
-    let mut output_errors = Vec::new();
-    let mut readers_drained = false;
-    // 运行阶段：按粗粒度切片等待输出块，每次醒来顺便检查取消与超时。两个泵都 EOF
-    // （Disconnected）只说明管道已关闭，退出状态仍必须从子进程回收，所以之后改成
-    // 纯定时轮询，直到观察到退出。
-    //
-    // 这个循环只确定结束原因：正常退出、取消、超时、输出错误和等待错误各自保持
-    // 区别；离开循环之后再统一终止、回收，并生成一次结果。
-    let outcome = loop {
-        if !readers_drained {
-            match receiver.recv_timeout(OUTPUT_POLL_INTERVAL) {
-                Ok(Ok(chunk)) => state.ingest(&chunk),
-                Ok(Err(error)) => {
-                    // 活动阶段读到错误就直接停掉命令；排空阶段的读错另行汇总处理。
-                    break Err(error.to_string());
-                }
-                Err(RecvTimeoutError::Disconnected) => readers_drained = true,
-                Err(RecvTimeoutError::Timeout) => {}
-            }
-        } else {
-            thread::sleep(OUTPUT_POLL_INTERVAL);
-        }
-        publish_output(&mut state, &mut on_update);
-        if signal.is_cancelled() {
-            break Err(ABORTED_MESSAGE.to_string());
-        }
-        if started.elapsed() >= Duration::from_millis(timeout_ms) {
-            break Err(format!(
-                "Command timed out after {timeout_ms} ms and was terminated; the output above is what \
-                 it produced before that. Re-run with a larger timeout_ms if the work needs \
-                 more time, or narrow the command."
-            ));
-        }
-        match managed.child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => {}
-            // 观察失败只是一种结束原因：它和其他非正常结束共用后面的回收与输出收尾，
-            // 已捕获的输出不会在错误分支上被丢掉。
-            Err(error) => break Err(format!("failed to wait for the command process: {error}")),
-        }
-    };
-    // 进程未正常退出时（超时或取消），终止并回收 Job 关联的整棵子进程树
-    let cleanup_failures = if outcome.is_ok() {
-        Vec::new()
-    } else {
-        managed.reclaim()
-    };
-    // 排空管道中残留的输出；若后台派生的孤儿进程仍持续占用写端，超过宽限期后截断停止
-    let mut output_truncated_by_background = false;
-    if !readers_drained {
-        let grace_deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
-        let mut converge_deadline: Option<Instant> = None;
+    pub(super) async fn next(&mut self, signal: &CancellationToken) -> ProcessEvent {
         loop {
-            let wait = match converge_deadline {
-                Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
-                    Some(remaining) => remaining.min(OUTPUT_POLL_INTERVAL),
-                    None => break,
-                },
-                None => OUTPUT_POLL_INTERVAL,
-            };
-            match receiver.recv_timeout(wait) {
-                Ok(Ok(chunk)) => state.ingest(&chunk),
-                Ok(Err(error)) => output_errors.push(error),
-                Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => {}
-            }
-            publish_output(&mut state, &mut on_update);
-            if converge_deadline.is_none() && Instant::now() >= grace_deadline {
-                stop.store(true, Ordering::SeqCst);
-                converge_deadline = Some(Instant::now() + OUTPUT_DRAIN_GRACE);
-                output_truncated_by_background = true;
-            }
-        }
-    }
-
-    let (mut content, spill_note) = state.finish();
-    // 附加失败信息（输出读取错误与回收失败）排在结束原因之后，只补充事实。
-    let mut auxiliary_failures: Vec<String> =
-        output_errors.into_iter().map(|error| error.to_string()).collect();
-    auxiliary_failures.extend(cleanup_failures);
-    let is_error = append_outcome(&mut content, outcome, &auxiliary_failures);
-    if output_truncated_by_background {
-        // 后台进程还握着管道写端；命令本身已经结束，所以这里的截断只是信息提示，不是错误。
-        append_status(&mut content, OUTPUT_TRUNCATED_BACKGROUND_NOTE);
-    }
-    // 完整输出有没有保存成功，与命令的退出状态无关；保存失败就保留原因，避免误报一个完整路径。
-    if let Some(note) = spill_note {
-        append_status(&mut content, &note);
-    }
-    let mut execution = ToolExecution::text(content);
-    execution.is_error = is_error;
-    execution
-}
-
-/// 把结束原因和附加失败信息写进结果文本；返回本次调用是不是失败结果。
-fn append_outcome(
-    content: &mut String,
-    outcome: Result<ExitStatus, String>,
-    auxiliary_failures: &[String],
-) -> bool {
-    let mut is_error = false;
-    match outcome {
-        Err(error) => {
-            append_status(content, &error);
-            is_error = true;
-        }
-        Ok(status) => {
-            if status.success() {
-                if content.is_empty() {
-                    *content = "(no output)".to_string();
+            tokio::select! {
+                biased;
+                _ = signal.cancelled() => return ProcessEvent::Finished(Outcome::Stopped),
+                _ = wait_deadline(self.deadline) => return ProcessEvent::Finished(Outcome::Failed(format!(
+                    "Command timed out after {} ms and was terminated", self.timeout_ms.expect("deadline has timeout")
+                ))),
+                // 先等主进程；finish 再终止并等待整棵进程树。
+                status = self.managed.child.inner_mut().wait() => return ProcessEvent::Finished(match status {
+                    Ok(status) => match status.code() {
+                        Some(code) => Outcome::Exited(code),
+                        None => Outcome::Failed("Command terminated without an exit code".to_string()),
+                    },
+                    Err(error) => Outcome::Failed(format!("failed to wait for the command process: {error}")),
+                }),
+                _ = self.progress.tick() => {},
+                chunk = self.output.next(), if self.output.is_open() => match chunk {
+                    Some(Ok(chunk)) => tokio::task::block_in_place(|| self.capture.ingest(&chunk)),
+                    Some(Err(error)) => return ProcessEvent::Finished(Outcome::Failed(error.to_string())),
+                    None => {},
                 }
-            } else {
-                append_status(content, &describe_exit(status));
-                is_error = true;
+            }
+            if let Some(output) = self.capture.current_output() {
+                return ProcessEvent::Progress(output);
             }
         }
     }
-    for failure in auxiliary_failures {
-        append_status(content, failure);
-        is_error = true;
+
+    /// 回收整树后才给出终态；主进程正常退出也不能遗留后代。
+    pub(super) async fn finish(mut self, mut outcome: Outcome) -> (ToolExecution, Outcome) {
+        let failures = self.managed.reclaim().await;
+        let drain = tokio::time::sleep(OUTPUT_DRAIN_GRACE);
+        tokio::pin!(drain);
+        let mut truncated = false;
+        let mut failures = failures;
+        while self.output.is_open() {
+            tokio::select! {
+                biased;
+                _ = &mut drain => { truncated = true; break; }
+                chunk = self.output.next() => match chunk {
+                    Some(Ok(chunk)) => tokio::task::block_in_place(|| self.capture.ingest(&chunk)),
+                    Some(Err(error)) => failures.push(error.to_string()),
+                    None => {},
+                }
+            }
+        }
+        if !failures.is_empty() {
+            let primary = match &outcome {
+                Outcome::Failed(message) => format!("{message}; "),
+                _ => String::new(),
+            };
+            outcome = Outcome::CleanupFailed(format!("{primary}{}", failures.join("; ")));
+        }
+        let (mut content, spill_note) = tokio::task::block_in_place(|| self.capture.finish());
+        let is_error = match &outcome {
+            Outcome::Exited(0) => false,
+            Outcome::Exited(code) => {
+                append_status(&mut content, &format!("Command exited with code {code}"));
+                true
+            }
+            Outcome::Stopped => {
+                append_status(&mut content, ABORTED_MESSAGE);
+                true
+            }
+            Outcome::Failed(message) | Outcome::CleanupFailed(message) => {
+                append_status(&mut content, message);
+                true
+            }
+        };
+        if content.is_empty() {
+            content = "(no output)".to_string();
+        }
+        if truncated {
+            append_status(&mut content, OUTPUT_TRUNCATED_BACKGROUND_NOTE);
+        }
+        if let Some(note) = spill_note {
+            append_status(&mut content, &note);
+        }
+        let mut execution = ToolExecution::text(content);
+        execution.is_error = is_error;
+        execution.duration_ms = Some(singularity_core::duration_millis(self.started.elapsed()));
+        (execution, outcome)
     }
-    is_error
 }
 
-fn publish_output(state: &mut CaptureState, on_update: &mut dyn FnMut(String)) {
-    if let Some(output) = state.current_output() {
-        on_update(output);
+async fn wait_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -192,13 +182,4 @@ fn append_status(content: &mut String, status: &str) {
         content.push_str("\n\n");
     }
     content.push_str(status);
-}
-
-/// 把失败的退出状态转成给模型看的错误文案。
-fn describe_exit(status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("Command exited with code {code}"),
-        // 没有退出码说明进程被信号终止，而不是正常退出。
-        None => "Command terminated".to_string(),
-    }
 }
