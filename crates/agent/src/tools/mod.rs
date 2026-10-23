@@ -6,6 +6,7 @@
 
 mod bash;
 mod mcp;
+mod output;
 mod question;
 mod read;
 mod registry;

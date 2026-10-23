@@ -1,9 +1,9 @@
 //! 解析提供方返回的模型能力；未知取值保持未知，不把 reasoning 布尔值当作档位列表。
 use super::validate_identifier;
 use serde_json::Value;
-use singularity_protocol::{DiscoveredModel, ProviderApiProtocol, ReasoningVariant};
+use singularity_protocol::DiscoveredModel;
 
-pub(super) fn metadata(id: &str, entry: &Value, protocol: ProviderApiProtocol) -> DiscoveredModel {
+pub(super) fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
     let capacity = |paths: &[&str]| {
         paths
             .iter()
@@ -24,12 +24,9 @@ pub(super) fn metadata(id: &str, entry: &Value, protocol: ProviderApiProtocol) -
         // default 只是占位值，off 是本仓约定的关闭档位，两者都不作为可选档位。
         if !matches!(effort, "default" | "off")
             && validate_identifier(effort, "reasoning effort").is_ok()
-            && !reasoning_variants.iter().any(|variant: &ReasoningVariant| variant.id == effort)
+            && !reasoning_variants.iter().any(|variant: &String| variant == effort)
         {
-            reasoning_variants.push(ReasoningVariant {
-                id: effort.to_string(),
-                wire_effort: Some(effort.to_string()),
-            });
+            reasoning_variants.push(effort.to_string());
         }
     }
     DiscoveredModel {
@@ -37,8 +34,5 @@ pub(super) fn metadata(id: &str, entry: &Value, protocol: ProviderApiProtocol) -
         max_context_tokens: capacity(&["/context_length", "/limit/context"]),
         max_output_tokens: capacity(&["/limit/output", "/top_provider/max_completion_tokens"]),
         reasoning_variants,
-        requires_reasoning_content_for_tool_calls: (protocol == ProviderApiProtocol::Chat
-            && entry.pointer("/interleaved/field").and_then(Value::as_str) == Some("reasoning_content"))
-        .then_some(true),
     }
 }

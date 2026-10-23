@@ -8,7 +8,7 @@ use time::format_description::well_known::Rfc2822;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{ModelErrorKind, ProviderError, provider_error_kind_for_http_status};
-use crate::{HTTP_STATUS_CONFLICT, MAX_RETRY_AFTER_MS, PROVIDER_TIMEOUT_SECONDS};
+use crate::{HTTP_STATUS_CONFLICT, PROVIDER_TIMEOUT_SECONDS};
 
 pub(crate) fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
     headers
@@ -22,7 +22,6 @@ pub(crate) fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
                 .and_then(|value| value.to_str().ok())
                 .and_then(parse_retry_after_value)
         })
-        .map(|delay| delay.min(Duration::from_millis(MAX_RETRY_AFTER_MS)))
 }
 
 fn parse_retry_after_value(value: &str) -> Option<Duration> {
@@ -54,18 +53,18 @@ pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
         .read_timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
         .user_agent(format!("singularity-agent/{}", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|error| provider_transport_error(error, "provider_client_initialization_failed"))?;
+        .map_err(provider_transport_error)?;
     Ok(CLIENT.get_or_init(|| client).clone())
 }
 
 /// 根据非 2xx HTTP 状态码构造 ProviderError。
 pub(crate) fn provider_error_from_http_status(status: u16) -> ProviderError {
     let kind = match status {
-        HTTP_STATUS_CONFLICT => ModelErrorKind::RateLimited,
+        HTTP_STATUS_CONFLICT => ModelErrorKind::Temporary,
         _ => provider_error_kind_for_http_status(status),
     };
     let message = format!("Provider returned HTTP {status}.");
-    ProviderError::new(kind, message).with_code("provider_http_status")
+    ProviderError::new(kind, message)
 }
 
 /// 提取网络传输异常的最内层错误原因；剥离可能含凭据的 URL，并限制最大长度。
@@ -78,20 +77,17 @@ pub(crate) fn transport_error_source(error: reqwest::Error) -> String {
     crate::error::bounded_provider_error_diagnostic(&source.to_string())
 }
 
-fn provider_transport_error(error: reqwest::Error, code: &'static str) -> ProviderError {
-    let kind = crate::error::provider_error_kind_for_transport(&error);
+fn provider_transport_error(error: reqwest::Error) -> ProviderError {
     let message = format!("provider transport failed: {}", transport_error_source(error));
-    ProviderError::new(kind, message).with_code(code)
+    ProviderError::new(ModelErrorKind::Temporary, message)
 }
 
 pub(crate) fn provider_cancelled_error() -> ProviderError {
     ProviderError::new(ModelErrorKind::Cancelled, "provider request cancelled")
-        .with_code("provider_request_cancelled")
 }
 
 pub(crate) async fn provider_future<F, T>(
     cancellation: &CancellationToken,
-    error_code: &'static str,
     future: F,
 ) -> Result<T, ProviderError>
 where
@@ -103,6 +99,6 @@ where
     tokio::select! {
         _ = cancellation.cancelled() => Err(provider_cancelled_error()),
         result = future => result
-            .map_err(|error| provider_transport_error(error, error_code)),
+            .map_err(provider_transport_error),
     }
 }

@@ -5,8 +5,10 @@
 
 use singularity_protocol::FileCandidate;
 
-/// 查找路径中包含 query 的候选，取得调用者所需数量后停止遍历。
-pub(crate) fn search_files(directory: &str, query: &str, limit: usize) -> Result<Vec<FileCandidate>, String> {
+const MAX_FILE_CANDIDATES: usize = 12;
+
+/// 查找路径中包含 query 的候选，找到 12 项后停止遍历。
+pub(crate) fn search_files(directory: &str, query: &str) -> Result<Vec<FileCandidate>, String> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
         return Ok(Vec::new());
@@ -15,7 +17,7 @@ pub(crate) fn search_files(directory: &str, query: &str, limit: usize) -> Result
     let mut pending = vec![root.as_path().to_path_buf()];
     let mut candidates = Vec::new();
     while let Some(directory) = pending.pop() {
-        if candidates.len() >= limit {
+        if candidates.len() >= MAX_FILE_CANDIDATES {
             break;
         }
         let directory_entries = match std::fs::read_dir(&directory) {
@@ -39,7 +41,7 @@ pub(crate) fn search_files(directory: &str, query: &str, limit: usize) -> Result
         }
         entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
         for entry in entries {
-            if candidates.len() >= limit {
+            if candidates.len() >= MAX_FILE_CANDIDATES {
                 break;
             }
             let file_type = match entry.file_type() {

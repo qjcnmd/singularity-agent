@@ -1,18 +1,16 @@
 /* 模态框与对话框 */
-.modal-backdrop {
-  position: fixed;
-  z-index: 30;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  padding: 24px;
+.modal::backdrop {
   background: var(--overlay);
   backdrop-filter: blur(4px);
   animation: fade-in 120ms ease-out;
 }
+.modal:not([open]) { display: none; }
 .modal {
   font-size: 13px;
-  width: min(720px, 100%);
+  width: min(720px, calc(100vw - 48px));
+  margin: auto;
+  padding: 0;
+  color: inherit;
   max-height: min(800px, calc(100vh - 48px));
   display: flex;
   flex-direction: column;
@@ -111,6 +109,7 @@
 }
 
 .sg-credential-dot {
+  background: var(--ink-faint);
   border-radius: 50%;
   flex: none;
   width: 8px;
@@ -119,9 +118,6 @@
 }
 .sg-credential-dot-configured {
   background: var(--positive);
-}
-.sg-credential-dot-missing {
-  background: var(--danger);
 }
 .sg-row-actions {
   align-items: center;
@@ -388,7 +384,7 @@
 .reasoning-option:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 .protocol-picker { position: relative; min-width: 0; }
 .protocol-trigger { display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; width: 100%; }
-.protocol-dropdown { position: absolute; top: calc(100% + 6px); left: 0; z-index: 10; width: 100%; }
+.protocol-dropdown { padding: 0; border: 0; overflow: visible; background: transparent; color: inherit; transition: display var(--disclosure-collapse-duration) allow-discrete, overlay var(--disclosure-collapse-duration) allow-discrete; }
 .protocol-dropdown .content-disclosure { border-radius: 12px; box-shadow: var(--shadow-floating); }
 .protocol-options { background: var(--surface); border-radius: 12px; box-shadow: inset 0 0 0 1px var(--line); padding: 5px; }
 .protocol-options button { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 8px; border: 0; border-radius: 7px; color: var(--ink); background: transparent; text-align: left; }
@@ -414,7 +410,7 @@
 .sg-provider-toggle:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; border-radius: 6px; }
 
 @media (max-width: 760px) {
-  .modal-backdrop { padding: 8px; }
+  .modal { max-width: calc(100vw - 16px); }
   .sg-settings-nav { flex-basis: 132px; padding: 12px 8px; }
   .sg-settings-page { padding: 16px; }
 }

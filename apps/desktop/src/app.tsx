@@ -2,6 +2,7 @@ import { actionToastTransition } from './motion'
 import { focusableElements } from './interactions'
 import { SidebarToggle } from './components/SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { ContextPanel } from './components/ContextPanel'
 import { Composer } from './components/Composer'
 import { Conversation } from './components/Conversation'
 import { Settings } from './components/Settings'
@@ -17,6 +18,7 @@ export function App() {
   useLayoutEffect(() => { document.documentElement.dataset.theme = state.theme }, [state.theme])
   useLayoutEffect(() => { document.documentElement.style.setProperty('--message-font-size', `${state.messageFontSize}px`) }, [state.messageFontSize])
   const [compactViewport, setCompactViewport] = useState(() => window.matchMedia('(max-width: 1000px)').matches)
+  const [detailTab, setDetailTab] = useState<'context' | 'background'>('context')
   const detailOpener = useRef<HTMLButtonElement | null>(null)
   const backgroundToggle = useRef<HTMLButtonElement>(null)
   const backgroundPanel = useRef<HTMLElement>(null)
@@ -83,11 +85,12 @@ export function App() {
           }}
         />
       <MainContent compactViewport={compactViewport} onOpenBackground={button => {
+        setDetailTab('background')
         detailOpener.current = button
         appStore.setBackgroundOpen(true)
         requestAnimationFrame(() => backgroundPanel.current?.querySelector<HTMLButtonElement>('button')?.focus())
       }} />
-      <aside id="background-panel" className={`background-panel${state.backgroundOpen ? ' is-open' : ''}`} aria-label="后台命令" aria-hidden={!state.backgroundOpen} inert={!state.backgroundOpen} ref={backgroundPanel}>
+      <aside id="background-panel" className={`background-panel${state.backgroundOpen ? ' is-open' : ''}`} aria-label="运行状态" aria-hidden={!state.backgroundOpen} inert={!state.backgroundOpen} ref={backgroundPanel}>
         <ResizeSeparator side="right" value={state.backgroundWidth} onChange={(value) => appStore.setBackgroundWidth(value)} />
         <AnimatePresence initial={false} mode="wait">
           {state.backgroundOpen && (
@@ -99,8 +102,21 @@ export function App() {
               exit={{ opacity: 0 }}
               transition={panelTransition}
             >
-              <h2 className="detail-heading">后台命令</h2>
-              <div className="detail-section"><BackgroundTasks /></div>
+              <h2 className="detail-heading">运行状态</h2>
+              <div className="detail-tabs" role="tablist" aria-label="运行状态分类">
+                {(['context', 'background'] as const).map(tab => <button key={tab} type="button" role="tab" id={`detail-tab-${tab}`}
+                  aria-selected={detailTab === tab} aria-controls="detail-body" tabIndex={detailTab === tab ? 0 : -1}
+                  onClick={() => setDetailTab(tab)} onKeyDown={event => {
+                    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+                    event.preventDefault()
+                    const next = tab === 'context' ? 'background' : 'context'
+                    setDetailTab(next)
+                    document.getElementById(`detail-tab-${next}`)?.focus()
+                  }}>{tab === 'context' ? '上下文' : '后台命令'}</button>)}
+              </div>
+              <div id="detail-body" className="detail-section" role="tabpanel" aria-labelledby={`detail-tab-${detailTab}`}>
+                {detailTab === 'context' ? <ContextPanel /> : <BackgroundTasks />}
+              </div>
             </motion.div>
           )}
         </AnimatePresence>
@@ -119,7 +135,7 @@ const MainContent = memo(function MainContent({ compactViewport, onOpenBackgroun
   const items = useMemo(() => buildTimeline(state.session, state.bootstrap?.userHome), [state.session, state.bootstrap?.userHome])
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspaceSessions = appStore.sessions()
-  // 页头与侧栏读同一份组级派生；任务尚未进入项目列表时它自成一例，只保留用户命名或“新任务”。
+  // 页头和侧栏用同一套标题规则；任务还不在项目列表里时，只显示用户起的名字或“新任务”。
   const sessionTitle = state.session === null ? '选择一个任务' : sessionTitles(workspaceSessions)(
     workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.summary,
   )
@@ -171,7 +187,7 @@ function ResizeSeparator({ value, onChange, side = 'left' }: { value: number; on
     <div
       className={`resize-separator ${side === 'left' ? 'separator-sidebar' : 'separator-background'}`}
       role="separator"
-      aria-label={side === 'left' ? '调整侧栏宽度' : '调整后台命令侧栏宽度'}
+      aria-label={side === 'left' ? '调整侧栏宽度' : '调整运行状态侧栏宽度'}
       aria-orientation="vertical"
       aria-valuenow={value}
       tabIndex={0}

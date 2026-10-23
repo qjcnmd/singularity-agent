@@ -1,10 +1,10 @@
-//! 同步提问：模型参数在准入时校验，实际等待由 Agent 的回合控制面执行。
+//! ask_user_question 工具的参数和说明；等待回答由 Agent 的 UserQuestions 负责。
 
 use serde::Deserialize;
 use serde_json::json;
 use singularity_protocol::UserQuestion;
 
-use super::registry::{ToolExecution, ToolSpec, error_result};
+use super::registry::{ToolExecution, error_result};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,12 +38,11 @@ impl QuestionArgs {
     }
 }
 
-pub(crate) fn spec() -> ToolSpec {
-    ToolSpec {
-        name: "ask_user_question",
-        snippet: "Ask the user a question and wait for their answer",
-        description: "Ask for missing information or a decision that only the user can provide. Execution waits until the user submits answers or stops the task. Ask concise, self-contained questions. Options are optional; users can always enter their own text. Use multiSelect for choices that can coexist. Do not use this tool for facts you can inspect yourself or routine implementation decisions. Put a recommended option first and mark its label when useful.",
-        parameters: json!({
+pub(crate) fn spec() -> singularity_model::ModelToolSchema {
+    singularity_model::ModelToolSchema {
+        name: "ask_user_question".to_string(),
+        description: "Ask for missing information or a decision that only the user can provide. Execution waits until the user submits answers or stops the task. Ask concise, self-contained questions. Options are optional; users can always enter their own text. Use multiSelect for choices that can coexist. Do not use this tool for facts you can inspect yourself or routine implementation decisions. Put a recommended option first and mark its label when useful.".to_string(),
+        parameters_schema: json!({
             "type": "object", "additionalProperties": false, "required": ["questions"],
             "properties": { "questions": { "type": "array", "minItems": 1, "items": {
                 "type": "object", "additionalProperties": false, "required": ["id", "question"],

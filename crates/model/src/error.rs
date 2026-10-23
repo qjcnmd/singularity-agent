@@ -1,16 +1,12 @@
-use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
 
-/// 从提供方边界保留下来的具体失败类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+/// 提供方失败的处理类别，具体原因保存在错误文字里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelErrorKind {
     Cancelled,
-    NetworkError,
-    Timeout,
-    RateLimited,
-    ProviderOverloaded,
+    /// 可自动重试的网络故障、超时、限流和服务端故障。
+    Temporary,
     AuthError,
     InvalidRequest,
     ContextLengthExceeded,
@@ -19,23 +15,11 @@ pub enum ModelErrorKind {
     UnknownProviderError,
 }
 
-impl std::fmt::Display for ModelErrorKind {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&singularity_protocol::wire_word(self))
-    }
-}
-
-/// 提供方配置没有通过校验。
-pub(crate) const PROVIDER_CONFIGURATION_INVALID_CODE: &str = "provider_configuration_invalid";
-/// 提供方配置文件或默认模型选择不存在。
-pub(crate) const PROVIDER_CONFIGURATION_MISSING_CODE: &str = "provider_configuration_missing";
-
 /// 提供方失败，含错误分类、可显示的诊断信息和重试等待时间。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderError {
     pub kind: ModelErrorKind,
     pub message: String,
-    pub code: Option<String>,
     /// 提供方要求的自动重试前最小等待时间。
     pub retry_after: Option<Duration>,
 }
@@ -54,30 +38,18 @@ impl ProviderError {
         Self {
             kind,
             message: message.into(),
-            code: None,
             retry_after: None,
         }
     }
 
-    /// 附上一个稳定错误码，供事件和诊断使用。
-    pub fn with_code(mut self, code: impl Into<String>) -> Self {
-        self.code = Some(code.into());
-        self
-    }
-
     /// 构造带分类的诊断错误，把具体原因并进各入口实际显示的错误文本里。
-    pub(crate) fn diagnostic(
-        kind: ModelErrorKind,
-        message: impl Into<String>,
-        code: impl Into<String>,
-        details: Vec<String>,
-    ) -> Self {
+    pub(crate) fn diagnostic(kind: ModelErrorKind, message: impl Into<String>, details: Vec<String>) -> Self {
         let mut message = message.into();
         if !details.is_empty() {
             message.push_str(": ");
             message.push_str(&details.join(", "));
         }
-        Self::new(kind, message).with_code(code)
+        Self::new(kind, message)
     }
 
     /// 提供方是否明确拒绝了这次请求的上下文规模（会触发强制压缩）。
@@ -87,11 +59,7 @@ impl ProviderError {
 
     /// 判断这个错误是否允许自动重发同一请求。
     pub fn is_retryable(&self) -> bool {
-        use ModelErrorKind::*;
-        matches!(
-            self.kind,
-            RateLimited | NetworkError | Timeout | ProviderOverloaded | UnknownProviderError
-        )
+        self.kind == ModelErrorKind::Temporary
     }
 
     /// 保留提供方要求的延迟，交给所属的重试策略使用。
@@ -103,7 +71,7 @@ impl ProviderError {
 
 /// 提供方错误响应体里表示上下文超限的线上错误码；只做全等匹配。
 const PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
-/// 限流类线上错误码：仍算可重试，和按状态码归类的结果一致（RateLimited）。
+/// 提供方明确返回的限流错误码，允许自动重试。
 const PROVIDER_RATE_LIMIT_EXCEEDED_CODE: &str = "rate_limit_exceeded";
 /// 配额耗尽的线上错误码：重试没有意义，归到认证/账务这一类不可重试的错误。
 const PROVIDER_INSUFFICIENT_QUOTA_CODE: &str = "insufficient_quota";
@@ -114,7 +82,7 @@ pub(crate) const MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS: usize = 256;
 #[derive(Default)]
 pub(crate) struct ProviderErrorBodyFields {
     pub(crate) code: Option<String>,
-    /// 线上的 error.type：和 code 一样是服务端原始事实，不拿它猜分类，但保留下来。
+    /// 响应里的 error.type；不用于分类，只附在错误消息里便于排查。
     pub(crate) wire_type: Option<String>,
     pub(crate) message: Option<String>,
 }
@@ -131,14 +99,9 @@ pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
     }
 }
 
-/// 服务端原始协议事实的有限条目：HTTP 状态和线上 code/type 都留下，不改变 kind/code 的分类
-/// 结果；空字段不产生条目，正文只取长度有限的诊断，不保存原始响应体或凭据。HTTP 和 SSE
-/// 两条入口共用这一套保留规则。
-pub(crate) fn provider_wire_facts(status: Option<u16>, fields: &ProviderErrorBodyFields) -> Vec<String> {
+/// 提供方返回的错误码和类型，截断后附在错误消息里；HTTP 和 SSE 两条入口共用。
+pub(crate) fn provider_wire_facts(fields: &ProviderErrorBodyFields) -> Vec<String> {
     let mut facts = Vec::new();
-    if let Some(status) = status {
-        facts.push(format!("HTTP {status}"));
-    }
     if let Some(code) = fields.code.as_deref().filter(|code| !code.is_empty()) {
         facts.push(format!("provider_error_code={}", bounded_provider_error_diagnostic(code)));
     }
@@ -148,8 +111,8 @@ pub(crate) fn provider_wire_facts(status: Option<u16>, fields: &ProviderErrorBod
     facts
 }
 
-/// 解析非 2xx 响应体的 {"error": {"code": "...", "message": "..."}} 形状；顶层没有
-/// error 或 error 不是对象，都当作没提供。
+/// 解析非 2xx 响应体中的 {"error": {"code": "...", "message": "..."}}；没有 error
+/// 或 error 不是对象时，各字段都为空。
 pub(crate) fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields {
     serde_json::from_slice::<Value>(body)
         .ok()
@@ -161,29 +124,19 @@ pub(crate) fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields 
 pub(crate) fn provider_error_kind_for_code(code: Option<&str>) -> Option<ModelErrorKind> {
     match code {
         Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE) => Some(ModelErrorKind::ContextLengthExceeded),
-        Some(PROVIDER_RATE_LIMIT_EXCEEDED_CODE) => Some(ModelErrorKind::RateLimited),
+        Some(PROVIDER_RATE_LIMIT_EXCEEDED_CODE) => Some(ModelErrorKind::Temporary),
         Some(PROVIDER_INSUFFICIENT_QUOTA_CODE) => Some(ModelErrorKind::AuthError),
         _ => None,
     }
 }
 
-pub(crate) fn provider_error_kind_for_transport(error: &reqwest::Error) -> ModelErrorKind {
-    if error.is_timeout() {
-        ModelErrorKind::Timeout
-    } else {
-        ModelErrorKind::NetworkError
-    }
-}
-
-/// HTTP 状态到错误类别的共同定义：401/403 认证、408 超时、429 限流、其余 4xx 算输入错误、
-/// 5xx 算提供方过载，其他算未知。调用方只对确实不一样的状态码单独处理。
+/// 超时、限流和服务端故障共用重试策略，具体状态码保留在错误文字里。
 pub(crate) fn provider_error_kind_for_http_status(status: u16) -> ModelErrorKind {
     match status {
         crate::HTTP_STATUS_UNAUTHORIZED | crate::HTTP_STATUS_FORBIDDEN => ModelErrorKind::AuthError,
-        crate::HTTP_STATUS_REQUEST_TIMEOUT => ModelErrorKind::Timeout,
-        crate::HTTP_STATUS_RATE_LIMITED => ModelErrorKind::RateLimited,
+        crate::HTTP_STATUS_REQUEST_TIMEOUT | crate::HTTP_STATUS_RATE_LIMITED => ModelErrorKind::Temporary,
         status if (400..=499).contains(&status) => ModelErrorKind::InvalidRequest,
-        status if (500..=599).contains(&status) => ModelErrorKind::ProviderOverloaded,
+        status if (500..=599).contains(&status) => ModelErrorKind::Temporary,
         _ => ModelErrorKind::UnknownProviderError,
     }
 }
@@ -227,15 +180,14 @@ pub(crate) fn bounded_wire_detail(fields: &ProviderErrorBodyFields) -> Option<St
 
 /// 构造内嵌的提供方错误（来自流内事件或 200 载荷）：已知线上错误码映射到对应的
 /// kind（上下文溢出触发强制压缩、限流保持可重试、配额归入不可重试的认证类），
-/// 未知码保持 UnknownProviderError（可重试），但带上提供方原文和码，不静默丢弃。
+/// 未知码保持 UnknownProviderError，不自动重试，并带上提供方原文和码。
 pub(crate) fn provider_embedded_error(
     fields: &ProviderErrorBodyFields,
     fallback_message: &str,
-    diagnostic_code: &'static str,
 ) -> ProviderError {
     let kind =
         provider_error_kind_for_code(fields.code.as_deref()).unwrap_or(ModelErrorKind::UnknownProviderError);
     let message = bounded_wire_detail(fields).unwrap_or_else(|| fallback_message.to_string());
-    let details = provider_wire_facts(None, fields);
-    ProviderError::diagnostic(kind, message, diagnostic_code, details)
+    let details = provider_wire_facts(fields);
+    ProviderError::diagnostic(kind, message, details)
 }

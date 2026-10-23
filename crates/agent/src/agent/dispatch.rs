@@ -1,21 +1,15 @@
-//! 全批工具均允许并行时，每组最多运行八个；包含独占工具时整批顺序执行。
-//! 进度实时发布，结果按模型调用顺序保存，随后开始下一组。
+//! 最多同时运行八个工具，完成一个就保存并补入下一个；提问等待其他工具结束。
 
-use super::{Agent, AgentEvent, Result};
+use super::{Agent, Result, TurnEvent};
 use crate::message::tool_result_message;
 use crate::session::lock_writer;
 use crate::tools::{PreparedTool, ToolExecution, error_result};
 use singularity_model::ModelToolCall;
 use std::{sync::Arc, time::Instant};
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 const MAX_PARALLEL_TOOLS: usize = 8;
-
-enum WorkerEvent {
-    Update { item_id: String, text: String },
-    Ended { index: usize, execution: ToolExecution },
-}
 
 impl Agent {
     pub(super) async fn dispatch_tools(
@@ -24,115 +18,145 @@ impl Agent {
         assistant_result_entry_id: &str,
         length_truncated: bool,
         cancellation: &CancellationToken,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
+        on_event: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<()> {
-        let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let prepared: Vec<_> = tool_calls
+        let cwd = lock_writer(&self.requests.session).cwd().to_path_buf();
+        let mut pending = tool_calls
             .into_iter()
             .enumerate()
             .map(|(index, call)| {
-                let prepared = if length_truncated {
+                let tool = if length_truncated {
                     Err(error_result(
                         "tool execution failed: model output was truncated before the tool call completed",
                     ))
                 } else {
-                    self.registry.preflight(&call.tool_name, &call.arguments)
+                    self.requests.registry.preflight(&call.tool_name, &call.arguments)
                 };
-                (crate::session::tool_item_id(assistant_result_entry_id, index), call, prepared)
+                (crate::session::tool_item_id(assistant_result_entry_id, index), call, tool)
             })
-            .collect();
-        let parallelism = if prepared
-            .iter()
-            .all(|(_, _, tool)| tool.as_ref().map_or(true, PreparedTool::supports_parallel))
-        {
-            MAX_PARALLEL_TOOLS
-        } else {
-            1
-        };
-        let mut pending = prepared.into_iter();
+            .peekable();
+        let mut workers = JoinSet::new();
+        let (progress, mut updates) = mpsc::channel::<(String, String)>(32);
+        let signal = cancellation.child_token();
+        let mut save_error = None;
         loop {
-            let batch: Vec<_> = pending.by_ref().take(parallelism).collect();
-            if batch.is_empty() {
-                break;
-            }
-            let (sender, mut receiver) = mpsc::channel(32);
-            let mut results: Vec<Option<ToolExecution>> = (0..batch.len()).map(|_| None).collect();
-            let mut identities = Vec::with_capacity(batch.len());
-            for (index, (item_id, call, prepared)) in batch.into_iter().enumerate() {
-                identities.push((item_id.clone(), call.tool_call_id));
-                on_event(AgentEvent::ToolExecutionStarted {
-                    item_id: item_id.clone(),
-                    tool_name: call.tool_name,
-                    arguments: call.arguments,
+            while save_error.is_none() && workers.len() < MAX_PARALLEL_TOOLS {
+                let Some((_, _, next)) = pending.peek() else { break };
+                if matches!(next, Ok(PreparedTool::Question(_))) && !workers.is_empty() {
+                    break;
+                }
+                let (item_id, call, tool) = pending.next().expect("pending tool exists");
+                on_event(TurnEvent::ItemUpdated {
+                    item: singularity_protocol::HistoryItem::Tool {
+                        id: item_id.clone(),
+                        name: call.tool_name,
+                        args: call.arguments,
+                        result: None,
+                        status: singularity_protocol::ToolStatus::Running,
+                    },
                 });
-                let prepared = if cancellation.is_cancelled() {
+                let tool = if signal.is_cancelled() {
                     Err(error_result(crate::tools::ABORTED_MESSAGE))
                 } else {
-                    prepared
+                    tool
                 };
-                match prepared {
-                    Err(execution) => results[index] = Some(execution),
-                    Ok(PreparedTool::Question(args)) => {
-                        let started = Instant::now();
-                        let mut execution = self
-                            .questions
-                            .ask(
-                                singularity_protocol::PendingQuestion { item_id, questions: args.questions },
-                                cancellation,
-                                on_event,
-                            )
-                            .await;
-                        execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
-                        results[index] = Some(execution);
+                if let Ok(PreparedTool::Question(args)) = tool {
+                    let started = Instant::now();
+                    let mut execution = self
+                        .questions
+                        .ask(
+                            singularity_protocol::PendingQuestion {
+                                item_id: item_id.clone(),
+                                questions: args.questions,
+                            },
+                            &signal,
+                            on_event,
+                        )
+                        .await;
+                    execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
+                    if let Err(error) =
+                        self.finish_tool(item_id, call.tool_call_id, execution, on_event).await
+                    {
+                        save_error = Some(error);
+                        signal.cancel();
                     }
-                    Ok(tool) => {
-                        let sender = sender.clone();
-                        let context = crate::tools::ToolContext {
-                            cwd: cwd.clone(),
-                            signal: cancellation.clone(),
-                            bash_tasks: Arc::clone(&self.execution.bash_tasks),
-                            turn_id: self.execution.turn_id.clone(),
-                            item_id: item_id.clone(),
-                        };
-                        tokio::spawn(async move {
-                            let started = Instant::now();
-                            let progress = sender.clone();
+                    continue;
+                }
+                let context = crate::tools::ToolContext {
+                    cwd: cwd.clone(),
+                    signal: signal.clone(),
+                    bash_tasks: Arc::clone(&self.bash_tasks),
+                };
+                let progress = progress.clone();
+                workers.spawn(async move {
+                    let started = Instant::now();
+                    let execution = match tool {
+                        Err(execution) => execution,
+                        Ok(tool) => {
+                            let id = item_id.clone();
                             let mut execution = tool
                                 .execute(context, move |text| {
                                     let progress = progress.clone();
-                                    let item_id = item_id.clone();
+                                    let id = id.clone();
                                     async move {
-                                        let _ = progress.send(WorkerEvent::Update { item_id, text }).await;
+                                        let _ = progress.send((id, text)).await;
                                     }
                                 })
                                 .await;
                             execution.duration_ms =
                                 Some(singularity_core::duration_millis(started.elapsed()));
-                            let _ = sender.send(WorkerEvent::Ended { index, execution }).await;
-                        });
+                            execution
+                        }
+                    };
+                    (item_id, call.tool_call_id, execution)
+                });
+            }
+            if workers.is_empty() {
+                break;
+            }
+            tokio::select! {
+                Some((item_id, partial_result)) = updates.recv() => {
+                    on_event(TurnEvent::ToolOutput { item_id, output: partial_result });
+                }
+                completed = workers.join_next() => {
+                    let (item_id, call_id, execution) = completed.expect("workers are running")
+                        .expect("tool worker completes while the runtime is running");
+                    // 完成前发出的进度先交付，防止旧进度覆盖已完成结果。
+                    while let Ok((item_id, partial_result)) = updates.try_recv() {
+                        on_event(TurnEvent::ToolOutput { item_id, output: partial_result });
+                    }
+                    if save_error.is_none()
+                        && let Err(error) = self.finish_tool(item_id, call_id, execution, on_event).await
+                    {
+                        save_error = Some(error);
+                        signal.cancel();
                     }
                 }
-            }
-            drop(sender);
-            while let Some(event) = receiver.recv().await {
-                match event {
-                    WorkerEvent::Update { item_id, text } => {
-                        on_event(AgentEvent::ToolExecutionUpdate { item_id, partial_result: text })
-                    }
-                    WorkerEvent::Ended { index, execution } => results[index] = Some(execution),
-                }
-            }
-            for ((item_id, tool_call_id), execution) in identities.into_iter().zip(results) {
-                let execution = execution.expect("each completed worker returns its result");
-                self.append_message(
-                    &item_id,
-                    tool_result_message(&tool_call_id, &execution),
-                    &execution.images,
-                )
-                .await?;
-                on_event(AgentEvent::ToolExecutionEnded { item_id, execution });
             }
         }
+        // 保存失败后等待已启动工具收尾，不再执行剩余调用。
+        save_error.map_or(Ok(()), Err)
+    }
+
+    async fn finish_tool(
+        &self,
+        item_id: String,
+        call_id: String,
+        execution: ToolExecution,
+        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+    ) -> Result<()> {
+        self.append_message(&item_id, tool_result_message(&call_id, &execution), &execution.images)
+            .await?;
+        on_event(TurnEvent::ToolFinished {
+            item_id,
+            result: singularity_protocol::ToolResult {
+                output: execution.content,
+                images: execution.images.into_iter().map(|image| image.attachment).collect(),
+                is_error: execution.is_error,
+                duration_ms: execution.duration_ms,
+                read_source: execution.read_source,
+            },
+        });
         Ok(())
     }
 }

@@ -1,12 +1,12 @@
 /**
- * 公共代码高亮：Shiki 引擎、明暗双主题 token，以及消费 token 的 React 绑定。
+ * 代码高亮：Shiki 引擎、明暗两套主题的 token，以及渲染 token 的 React hook。
  * Markdown 代码块从这里取高亮结果。
  */
 import { createElement, useEffect, useMemo, useState, type CSSProperties } from 'react'
 
 /**
- * 支持高亮的语言。静态 import 说明符是打包分块边界，语言名与加载器只能成对出现，
- * 改用一个对象同时给出两者：语言清单由对象键派生，不需要另写一份名单。
+ * 支持高亮的语言。每个语言的 import 必须写成静态字符串，打包时才会拆成单独的分块，
+ * 所以语言名和加载函数写在同一个对象里；语言清单直接取对象的键，不另写一份。
  */
 const LANGUAGE_LOADERS = {
   javascript: () => import('@shikijs/langs/javascript'),
@@ -31,7 +31,7 @@ function languageIdFor(language: string): LanguageId | 'text' {
   return Object.hasOwn(LANGUAGE_ALIASES, name) ? LANGUAGE_ALIASES[name] : 'text'
 }
 
-/** 高亮器契约直接取自库的导出签名，应用不再手写一份缩小的 token 结构。 */
+/** 高亮器类型直接取自库的导出，不另写一份简化的类型。 */
 type Highlighter = Awaited<ReturnType<typeof import('@shikijs/core')['createHighlighterCore']>>
 
 /** 每个 token 携带明暗两套配色（库的 --shiki-light/--shiki-dark CSS 变量）。 */
@@ -80,8 +80,8 @@ function tokenize(highlighter: Highlighter, code: string, lang: LanguageId): Hig
 /** 单行高亮 token 的库类型。 */
 type CodeLine = HighlightedLines[number]
 
-/** 状态里只存异步资源是否就绪；token 由当前代码派生，不经 Promise 写回。
- *  流式代码变化不会形成高亮完成 → setState → 再次提交的更新链。 */
+/** 状态里只记录语言是否加载完成；token 每次渲染时按当前代码计算，不在 Promise 回调里写回。
+ *  这样流式输出改变代码时，不会出现“高亮完成 → setState → 再次渲染”的连锁更新。 */
 export function useCodeTokens(code: string, language: string) {
   const lang = languageIdFor(language)
   const [loaded, setLoaded] = useState<{ highlighter: Highlighter; language: LanguageId } | null>(null)

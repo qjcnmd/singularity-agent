@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! 用户级 MCP 配置，以及按工作目录复用的连接和成功发现的工具目录。
+//! 用户级 MCP 配置、按工作目录复用的连接，以及设置页查看的最近发现结果。
 
 mod client;
 mod config;
@@ -11,7 +11,7 @@ pub use result::McpToolResult;
 use client::Connection;
 use config::{Configuration, ServerConfig};
 use rmcp::model::Tool;
-use singularity_protocol::{McpConnectionStatus, McpInspection, McpServerInput, McpToolInfo};
+use singularity_protocol::{McpConnectionStatus, McpServerInput, McpServerState, McpToolInfo};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -23,19 +23,19 @@ type ConnectionCell = Arc<tokio::sync::Mutex<ConnectionState>>;
 
 struct ConnectionState {
     connection: Option<Arc<Connection>>,
-    // 健康连接复用成功目录；设置页也从这里读取状态，不另发发现请求。
+    // 设置页读取最近发现结果，不另发发现请求。
     catalog: Result<Vec<Tool>, String>,
 }
 
-type Connections = BTreeMap<(PathBuf, String), (ServerConfig, ConnectionCell)>;
+type Connections = BTreeMap<(String, String), (ServerConfig, ConnectionCell)>;
 
-/// 进程内的 MCP 所有者；设置和 Agent 共享同一实例，不持有模型或会话状态。
+/// MCP 配置和连接的管理者；设置页和 Agent 共用同一个实例。
 pub struct McpManager {
     home: PathBuf,
     connections: Mutex<Connections>,
 }
 
-/// 已发现的 MCP 工具；名字与调用目标来自同一份冻结目录。
+/// 本轮发现的一个 MCP 工具；调用时使用发现时的连接，本轮内不变。
 #[derive(Clone)]
 pub struct McpTool {
     pub name: String,
@@ -63,7 +63,7 @@ impl McpTool {
     }
 }
 
-/// 工具发现保留每个失败原因，由宿主向用户报告；不可用服务器不广告工具。
+/// 一次工具发现的结果；连不上的服务器不提供工具，失败原因写进 Developer 指令告诉模型。
 #[derive(Default)]
 pub struct McpDiscovery {
     pub tools: Vec<McpTool>,
@@ -84,37 +84,34 @@ impl McpManager {
         self.connections.lock().expect("MCP connection lock poisoned")
     }
 
-    /// 返回设置编辑所需的配置；只走私有桌面 RPC，不进入会话与模型请求。
-    pub fn list(&self) -> Result<Vec<McpServerInput>, String> {
-        Ok(config::read(&self.home)?
-            .servers
-            .into_iter()
-            .map(|(id, config)| config.into_input(id))
-            .collect())
+    /// 一次返回配置和已有连接状态，不启动服务器或查询工具。
+    pub fn list(&self, cwd: &Path) -> Result<Vec<McpServerState>, String> {
+        let config = config::read(&self.home)?;
+        Ok(Self::states(config, cwd, &self.lock()))
     }
 
-    /// 先验证并原子落盘，再发布新配置；Agent 在下次工具发现前继续持有原连接与目录。
-    pub fn save(&self, input: McpServerInput) -> Result<(), String> {
+    /// 检查并原子写入配置，返回配置和状态；正在运行的回合继续用原来的连接和工具。
+    pub fn save(&self, input: McpServerInput, cwd: &Path) -> Result<Vec<McpServerState>, String> {
         let id = input.server_id.clone();
         let config = ServerConfig::from_input(input);
         config.validate(&id)?;
-        self.update(&id, |all| {
+        self.update(&id, cwd, |all| {
             all.servers.insert(id.clone(), config);
             Ok(())
         })
     }
 
     /// 修改服务器开关，不删除配置。
-    pub fn toggle(&self, id: &str, enabled: bool) -> Result<(), String> {
-        self.update(id, |all| {
+    pub fn toggle(&self, id: &str, enabled: bool, cwd: &Path) -> Result<Vec<McpServerState>, String> {
+        self.update(id, cwd, |all| {
             all.servers.get_mut(id).ok_or("MCP 服务器不存在。")?.enabled = enabled;
             Ok(())
         })
     }
 
-    /// 删除设置并释放管理器持有的连接；已有工具快照继续可用，直到 Agent 刷新目录。
-    pub fn remove(&self, id: &str) -> Result<(), String> {
-        self.update(id, |all| {
+    /// 删除配置并释放连接；正在运行的回合仍可使用已发现的工具，直到这一轮结束。
+    pub fn remove(&self, id: &str, cwd: &Path) -> Result<Vec<McpServerState>, String> {
+        self.update(id, cwd, |all| {
             all.servers.remove(id).ok_or("MCP 服务器不存在。")?;
             Ok(())
         })
@@ -123,14 +120,24 @@ impl McpManager {
     fn update(
         &self,
         id: &str,
+        cwd: &Path,
         change: impl FnOnce(&mut Configuration) -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<McpServerState>, String> {
         let mut connections = self.lock();
         let mut config = config::read(&self.home)?;
         change(&mut config)?;
         config::write(&self.home, &config)?;
         connections.retain(|(_, server), _| server != id);
-        Ok(())
+        Ok(Self::states(config, cwd, &connections))
+    }
+
+    fn states(config: Configuration, cwd: &Path, connections: &Connections) -> Vec<McpServerState> {
+        let directory = directory_key(cwd);
+        config
+            .servers
+            .into_iter()
+            .map(|(id, config)| Self::server_state(id, config, &directory, connections))
+            .collect()
     }
 
     fn entries(
@@ -144,7 +151,7 @@ impl McpManager {
         if only.is_some_and(|id| !config.servers.contains_key(id)) {
             return Err("MCP 服务器不存在。".into());
         }
-        // 磁盘是配置事实来源；已更改或停用的连接只从后续操作中移除，回合快照仍可收尾。
+        // 以 mcp.json 为准：配置已改或已停用的连接从表里移除，正在运行的回合仍持有旧连接直到结束。
         connections.retain(|(_, id), (previous, _)| {
             config.servers.get(id).is_some_and(|current| current.enabled && current == previous)
         });
@@ -153,7 +160,7 @@ impl McpManager {
             if !config.enabled || only.is_some_and(|only| only != id) {
                 continue;
             }
-            let key = (cwd.to_path_buf(), id.clone());
+            let key = (directory_key(cwd), id.clone());
             if reconnect {
                 connections.remove(&key);
             }
@@ -180,12 +187,7 @@ impl McpManager {
         // 同一项目的并发准备共用连接；失败的工具调用不会走这里重放。
         let mut state = cell.lock().await;
         let connection = match state.connection.as_ref().filter(|connection| !connection.is_closed()) {
-            Some(connection) => {
-                if let Ok(tools) = &state.catalog {
-                    return Ok((Arc::clone(connection), tools.clone()));
-                }
-                Arc::clone(connection)
-            }
+            Some(connection) => Arc::clone(connection),
             None => {
                 state.connection = None;
                 match Connection::connect(cwd, config).await {
@@ -206,7 +208,7 @@ impl McpManager {
         tools.map(|tools| (connection, tools))
     }
 
-    /// 获取全部已启用工具；健康连接复用成功目录，首连、重连或上次发现失败时重新发现。
+    /// 每轮获取全部已启用工具；复用健康连接，重新读取目录。
     /// BTreeMap 与名称排序保持请求定义顺序稳定。
     pub async fn discover(&self, cwd: &Path, signal: &CancellationToken) -> McpDiscovery {
         if signal.is_cancelled() {
@@ -263,34 +265,42 @@ impl McpManager {
         result
     }
 
-    /// 设置页只读已有状态；用户明确重试时才重建该项目的连接并发现工具。
-    pub async fn inspect(&self, id: &str, cwd: &Path, reconnect: bool) -> Result<McpInspection, String> {
-        if reconnect && let Some((_, config, cell)) = self.entries(cwd, Some(id), true)?.pop() {
+    /// 用户明确重试时重建该项目的连接并发现工具，连接失败随服务器状态返回。
+    pub async fn reconnect(&self, id: &str, cwd: &Path) -> Result<McpServerState, String> {
+        if let Some((_, config, cell)) = self.entries(cwd, Some(id), true)?.pop() {
             // 连接失败保存在状态中，与执行准备失败使用同一份原因。
             let _ = Self::tools(cwd, config, &cell).await;
         }
         // 重连等待期间设置可能已修改，返回时读取当前配置和连接。
-        let config = config::read(&self.home)?;
-        let config = config.servers.get(id).ok_or("MCP 服务器不存在。")?;
-        let mut inspection = McpInspection {
-            server_id: id.into(),
+        let mut config = config::read(&self.home)?;
+        let config = config.servers.remove(id).ok_or("MCP 服务器不存在。")?;
+        Ok(Self::server_state(id.into(), config, &directory_key(cwd), &self.lock()))
+    }
+
+    fn server_state(
+        id: String,
+        config: ServerConfig,
+        directory: &str,
+        connections: &Connections,
+    ) -> McpServerState {
+        let cell = connections
+            .get(&(directory.into(), id.clone()))
+            .filter(|(previous, _)| previous == &config)
+            .map(|(_, cell)| cell);
+        let mut inspection = McpServerState {
+            server: config.into_input(id),
             status: McpConnectionStatus::NotConnected,
             error: None,
             tools: vec![],
         };
-        if !config.enabled {
+        if !inspection.server.enabled {
             inspection.status = McpConnectionStatus::Disabled;
-            return Ok(inspection);
+            return inspection;
         }
-        let cell = self
-            .lock()
-            .get(&(cwd.to_path_buf(), id.into()))
-            .filter(|(previous, _)| previous == config)
-            .map(|(_, cell)| Arc::clone(cell));
-        let Some(cell) = cell else { return Ok(inspection) };
+        let Some(cell) = cell else { return inspection };
         let Ok(state) = cell.try_lock() else {
             inspection.status = McpConnectionStatus::Connecting;
-            return Ok(inspection);
+            return inspection;
         };
         match (&state.catalog, &state.connection) {
             (Err(error), _) => {
@@ -313,16 +323,36 @@ impl McpManager {
             }
             (Ok(_), None) => {}
         }
-        Ok(inspection)
+        inspection
     }
 
-    /// 任务结算后关闭所有传输，等待 SDK 回收本地进程。
+    /// 立即移除项目持有的连接，再等待这些连接退出；重新添加项目会建立新连接。
+    pub fn disconnect_directory(&self, cwd: &Path) -> impl Future<Output = ()> + Send + 'static + use<> {
+        let mut connections = self.lock();
+        let key = directory_key(cwd);
+        let cells = connections
+            .extract_if(.., |(directory, _), _| directory == &key)
+            .map(|(_, (_, cell))| cell)
+            .collect();
+        close_connections(cells)
+    }
+
+    /// 所有任务停止后关闭全部连接，等待 SDK 回收本地进程。
     pub async fn shutdown(&self) {
-        let cells = std::mem::take(&mut *self.lock());
-        for (_, cell) in cells.into_values() {
-            if let Some(connection) = &cell.lock().await.connection {
-                connection.close().await;
-            }
+        let cells = std::mem::take(&mut *self.lock()).into_values().map(|(_, cell)| cell).collect();
+        close_connections(cells).await;
+    }
+}
+
+async fn close_connections(cells: Vec<ConnectionCell>) {
+    for cell in cells {
+        if let Some(connection) = &cell.lock().await.connection {
+            connection.close().await;
         }
     }
+}
+
+// 原生路径带有 Windows 长路径前缀，界面路径没有；两者按同一目录复用和关闭连接。
+fn directory_key(cwd: &Path) -> String {
+    singularity_core::display_path(cwd).to_lowercase()
 }

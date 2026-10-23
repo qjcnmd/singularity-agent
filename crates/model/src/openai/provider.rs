@@ -1,14 +1,13 @@
-//! 具体的 OpenAI-compatible provider：选协议、编排一次调用、终结响应。
+//! OpenAI 兼容的提供方：按配置选择协议，发送一次流式请求并返回检查过的回复。
 //!
-//! 两种协议的请求编码、SSE 解码和响应终结在各自的协议模块里；可取消的网络等待、
-//! SSE 帧切分由 transport 提供（本模块依赖它，它不依赖本模块）。
+//! 两种协议的编码和解码在各自的模块；可取消的网络等待和 SSE 分帧在 transport。
 
 use std::fmt;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::config::selection::{OpenAiProviderConfig, SelectedModel};
-use crate::config::{ModelConfigurationSnapshot, ProviderConfigSnapshot};
+use crate::config::{ModelConfigManager, ModelConfigurationSnapshot};
 use crate::error::{
     ProviderError, bounded_provider_error_diagnostic, parse_provider_error_body, provider_error_kind_for_code,
 };
@@ -16,14 +15,14 @@ use crate::openai::{
     chat_completions_endpoint, openai_chat_stream_request_payload, openai_responses_stream_request_payload,
     read_chat_sse_stream, read_responses_sse_stream, responses_endpoint,
 };
+use crate::provider::ProviderStreamEvent;
 use crate::provider::contract::ProviderApiProtocol;
-use crate::provider::{ProviderCompletion, ProviderStreamEvent};
 use crate::transport::{
     provider_client, provider_error_from_http_status, provider_future, retry_after_delay,
 };
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
 
-/// 使用已解析模型选择执行一次 Chat Completions 或 Responses 流式请求。
+/// 按所选模型的协议发送 Chat Completions 或 Responses 流式请求。
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     selected_model: SelectedModel,
@@ -41,12 +40,12 @@ impl fmt::Debug for OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// 用冻结的配置快照和 selector 建立执行客户端。
-    pub fn from_snapshot(
-        snapshot: &ProviderConfigSnapshot,
-        selector: Option<&str>,
+    /// 读取当前模型配置，创建本轮使用的提供方。
+    pub fn new(
+        models: &ModelConfigManager,
+        selection: &singularity_protocol::ModelSelection,
     ) -> Result<Self, ProviderError> {
-        let (config, selected_model) = snapshot.resolve(selector)?;
+        let (config, selected_model) = models.resolve(selection)?;
         Ok(Self {
             config,
             selected_model,
@@ -54,7 +53,7 @@ impl OpenAiProvider {
         })
     }
 
-    /// 本次模型选择的容量快照，供请求预算与压缩使用。
+    /// 本次所选模型的上下文窗口和最大输出，用于输出预算和压缩判断。
     pub fn model_configuration(&self) -> ModelConfigurationSnapshot {
         let selection = &self.selected_model;
         ModelConfigurationSnapshot {
@@ -63,53 +62,49 @@ impl OpenAiProvider {
         }
     }
 
-    /// 已解析的提供方与模型身份，供请求执行层记录本次调用。
+    /// 提供方名称和模型名称，写进请求记录。
     pub fn model_identity(&self) -> (&str, &str) {
         (&self.config.provider_name, &self.selected_model.model_name)
     }
 
-    /// 执行一次协议请求，返回结果及实际用量；请求记录、计时和重试由调用方负责。
+    /// 发送一次请求，返回回复和实际用量；请求记录、计时和重试由调用方负责。
     pub async fn complete_stream(
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
-    ) -> ProviderCompletion {
-        let selection = &self.selected_model;
-        let completion = self.complete_protocol_stream(request, cancellation, on_event).await;
-
-        // 即使响应随后因缺少续接材料被拒绝，它上报的用量也已经产生了。
-        let usage = completion.as_ref().ok().and_then(|response| response.usage.clone());
-        let completion = completion.and_then(|response| {
-            validate_response_reasoning(&response, selection.requires_reasoning_content_for_tool_calls)?;
-            Ok(response)
-        });
-        ProviderCompletion { result: completion, usage }
-    }
-
-    /// 一次选择协议，让请求编码、端点和响应解码始终配套。
-    async fn complete_protocol_stream(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
-    ) -> Result<ModelTurnResponse, ProviderError> {
+    ) -> ModelTurnResponse {
         let selection = &self.selected_model;
         let provider_name = &self.config.provider_name;
-        match selection.api_protocol {
+        let (endpoint, payload) = match selection.api_protocol {
             ProviderApiProtocol::Chat => {
                 let endpoint = chat_completions_endpoint(&self.config.base_url);
                 let payload =
                     openai_chat_stream_request_payload(request, selection, provider_name, &endpoint);
-                let response = self.send_request(&endpoint, &payload, cancellation).await?;
-                read_chat_sse_stream(cancellation, response, on_event, &self.config, selection, &endpoint)
-                    .await
+                (endpoint, payload)
             }
             ProviderApiProtocol::Responses => {
                 let endpoint = responses_endpoint(&self.config.base_url);
                 let payload =
                     openai_responses_stream_request_payload(request, selection, provider_name, &endpoint);
-                let response = self.send_request(&endpoint, &payload, cancellation).await?;
+                (endpoint, payload)
+            }
+        };
+        let response = match self.send_request(&endpoint, &payload, cancellation).await {
+            Ok(response) => response,
+            Err(error) => {
+                return ModelTurnResponse::failed(
+                    error,
+                    crate::Message::assistant(String::new(), String::new(), Vec::new(), None),
+                );
+            }
+        };
+        match selection.api_protocol {
+            ProviderApiProtocol::Chat => {
+                read_chat_sse_stream(cancellation, response, on_event, &self.config, selection, &endpoint)
+                    .await
+            }
+            ProviderApiProtocol::Responses => {
                 read_responses_sse_stream(
                     cancellation,
                     response,
@@ -129,12 +124,11 @@ impl OpenAiProvider {
         payload: &serde_json::Value,
         cancellation: &CancellationToken,
     ) -> Result<reqwest::Response, ProviderError> {
-        let response = provider_future(
-            cancellation,
-            "provider_request_send_failed",
-            self.client.post(endpoint).bearer_auth(&self.config.api_key).json(payload).send(),
-        )
-        .await?;
+        let mut request = self.client.post(endpoint).json(payload);
+        if !self.config.api_key.is_empty() {
+            request = request.bearer_auth(&self.config.api_key);
+        }
+        let response = provider_future(cancellation, request.send()).await?;
         if response.status().is_success() {
             Ok(response)
         } else {
@@ -148,78 +142,34 @@ impl OpenAiProvider {
         cancellation: &CancellationToken,
     ) -> ProviderError {
         let status_code = response.status().as_u16();
-        let retry_after = retry_after_delay(response.headers());
-        let error_body =
-            match provider_future(cancellation, "provider_response_body_read_failed", response.bytes()).await
-            {
-                Ok(body) => body,
-                Err(error) if error.kind == crate::ModelErrorKind::Cancelled => return error,
-                Err(error) => {
-                    let mut failure =
-                        provider_error_from_http_status(status_code).with_retry_after(retry_after);
-                    failure
-                        .message
-                        .push_str(&format!(" Could not read provider error response: {}", error.message));
-                    return failure;
-                }
-            };
-        let error_fields = parse_provider_error_body(&error_body);
-        let coded_kind = provider_error_kind_for_code(error_fields.code.as_deref());
-        let model_error = match coded_kind {
-            Some(kind) => {
-                let detail = crate::error::bounded_wire_detail(&error_fields);
-                let message = match detail {
-                    Some(text) => format!("provider rejected the request: {text}"),
-                    None => "provider rejected the request by wire error code".to_string(),
-                };
-                ProviderError::new(kind, message).with_code("provider_rejected_by_error_code")
+        let mut error = provider_error_from_http_status(status_code)
+            .with_retry_after(retry_after_delay(response.headers()));
+        let body = match provider_future(cancellation, response.bytes()).await {
+            Ok(body) => body,
+            Err(read_error) if read_error.kind == crate::ModelErrorKind::Cancelled => return read_error,
+            Err(read_error) => {
+                error
+                    .message
+                    .push_str(&format!(" Could not read provider error response: {}", read_error.message));
+                return error;
             }
-            None => provider_error_from_http_status(status_code),
         };
-        let provider_diagnostic = if coded_kind.is_some() {
-            None
-        } else {
-            error_fields
-                .message
-                .as_deref()
-                .map(bounded_provider_error_diagnostic)
-                .or_else(|| Some(bounded_provider_error_diagnostic(&String::from_utf8_lossy(&error_body))))
-                .filter(|diagnostic| !diagnostic.is_empty())
-        };
-        let mut error = model_error.with_retry_after(retry_after);
-        // 分类不改变原始的协议事实：按 wire 错误码分类会重写 kind/code，此时 HTTP 状态
-        // 和 wire code/type 仍以有界诊断保留；没命中错误码分类时，状态已经写在消息里，
-        // 不重复。
-        let status_fact = coded_kind.is_some().then_some(status_code);
-        let facts = crate::error::provider_wire_facts(status_fact, &error_fields);
-        if !facts.is_empty() {
-            error.message.push_str(" (");
-            error.message.push_str(&facts.join(", "));
-            error.message.push(')');
+        let fields = parse_provider_error_body(&body);
+        // 已知错误码比 HTTP 状态更准确，例如 400 里的上下文超限需要触发压缩。
+        if let Some(kind) = provider_error_kind_for_code(fields.code.as_deref()) {
+            error.kind = kind;
         }
-        if let Some(diagnostic) = provider_diagnostic {
-            error.message.push_str(" Provider diagnostic: ");
-            error.message.push_str(&diagnostic);
+        let facts = crate::error::provider_wire_facts(&fields);
+        if !facts.is_empty() {
+            error.message.push_str(&format!(" ({})", facts.join(", ")));
+        }
+        let diagnostic = match fields.message.as_deref() {
+            Some(message) => bounded_provider_error_diagnostic(message),
+            None => bounded_provider_error_diagnostic(&String::from_utf8_lossy(&body)),
+        };
+        if !diagnostic.is_empty() {
+            error.message.push_str(&format!(" Provider diagnostic: {diagnostic}"));
         }
         error
     }
-}
-
-/// 对真实响应检查续接是否完整。
-fn validate_response_reasoning(
-    response: &ModelTurnResponse,
-    requires_reasoning_content_for_tool_calls: bool,
-) -> Result<(), ProviderError> {
-    let message = &response.assistant_message;
-    if requires_reasoning_content_for_tool_calls
-        && !message.tool_calls.is_empty()
-        && message.provider_reasoning_replay.is_none()
-    {
-        return Err(ProviderError::new(
-            crate::ModelErrorKind::JsonSchemaViolation,
-            "provider response is missing required continuation data",
-        )
-        .with_code("provider_reasoning_history_invalid"));
-    }
-    Ok(())
 }

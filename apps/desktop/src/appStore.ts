@@ -2,26 +2,25 @@ import { SessionStore, type AppState, type QuestionDraft } from './sessionStore'
 import { actionOrigin } from './storeActions'
 export { actionOrigin, hasInlineActionError, pendingKey } from './storeActions'
 export type { AppState, ActionError } from './sessionStore'
-import { effectiveSelector, selectedModel } from './modelChoices'
+import { effectiveSelection, selectedModel } from './modelChoices'
 import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { emptyDraft, imageUpload, type Draft } from './drafts'
-import type { ProviderConfigurationInput, RpcMethod, RpcParams, SkillMetadata, ViewportAnchor } from './protocol'
+import type { ModelSelection, ProviderConfigurationInput, RpcMethod, RpcParams, ViewportAnchor } from './protocol'
 import { selectedSessionPhase } from './sessionState'
+import { acceptModelCatalog } from './sync'
 
 type SessionActionMethod = {
   [Method in RpcMethod]: RpcParams<Method> extends { sessionId: string } ? Method : never
 }[RpcMethod]
 
 class AppStore extends SessionStore {
-  setDraft(text: string, skill?: SkillMetadata): void {
+  setDraft(text: string): void {
     const id = this.draftKey()
     if (id === null) return
     const draft = this.inputDraft()
-    const skills = Object.fromEntries(Object.entries(draft.skills ?? {}).filter(([name]) => text.includes(`/${name}`)))
-    if (skill !== undefined) skills[skill.name] = skill.path
-    void this.drafts.set(id, { ...draft, text, skills })
+    void this.drafts.set(id, { ...draft, text })
   }
 
   inputDraft(): Draft {
@@ -34,25 +33,27 @@ class AppStore extends SessionStore {
     void this.drafts.set(id, { ...draft, images: append ? [...draft.images, ...images] : images })
   }
 
-  modelSelector(): string | null {
-    return effectiveSelector(this.state.session?.runtime.selector ?? this.inputDraft().selector, this.state.bootstrap?.modelCatalog)
+  modelSelection(): ModelSelection | null {
+    if (this.state.selectedSessionId !== null) return this.state.session?.runtime.selection ?? null
+    return effectiveSelection(this.inputDraft().selection, this.state.bootstrap?.modelCatalog)
   }
 
   modelAvailable(): boolean {
     return selectedModel(this.state.bootstrap?.modelCatalog,
-      this.modelSelector()) !== undefined
+      this.modelSelection()) !== undefined
   }
 
   submissionState() {
     const state = this.state
     const draft = this.inputDraft()
     const phase = selectedSessionPhase(state)
-    const active = phase === 'running' || phase === 'compacting' || phase === 'reserved'
+    const active = phase === 'running' || phase === 'compacting'
     const submitPending = this.isPending('session.submit', actionOrigin.session(state.selectedSessionId))
     // 按任务选择、连接、任务读取和运行阶段给出第一项阻止原因。
     let blockedReason: string | null = null
     if (state.selectedWorkspaceId === null) blockedReason = '请先选择项目'
     else if (state.connection !== 'ready') blockedReason = '连接未就绪'
+    else if (state.bootstrapLoad.status !== 'idle') blockedReason = state.bootstrapLoad.status === 'error' ? '项目读取失败' : '正在读取项目'
     else if (state.sessionLoad.status === 'loading') blockedReason = '正在读取任务'
     else if (state.selectedSessionId !== null && state.session === null) blockedReason = state.sessionLoad.status === 'error'
       ? '任务读取失败' : '正在读取任务'
@@ -69,12 +70,14 @@ class AppStore extends SessionStore {
     const key = this.draftKey()
     if (!canSubmit || workspaceId === null || key === null) return false
     const draft = this.inputDraft()
-    const selector = this.modelSelector()
-    const selection = this.selectionRequest
+    const selection = this.modelSelection()
+    const navigation = this.selectionRequest
     return this.action('session.submit', actionOrigin.session(sessionId), async () => {
-      const input = { text: draft.text, skills: draft.skills ?? {}, images: await Promise.all(draft.images.map(imageUpload)) }
-      if (sessionId === null) await this.startSession({ ...input, workspaceId, selector }, selection)
-      else await this.transport.rpc('session.submit', { ...input, sessionId })
+      const input = { text: draft.text, images: await Promise.all(draft.images.map(imageUpload)) }
+      if (sessionId === null) {
+        if (selection === null) throw new Error('请选择模型')
+        await this.startSession({ ...input, workspaceId, selection }, navigation)
+      } else await this.transport.rpc('session.submit', { ...input, sessionId })
       await this.drafts.clearIfUnchanged(key, draft)
     })
   }
@@ -112,20 +115,20 @@ class AppStore extends SessionStore {
       () => this.transport.rpc('session.rename', { sessionId, name }))
   }
 
-  async archiveSession(sessionId: string): Promise<boolean> {
-    return this.action('session.archive', actionOrigin.session(sessionId), async () => {
-      await this.transport.rpc('session.archive', { sessionId })
+  async deleteSession(sessionId: string): Promise<boolean> {
+    return this.action('session.delete', actionOrigin.session(sessionId), async () => {
+      await this.transport.rpc('session.delete', { sessionId })
       this.clearSessionAnchors([sessionId])
-      await this.drafts.remove([sessionId], '任务已归档')
+      await this.drafts.remove([sessionId], '任务已删除')
     })
   }
 
-  async updateSettings(selector: string): Promise<boolean> {
+  async updateSettings(selection: ModelSelection): Promise<boolean> {
     if (this.state.selectedSessionId === null) {
       const key = this.draftKey()
-      return key !== null ? this.drafts.set(key, { ...this.inputDraft(), selector }) : false
+      return key !== null ? this.drafts.set(key, { ...this.inputDraft(), selection }) : false
     }
-    return this.sessionAction('session.updateSettings', sessionId => ({ sessionId, selector }))
+    return this.sessionAction('session.updateSettings', sessionId => ({ sessionId, selection }))
   }
 
   async removeWorkspace(workspaceId: string): Promise<boolean> {
@@ -145,12 +148,18 @@ class AppStore extends SessionStore {
 
   async saveProvider(provider: ProviderConfigurationInput, apiKey?: string): Promise<boolean> {
     return this.action('model.saveProvider', actionOrigin.inline('model.saveProvider', provider.providerId),
-      () => this.transport.rpc('model.saveProvider', { provider, apiKey: apiKey || undefined }))
+      async () => {
+        const result = await this.transport.rpc('model.saveProvider', { provider, apiKey: apiKey || undefined })
+        this.applySync(acceptModelCatalog(this.state, result))
+      })
   }
 
   async removeProvider(providerId: string): Promise<boolean> {
     return this.action('model.removeProvider', actionOrigin.inline('model.removeProvider', providerId),
-      () => this.transport.rpc('model.removeProvider', { providerId }))
+      async () => {
+        const result = await this.transport.rpc('model.removeProvider', { providerId })
+        this.applySync(acceptModelCatalog(this.state, result))
+      })
   }
 
   openDirectoryPicker(): void {
@@ -190,7 +199,6 @@ class AppStore extends SessionStore {
     if (previous === undefined && anchor.mode === 'following') return
     if (previous?.mode === anchor.mode
       && previous.anchorItemId === anchor.anchorItemId
-      && previous.turnId === anchor.turnId
       && Math.abs(previous.offset - anchor.offset) < 1) return
     const viewportAnchors = { ...this.state.viewportAnchors }
     if (anchor.mode === 'following') delete viewportAnchors[id]
@@ -207,7 +215,7 @@ class AppStore extends SessionStore {
     })
   }
 
-  /** 归档任务或移除项目成功后清理相应阅读锚点。 */
+  /** 删除任务或移除项目成功后清理相应阅读锚点。 */
   private clearSessionAnchors(ids: string[]): void {
     const viewportAnchors = { ...this.state.viewportAnchors }
     for (const id of ids) {

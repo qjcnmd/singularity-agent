@@ -7,7 +7,8 @@ import { Backend } from './backend.js'
 import type { DirectoryPickResult, RpcResponse } from '../src/protocol.generated.js'
 
 const entry = 'singularity://app/'
-const home = resolve(process.env.SINGULARITY_HOME || join(homedir(), '.singularity'))
+const configuredHome = process.env.SINGULARITY_HOME
+const home = resolve(configuredHome?.trim() ? configuredHome : join(homedir(), '.singularity'))
 // 数据目录决定 Chromium profile：不同目录各用各的锁和视图状态。
 app.setPath('userData', join(app.getPath('appData'), 'Singularity', createHash('sha256').update(home.toLowerCase()).digest('hex').slice(0, 16)))
 protocol.registerSchemesAsPrivileged([{ scheme: 'singularity', privileges: { standard: true, secure: true, supportFetchAPI: true } }])

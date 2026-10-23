@@ -132,6 +132,8 @@ impl Connection {
                     handler.serve(transport).await.map_err(|error| format!("MCP 初始化失败：{error}"))?
                 }
             };
+            // 每轮实际读取工具目录；发现失败时也不回退到 SDK 缓存。
+            service.set_response_cache_config(rmcp::service::ClientCacheConfig::disabled()).await;
             Ok(Self {
                 peer: service.peer().clone(),
                 service: tokio::sync::Mutex::new(Some(service)),
@@ -155,7 +157,7 @@ impl Connection {
     }
 
     pub async fn tools(&self) -> Result<Vec<Tool>, String> {
-        // 管理器只在首连、重连或发现失败后重试时调用。
+        // 每轮读取目录，服务器更新工具后下轮生效。
         tokio::time::timeout(Duration::from_secs(self.config.startup_timeout_sec), self.peer.list_all_tools())
             .await
             .map_err(|_| "MCP 工具发现超时。".to_string())?

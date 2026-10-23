@@ -17,11 +17,6 @@ export class RpcFailure extends Error {
   }
 }
 
-/** 通道不可用时，调用方保留连接失败状态。 */
-export function isConnectionFailure(error: unknown): boolean {
-  return error instanceof RpcFailure && error.code === 'unavailable'
-}
-
 declare global {
   interface Window {
     singularity: {
@@ -37,6 +32,7 @@ export class RpcClient {
   private unsubscribe: (() => void) | null = null
   private unsubscribeFailure: (() => void) | null = null
   private stopped = true
+  private status: ConnectionStatus = 'connecting'
 
   constructor(
     private readonly onFrame: (frame: StreamEnvelope) => void,
@@ -47,10 +43,14 @@ export class RpcClient {
     if (!this.stopped) return
     this.stopped = false
     this.unsubscribe = window.singularity.onFrame(frame => this.accept(frame))
-    this.unsubscribeFailure = window.singularity.onFailure(() => this.onStatus('recovering'))
-    this.onStatus('connecting')
-    void window.singularity.connect().then(frame => this.accept(frame))
-      .catch(() => { if (!this.stopped) this.onStatus('recovering') })
+    this.unsubscribeFailure = window.singularity.onFailure(() => this.setStatus('recovering'))
+    this.setStatus('connecting')
+    void window.singularity.connect().then(frame => {
+      if (this.stopped || this.status === 'recovering') return
+      this.setStatus('ready')
+      this.accept(frame)
+    })
+      .catch(() => { if (!this.stopped) this.setStatus('recovering') })
   }
 
   stop(): void {
@@ -66,7 +66,7 @@ export class RpcClient {
     try {
       envelope = await window.singularity.rpc({ method, params })
     } catch {
-      this.onStatus('recovering')
+      this.setStatus('recovering')
       throw new RpcFailure('unavailable', '工作台后端不可用。', '请重新启动桌面应用。')
     }
     if (envelope.type === 'error') {
@@ -74,6 +74,11 @@ export class RpcClient {
       throw new RpcFailure(error.code, error.message, error.recovery)
     }
     return envelope.result
+  }
+
+  private setStatus(status: ConnectionStatus): void {
+    this.status = status
+    this.onStatus(status)
   }
 
   private accept(frame: StreamEnvelope): void {

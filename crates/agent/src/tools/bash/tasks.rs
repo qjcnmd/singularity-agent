@@ -1,4 +1,4 @@
-//! 会话拥有的后台进程：保存开始与终态，实时发布输出。
+//! 后台命令统一从会话记录读取；运行中的输出和进程控制保留在内存中。
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::session::{LedgerRecord, SessionEntry, lock_writer};
 use crate::tools::registry::{ABORTED_MESSAGE, ToolExecution, error_result};
 
 use super::exec::{Outcome, Process, ProcessEvent};
@@ -28,7 +29,7 @@ struct Entry {
     done: watch::Sender<Option<Result<(), String>>>,
 }
 
-/// 一个会话的后台命令与其进程所有权；不接管历史 PID。
+/// 一个会话的后台命令查询与进程所有权；保存终态后释放内存条目，不接管历史 PID。
 pub struct BashTasks {
     entries: Mutex<BTreeMap<String, Arc<Entry>>>,
     updates: mpsc::Sender<BashTaskUpdate>,
@@ -54,14 +55,32 @@ impl BashTasks {
         )
     }
 
-    /// 返回后台任务的当前状态。
+    /// 界面和工具共用的后台列表；实时输出覆盖运行记录，历史中未结束的命令标为中断。
     pub fn list(&self) -> Vec<BackgroundTask> {
+        let writer = lock_writer(&self.writer);
+        let entries = self.entries.lock().expect("bash task entries lock");
+        let mut tasks = BTreeMap::new();
+        for record in writer.entries() {
+            if let Some(task) = recorded_task(record) {
+                tasks.insert(&task.task_id, task);
+            }
+        }
+        tasks.into_values().map(|task| current_task(task, &entries)).collect()
+    }
+
+    /// 命令执行、回收或保存终态期间仍占用会话；完成通知入队后才释放。
+    pub fn is_busy(&self) -> bool {
         self.entries
             .lock()
             .expect("bash task entries lock")
             .values()
-            .map(|entry| entry.task.lock().expect("bash task lock").clone())
-            .collect()
+            .any(|entry| entry.done.borrow().is_none())
+    }
+
+    /// 给模型的列表只含 ID、命令、说明和状态，输出由 task_output 按需读取。
+    pub(crate) fn tool_list(&self) -> ToolExecution {
+        let tasks: Vec<_> = self.list().iter().map(task_summary).collect();
+        ToolExecution::text(serde_json::to_string(&tasks).expect("task summaries serialize"))
     }
 
     /// 读取累计输出；只等待指定窗口，不取消后台命令。
@@ -71,34 +90,36 @@ impl BashTasks {
         wait_ms: u64,
         signal: &CancellationToken,
     ) -> ToolExecution {
-        let entry = match self.entry(task_id) {
-            Ok(entry) => entry,
-            Err(result) => return result,
-        };
-        let mut done = entry.done.subscribe();
-        if wait_ms > 0 && done.borrow().is_none() {
-            tokio::select! {
-                biased;
-                _ = signal.cancelled() => return error_result(ABORTED_MESSAGE),
-                _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {},
-                _ = wait_done(&mut done) => {},
+        if let Some(entry) = self.entry(task_id) {
+            let mut done = entry.done.subscribe();
+            if wait_ms > 0 && done.borrow().is_none() {
+                tokio::select! {
+                    biased;
+                    _ = signal.cancelled() => return error_result(ABORTED_MESSAGE),
+                    _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {},
+                    _ = wait_done(&mut done) => {},
+                }
+            }
+            if let Some(Err(error)) = &*done.borrow() {
+                return error_result(error.clone());
             }
         }
-        entry_result(&entry)
+        self.task(task_id).map(|task| task_result(&task, true)).unwrap_or_else(error_result)
     }
 
-    /// 取消后台命令，并等待回收及终态确认；重复停止返回原结果。
-    pub async fn stop(&self, task_id: &str) -> ToolExecution {
-        let entry = match self.entry(task_id) {
-            Ok(entry) => entry,
-            Err(result) => return result,
-        };
-        let mut done = entry.done.subscribe();
-        if done.borrow().is_none() {
-            entry.cancel.cancel();
-            wait_done(&mut done).await;
+    /// 取消后台命令并等待回收、保存终态；操作成功后返回命令结果。
+    pub async fn stop(&self, task_id: &str) -> Result<ToolExecution, String> {
+        if let Some(entry) = self.entry(task_id) {
+            let mut done = entry.done.subscribe();
+            if done.borrow().is_none() {
+                entry.cancel.cancel();
+                wait_done(&mut done).await;
+            }
+            if let Some(Err(error)) = &*done.borrow() {
+                return Err(error.clone());
+            }
         }
-        entry_result(&entry)
+        self.task(task_id).map(|task| task_result(&task, false))
     }
 
     /// 停止并等待全部活进程；此后仍可启动新命令。
@@ -128,22 +149,19 @@ impl BashTasks {
         self: &Arc<Self>,
         args: BashArgs,
         cwd: PathBuf,
-        turn_id: String,
-        item_id: String,
         signal: CancellationToken,
         mut on_update: impl FnMut(String) -> F + Send,
     ) -> ToolExecution {
         if signal.is_cancelled() {
             return error_result(ABORTED_MESSAGE);
         }
-        let started_at = singularity_core::now_iso();
         let mut process = match Process::spawn(&args, &cwd).await {
             Ok(process) => process,
             Err(error) => return error_result(error),
         };
         let mut output = String::new();
-        if !args.run_in_background {
-            let yield_at = tokio::time::sleep(Duration::from_millis(args.yield_time_ms.get()));
+        if args.yield_time_ms > 0 {
+            let yield_at = tokio::time::sleep(Duration::from_millis(args.yield_time_ms));
             tokio::pin!(yield_at);
             loop {
                 tokio::select! {
@@ -161,11 +179,8 @@ impl BashTasks {
         }
         let task = BackgroundTask {
             task_id: Uuid::now_v7().to_string(),
-            turn_id,
-            item_id,
             command: args.command,
-            description: args.description.unwrap_or_default(),
-            started_at,
+            description: args.description,
             output,
             state: BackgroundTaskState::Running,
         };
@@ -176,20 +191,35 @@ impl BashTasks {
             cancel: CancellationToken::new(),
             done,
         });
-        if let Err(error) = self.save(task.clone()).await {
-            return process.finish(Outcome::Failed(error)).await.0;
+        let manager = Arc::clone(self);
+        let started_task = task.clone();
+        let started_task_id = task_id.clone();
+        let started_entry = Arc::clone(&entry);
+        let started = crate::session::with_writer_async(&self.writer, move |writer| {
+            writer.append_record(LedgerRecord::BackgroundTaskUpdated { task: started_task })?;
+            // 查询按同一顺序锁定写者和进程表，不会把刚保存的开始记录误认为历史中断。
+            manager
+                .entries
+                .lock()
+                .expect("bash task entries lock")
+                .insert(started_task_id, started_entry);
+            Ok(())
+        })
+        .await;
+        if let Err(error) = started {
+            return process.finish(Outcome::Failed(error.to_string())).await.0;
         }
-        self.entries.lock().expect("bash task entries lock").insert(task_id, entry.clone());
         let _ = self.updates.send(BashTaskUpdate::Updated(task)).await;
-        // 保存期间仍可能收到停止，完成回收和落盘后再返回。
+        // 保存开始记录期间可能已经收到停止；这时等进程回收、最终状态保存后再返回。
         if signal.is_cancelled() || entry.cancel.is_cancelled() {
             entry.cancel.cancel();
             self.clone().run_background(entry.clone(), process).await;
-            let mut result = entry_result(&entry);
+            let mut result =
+                self.task(&task_id).map(|task| task_result(&task, false)).unwrap_or_else(error_result);
             result.is_error = true;
             return result;
         }
-        let result = entry_result(&entry);
+        let result = task_result(&entry.task.lock().expect("bash task lock"), false);
         let manager = self.clone();
         tokio::spawn(async move {
             manager.run_background(entry, process).await;
@@ -197,31 +227,32 @@ impl BashTasks {
         result
     }
 
-    fn entry(&self, task_id: &str) -> Result<Arc<Entry>, ToolExecution> {
-        self.entries
-            .lock()
-            .expect("bash task entries lock")
-            .get(task_id)
-            .cloned()
-            .ok_or_else(|| error_result(format!("Unknown background task: {task_id}")))
+    fn entry(&self, task_id: &str) -> Option<Arc<Entry>> {
+        self.entries.lock().expect("bash task entries lock").get(task_id).cloned()
     }
 
-    async fn save(&self, task: BackgroundTask) -> Result<(), String> {
-        crate::session::with_writer_async(&self.writer, move |writer| {
-            writer.append_record(crate::session::LedgerRecord::BackgroundTaskUpdated { task })
-        })
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    fn task(&self, task_id: &str) -> Result<BackgroundTask, String> {
+        let writer = lock_writer(&self.writer);
+        let entries = self.entries.lock().expect("bash task entries lock");
+        writer
+            .entries()
+            .iter()
+            .rev()
+            .filter_map(recorded_task)
+            .find(|task| task.task_id == task_id)
+            .map(|task| current_task(task, &entries))
+            .ok_or_else(|| format!("Unknown background task: {task_id}"))
     }
 
     async fn run_background(self: Arc<Self>, entry: Arc<Entry>, mut process: Process) {
         let outcome = loop {
             match process.next(&entry.cancel).await {
                 ProcessEvent::Progress(output) => {
-                    let mut task = entry.task.lock().expect("bash task lock").clone();
-                    task.output = output;
-                    *entry.task.lock().expect("bash task lock") = task.clone();
+                    let task = {
+                        let mut task = entry.task.lock().expect("bash task lock");
+                        task.output = output;
+                        task.clone()
+                    };
                     let _ = self.updates.send(BashTaskUpdate::Updated(task)).await;
                 }
                 ProcessEvent::Finished(outcome) => break outcome,
@@ -231,8 +262,14 @@ impl BashTasks {
         let mut task = entry.task.lock().expect("bash task lock").clone();
         task.output = result.content;
         task.state = outcome.state(result.duration_ms.expect("process duration"));
-        match self.save(task.clone()).await {
-            Ok(()) => {
+        let task_id = task.task_id.clone();
+        let saved_task = task.clone();
+        let saved = crate::session::with_writer_async(&self.writer, move |writer| {
+            writer.append_record(LedgerRecord::BackgroundTaskUpdated { task: saved_task })
+        })
+        .await;
+        match saved {
+            Ok(_) => {
                 let status = match &task.state {
                     BackgroundTaskState::Exited { exit_code, .. } => {
                         Some(format!("exited with code {exit_code}"))
@@ -254,13 +291,15 @@ impl BashTasks {
                     _ => Ok(()),
                 };
                 entry.done.send_replace(Some(completion));
+                self.entries.lock().expect("bash task entries lock").remove(&task_id);
             }
             Err(error) => {
+                let error = error.to_string();
                 task.state = BackgroundTaskState::Failed {
                     message: format!("保存后台命令结果失败：{error}"),
-                    finished_at: singularity_core::now_iso(),
                     duration_ms: result.duration_ms.expect("process duration"),
                 };
+                // 未保存的结果不能从日志读回，保留它和错误，直到本次会话关闭。
                 *entry.task.lock().expect("bash task lock") = task;
                 let _ = self.updates.send(BashTaskUpdate::Failed(error.clone())).await;
                 entry.done.send_replace(Some(Err(error)));
@@ -277,14 +316,45 @@ async fn wait_done(done: &mut watch::Receiver<Option<Result<(), String>>>) {
     }
 }
 
-fn entry_result(entry: &Entry) -> ToolExecution {
-    if let Some(Err(error)) = &*entry.done.borrow() {
-        return error_result(error.clone());
+fn recorded_task(entry: &SessionEntry) -> Option<&BackgroundTask> {
+    match entry {
+        SessionEntry::Record {
+            record: LedgerRecord::BackgroundTaskUpdated { task },
+            ..
+        } => Some(task),
+        _ => None,
     }
-    let task = entry.task.lock().expect("bash task lock");
-    let mut result = ToolExecution::text(serde_json::to_string(&*task).expect("background task serializes"));
+}
+
+fn current_task(task: &BackgroundTask, entries: &BTreeMap<String, Arc<Entry>>) -> BackgroundTask {
+    if task.state.is_running() {
+        if let Some(entry) = entries.get(&task.task_id) {
+            return entry.task.lock().expect("bash task lock").clone();
+        }
+        let mut task = task.clone();
+        task.state = BackgroundTaskState::Interrupted;
+        return task;
+    }
+    task.clone()
+}
+
+fn task_result(task: &BackgroundTask, include_output: bool) -> ToolExecution {
+    let mut summary = task_summary(task);
+    if include_output {
+        summary["output"] = serde_json::json!(task.output);
+    }
+    let mut result = ToolExecution::text(serde_json::to_string(&summary).expect("task result serializes"));
     result.is_error = matches!(task.state,
         BackgroundTaskState::Exited { exit_code, .. } if exit_code != 0)
         || matches!(task.state, BackgroundTaskState::Failed { .. } | BackgroundTaskState::Interrupted);
     result
+}
+
+fn task_summary(task: &BackgroundTask) -> serde_json::Value {
+    serde_json::json!({
+        "taskId": task.task_id,
+        "command": task.command,
+        "description": task.description,
+        "state": task.state,
+    })
 }

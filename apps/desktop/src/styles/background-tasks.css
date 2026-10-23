@@ -33,3 +33,20 @@
   .separator-background { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { .background-panel { transition: none; } }
+.detail-tabs { display: flex; gap: 4px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+.detail-tabs button { flex: 1; padding: 7px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--ink-soft); font: inherit; font-size: 12px; cursor: pointer; }
+.detail-tabs button[aria-selected="true"] { background: var(--surface-hover); color: var(--ink); font-weight: 600; }
+.context-panel { flex: 1; min-width: 0; padding: 16px; overflow-y: auto; }
+.context-panel section + section { margin-top: 24px; }
+.context-panel h3 { display: flex; gap: 8px; align-items: baseline; margin: 0 0 10px; font-size: 12px; color: var(--ink-soft); font-weight: 500; }
+.context-panel h3 span { opacity: .7; font-variant-numeric: tabular-nums; }
+.context-instruction { margin: 4px 0; }
+.context-instruction .activity-toggle { width: 100%; height: auto; min-height: 42px; gap: 7px; padding: 6px 0; overflow: visible; }
+.instruction-body { margin: 8px 0 12px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 12px; line-height: 1.7; color: var(--ink-soft); }
+.context-names { display: flex; flex-wrap: wrap; gap: 6px; padding: 0; margin: 0; list-style: none; }
+.context-names li { max-width: 100%; padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; font-size: 12px; overflow-wrap: anywhere; }
+.instruction-label { min-width: 0; text-align: left; display: grid; gap: 3px; }
+.instruction-label small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-faint); font-size: 11px; font-weight: 400; }
+
+.context-group { width: 100%; gap: 7px; margin-bottom: 10px; font-size: 12px; }
+.context-count { color: var(--ink-faint); font-variant-numeric: tabular-nums; }

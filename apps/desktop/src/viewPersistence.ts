@@ -1,16 +1,8 @@
 // 桌面视图及默认值；运行态由 Store 独立维护。
 import type { ViewportAnchor } from './protocol'
-import type { SessionView } from './execution'
-import { buildTimeline } from './timeline'
-
-/** 只恢复当前已加载的阅读位置；更早历史由用户按需加载。 */
-export function anchorLocation(session: SessionView | null, anchor: ViewportAnchor | undefined): 'found' | 'missing' {
-  return anchor?.mode !== 'anchored' || buildTimeline(session).some(item => item.key === anchor.anchorItemId)
-    ? 'found' : 'missing'
-}
 
 export const defaultAnchor = (): ViewportAnchor => ({
-  mode: 'following', anchorItemId: null, turnId: null, offset: 0,
+  mode: 'following', anchorItemId: null, offset: 0,
 })
 
 export const messageFontSize = { min: 12, max: 24, default: 16 }
@@ -55,7 +47,7 @@ export function loadPersisted(): PersistedView {
   }
   try {
     const stored = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as PersistedView | null
-    return stored === null ? fallback : { ...fallback, ...stored }
+    return stored ?? fallback
   } catch {
     return fallback
   }

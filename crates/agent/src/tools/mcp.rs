@@ -4,7 +4,6 @@ use super::{ToolExecution, error_result};
 use crate::image::InputImage;
 use serde_json::{Map, Value};
 use singularity_mcp::McpTool;
-use singularity_protocol::ImageUpload;
 use tokio_util::sync::CancellationToken;
 
 pub(super) async fn execute(
@@ -15,24 +14,31 @@ pub(super) async fn execute(
     if signal.is_cancelled() {
         return error_result(super::ABORTED_MESSAGE);
     }
-    let result = match tool.call(args, signal).await {
-        Ok(result) => result,
-        Err(error) => return error_result(error),
-    };
+    let result = tool.call(args, signal).await;
     tokio::task::spawn_blocking(move || {
-        let mut execution = ToolExecution::text(result.content);
-        execution.is_error = result.is_error;
-        for data_url in result.images {
-            match InputImage::upload(ImageUpload {
-                name: format!("{}.image", tool.name),
-                data_url,
-            }) {
-                Ok(image) => execution.images.push(image),
-                Err(error) => {
-                    execution.content.push_str(&format!("\n\nMCP 图片无效：{error}"));
-                    execution.is_error = true;
+        let mut execution = match result {
+            Ok(result) => {
+                let mut execution = ToolExecution::text(result.content);
+                execution.is_error = result.is_error;
+                for data in result.images {
+                    match InputImage::from_base64(format!("{}.image", tool.name), &data) {
+                        Ok(image) => execution.images.push(image),
+                        Err(error) => {
+                            execution.content.push_str(&format!("\n\nMCP 图片无效：{error}"));
+                            execution.is_error = true;
+                        }
+                    }
                 }
+                execution
             }
+            Err(error) => error_result(error),
+        };
+        let mut output = super::output::CaptureState::default();
+        output.ingest(&execution.content);
+        let (content, note) = output.finish();
+        execution.content = content;
+        if let Some(note) = note {
+            execution.content.push_str(&format!("\n\n{note}"));
         }
         execution
     })

@@ -1,35 +1,21 @@
-//! Harness 的 Developer 指令：固定行为、工具约定、环境事实与当前工作目录。
+//! Developer 指令：基本行为、运行环境和当前工作目录；工具说明随请求定义发送。
 
-use crate::tools::ToolRegistrySnapshot;
-
-/// 文件指令与 Skill 目录提示由 Agent 请求装配。
-pub(crate) fn assemble_developer_instructions(cwd: &str, registry: &ToolRegistrySnapshot) -> String {
-    let mut prompt = base_prompt(&registry.prompt_lines());
-    // 平台和 shell 是稳定事实，直接写进提示词：不写时模型会自己猜方言（比如在 Git Bash
-    // 上写 cmd 的 `cd /d`、`2>nul`），输出可能被重定向吞掉。
-    prompt.push_str("\n\nEnvironment:\n- Platform: ");
-    prompt.push_str(std::env::consts::OS);
-    prompt.push_str("\n- Command shell: bash (Git Bash on Windows).");
-    prompt.push_str("\n\nCurrent working directory: ");
-    prompt.push_str(cwd);
-    prompt
-}
-
-fn base_prompt(tools: &[(&str, &str)]) -> String {
-    let available_tools = tools
-        .iter()
-        .map(|(name, snippet)| format!("- {name}: {snippet}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+/// 生成 Developer 指令；文件指令和技能列表由请求组装代码另外添加。
+pub(crate) fn assemble_developer_instructions(cwd: &str) -> String {
+    // 写明平台和 shell，否则模型可能在 Git Bash 里写 cmd 语法（如 `cd /d`、`2>nul`），
+    // 输出被重定向丢掉。
     format!(
         "You are an expert coding assistant operating inside Singularity, a coding agent \
              harness. You help users by reading files, executing commands, editing code, and \
              writing new files.\n\n\
-             Available tools:\n{available_tools}\n\n\
              Guidelines:\n\
              - Use read for text files and images.\n\
              - Use bash with rg for content searches and rg --files for file discovery; use Python or other commands for text edits, file writes, byte ranges, and structured processing.\n\
              - Be concise in your responses\n\
-             - Show file paths clearly when working with files"
+             - Show file paths clearly when working with files\n\n\
+             Environment:\n- Platform: {}\n\
+             - Command shell: bash (Git Bash on Windows).\n\n\
+             Current working directory: {cwd}",
+        std::env::consts::OS
     )
 }

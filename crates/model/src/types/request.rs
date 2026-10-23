@@ -1,10 +1,12 @@
-use super::message::ModelMessage;
+use super::message::Message;
 use super::tool::ModelToolSchema;
 
-/// Provider 无关的模型输入；执行层为每次发送分配 attempt 身份。
+/// 与协议无关的一次模型请求；每次发送尝试的 ID 由请求执行代码分配。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelTurnRequest {
-    pub messages: Vec<ModelMessage>,
+    pub messages: Vec<Message>,
+    /// 已读取的图片 data URL，按消息中的附件 ID 查找。
+    pub images: std::collections::HashMap<String, String>,
     pub tools: Vec<ModelToolSchema>,
-    pub model_preferences: singularity_protocol::RequestPreferences,
+    pub max_output_tokens: u32,
 }

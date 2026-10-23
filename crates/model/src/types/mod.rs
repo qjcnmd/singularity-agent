@@ -4,8 +4,9 @@ mod request;
 mod response;
 mod tool;
 
-pub use message::{ModelMessage, ModelRole};
-pub use reasoning::ProviderReasoningReplay;
+pub(crate) use message::ModelRole;
+pub use message::{ContentBlock, Message};
+pub use reasoning::{ProviderBlockMetadata, ProviderMessageMetadata};
 pub use request::ModelTurnRequest;
 pub use response::{ModelStopReason, ModelTurnResponse};
 pub use singularity_protocol::ModelUsage;

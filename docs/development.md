@@ -75,12 +75,10 @@ cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D w
 cargo check --workspace --all-targets
 ```
 
-### 应用回归测试
-
-应用回归测试检查消息入队后立即返回、准备失败后保留输入、停止清空队列，以及冷打开损坏历史时报告读取错误：
-
+### 回归测试
 ```powershell
-cargo test -p singularity_app --locked
+cargo test --workspace --locked
+npm --prefix apps/desktop test
 ```
 
 ---
@@ -123,4 +121,4 @@ npm --prefix apps/desktop run package
 产物输出于 `apps/desktop/release/win-unpacked/`，包含 `Singularity.exe` 与完整运行时依赖。
 
 ### CI
-- **CI 工作流** (`.github/workflows/ci.yml`)：推送到 `main` 时运行 Rust 格式化检查、Clippy、编译、应用回归测试及依赖检查。
+- **CI 工作流** (`.github/workflows/ci.yml`)：推送到 `main` 时运行 Rust 格式化检查、Clippy、编译、Rust 与前端同步测试及依赖检查。

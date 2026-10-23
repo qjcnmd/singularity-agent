@@ -1,5 +1,5 @@
 import { useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
-import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
+import { appStore, type AppState } from '../appStore'
 import { type TimelineItemModel } from '../timeline'
 import { TimelineItem } from './TimelineItem'
 import { defaultAnchor } from '../viewPersistence'
@@ -47,11 +47,11 @@ export function Conversation({ state, items }: Props) {
   const saveReadingPosition = (node: HTMLDivElement, element: HTMLElement) => {
     const index = items.findIndex(item => item.key === element.dataset.itemId)
     // 重试会撤回流式片段；用它之前最近的已保存条目记录位置。
-    const stable = items.slice(0, index + 1).findLast(item => item.anchorTurnId !== undefined)
-      ?? items.slice(index + 1).find(item => item.anchorTurnId !== undefined)
+    const stable = items.slice(0, index + 1).findLast(item => item.stable)
+      ?? items.slice(index + 1).find(item => item.stable)
     const target = stable && node.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(stable.key)}"]`)
-    if (!stable || stable.anchorTurnId === undefined || !target) { appStore.setViewportAnchor(defaultAnchor()); return }
-    appStore.setViewportAnchor({ mode: 'anchored', anchorItemId: stable.key, turnId: stable.anchorTurnId,
+    if (!stable || !stable.stable || !target) { appStore.setViewportAnchor(defaultAnchor()); return }
+    appStore.setViewportAnchor({ mode: 'anchored', anchorItemId: stable.key,
       offset: target.getBoundingClientRect().top - node.getBoundingClientRect().top })
   }
 
@@ -111,23 +111,10 @@ export function Conversation({ state, items }: Props) {
     return <div className="conversation-surface" aria-busy="true" />
   }
 
-  const sessionOrigin = actionOrigin.session(sessionId)
-  const loadingOlder = state.pendingActions.has(pendingKey('history.older', sessionOrigin))
   return (
     <div className="conversation-surface"><div className="conversation-scroll" ref={viewport} tabIndex={0} aria-label="任务内容" onScroll={onScroll} onClickCapture={preserveDisclosurePosition}>
       <div className="conversation-document">
-        {state.session.nextCursor !== null && (
-          <button
-            type="button"
-            className="load-older"
-            disabled={loadingOlder}
-            aria-busy={loadingOlder}
-            onClick={() => void appStore.readOlder()}
-          >
-            加载更早的记录
-          </button>
-        )}
-        {items.map(item => <TimelineItem key={item.fact?.id ?? item.key} item={item} sessionId={sessionId ?? undefined} />)}
+        {items.map(item => <TimelineItem key={item.key} item={item} sessionId={sessionId ?? undefined} />)}
       </div>
 
     </div>

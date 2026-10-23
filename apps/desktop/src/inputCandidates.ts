@@ -26,7 +26,6 @@ export function useFileCandidates(query: string | undefined, scope: QueryScope) 
       void appStore.transport.rpc('file.search', {
         workspaceId: selectedWorkspaceId,
         query: query.trim(),
-        limit: 12,
       }).then(
         result => { if (active) setFiles({ status: 'ready', result }) },
         error => { if (active) setFiles({ status: 'error', error: error instanceof Error ? error : new Error(String(error)) }) },

@@ -1,10 +1,9 @@
 import '../styles/model-picker.css'
-import { PickerSurface } from './PickerSurface'
 import { ExpandChevron } from './ExpandChevron'
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { useDismissOnOutside, useSelectionGuard, useTransientFocus, focusableElements, navigateList } from '../interactions'
-import { sortReasoningVariants, selectedModel, composeSelector } from '../modelChoices'
-import type { ModelConfigurationInput, RedactedProvider } from '../protocol'
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
+import { usePopoverFocus, useSelectionGuard, focusableElements, navigateList } from '../interactions'
+import { sortReasoningVariants, selectedModel } from '../modelChoices'
+import type { ModelSelection, ModelConfigurationInput, RedactedProvider } from '../protocol'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 
 interface ModelChoice {
@@ -18,46 +17,46 @@ interface ModelPickerProps {
 }
 
 export function ModelPicker({ state }: ModelPickerProps) {
-  const selector = appStore.modelSelector()
+  const selection = appStore.modelSelection()
   // 切换任务关闭浮层并丢弃待处理的滑块编辑；同一任务切换模型保留浮层。
   const scope = JSON.stringify([state.selectedWorkspaceId, state.selectedSessionId])
-  return <ModelPickerControls key={scope} state={state} selector={selector} />
+  return <ModelPickerControls key={scope} state={state} selection={selection} />
 }
 
-function ModelPickerControls({ state, selector }: ModelPickerProps & {
-  selector: string | null
+function ModelPickerControls({ state, selection }: ModelPickerProps & {
+  selection: ModelSelection | null
 }) {
   const [open, setOpen] = useState(false)
-  const root = useRef<HTMLDivElement>(null)
+  const popupId = useId()
+  const popup = useRef<HTMLDivElement>(null)
   const [previewIndex, setPreviewIndex] = useState<number | null>(null)
   const committing = useRef(false)
   const queuedEffort = useRef<number | null>(null)
   const dragging = useRef(false)
   const catalog = state.bootstrap?.modelCatalog
-  const currentChoice = selectedModel(catalog, selector)
+  const currentChoice = selectedModel(catalog, selection)
   const variants = sortReasoningVariants(currentChoice?.model.reasoningVariants)
   const resolvedEffort = currentChoice?.effort ?? null
-  const resolvedIndex = variants.findIndex((variant) => variant.id === resolvedEffort)
+  const resolvedIndex = variants.findIndex((variant) => variant === resolvedEffort)
   const sliderIndex = previewIndex ?? Math.max(0, resolvedIndex)
   const effortSelected = previewIndex !== null || resolvedIndex >= 0
-  const displayedEffort = effortSelected ? variants[Math.round(sliderIndex)]?.id ?? '' : ''
+  const displayedEffort = effortSelected ? variants[Math.round(sliderIndex)] ?? '' : ''
   useEffect(() => {
     if (!committing.current && !dragging.current) setPreviewIndex(null)
-  }, [selector, open])
+  }, [selection, open])
   useLayoutEffect(() => () => { queuedEffort.current = null }, [])
   const selectionGuard = useSelectionGuard()
   const sessionId = state.selectedSessionId
   const origin = actionOrigin.session(sessionId)
   const pending = state.pendingActions.has(pendingKey('session.updateSettings', origin))
 
-  useTransientFocus(open, () => setOpen(false), root, node => node.querySelector<HTMLElement>('.sg-native-slider:not(:disabled), .sg-menu button:not(:disabled)'))
-  useDismissOnOutside(root, open, () => setOpen(false))
+  usePopoverFocus(open, popup, '.sg-native-slider:not(:disabled), .sg-menu button:not(:disabled)')
 
   const chooseModel = async (choice: ModelChoice) => {
-    const effort = choice.model.reasoningVariants?.some((variant) => variant.id === resolvedEffort)
+    const effort = choice.model.reasoningVariants?.some((variant) => variant === resolvedEffort)
       ? resolvedEffort
       : choice.model.defaultVariant
-    await appStore.updateSettings(composeSelector(choice.provider.providerId, choice.model.modelId, effort))
+    await appStore.updateSettings({ provider: choice.provider.providerId, model: choice.model.modelId, reasoning: effort })
   }
 
   const chooseEffort = async (position: number) => {
@@ -72,9 +71,8 @@ function ModelPickerControls({ state, selector }: ModelPickerProps & {
         queuedEffort.current = null
         const variant = variants[next]
         if (variant === undefined) break
-        const nextSelector = composeSelector(currentChoice.provider.providerId, currentChoice.model.modelId, variant.id)
-        if (appStore.getSnapshot().session?.runtime.selector === nextSelector) continue
-        if (!await appStore.updateSettings(nextSelector)) {
+        const nextSelection = { provider: currentChoice.provider.providerId, model: currentChoice.model.modelId, reasoning: variant }
+        if (!await appStore.updateSettings(nextSelection)) {
           queuedEffort.current = null
           break
         }
@@ -90,26 +88,28 @@ function ModelPickerControls({ state, selector }: ModelPickerProps & {
   const providers = catalog?.providers ?? []
 
   return (
-    <div className="sg-root" ref={root} onKeyDown={event => {
+    <div className="sg-root" onKeyDown={event => {
       if (event.target instanceof HTMLInputElement || !open) return
       const menu = event.currentTarget.querySelector<HTMLElement>('.sg-menu')
       if (menu && navigateList(event.key, focusableElements(menu).filter(node => node.tagName === 'BUTTON'))) event.preventDefault()
     }}>
       <button
+        popoverTarget={popupId}
         type="button"
         className="sg-trigger"
         disabled={state.selectedWorkspaceId === null}
         aria-haspopup="dialog"
         aria-expanded={open}
         title={effortLabel ? `${modelLabel} · ${effortLabel}` : modelLabel}
-        {...selectionGuard(() => { setOpen(!open) })}
+        {...selectionGuard()}
       >
         <span className="sg-triggerLabel">{modelLabel}</span>
         {effortLabel !== null && <span className="sg-triggerEffort">{effortLabel}</span>}
         <ExpandChevron expanded={open} size={12} className="sg-chevron" />
       </button>
 
-      <PickerSurface open={open}>
+      <div ref={popup} id={popupId} popover="auto" className="picker-disclosure model-popover" inert={!open} aria-hidden={!open}
+        onToggle={event => setOpen(event.newState === 'open')}><div>
         <div className="sg-menu" role="dialog" aria-label="模型与推理等级">
           <div className="sg-menuBody">
             <div className="sg-groups">
@@ -126,8 +126,8 @@ function ModelPickerControls({ state, selector }: ModelPickerProps & {
                         key={model.modelId}
                         type="button"
                         aria-pressed={isSelected}
-                        disabled={!provider.credentialConfigured || pending}
-                        className={`sg-option${provider.credentialConfigured ? '' : ' is-unavailable'}`}
+                        disabled={pending}
+                        className="sg-option"
                         {...selectionGuard(() => {
                           void chooseModel({ provider, model })
                         })}
@@ -149,7 +149,7 @@ function ModelPickerControls({ state, selector }: ModelPickerProps & {
                 <div className="sg-range" aria-hidden="true">
                   <div className="sg-rail" />
                   <div className="sg-fill" style={{ width: !effortSelected ? '0' : variants.length === 1 ? 'calc(100% + 12px)' : sliderIndex <= 0 ? '0' : `calc(${sliderIndex / (variants.length - 1) * 100}% + 12px)` }} />
-                  {variants.map((variant, index) => <div key={variant.id} className={`sg-tick${effortSelected && index <= Math.round(sliderIndex) ? ' sg-tick-on' : ''}`} style={{ left: `${variants.length > 1 ? index / (variants.length - 1) * 100 : 100}%` }} />)}
+                  {variants.map((variant, index) => <div key={variant} className={`sg-tick${effortSelected && index <= Math.round(sliderIndex) ? ' sg-tick-on' : ''}`} style={{ left: `${variants.length > 1 ? index / (variants.length - 1) * 100 : 100}%` }} />)}
                   <div className="sg-thumb" style={{ left: `${variants.length > 1 ? sliderIndex / (variants.length - 1) * 100 : 100}%`, opacity: effortSelected ? 1 : 0 }} />
                 </div>
                 <input className="sg-native-slider" type="range" min={0} max={Math.max(0, variants.length - 1)} step="any" value={sliderIndex}
@@ -174,7 +174,7 @@ function ModelPickerControls({ state, selector }: ModelPickerProps & {
           )}
 
         </div>
-      </PickerSurface>
+      </div></div>
     </div>
   )
 }

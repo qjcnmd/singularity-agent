@@ -13,9 +13,8 @@
 .sg-group + .sg-group { margin-top: 4px; }
 .sg-groupTitle { z-index: 1; background: var(--surface); color: var(--ink-faint); padding: 5px 8px 3px; font-size: 12px; font-weight: 500; line-height: 18px; position: sticky; top: 0; }
 .sg-option { width: 100%; min-height: 38px; color: inherit; text-align: left; cursor: pointer; background: 0 0; border: none; border-radius: 10px; outline: none; align-items: center; gap: 8px; padding: 6px 8px; display: flex; }
-.sg-option:hover:not(.is-unavailable), .sg-option:focus-visible { background: var(--surface-hover); }
+.sg-option:hover:not(:disabled), .sg-option:focus-visible { background: var(--surface-hover); }
 .sg-option:disabled { cursor: default; }
-.sg-option.is-unavailable { color: var(--ink-faint); }
 
 .sg-modelName { flex: 1; color: inherit; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 500; line-height: 20px; overflow: hidden; }
 
@@ -35,7 +34,7 @@
 .sg-thumb { position: absolute; z-index: 2; top: 2.5px; width: 27px; height: 27px; margin-left: -13.5px; border-radius: 50%; background: #fff; border: 1px solid #DCDBDC; box-shadow: 0 1px 2px rgba(20,30,50,.12), 0 3px 8px rgba(20,30,50,.08); transition: opacity var(--sg-snap); }
 .sg-track:hover .sg-thumb { box-shadow: 0 1px 2px rgba(20,30,50,.14), 0 4px 10px rgba(20,30,50,.1); }
 
-.sg-root > .picker-disclosure { position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 20; width: min(220px, 100vw - 32px); }
+.sg-root > .model-popover { position: fixed; position-anchor: auto; inset: 0; bottom: anchor(top); right: max(0px, calc(anchor(right) - 8px)); place-self: end; width: min(220px, 100vw - 32px); margin: 8px; padding: 0; border: 0; overflow: visible; background: transparent; color: inherit; }
 .sg-menu > .sg-menuBody { min-height: 0; }
 .sg-native-slider { position: absolute; inset: 0; width: 100%; height: 32px; margin: 0; padding: 0; opacity: 0; cursor: grab; touch-action: none; appearance: none; background: transparent; }
 .sg-track:has(:focus-visible) .sg-thumb { outline: 2px solid var(--focus); outline-offset: 2px; }

@@ -1,7 +1,6 @@
-/** 动作来源键由发起方与原位反馈共用。 */
+/** 操作来源的键：发起操作的控件和显示错误的位置用同一个键对应起来。 */
 export const actionOrigin = {
   session: (id: string | null) => `session:${id}`,
-  workspace: (id: string | null) => `workspace:${id}`,
   control: (sessionId: string | null, controlId: string) => `control:${sessionId}:${controlId}`,
   inline: (method: string, id: string | null) => `inline:${method}:${id}`,
   directoryPicker: 'directory:picker',
@@ -12,8 +11,7 @@ export function hasInlineActionError(origin: string): boolean {
   return origin.startsWith('control:') || origin.startsWith('inline:')
 }
 
-/** 待处理动作键：方法名与来源。查询方按同一规则在已订阅的 pendingActions
- *  上查自己的键，不再为了读 pending 去碰全局 store。 */
+/** 进行中操作的键：方法名加来源。组件用它在已订阅的 pendingActions 里判断自己的操作是否进行中。 */
 export function pendingKey(method: string, origin: string): string {
   return `${method}:${origin}`
 }

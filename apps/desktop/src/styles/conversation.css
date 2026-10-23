@@ -18,22 +18,6 @@
   flex-direction: column;
   gap: 6px;
 }
-.load-older {
-  display: block;
-  margin: 0 auto 25px;
-  padding: 6px 14px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--ink-soft);
-  cursor: pointer;
-  font-size: 12px;
-  box-shadow: 0 1px 2px rgb(0 0 0 / 3%);
-}
-.load-older:hover {
-  background: var(--surface-hover);
-  color: var(--ink);
-}
 
 /* 精简空状态 - 干净且不打扰 */
 .empty-state {
@@ -143,7 +127,7 @@
 .step-separator { flex: none; margin: 0 8px; color: var(--ink-faint); }
 .step-summary { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--ink-faint); }
 .step-summary.follows-end { text-overflow: clip; }
-.activity-step.status-error .step-summary, .activity-step.status-error .step-icon { color: var(--danger); }
+.activity-step.status-failed .step-summary, .activity-step.status-failed .step-icon { color: var(--danger); }
 .activity-toggle .item-status { margin-left: 8px; font-size: 12px; }
 .reasoning-row .step-summary { position: relative; }
 .reasoning-summary-measure { position: absolute; top: 0; left: 0; width: max-content; visibility: hidden; white-space: pre; pointer-events: none; }
@@ -168,11 +152,11 @@
 .activity-shimmer { background: linear-gradient(90deg, var(--ink-soft) 35%, var(--ink-faint) 50%, var(--ink-soft) 65%); background-size: 250% 100%; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: activity-shimmer 2.8s ease-in-out infinite; }
 .execution-title { --execution-color: var(--accent); background-image: linear-gradient(var(--execution-color), var(--execution-color)); background-size: 200% 100%; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: execution-shine 1.6s linear infinite paused; }
 .status-running .execution-title { background-image: linear-gradient(100deg, var(--execution-color) 0%, var(--execution-color) 35%, color-mix(in srgb, var(--execution-color), white 45%) 50%, var(--execution-color) 65%, var(--execution-color) 100%); animation-play-state: running; }
-.status-error .execution-title { --execution-color: var(--danger); }
+.status-failed .execution-title { --execution-color: var(--danger); }
 .muted-execution-title { --execution-color: var(--ink-faint); }
 .compaction-toggle { gap: 8px; color: var(--ink-faint); }
 .compaction-toggle[aria-disabled=true] { cursor: default; }
-.timeline-compaction.status-error .compaction-label { color: var(--danger); }
+.timeline-compaction.status-failed .compaction-label { color: var(--danger); }
 .compaction-summary { padding: 10px 14px; border-radius: 14px; background: var(--surface-muted); color: var(--ink-soft); }
 @keyframes execution-shine { from { background-position: 150% center; } to { background-position: -50% center; } }
 @keyframes activity-shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
@@ -220,8 +204,3 @@
   .conversation-document { padding: 72px 16px 20px; }
   .timeline-user { max-width: 94%; }
 }
-
-.context-content { max-height: 420px; overflow: auto; }
-.context-content pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 12px; line-height: 1.7; color: var(--ink-soft); }
-
-.timeline-context .activity-toggle { gap: 6px; }

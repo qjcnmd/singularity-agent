@@ -3,7 +3,6 @@ export type * from './protocol.generated'
 
 /** 连接生命周期只描述传输层确实会宣告的状态；RPC 失败码另见 RpcErrorCode。 */
 export type ConnectionStatus = 'connecting' | 'ready' | 'recovering'
-type TurnEventEnvelope = Wire.TurnEventEnvelope
 
 export type RpcMethod = keyof Wire.RpcContract
 export type RpcParams<M extends RpcMethod> = Wire.RpcContract[M]['params']
@@ -12,12 +11,6 @@ export type RpcResponse<M extends RpcMethod> =
   | { type: 'success'; result: RpcResult<M> }
   | Extract<Wire.RpcResponse, { type: 'error' }>
 
-/** 事件归属的 turn；独立压缩不绑定 turn。 */
-export function eventTurnId(event: TurnEventEnvelope): string | null {
-  if ('turn' in event.params) return event.params.turn.turnId
-  return event.params.turnId
-}
-
 export type ViewportAnchor =
-  | { mode: 'following'; anchorItemId: null; turnId: null; offset: 0 }
-  | { mode: 'anchored'; anchorItemId: string; turnId: string | null; offset: number }
+  | { mode: 'following'; anchorItemId: null; offset: 0 }
+  | { mode: 'anchored'; anchorItemId: string; offset: number }

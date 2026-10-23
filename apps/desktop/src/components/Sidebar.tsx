@@ -1,7 +1,6 @@
 import { Ellipsis, FolderMinus, Plus } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
-import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { AnimatePresence } from 'motion/react'
+import { memo, useEffect, useLayoutEffect, useId, useRef, useState } from 'react'
 import { useSelectionGuard } from '../interactions'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
 import type { ThreadSummary, Workspace } from '../protocol'
@@ -31,9 +30,8 @@ function sameSidebarState(previous: SidebarState, next: SidebarState): boolean {
     if (key !== 'liveSessions') return Object.is(previous[key], next[key])
     const left = previous.liveSessions, right = next.liveSessions
     return Object.keys(left).length === Object.keys(right).length && Object.entries(left).every(([id, value]) =>
-      value.phase === right[id]?.phase && value.terminal?.source === right[id]?.terminal?.source
-      && value.terminal?.status === right[id]?.terminal?.status
-      && value.terminal?.manuallyStopped === right[id]?.terminal?.manuallyStopped)
+      value.phase === right[id]?.phase && value.failure?.source === right[id]?.failure?.source
+)
   })
 }
 
@@ -61,7 +59,7 @@ function SidebarView() {
   const collapsed = new Set(state.sidebarView.collapsed)
   const [showAll, setShowAll] = useState<Set<string>>(new Set())
   const sessionRow = (session: ThreadSummary, title: string) => <div key={session.threadId}><SessionButton session={session} title={title} selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
-      unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })} onArchive={() => { void appStore.archiveSession(session.threadId) }} /></div>
+      unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })} onDelete={() => { void appStore.deleteSession(session.threadId) }} /></div>
   return (
     <>
             <aside ref={sidebar} className={`sidebar-shell${state.sidebarCollapsed ? ' is-collapsed' : ''}`} aria-label="项目与任务导航" onTransitionEnd={focusSidebar}>
@@ -138,11 +136,11 @@ function SidebarView() {
 function WorkspaceButton({ workspace, selected, expanded, appearance, onToggle, onRemove }: { workspace: Workspace; selected: boolean; expanded: boolean; appearance: WorkspaceAppearance; onToggle: () => void; onRemove: () => void }) {
   const guard = useSelectionGuard()
   const [appearanceOpen, setAppearanceOpen] = useState(false)
-  const iconAnchor = useRef<HTMLButtonElement>(null)
+  const appearanceId = useId()
   const name = workspaceName(workspace)
   return (
     <div className={`workspace-row${selected ? ' is-selected' : ''}`}>
-      <button ref={iconAnchor} type="button" className="workspace-icon-button" aria-label={`更改 ${name} 的颜色`} aria-haspopup="dialog" aria-expanded={appearanceOpen} onClick={() => setAppearanceOpen(value => !value)}><WorkspaceIcon appearance={appearance} /></button>
+      <button type="button" className="workspace-icon-button" aria-label={`更改 ${name} 的颜色`} aria-haspopup="dialog" aria-expanded={appearanceOpen} popoverTarget={appearanceId}><WorkspaceIcon appearance={appearance} /></button>
       <button
         type="button"
         className="workspace-button"
@@ -155,7 +153,7 @@ function WorkspaceButton({ workspace, selected, expanded, appearance, onToggle, 
       </button>
       <button type="button" className="icon-button workspace-new" onClick={() => void appStore.newTask(workspace.workspaceId)} aria-label={`在 ${name} 新建任务`}><Plus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
       <button type="button" className="icon-button workspace-remove" onClick={onRemove} aria-label={`移除项目 ${name}`} title="移除项目" aria-haspopup="dialog"><FolderMinus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
-      <AnimatePresence>{appearanceOpen && <WorkspaceAppearancePicker anchor={iconAnchor} appearance={appearance} onChange={value => appStore.setWorkspaceAppearance(workspace.workspaceId, value)} onClose={() => { setAppearanceOpen(false); requestAnimationFrame(() => iconAnchor.current?.focus()) }} />}</AnimatePresence>
+      <WorkspaceAppearancePicker id={appearanceId} open={appearanceOpen} appearance={appearance} onChange={value => appStore.setWorkspaceAppearance(workspace.workspaceId, value)} onToggle={setAppearanceOpen} />
     </div>
   )
 }
@@ -167,7 +165,7 @@ function SessionButton({
   title,
   unread,
   onRename,
-  onArchive,
+  onDelete,
 }: {
   session: ThreadSummary
   selected: boolean
@@ -175,7 +173,7 @@ function SessionButton({
   title: string
   unread: boolean
   onRename: () => void
-  onArchive: () => void
+  onDelete: () => void
 }) {
   const mainGuard = useSelectionGuard()
   const [menuOpen, setMenuOpen] = useState(false)
@@ -190,12 +188,12 @@ function SessionButton({
         <span className={`session-status status-${unread && !selected ? status.className : 'idle'}`} aria-hidden="true" />
         <span className="session-label">
           <strong className={live && live.phase !== 'idle' ? 'activity-shimmer' : undefined}>{title}</strong>
-          {session.turnCount > 0 && <time dateTime={session.updatedAt}>{relativeTime(session.updatedAt)}</time>}
+          {session.status !== null && <time dateTime={session.updatedAt}>{relativeTime(session.updatedAt)}</time>}
         </span>
         <span className="sr-only">{status.label}</span>
       </button>
       <span className="session-actions"><button ref={anchor} type="button" className="icon-button" aria-label="任务菜单" aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen(value => !value)}><Ellipsis size={16} strokeWidth={1.6} aria-hidden="true" /></button></span>
-      {menuOpen && <Menu anchor={anchor} label="任务菜单" onClose={() => setMenuOpen(false)} entries={[{ id: 'rename', label: '重命名', onSelect: onRename }, { id: 'archive', label: '归档任务', onSelect: onArchive }]} />}
+      {menuOpen && <Menu anchor={anchor} label="任务菜单" onClose={() => setMenuOpen(false)} entries={[{ id: 'rename', label: '重命名', onSelect: onRename }, { id: 'delete', label: '删除任务', onSelect: onDelete }]} />}
     </div>
   )
 }

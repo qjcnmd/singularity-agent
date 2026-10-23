@@ -48,7 +48,7 @@
 .icon-button, .quiet-button, .secondary-button, .primary-button, .stop-button, .expand-button, .header-button,
 .workspace-button, .session-main,
 .composer-candidates button, .submit-button,
-.workspace-icon-button, .load-older {
+.workspace-icon-button {
   transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease, transform 80ms ease, box-shadow 140ms ease;
 }
 .icon-button, .quiet-button, .secondary-button, .primary-button, .stop-button, .expand-button, .header-button {
@@ -113,7 +113,7 @@
 }
 /* 按钮按压交互反馈 */
 .icon-button:active, .quiet-button:active, .secondary-button:active, .primary-button:active, .header-button:active,
-.workspace-icon-button:active, .sg-icon-btn:active, .load-older:active {
+.workspace-icon-button:active, .sg-icon-btn:active {
   transform: scale(0.96);
 }
 .icon-button:active, .quiet-button:active, .header-button:active { background: var(--surface-pressed); }
@@ -375,7 +375,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .workspace-icon-button { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 8px; background: transparent; cursor: pointer; }
 .workspace-icon-button:hover { background: var(--surface-muted); }
 .workspace-dot { display: inline-block; flex: none; width: 13px; height: 13px; border-radius: 50%; }
-.workspace-appearance-picker { position: fixed; z-index: 100; width: max-content; padding: 10px; border: 1px solid var(--line); border-radius: 14px; transform-origin: top left; }
+.workspace-appearance-picker { width: max-content; padding: 10px; border: 1px solid var(--line); border-radius: 14px; transform-origin: top left; color: var(--ink); opacity: 0; transform: translateY(-4px) scale(.96); transition: opacity var(--disclosure-collapse-duration) var(--disclosure-collapse-ease), transform var(--disclosure-collapse-duration) var(--disclosure-collapse-ease), display var(--disclosure-collapse-duration) allow-discrete, overlay var(--disclosure-collapse-duration) allow-discrete; }
+.workspace-appearance-picker:popover-open { opacity: 1; transform: translateY(0) scale(1); transition-duration: var(--disclosure-duration); transition-timing-function: var(--disclosure-ease); }
+@starting-style { .workspace-appearance-picker:popover-open { opacity: 0; transform: translateY(-4px) scale(.96); } }
 .workspace-color-grid { display: flex; gap: 8px; }
 .workspace-color-grid button { flex: none; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%; position: relative; cursor: pointer; }
 .workspace-color-grid button[aria-pressed=true] { outline: 2px solid currentColor; outline-offset: 3px; color: var(--ink); }

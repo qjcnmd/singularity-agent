@@ -10,17 +10,17 @@ export function selectedSessionPhase(state: Pick<SyncState, 'session' | 'liveSes
 }
 
 /**
- * 侧栏任务状态的派生规则：活动相位优先，空闲时只由**回合**终态决定。
+ * 侧栏显示的任务状态：运行中时显示当前阶段，空闲时只看最近一个**回合**的结果。
  *
- * 独立压缩的终态属于那次压缩。它在对话区自成一行，不改任务状态，压缩失败或
- * 中断不会把已完成的任务标成失败。
+ * 独立压缩的结果只显示在对话区的那一行，不改变任务状态；压缩失败或中断不会把
+ * 已完成的任务标成失败。
  */
 export function sessionState(session: ThreadSummary, live: LiveSessionState | undefined) {
   if (live !== undefined && live.phase !== 'idle') {
     return { className: live.phase, label: phaseText[live.phase] }
   }
-  const terminal = live?.terminal?.source === 'turn' ? live.terminal : session
-  const { status, manuallyStopped } = terminal
+  if (live?.failure?.source === 'turn') return { className: 'failed', label: '执行失败' }
+  const { status, manuallyStopped } = session
   return status === null
     ? { className: 'idle', label: '就绪' }
     : {

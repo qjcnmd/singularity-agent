@@ -11,10 +11,11 @@ type ModelInput = ProviderConfigurationInput['models'][number]
 type ProviderEditorProps = {
   state: Pick<AppState, 'bootstrap' | 'actionErrors' | 'pendingActions'>
   provider?: RedactedProvider
+  active: boolean
   onDone: () => void
 }
 
-export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps) {
+export function ProviderEditor({ state, provider, active, onDone }: ProviderEditorProps) {
   const [providerId, setProviderId] = useState(provider?.providerId ?? '')
   const [name, setName] = useState(provider?.displayName ?? '')
   const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? '')
@@ -33,8 +34,10 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
     setFetching(false)
     setCandidates(null)
     setFailure(null)
+    if (!active) setModelEditor(null)
+    // 收起动画仍保留组件；关闭编辑器时就丢弃未返回的查询。
     return () => { discoveryRevision.current += 1 }
-  }, [providerId, baseUrl, apiKey, protocol])
+  }, [providerId, baseUrl, apiKey, active])
   const saveError = state.actionErrors[origin]
   /** 校验并提交模型草稿。返回错误提示字符串表示校验失败，null 表示已成功加入列表。 */
   const commitModel = (index: number | null, draft: ModelInput): string | null => {
@@ -46,7 +49,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
 
   function queryModels() {
     return appStore.transport.rpc('model.discover', {
-      providerId: providerId.trim(), baseUrl, apiKey: apiKey.trim() || null, apiProtocol: protocol,
+      providerId: providerId.trim(), baseUrl, apiKey: apiKey.trim() || null,
     })
   }
 
@@ -86,8 +89,8 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
     event.preventDefault()
     setFailure(null)
     appStore.clearError(origin)
-    if (!/^[^\s/#]+$/.test(providerId.trim())) {
-      setFailure('请输入不含空格、/ 或 # 的提供方 ID。')
+    if (!/^[^\s\x00-\x1f\x7f]+$/.test(providerId.trim())) {
+      setFailure('请输入不含空白和控制字符的提供方 ID。')
       return
     }
     if (!provider && state.bootstrap?.modelCatalog.providers.some(p => p.providerId === providerId.trim())) {
@@ -141,7 +144,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
             </label>}
           <label className="sg-field">
             <span>API 密钥</span>
-            <input className="sg-input" type="password" autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={provider?.credentialConfigured ? '已配置——输入新值可替换' : '输入 API 密钥'} />
+            <input className="sg-input" type="password" autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={provider?.credentialConfigured ? '已配置——输入新值可替换' : '可选，服务需要认证时填写'} />
           </label>
           <div className="sg-customized-body">
             <label className="sg-field">
@@ -191,11 +194,11 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
           </footer>
         </fieldset>
       </form>
-      {modelEditor && <ModelEditor
+      {active && modelEditor && <ModelEditor
         index={modelEditor.index} initial={modelEditor.draft} protocol={protocol} discover={queryModels}
         onConfirm={draft => commitModel(modelEditor.index, draft)} onClose={() => setModelEditor(null)}
       />}
-      <Dialog open={candidates !== null} onClose={() => setCandidates(null)} labelledBy="discovered-models-title" className="confirm-modal model-discovery-modal">
+      <Dialog open={active && candidates !== null} onClose={() => setCandidates(null)} labelledBy="discovered-models-title" className="confirm-modal model-discovery-modal">
         <header className="modal-header">
           <h2 id="discovered-models-title">选择可用模型</h2>
           <button type="button" className="icon-button" onClick={() => setCandidates(null)} aria-label="关闭模型列表">×</button>
@@ -207,7 +210,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
               <span>
                 {candidate.modelId}
                 {(candidate.reasoningVariants.length > 0 || candidate.maxContextTokens !== null) && <small>
-                  {candidate.reasoningVariants.map(variant => variant.id).join(' / ')}
+                  {candidate.reasoningVariants.join(' / ')}
                   {candidate.maxContextTokens ? `${candidate.reasoningVariants.length ? ' · ' : ''}${formatTokenCount(candidate.maxContextTokens)}` : ''}
                 </small>}
               </span>
@@ -226,5 +229,5 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
 
 function invalidModelId(models: ModelInput[], index: number | null, value: string): boolean {
   const id = value.trim()
-  return !id || /\s|#/.test(id) || models.some((model, at) => at !== index && model.modelId.trim() === id)
+  return !id || /[\s\x00-\x1f\x7f]/.test(id) || models.some((model, at) => at !== index && model.modelId.trim() === id)
 }

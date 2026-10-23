@@ -25,21 +25,16 @@ pub struct ThreadSummary {
     pub updated_at: String,
     pub title: Option<String>,
     pub status: Option<TurnStatus>,
-    /// 最近一次被中断的 run，在账本里有明确的用户取消记录。
+    /// 最近一个回合是否由用户停止而中断。
     pub manually_stopped: bool,
-    pub turn_count: usize,
-    /// 整份账本的累计模型用量。它只在生成快照时更新，运行中回合的增量要调用方从活动
-    /// 事件累计，实时值由 SessionRuntime 提供。
-    pub usage: SessionModelUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-pub struct ThreadReadPage {
+pub struct ThreadHistory {
     pub summary: ThreadSummary,
     pub turns: Vec<ThreadTurn>,
-    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -47,50 +42,51 @@ pub struct ThreadReadPage {
 #[serde(rename_all = "snake_case")]
 pub enum SessionPhase {
     Idle,
-    Reserved,
     Running,
     Compacting,
     Stopping,
 }
 
-/// 给执行事件附加会话版本和真实运行阶段，客户端不从事件类型推断阶段。
+/// 给执行事件附加真实运行阶段，客户端不从事件类型推断阶段。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct TurnEventEnvelope {
+    pub turn_id: Option<String>,
     #[serde(flatten)]
     pub event: TurnEvent,
-    pub session_revision: u64,
     pub phase: SessionPhase,
-    /// 请求观测改变合计时携带完整用量，客户端无需重算。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub usage: Option<SessionModelUsage>,
 }
 
-/// 产生了终态反馈的操作：普通回合，或一次独立的压缩。界面按来源决定反馈放在哪里。
-/// 回合终态描述任务本身，压缩终态只描述那次压缩，不改变任务状态。
+/// 未保存错误来自普通回合或独立压缩；压缩失败不改变任务的回合状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
-pub enum SessionTerminalSource {
+pub enum SessionOperation {
     Turn,
     Compaction,
 }
 
+/// 未能写入历史的操作错误；已保存的回合结果直接从历史读取。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-pub struct SessionTerminalSnapshot {
-    pub source: SessionTerminalSource,
-    pub status: TurnStatus,
-    /// 该回合的中断来自已接受的用户停止，与持久化摘要使用同一事实。
-    pub manually_stopped: bool,
+pub struct SessionFailure {
+    pub source: SessionOperation,
     /// 未保存到会话历史的失败原因；已保存的结果通过历史与执行事件展示。
-    pub error: Option<crate::TurnErrorDetail>,
+    pub error: crate::TurnErrorDetail,
 }
 
-/// 已接收、尚未保存为用户消息的输入；身份在交付后保持不变。
+/// 项目列表恢复任务状态所需的当前阶段和未保存错误。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatus {
+    pub phase: SessionPhase,
+    pub failure: Option<SessionFailure>,
+}
+
+/// 已接受、还没保存的用户消息；保存后条目 ID 不变。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -100,21 +96,38 @@ pub struct PendingUserMessage {
     pub images: Vec<crate::ImageAttachment>,
 }
 
-/// 会话当前运行阶段、待处理输入、后台命令与用量。
+/// 提供方、模型和可选推理档位；配置、会话和桌面请求共用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelSelection {
+    pub provider: String,
+    pub model: String,
+    pub reasoning: Option<String>,
+}
+
+/// 会话当前运行阶段、待处理输入与用量。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntime {
-    pub session_revision: u64,
     pub phase: SessionPhase,
-    pub selector: Option<String>,
-    pub model_context_window: Option<u64>,
+    pub selection: ModelSelection,
+    pub context_usage: Option<ContextUsage>,
     pub pending_question: Option<crate::PendingQuestion>,
     pub pending_messages: Vec<PendingUserMessage>,
-    pub background_tasks: Vec<crate::BackgroundTask>,
-    pub terminal: Option<SessionTerminalSnapshot>,
-    /// 活动执行累计到的完整用量；尚未执行时从历史摘要读取。
-    pub usage: Option<SessionModelUsage>,
+    pub failure: Option<SessionFailure>,
+    /// 整份会话的累计模型用量。
+    pub usage: SessionModelUsage,
+}
+
+/// 最近一次生成请求的实际输入用量，以及执行时采用的窗口大小。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsage {
+    pub used: u64,
+    pub capacity: u64,
 }
 
 /// 可编辑的模型取值；取值是否合法由 runtime 的配置解析负责校验。
@@ -125,12 +138,11 @@ pub struct ModelConfigurationInput {
     pub model_id: String,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
-    pub reasoning_variants: Option<Vec<ReasoningVariant>>,
+    pub reasoning_variants: Option<Vec<String>>,
     pub default_variant: Option<String>,
     pub thinking_wire_format: Option<String>,
     /// Chat 输出上限使用的 wire 字段名；`None` 表示发送 `max_tokens`。
     pub chat_output_tokens_field: Option<String>,
-    pub requires_reasoning_content_for_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -151,7 +163,7 @@ pub struct RedactedProvider {
 pub struct RedactedModelCatalog {
     /// 配置读取或默认模型选择校验失败；尚未配置提供方或模型时为空。
     pub error: Option<String>,
-    pub default_selector: Option<String>,
+    pub default_selection: Option<ModelSelection>,
     pub providers: Vec<RedactedProvider>,
 }
 
@@ -161,14 +173,6 @@ pub struct RedactedModelCatalog {
 pub enum ProviderApiProtocol {
     Chat,
     Responses,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct ReasoningVariant {
-    pub id: String,
-    pub wire_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,8 +194,7 @@ pub struct DiscoveredModel {
     pub model_id: String,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
-    pub reasoning_variants: Vec<ReasoningVariant>,
-    pub requires_reasoning_content_for_tool_calls: Option<bool>,
+    pub reasoning_variants: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -200,7 +203,7 @@ pub struct DiscoveredModel {
 pub struct AppBootstrap {
     /// 系统用户主目录，用于界面缩短路径；与应用数据目录无关。
     pub user_home: Option<String>,
-    pub session_phases: std::collections::BTreeMap<String, SessionPhase>,
+    pub session_states: BTreeMap<String, SessionStatus>,
     pub revision: u64,
     pub workspaces: Vec<Workspace>,
     pub sessions_by_workspace: BTreeMap<String, Vec<ThreadSummary>>,
@@ -211,8 +214,13 @@ pub struct AppBootstrap {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionReadResult {
-    pub history: ThreadReadPage,
+    /// 快照包含的最后一个会话事件在全局流中的位置。
+    pub revision: u64,
+    pub history: ThreadHistory,
     pub runtime: SessionRuntime,
+    /// 首次读取后台命令，后续变化由独立事件更新。
+    pub background_tasks: Vec<crate::BackgroundTask>,
+    pub context: Option<crate::InjectedContext>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -258,7 +266,7 @@ pub enum RpcResponse {
     Error { error: RpcError },
 }
 
-/// 带类型的载荷；外层信封会把该枚举展平成既有的 wire 形状。
+/// 推送给工作台的事件；序列化时与外层的事件序号合并成一个对象。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -281,13 +289,19 @@ pub enum StreamEvent {
         #[serde(rename = "sessionId")]
         session_id: String,
         payload: SessionRuntime,
+        summary: ThreadSummary,
+    },
+    SessionSummaryChanged {
+        summary: ThreadSummary,
     },
     BackgroundTaskUpdated {
         #[serde(rename = "sessionId")]
         session_id: String,
         payload: Box<crate::BackgroundTaskUpdate>,
     },
-    ResyncRequired,
+    AppReadFailed {
+        error: RpcError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -299,11 +313,21 @@ pub struct StreamEnvelope {
     pub event: StreamEvent,
 }
 
-/// 首次发送确认已接收输入；工作台按返回的身份打开任务。
+/// 首次发送的结果：输入已接受，工作台按返回的任务 ID 打开任务。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStartResult {
-    pub session_id: String,
-    pub bootstrap: AppBootstrap,
+    pub summary: ThreadSummary,
+    pub status: SessionStatus,
+    pub revision: u64,
+}
+
+/// 模型配置的局部读取结果；序号用于拒绝晚到的旧工作台快照。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogResult {
+    pub catalog: crate::RedactedModelCatalog,
+    pub revision: u64,
 }

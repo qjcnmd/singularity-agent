@@ -1,16 +1,14 @@
-//! 上下文缩减策略、摘要请求的构造与结果校验。
+//! 摘要请求的构造和结果检查。
 //!
-//! 摘要只替换早期历史；请求执行、取消和持久提交统一由 Agent 负责，文件指令由每轮准备负责。
+//! 摘要只替换早期历史；发送、停止和保存由 Agent 负责，文件指令在每轮准备时读取。
 
+use crate::agent::request::RequestDefinitions;
 use crate::request_execution::output_budget_tokens;
-use crate::session::RequestDefinitions;
 use crate::session::context::CompactionPrefix;
 use crate::session::context::estimate_tokens_of;
 
 use crate::agent::{AgentError, Result};
-use singularity_model::{
-    ModelConfigurationSnapshot, ModelMessage, ModelRole, ModelTurnRequest, ModelTurnResponse,
-};
+use singularity_model::{Message, ModelConfigurationSnapshot, ModelTurnRequest, ModelTurnResponse};
 
 /// 摘要请求的目标输出上限；实际值还受模型上限与本次请求的窗口余量约束。
 const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
@@ -39,37 +37,41 @@ const SUMMARY_FORMAT: &str = r#"Output only a concise summary with these Markdow
 
 Use "(none)" for an empty section. Preserve exact paths, identifiers, commands, errors, and user wording when needed to continue. Distinguish verified results from plans. Project files remain authoritative; Harness and project instructions are loaded separately. Do not call tools or continue the conversation."#;
 
-/// 摘要请求和它要替换的历史边界；响应只有通过校验才能生成落盘条目。
+/// 摘要请求，以及摘要生效后保留的第一条记录。
 pub(crate) struct PreparedCompaction {
     pub(crate) request: ModelTurnRequest,
     pub(crate) first_kept_entry_id: String,
 }
 impl PreparedCompaction {
-    /// 摘要请求沿用生成请求的指令前缀与工具定义；只替换选中的对话历史前缀。
+    /// 摘要请求沿用普通请求的指令和工具定义，后面接要总结的早期对话和总结要求。
     pub(crate) fn new(
         prefix: CompactionPrefix,
-        definitions: &RequestDefinitions,
+        definitions: RequestDefinitions,
         model: &ModelConfigurationSnapshot,
     ) -> crate::agent::Result<Self> {
         let overhead_tokens = definitions.estimated_tokens();
-        let mut messages = definitions.model_messages();
-        messages.extend(crate::session::context::load_messages(prefix.messages, &prefix.image_directory)?);
-        let instruction = match prefix.previous_summary {
-            Some(previous) => format!(
-                "<previous-summary>\n{previous}\n</previous-summary>\n\n{UPDATE_SUMMARY_INSTRUCTION}\n\n{SUMMARY_FORMAT}"
-            ),
-            None => format!("{INITIAL_SUMMARY_INSTRUCTION}\n\n{SUMMARY_FORMAT}"),
+        let mut messages = definitions.messages;
+        messages.extend(prefix.messages);
+        let images = crate::session::context::load_images(&mut messages, &prefix.image_directory)?;
+        let task = if prefix.updating {
+            UPDATE_SUMMARY_INSTRUCTION
+        } else {
+            INITIAL_SUMMARY_INSTRUCTION
         };
+        let instruction = format!(
+            "{task}
+
+{SUMMARY_FORMAT}"
+        );
         let input_tokens = overhead_tokens
             .saturating_add(prefix.estimated_tokens)
             .saturating_add(estimate_tokens_of(&instruction) + 8);
-        messages.push(ModelMessage::text(ModelRole::User, instruction));
+        messages.push(Message::user(instruction));
         let request = ModelTurnRequest {
             messages,
-            tools: definitions.tools.clone(),
-            model_preferences: singularity_protocol::RequestPreferences {
-                max_output_tokens: output_budget_tokens(model, input_tokens, DEFAULT_SUMMARY_MAX_TOKENS),
-            },
+            images,
+            tools: definitions.tools,
+            max_output_tokens: output_budget_tokens(model, input_tokens, DEFAULT_SUMMARY_MAX_TOKENS),
         };
         Ok(Self {
             request,
@@ -78,14 +80,14 @@ impl PreparedCompaction {
     }
 }
 
-/// 摘要通过校验后才由 Agent 保存并替换早期对话。
+/// 检查摘要：没有被截断且正文非空才能使用。
 pub(crate) fn validate_summary(response: ModelTurnResponse) -> Result<String> {
     if response.is_length_truncated() {
         return Err(AgentError::InvalidSummary(
             "summary reached the output limit (incomplete checkpoint)".into(),
         ));
     }
-    let text = response.assistant_message.content;
+    let text = response.assistant_message.content_text();
     if text.trim().is_empty() {
         return Err(AgentError::InvalidSummary("summary contains no text".into()));
     }

@@ -1,6 +1,6 @@
 # Singularity
 
-Singularity 是以 Rust 实现的本地 coding-agent harness。日常工作通过 Electron 桌面工作台进行。Workspace、Session、模型配置和执行状态由本机 Host 管理，React 渲染进程负责呈现与控制。
+Singularity 是用 Rust 实现的本地 Coding Agent，通过 Electron 桌面工作台使用。项目、任务、模型配置和执行状态由本机的 Rust 后端管理，React 界面负责显示和操作。
 
 当前发布目标为 Windows x86-64。
 
@@ -9,7 +9,7 @@ Singularity 是以 Rust 实现的本地 coding-agent harness。日常工作通�
 ```text
 Singularity.exe（Electron：窗口、托盘、原生文件夹选择）
   └─ preload IPC → 主进程 → stdio → Rust AppServer
-       └─ crates/runtime → AgentLoop → 工具与 Provider
+       └─ app::runtime → Agent 循环 → 工具与模型提供方
 ```
 
 完整运行流程见 [HTML 架构图](architecture.html)；模块职责、状态归属与源码入口见[架构说明](docs/architecture.md)。
@@ -24,9 +24,9 @@ Singularity.exe（Electron：窗口、托盘、原生文件夹选择）
 
 双击发布目录中的 `Singularity.exe`。关闭窗口会隐藏到托盘，任务继续运行；点击托盘图标重新显示，从托盘菜单退出应用。
 
-首次使用可在“设置 > 模型”中登记兼容 OpenAI Chat 或 Responses 协议的 Provider、模型与 API Key。API Key 是只写字段，页面与 Host 响应只显示脱敏配置状态。随后添加本机 Workspace、创建 Task，并在底部 Composer 的组合选择器中选择当前会话使用的模型与思考程度后提交工作。
+首次使用时，在“设置 > 模型”中添加兼容 OpenAI Chat 或 Responses 协议的提供方、模型和 API Key。API Key 只能写入，界面只显示是否已配置。然后添加本机项目、新建任务，在底部输入框的选择器中选好模型和思考程度，发送消息开始工作。
 
-空闲时发送启动新回合；运行中按 Enter 或 Ctrl/Cmd+Enter 发送 steer，引导当前回合在下一次模型请求时继续执行。会话日志保存历史，Host 维护执行状态，刷新或关闭页面不会停止后台任务。详细操作见 [工作台交互](docs/desktop-ui.md)。
+空闲时发送消息会开始新的一轮；运行中发送的消息会排队，在下一次模型请求前交给模型。历史保存在会话日志里，执行状态由后端维护，刷新或关闭窗口不会停止正在运行的任务。详细操作见[工作台交互](docs/desktop-ui.md)。
 
 ## 本地数据与权限
 
@@ -34,7 +34,7 @@ Singularity.exe（Electron：窗口、托盘、原生文件夹选择）
 
 工作台从打包资源加载，RPC 与事件走私有进程管道，不监听 HTTP 或 WebSocket 端口。渲染进程通过隔离的 preload 调用桌面能力。
 
-Agent 继承 `singularity.exe` 的本机权限，可读取、编辑文件并运行命令。Workspace 用于项目上下文、Session 分组和文件候选，不是文件系统沙箱。
+Agent 继承 `singularity.exe` 的本机权限，可以读写文件和运行命令。项目只用于提供上下文、给任务分组和补全文件名，不限制文件访问范围。
 
 ## 开发与维护
 
@@ -42,12 +42,10 @@ Agent 继承 `singularity.exe` 的本机权限，可读取、编辑文件并运�
 | --- | --- |
 | [安装与运行](docs/INSTALL.md) | 发布包安装、源码构建、模型和技能配置、数据维护 |
 | [工作台交互](docs/desktop-ui.md) | 项目、任务、输入、注入内容与显示约定 |
-| [开发指南](docs/development.md) | 本地运行、相关检查、测试组织和发布流程 |
+| [开发指南](docs/development.md) | 本地运行、检查和发布流程 |
 | [架构图](architecture.html) | 完整运行流程、执行顺序与条件分支 |
-| [架构说明](docs/architecture.md) | 模块职责、状态归属与源码导航 |
+| [架构说明](docs/architecture.md) | 模块职责、状态由谁维护与源码导航 |
 | [宪章](docs/constitution.md) | 产品方向与边界 |
-
-安装说明见源码仓库的 `docs/INSTALL.md`。
 
 ## 许可证
 

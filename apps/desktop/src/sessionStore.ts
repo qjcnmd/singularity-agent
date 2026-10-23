@@ -1,12 +1,10 @@
-import { reduceUnread, initialSyncState, acceptBootstrap, acceptSessionRead, resetBaseline, reduceStream, pruneStaleSelection, type SyncState } from './sync'
-import { anchorLocation, loadPersisted, persistView, type PersistedView } from './viewPersistence'
-import { RpcFailure, RpcClient, isConnectionFailure } from './rpcClient'
+import { reduceUnread, initialSyncState, acceptBootstrap, acceptSessionStart, acceptSessionRead, resetBaseline, reduceStream, pruneStaleSelection, type SyncState } from './sync'
+import { loadPersisted, persistView, type PersistedView } from './viewPersistence'
+import { RpcFailure, RpcClient } from './rpcClient'
 import type { ConnectionStatus, StreamEnvelope, AppBootstrap, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
 import { actionOrigin, pendingKey } from './storeActions'
 import { DraftStore, DraftStorageError, type DraftSnapshot } from './drafts'
-import { prependExecutionHistory } from './execution'
 
-const SESSION_PAGE_SIZE = 40
 
 export interface ActionError {
   code: string
@@ -18,8 +16,6 @@ interface SessionLoadState {
   status: 'idle' | 'loading' | 'error'
   error: ActionError | null
 }
-
-interface SessionReadFailure { error: unknown }
 
 export interface QuestionDraft { itemId: string; index: number; answers: UserQuestionAnswer[] }
 
@@ -37,7 +33,7 @@ export interface AppState extends PersistedView, SyncState {
 }
 
 
-/** 任务导航和读取/事件同步的状态所有者；导航请求的身份与接纳规则留在内部。 */
+/** 管理任务切换、历史读取和事件同步的状态；判断哪次读取结果仍然有效的规则在内部。 */
 export class SessionStore {
   protected state: AppState = {
     ...loadPersisted(),
@@ -68,8 +64,7 @@ export class SessionStore {
 
   private resyncing: Promise<void> | null = null
   protected selectionRequest = 0
-  /** 完成后清除请求标记以回放事件，保留结果给晚返回的旧读取，避免丢失连接错误。 */
-  private latestRead: { request: symbol | null; promise: Promise<SessionReadFailure | null> } | null = null
+  private latestRead: symbol | null = null
 
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
@@ -124,6 +119,7 @@ export class SessionStore {
   newTask(workspaceId = this.state.selectedWorkspaceId): void {
     if (workspaceId === null) return
     this.selectionRequest += 1
+    this.latestRead = null
     this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: null, session: null,
       sessionLoad: { status: 'idle', error: null } })
     if (this.state.sidebarView.collapsed.includes(workspaceId)) {
@@ -131,6 +127,7 @@ export class SessionStore {
         collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceId) } })
     }
     this.saveSelection()
+    if (this.resyncing === null) this.flushFrames()
   }
 
   draftKey(): string | null {
@@ -139,63 +136,34 @@ export class SessionStore {
 
   protected async startSession(params: SessionStartParams, selection: number): Promise<void> {
     const started = await this.transport.rpc('session.start', params)
-    this.applySync(acceptBootstrap(this.state, started.bootstrap))
+    this.applySync(acceptSessionStart(this.state, params.workspaceId, started))
     // 提交已成功；读取正文的结果不影响草稿清理，期间切换页面也不跳回。
-    if (selection === this.selectionRequest) void this.selectSession(started.sessionId)
+    if (selection === this.selectionRequest) void this.selectSession(started.summary.threadId)
   }
 
   sessions(workspaceId = this.state.selectedWorkspaceId): ThreadSummary[] {
     return workspaceId === null ? [] : this.state.bootstrap?.sessionsByWorkspace[workspaceId] ?? []
   }
 
-  async readOlder(): Promise<boolean> {
-    const { selectedSessionId, session } = this.state
-    const beforeTurn = session?.nextCursor
-    if (selectedSessionId === null || beforeTurn == null) return false
-    return this.action('history.older', actionOrigin.session(selectedSessionId), async () => {
-      const older = await this.transport.rpc('session.read', {
-        sessionId: selectedSessionId, beforeTurn, limit: SESSION_PAGE_SIZE,
-      })
-      if (this.state.selectedSessionId !== selectedSessionId
-        || this.state.session?.nextCursor !== beforeTurn) return
-      this.patch({ session: prependExecutionHistory(this.state.session, older.history) })
-    })
-  }
-
-  /** 业务读取失败由 sessionLoad 展示；原始错误返回给 resync，供它处理连接失败。 */
-  private readSession(sessionId: string): Promise<SessionReadFailure | null> {
+  private async readSession(sessionId: string): Promise<void> {
     const request = Symbol()
-    const promise = this.performRead(request, sessionId)
-    this.latestRead = { request, promise }
-    return promise
-  }
-
-  private async performRead(request: symbol, sessionId: string): Promise<SessionReadFailure | null> {
+    this.latestRead = request
     this.patch({ sessionLoad: { status: 'loading', error: null } })
     try {
-      const session = await this.transport.rpc('session.read', { sessionId, beforeTurn: null, limit: SESSION_PAGE_SIZE })
-      if (!this.readIsCurrent(request, sessionId)) return await this.followLatestRead(request)
+      const session = await this.transport.rpc('session.read', { sessionId })
+      if (!this.readIsCurrent(request, sessionId)) return
       const accepted = acceptSessionRead(this.state, session)
-      const restored = accepted.session
-      const anchor = this.state.viewportAnchors[sessionId]
-      if (anchorLocation(restored, anchor) === 'missing') {
-        const viewportAnchors = { ...this.state.viewportAnchors }
-        delete viewportAnchors[sessionId]
-        this.saveView({ viewportAnchors })
-      }
-      this.applySync({ ...accepted, session: restored })
+      this.applySync(accepted)
       this.patch({ sessionLoad: { status: 'idle', error: null } })
-      return null
     } catch (error) {
-      if (!this.readIsCurrent(request, sessionId)) return await this.followLatestRead(request)
+      if (!this.readIsCurrent(request, sessionId)) return
       this.patch({
         session: null,
         sessionLoad: { status: 'error', error: this.toActionError(error) },
       })
-      return { error }
     } finally {
-      if (request === this.latestRead?.request) {
-        this.latestRead.request = null
+      if (request === this.latestRead) {
+        this.latestRead = null
         if (this.resyncing === null) this.flushFrames()
       }
     }
@@ -203,26 +171,17 @@ export class SessionStore {
 
   /** 读取是否仍代表当前选择：有更新的请求或选择时，旧读取不写入状态。 */
   private readIsCurrent(request: symbol, sessionId: string): boolean {
-    return request === this.latestRead?.request && this.state.selectedSessionId === sessionId
-  }
-
-  /** 被取代的读取等取代它的那次读取结束再返回；不然旧读取会把新读取的连接级失败
-   *  覆盖成就绪。取代者是选择变更本身（没有新的读取）时，当前已没有待读取的选择，
-   *  本次读取直接结束。 */
-  private async followLatestRead(request: symbol): Promise<SessionReadFailure | null> {
-    const latest = this.latestRead
-    if (latest === null || latest.request === request) return null
-    return await latest.promise
+    return request === this.latestRead && this.state.selectedSessionId === sessionId
   }
 
   private onFrame(frame: StreamEnvelope): void {
-    if (this.resyncing === null && this.latestRead?.request == null && this.state.bootstrapLoad.status === 'error') {
+    if (this.resyncing === null && this.latestRead == null && this.state.bootstrapLoad.status === 'error') {
       // 等待重试时只更新运行状态，正文由重试补读，不积存工具输出。
       if (frame.type === 'session_changed' || frame.type === 'session_settled' || frame.type === 'background_task_updated') this.applyFrame(frame)
       return
     }
     // 正在重同步或初始化加载时暂存接收到的事件，就绪后再回放
-    if (this.resyncing !== null || this.latestRead?.request != null
+    if (this.resyncing !== null || this.latestRead != null
       || (frame.type !== 'ready' && this.state.bootstrap === null)) {
       this.queuedFrames.push(frame)
       return
@@ -231,25 +190,26 @@ export class SessionStore {
   }
 
   private applyFrame(frame: StreamEnvelope): void {
+    if (frame.type === 'app_read_failed' && frame.revision > this.state.revision) {
+      this.patch({ bootstrapLoad: { status: 'error', error: frame.error } })
+    }
     const { state, effect } = reduceStream(this.state, frame)
     this.applySync(state, (frame.type === 'background_task_updated' && frame.payload.task.state.status === 'running')
       || (frame.type === 'turn_event' && (
-        frame.payload.method === 'item/agentMessage/delta' || frame.payload.method === 'item/agentThinking/delta'
-        || frame.payload.method === 'tool/execution/update')))
+        frame.payload.method === 'item/textDelta'
+        || frame.payload.method === 'tool/output')))
     if ((frame.type === 'session_changed' || frame.type === 'session_settled')
-      && state.liveSessions[frame.sessionId]?.sessionRevision === frame.payload.sessionRevision) {
+      && state.liveSessions[frame.sessionId]?.revision === frame.revision) {
       this.retainQuestionDraft(frame.sessionId, frame.payload.pendingQuestion?.itemId)
     }
     if (this.state.bootstrapLoad.status === 'error') return
     if (effect === 'resync') void this.resync()
-    if (effect === 'refresh_bootstrap') void this.refreshBootstrap()
   }
 
   resync(): Promise<void> {
     if (this.resyncing !== null) return this.resyncing
-    this.patch({ connection: 'recovering', bootstrapLoad: { status: 'loading', error: null } })
+    this.patch({ bootstrapLoad: { status: 'loading', error: null } })
     this.resyncing = (async () => {
-      let converged = false
       try {
         const bootstrap = await this.transport.rpc('app.bootstrap', {})
         this.applySync(resetBaseline(this.state, bootstrap))
@@ -259,30 +219,19 @@ export class SessionStore {
         }
         const { selectedSessionId } = this.state
         if (selectedSessionId !== null) {
-          const read = await this.readSession(selectedSessionId)
-          // 仅网络/连接故障需阻断 ready；普通业务错误（如会话已归档）不阻断连接
-          if (read !== null && isConnectionFailure(read.error)) throw read.error
+          await this.readSession(selectedSessionId)
         } else {
           this.patch({
             session: null,
             sessionLoad: { status: 'idle', error: null },
           })
         }
-        converged = true
+        this.patch({ bootstrapLoad: { status: 'idle', error: null } })
       } catch (error) {
-        if (isConnectionFailure(error)) {
-          this.transport.stop()
-          this.queuedFrames = []
-        } else {
-          this.patch({ bootstrapLoad: { status: 'error', error: this.toActionError(error) } })
-        }
+        this.patch({ bootstrapLoad: { status: 'error', error: this.toActionError(error) } })
       } finally {
         this.resyncing = null
-        if (converged) {
-          this.patch({ bootstrapLoad: { status: 'idle', error: null } })
-          this.flushFrames()
-          if (this.resyncing === null) this.patch({ connection: 'ready' })
-        } else this.flushFrames()
+        this.flushFrames()
       }
     })()
     return this.resyncing
@@ -352,13 +301,13 @@ export class SessionStore {
 
   private updateBootstrap(bootstrap: AppBootstrap): void {
     this.applySync(acceptBootstrap(this.state, bootstrap))
-    if (this.resyncing === null && this.latestRead?.request == null) this.flushFrames()
+    if (this.resyncing === null && this.latestRead == null) this.flushFrames()
   }
 
-  private applySync(state: SyncState, progress = false): void {
+  protected applySync(state: SyncState, progress = false): void {
     if (state === this.state) return
-    const { revision, bootstrap, session, liveSessions } = state
-    const patch: Partial<AppState> = { revision, bootstrap, session, liveSessions }
+    const { revision, modelCatalogRevision, bootstrap, session, liveSessions } = state
+    const patch: Partial<AppState> = { revision, modelCatalogRevision, bootstrap, session, liveSessions }
     if (bootstrap !== null && bootstrap !== this.state.bootstrap) {
       const pruned = pruneStaleSelection(bootstrap, { ...this.state, session, liveSessions })
       patch.liveSessions = pruned.liveSessions

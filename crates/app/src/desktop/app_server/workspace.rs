@@ -1,6 +1,4 @@
-//! 工作台的工作区和目录边界：项目登记、会话目录查询和分组投影，只回答「任务属于哪个
-//! 项目、目录在哪、怎么分组、有哪些候选」；会话生命周期、事件归并、发布入口和错误映射
-//! 由父模块持有，本模块不碰会话执行编排，只管调用。
+//! 项目登记、按项目分组任务，以及移除项目时释放相关资源。
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -18,7 +16,7 @@ impl AppServer {
         self.bootstrap_with_catalog(catalog)
     }
 
-    /// 调用方持有发布锁，使配置读取、快照构造和序号绑定不与配置保存交错。
+    /// 调用方持有发布锁，读取配置、生成快照和取得事件序号不会与保存配置交错。
     pub(super) fn bootstrap_with_catalog(
         &self,
         model_catalog: RedactedModelCatalog,
@@ -26,15 +24,15 @@ impl AppServer {
         let revision = self.revision();
         let workspaces = self.workspaces.list();
         let threads = self.catalog.list_threads().map_err(catalog_error)?;
-        let session_phases: BTreeMap<_, _> = self
+        let session_states: BTreeMap<_, _> = self
             .lock_sessions()
             .iter()
-            .map(|(id, slot)| (id.clone(), slot.conversation().phase()))
+            .map(|(id, conversation)| (id.clone(), conversation.status()))
             .collect();
         let sessions_by_workspace = group_threads(&workspaces, threads).map_err(internal_error)?;
         Ok(AppBootstrap {
             user_home: std::env::home_dir().and_then(|home| home.into_os_string().into_string().ok()),
-            session_phases,
+            session_states,
             revision,
             workspaces,
             sessions_by_workspace,
@@ -48,45 +46,48 @@ impl AppServer {
         Ok(workspace)
     }
 
-    pub fn remove_workspace(&self, workspace_id: &str) -> Result<(), RpcError> {
-        let workspace = self.workspace(workspace_id)?;
-        // 占用情况只看已登记的 slot，不靠可能失败、可能不全的磁盘目录枚举：会话属于谁由
-        // 它的规范 cwd 决定，忙不忙由普通执行、后台命令和待处理输入决定。生命周期临界区和启动
-        // 占用共用同一条边界，检查和注销之间插不进新的占用。
-        let lifecycle = self.lock_lifecycle();
-        let busy =
-            self.lock_sessions().values().any(|slot| {
-                // 归属只做布尔判断，用的是和打开任务时同一条目录比较规则。
-                let belongs = matches!(
-                    singularity_core::saved_directory_matches(
-                        &workspace.root,
-                        &slot.conversation().thread().cwd,
-                    ),
+    pub async fn remove_workspace(self: &std::sync::Arc<Self>, workspace_id: &str) -> Result<(), RpcError> {
+        let app = std::sync::Arc::clone(self);
+        let workspace_id = workspace_id.to_owned();
+        let close = tokio::task::spawn_blocking(move || {
+            let lifecycle = app.lock_lifecycle();
+            let workspace = app.workspace(&workspace_id)?;
+            let mut sessions = app.lock_sessions();
+            let belongs = |conversation: &std::sync::Arc<crate::runtime::Conversation>| {
+                matches!(
+                    singularity_core::saved_directory_matches(&workspace.root, &conversation.thread().cwd),
                     Ok(true)
-                );
-                if !belongs {
-                    return false;
+                )
+            };
+            if sessions.values().any(|conversation| belongs(conversation) && conversation.has_work()) {
+                return Err(RpcError::new(
+                    singularity_protocol::RpcErrorCode::WorkspaceBusy,
+                    format!("项目 {} 仍有运行中的任务、后台命令或待处理输入。", workspace.root),
+                    "等待处理完成，或停止后台命令并删除相关任务后重试。",
+                ));
+            }
+            app.workspaces.remove(&workspace_id).map_err(workspace_error)?;
+            sessions.retain(|_, conversation| {
+                if belongs(conversation) {
+                    conversation.set_closing(true);
+                    false
+                } else {
+                    true
                 }
-                // 完成发布与通知入箱共用 slot 锁：不能在后台变为终态、通知尚未入箱时移除。
-                slot.conversation().bash_tasks().list().iter().any(|task| task.state.is_running())
-                    || slot.conversation().is_occupied()
-                    || slot.conversation().has_pending_input()
             });
-        if busy {
-            return Err(RpcError::new(
-                singularity_protocol::RpcErrorCode::WorkspaceBusy,
-                format!("项目 {} 仍有运行中的任务、后台命令或待处理输入。", workspace.root),
-                "等待处理完成，或停止后台命令并归档相关任务后重试。",
-            ));
-        }
-        self.workspaces.remove(workspace_id).map_err(workspace_error)?;
-        drop(lifecycle);
-        self.publish_app_snapshot();
+            drop(sessions);
+            let close = app.mcp.disconnect_directory(Path::new(&workspace.root));
+            drop(lifecycle);
+            app.publish_app_snapshot();
+            Ok(close)
+        })
+        .await
+        .expect("workspace removal worker completes")?;
+        close.await;
         Ok(())
     }
 
     pub fn workspace(&self, workspace_id: &str) -> Result<Workspace, RpcError> {
-        // 工作区不存在时，对外错误和其他工作区操作走同一个来源（workspace_error）。
         self.workspaces
             .find(workspace_id)
             .ok_or_else(|| workspace_error(WorkspaceError::NotFound))
@@ -103,7 +104,6 @@ impl AppServer {
                 .map(|skill| singularity_protocol::SkillMetadata {
                     name: skill.name,
                     description: skill.description,
-                    path: singularity_core::display_path(&skill.path),
                 })
                 .collect(),
             diagnostics: catalog.diagnostics,
@@ -115,21 +115,18 @@ impl AppServer {
         &self,
         workspace_id: &str,
         query: &str,
-        limit: usize,
     ) -> Result<Vec<singularity_protocol::FileCandidate>, RpcError> {
         let root = self.workspace(workspace_id)?.root;
-        workspace_files::search_files(&root, query, limit).map_err(invalid_request)
+        workspace_files::search_files(&root, query).map_err(invalid_request)
     }
 }
 
-/// 按 Session ledger 里的规范 cwd 把任务分到已登记项目；registry 不缓存会话
-/// 关系，所以每次读取都重新投影一遍。
+/// 按会话日志里记录的工作目录把任务分到已登记的项目；项目登记不保存任务列表，
+/// 每次读取都重新分组。不属于任何项目的任务不显示。
 fn group_threads(
     workspaces: &[Workspace],
     threads: Vec<ThreadSummary>,
 ) -> Result<BTreeMap<String, Vec<ThreadSummary>>, String> {
-    // 身份和它的分组桶在同一次构造里配好：匹配上的身份必然有自己的桶，
-    // 不会出现「匹配到了却没有桶」的情况。
     let mut grouped: BTreeMap<String, (singularity_core::CanonicalWorkspacePath, Vec<ThreadSummary>)> =
         workspaces
             .iter()

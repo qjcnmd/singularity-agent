@@ -14,8 +14,8 @@ use crate::provider::contract::{
 };
 use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
 use crate::types::{
-    ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
-    ProviderReasoningReplay,
+    ContentBlock, Message, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
+    ProviderBlockMetadata, ProviderMessageMetadata,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -25,7 +25,8 @@ pub(crate) fn openai_responses_stream_request_payload(
     provider_name: &str,
     endpoint: &str,
 ) -> Value {
-    let (instructions, input) = openai_responses_input(&request.messages, selection, provider_name, endpoint);
+    let (instructions, input) =
+        openai_responses_input(&request.messages, &request.images, selection, provider_name, endpoint);
     let mut payload = json!({
         "model": selection.model_name,
         "input": input,
@@ -37,7 +38,7 @@ pub(crate) fn openai_responses_stream_request_payload(
     if let Some(instructions) = instructions {
         payload["instructions"] = json!(instructions);
     }
-    payload["max_output_tokens"] = json!(request.model_preferences.max_output_tokens);
+    payload["max_output_tokens"] = json!(request.max_output_tokens);
     if !request.tools.is_empty() {
         payload["tools"] = json!(
             request
@@ -80,7 +81,6 @@ pub(crate) fn parse_openai_responses_response(
         return Err(provider_embedded_error(
             &provider_error_fields(error),
             "provider Responses payload contained an error",
-            "responses_error_present",
         ));
     }
     let status = payload.get("status").and_then(Value::as_str);
@@ -104,7 +104,7 @@ pub(crate) fn parse_openai_responses_response(
             vec!["responses_status_not_completed".to_string()],
         ));
     }
-    // output 整份移出 payload：解析借用同一批条目，成功后它直接作为回放载荷，不再另建容器。
+    // 内容按提供方输出的顺序保存；续接字段跟随各块，正文和参数不重复保存。
     let output = match payload.get_mut("output").map(std::mem::take) {
         Some(Value::Array(items)) => items,
         _ => {
@@ -114,76 +114,72 @@ pub(crate) fn parse_openai_responses_response(
             ));
         }
     };
-    let mut content = String::new();
-    let mut thinking = String::new();
-    let mut tool_calls = Vec::new();
-    let mut has_reasoning_item = false;
-    for item in &output {
+    let mut content = Vec::new();
+    for item in output {
         let Some(item_type) = item.get("type").and_then(Value::as_str) else {
             return Err(provider_response_validation_error(
                 "provider Responses output item type was missing",
-                vec!["responses_output_item_type_missing".to_string()],
+                vec!["responses_output_item_type_missing".into()],
             ));
         };
-        match item_type {
+        let block = match item_type {
             "message" => {
-                let message = parse_responses_message_content(item.get("content")).map_err(|evidence| {
+                let text = parse_responses_message_content(item.get("content")).map_err(|evidence| {
                     provider_response_validation_error(
                         "provider Responses message content was invalid",
-                        vec![evidence.to_string()],
+                        vec![evidence.into()],
                     )
                 })?;
-                content.push_str(&message);
+                ContentBlock::Text {
+                    text,
+                    metadata: Some(block_metadata(item, &["content"])),
+                }
             }
             "function_call" => {
                 let arguments = parse_tool_call_arguments(item.get("arguments"))?;
-                tool_calls.push(ModelToolCall {
-                    tool_call_id: item.get("call_id").and_then(Value::as_str).unwrap_or_default().to_string(),
-                    tool_name: item.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
+                ContentBlock::ToolCall(ModelToolCall {
+                    tool_call_id: item.get("call_id").and_then(Value::as_str).unwrap_or_default().into(),
+                    tool_name: item.get("name").and_then(Value::as_str).unwrap_or_default().into(),
                     arguments,
-                });
+                    metadata: Some(block_metadata(item, &["call_id", "name", "arguments"])),
+                })
             }
             "reasoning" => {
-                has_reasoning_item = true;
-                for summary in item.get("summary").and_then(Value::as_array).into_iter().flatten() {
-                    if summary.get("type").and_then(Value::as_str) == Some("summary_text")
-                        && let Some(text) = summary.get("text").and_then(Value::as_str)
-                    {
-                        thinking.push_str(text);
-                    }
-                }
                 if item.get("id").and_then(Value::as_str).is_none_or(str::is_empty) {
                     return Err(provider_response_validation_error(
                         "provider Responses reasoning item id was missing",
-                        vec!["responses_reasoning_item_id_missing".to_string()],
+                        vec!["responses_reasoning_item_id_missing".into()],
                     ));
+                }
+                let thinking = item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("summary_text"))
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect();
+                ContentBlock::Thinking {
+                    thinking,
+                    metadata: Some(block_metadata(item, &["summary"])),
                 }
             }
             _ => {
                 return Err(provider_response_validation_error(
                     "provider Responses payload contained an unsupported output item",
-                    vec!["responses_output_item_unsupported".to_string()],
+                    vec!["responses_output_item_unsupported".into()],
                 ));
             }
-        }
+        };
+        content.push(block);
     }
-    let replay = if has_reasoning_item {
-        Some(ProviderReasoningReplay::Responses {
-            provider_name: config.provider_name.clone(),
-            model_name: model_name.to_string(),
-            endpoint: endpoint.to_string(),
-            items: output,
-        })
-    } else {
-        None
-    };
-    finalize_provider_response(ModelTurnResponse {
-        assistant_message: ModelMessage {
-            tool_calls,
-            provider_reasoning_replay: replay,
-            ..ModelMessage::text(ModelRole::Assistant, content)
-        },
-        thinking,
+    let provider_metadata = Some(ProviderMessageMetadata::Responses {
+        provider_name: config.provider_name.clone(),
+        model_name: model_name.into(),
+        endpoint: endpoint.into(),
+    });
+    Ok(finalize_provider_response(ModelTurnResponse {
+        assistant_message: Message::Assistant { content, provider_metadata },
         usage: parse_usage(
             payload.get("usage"),
             "input_tokens",
@@ -195,7 +191,7 @@ pub(crate) fn parse_openai_responses_response(
         } else {
             ModelStopReason::Stop
         },
-    })
+    }))
 }
 
 /// message content 规则：缺 content 算协议错误，text/output_text 与 refusal 都拼成可见文本。
@@ -220,56 +216,63 @@ fn parse_responses_message_content(content: Option<&Value>) -> Result<String, &'
     }
 }
 
-/// 把消息投影成 Responses 的输入；私有续接按身份筛选（见 super::reasoning_replay_for）。
+/// 把消息编码成 Responses 的 input；是否附带提供方私有数据见 super::message_metadata_for。
 pub(crate) fn openai_responses_input(
-    messages: &[ModelMessage],
+    messages: &[Message],
+    images: &std::collections::HashMap<String, String>,
     selection: &SelectedModel,
     provider_name: &str,
     endpoint: &str,
 ) -> (Option<String>, Vec<Value>) {
     let instruction_count =
-        messages.iter().take_while(|message| message.role == ModelRole::Developer).count();
+        messages.iter().take_while(|message| message.role() == ModelRole::Developer).count();
     let instructions = messages[..instruction_count]
         .iter()
-        .map(|message| message.content.as_str())
+        .map(Message::content_text)
         .filter(|message| !message.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
     let mut items = Vec::new();
     for message in &messages[instruction_count..] {
-        match message.role {
+        match message.role() {
             ModelRole::Tool => {
                 items.push(json!({
                     "type": "function_call_output",
-                    "call_id": message.tool_call_id,
-                    "output": responses_content(message),
+                    "call_id": message.tool_call_id(),
+                    "output": responses_content(message, images),
                 }));
             }
             ModelRole::Assistant => {
-                if let Some(ProviderReasoningReplay::Responses { items: replay_items, .. }) =
-                    super::reasoning_replay_for(message, selection, provider_name, endpoint)
-                {
-                    items.extend(replay_items.iter().cloned());
-                } else {
-                    if !message.content.is_empty() {
-                        items.push(json!({
-                            "type": "message",
-                            "role": "assistant",
-                            "content": message.content,
-                        }));
+                let same_provider =
+                    super::message_metadata_for(message, selection, provider_name, endpoint).is_some();
+                for block in message.content() {
+                    let (mut item, metadata) = match block {
+                        ContentBlock::Text { text, metadata } => (
+                            json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":text}]}),
+                            metadata.as_ref(),
+                        ),
+                        ContentBlock::Thinking { thinking, metadata }
+                            if same_provider && metadata.is_some() =>
+                        {
+                            (
+                                json!({"type":"reasoning", "summary": if thinking.is_empty() { vec![] } else { vec![json!({"type":"summary_text", "text":thinking})] }}),
+                                metadata.as_ref(),
+                            )
+                        }
+                        ContentBlock::ToolCall(call) => (
+                            json!({"type":"function_call", "call_id":call.tool_call_id, "name":call.tool_name, "arguments":call.arguments.to_string()}),
+                            call.metadata.as_ref(),
+                        ),
+                        _ => continue,
+                    };
+                    if same_provider && let Some(metadata) = metadata {
+                        item.as_object_mut().expect("encoded item is an object").extend(metadata.0.clone());
                     }
-                    items.extend(message.tool_calls.iter().map(|call| {
-                        json!({
-                            "type": "function_call",
-                            "call_id": call.tool_call_id,
-                            "name": call.tool_name,
-                            "arguments": call.arguments.to_string(),
-                        })
-                    }));
+                    items.push(item);
                 }
             }
             ModelRole::Developer | ModelRole::User => {
-                let role = match message.role {
+                let role = match message.role() {
                     // 开头的 developer 已折叠进 instructions；历史之后的 developer
                     // 使用 Responses 输入 schema 接受的 system 角色。
                     ModelRole::Developer => "system",
@@ -279,7 +282,7 @@ pub(crate) fn openai_responses_input(
                 items.push(json!({
                     "type": "message",
                     "role": role,
-                    "content": responses_content(message),
+                    "content": responses_content(message, images),
                 }));
             }
         }
@@ -287,11 +290,25 @@ pub(crate) fn openai_responses_input(
     ((!instructions.is_empty()).then_some(instructions), items)
 }
 
-fn responses_content(message: &ModelMessage) -> Value {
-    if message.images.is_empty() {
-        return json!(message.content);
+fn responses_content(message: &Message, images: &std::collections::HashMap<String, String>) -> Value {
+    if message.images().next().is_none() {
+        return json!(message.content_text());
     }
-    let mut parts = vec![json!({"type": "input_text", "text": message.content})];
-    parts.extend(message.images.iter().map(|image| json!({"type": "input_image", "image_url": image})));
+    let mut parts = vec![json!({"type": "input_text", "text": message.content_text()})];
+    parts.extend(
+        message
+            .images()
+            .map(|image| json!({"type": "input_image", "image_url": images[&image.id]})),
+    );
     json!(parts)
+}
+
+fn block_metadata(item: Value, content_fields: &[&str]) -> ProviderBlockMetadata {
+    let Value::Object(mut fields) = item else {
+        unreachable!("typed output item is an object");
+    };
+    for field in content_fields {
+        fields.remove(*field);
+    }
+    ProviderBlockMetadata(fields)
 }

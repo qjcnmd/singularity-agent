@@ -1,4 +1,4 @@
-//! 工作台 Workspace 登记事实的持久化（仅属主可读写）。
+//! 已添加项目的列表，保存在数据目录的 `workspaces.json`（仅当前用户可读写）。
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -15,7 +15,7 @@ struct RegistryFile {
     workspaces: Vec<Workspace>,
 }
 
-/// 登记操作的错误分三类：输入有问题、项目不存在、持久化失败；入口据此选择恢复提示。
+/// 输入无效、项目不存在、保存失败三类错误；RPC 入口据此给出不同的处理建议。
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
     #[error("{0}")]
@@ -57,7 +57,7 @@ impl WorkspaceStore {
         self.lock().workspaces.clone()
     }
 
-    /// 按稳定身份查询当前登记，返回工作台 DTO。
+    /// 按项目 ID 查找已登记的项目。
     pub fn find(&self, workspace_id: &str) -> Option<Workspace> {
         self.lock()
             .workspaces
@@ -66,7 +66,7 @@ impl WorkspaceStore {
             .cloned()
     }
 
-    /// 登记已存在的目录；规范目录身份重复时拒绝，不改变已有登记。
+    /// 登记一个已存在的目录；同一目录（忽略大小写）已登记时报错。
     pub fn add(&self, root: &Path) -> Result<Workspace, WorkspaceError> {
         let canonical =
             singularity_core::canonicalize_workspace(root).map_err(WorkspaceError::InvalidInput)?;

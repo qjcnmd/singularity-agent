@@ -1,7 +1,7 @@
 use super::*;
 use crate::provider::contract::finalize_provider_response;
 
-/// 用 Chat 协议解码一次真实响应：共享读取循环驱动本协议解码器，终结也在本模块内。
+/// 读取并解码一次 Chat 流式响应。
 pub(crate) async fn read_chat_sse_stream(
     cancellation: &CancellationToken,
     response: reqwest::Response,
@@ -9,13 +9,10 @@ pub(crate) async fn read_chat_sse_stream(
     config: &OpenAiProviderConfig,
     selection: &SelectedModel,
     endpoint: &str,
-) -> Result<ModelTurnResponse, ProviderError> {
-    read_sse_stream(
-        cancellation,
-        response,
-        ChatSseDecoder::new(on_event, config, &selection.model_name, endpoint),
-    )
-    .await
+) -> ModelTurnResponse {
+    let mut decoder = ChatSseDecoder::new(on_event, config, &selection.model_name, endpoint);
+    let result = read_sse_stream(cancellation, response, &mut decoder).await;
+    decoder.finish(result)
 }
 
 #[derive(Default)]
@@ -25,8 +22,8 @@ struct ChatToolAccumulator {
     arguments: String,
 }
 
-/// 增量解析的 Chat SSE 解码器。公开正文与公开 reasoning 文本按增量发出；
-/// 未拼完的工具参数和 provider 私有续接材料只在最后物化规范化响应时一次性产出。
+/// Chat SSE 解码器。正文和思考文本边收边发出；工具参数和提供方私有数据在流结束后
+/// 一次性整理进最终回复。
 struct ChatSseDecoder<'a> {
     config: &'a OpenAiProviderConfig,
     model_name: &'a str,
@@ -43,7 +40,6 @@ struct ChatSseDecoder<'a> {
 }
 
 impl SseStreamDecoder for ChatSseDecoder<'_> {
-    type Terminal = ModelTurnResponse;
     fn frame_malformed() -> fn(&'static str) -> ProviderError {
         provider_chat_stream_malformed_error
     }
@@ -52,7 +48,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         let raw = std::str::from_utf8(data)
             .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_utf8"))?
             .trim();
-        // [DONE] 是流终点；其后的尾帧会被共享驱动在到达终态后停止派发，不参与终态物化。
+        // [DONE] 表示流结束；读取循环随后停止，之后的数据不再处理。
         if raw == "[DONE]" {
             self.done = true;
             return Ok(());
@@ -63,7 +59,6 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             return Err(crate::error::provider_embedded_error(
                 &crate::error::provider_error_fields(error),
                 "provider Chat stream returned an error",
-                "chat_stream_error",
             ));
         }
         if let Some(usage) = payload.get("usage").filter(|value| value.is_object()) {
@@ -110,8 +105,10 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             // 兼容端点可能在同一块里用多个键携带同一段 reasoning（实测双键同文），故只取第一个非空键。
             if let Some((field, reasoning)) = chat_reasoning_text(delta) {
                 self.reasoning_field.get_or_insert_with(|| field.to_string());
-                self.reasoning_content.push_str(reasoning);
-                (self.on_event)(ProviderStreamEvent::ReasoningTextDelta { delta: reasoning.to_string() });
+                if !reasoning.is_empty() {
+                    self.reasoning_content.push_str(reasoning);
+                    (self.on_event)(ProviderStreamEvent::ReasoningTextDelta { delta: reasoning.to_string() });
+                }
             }
             if let Some(details) = delta.get("reasoning_details").filter(|value| !value.is_null()) {
                 let details = details
@@ -134,96 +131,80 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         Ok(())
     }
 
-    fn materialize_terminal(self) -> Result<Self::Terminal, ProviderError> {
-        if !self.done {
-            return Err(provider_chat_stream_malformed_error("terminal_done_missing"));
-        }
-        let finish_reason = self
-            .finish_reason
-            .ok_or_else(|| provider_chat_stream_malformed_error("finish_reason_missing"))?;
-        let tool_calls = self
-            .tool_calls
-            .into_values()
-            .map(|call| {
-                let arguments = parse_tool_arguments(&call.arguments);
-                ModelToolCall {
-                    tool_call_id: call.id,
-                    tool_name: call.name,
-                    arguments,
-                }
-            })
-            .collect();
-        let Self {
-            config,
-            model_name,
-            endpoint,
-            content,
-            reasoning_content,
-            reasoning_field,
-            reasoning_details,
-            usage,
-            ..
-        } = self;
-        let reasoning_field =
-            reasoning_field.unwrap_or_else(|| crate::types::DEFAULT_CHAT_REASONING_FIELD.into());
-        let usage = parse_usage(
-            usage.as_ref(),
-            "prompt_tokens",
-            "completion_tokens",
-            "/prompt_tokens_details/cached_tokens",
-        );
-        // 未知原因按协议失败处理，不会当成正常完成。
-        let stop_reason = match finish_reason.as_str() {
-            "length" => ModelStopReason::Length,
-            "stop" | "tool_calls" | "function_call" => ModelStopReason::Stop,
-            "content_filter" => {
-                return Err(provider_content_filter_error(
-                    "provider Chat response was stopped by content filter",
-                ));
-            }
-            "network_error" => {
-                return Err(provider_finish_network_error("provider Chat response reported a network error"));
-            }
-            unknown => return Err(provider_chat_finish_reason_unsupported(unknown)),
-        };
-        let thinking = if !reasoning_content.is_empty() {
-            reasoning_content.clone()
-        } else {
-            reasoning_details
-                .iter()
-                .filter_map(|detail| detail.as_object().and_then(chat_reasoning_detail_text))
-                .collect()
-        };
-        let replay = if !reasoning_content.is_empty() || !reasoning_details.is_empty() {
-            Some(ProviderReasoningReplay::Chat {
-                provider_name: config.provider_name.clone(),
-                model_name: model_name.to_string(),
-                endpoint: endpoint.to_string(),
-                reasoning_content,
-                reasoning_field,
-                reasoning_details,
-            })
-        } else {
-            None
-        };
-        finalize_provider_response(ModelTurnResponse {
-            assistant_message: ModelMessage {
-                tool_calls,
-                provider_reasoning_replay: replay,
-                ..ModelMessage::text(ModelRole::Assistant, content)
-            },
-            thinking,
-            usage,
-            stop_reason,
-        })
-    }
-
     fn protocol_complete(&self) -> bool {
         self.done
     }
 }
 
 impl<'a> ChatSseDecoder<'a> {
+    fn finish(self, result: Result<(), ProviderError>) -> ModelTurnResponse {
+        let stop_reason = result.and_then(|()| {
+            if !self.done {
+                return Err(provider_chat_stream_malformed_error("terminal_done_missing"));
+            }
+            match self.finish_reason.as_deref() {
+                Some("length") => Ok(ModelStopReason::Length),
+                Some("stop" | "tool_calls" | "function_call") => Ok(ModelStopReason::Stop),
+                Some("content_filter") => {
+                    Err(provider_content_filter_error("provider Chat response was stopped by content filter"))
+                }
+                Some("network_error") => {
+                    Err(provider_finish_network_error("provider Chat response reported a network error"))
+                }
+                Some(unknown) => Err(provider_chat_finish_reason_unsupported(unknown)),
+                None => Err(provider_chat_stream_malformed_error("finish_reason_missing")),
+            }
+        });
+        let thinking = if self.reasoning_content.is_empty() {
+            self.reasoning_details
+                .iter()
+                .filter_map(|detail| detail.as_object().and_then(chat_reasoning_detail_text))
+                .collect()
+        } else {
+            self.reasoning_content
+        };
+        let stop_reason = match stop_reason {
+            Ok(reason) => reason,
+            Err(error) => {
+                return ModelTurnResponse::failed(
+                    error,
+                    Message::assistant(self.content, thinking, Vec::new(), None),
+                );
+            }
+        };
+        let tool_calls = self
+            .tool_calls
+            .into_values()
+            .map(|call| ModelToolCall {
+                tool_call_id: call.id,
+                tool_name: call.name,
+                arguments: parse_tool_arguments(&call.arguments),
+                metadata: None,
+            })
+            .collect();
+        let replay = (self.reasoning_field.is_some() || !self.reasoning_details.is_empty()).then(|| {
+            ProviderMessageMetadata::Chat {
+                provider_name: self.config.provider_name.clone(),
+                model_name: self.model_name.to_string(),
+                endpoint: self.endpoint.to_string(),
+                reasoning_field: self
+                    .reasoning_field
+                    .unwrap_or_else(|| crate::types::DEFAULT_CHAT_REASONING_FIELD.into()),
+                reasoning_details: self.reasoning_details,
+            }
+        });
+        finalize_provider_response(ModelTurnResponse {
+            assistant_message: Message::assistant(self.content, thinking, tool_calls, replay),
+            usage: parse_usage(
+                self.usage.as_ref(),
+                "prompt_tokens",
+                "completion_tokens",
+                "/prompt_tokens_details/cached_tokens",
+            ),
+            stop_reason,
+        })
+    }
+
     fn new(
         on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send),
         config: &'a OpenAiProviderConfig,
@@ -246,15 +227,15 @@ impl<'a> ChatSseDecoder<'a> {
         }
     }
 
-    /// 接收一组 reasoning detail 片段：先校验形状，再按既有片段规则并入累计状态。只有当
-    /// provider 没有通过 reasoning_content/reasoning 给出公开思考文本时，detail 里的公开
-    /// 文本才作为思考增量发出一次；其余字段（含加密回放材料）只累计，不进入公开事件。
+    /// 接收一组 reasoning_details 片段：检查格式后合并到已有片段。提供方没有通过
+    /// reasoning_content / reasoning 给出思考文本时，才把片段里的文本作为思考增量发出；
+    /// 其他字段（包括加密数据）只保存，不显示。
     fn receive_reasoning_details(&mut self, details: &[Value]) -> Result<(), ProviderError> {
         for detail in details {
             let Some(detail) = detail.as_object() else {
                 return Err(provider_chat_stream_malformed_error("reasoning_detail_not_object"));
             };
-            if self.reasoning_field.is_none()
+            if self.reasoning_content.is_empty()
                 && let Some(text) = chat_reasoning_detail_text(detail)
             {
                 (self.on_event)(ProviderStreamEvent::ReasoningTextDelta { delta: text.to_string() });
@@ -340,14 +321,43 @@ fn append_reasoning_detail(details: &mut Vec<Value>, incoming: &serde_json::Map<
 }
 
 fn provider_chat_stream_malformed_error(reason: &'static str) -> ProviderError {
-    provider_stream_malformed_error("provider Chat stream was malformed", "chat_stream_malformed", reason)
+    provider_stream_malformed_error("provider Chat stream was malformed", reason)
 }
 
-/// 流里 index 字段的唯一解释：省略 index 的单个 choice / 工具调用按兼容保留为 0；
-/// 写了却不是合法索引（负数、字符串、null）属于协议缺陷，不与真实的索引 0 混同。
+/// 读取 index 字段：省略时按 0 处理（兼容只有一个 choice 或工具调用的实现）；
+/// 写了但不是非负整数（负数、字符串、null）时报格式错误，不当作 0。
 fn stream_index(value: Option<&Value>, malformed: &'static str) -> Result<u64, ProviderError> {
     match value {
         None => Ok(0),
         Some(value) => value.as_u64().ok_or_else(|| provider_chat_stream_malformed_error(malformed)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ContentBlock;
+
+    #[test]
+    fn interrupted_stream_keeps_text_without_executing_partial_tools() {
+        let config = OpenAiProviderConfig {
+            provider_name: "provider".into(),
+            base_url: "https://example.com".into(),
+            api_key: String::new(),
+        };
+        for kind in [ModelErrorKind::Cancelled, ModelErrorKind::JsonSchemaViolation] {
+            let mut on_event = |_| {};
+            let mut decoder =
+                ChatSseDecoder::new(&mut on_event, &config, "model", "https://example.com/chat/completions");
+            decoder.dispatch_event(br#"{"choices":[{"index":0,"delta":{"content":"partial","reasoning_content":"thinking","tool_calls":[{"index":0,"id":"call","function":{"name":"bash","arguments":"{"}}]}}]}"#).expect("valid stream fragment");
+            let response = decoder.finish(Err(ProviderError::new(kind, "stream ended")));
+            assert_eq!(response.assistant_message.content_text(), "partial");
+            assert!(response.assistant_message.content().iter().any(
+                |block| matches!(block, ContentBlock::Thinking { thinking, .. } if thinking == "thinking")
+            ));
+            assert_eq!(response.assistant_message.tool_calls().count(), 0);
+            assert_eq!(response.error().map(|error| error.kind), Some(kind));
+            assert_eq!(response.usage, None);
+        }
     }
 }

@@ -1,6 +1,5 @@
 //! bash 工具的执行、输出捕获与规格定义。
 
-mod capture;
 mod exec;
 pub(crate) mod job_object;
 mod pump;

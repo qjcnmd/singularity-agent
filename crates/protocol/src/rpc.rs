@@ -23,7 +23,6 @@ pub struct BackgroundTaskParams {
 pub struct FileSearchParams {
     pub workspace_id: String,
     pub query: String,
-    pub limit: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,13 +35,6 @@ pub struct WorkspaceAddParams {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceParams {
-    pub workspace_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceRemoveParams {
     pub workspace_id: String,
 }
 
@@ -71,17 +63,6 @@ pub struct DiscoverModelsParams {
     pub base_url: String,
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub api_key: Option<String>,
-    pub api_protocol: ProviderApiProtocol,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct SessionReadParams {
-    pub session_id: String,
-    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
-    pub before_turn: Option<String>,
-    pub limit: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,10 +78,9 @@ pub struct SessionParams {
 #[serde(rename_all = "camelCase")]
 pub struct SessionStartParams {
     pub workspace_id: String,
-    pub selector: Option<String>,
+    pub selection: crate::ModelSelection,
     pub text: String,
     pub images: Vec<crate::ImageUpload>,
-    pub skills: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,15 +89,6 @@ pub struct SessionStartParams {
 pub struct SessionTextParams {
     pub session_id: String,
     pub text: String,
-    /// 用户选择的技能名到绝对文件路径的绑定。
-    #[serde(default)]
-    #[cfg_attr(
-        feature = "typescript",
-        ts(as = "Option<std::collections::BTreeMap<String, String>>", optional)
-    )]
-    pub skills: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
-    #[cfg_attr(feature = "typescript", ts(as = "Option<Vec<crate::ImageUpload>>", optional))]
     pub images: Vec<crate::ImageUpload>,
 }
 
@@ -142,7 +113,7 @@ pub struct SessionRenameParams {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettingsParams {
     pub session_id: String,
-    pub selector: String,
+    pub selection: crate::ModelSelection,
 }
 
 // 请求参数和客户端返回类型由同一份方法表声明。
@@ -172,20 +143,20 @@ rpc_methods! {
     FileSearch => "file.search" (FileSearchParams) -> Vec<FileCandidate>,
     SkillsList => "skills.list" (WorkspaceParams) -> SkillCatalog,
     WorkspaceAdd => "workspace.add" (WorkspaceAddParams) -> Workspace,
-    WorkspaceRemove => "workspace.remove" (WorkspaceRemoveParams) -> (),
-    ModelSaveProvider => "model.saveProvider" (ProviderSaveParams) -> (),
+    WorkspaceRemove => "workspace.remove" (WorkspaceParams) -> (),
+    ModelSaveProvider => "model.saveProvider" (ProviderSaveParams) -> ModelCatalogResult,
     ModelDiscover => "model.discover" (DiscoverModelsParams) -> Vec<DiscoveredModel>,
-    ModelRemoveProvider => "model.removeProvider" (ProviderParams) -> (),
-    McpList => "mcp.list" (EmptyParams) -> Vec<McpServerInput>,
-    McpSave => "mcp.save" (McpSaveParams) -> (),
-    McpRemove => "mcp.remove" (McpServerParams) -> (),
-    McpToggle => "mcp.toggle" (McpToggleParams) -> (),
-    McpInspect => "mcp.inspect" (McpInspectParams) -> McpInspection,
+    ModelRemoveProvider => "model.removeProvider" (ProviderParams) -> ModelCatalogResult,
+    McpList => "mcp.list" (McpListParams) -> Vec<McpServerState>,
+    McpSave => "mcp.save" (McpSaveParams) -> Vec<McpServerState>,
+    McpRemove => "mcp.remove" (McpServerParams) -> Vec<McpServerState>,
+    McpToggle => "mcp.toggle" (McpToggleParams) -> Vec<McpServerState>,
+    McpReconnect => "mcp.reconnect" (McpServerParams) -> McpServerState,
     SessionStart => "session.start" (SessionStartParams) -> SessionStartResult,
-    SessionRead => "session.read" (SessionReadParams) -> SessionReadResult,
+    SessionRead => "session.read" (SessionParams) -> SessionReadResult,
     SessionImageRead => "session.imageRead" (SessionImageParams) -> String,
     SessionRename => "session.rename" (SessionRenameParams) -> (),
-    SessionArchive => "session.archive" (SessionParams) -> (),
+    SessionDelete => "session.delete" (SessionParams) -> (),
     SessionSubmit => "session.submit" (SessionTextParams) -> (),
     SessionAnswerQuestion => "session.answerQuestion" (crate::QuestionAnswerParams) -> (),
     SessionAbort => "session.abort" (SessionParams) -> (),

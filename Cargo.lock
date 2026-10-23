@@ -1406,11 +1406,11 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "singularity_agent",
  "singularity_core",
  "singularity_mcp",
  "singularity_model",
  "singularity_protocol",
- "singularity_runtime",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1426,7 +1426,6 @@ dependencies = [
  "serde_json",
  "time",
  "uuid",
- "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1470,21 +1469,6 @@ dependencies = [
  "serde",
  "serde_json",
  "ts-rs",
-]
-
-[[package]]
-name = "singularity_runtime"
-version = "0.1.0"
-dependencies = [
- "singularity_agent",
- "singularity_core",
- "singularity_mcp",
- "singularity_model",
- "singularity_protocol",
- "thiserror",
- "tokio",
- "tokio-util",
- "uuid",
 ]
 
 [[package]]

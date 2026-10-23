@@ -99,10 +99,16 @@ impl ServerConfig {
     /// 网络异常、服务器 stderr 和服务端错误可能含令牌，发布前去掉配置中的敏感值。
     pub fn redact(&self, mut error: String) -> String {
         let mut values: Vec<&str> = match &self.transport {
-            McpTransportConfig::Stdio { env, .. } => env.values().map(String::as_str).collect(),
+            McpTransportConfig::Stdio { env, .. } => env
+                .iter()
+                .filter(|(name, _)| is_secret_name(name))
+                .map(|(_, value)| value.as_str())
+                .collect(),
             McpTransportConfig::Http { url, headers } => {
                 let mut values = vec![url.as_str()];
-                values.extend(headers.values().map(String::as_str));
+                values.extend(
+                    headers.iter().filter(|(name, _)| is_secret_name(name)).map(|(_, value)| value.as_str()),
+                );
                 for (name, value) in headers {
                     // 服务端错误可能只回显认证值，没有 Bearer / Basic 前缀。
                     if name.eq_ignore_ascii_case("authorization")
@@ -123,6 +129,16 @@ impl ServerConfig {
         }
         error
     }
+}
+
+fn is_secret_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase().replace('-', "_");
+    name == "authorization"
+        || name == "proxy_authorization"
+        || name == "cookie"
+        || name
+            .split('_')
+            .any(|part| matches!(part, "key" | "token" | "secret" | "password" | "credential"))
 }
 
 pub(crate) fn read(home: &Path) -> Result<Configuration, String> {

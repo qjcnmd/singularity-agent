@@ -1,28 +1,24 @@
 use crate::{CHAT_COMPLETIONS_PATH, MODELS_PATH, RESPONSES_PATH};
 
-/// 已知的 OpenAI 协议端点；`base_url` 末尾写着其中一个时，先把它剥掉。
-const KNOWN_ENDPOINTS: [&str; 3] = [CHAT_COMPLETIONS_PATH, RESPONSES_PATH, MODELS_PATH];
-
-/// Chat Completions 的 reasoning 字段形状由模型目录显式指定，不靠 provider 名或模型名
-/// 去猜；枚举本身不参与序列化。
+/// Chat Completions 请求里表示思考开关的字段，由模型配置指定，不按提供方名或模型名猜测。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThinkingWireFormat {
-    /// 用既有的 thinking: {"type": "enabled|disabled"} 字段表达开关。
+    /// `thinking: {"type": "enabled" | "disabled"}`。
     ThinkingType,
-    /// 文档声明支持该能力的 provider，用顶层的 enable_thinking 布尔值表达开关。
+    /// 顶层的 `enable_thinking` 布尔值。
     EnableThinking,
-    /// 思考开关没有独立的 wire 字段，只能靠 reasoning_effort 表达（部分兼容网关的 Chat 形状）。
+    /// 没有单独的开关字段，关闭时发送 `reasoning_effort: "none"`（部分兼容网关的做法）。
     ReasoningEffort,
 }
 
 impl ThinkingWireFormat {
-    /// 全部合法词形，顺序就是错误提示里的列举顺序。
+    /// 全部取值，顺序就是错误提示里的列举顺序。
     pub(crate) const ALL: [Self; 3] = [Self::ThinkingType, Self::EnableThinking, Self::ReasoningEffort];
 
-    /// 没有声明 thinking_wire_format 时用的词形。
+    /// 配置里没写 thinking_wire_format 时的默认值。
     pub(crate) const DEFAULT: Self = Self::ReasoningEffort;
 
-    /// 配置解析、错误提示与目录发现共用的词形文本，词形只在这一处定义。
+    /// 配置文件里的写法；解析配置、错误提示和模型发现都用这里的名称。
     pub(crate) fn wire_name(self) -> &'static str {
         match self {
             Self::ThinkingType => "thinking_type",
@@ -40,33 +36,23 @@ impl ThinkingWireFormat {
     }
 }
 
-/// Chat Completions 请求里输出上限所用的 wire 字段名，也是配置没写时的默认值。
-/// 配置里写什么就发什么，两个合法词形都有 provider 在用；不按模型名或提供方去猜。
+/// Chat Completions 请求里输出上限字段的默认名称。配置可以改成 `max_completion_tokens`，
+/// 两种写法都有提供方在用，按配置发送，不按模型名或提供方猜测。
 pub(crate) const DEFAULT_CHAT_OUTPUT_TOKENS_FIELD: &str = "max_tokens";
 
-/// 输入的规范形状：去掉首尾空白与结尾斜杠；不改变地址语义。
+/// 去掉地址首尾空白和结尾的斜杠，其余部分（包括自定义路径）保持不变。
 pub(crate) fn canonical_base_url(value: &str) -> &str {
     value.trim().trim_end_matches('/')
 }
 
-/// 已通过配置校验的 `base_url` 的 API 根：只剥掉路径末尾的三种已知端点。
-/// 裸主机、版本根和自定义前缀都保留；推理与目录共用同一个根，不额外补版本段。
-pub(crate) fn api_root(base_url: &str) -> String {
-    // 配置入口已验证 URL；只处理路径，避免把主机名当作端点。
-    let url = reqwest::Url::parse(canonical_base_url(base_url)).expect("base_url must be validated");
-    let path = url.path().trim_end_matches('/');
-    let root = KNOWN_ENDPOINTS.iter().find_map(|endpoint| path.strip_suffix(endpoint)).unwrap_or(path);
-    format!("{}{root}", url.origin().ascii_serialization())
-}
-
 pub(crate) fn chat_completions_endpoint(base_url: &str) -> String {
-    format!("{}{CHAT_COMPLETIONS_PATH}", api_root(base_url))
+    format!("{}{CHAT_COMPLETIONS_PATH}", canonical_base_url(base_url))
 }
 
 pub(crate) fn responses_endpoint(base_url: &str) -> String {
-    format!("{}{RESPONSES_PATH}", api_root(base_url))
+    format!("{}{RESPONSES_PATH}", canonical_base_url(base_url))
 }
 
 pub(crate) fn models_endpoint(base_url: &str) -> String {
-    format!("{}{MODELS_PATH}", api_root(base_url))
+    format!("{}{MODELS_PATH}", canonical_base_url(base_url))
 }

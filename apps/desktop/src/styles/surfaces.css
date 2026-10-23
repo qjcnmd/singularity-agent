@@ -10,9 +10,21 @@
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes modal-in { from { opacity: 0; transform: translateY(5px) scale(0.995); } }
 
-.context-menu { position: fixed; z-index: 100; min-width: 210px; max-width: min(360px, calc(100vw - 16px)); max-height: min(420px, calc(100vh - 16px)); overflow: auto; padding: 5px; border: 1px solid var(--line); border-radius: 16px; animation: menu-enter 120ms ease-out; }
+.context-menu { z-index: 100; min-width: 210px; max-width: min(360px, calc(100vw - 16px)); max-height: min(420px, calc(100vh - 16px)); overflow: auto; padding: 5px; border: 1px solid var(--line); border-radius: 16px; animation: menu-enter 120ms ease-out; }
 .context-menu button { display: flex; justify-content: space-between; gap: 24px; width: 100%; padding: 8px 11px; border: 0; text-align: left; background: transparent; color: var(--ink); border-radius: 10px; }
 .context-menu button:hover, .context-menu button:focus-visible { background: var(--surface-hover); }
+/* 原生 Popover 的触发按钮就是定位锚点；8px 外边距保留窗口边缘空间。 */
+.context-menu, .protocol-dropdown, .workspace-appearance-picker {
+  position: fixed;
+  position-anchor: auto;
+  inset: auto;
+  margin: 8px;
+  top: calc(anchor(bottom) + 6px - 8px);
+  left: max(0px, calc(anchor(left) - 8px));
+  position-try-fallbacks: --popover-right, flip-block, --popover-right flip-block;
+}
+@position-try --popover-right { left: auto; right: 0; }
+.protocol-dropdown { width: anchor-size(width); }
 /* 折叠面板高度过渡动画 */
 .content-disclosure { overflow: hidden; height: 0; transition: height var(--disclosure-collapse-duration) var(--disclosure-collapse-ease); }
 .content-disclosure.is-open { height: auto; transition: height var(--disclosure-duration) var(--disclosure-ease); }
@@ -31,9 +43,10 @@
   transform-origin: bottom center;
   transition: opacity var(--disclosure-collapse-duration) var(--disclosure-collapse-ease),
     transform var(--disclosure-collapse-duration) var(--disclosure-collapse-ease),
-    display var(--disclosure-collapse-duration) allow-discrete;
+    display var(--disclosure-collapse-duration) allow-discrete,
+    overlay var(--disclosure-collapse-duration) allow-discrete;
 }
-.picker-disclosure.is-open {
+.picker-disclosure.is-open, .picker-disclosure:popover-open {
   display: block;
   opacity: 1;
   transform: translateY(0) scale(1);
@@ -41,14 +54,14 @@
   transition-timing-function: var(--disclosure-ease);
 }
 @starting-style {
-  .picker-disclosure.is-open { opacity: 0; transform: translateY(6px) scale(.96); }
+  .picker-disclosure.is-open, .picker-disclosure:popover-open { opacity: 0; transform: translateY(6px) scale(.96); }
 }
 .picker-disclosure > div { overflow: hidden; background: var(--surface); border-radius: 12px; box-shadow: inset 0 0 0 1px var(--line), var(--shadow-floating); }
 @keyframes menu-enter { from { opacity: 0; } to { opacity: 1; } }
 
 @media (prefers-reduced-motion: reduce) {
   /* 响应系统的减少动态效果偏好 */
-  .content-disclosure, .content-disclosure > div, .picker-disclosure, .expand-chevron { transition: none !important; }
+  .content-disclosure, .content-disclosure > div, .picker-disclosure, .expand-chevron, .protocol-dropdown, .workspace-appearance-picker { transition: none !important; }
   .context-menu, .context-menu > button { animation: none; }
 }
 

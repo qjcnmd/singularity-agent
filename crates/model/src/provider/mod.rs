@@ -2,8 +2,6 @@
 
 pub mod contract;
 
-use crate::ModelUsage;
-
 /// 面向 Agent 边界的 provider 流数据：已规范化，且不含敏感内容。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderStreamEvent {
@@ -14,11 +12,4 @@ pub enum ProviderStreamEvent {
     /// 提供方公开的思考文本增量：Chat 的 reasoning 增量和 Responses 的
     /// reasoning summary 增量都从这里发出，不含 provider 私有的回放材料。
     ReasoningTextDelta { delta: String },
-}
-
-/// 一次调用的协议结果与已上报用量。回复被续接校验拒绝时，用量仍然保留。
-/// 存储错误属于请求执行层，不进入模型调用结果。
-pub struct ProviderCompletion {
-    pub result: Result<crate::ModelTurnResponse, crate::ProviderError>,
-    pub usage: Option<ModelUsage>,
 }

@@ -4,33 +4,35 @@ export type AppBootstrap = {
 /**
  * 系统用户主目录，用于界面缩短路径；与应用数据目录无关。
  */
-userHome: string | null, sessionPhases: { [key in string]: SessionPhase }, revision: number, workspaces: Array<Workspace>, sessionsByWorkspace: { [key in string]: Array<ThreadSummary> }, modelCatalog: RedactedModelCatalog, };
+userHome: string | null, sessionStates: { [key in string]: SessionStatus }, revision: number, workspaces: Array<Workspace>, sessionsByWorkspace: { [key in string]: Array<ThreadSummary> }, modelCatalog: RedactedModelCatalog, };
 
-export type BackgroundTask = { taskId: string, turnId: string, itemId: string, command: string, description: string, startedAt: string,
+export type BackgroundTask = { taskId: string, command: string, description: string,
 /**
- * 有界输出尾部；超长输出的完整文件位置沿用 Bash 的保存说明。
+ * 输出的末尾部分；超长时附带完整输出文件的位置，与 bash 工具的结果相同。
  */
 output: string, state: BackgroundTaskState, };
 
 export type BackgroundTaskParams = { sessionId: string, taskId: string, };
 
-export type BackgroundTaskState = { "status": "running" } | { "status": "exited", exitCode: number, finishedAt: string, durationMs: number, } | { "status": "stopped", finishedAt: string, durationMs: number, } | { "status": "failed", message: string, finishedAt: string, durationMs: number, } | { "status": "interrupted" };
+export type BackgroundTaskState = { "status": "running" } | { "status": "exited", exitCode: number, durationMs: number, } | { "status": "stopped", durationMs: number, } | { "status": "failed", message: string, durationMs: number, } | { "status": "interrupted" };
 
-export type BackgroundTaskUpdate = { sessionRevision: number, phase: SessionPhase, task: BackgroundTask, };
+export type BackgroundTaskUpdate = { phase: SessionPhase, task: BackgroundTask, };
+
+export type ContextUsage = { used: number, capacity: number, };
 
 export type DirectoryPickResult = { path: string | null, };
 
-export type DiscoverModelsParams = { providerId: string, baseUrl: string, apiKey?: string | null, apiProtocol: ProviderApiProtocol, };
+export type DiscoverModelsParams = { providerId: string, baseUrl: string, apiKey?: string | null, };
 
-export type DiscoveredModel = { modelId: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, requiresReasoningContentForToolCalls: boolean | null, };
+export type DiscoveredModel = { modelId: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<string>, };
 
 export type EmptyParams = Record<string, never>;
 
 export type FileCandidate = { path: string, };
 
-export type FileSearchParams = { workspaceId: string, query: string, limit: number, };
+export type FileSearchParams = { workspaceId: string, query: string, };
 
-export type HistoryItem = { "type": "request", observation: RequestObservation, } | { "type": "context", id: string, name: string, content: string, } | { "type": "message", id: string, running: boolean, role: HistoryMessageRole, text: string, images?: Array<ImageAttachment>, } | { "type": "thinking", id: string, running: boolean, text: string, } | { "type": "tool", id: string, running: boolean, name: string, args: JsonValue, result: ToolResult | null, } | { "type": "settings", id: string, provider: string, model: string, reasoning: string | null, } | { "type": "compaction", id: string, summary: string, } | { "type": "compaction_result", id: string, status: TurnStatus, message: string | null, };
+export type HistoryItem = { "type": "message", id: string, status: TurnStatus, role: HistoryMessageRole, text: string, images?: Array<ImageAttachment>, } | { "type": "thinking", id: string, status: TurnStatus, text: string, } | { "type": "tool", id: string, status: ToolStatus, name: string, args: JsonValue, result: ToolResult | null, } | { "type": "compaction", id: string, summary: string, } | { "type": "compaction_result", id: string, status: TurnStatus, message: string | null, };
 
 export type HistoryMessageRole = "user" | "assistant";
 
@@ -38,55 +40,49 @@ export type ImageAttachment = { id: string, name: string, mimeType: string, widt
 
 export type ImageUpload = { name: string, dataUrl: string, };
 
-export type ItemRef = { itemId: string, };
+export type InjectedContext = { instructions: Array<InstructionFile>, skills: Array<string>, tools: Array<string>, };
+
+export type InstructionFile = { path: string, content: string, global: boolean, };
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
 
 export type McpConnectionStatus = "not_connected" | "connecting" | "connected" | "failed" | "disabled";
 
-export type McpInspectParams = { serverId: string, workspaceId: string | null, reconnect: boolean, };
+export type McpListParams = { workspaceId: string | null, };
 
-export type McpInspection = { serverId: string, status: McpConnectionStatus, error: string | null, tools: Array<McpToolInfo>, };
-
-export type McpSaveParams = { server: McpServerInput, };
+export type McpSaveParams = { server: McpServerInput, workspaceId: string | null, };
 
 export type McpServerInput = { serverId: string, enabled: boolean, startupTimeoutSec: number, toolTimeoutSec: number, transport: McpTransportConfig, };
 
-export type McpServerParams = { serverId: string, };
+export type McpServerParams = { serverId: string, workspaceId: string | null, };
 
-export type McpToggleParams = { serverId: string, enabled: boolean, };
+export type McpServerState = { server: McpServerInput, status: McpConnectionStatus, error: string | null, tools: Array<McpToolInfo>, };
+
+export type McpToggleParams = { serverId: string, enabled: boolean, workspaceId: string | null, };
 
 export type McpToolInfo = { name: string, description: string, };
 
 export type McpTransportConfig = { "type": "stdio", command: string, args: Array<string>, cwd?: string | null, env?: { [key in string]: string }, } | { "type": "http", url: string, headers?: { [key in string]: string }, };
 
-export type ModelConfigurationInput = { modelId: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant> | null, defaultVariant: string | null, thinkingWireFormat: string | null,
+export type ModelCatalogResult = { catalog: RedactedModelCatalog, revision: number, };
+
+export type ModelConfigurationInput = { modelId: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<string> | null, defaultVariant: string | null, thinkingWireFormat: string | null,
 /**
  * Chat 输出上限使用的 wire 字段名；`None` 表示发送 `max_tokens`。
  */
-chatOutputTokensField: string | null, requiresReasoningContentForToolCalls: boolean | null, };
+chatOutputTokensField: string | null, };
 
-export type ModelUsage = { inputTokens: number, outputTokens: number,
-/**
- * 供应商上报总量，缺失时由协议解析器将输入输出相加得到。
- */
-totalTokens: number,
-/**
- * None 为未上报；Some(0) 为明确上报零缓存用量。
- */
-cachedInputTokens: number | null, };
+export type ModelSelection = { provider: string, model: string, reasoning: string | null, };
 
 export type PendingQuestion = {
 /**
- * 工具条目身份；用于拒绝已经结束或属于另一轮的问题答案。
+ * 提问工具的条目 ID；用于拒绝已经结束或属于其他回合的问题的答案。
  */
 itemId: string, questions: Array<UserQuestion>, };
 
 export type PendingUserMessage = { itemId: string, text: string, images: Array<ImageAttachment>, };
 
 export type ProviderApiProtocol = "chat" | "responses";
-
-export type ProviderAttemptStatus = "started" | "ok" | "error" | "cancelled";
 
 export type ProviderConfigurationInput = { apiProtocol: ProviderApiProtocol, providerId: string, displayName: string | null, baseUrl: string, models: Array<ModelConfigurationInput>, };
 
@@ -102,44 +98,21 @@ export type QuestionAnswerParams = { sessionId: string, itemId: string, answers:
 
 export type ReadSource = {
 /**
- * 实际读到的首个源文件行号；offset 省略或为 0 时规范化为 1。
+ * 第一行的行号；offset 省略或为 0 时是 1。
  */
 startLine: number,
 /**
- * 正文行数；分页续读和超长单行的说明都不计入。
+ * 正文行数，不含末尾的续读和超长行说明。
  */
 lineCount: number, };
-
-export type ReasoningVariant = { id: string, wireEffort: string | null, };
 
 export type RedactedModelCatalog = {
 /**
  * 配置读取或默认模型选择校验失败；尚未配置提供方或模型时为空。
  */
-error: string | null, defaultSelector: string | null, providers: Array<RedactedProvider>, };
+error: string | null, defaultSelection: ModelSelection | null, providers: Array<RedactedProvider>, };
 
 export type RedactedProvider = { apiProtocol: ProviderApiProtocol, providerId: string, displayName: string | null, baseUrl: string, credentialConfigured: boolean, models: Array<ModelConfigurationInput>, };
-
-export type RequestObservation = {
-/**
- * 查找请求详情并配对开始、结束观测的键；每次 provider attempt 生成一个，
- * 与 assistant 或 compaction 的会话条目身份无关。
- */
-requestId: string, purpose: RequestPurpose, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number,
-/**
- * 请求开始到首个生成增量的实测耗时；没有生成增量时保持未知。
- */
-ttftMs?: number,
-/**
- * 首个生成增量到请求完成的耗时；没有生成增量时保持未知。
- */
-decodeMs?: number,
-/**
- * 未上报时为 None；有用量时输入、输出和总数始终齐全。
- */
-usage: ModelUsage | null, };
-
-export type RequestPurpose = "generation" | "compaction";
 
 export type RpcError = { code: RpcErrorCode, message: string, recovery: string, };
 
@@ -147,11 +120,17 @@ export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspac
 
 export type RpcResponse = { "type": "success", result: JsonValue, } | { "type": "error", error: RpcError, };
 
+export type SessionFailure = { source: SessionOperation,
+/**
+ * 未保存到会话历史的失败原因；已保存的结果通过历史与执行事件展示。
+ */
+error: TurnErrorDetail, };
+
 export type SessionImageParams = { sessionId: string, imageId: string, };
 
 export type SessionModelUsage = {
 /**
- * 有首 token 计时的请求：等待耗时合计与样本数，用于计算 TTFT；不依赖 usage 上报。
+ * 测到首 Token 耗时的请求的耗时合计和请求数，用于计算平均首 Token 耗时；与是否上报用量无关。
  */
 ttftMs: number, ttftRequests: number,
 /**
@@ -163,7 +142,7 @@ inputTokens: number,
  */
 cachedInputTokens: number, outputTokens: number, totalTokens: number,
 /**
- * 同时具有生成耗时和输出计数的样本，用于计算 TPS。
+ * 同时有生成耗时和输出 Token 数的请求的合计，用于计算每秒输出 Token 数。
  */
 decodeTokens: number, decodeMs: number,
 /**
@@ -175,102 +154,81 @@ cacheUsageComplete: boolean,
  */
 generationMs: number,
 /**
- * 是否有请求报告了 usage；为 false 时 token 计数不含任何真实消费。
+ * 是否有请求上报了用量；为 false 时 Token 数都是 0，不代表没有消耗。
  */
 usagePresent: boolean, };
 
+export type SessionOperation = "turn" | "compaction";
+
 export type SessionParams = { sessionId: string, };
 
-export type SessionPhase = "idle" | "reserved" | "running" | "compacting" | "stopping";
+export type SessionPhase = "idle" | "running" | "compacting" | "stopping";
 
-export type SessionReadParams = { sessionId: string, beforeTurn?: string | null, limit: number, };
-
-export type SessionReadResult = { history: ThreadReadPage, runtime: SessionRuntime, };
+export type SessionReadResult = {
+/**
+ * 快照包含的最后一个会话事件在全局流中的位置。
+ */
+revision: number, history: ThreadHistory, runtime: SessionRuntime,
+/**
+ * 首次读取后台命令，后续变化由独立事件更新。
+ */
+backgroundTasks: Array<BackgroundTask>, context: InjectedContext | null, };
 
 export type SessionRenameParams = { sessionId: string, name: string, };
 
-export type SessionRuntime = { sessionRevision: number, phase: SessionPhase, selector: string | null, modelContextWindow: number | null, pendingQuestion: PendingQuestion | null, pendingMessages: Array<PendingUserMessage>, backgroundTasks: Array<BackgroundTask>, terminal: SessionTerminalSnapshot | null,
+export type SessionRuntime = { phase: SessionPhase, selection: ModelSelection, contextUsage: ContextUsage | null, pendingQuestion: PendingQuestion | null, pendingMessages: Array<PendingUserMessage>, failure: SessionFailure | null,
 /**
- * 活动执行累计到的完整用量；尚未执行时从历史摘要读取。
- */
-usage: SessionModelUsage | null, };
-
-export type SessionStartParams = { workspaceId: string, selector: string | null, text: string, images: Array<ImageUpload>, skills: { [key in string]: string }, };
-
-export type SessionStartResult = { sessionId: string, bootstrap: AppBootstrap, };
-
-export type SessionTerminalSnapshot = { source: SessionTerminalSource, status: TurnStatus,
-/**
- * 该回合的中断来自已接受的用户停止，与持久化摘要使用同一事实。
- */
-manuallyStopped: boolean,
-/**
- * 未保存到会话历史的失败原因；已保存的结果通过历史与执行事件展示。
- */
-error: TurnErrorDetail | null, };
-
-export type SessionTerminalSource = "turn" | "compaction";
-
-export type SessionTextParams = { sessionId: string, text: string,
-/**
- * 用户选择的技能名到绝对文件路径的绑定。
- */
-skills?: { [key in string]: string }, images?: Array<ImageUpload>, };
-
-export type SkillCatalog = { skills: Array<SkillMetadata>, diagnostics: Array<string>, };
-
-export type SkillMetadata = { name: string, description: string, path: string, };
-
-export type StreamEnvelope = { revision: number, } & ({ "type": "ready" } | { "type": "app_changed", payload: AppBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: TurnEventEnvelope, } | { "type": "session_settled", sessionId: string, payload: SessionRuntime, } | { "type": "background_task_updated", sessionId: string, payload: BackgroundTaskUpdate, } | { "type": "resync_required" });
-
-export type ThreadReadPage = { summary: ThreadSummary, turns: Array<ThreadTurn>, nextCursor: string | null, };
-
-export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, updatedAt: string, title: string | null, status: TurnStatus | null,
-/**
- * 最近一次被中断的 run，在账本里有明确的用户取消记录。
- */
-manuallyStopped: boolean, turnCount: number,
-/**
- * 整份账本的累计模型用量。它只在生成快照时更新，运行中回合的增量要调用方从活动
- * 事件累计，实时值由 SessionRuntime 提供。
+ * 整份会话的累计模型用量。
  */
 usage: SessionModelUsage, };
 
-export type ThreadTurn = { startedAt?: string, finishedAt?: string, turnId: string | null, status: TurnStatus | null,
+export type SessionStartParams = { workspaceId: string, selection: ModelSelection, text: string, images: Array<ImageUpload>, };
+
+export type SessionStartResult = { summary: ThreadSummary, status: SessionStatus, revision: number, };
+
+export type SessionStatus = { phase: SessionPhase, failure: SessionFailure | null, };
+
+export type SessionTextParams = { sessionId: string, text: string, images: Array<ImageUpload>, };
+
+export type SkillCatalog = { skills: Array<SkillMetadata>, diagnostics: Array<string>, };
+
+export type SkillMetadata = { name: string, description: string, };
+
+export type StreamEnvelope = { revision: number, } & ({ "type": "ready" } | { "type": "app_changed", payload: AppBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: TurnEventEnvelope, } | { "type": "session_settled", sessionId: string, payload: SessionRuntime, summary: ThreadSummary, } | { "type": "session_summary_changed", summary: ThreadSummary, } | { "type": "background_task_updated", sessionId: string, payload: BackgroundTaskUpdate, } | { "type": "app_read_failed", error: RpcError, });
+
+export type ThreadHistory = { summary: ThreadSummary, turns: Array<ThreadTurn>, };
+
+export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, updatedAt: string, title: string | null, status: TurnStatus | null,
 /**
- * 中断是否来自用户主动停止；未完成的历史操作为 false。
+ * 最近一个回合是否由用户停止而中断。
+ */
+manuallyStopped: boolean, };
+
+export type ThreadTurn = { startedAt?: string, finishedAt?: string, turnId: string, status: TurnStatus | null,
+/**
+ * 中断是否由用户停止；没有结束记录的回合为 false。
  */
 manuallyStopped: boolean, error?: TurnErrorDetail, items: Array<HistoryItem>, };
 
 export type ToolResult = { output: string, images?: Array<ImageAttachment>, readSource?: ReadSource, isError: boolean, durationMs?: number, };
 
+export type ToolStatus = "pending" | "running" | "completed" | "failed" | "interrupted";
+
 export type Turn = { turnId: string, status: TurnStatus, };
 
 export type TurnErrorDetail = { cause: TurnFailureCause, message: string,
 /**
- * 已展示这次失败的条目；回合结束时只关联它，不再重复显示原因。
+ * 已经显示了这次失败的条目（如压缩条目）；界面据此不再重复显示原因。
  */
 itemId?: string, };
 
-export type TurnEventEnvelope = { sessionRevision: number, phase: SessionPhase,
-/**
- * 请求观测改变合计时携带完整用量，客户端无需重算。
- */
-usage?: SessionModelUsage, } & ({ "method": "context/injected", "params": { turnId: string | null, content: HistoryItem, } } | { "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "turn/userMessage", "params": { turnId: string, item: ItemRef, text: string, images?: Array<ImageAttachment>, } } | { "method": "item/agentMessage/delta", "params": { turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking/delta", "params": { turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { turnId: string,
-/**
- * 与历史共享的公开 occurrence 身份；provider 的 wire 调用 ID 不在协议里。
- */
-item: ItemRef, toolName: string, args: JsonValue, } } | { "method": "tool/execution/update", "params": { turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { turnId: string, item: ItemRef, output: string, images?: Array<ImageAttachment>, readSource?: ReadSource, isError: boolean, durationMs?: number, } } | { "method": "item/discarded", "params": { turnId: string, item: ItemRef, } } | { "method": "item/completed", "params": { turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "provider/attempt", "params": { observation: RequestObservation,
-/**
- * 独立压缩不属于回合；普通执行使用实际回合身份。
- */
-turnId: string | null, } } | { "method": "compaction/updated", "params": { turnId: string | null, content: HistoryItem, } } | { "method": "session/settingsUpdated", "params": { turnId: string | null, content: HistoryItem, } } | { "method": "turn/completed", "params": { turn: Turn, manuallyStopped: boolean, finishedAt: string, } } | { "method": "turn/error", "params": { turnId: string, error: TurnErrorDetail, finishedAt: string, } });
+export type TurnEventEnvelope = { turnId: string | null, phase: SessionPhase, } & ({ "method": "context/loaded", "params": { context: InjectedContext, } } | { "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "item/updated", "params": { item: HistoryItem, } } | { "method": "item/textDelta", "params": { itemId: string, thinking: boolean, delta: string, } } | { "method": "message/finished", "params": { messageId: string, items: Array<HistoryItem>, } } | { "method": "message/discarded", "params": { messageId: string, } } | { "method": "tool/output", "params": { itemId: string, output: string, } } | { "method": "tool/finished", "params": { itemId: string, result: ToolResult, } } | { "method": "turn/completed", "params": { turn: Turn, manuallyStopped: boolean, finishedAt: string, } } | { "method": "turn/error", "params": { error: TurnErrorDetail, finishedAt: string, } });
 
-export type TurnFailureCause = "store" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
+export type TurnFailureCause = "store" | "provider" | "internal";
 
 export type TurnStatus = "running" | "completed" | "failed" | "interrupted";
 
-export type UpdateSettingsParams = { sessionId: string, selector: string, };
+export type UpdateSettingsParams = { sessionId: string, selection: ModelSelection, };
 
 export type UserQuestion = { id: string, question: string, options: Array<UserQuestionOption>, multiSelect: boolean, };
 
@@ -284,28 +242,26 @@ export type WorkspaceAddParams = { root: string, };
 
 export type WorkspaceParams = { workspaceId: string, };
 
-export type WorkspaceRemoveParams = { workspaceId: string, };
-
 export interface RpcContract {
   "app.bootstrap": { params: EmptyParams; result: AppBootstrap }
   "directory.pick": { params: EmptyParams; result: DirectoryPickResult }
   "file.search": { params: FileSearchParams; result: Array<FileCandidate> }
   "skills.list": { params: WorkspaceParams; result: SkillCatalog }
   "workspace.add": { params: WorkspaceAddParams; result: Workspace }
-  "workspace.remove": { params: WorkspaceRemoveParams; result: null }
-  "model.saveProvider": { params: ProviderSaveParams; result: null }
+  "workspace.remove": { params: WorkspaceParams; result: null }
+  "model.saveProvider": { params: ProviderSaveParams; result: ModelCatalogResult }
   "model.discover": { params: DiscoverModelsParams; result: Array<DiscoveredModel> }
-  "model.removeProvider": { params: ProviderParams; result: null }
-  "mcp.list": { params: EmptyParams; result: Array<McpServerInput> }
-  "mcp.save": { params: McpSaveParams; result: null }
-  "mcp.remove": { params: McpServerParams; result: null }
-  "mcp.toggle": { params: McpToggleParams; result: null }
-  "mcp.inspect": { params: McpInspectParams; result: McpInspection }
+  "model.removeProvider": { params: ProviderParams; result: ModelCatalogResult }
+  "mcp.list": { params: McpListParams; result: Array<McpServerState> }
+  "mcp.save": { params: McpSaveParams; result: Array<McpServerState> }
+  "mcp.remove": { params: McpServerParams; result: Array<McpServerState> }
+  "mcp.toggle": { params: McpToggleParams; result: Array<McpServerState> }
+  "mcp.reconnect": { params: McpServerParams; result: McpServerState }
   "session.start": { params: SessionStartParams; result: SessionStartResult }
-  "session.read": { params: SessionReadParams; result: SessionReadResult }
+  "session.read": { params: SessionParams; result: SessionReadResult }
   "session.imageRead": { params: SessionImageParams; result: string }
   "session.rename": { params: SessionRenameParams; result: null }
-  "session.archive": { params: SessionParams; result: null }
+  "session.delete": { params: SessionParams; result: null }
   "session.submit": { params: SessionTextParams; result: null }
   "session.answerQuestion": { params: QuestionAnswerParams; result: null }
   "session.abort": { params: SessionParams; result: null }

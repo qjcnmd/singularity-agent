@@ -1,8 +1,8 @@
-//! 在 MCP 边界转换 SDK 内容，宿主只接收文字和待校验的图片。
+//! 把 MCP SDK 返回的内容转换成文字和图片；不支持的内容类型转成说明文字并标记为错误。
 
 use rmcp::model::{CallToolResult, ContentBlock, ResourceContents};
 
-/// 工具结果；图片是服务器返回的 data URL，由宿主校验和保存。
+/// 工具结果；图片保留服务器返回的 Base64 内容，由 Agent 检查和保存。
 pub struct McpToolResult {
     pub content: String,
     pub images: Vec<String>,
@@ -17,13 +17,13 @@ pub(crate) fn convert(result: CallToolResult) -> McpToolResult {
         match block {
             ContentBlock::Text(content) => text.push(content.text),
             ContentBlock::Image(content) => {
-                images.push(format!("data:{};base64,{}", content.mime_type, content.data));
+                images.push(content.data);
             }
             ContentBlock::Resource(content) => match content.resource {
                 ResourceContents::TextResourceContents { text: content, .. } => text.push(content),
                 ResourceContents::BlobResourceContents { uri, mime_type, blob, .. } => match mime_type {
                     Some(mime) if mime.starts_with("image/") => {
-                        images.push(format!("data:{mime};base64,{blob}"));
+                        images.push(blob);
                     }
                     mime => {
                         text.push(format!(
@@ -54,11 +54,12 @@ pub(crate) fn convert(result: CallToolResult) -> McpToolResult {
             }
         }
     }
-    if let Some(content) = result.structured_content {
-        let structured = serde_json::to_string(&content).expect("structured content is JSON");
-        if !text.contains(&structured) {
-            text.push(structured);
-        }
+    if let Some(content) = result.structured_content
+        && !text
+            .iter()
+            .any(|text| serde_json::from_str::<serde_json::Value>(text).ok().as_ref() == Some(&content))
+    {
+        text.push(serde_json::to_string(&content).expect("structured content is JSON"));
     }
     McpToolResult {
         content: text.join("\n\n"),

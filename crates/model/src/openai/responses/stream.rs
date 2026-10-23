@@ -1,6 +1,6 @@
 use super::*;
 
-/// 用 Responses 协议解码一次真实响应：共享读取循环驱动本协议解码器，终结也在本模块内。
+/// 读取并解码一次 Responses 流式响应。
 pub(crate) async fn read_responses_sse_stream(
     cancellation: &CancellationToken,
     response: reqwest::Response,
@@ -8,19 +8,21 @@ pub(crate) async fn read_responses_sse_stream(
     config: &OpenAiProviderConfig,
     selection: &SelectedModel,
     endpoint: &str,
-) -> Result<ModelTurnResponse, ProviderError> {
-    let payload = read_sse_stream(cancellation, response, ResponsesSseDecoder::new(on_event)).await?;
-    parse_openai_responses_response(config, payload, &selection.model_name, endpoint)
+) -> ModelTurnResponse {
+    let mut decoder = ResponsesSseDecoder::new(on_event);
+    let result = read_sse_stream(cancellation, response, &mut decoder).await;
+    decoder.finish(result, config, &selection.model_name, endpoint)
 }
 
-/// 按 Responses 事件契约增量解析的 SSE 解码器。
+/// Responses SSE 解码器：边收边发出正文和思考增量，保留最终的 response 对象。
 struct ResponsesSseDecoder<'a> {
     terminal_response: Option<Value>,
+    text: String,
+    thinking: String,
     on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send),
 }
 
 impl SseStreamDecoder for ResponsesSseDecoder<'_> {
-    type Terminal = Value;
     fn frame_malformed() -> fn(&'static str) -> ProviderError {
         provider_responses_stream_malformed_error
     }
@@ -41,7 +43,9 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                     (self.on_event)(ProviderStreamEvent::ToolCallDelta);
                 }
             }
-            "response.output_text.delta" | "response.reasoning_summary_text.delta" => {
+            "response.output_text.delta"
+            | "response.refusal.delta"
+            | "response.reasoning_summary_text.delta" => {
                 let reasoning = payload_type == "response.reasoning_summary_text.delta";
                 let delta = payload.get("delta").and_then(Value::as_str).ok_or_else(|| {
                     provider_responses_stream_malformed_error(if reasoning {
@@ -51,6 +55,11 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                     })
                 })?;
                 if !delta.is_empty() {
+                    if reasoning {
+                        self.thinking.push_str(delta);
+                    } else {
+                        self.text.push_str(delta);
+                    }
                     let delta = delta.to_string();
                     (self.on_event)(if reasoning {
                         ProviderStreamEvent::ReasoningTextDelta { delta }
@@ -73,11 +82,7 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                 let fields = provider_error_fields(
                     payload.get("error").filter(|error| error.is_object()).unwrap_or(&payload),
                 );
-                return Err(provider_embedded_error(
-                    &fields,
-                    "provider Responses stream returned an error",
-                    "responses_stream_error",
-                ));
+                return Err(provider_embedded_error(&fields, "provider Responses stream returned an error"));
             }
             "response.failed" => {
                 let fields = payload
@@ -85,20 +90,12 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                     .and_then(|response| response.get("error"))
                     .map(provider_error_fields)
                     .unwrap_or_default();
-                return Err(provider_embedded_error(
-                    &fields,
-                    "provider Responses stream failed",
-                    "responses_stream_failed",
-                ));
+                return Err(provider_embedded_error(&fields, "provider Responses stream failed"));
             }
             // 其余事件不影响公开文本与终态，都忽略。
             _ => {}
         }
         Ok(())
-    }
-
-    fn materialize_terminal(self) -> Result<Self::Terminal, ProviderError> {
-        self.terminal_response.ok_or_else(provider_responses_stream_terminal_missing_error)
     }
 
     fn protocol_complete(&self) -> bool {
@@ -109,16 +106,40 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
 
 impl<'a> ResponsesSseDecoder<'a> {
     fn new(on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send)) -> Self {
-        Self { terminal_response: None, on_event }
+        Self {
+            terminal_response: None,
+            text: String::new(),
+            thinking: String::new(),
+            on_event,
+        }
+    }
+
+    fn finish(
+        mut self,
+        result: Result<(), ProviderError>,
+        config: &OpenAiProviderConfig,
+        model_name: &str,
+        endpoint: &str,
+    ) -> ModelTurnResponse {
+        let result = result.and_then(|()| {
+            let payload = self
+                .terminal_response
+                .take()
+                .ok_or_else(provider_responses_stream_terminal_missing_error)?;
+            parse_openai_responses_response(config, payload, model_name, endpoint)
+        });
+        match result {
+            Ok(response) => response,
+            Err(error) => ModelTurnResponse::failed(
+                error,
+                Message::assistant(self.text, self.thinking, Vec::new(), None),
+            ),
+        }
     }
 }
 
 fn provider_responses_stream_malformed_error(reason: &'static str) -> ProviderError {
-    provider_stream_malformed_error(
-        "provider Responses stream was malformed",
-        "responses_stream_malformed",
-        reason,
-    )
+    provider_stream_malformed_error("provider Responses stream was malformed", reason)
 }
 
 fn provider_responses_stream_terminal_missing_error() -> ProviderError {
@@ -126,5 +147,42 @@ fn provider_responses_stream_terminal_missing_error() -> ProviderError {
         ModelErrorKind::JsonSchemaViolation,
         "provider Responses stream did not contain a completed terminal",
     )
-    .with_code("responses_stream_terminal_missing")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ContentBlock;
+
+    #[test]
+    fn interrupted_stream_keeps_text_and_thinking() {
+        let config = OpenAiProviderConfig {
+            provider_name: "provider".into(),
+            base_url: "https://example.com".into(),
+            api_key: String::new(),
+        };
+        for kind in [ModelErrorKind::Cancelled, ModelErrorKind::JsonSchemaViolation] {
+            let mut on_event = |_| {};
+            let mut decoder = ResponsesSseDecoder::new(&mut on_event);
+            decoder
+                .dispatch_event(br#"{"type":"response.output_text.delta","delta":"partial"}"#)
+                .expect("valid stream fragment");
+            decoder
+                .dispatch_event(br#"{"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#)
+                .expect("valid stream fragment");
+            let response = decoder.finish(
+                Err(ProviderError::new(kind, "stream ended")),
+                &config,
+                "model",
+                "https://example.com/responses",
+            );
+            assert_eq!(response.assistant_message.content_text(), "partial");
+            assert!(response.assistant_message.content().iter().any(
+                |block| matches!(block, ContentBlock::Thinking { thinking, .. } if thinking == "thinking")
+            ));
+            assert_eq!(response.assistant_message.tool_calls().count(), 0);
+            assert_eq!(response.error().map(|error| error.kind), Some(kind));
+            assert_eq!(response.usage, None);
+        }
+    }
 }

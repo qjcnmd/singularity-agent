@@ -13,8 +13,8 @@ pub(super) fn bash_path() -> Result<String, String> {
 
 /// 判断候选路径是不是 System32 下的 bash 启动器存根。
 ///
-/// System32 下的 bash.exe 是 WSL 的启动器存根：路径语义和进程模型与 Unix shell 不同，
-/// 没装发行版或服务没运行时还会静默无输出，不算执行后端。
+/// System32 下的 bash.exe 是 WSL 的启动器：路径和进程行为与 Git Bash 不同，
+/// 没装发行版或服务没运行时还会没有任何输出，所以不使用它。
 ///
 /// Windows 路径不区分大小写，而 `Path` 的组件比较是逐字节的，所以这里显式折叠 ASCII
 /// 大小写：PATH 里的 `C:\windows\system32` 和 `C:\Windows\System32` 一样要排除。
@@ -32,7 +32,7 @@ fn is_system32_bash_launcher(candidate: &Path, system_root: &str) -> bool {
     file_name.eq_ignore_ascii_case("bash.exe") && directory.eq_ignore_ascii_case("System32")
 }
 
-/// 逐组件比较前缀，并按 Windows 的路径语义折叠 ASCII 大小写。
+/// 逐级比较路径前缀，忽略 ASCII 大小写（Windows 路径不区分大小写）。
 fn starts_with_ignore_ascii_case(path: &Path, prefix: &Path) -> bool {
     let mut components = path.components();
     prefix.components().all(|expected| {

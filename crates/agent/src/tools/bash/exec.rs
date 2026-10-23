@@ -9,11 +9,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tools::registry::{ABORTED_MESSAGE, ToolExecution};
 
-use super::capture::CaptureState;
 use super::job_object::{self, ManagedChild};
 use super::pump::OutputStreams;
 use super::shell::bash_path;
 use super::spec::BashArgs;
+use crate::tools::output::CaptureState;
 
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
@@ -33,19 +33,12 @@ pub(super) enum Outcome {
 
 impl Outcome {
     pub(super) fn state(&self, duration_ms: u64) -> BackgroundTaskState {
-        let finished_at = singularity_core::now_iso();
         match self {
-            Self::Exited(exit_code) => BackgroundTaskState::Exited {
-                exit_code: *exit_code,
-                finished_at,
-                duration_ms,
-            },
-            Self::Stopped => BackgroundTaskState::Stopped { finished_at, duration_ms },
-            Self::Failed(message) | Self::CleanupFailed(message) => BackgroundTaskState::Failed {
-                message: message.clone(),
-                finished_at,
-                duration_ms,
-            },
+            Self::Exited(exit_code) => BackgroundTaskState::Exited { exit_code: *exit_code, duration_ms },
+            Self::Stopped => BackgroundTaskState::Stopped { duration_ms },
+            Self::Failed(message) | Self::CleanupFailed(message) => {
+                BackgroundTaskState::Failed { message: message.clone(), duration_ms }
+            }
         }
     }
 }
@@ -72,7 +65,7 @@ impl Process {
         );
         let mut progress = tokio::time::interval(Duration::from_millis(100));
         progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let timeout_ms = args.total_timeout_ms();
+        let timeout_ms = args.timeout_ms.map(std::num::NonZeroU64::get);
         Ok(Self {
             managed,
             output,
@@ -138,7 +131,7 @@ impl Process {
             };
             outcome = Outcome::CleanupFailed(format!("{primary}{}", failures.join("; ")));
         }
-        let (mut content, spill_note) = tokio::task::block_in_place(|| self.capture.finish());
+        let (mut content, spill_note) = self.capture.finish();
         let is_error = match &outcome {
             Outcome::Exited(0) => false,
             Outcome::Exited(code) => {

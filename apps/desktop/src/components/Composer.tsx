@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { navigateList, useSelectionGuard, useDismissOnOutside } from '../interactions'
 import { RpcFailure } from '../rpcClient'
-import type { SkillMetadata, SessionModelUsage } from '../protocol'
+import type { SessionModelUsage } from '../protocol'
 import { actionOrigin, appStore, useAppStore, pendingKey, type AppState } from '../appStore'
 import { ModelPicker } from './ModelPicker'
 import { WorkspacePicker } from './WorkspacePicker'
@@ -11,7 +11,6 @@ import { motion, useReducedMotion } from 'motion/react'
 import { flushSync } from 'react-dom'
 import { ImagePlus, Settings } from 'lucide-react'
 import { formatTokenCount } from '../copy'
-import { contextOccupancy } from '../contextUsage'
 import { cacheHitPercent, firstTokenLatency, generationRate, sessionUsage } from '../sessionUsage'
 import { inputTrigger } from '../inputTrigger'
 import { useFileCandidates, useSkillCandidates } from '../inputCandidates'
@@ -33,7 +32,7 @@ function ComposerView({ centered }: { centered: boolean }) {
   const imageInput = useImageInput(images => { if (draftKey !== null) appStore.setImages(draftKey, images, true) }, inputDisabled || !!pendingQuestion)
   const phase = selectedSessionPhase(state)
   const busy = phase === 'running' || phase === 'compacting' || phase === 'stopping'
-  const hasTurns = state.session?.facts.some(turn => turn.id !== null) ?? false
+  const hasTurns = (state.session?.facts.length ?? 0) > 0
   const [caret, setCaret] = useState(draft.length)
   const trigger = inputTrigger(draft, caret)
   const fileQuery = trigger?.kind === 'file' ? trigger.query : undefined
@@ -42,8 +41,8 @@ function ComposerView({ centered }: { centered: boolean }) {
   const files = useFileCandidates(fileQuery, state)
   const skills = useSkillCandidates(skillMenu, state)
   const candidates = skillMenu ? skills : files
-  const suggestions: { value: string; description: string; skill?: SkillMetadata }[] = skillMenu
-    ? (skills.status === 'ready' ? skills.result.skills : []).filter(skill => skill.name.startsWith(skillQuery)).map(skill => ({ value: skill.name, description: skill.description, skill }))
+  const suggestions: { value: string; description: string }[] = skillMenu
+    ? (skills.status === 'ready' ? skills.result.skills : []).filter(skill => skill.name.startsWith(skillQuery)).map(skill => ({ value: skill.name, description: skill.description }))
     : (files.status === 'ready' ? files.result : []).map(file => ({ value: file.path, description: '任务文件' }))
   const [suggestionIndex, setSuggestionIndex] = useState(0)
   const [suggestionsOpen, setSuggestionsOpen] = useState(true)
@@ -53,7 +52,8 @@ function ComposerView({ centered }: { centered: boolean }) {
   const candidateRetry = useRef<HTMLButtonElement>(null)
   const selectionGuard = useSelectionGuard()
   const sessionOrigin = actionOrigin.session(sessionId)
-  const occupancy = useMemo(() => contextOccupancy(state.session, state.bootstrap?.modelCatalog), [state.session, state.bootstrap?.modelCatalog])
+  const contextUsage = state.session?.runtime.contextUsage
+  const occupancy = contextUsage ? { ...contextUsage, percent: Math.min(100, Math.round(contextUsage.used / contextUsage.capacity * 100)) } : null
   const usage = useMemo(() => sessionUsage(state.session), [state.session])
   useEffect(() => {
     setCaret(textarea.current?.selectionStart ?? draft.length)
@@ -65,7 +65,7 @@ function ComposerView({ centered }: { centered: boolean }) {
     if (trigger === null) return
     const insertion = `${trigger.kind === 'skill' ? '/' : '@'}${candidate.value} `
     const position = trigger.start + insertion.length
-    appStore.setDraft(draft.slice(0, trigger.start) + insertion + draft.slice(trigger.end), candidate.skill)
+    appStore.setDraft(draft.slice(0, trigger.start) + insertion + draft.slice(trigger.end))
     setCaret(position)
     requestAnimationFrame(() => { textarea.current?.focus(); textarea.current?.setSelectionRange(position, position) })
     setSuggestionsOpen(false)

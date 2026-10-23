@@ -110,7 +110,7 @@ export function Settings() {
                       }}>
                         <span className="sg-row-identity">
                           <strong>{provider.displayName || provider.providerId}</strong>
-                          <span className={`sg-credential-dot sg-credential-dot-${provider.credentialConfigured ? 'configured' : 'missing'}`} role="img" aria-label={provider.credentialConfigured ? 'API 密钥已配置' : 'API 密钥缺失'} />
+                          <span className={`sg-credential-dot${provider.credentialConfigured ? ' sg-credential-dot-configured' : ''}`} role="img" aria-label={provider.credentialConfigured ? 'API 密钥已配置' : '未使用 API 密钥'} />
                         </span>
                         <ExpandChevron expanded={expanded} size={16} />
                       </button>
@@ -120,7 +120,7 @@ export function Settings() {
                     </div>
                     <Disclosure open={expanded}>
                       <div id={`provider-editor-${provider.providerId}`}>
-                        <ProviderEditor key={`${provider.providerId}:${editorVersion}`} state={state} provider={provider} onDone={() => setEditor(null)} />
+                        <ProviderEditor key={`${provider.providerId}:${editorVersion}`} state={state} provider={provider} active={state.settingsOpen && page === 'models' && expanded} onDone={() => setEditor(null)} />
                       </div>
                     </Disclosure>
                   </div>
@@ -131,7 +131,7 @@ export function Settings() {
             {editor !== 'new' ? <div className="sg-add-actions">
               <button type="button" className="sg-add-card-btn" disabled={unreadable || busy} onClick={() => openEditor('new')}>＋ 添加提供方</button>
             </div> : null}
-            <Disclosure open={editor === 'new'}><ProviderEditor key={editorVersion} state={state} onDone={() => setEditor(null)} /></Disclosure>
+            <Disclosure open={editor === 'new'}><ProviderEditor key={editorVersion} state={state} active={state.settingsOpen && page === 'models' && editor === 'new'} onDone={() => setEditor(null)} /></Disclosure>
           </section>
           <section className="sg-settings-page" aria-label="MCP 设置" hidden={page !== 'mcp'}>
             {state.settingsOpen && <McpSettings workspaceId={state.selectedWorkspaceId} active={page === 'mcp'} busy={mcpBusy} onBusyChange={setMcpBusy} />}

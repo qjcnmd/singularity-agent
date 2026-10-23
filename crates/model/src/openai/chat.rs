@@ -14,8 +14,8 @@ use crate::provider::ProviderStreamEvent;
 use crate::provider::contract::{provider_content_filter_error, provider_finish_network_error};
 use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
 use crate::types::{
-    ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelToolSchema, ModelTurnRequest,
-    ModelTurnResponse, ProviderReasoningReplay,
+    Message, ModelRole, ModelStopReason, ModelToolCall, ModelToolSchema, ModelTurnRequest, ModelTurnResponse,
+    ProviderMessageMetadata,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -27,7 +27,7 @@ pub(crate) fn openai_chat_stream_request_payload(
 ) -> Value {
     let mut payload = json!({
         "model": selection.model_name,
-        "messages": openai_messages(&request.messages, selection, provider_name, endpoint),
+        "messages": openai_messages(&request.messages, &request.images, selection, provider_name, endpoint),
         "stream": true,
         // provider 实现 OpenAI 兼容的 include_usage 扩展时会在最后一个流块带上 usage；
         // 不支持该扩展的 provider 照样返回合法响应，用量留空。
@@ -35,7 +35,7 @@ pub(crate) fn openai_chat_stream_request_payload(
     });
     let reasoning = super::reasoning_wire_decision(selection);
     // 输出上限用哪个字段名由模型配置决定，本层不猜；Responses 协议用 `max_output_tokens`。
-    payload[selection.chat_output_tokens_field] = json!(request.model_preferences.max_output_tokens);
+    payload[selection.chat_output_tokens_field] = json!(request.max_output_tokens);
     if let Some(enabled) = reasoning.enabled {
         apply_thinking_wire(&mut payload, enabled, selection.thinking_wire_format);
         if enabled && let Some(wire_effort) = reasoning.effort {
@@ -48,7 +48,7 @@ pub(crate) fn openai_chat_stream_request_payload(
     payload
 }
 
-/// 把思考开关落到 wire 上；具体形状由 provider 选定的 ThinkingWireFormat 决定。
+/// 按模型配置的 ThinkingWireFormat 写入思考开关字段。
 fn apply_thinking_wire(payload: &mut Value, enabled: bool, wire_format: ThinkingWireFormat) {
     match wire_format {
         ThinkingWireFormat::ThinkingType => {
@@ -65,15 +65,12 @@ fn apply_thinking_wire(payload: &mut Value, enabled: bool, wire_format: Thinking
     }
 }
 
-/// 在已知的兼容字段里只取第一个非空值，避免同一段增量被显示两次。
+/// 优先取第一个非空字段；全部为空时仍保留字段，供下一次请求原样续接。
 fn chat_reasoning_text(message: &serde_json::Map<String, Value>) -> Option<(&'static str, &str)> {
-    crate::types::CHAT_REASONING_FIELDS.iter().find_map(|field| {
-        message
-            .get(*field)
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .map(|text| (*field, text))
-    })
+    let mut fields = crate::types::CHAT_REASONING_FIELDS
+        .iter()
+        .filter_map(|field| message.get(*field).and_then(Value::as_str).map(|text| (*field, text)));
+    fields.clone().find(|(_, text)| !text.is_empty()).or_else(|| fields.next())
 }
 
 fn chat_reasoning_detail_text(detail: &serde_json::Map<String, Value>) -> Option<&str> {
@@ -96,7 +93,6 @@ fn provider_chat_finish_reason_unsupported(reason: &str) -> ProviderError {
     ProviderError::diagnostic(
         ModelErrorKind::JsonSchemaViolation,
         "provider Chat response reported an unsupported finish reason",
-        "chat_stream_malformed",
         vec![format!(
             "finish_reason={}",
             crate::error::bounded_provider_error_diagnostic(reason)
@@ -104,65 +100,71 @@ fn provider_chat_finish_reason_unsupported(reason: &str) -> ProviderError {
     )
 }
 
-/// 构造单条消息的 payload；私有续接材料的身份筛选见 super::reasoning_replay_for。
+/// 编码一条消息；是否附带提供方私有的思考数据见 super::message_metadata_for。
 fn openai_message_payload_with_reasoning(
-    message: &ModelMessage,
+    message: &Message,
+    images: &std::collections::HashMap<String, String>,
     selection: &SelectedModel,
     provider_name: &str,
     endpoint: &str,
 ) -> Value {
-    let role = if message.role == ModelRole::Developer {
+    let role = if message.role() == ModelRole::Developer {
         json!("system")
     } else {
-        json!(message.role)
+        json!(message.role())
     };
-    let content = openai_message_content(message);
+    let content = openai_message_content(message, images);
     let mut payload = json!({
         "role": role,
         "content": content,
     });
-    if let Some(tool_call_id) = &message.tool_call_id {
+    if let Some(tool_call_id) = message.tool_call_id() {
         payload["tool_call_id"] = json!(tool_call_id);
     }
-    if !message.tool_calls.is_empty() {
-        payload["tool_calls"] =
-            json!(message.tool_calls.iter().map(openai_tool_call_payload).collect::<Vec<_>>());
+    if message.tool_calls().next().is_some() {
+        payload["tool_calls"] = json!(message.tool_calls().map(openai_tool_call_payload).collect::<Vec<_>>());
     }
-    if let Some(ProviderReasoningReplay::Chat {
-        reasoning_content,
-        reasoning_field,
-        reasoning_details,
-        ..
-    }) = super::reasoning_replay_for(message, selection, provider_name, endpoint)
+    if let Some(ProviderMessageMetadata::Chat { reasoning_field, reasoning_details, .. }) =
+        super::message_metadata_for(message, selection, provider_name, endpoint)
     {
-        // 续接材料按形态择一发送：有 details 时不再重复发思考文本。
+        // 有 reasoning_details 时只发它，不再重复发思考文本。
         if !reasoning_details.is_empty() {
             payload["reasoning_details"] = json!(reasoning_details);
-        } else if !reasoning_content.is_empty() {
-            payload[reasoning_field] = json!(reasoning_content);
+        } else {
+            let thinking: String = message
+                .content()
+                .iter()
+                .filter_map(|block| match block {
+                    crate::ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                    _ => None,
+                })
+                .collect();
+            payload[reasoning_field] = json!(thinking);
         }
     }
     payload
 }
 
-fn openai_message_content(message: &ModelMessage) -> Value {
-    let text = &message.content;
-    if message.images.is_empty() || message.role == ModelRole::Tool {
+fn openai_message_content(message: &Message, images: &std::collections::HashMap<String, String>) -> Value {
+    let text = message.content_text();
+    if message.images().next().is_none() || message.role() == ModelRole::Tool {
         json!(text)
     } else {
         let mut content = vec![json!({"type": "text", "text": text})];
-        content.extend(message.images.iter().map(|image| {
+        content.extend(message.images().map(|image| {
             json!({
-                "type": "image_url", "image_url": {"url": image}
+                "type": "image_url", "image_url": {"url": images[&image.id]}
             })
         }));
         json!(content)
     }
 }
 
-// Chat 只接受文本工具结果；整批结果闭合后才发送视觉消息，避免拆开并行调用的配对。
+// Chat 的工具结果只能是文本；工具结果里的图片放到这批结果之后的一条用户消息里，
+// 避免插在一组并行调用的结果中间。
 fn openai_messages(
-    messages: &[ModelMessage],
+    messages: &[Message],
+    images_by_id: &std::collections::HashMap<String, String>,
     selection: &SelectedModel,
     provider_name: &str,
     endpoint: &str,
@@ -170,14 +172,20 @@ fn openai_messages(
     let mut result = Vec::new();
     let mut images = Vec::new();
     for message in messages {
-        if message.role != ModelRole::Tool && !images.is_empty() {
+        if message.role() != ModelRole::Tool && !images.is_empty() {
             result.push(json!({"role": "user", "content": std::mem::take(&mut images)}));
         }
-        result.push(openai_message_payload_with_reasoning(message, selection, provider_name, endpoint));
-        if message.role == ModelRole::Tool {
-            for image in &message.images {
-                images.push(json!({"type": "text", "text": format!("Image from tool call {}:", message.tool_call_id.as_deref().expect("tool result has its call ID"))}));
-                images.push(json!({"type": "image_url", "image_url": {"url": image}}));
+        result.push(openai_message_payload_with_reasoning(
+            message,
+            images_by_id,
+            selection,
+            provider_name,
+            endpoint,
+        ));
+        if message.role() == ModelRole::Tool {
+            for image in message.images() {
+                images.push(json!({"type": "text", "text": format!("Image from tool call {}:", message.tool_call_id().expect("tool result has its call ID"))}));
+                images.push(json!({"type": "image_url", "image_url": {"url": images_by_id[&image.id]}}));
             }
         }
     }

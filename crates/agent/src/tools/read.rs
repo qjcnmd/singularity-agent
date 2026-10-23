@@ -20,7 +20,6 @@ static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     )
 });
 const NAME: &str = "read";
-const SNIPPET: &str = "Read text files or view images";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,12 +29,11 @@ pub(crate) struct ReadArgs {
     pub(crate) limit: Option<u64>,
 }
 
-pub(crate) fn spec() -> super::registry::ToolSpec {
-    super::registry::ToolSpec {
-        name: NAME,
-        snippet: SNIPPET,
-        description: &DESCRIPTION,
-        parameters: json!({
+pub(crate) fn spec() -> singularity_model::ModelToolSchema {
+    singularity_model::ModelToolSchema {
+        name: NAME.to_string(),
+        description: DESCRIPTION.clone(),
+        parameters_schema: json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },

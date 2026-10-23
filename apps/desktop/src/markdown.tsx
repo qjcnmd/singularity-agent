@@ -1,7 +1,7 @@
 //! 正文渲染：Markdown（GFM、数学公式）与代码块布局。
 //!
-//! 会话条目显示模型正文，渲染规则由本模块统一提供。本模块只承载
-//! 共用渲染与代码块布局，不持有时间线条目的编排状态，代码高亮由 highlight 提供。
+//! 模型正文的 Markdown 渲染和代码块布局，各处共用。时间线条目的状态不在这里，
+//! 代码高亮在 highlight。
 
 import { isValidElement, memo, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { useReducedMotion } from 'motion/react'
@@ -73,7 +73,7 @@ function MarkdownTable({ children }: { children?: ReactNode }) {
 
 function MarkdownLink({ href, children }: { href?: string; children?: ReactNode }) {
   const selectionGuard = useSelectionGuard()
-  // 导航仍由 Chromium 按 a 的原生语义处理（含键盘与修饰键点击）；这里只拦下拖选后的误触。
+  // 打开链接仍由 Chromium 的原生行为处理（包括键盘和修饰键点击）；这里只拦下拖选文字后的误点。
   return <a href={href} target="_blank" rel="noreferrer" {...selectionGuard()}>{children}</a>
 }
 

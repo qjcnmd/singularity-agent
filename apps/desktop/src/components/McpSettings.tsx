@@ -1,11 +1,9 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { appStore } from '../appStore'
-import type { McpConnectionStatus, McpInspection, McpServerInput } from '../protocol'
+import type { McpConnectionStatus, McpServerInput, McpServerState } from '../protocol'
 import { Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
-
-type InspectionState = { loading: boolean; result?: McpInspection }
 
 const connectionLabels: Record<McpConnectionStatus, string> = {
   not_connected: '尚未连接', connecting: '连接中…', connected: '已连接', failed: '连接失败', disabled: '已关闭',
@@ -14,72 +12,84 @@ const connectionLabels: Record<McpConnectionStatus, string> = {
 export function McpSettings({ workspaceId, active, busy, onBusyChange }: {
   workspaceId: string | null; active: boolean; busy: boolean; onBusyChange: (busy: boolean) => void
 }) {
-  const [servers, setServers] = useState<McpServerInput[]>([])
+  const [servers, setServers] = useState<McpServerState[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [inspections, setInspections] = useState<Record<string, InspectionState>>({})
   const [expanded, setExpanded] = useState<string | null>(null)
   const [editor, setEditor] = useState<McpServerInput | 'new' | null>(null)
   const [removing, setRemoving] = useState<McpServerInput | null>(null)
   const revision = useRef(0)
 
-  const inspect = useCallback(async (serverId: string, reconnect = false, version = revision.current) => {
-    setInspections(current => ({ ...current, [serverId]: {
-      loading: true, result: reconnect ? undefined : current[serverId]?.result,
-    } }))
-    try {
-      const result = await appStore.transport.rpc('mcp.inspect', { serverId, workspaceId, reconnect })
-      if (revision.current === version) setInspections(current => ({ ...current, [serverId]: { loading: false, result } }))
-    } catch (error) {
-      if (revision.current === version) setInspections(current => ({ ...current, [serverId]: { loading: false, result: {
-        serverId, status: 'failed', error: error instanceof Error ? error.message : '读取 MCP 状态失败。', tools: [],
-      } } }))
-    }
-  }, [workspaceId])
-
   const load = useCallback(async () => {
     const version = ++revision.current
-    setLoading(true)
-    setError(null)
-    setInspections({})
     try {
-      const servers = await appStore.transport.rpc('mcp.list', {})
-      if (version !== revision.current) return
-      setServers(servers)
-      for (const server of servers) if (server.enabled) void inspect(server.serverId, false, version)
+      const servers = await appStore.transport.rpc('mcp.list', { workspaceId })
+      if (version === revision.current) setServers(servers)
     } catch (error) {
-      if (version === revision.current) setError(error instanceof Error ? error.message : '读取 MCP 配置失败。')
-    } finally {
-      if (version === revision.current) setLoading(false)
-    }
-  }, [inspect])
+      if (version === revision.current) {
+        setError(error instanceof Error ? error.message : '读取 MCP 配置失败。')
+      }
+    } finally { if (version === revision.current) setLoading(false) }
+  }, [workspaceId])
 
   useEffect(() => {
     if (!active) return
+    setLoading(true)
+    setError(null)
     void load()
     return () => { revision.current += 1 }
     // 进入 MCP 分类只读取状态；保持挂载让分类切换保留编辑草稿。
   }, [active, load])
 
   useEffect(() => {
-    if (!active) return
-    const connecting = Object.entries(inspections)
-      .filter(([, state]) => !state.loading && state.result?.status === 'connecting')
-    if (connecting.length === 0) return
-    // 只等正在建立的连接，不启动服务器，也不重叠发送状态查询。
+    if (!active || busy || loading || error) return
+    // 页面可见时持续读取后端状态；上次读取结束后再计时，不启动服务器。
     const timer = window.setTimeout(() => {
-      for (const [serverId] of connecting) void inspect(serverId)
+      void load()
     }, 1000)
     return () => window.clearTimeout(timer)
-  }, [active, inspections, inspect])
+  }, [active, busy, loading, error, servers, load])
 
-  async function mutate(action: () => Promise<unknown>) {
+  async function reconnect(serverId: string) {
+    const version = ++revision.current
+    setServers(current => current.map(state => state.server.serverId === serverId
+      ? { ...state, status: 'connecting', error: null, tools: [] } : state))
+    try {
+      const result = await appStore.transport.rpc('mcp.reconnect', { serverId, workspaceId })
+      if (revision.current === version) setServers(current => current.map(state => state.server.serverId === serverId ? result : state))
+    } catch (error) {
+      if (revision.current === version) setServers(current => current.map(state => state.server.serverId === serverId
+        ? { ...state, status: 'failed', error: error instanceof Error ? error.message : '连接 MCP 失败。', tools: [] } : state))
+    }
+  }
+
+  async function mutate(action: () => Promise<McpServerState[]>) {
     if (busy) return false
     onBusyChange(true)
     setError(null)
-    try { await action(); await load(); return true }
-    catch (error) { setError(error instanceof Error ? error.message : '保存 MCP 配置失败。'); return false }
+    const version = ++revision.current
+    try {
+      const servers = await action()
+      if (version !== revision.current) return false
+      setServers(servers)
+      setLoading(false)
+      return true
+    }
+    catch (error) {
+      if (version === revision.current) setError(error instanceof Error ? error.message : '保存 MCP 配置失败。')
+      return false
+    }
     finally { onBusyChange(false) }
+  }
+
+  async function retryLoad() {
+    if (busy) return
+    onBusyChange(true)
+    setLoading(true)
+    setError(null)
+    try {
+      await load()
+    } finally { onBusyChange(false) }
   }
 
   return <section className="mcp-settings" aria-labelledby="mcp-settings-title" aria-busy={loading}>
@@ -87,29 +97,28 @@ export function McpSettings({ workspaceId, active, busy, onBusyChange }: {
       <h3 id="mcp-settings-title">MCP</h3>
       <p>执行任务时自动连接，连接配置和开关在下次运行时更新。每轮运行读取当前指令和工具清单，轮内保持一致。</p>
     </header>
-    {error && editor === null && removing === null && <p role="alert" className="form-error">{error} <button type="button" className="quiet-button" disabled={busy} onClick={() => void load()}>重新读取</button></p>}
+    {error && editor === null && removing === null && <p role="alert" className="form-error">{error} <button type="button" className="quiet-button" disabled={busy || loading} onClick={() => void retryLoad()}>重新读取</button></p>}
     <div className="sg-provider-list">
-      {servers.map(server => {
-        const inspection = inspections[server.serverId]
-        const result = inspection?.result
+      {servers.map(result => {
+        const server = result.server
         const open = expanded === server.serverId
         return <div className="sg-row-card" key={server.serverId}>
           <div className="sg-row-head mcp-row-head">
             <button type="button" className="sg-provider-toggle" aria-expanded={open} aria-controls={`mcp-tools-${server.serverId}`} onClick={() => setExpanded(open ? null : server.serverId)}>
-              <span className="sg-row-identity"><strong>{server.serverId}</strong><span className="mcp-status">{!server.enabled ? '已关闭' : result?.status === 'connected' ? `${result.tools.length} 个工具` : result ? connectionLabels[result.status] : inspection?.loading ? '检查中…' : '尚未连接'}</span></span>
+              <span className="sg-row-identity"><strong>{server.serverId}</strong><span className="mcp-status">{result.status === 'connected' ? `${result.tools.length} 个工具` : connectionLabels[result.status]}</span></span>
               <ExpandChevron expanded={open} size={16} />
             </button>
             <span className="sg-row-actions">
-              <label className="mcp-switch"><input type="checkbox" role="switch" aria-label={`启用 MCP ${server.serverId}`} checked={server.enabled} disabled={busy || loading} onChange={event => { const enabled = event.target.checked; void mutate(() => appStore.transport.rpc('mcp.toggle', { serverId: server.serverId, enabled })) }} />启用</label>
-              <button type="button" className="quiet-button" disabled={busy} aria-label={`编辑 MCP ${server.serverId}`} onClick={() => { setError(null); setEditor(server) }}>编辑</button>
-              <button type="button" className="quiet-button danger" disabled={busy} aria-label={`删除 MCP ${server.serverId}`} onClick={() => { setError(null); setRemoving(server) }}>删除</button>
+              <label className="mcp-switch"><input type="checkbox" role="switch" aria-label={`启用 MCP ${server.serverId}`} checked={server.enabled} disabled={busy || loading} onChange={event => { const enabled = event.target.checked; void mutate(() => appStore.transport.rpc('mcp.toggle', { serverId: server.serverId, enabled, workspaceId })) }} />启用</label>
+              <button type="button" className="quiet-button" disabled={busy || loading} aria-label={`编辑 MCP ${server.serverId}`} onClick={() => { setError(null); setEditor(server) }}>编辑</button>
+              <button type="button" className="quiet-button danger" disabled={busy || loading} aria-label={`删除 MCP ${server.serverId}`} onClick={() => { setError(null); setRemoving(server) }}>删除</button>
             </span>
           </div>
           <Disclosure open={open}><div id={`mcp-tools-${server.serverId}`} className="mcp-tools">
             <p className="mcp-endpoint">{server.transport.type === 'stdio' ? `${server.transport.command} ${server.transport.args.join(' ')}` : server.transport.url}</p>
-            {result?.error && server.enabled && <p role="alert" className="form-error">{result.error}</p>}
-            {server.enabled && result?.status === 'failed' && <button type="button" className="secondary-button" disabled={busy} onClick={() => void inspect(server.serverId, true)}>重试连接</button>}
-            {result?.tools.map(tool => <div key={tool.name} className="mcp-tool"><strong>{tool.name}</strong><p>{tool.description}</p></div>)}
+            {result.error && server.enabled && <p role="alert" className="form-error">{result.error}</p>}
+            {server.enabled && result.status === 'failed' && <button type="button" className="secondary-button" disabled={busy || loading} onClick={() => void reconnect(server.serverId)}>重试连接</button>}
+            {result.tools.map(tool => <div key={tool.name} className="mcp-tool"><strong>{tool.name}</strong><p>{tool.description}</p></div>)}
           </div></Disclosure>
         </div>
       })}
@@ -119,15 +128,17 @@ export function McpSettings({ workspaceId, active, busy, onBusyChange }: {
     <Dialog open={editor !== null} onClose={() => { if (!busy) setEditor(null) }} labelledBy="mcp-editor-title">
       <header className="modal-header"><h2 id="mcp-editor-title">{editor === 'new' ? '添加 MCP' : '编辑 MCP'}</h2><button type="button" className="quiet-button" disabled={busy} onClick={() => setEditor(null)}>取消</button></header>
       {editor !== null && <McpEditor key={editor === 'new' ? 'new' : editor.serverId} server={editor === 'new' ? undefined : editor} busy={busy} error={error} onSave={async server => {
-        if (editor === 'new' && servers.some(current => current.serverId === server.serverId)) throw new Error('该 MCP 名称已存在，请编辑已有服务器。')
-        if (await mutate(() => appStore.transport.rpc('mcp.save', { server }))) setEditor(null)
+        if (editor === 'new' && servers.some(current => current.server.serverId === server.serverId)) throw new Error('该 MCP 名称已存在，请编辑已有服务器。')
+        if (await mutate(() => appStore.transport.rpc('mcp.save', { server, workspaceId }))) setEditor(null)
       }} />}
     </Dialog>
     <Dialog open={removing !== null} onClose={() => { if (!busy) setRemoving(null) }} labelledBy="mcp-remove-title" className="confirm-modal">
       <header className="modal-header"><h2 id="mcp-remove-title">删除 MCP</h2></header>
       <div className="confirm-body"><p>删除“{removing?.serverId}”的配置？</p>{error && <p role="alert" className="form-error">{error}</p>}<footer>
         <button type="button" className="secondary-button" disabled={busy} onClick={() => setRemoving(null)}>取消</button>
-        <button type="button" className="danger-button" disabled={busy} onClick={() => { if (removing) void mutate(() => appStore.transport.rpc('mcp.remove', { serverId: removing.serverId })).then(saved => { if (saved) setRemoving(null) }) }}>删除</button>
+        <button type="button" className="danger-button" disabled={busy} onClick={() => {
+          if (removing) void mutate(() => appStore.transport.rpc('mcp.remove', { serverId: removing.serverId, workspaceId })).then(saved => { if (saved) setRemoving(null) })
+        }}>删除</button>
       </footer></div>
     </Dialog>
   </section>

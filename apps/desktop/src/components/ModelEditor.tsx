@@ -69,6 +69,7 @@ export function ModelEditor({ index, initial, protocol, onConfirm, onClose, disc
     const current = ++revision.current
     setLoading(true)
     setFeedback(null)
+    setError(null)
     try {
       const found = (await discover()).find(model => model.modelId === id)
       if (current !== revision.current) return
@@ -76,14 +77,13 @@ export function ModelEditor({ index, initial, protocol, onConfirm, onClose, disc
         setFeedback('未获取模型参数')
         return
       }
-      setError(null)
       const previous = draftRef.current
       const next = fillDraft(previous, found, protocol)
       setDraft(next)
       setOptions(reasoningOptionsFor([...found.reasoningVariants, ...(next.reasoningVariants ?? [])], protocol))
       if (found.maxContextTokens === null && found.maxOutputTokens === null && found.reasoningVariants.length === 0) setFeedback('未获取模型参数')
-    } catch {
-      if (current === revision.current) setFeedback('未获取模型参数')
+    } catch (error) {
+      if (current === revision.current) setError(error instanceof Error ? error.message : String(error))
     } finally {
       if (current === revision.current) setLoading(false)
     }
@@ -131,7 +131,7 @@ export function ModelEditor({ index, initial, protocol, onConfirm, onClose, disc
             <input aria-label="最大输出 Token" className="sg-input" aria-required="true" value={draft.outputText} placeholder="例如 32K" onChange={event => patch({ outputText: event.target.value })} />
           </label></div>
           <ReasoningOptions options={options} selected={variants} onChange={reasoningVariants => patch({ reasoningVariants,
-            defaultVariant: reasoningVariants.some(variant => variant.id === draft.defaultVariant) ? draft.defaultVariant : null })} />
+            defaultVariant: reasoningVariants.some(variant => variant === draft.defaultVariant) ? draft.defaultVariant : null })} />
         </div>
         {error && <p className="form-error model-editor-error" role="alert">{error}</p>}
         <footer className="sg-editor-actions">

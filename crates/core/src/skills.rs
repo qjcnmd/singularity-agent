@@ -40,8 +40,7 @@ fn enabled() -> bool {
 }
 
 /// 发现阶段只读 frontmatter；正文由模型通过 read 读取。
-fn discover_skill(path: &Path) -> Result<Skill, String> {
-    let file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+fn discover_skill(path: &Path, file: fs::File) -> Result<Skill, String> {
     let mut lines = BufReader::new(file).lines();
     let first = lines
         .next()
@@ -108,7 +107,7 @@ impl SkillCatalog {
         catalog
     }
 
-    /// 按 roots 的先后顺序，发现平铺的 Markdown 文件或一层 bundle 目录。
+    /// 按 roots 的先后顺序，发现子目录中的 SKILL.md。
     fn from_roots(roots: &[PathBuf]) -> Self {
         let mut found = BTreeMap::new();
         let mut diagnostics = Vec::new();
@@ -130,19 +129,9 @@ impl SkillCatalog {
                         // 写进诊断。metadata 跟随符号链接，发现范围与 is_dir() 一致。
                         match path.metadata() {
                             Ok(metadata) if metadata.is_dir() => {
-                                let skill = path.join("SKILL.md");
-                                // SKILL.md 是可选的：确实不存在就安静跳过，其他 I/O 失败写进诊断。
-                                match skill.metadata() {
-                                    Ok(_) => paths.push(skill),
-                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                    Err(e) => diagnostics.push(format!("{}: {e}", skill.display())),
-                                }
+                                paths.push(path.join("SKILL.md"));
                             }
-                            Ok(_) => {
-                                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("md")) {
-                                    paths.push(path);
-                                }
-                            }
+                            Ok(_) => {}
                             Err(e) => diagnostics.push(format!("{}: {e}", path.display())),
                         }
                     }
@@ -151,7 +140,15 @@ impl SkillCatalog {
             }
             paths.sort();
             for path in paths {
-                match discover_skill(&path) {
+                let file = match fs::File::open(&path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        diagnostics.push(format!("{}: {error}", path.display()));
+                        continue;
+                    }
+                };
+                match discover_skill(&path, file) {
                     Ok(skill) => {
                         found.entry(skill.name.clone()).or_insert(skill);
                     }
@@ -165,12 +162,15 @@ impl SkillCatalog {
         }
     }
 
+    /// 实际向模型公布的技能；请求目录和运行状态使用同一个筛选规则。
+    pub fn model_skills(&self) -> impl Iterator<Item = &Skill> {
+        self.skills.iter().filter(|skill| !skill.disable_model_invocation)
+    }
+
     /// 列出名称、摘要和文件路径；完整指令由模型通过 read 工具加载。
     pub fn prompt(&self) -> String {
         let mut lines: Vec<_> = self
-            .skills
-            .iter()
-            .filter(|skill| !skill.disable_model_invocation)
+            .model_skills()
             .map(|s| format!("- {}: {} (path: {})", s.name, s.description, s.path.display()))
             .collect();
         if !lines.is_empty() {

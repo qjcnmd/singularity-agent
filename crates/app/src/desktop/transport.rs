@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use singularity_protocol::{RpcRequest, RpcResponse, StreamEvent};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -24,8 +24,10 @@ struct Response {
     response: RpcResponse,
 }
 
-pub async fn run(app: Arc<AppServer>) -> Result<(), String> {
-    let mut events = app.subscribe();
+pub async fn run(
+    app: Arc<AppServer>,
+    mut events: mpsc::UnboundedReceiver<singularity_protocol::StreamEnvelope>,
+) -> Result<(), String> {
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut output = tokio::io::stdout();
     let mut requests = JoinSet::new();
@@ -58,11 +60,7 @@ pub async fn run(app: Arc<AppServer>) -> Result<(), String> {
                     write(&mut output, &response).await?;
                 }
                 event = events.recv() => {
-                    let frame = match event {
-                        Ok(frame) => frame,
-                        Err(broadcast::error::RecvError::Lagged(_)) => app.frame(StreamEvent::ResyncRequired),
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    };
+                    let Some(frame) = event else { break };
                     write(&mut output, &frame).await?;
                 }
             }

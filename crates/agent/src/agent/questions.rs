@@ -1,4 +1,4 @@
-//! 一个活动回合的待答问题。请求只在内存中等待；问题与答案由既有工具调用/结果账本保存。
+//! 当前回合中等待用户回答的问题。等待只在内存中；问题和答案作为工具调用和工具结果写进日志。
 
 use std::sync::Mutex;
 
@@ -6,7 +6,7 @@ use singularity_protocol::{PendingQuestion, UserQuestionAnswer};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use super::AgentEvent;
+use super::TurnEvent;
 use crate::tools::{ABORTED_MESSAGE, ToolExecution, error_result};
 
 struct WaitingQuestion {
@@ -14,7 +14,7 @@ struct WaitingQuestion {
     reply: oneshot::Sender<Vec<UserQuestionAnswer>>,
 }
 
-/// 桌面回合控制面。一个独占工具调用最多等待一组问题。
+/// 一次最多等待一组问题；提问工具单独执行，不与其他工具并行。
 #[derive(Default)]
 pub struct UserQuestions {
     waiting: Mutex<Option<WaitingQuestion>>,
@@ -30,7 +30,7 @@ impl UserQuestions {
             .map(|waiting| waiting.request.clone())
     }
 
-    /// 校验界面提交的答案后交付一次；错误答案保留原问题供修正。
+    /// 检查界面提交的答案，通过后交给等待中的工具；不通过时问题保留，用户可以修改后重交。
     pub fn answer(&self, item_id: &str, answers: Vec<UserQuestionAnswer>) -> Result<(), String> {
         let mut slot = self.waiting.lock().expect("question lock poisoned");
         let waiting = slot
@@ -70,11 +70,11 @@ impl UserQuestions {
         &self,
         request: PendingQuestion,
         cancellation: &CancellationToken,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
+        on_event: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> ToolExecution {
         let (reply, receive) = oneshot::channel();
         *self.waiting.lock().expect("question lock poisoned") = Some(WaitingQuestion { request, reply });
-        on_event(AgentEvent::PendingQuestionChanged);
+        on_event(TurnEvent::SessionStateChanged {});
         let result = tokio::select! {
             biased;
             () = cancellation.cancelled() => error_result(ABORTED_MESSAGE),
@@ -83,7 +83,7 @@ impl UserQuestions {
             }).to_string()),
         };
         self.waiting.lock().expect("question lock poisoned").take();
-        on_event(AgentEvent::PendingQuestionChanged);
+        on_event(TurnEvent::SessionStateChanged {});
         result
     }
 }

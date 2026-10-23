@@ -1,4 +1,4 @@
-//! 可变会话的生命周期与追加管理。
+//! 会话日志的创建、打开和追加写入。
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -8,23 +8,22 @@ use std::sync::Arc;
 
 use singularity_core::now_iso;
 
-use crate::message::AgentMessage;
+use singularity_model::Message;
 
-use super::file::{ParsedSession, TailPolicy, parse_session_file, repair_tail};
+use super::file::{parse_session_file, repair_tail};
 use super::format::{
     CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError, SessionHeader, SessionMetadata,
 };
 
-/// JSONL 会话管理器。会话是严格的线性序列，entries 的物理顺序就是事实来源的顺序；
-/// 执行入口负责交接单个写者，turn 内通过 SessionWriter 串行追加。
+/// 可写的会话日志。记录按写入顺序排列，这个顺序就是事情发生的顺序；
+/// 一个会话只有一个 SessionManager，通过 SessionWriter 共享并按顺序追加。
 pub struct SessionManager {
     pub(super) data: SessionData,
+    /// 上一次追加失败的原因；之后拒绝写入，直到重新打开日志截掉残缺的末尾。
     append_error: Option<Arc<std::io::Error>>,
 }
 
-/// 已解析出来的会话事实。只读扫描与写者共用同一套解析、索引和投影，写入
-/// 能力只属于 SessionManager；只读打开已有会话不会修改文件。
-#[derive(Clone)]
+/// 解析后的会话内容。只读打开和写者共用这套解析结果；只读打开不会修改文件。
 pub struct SessionData {
     pub(super) file: PathBuf,
     pub(super) cwd: PathBuf,
@@ -60,12 +59,14 @@ impl std::fmt::Debug for SessionData {
 }
 
 impl SessionManager {
-    /// 当前已保存记录的不可变快照。
-    pub fn data_snapshot(&self) -> SessionData {
-        self.data.clone()
-    }
-    /// 新建会话：文件名与 header id 都用调用方指定的 UUID，创建时间在写入文件头时生成。
-    pub fn create_with_id(cwd: &Path, sessions_dir: &Path, session_id: &str) -> Result<Self> {
+    /// 新建会话日志：文件名和文件头里的 ID 都用调用方给的 UUID；文件已存在时报错，
+    /// 写入失败时删除文件。
+    pub fn create_with_id(
+        cwd: &Path,
+        sessions_dir: &Path,
+        session_id: &str,
+        selection: singularity_protocol::ModelSelection,
+    ) -> Result<Self> {
         let cwd = singularity_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
         let cwd_display = cwd.display().to_string();
         std::fs::create_dir_all(sessions_dir)?;
@@ -73,12 +74,26 @@ impl SessionManager {
         let header = SessionHeader::new(session_id.to_string(), cwd_display, now_iso());
         let mut header_bytes = serde_json::to_vec(&header)?;
         header_bytes.push(b'\n');
-        singularity_core::atomic_create_bytes(&file, &header_bytes)?;
+        let entries = vec![SessionEntry::Metadata {
+            id: super::new_entry_id(),
+            timestamp: header.timestamp.clone(),
+            metadata: SessionMetadata::ThreadSettings { selection },
+        }];
+        for entry in &entries {
+            serde_json::to_writer(&mut header_bytes, entry)?;
+            header_bytes.push(b'\n');
+        }
+        let mut handle = std::fs::File::create_new(&file)?;
+        if let Err(error) = handle.write_all(&header_bytes) {
+            drop(handle);
+            let _ = std::fs::remove_file(&file);
+            return Err(error.into());
+        }
         Ok(Self {
             data: SessionData {
                 file,
                 cwd: cwd.as_path().to_path_buf(),
-                entries: Vec::new(),
+                entries,
                 session_id: header.id,
                 header_timestamp: header.timestamp,
             },
@@ -86,25 +101,23 @@ impl SessionManager {
         })
     }
 
-    /// 打开既有会话，校验头部身份并清除未完成的尾行；完整记录保持原样。
-    /// 调用方须在执行入口持有该会话的写入所有权。
+    /// 以写入方式打开已有日志：检查文件头 ID，截掉没写完的最后一行，完整的记录不动。
+    /// 同一个日志同时只能有一个写者。
     pub fn open_existing(path: &Path, expected_id: &str) -> Result<Self> {
-        let file = path.to_path_buf();
-        let data = SessionData::open_parsed(&file, TailPolicy::RepairTail, Some(expected_id))?;
+        let (data, repair) = parse_session_file(path)?;
+        data.verify_session_id(expected_id)?;
+        if let Some(offset) = repair {
+            repair_tail(path, offset)?;
+        }
         Ok(Self { data, append_error: None })
     }
 }
 
 impl SessionData {
-    /// 图片快照与任务身份绑定，归档后仍使用同一个目录。
+    /// 这个任务的图片目录：`sessions/images/<任务 ID>`。
     pub fn image_directory(&self) -> PathBuf {
         let parent = self.file.parent().expect("session has a parent directory");
-        let root = if parent.file_name().is_some_and(|name| name == "archived") {
-            parent.parent().expect("archive belongs to sessions directory")
-        } else {
-            parent
-        };
-        root.join("images").join(&self.session_id)
+        parent.join("images").join(&self.session_id)
     }
 
     /// 只允许读取这份历史实际引用的图片，不接受任意文件路径。
@@ -116,43 +129,22 @@ impl SessionData {
                 SessionEntry::Message { message, .. } => Some(message),
                 _ => None,
             })
-            .flat_map(AgentMessage::images)
+            .flat_map(Message::images)
             .find(|image| image.id == image_id)
             .ok_or_else(|| SessionError::InvalidSession("图片不在该任务历史中。".into()))?;
         Ok(crate::image::load_image(&self.image_directory(), attachment)?)
     }
 
-    /// 为只读扫描（列表、摘要、分页投影）打开既有会话文件。
+    /// 只读打开日志，用于任务列表、预览和历史读取。
     ///
-    /// 只读取以换行符结束的完整记录，不写入。执行侧重开写者时
-    /// 修复未完成的尾行，模型上下文从已保存的记录派生。
+    /// 只读取以换行结束的完整记录，不修改文件；截掉残缺末尾由写者打开时负责。
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_parsed(path, TailPolicy::CompleteLines, None)
-    }
-
-    /// 两条打开路径共用解析与索引；写打开时修复尾行。
-    fn open_parsed(path: &Path, tail_policy: TailPolicy, expected_id: Option<&str>) -> Result<Self> {
-        let file = path.to_path_buf();
-        let ParsedSession { header, cwd, entries, repair } = parse_session_file(&file, tail_policy)?;
-        if let Some(expected_id) = expected_id {
-            verify_header_id(&header.id, expected_id)?;
-        }
-        if let Some((offset, add_newline)) = repair {
-            repair_tail(&file, offset, add_newline)?;
-        }
-        Ok(Self {
-            file,
-            cwd,
-            entries,
-            session_id: header.id,
-            header_timestamp: header.timestamp,
-        })
+        parse_session_file(path).map(|(data, _)| data)
     }
 }
 
 impl SessionManager {
-    /// 追加一条 compaction 条目并立即写盘（id 是预分配的：本次摘要 attempt 的
-    /// result_entry_id 就指向它）。返回已提交条目的时间。
+    /// 追加一条摘要记录，ID 使用压缩开始时分配给界面条目的 ID。返回保存时间。
     pub(crate) fn append_compaction_with_id(
         &mut self,
         id: &str,
@@ -165,7 +157,7 @@ impl SessionManager {
         })
     }
 
-    /// 追加一条不进入模型上下文的 metadata，返回实际保存的时间。
+    /// 追加一条任务设置（模型选择或名称），不进入模型上下文。返回保存时间。
     pub fn append_metadata(&mut self, metadata: SessionMetadata) -> Result<String> {
         self.append_entry(SessionEntry::Metadata {
             id: super::new_entry_id(),
@@ -174,28 +166,34 @@ impl SessionManager {
         })
     }
 
-    /// 追加一条 operation ledger 记录。记录本身就是持久事实，服务查看与统计，
-    /// 不进入模型上下文。返回实际保存的时间。
+    /// 追加一条执行记录（回合开始与结束、请求、后台命令等），用于显示和统计，
+    /// 不进入模型上下文。返回保存时间。
     pub fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
         self.append_record_with_id(super::new_entry_id(), record)
     }
 
-    /// 沿用执行器预分配的身份，让保存内容与实时反馈对应同一条目。
+    /// 使用事先分配的 ID 追加执行记录，保存的内容和实时显示的条目对应同一个 ID。
     pub(crate) fn append_record_with_id(&mut self, id: String, record: LedgerRecord) -> Result<String> {
         self.append_entry(SessionEntry::Record { id, timestamp: now_iso(), record })
     }
 
-    /// 追加执行器为本次回答或工具结果预分配身份的消息。
-    pub(crate) fn append_message_with_id(&mut self, id: &str, message: AgentMessage) -> Result<String> {
+    /// 使用事先分配的 ID 追加一条消息（回复、用户输入或工具结果）。
+    pub(crate) fn append_message_with_id(
+        &mut self,
+        id: &str,
+        message: Message,
+        observation: Option<singularity_protocol::RequestObservation>,
+    ) -> Result<String> {
         self.append_entry(SessionEntry::Message {
             id: id.to_string(),
             timestamp: now_iso(),
             message,
+            observation,
         })
     }
 
     pub(super) fn append_entry(&mut self, entry: SessionEntry) -> Result<String> {
-        // 上次追加已经失败：文件尾部可能残缺，重开修复前不再接受任何写入。
+        // 上次追加失败，文件末尾可能有半行；重新打开截掉之前不再写入。
         if let Some(error) = &self.append_error {
             return Err(SessionError::Io(std::io::Error::new(
                 error.kind(),
@@ -212,8 +210,7 @@ impl SessionManager {
     }
 
     fn write_append(&mut self, handle: &mut impl Write, bytes: &[u8]) -> Result<()> {
-        // 写入失败可能在文件尾部留下半行 JSONL。这一行原样保留，交给现有的重开
-        // 修复路径处理，不往它后面再追加任何记录。
+        // 写入失败可能留下半行。这半行留给下次打开时截掉，在那之前不再追加。
         let result = handle
             .write_all(bytes)
             .and_then(|()| handle.write_all(b"\n"))
@@ -227,50 +224,45 @@ impl SessionManager {
 }
 
 impl SessionData {
-    /// 会话日志路径，供读取错误定位文件。
+    /// 会话日志路径，用于错误信息。
     pub fn path(&self) -> &Path {
         &self.file
     }
 
-    /// 会话头部声明的稳定身份，即会话 id。
+    /// 文件头里的会话 ID。
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
-    /// 校验会话头部 id 与请求方声明的是否一致；不一致就属于损坏状态。
+    /// 检查文件头里的 ID 与文件名是否一致；不一致说明文件损坏或被改名。
     pub fn verify_session_id(&self, expected: &str) -> Result<()> {
-        verify_header_id(self.session_id(), expected)
+        if self.session_id() == expected {
+            Ok(())
+        } else {
+            Err(SessionError::InvalidHeader(format!(
+                "rollout header id {} does not match expected id {expected}",
+                self.session_id()
+            )))
+        }
     }
 
-    /// header 里的时间戳，是重建索引时权威的创建时间。
+    /// 文件头里的创建时间。
     pub fn created_at(&self) -> &str {
         &self.header_timestamp
     }
 
-    /// 会话头部声明的规范工作目录（已归一化）。
+    /// 任务的工作目录（规范化后的绝对路径）。
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
 
-    /// 工作目录归一化后的显示路径，Thread 投影、摘要与系统提示词共用。
-    /// 修复写回用的是解析时的原始 header，不受这里显示转换的影响。
+    /// 工作目录的显示形式（去掉 Windows 长路径前缀），任务信息、列表和提示词共用。
     pub fn cwd_string(&self) -> String {
         singularity_core::display_path(&self.cwd)
     }
 
-    /// 已解析的条目，按落盘顺序排列。
+    /// 解析出的记录，按写入顺序排列。
     pub fn entries(&self) -> &[SessionEntry] {
         &self.entries
-    }
-}
-
-/// 头部身份与期望 id 是否一致的规则；打开和只读校验共用这一处判定。
-fn verify_header_id(actual: &str, expected: &str) -> Result<()> {
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(SessionError::InvalidHeader(format!(
-            "rollout header id {actual} does not match expected id {expected}"
-        )))
     }
 }

@@ -10,8 +10,8 @@ if (root === null) {
   throw new Error('Singularity app root is missing')
 }
 
-// CSS 的 disclosure 与 JS 高度动画共用 motion.ts 的时序：数值在这里派生一次，
-// 写入 documentElement 后由同名变量消费。
+// CSS 的折叠动效和 JS 的高度动画共用 motion.ts 的时长：在这里写入 documentElement 的
+// CSS 变量，样式表通过同名变量读取。
 for (const [property, value] of Object.entries(disclosureCssVariables)) {
   document.documentElement.style.setProperty(property, value)
 }

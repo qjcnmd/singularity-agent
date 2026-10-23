@@ -1,9 +1,9 @@
-//! 公共协议对象：历史投影、会话摘要和 turn 合同。
+//! 前后端共用的历史、任务摘要、回合和用量类型。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// 这次 provider 请求的发起原因；摘要请求和生成请求共用同一套计量。
+/// 请求的用途：普通生成或压缩摘要；两者的用量都计入会话合计。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -12,28 +12,25 @@ pub enum RequestPurpose {
     Compaction,
 }
 
-/// 提供方单次请求上报的真实 Token 数与缓存计数。
+/// 提供方为一次请求上报的 Token 数和缓存命中数。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    /// 供应商上报总量，缺失时由协议解析器将输入输出相加得到。
+    /// 提供方上报的总数；没有上报时取输入与输出之和。
     pub total_tokens: u64,
     /// None 为未上报；Some(0) 为明确上报零缓存用量。
     pub cached_input_tokens: Option<u64>,
 }
 
-/// 请求用量与结果：持久化会话和实时 provider/attempt 事件共用。
-/// 请求本身与 provider 无关；鉴权信息和私有的重放数据都不在这里。
+/// 一次请求尝试的结果、耗时和用量；保存到日志后由后端统计。
+/// 不含密钥或提供方私有数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestObservation {
-    /// 查找请求详情并配对开始、结束观测的键；每次 provider attempt 生成一个，
-    /// 与 assistant 或 compaction 的会话条目身份无关。
-    pub request_id: String,
     pub purpose: RequestPurpose,
     pub provider: String,
     pub model: String,
@@ -51,18 +48,18 @@ pub struct RequestObservation {
     pub usage: Option<ModelUsage>,
 }
 
-/// read 工具真实读到的源文件范围：只有实际起始行和正文行数，不含正文本身。
+/// read 工具实际读到的行范围：起始行号和正文行数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ReadSource {
-    /// 实际读到的首个源文件行号；offset 省略或为 0 时规范化为 1。
+    /// 第一行的行号；offset 省略或为 0 时是 1。
     pub start_line: u64,
-    /// 正文行数；分页续读和超长单行的说明都不计入。
+    /// 正文行数，不含末尾的续读和超长行说明。
     pub line_count: u64,
 }
 
-/// 工具已经保存的结果；历史条目把它与调用放在一起，未完成时为空。
+/// 工具的结果，放在对应的工具条目里；工具还没结束时为空。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -83,7 +80,7 @@ pub struct ToolResult {
     pub duration_ms: Option<u64>,
 }
 
-/// 历史中可展示为消息的角色；工具调用和请求各有独立条目。
+/// 历史中可展示为消息的角色；工具调用单独显示。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -95,23 +92,13 @@ pub enum HistoryMessageRole {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
-/// 对外公开的历史 item：只带展示需要的字段，不含 provider 的私有重放材料。
+/// 工作台显示的一条历史：只含显示需要的字段，不含提供方私有的续接数据。
 ///
-/// 一个 turn 的状态和身份归 ThreadTurn 所有，轮内的条目不重复承载同一份事实。
+/// 回合的 ID 和状态保存在 ThreadTurn 上，条目里不重复。
 pub enum HistoryItem {
-    /// 请求状态与计量，身份来自 request_id。
-    Request {
-        observation: RequestObservation,
-    },
-    /// 本轮实际注入的内容。
-    Context {
-        id: String,
-        name: String,
-        content: String,
-    },
     Message {
         id: String,
-        running: bool,
+        status: TurnStatus,
         role: HistoryMessageRole,
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -123,27 +110,21 @@ pub enum HistoryItem {
     },
     Thinking {
         id: String,
-        running: bool,
+        status: TurnStatus,
         text: String,
     },
     Tool {
         id: String,
-        running: bool,
+        status: ToolStatus,
         name: String,
         args: Value,
         result: Option<ToolResult>,
-    },
-    Settings {
-        id: String,
-        provider: String,
-        model: String,
-        reasoning: Option<String>,
     },
     Compaction {
         id: String,
         summary: String,
     },
-    /// 压缩的开始、失败、中断或无需压缩结果；成功摘要使用 Compaction 条目。
+    /// 压缩进行中、失败、中断或无需压缩；成功的摘要用 Compaction 条目。
     CompactionResult {
         id: String,
         status: TurnStatus,
@@ -152,15 +133,12 @@ pub enum HistoryItem {
 }
 
 impl HistoryItem {
-    /// 公开 history item 的稳定 id；请求条目的身份是它所观测的 request id。
+    /// 条目 ID。
     pub fn id(&self) -> &str {
         match self {
-            Self::Request { observation, .. } => &observation.request_id,
-            Self::Context { id, .. }
-            | Self::Message { id, .. }
+            Self::Message { id, .. }
             | Self::Thinking { id, .. }
             | Self::Tool { id, .. }
-            | Self::Settings { id, .. }
             | Self::Compaction { id, .. }
             | Self::CompactionResult { id, .. } => id,
         }
@@ -170,7 +148,7 @@ impl HistoryItem {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-/// 公开历史中的单回合；`turn_id` 为 None 表示首个回合之前的前导条目。
+/// 从回合开始记录起生成的历史；初始设置不构成回合。
 pub struct ThreadTurn {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
@@ -178,9 +156,9 @@ pub struct ThreadTurn {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub finished_at: Option<String>,
-    pub turn_id: Option<String>,
+    pub turn_id: String,
     pub status: Option<TurnStatus>,
-    /// 中断是否来自用户主动停止；未完成的历史操作为 false。
+    /// 中断是否由用户停止；没有结束记录的回合为 false。
     pub manually_stopped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
@@ -188,33 +166,32 @@ pub struct ThreadTurn {
     pub items: Vec<HistoryItem>,
 }
 
-/// 持久化 thread（即 session）的公开摘要。
+/// 任务的 ID、工作目录和当前模型选择。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Thread {
     pub thread_id: String,
-    pub model: Option<String>,
+    pub model: crate::ModelSelection,
     pub cwd: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-/// 持久化 turn 的公开摘要。
+/// 回合的 ID 和状态。
 pub struct Turn {
     pub turn_id: String,
     pub status: TurnStatus,
 }
 
-/// 整份账本里 provider 请求观测的合计，供工作台展示成本和速度。
+/// 整个会话的模型请求合计，供工作台显示成本和速度。
 ///
-/// requestId 每次 attempt 各生成一个，按它归并同一请求的 started 与终态观测（取末次），
-/// 重试计入合计，该规则与工作台历史的请求投影一致。TTFT 只统计有实测计时的请求，token
-/// 与消费只统计上报了 usage 的请求，跨轮累计输入、输出和耗时。
+/// 每次请求尝试计一次，重试也计入，与日志中的请求记录一致。首 Token 耗时只统计
+/// 实际测到的请求，Token 数只统计上报了用量的请求。
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionModelUsage {
-    /// 有首 token 计时的请求：等待耗时合计与样本数，用于计算 TTFT；不依赖 usage 上报。
+    /// 测到首 Token 耗时的请求的耗时合计和请求数，用于计算平均首 Token 耗时；与是否上报用量无关。
     pub ttft_ms: u64,
     pub ttft_requests: u64,
     /// 输入合计（包含命中缓存的那部分）。
@@ -223,14 +200,14 @@ pub struct SessionModelUsage {
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
-    /// 同时具有生成耗时和输出计数的样本，用于计算 TPS。
+    /// 同时有生成耗时和输出 Token 数的请求的合计，用于计算每秒输出 Token 数。
     pub decode_tokens: u64,
     pub decode_ms: u64,
     /// 计入合计的请求是否都明确报告了缓存输入用量。
     pub cache_usage_complete: bool,
     /// 计入统计的请求耗时合计（毫秒），含等待首个 token。
     pub generation_ms: u64,
-    /// 是否有请求报告了 usage；为 false 时 token 计数不含任何真实消费。
+    /// 是否有请求上报了用量；为 false 时 Token 数都是 0，不代表没有消耗。
     pub usage_present: bool,
 }
 
@@ -239,6 +216,18 @@ pub struct SessionModelUsage {
 #[serde(rename_all = "snake_case")]
 /// 回合生命周期状态。
 pub enum TurnStatus {
+    Running,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+/// 工具调用的状态；收到调用后先排队，实际开始执行时才进入 Running。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStatus {
+    Pending,
     Running,
     Completed,
     Failed,

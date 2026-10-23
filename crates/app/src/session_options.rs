@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::runtime::{SESSIONS_DIR_NAME, ThreadCatalog};
 use singularity_model::ModelConfigManager;
-use singularity_runtime::{SESSIONS_DIR_NAME, ThreadCatalog, TurnRunner};
 
 use crate::desktop::AppServer;
 use crate::desktop::workspace_store::WorkspaceStore;
@@ -32,13 +32,18 @@ pub fn lock_data_directory() -> Result<(PathBuf, std::fs::File), String> {
 }
 
 /// 装配工作台共享组件，直接交给应用服务持有。
-pub fn prepare_desktop(home: &Path) -> Result<Arc<AppServer>, String> {
+pub fn prepare_desktop(
+    home: &Path,
+) -> Result<
+    (Arc<AppServer>, tokio::sync::mpsc::UnboundedReceiver<singularity_protocol::StreamEnvelope>),
+    String,
+> {
     let sessions_dir = home.join(SESSIONS_DIR_NAME);
     singularity_core::create_data_dir(&sessions_dir)?;
     let models = Arc::new(ModelConfigManager::open(home.to_path_buf()));
     let mcp = Arc::new(singularity_mcp::McpManager::open(home.to_path_buf()));
-    let runner = Arc::new(TurnRunner::new(sessions_dir.clone(), Arc::clone(&models), Arc::clone(&mcp)));
     let catalog = ThreadCatalog::new(sessions_dir);
     let workspaces = WorkspaceStore::open(home)?;
-    Ok(AppServer::new(runner, catalog, workspaces, models, mcp, home.to_path_buf()))
+    let (stream, events) = tokio::sync::mpsc::unbounded_channel();
+    Ok((AppServer::new(catalog, workspaces, models, mcp, home.to_path_buf(), stream), events))
 }

@@ -1,24 +1,22 @@
-import type { FactStatus } from './execution'
-import type { SessionPhase, TurnStatus, Workspace } from './protocol'
+import type { SessionPhase, ToolStatus, TurnStatus, Workspace } from './protocol'
 
 /** 项目路径由后端统一为正斜杠；盘符根目录直接显示完整路径。 */
 export function workspaceName(workspace: Workspace): string {
   return workspace.root.slice(workspace.root.lastIndexOf('/') + 1) || workspace.root
 }
 
-/// 执行事实状态的统一词表：会话显示共用一份。展示差异（例如时间线不显示
-/// stable 标签）由各组件自己决定，不通过复制整张映射实现。
-export const factStatusText: Record<FactStatus, string> = {
-  stable: '已记录',
+/** 直接显示协议状态；已保存的摘要没有执行状态。 */
+export const factStatusText: Record<ToolStatus | TurnStatus | 'recorded', string> = {
+  recorded: '已记录',
+  pending: '等待执行',
   running: '进行中',
-  ok: '已完成',
-  error: '失败',
-  cancelled: '已停止',
+  completed: '已完成',
+  failed: '失败',
+  interrupted: '已停止',
 }
 
 export const phaseText: Record<SessionPhase, string> = {
   idle: '就绪',
-  reserved: '正在启动',
   running: '正在运行',
   compacting: '正在压缩上下文',
   stopping: '正在停止',
@@ -33,10 +31,9 @@ export const turnStatusText: Record<TurnStatus, string> = {
 
 /** 用户停止与异常中断共用同一判断，正文和侧栏不能各自推断来源。 */
 export function interruptionText(manuallyStopped: boolean): string {
-  return manuallyStopped ? factStatusText.cancelled : '任务异常中断'
+  return manuallyStopped ? factStatusText.interrupted : '任务异常中断'
 }
 
-export const compactionTitle = '上下文压缩'
 export const compactionText = {
   running: '正在压缩上下文…',
   completed: '上下文已压缩',

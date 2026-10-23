@@ -20,8 +20,8 @@ singularity_core = { path = "../core" }
 singularity_model = { path = "../model" }
 singularity_mcp = { path = "../mcp" }
 singularity_protocol = { path = "../protocol" }
-singularity_runtime = { path = "../runtime" }
+singularity_agent = { path = "../agent" }
 thiserror.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v7"] }
 tokio.workspace = true
 tokio-util.workspace = true

@@ -14,8 +14,7 @@ const emptyTasks: BackgroundTask[] = []
 function selectedTasks(state: BackgroundState): BackgroundTask[] {
   const id = state.selectedSessionId
   if (id === null) return emptyTasks
-  return state.session?.summary.threadId === id ? state.session.runtime.backgroundTasks
-    : state.liveSessions[id]?.backgroundTasks ?? emptyTasks
+  return state.liveSessions[id]?.backgroundTasks ?? emptyTasks
 }
 
 export const BackgroundTasksButton = memo(function BackgroundTasksButton({ onOpen }: { onOpen: (button: HTMLButtonElement) => void }) {

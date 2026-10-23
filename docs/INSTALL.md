@@ -58,12 +58,14 @@ npm --prefix apps/desktop run package
 
 ### 配置文件示例
 
+默认模型只用于空白页的初始选择；首次发送保存该任务的模型，之后沿用它或在任务内切换。
+
 模型容量可通过“获取模型参数”读取提供方返回的值；提供方未返回时手动填写。工作台用档位按钮配置可用思考程度，使用时在模型选择器中切换；`default_variant` 可省略，已有配置中的默认档位仍然有效。
 
 `~/.singularity/config.json`：
 ```json
 {
-  "default_model": "deepseek/deepseek-chat",
+  "default_model": { "provider": "deepseek", "model": "deepseek-chat", "reasoning": null },
   "providers": {
     "deepseek": {
       "api_key": "sk-your-api-key-here",
@@ -78,9 +80,7 @@ npm --prefix apps/desktop run package
           "max_context_tokens": 128000,
           "max_output_tokens": 8192,
           "default_variant": "high",
-          "reasoning_variants": {
-            "high": { "wire_effort": "high" }
-          }
+          "reasoning_variants": ["high"]
         }
       }
     }
@@ -88,11 +88,13 @@ npm --prefix apps/desktop run package
 }
 ```
 
+`reasoning_variants` 直接填写提供方接受的档位名称，例如 `["off", "low", "high"]`。仅支持开关的 Chat 模型可填写 `["off", "on"]`。
+
 ### `base_url` 规范与常见厂商示例
 
 `api_protocol` 必须在提供方上设置为 `chat` 或 `responses`，该提供方的所有模型统一使用它。模型配置不包含协议字段。
 
-系统会自动从 `base_url` 拼接 `/chat/completions`、`/responses` 或 `/models`。请确保 `base_url` 填写至包含版本号的 API 根路径：
+系统会在 `base_url` 后追加 `/chat/completions`、`/responses` 或 `/models`。请填写 API 根地址，按服务商要求保留版本号和自定义路径，不填写完整接口地址：
 
 | 提供方 | 推荐 `base_url` | 协议类型 (`api_protocol`) |
 | --- | --- | --- |
@@ -109,7 +111,6 @@ npm --prefix apps/desktop run package
 | 字段 | 默认值 | 作用说明 |
 | --- | --- | --- |
 | `thinking_wire_format` | `reasoning_effort` | 思考模式字段：`reasoning_effort`、`thinking_type` (Anthropic 风格) 或 `enable_thinking` (布尔值) |
-| `requires_reasoning_content_for_tool_calls` | `false` | 端点是否强制要求在工具响应中回传推理上下文（续接数据） |
 | `chat_output_tokens_field` | `max_tokens` | Chat 协议指定输出上限的字段名，可切换为 `max_completion_tokens` |
 
 ---
@@ -142,8 +143,8 @@ npm --prefix apps/desktop run package
 ```
 
 - **可省略字段**：参数 `args`、额外环境变量 `env` 和请求头 `headers` 省略时按空值读取；工作目录 `cwd` 省略时使用任务的项目目录。设置接口与文件使用相同规则。
-- **生效时机**：连接配置和开关在下次运行任务时更新。模型收到的工具清单与项目指令一起加载：每轮运行时加载，轮内保持一致。
-- **连接状态**：打开设置只查看已有状态。任务准备时复用健康连接和最近一次成功工具目录；首连、断线重连、目录读取失败后的下次准备时重新获取目录。失败时可点击“重试连接”重建连接并获取目录。服务器在连接健康时移除工具，普通回合可能继续使用旧目录，由服务器在调用时返回失败；调用不会自动重复执行。
+- **生效时机**：配置和开关在下一轮任务开始时生效。工具清单与项目指令一起在每轮开始时加载，同一轮内不变。
+- **连接状态**：打开设置只查看已有状态，不会主动连接。每轮开始时复用正常的连接并重新获取工具列表，服务器更新工具后下一轮生效。连接失败时可点击“重试连接”。工具在一轮中途被服务器移除时，调用会直接失败，不会自动重试。
 - **环境要求**：本地 stdio 服务需要在系统 PATH 中安装对应的运行环境（如 Node.js 或 Python）。
 
 ---
@@ -151,12 +152,14 @@ npm --prefix apps/desktop run package
 ## 5. 项目指令与技能 (Skills)
 
 ### 项目指令 (`AGENTS.md`)
-Agent 每轮运行时读取当前项目指令，轮内保持一致；压缩只更新摘要。读取按层级自顶向下合并（单文件最大 32 KiB，总计最大 64 KiB）：
+Agent 在每轮开始时完整读取指令，同一轮内不变，压缩不会重新读取。按以下顺序合并，越靠后越具体：
 1. 用户全局指令：`~/.singularity/AGENTS.md`
-2. 项目各级指令：从任务工作目录向上递归查找至 Git 根目录下的 `AGENTS.md`
+2. 项目指令：从项目根目录（含 `.git` 的目录；找不到时就是任务目录）逐级到任务目录，每一级的 `AGENTS.md`
 
 ### 技能目录 (Skills)
-在输入框输入 `/` 可触发技能候选项。技能为包含 YAML Frontmatter 的 Markdown 文件：
+在输入框开头或空白后输入 `/` 可触发技能候选项，也可直接键入完整名称。正文中的引用同样生效，多个技能用空白分隔，例如 `使用 /code-review /find-simplifications 审查项目`。发送时按当前项目的技能目录，把可由用户调用的 `/技能名` 替换为 `read 技能文件的绝对路径`；界面和草稿保留原文，正文由模型通过 read 工具读取。未知名称、路径以及紧贴标点的 `/技能名，`、`(/技能名)` 都保留原文；`/a/b` 不表示两个技能。
+
+每个技能放在独立子目录，以 `SKILL.md` 为入口，例如 `.agents/skills/code-review/SKILL.md`；只扫描这一层子目录。入口包含 YAML Frontmatter：
 
 ```markdown
 ---
@@ -178,7 +181,7 @@ description: 审查代码改动并生成专业建议
 
 系统所有配置、凭据与任务会话集中存储于数据根目录：
 - **默认路径**：`%USERPROFILE%\.singularity`
-- **自定义路径**：设置系统环境变量 `SINGULARITY_HOME` 为指定的绝对路径。
+- **自定义路径**：设置系统环境变量 `SINGULARITY_HOME` 为指定的绝对路径；未设置或只含空白时使用默认目录。
 
 ### 目录结构
 
@@ -186,9 +189,8 @@ description: 审查代码改动并生成专业建议
 | --- | --- |
 | `config.json` | 模型提供方配置、API Key、模型元数据与默认模型选择 |
 | `mcp.json` | MCP 服务器列表、环境变量与开关状态 |
-| `workspaces.json` | 已打开项目的目录与历史登记 |
-| `sessions/<id>.jsonl` | 活跃任务的完整执行历史与事件记录（当前格式为 v1） |
-| `sessions/archived/` | 已归档任务的会话文件 |
+| `workspaces.json` | 已添加的项目及其目录 |
+| `sessions/<id>.jsonl` | 每个任务的完整历史（当前格式为 v1） |
 | `sessions/images/` | 会话中发送或读取的图片快照文件 |
 | `skills/` | 用户级全局技能脚本与说明 |
 
@@ -196,6 +198,4 @@ description: 审查代码改动并生成专业建议
 - **备份**：退出所有 Singularity 进程后，直接复制整份 `.singularity` 目录即可完成备份。
 - **卸载**：直接删除应用解压目录即可；用户数据目录（`.singularity`）默认保留，如需清理请手动删除。
 
-Chat 请求统一使用 system 指令角色；自动选择工具使用协议默认值，工具调用消息的空正文发送空字符串。
-
-开发阶段修改会话格式后，退出应用并清空数据目录中的 `sessions/`，包括归档与附件，再启动新版。模型配置和项目登记独立保存。
+开发阶段修改会话格式后，退出应用并清空数据目录中的 `sessions/`，包括附件，再启动新版。模型配置和项目登记独立保存。

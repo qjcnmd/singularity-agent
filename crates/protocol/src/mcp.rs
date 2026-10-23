@@ -35,10 +35,20 @@ pub struct McpServerInput {
     pub transport: McpTransportConfig,
 }
 
+/// 按项目目录读取配置和已有连接状态。
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct McpListParams {
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
 pub struct McpSaveParams {
     pub server: McpServerInput,
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +56,7 @@ pub struct McpSaveParams {
 #[serde(rename_all = "camelCase")]
 pub struct McpServerParams {
     pub server_id: String,
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,15 +65,7 @@ pub struct McpServerParams {
 pub struct McpToggleParams {
     pub server_id: String,
     pub enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct McpInspectParams {
-    pub server_id: String,
     pub workspace_id: Option<String>,
-    pub reconnect: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,8 +91,9 @@ pub enum McpConnectionStatus {
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-pub struct McpInspection {
-    pub server_id: String,
+/// 一台服务器的配置、当前连接状态和最近发现的工具。
+pub struct McpServerState {
+    pub server: McpServerInput,
     pub status: McpConnectionStatus,
     pub error: Option<String>,
     pub tools: Vec<McpToolInfo>,

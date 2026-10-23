@@ -4,7 +4,7 @@ import type { SessionModelUsage } from './protocol'
 /** 后端统一累计历史和活动请求；没有用量或计时样本时不显示统计。 */
 export function sessionUsage(session: SessionView | null): SessionModelUsage | null {
   if (session === null) return null
-  const usage = session.runtime.usage ?? session.summary.usage
+  const usage = session.runtime.usage
   return usage.usagePresent || usage.ttftRequests > 0 ? usage : null
 }
 

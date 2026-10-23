@@ -26,7 +26,7 @@ pub struct UserQuestion {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PendingQuestion {
-    /// 工具条目身份；用于拒绝已经结束或属于另一轮的问题答案。
+    /// 提问工具的条目 ID；用于拒绝已经结束或属于其他回合的问题的答案。
     pub item_id: String,
     pub questions: Vec<UserQuestion>,
 }

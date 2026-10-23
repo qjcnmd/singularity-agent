@@ -30,7 +30,7 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
   if (item.kind === 'duration') return <TurnDuration itemKey={item.key} {...item.timing} />
 
   if (item.kind === 'terminal') {
-    if (timelineStatus(item) === 'error') return <div className="turn-error" data-item-id={item.key} role="alert">
+    if (timelineStatus(item) === 'failed') return <div className="turn-error" data-item-id={item.key} role="alert">
       <CircleAlert size={15} strokeWidth={1.6} aria-hidden="true" /><span>{item.summary}</span>
     </div>
     return <span className="stopped-marker" data-item-id={item.key}>{item.title}</span>
@@ -45,7 +45,7 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
         aria-label={`${item.title}，${factStatusText[timelineStatus(item)]}`}
       >
         <div className="timeline-body message-body">{item.kind === 'user' ? <div className="user-text">{body}</div> : <MarkdownBody text={body} streaming={timelineStatus(item) === 'running'} />}</div>
-        {sessionId && item.fact?.images && <AttachedImages sessionId={sessionId} images={item.fact.images} />}
+        {sessionId && item.fact?.type === 'message' && item.fact.images && <AttachedImages sessionId={sessionId} images={item.fact.images} />}
         {canCollapse && (
           <button type="button" className="expand-button" aria-expanded={expanded} {...selectionGuard(() => setExpanded((value) => !value))}>
             {expanded ? '收起' : `展开全文 · 还有 ${hiddenLines} 行`}
@@ -56,7 +56,6 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
   }
 
   if (item.kind === 'thinking') return <ReasoningRow item={item} />
-  if (item.kind === 'context') return <ContextRow item={item} />
   if (item.kind === 'compaction') return <CompactionRow item={item} />
 
   return (
@@ -66,11 +65,12 @@ export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Prop
         <ExpandChevron expanded={expanded} className="step-chevron" />
         <span className="step-separator" aria-hidden="true">·</span>
         <span className="step-summary">{item.summary}</span>
-        {timelineStatus(item) === 'cancelled' && <span className="item-status">{factStatusText.cancelled}</span>}
+        {timelineStatus(item) === 'interrupted' && <span className="item-status">{factStatusText.interrupted}</span>}
+        {item.fact.status === 'pending' && <span className="item-status">{factStatusText.pending}</span>}
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
-        {item.fact.duration !== undefined && <div className="tool-duration">耗时 {formatTurnDuration(item.fact.duration)}</div>}
-        <div className="timeline-body activity-output"><ToolOutput item={item} />{sessionId && item.fact?.images && <AttachedImages sessionId={sessionId} images={item.fact.images} />}</div>
+        {item.fact.result?.durationMs !== undefined && <div className="tool-duration">耗时 {formatTurnDuration(item.fact.result.durationMs)}</div>}
+        <div className="timeline-body activity-output"><ToolOutput item={item} />{sessionId && item.fact.result?.images && <AttachedImages sessionId={sessionId} images={item.fact.result.images} />}</div>
       </div></Disclosure>
     </article>
   )
@@ -88,7 +88,7 @@ function TurnDuration({ itemKey, startedAt, finishedAt }: { itemKey: string; sta
 }
 
 function StepLabel({ item, icon }: Props & { icon?: ReactNode }) {
-  const muted = item.kind === 'thinking' || (item.fact?.kind === 'tool' && item.title === 'read')
+  const muted = item.kind === 'thinking' || (item.fact?.type === 'tool' && item.title === 'read')
   return <span className="step-label">
     {icon !== undefined && <span className="step-icon" aria-hidden="true">{icon}</span>}
     <span className={`step-title execution-title${muted ? ' muted-execution-title' : ''}`}>{item.title}</span>
@@ -173,31 +173,18 @@ function CompactionRow({ item }: Props) {
   </article>
 }
 
-function ContextRow({ item }: Props) {
-  const [expanded, setExpanded] = useState(false)
-  const guard = useSelectionGuard()
-  const text = timelineBody(item)
-  return <article className="timeline-item activity-step timeline-context" data-item-id={item.key}>
-    <button type="button" className="activity-toggle" aria-expanded={expanded}
-      {...guard(() => setExpanded(value => !value))}>
-      <span className="step-title">{item.title}</span>
-      <ExpandChevron expanded={expanded} size={14} />
-    </button>
-    <Disclosure open={expanded}><div className="activity-expanded context-content"><pre>{text}</pre></div></Disclosure>
-  </article>
-}
-
 function ToolOutput({ item }: { item: Extract<TimelineItemModel, { kind: 'tool' }> }) {
   const fact = item.fact
-  const { args: input, output } = fact
+  const input = fact.args
+  const output = fact.result?.output ?? ''
   const command = item.title === 'bash' ? toolArgument(item.title, input) : null
   if (command !== null) return <CommandOutput command={command} output={output} />
-  const hasReadLines = fact.readSource !== undefined && fact.readSource.lineCount > 0
-  if (item.filePath !== null && (output !== '' || hasReadLines) && fact.name === 'read' && timelineStatus(item) !== 'error') return <div>
+  const hasReadLines = fact.result?.readSource !== undefined && fact.result?.readSource.lineCount > 0
+  if (item.filePath !== null && (output !== '' || hasReadLines) && fact.name === 'read' && timelineStatus(item) !== 'failed') return <div>
     <div className="tool-output-header">{item.filePath}</div>
     {/* 只有 producer 记录了真实来源范围才编号；否则按普通文本展示，不猜边界。 */}
-    {fact.readSource
-      ? <div className="tool-lines">{readOutputLines(output, fact.readSource).map((line, index) => (
+    {fact.result?.readSource
+      ? <div className="tool-lines">{readOutputLines(output, fact.result.readSource).map((line, index) => (
         <div key={index} className="tool-line">{line.number !== undefined && <span className="tool-line-number">{line.number}</span>}<span>{line.text}</span></div>
       ))}</div>
       : <pre><code>{output}</code></pre>}
@@ -206,7 +193,7 @@ function ToolOutput({ item }: { item: Extract<TimelineItemModel, { kind: 'tool' 
     <div>
       <ToolSection label="参数"><pre><code>{JSON.stringify(input, null, 2) || '（空）'}</code></pre></ToolSection>
       {output !== '' && (
-        <ToolSection label={timelineStatus(item) === 'error' ? '错误' : '输出'}>
+        <ToolSection label={timelineStatus(item) === 'failed' ? '错误' : '输出'}>
           <pre><code>{output}</code></pre>
         </ToolSection>
       )}

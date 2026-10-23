@@ -27,8 +27,13 @@ impl InputImage {
         if !header.starts_with("data:") || !header.ends_with(";base64") {
             return Err("图片必须使用 Base64 data URL。".into());
         }
+        Self::from_base64(upload.name, data)
+    }
+
+    /// 解码外部图片的 Base64 内容，按实际字节识别格式。
+    pub(crate) fn from_base64(name: String, data: &str) -> Result<Self, String> {
         let bytes = STANDARD.decode(data).map_err(|_| "图片 Base64 数据无效。")?;
-        Self::prepare(upload.name, bytes)
+        Self::prepare(name, bytes)
     }
 
     /// 读取一次文件内容，后续保存和模型请求使用这份快照。
@@ -75,8 +80,8 @@ impl InputImage {
 
     pub(crate) fn save(&self, directory: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(directory)?;
-        // 同一份已接受输入在保存失败后可能重新交付，始终写回相同的不可变字节。
-        singularity_core::atomic_replace_bytes(&directory.join(&self.attachment.id), &self.bytes)
+        // 图片写完才保存消息引用；重试仍写入同一份字节。
+        std::fs::write(directory.join(&self.attachment.id), self.bytes.as_slice())
     }
 }
 

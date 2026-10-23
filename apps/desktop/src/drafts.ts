@@ -1,8 +1,8 @@
-import type { ImageUpload } from './protocol'
+import type { ModelSelection, ImageUpload } from './protocol'
 
-export interface Draft { text: string; images: File[]; skills?: Record<string, string>; selector?: string }
+export interface Draft { text: string; images: File[]; selection?: ModelSelection }
 export const emptyDraft: Draft = { text: '', images: [] }
-const hasDraft = (draft: Draft | undefined) => draft !== undefined && (draft.text !== '' || draft.images.length > 0 || draft.selector !== undefined)
+const hasDraft = (draft: Draft | undefined) => draft !== undefined && (draft.text !== '' || draft.images.length > 0 || draft.selection !== undefined)
 
 export type DraftSnapshot = Readonly<Record<string, Draft>>
 
@@ -60,7 +60,7 @@ export class DraftStore {
     if (this.snapshot?.[sessionId] === submitted) await this.set(sessionId, emptyDraft)
   }
 
-  /** 归档或移除已成功；草稿删除成功后才更新快照，失败保留原记录并说明部分完成。 */
+  /** 删除或移除已成功；草稿删除成功后才更新快照，失败保留原记录并说明部分完成。 */
   async remove(sessionIds: string[], completed: string): Promise<void> {
     try {
       await removeDrafts(sessionIds)
@@ -107,7 +107,7 @@ async function persistDraft(id: string, draft: Draft): Promise<void> {
   await complete(transaction)
 }
 
-/** 归档或移除成功后，一次提交对应任务的草稿删除。 */
+/** 删除或移除成功后，一次提交对应任务的草稿删除。 */
 async function removeDrafts(ids: string[]): Promise<void> {
   const transaction = (await openDatabase()).transaction('drafts', 'readwrite')
   const store = transaction.objectStore('drafts')

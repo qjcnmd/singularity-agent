@@ -1,14 +1,19 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// 模型与保存的工具定义共用相同字段；Provider 编码器负责网络格式。
-pub use singularity_protocol::RequestTool as ModelToolSchema;
+/// 发给模型的工具定义；Chat 和 Responses 发送时各自编码。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelToolSchema {
+    pub name: String,
+    pub description: String,
+    pub parameters_schema: Value,
+}
 
-/// 一次模型工具调用。参数只保存一份原始值，合法性由工具预检环节拒绝。
+/// 模型发起的一次工具调用；参数保存原始 JSON，执行前由工具注册表检查。
 ///
-/// 全仓唯一的工具调用载荷：会话日志、公开历史条目和模型请求都用它。序列化字段保持日志与公开
-/// 事件已有的形状（`id` / `name` / `args`）。发给提供方的
-/// 线上格式由 Chat/Responses 编码器各自构造，不从这个类型派生。
+/// 会话日志、历史条目和模型请求都用这个类型，日志中的字段名是 `id` / `name` / `args`。
+/// 发给提供方的格式由 Chat / Responses 编码器各自生成。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelToolCall {
@@ -18,4 +23,6 @@ pub struct ModelToolCall {
     pub tool_name: String,
     #[serde(rename = "args")]
     pub arguments: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<super::ProviderBlockMetadata>,
 }
