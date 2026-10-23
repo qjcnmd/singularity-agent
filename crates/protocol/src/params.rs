@@ -150,14 +150,12 @@ impl HistoryItem {
 #[serde(rename_all = "camelCase")]
 /// 从回合开始记录起生成的历史；初始设置不构成回合。
 pub struct ThreadTurn {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub started_at: Option<String>,
+    pub started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub finished_at: Option<String>,
     pub turn_id: String,
-    pub status: Option<TurnStatus>,
+    pub status: TurnStatus,
     /// 中断是否由用户停止；没有结束记录的回合为 false。
     pub manually_stopped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]

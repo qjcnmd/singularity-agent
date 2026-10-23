@@ -71,7 +71,7 @@ pub(super) fn resolve_model_definition(
     let max_context_tokens = model_file.max_context_tokens;
     let max_output_tokens = model_file.max_output_tokens;
     let reasoning_variants = model_file.reasoning_variants.as_deref().unwrap_or_default();
-    validate_reasoning_variants(protocol, reasoning_variants, model_file.default_variant.as_deref())?;
+    validate_reasoning_variants(protocol, reasoning_variants)?;
     let thinking_wire_format =
         parse_thinking_wire_format(model_file.thinking_wire_format.as_deref(), protocol)?;
     let chat_output_tokens_field =
@@ -79,7 +79,6 @@ pub(super) fn resolve_model_definition(
     if max_context_tokens == 0 || max_output_tokens == 0 {
         return Err(configuration_error("模型上下文窗口和最大输出 Token 须大于 0"));
     }
-    let requested_variant = requested_variant.or(model_file.default_variant.as_deref());
     if requested_variant.is_some_and(|value| !reasoning_variants.iter().any(|variant| variant == value)) {
         return Err(configuration_error("模型选择器指定的推理档位未在模型配置中声明"));
     }

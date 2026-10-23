@@ -106,7 +106,6 @@ impl Conversation {
             session_id: self.thread().thread_id,
             payload: self.runtime(view),
         });
-        self.changed.notify_waiters();
     }
     pub(super) fn summary(&self) -> singularity_protocol::ThreadSummary {
         let writer = lock_writer(&self.writer);
@@ -157,6 +156,5 @@ impl Conversation {
                 phase: self.phase(),
             }),
         });
-        self.changed.notify_waiters();
     }
 }

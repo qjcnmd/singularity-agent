@@ -32,10 +32,13 @@
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.1.1",
-    "electron": "44.4.5",
+    "electron": "44.5.0",
     "electron-builder": "26.15.3",
     "typescript": "7.0.2",
-    "vite": "8.2.2"
+    "vite": "8.2.4"
+  },
+  "overrides": {
+    "katex": "$katex"
   },
   "main": "desktop-dist/desktop/main.js",
   "description": "Singularity desktop coding agent",

@@ -97,7 +97,7 @@ function projectTurn(turn: ThreadTurn, cwd: string, userHome: string | null | un
     if (item.kind !== 'user' && workStartIndex < 0) workStartIndex = result.length
     result.push(item)
   }
-  if (startedAt && (turn.finishedAt || active)) {
+  if (turn.finishedAt || active) {
     result.splice(workStartIndex < 0 ? result.length : workStartIndex, 0, {
       key: `content:${group}:duration`, stable: true, kind: 'duration', title: '',
       timing: { startedAt, finishedAt: turn.finishedAt },

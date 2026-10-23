@@ -58,7 +58,7 @@ test('保存失败结束临时输出，保留片段且只显示一次错误', ()
   const failure = { source: 'turn', error: { cause: 'store', message: '保存执行结果失败' } }
   let state = { ...initialSyncState(), session: {
     summary: { ...summary, cwd: 'C:/project' }, runtime, context: null,
-    facts: [{ turnId: 'turn', status: 'running', manuallyStopped: false, items: [
+    facts: [{ turnId: 'turn', startedAt: '2026-10-23T00:00:00Z', status: 'running', manuallyStopped: false, items: [
       { type: 'message', id: 'user', role: 'user', text: '检查项目', status: 'completed' },
       { type: 'message', id: 'reply', role: 'assistant', text: '收到的正文', status: 'running' },
       { type: 'thinking', id: 'thinking', text: '收到的思考', status: 'running' },
@@ -86,7 +86,7 @@ test('保存失败结束临时输出，保留片段且只显示一次错误', ()
 
   for (const source of ['turn', 'compaction']) {
     const previous = { ...state, session: { ...state.session, facts: [
-      { turnId: 'completed-turn', status: 'completed', items: [] },
+      { turnId: 'completed-turn', startedAt: '2026-10-23T00:00:00Z', status: 'completed', manuallyStopped: false, items: [] },
     ] } }
     const preparedFailure = reduceStream(previous, { ...settled, revision: 3,
       payload: { ...settled.payload, failure: { ...failure, source } } }).state

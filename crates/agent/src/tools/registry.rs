@@ -142,8 +142,11 @@ impl ToolRegistrySnapshot {
                 args.as_object().ok_or_else(|| error_result("MCP tool arguments must be a JSON object"))?;
             return Ok(PreparedTool::Mcp(tool.clone(), args.clone()));
         }
-        let (_, parse) =
-            self.tools.iter().find(|(spec, _)| spec.name == name).ok_or_else(|| unknown_tool(name))?;
+        let (_, parse) = self
+            .tools
+            .iter()
+            .find(|(spec, _)| spec.name == name)
+            .ok_or_else(|| error_result(format!("tool execution failed: unknown tool: {name}")))?;
         parse(args)
     }
 
@@ -157,11 +160,6 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
     let mut execution = ToolExecution::text(message);
     execution.is_error = true;
     execution
-}
-
-/// 模型调用了不存在的工具时返回的结果。
-pub(crate) fn unknown_tool(name: &str) -> ToolExecution {
-    error_result(format!("tool execution failed: unknown tool: {name}"))
 }
 
 /// 解析工具参数；失败时返回给模型看的错误结果，调用方直接把它当作工具结果。

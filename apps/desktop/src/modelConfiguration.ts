@@ -43,7 +43,6 @@ export function blankModel(): ModelConfigurationInput {
     maxContextTokens: null,
     maxOutputTokens: null,
     reasoningVariants: null,
-    defaultVariant: null,
     thinkingWireFormat: null,
     chatOutputTokensField: null,
   }
@@ -84,7 +83,6 @@ export function mergeDiscoveredModel(current: ModelConfigurationInput, candidate
     // 未返回的值保持为空。
     if (value === null || (field === 'reasoningVariants' && candidate.reasoningVariants.length === 0)) continue
     Object.assign(merged, { [field]: value })
-    if (field === 'reasoningVariants' && !candidate.reasoningVariants.some(variant => variant === merged.defaultVariant)) merged.defaultVariant = null
   }
   return applyProtocol(merged, protocol)
 }

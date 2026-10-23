@@ -139,7 +139,6 @@ pub struct ModelConfigurationInput {
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning_variants: Option<Vec<String>>,
-    pub default_variant: Option<String>,
     pub thinking_wire_format: Option<String>,
     /// Chat 输出上限使用的 wire 字段名；`None` 表示发送 `max_tokens`。
     pub chat_output_tokens_field: Option<String>,

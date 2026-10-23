@@ -76,6 +76,9 @@ cargo check --workspace --all-targets
 ```
 
 ### 回归测试
+
+公式渲染和样式共用 `package.json` 中指定的 KaTeX 版本；`overrides` 同时约束 Markdown 插件的传递依赖。更新时检查行内公式、独立公式、矩阵和错误公式。
+
 ```powershell
 cargo test --workspace --locked
 npm --prefix apps/desktop test

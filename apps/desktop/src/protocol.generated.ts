@@ -66,7 +66,7 @@ export type McpTransportConfig = { "type": "stdio", command: string, args: Array
 
 export type ModelCatalogResult = { catalog: RedactedModelCatalog, revision: number, };
 
-export type ModelConfigurationInput = { modelId: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<string> | null, defaultVariant: string | null, thinkingWireFormat: string | null,
+export type ModelConfigurationInput = { modelId: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<string> | null, thinkingWireFormat: string | null,
 /**
  * Chat 输出上限使用的 wire 字段名；`None` 表示发送 `max_tokens`。
  */
@@ -204,7 +204,7 @@ export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, 
  */
 manuallyStopped: boolean, };
 
-export type ThreadTurn = { startedAt?: string, finishedAt?: string, turnId: string, status: TurnStatus | null,
+export type ThreadTurn = { startedAt: string, finishedAt?: string, turnId: string, status: TurnStatus,
 /**
  * 中断是否由用户停止；没有结束记录的回合为 false。
  */

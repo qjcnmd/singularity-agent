@@ -26,7 +26,7 @@ export function selectedModel(catalog: RedactedModelCatalog | undefined, selecti
   const provider = catalog?.providers.find(provider => provider.providerId === selection?.provider)
   const model = provider?.models.find(model => model.modelId === selection?.model)
   if (!provider || !model) return undefined
-  const effort = selection?.reasoning ?? model.defaultVariant
+  const effort = selection?.reasoning ?? null
   if (effort !== null && !model.reasoningVariants?.some(variant => variant === effort)) return undefined
   return { provider, model, effort }
 }

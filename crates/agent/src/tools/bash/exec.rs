@@ -54,7 +54,7 @@ pub(super) struct Process {
 }
 
 impl Process {
-    pub(super) async fn spawn(args: &BashArgs, cwd: &Path) -> Result<Self, String> {
+    pub(super) fn spawn(args: &BashArgs, cwd: &Path) -> Result<Self, String> {
         let shell = bash_path()?;
         let started = Instant::now();
         let mut managed = job_object::spawn_in_job(&shell, &args.command, cwd)

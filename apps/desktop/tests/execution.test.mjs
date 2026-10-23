@@ -5,7 +5,13 @@ import { acceptExecutionEvent } from '../src/execution.ts'
 test('完成的回复按保存顺序替换增量；工具更新和再次读取不改变位置', () => {
   const event = (method, params) => ({ turnId: 'turn', phase: 'running', method, params })
   const user = { type: 'message', id: 'user:text:0', role: 'user', text: '检查文件', status: 'completed' }
-  let facts = [{ turnId: 'turn', status: 'running', manuallyStopped: false, items: [user] }]
+  const started = event('turn/started', { turn: { turnId: 'turn', status: 'running' }, startedAt: '2026-10-23T00:00:00Z' })
+  let facts = acceptExecutionEvent([], started)
+  facts = acceptExecutionEvent(facts, event('item/updated', { item: user }))
+  // 历史可能先包含开始记录，随后才收到开始事件；保留已读到的内容。
+  facts = acceptExecutionEvent(facts, started)
+  assert.equal(facts.length, 1)
+  assert.deepEqual(facts[0].items, [user])
   for (const [thinking, delta] of [[false, '先读文件，然后说明'], [true, '思考']]) {
     facts = acceptExecutionEvent(facts, event('item/textDelta', {
       itemId: `reply:${thinking ? 'thinking' : 'text'}:0`, thinking, delta,
@@ -39,7 +45,10 @@ test('八个工具运行时第九个仍在等待，停止后不再显示等待',
   const tools = Array.from({ length: 9 }, (_, index) => ({
     type: 'tool', id: `reply:tool:${index}`, name: 'read', args: {}, result: null, status: 'pending',
   }))
-  let facts = acceptExecutionEvent([], event('message/finished', { messageId: 'reply', items: tools }))
+  let facts = acceptExecutionEvent([], event('turn/started', {
+    turn: { turnId: 'turn', status: 'running' }, startedAt: '2026-10-23T00:00:00Z',
+  }))
+  facts = acceptExecutionEvent(facts, event('message/finished', { messageId: 'reply', items: tools }))
   for (const tool of tools.slice(0, 8)) {
     facts = acceptExecutionEvent(facts, event('item/updated', { item: { ...tool, status: 'running' } }))
   }

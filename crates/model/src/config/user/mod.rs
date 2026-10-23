@@ -39,8 +39,6 @@ pub(crate) struct UserConfigModel {
     /// 缺省可由发现结果补齐；显式空数组保留用户不提供思考选项的选择。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_variants: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) default_variant: Option<String>,
     /// Chat 端点输出上限所用的线上字段名，缺省是 `max_tokens`，
     /// 另一选项是 `max_completion_tokens`。Responses 不用它。
     #[serde(default, skip_serializing_if = "Option::is_none")]

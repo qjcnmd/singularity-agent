@@ -11,7 +11,7 @@ use singularity_protocol::{
 /// 一个回合在日志中的条目范围和最终状态；初始设置不构成回合。
 pub(crate) struct IndexedTurn {
     pub turn_id: String,
-    pub status: Option<TurnStatus>,
+    pub status: TurnStatus,
     pub error: Option<singularity_protocol::TurnErrorDetail>,
     /// 用户主动停止导致的中断。
     pub manually_stopped: bool,
@@ -22,7 +22,7 @@ impl IndexedTurn {
     /// 生成这个回合的公开历史；工具结果合并到对应的调用条目里。
     pub fn project(&self, session: &SessionData) -> Result<ThreadTurn, SessionError> {
         let mut items = Vec::new();
-        let mut started_at = None;
+        let started_at = session.entries()[self.entries.start].timestamp().to_owned();
         let mut finished_at = None;
         let mut tool_items = std::collections::HashMap::new();
         for entry in &session.entries()[self.entries.clone()] {
@@ -90,11 +90,6 @@ impl IndexedTurn {
                 SessionEntry::Metadata { .. } => {}
                 SessionEntry::Record {
                     timestamp,
-                    record: LedgerRecord::OperationStarted { turn_id, .. },
-                    ..
-                } if turn_id == &self.turn_id => started_at = Some(timestamp.clone()),
-                SessionEntry::Record {
-                    timestamp,
                     record: LedgerRecord::OperationFinished { turn_id: id, .. },
                     ..
                 } if id == &self.turn_id => finished_at = Some(timestamp.clone()),
@@ -128,7 +123,7 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
             }
             turns.push(IndexedTurn {
                 turn_id: turn_id.clone(),
-                status: None,
+                status: TurnStatus::Interrupted,
                 error: None,
                 manually_stopped: false,
                 entries: position..entries.len(),
@@ -147,17 +142,11 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
             ..
         } = entry
             && let Some(last) = turns.last_mut()
-            && last.status.is_none()
             && &last.turn_id == id
         {
-            last.status = Some(*outcome);
+            last.status = *outcome;
             last.error = error.clone();
             last.manually_stopped = *outcome == TurnStatus::Interrupted && *user_stopped;
-        }
-    }
-    for turn in &mut turns {
-        if turn.status.is_none() {
-            turn.status = Some(TurnStatus::Interrupted);
         }
     }
     turns
@@ -307,7 +296,7 @@ pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> 
         created_at,
         updated_at,
         title,
-        status: last_turn.and_then(|turn| turn.status),
+        status: last_turn.map(|turn| turn.status),
         manually_stopped: last_turn.is_some_and(|turn| turn.manually_stopped),
     }
 }

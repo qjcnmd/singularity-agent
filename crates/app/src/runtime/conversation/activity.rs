@@ -70,7 +70,7 @@ impl Activity {
     pub(super) fn merge(&self, page: &mut ThreadHistory) {
         if let Some(turn) = page.turns.last_mut() {
             if self.turn_id.as_ref() == Some(&turn.turn_id) && turn.finished_at.is_none() {
-                turn.status = Some(TurnStatus::Running);
+                turn.status = TurnStatus::Running;
                 // 日志没有执行中的状态；当前回合尚无结果的调用仍在等待，运行中的进度随后覆盖它。
                 for item in &mut turn.items {
                     if let HistoryItem::Tool { status, result: None, .. } = item {
@@ -110,8 +110,8 @@ mod tests {
             },
             turns: vec![singularity_protocol::ThreadTurn {
                 turn_id: "turn".into(),
-                status: Some(TurnStatus::Interrupted),
-                started_at: None,
+                status: TurnStatus::Interrupted,
+                started_at: "2026-10-23T00:00:00.000Z".into(),
                 finished_at: None,
                 error: None,
                 manually_stopped: false,

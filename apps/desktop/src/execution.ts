@@ -36,7 +36,10 @@ export function acceptExecutionEvent(facts: ThreadTurn[], event: TurnEventEnvelo
   // 尚无回合时，独立压缩没有可显示的历史。
   if (id === undefined) return facts
   const index = facts.findIndex(turn => turn.turnId === id)
-  let turn: ThreadTurn = index < 0 ? { turnId: id, status: null, manuallyStopped: false, items: [] } : facts[index]
+  if (event.method === 'turn/started' && index < 0) {
+    return [...facts, { turnId: id, status: 'running', startedAt: event.params.startedAt, manuallyStopped: false, items: [] }]
+  }
+  let turn = facts[index]
   switch (event.method) {
     case 'turn/started': turn = { ...turn, status: 'running', startedAt: event.params.startedAt }; break
     case 'item/updated': turn = upsert(turn, event.params.item); break
@@ -65,7 +68,6 @@ export function acceptExecutionEvent(facts: ThreadTurn[], event: TurnEventEnvelo
     default: event satisfies never
   }
   const next = [...facts]
-  if (index < 0) next.push(turn)
-  else next[index] = turn
+  next[index] = turn
   return next
 }

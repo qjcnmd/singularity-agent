@@ -130,8 +130,7 @@ export function ModelEditor({ index, initial, protocol, onConfirm, onClose, disc
             <span>最大输出 Token</span>
             <input aria-label="最大输出 Token" className="sg-input" aria-required="true" value={draft.outputText} placeholder="例如 32K" onChange={event => patch({ outputText: event.target.value })} />
           </label></div>
-          <ReasoningOptions options={options} selected={variants} onChange={reasoningVariants => patch({ reasoningVariants,
-            defaultVariant: reasoningVariants.some(variant => variant === draft.defaultVariant) ? draft.defaultVariant : null })} />
+          <ReasoningOptions options={options} selected={variants} onChange={reasoningVariants => patch({ reasoningVariants })} />
         </div>
         {error && <p className="form-error model-editor-error" role="alert">{error}</p>}
         <footer className="sg-editor-actions">

@@ -55,7 +55,7 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
   const chooseModel = async (choice: ModelChoice) => {
     const effort = choice.model.reasoningVariants?.some((variant) => variant === resolvedEffort)
       ? resolvedEffort
-      : choice.model.defaultVariant
+      : null
     await appStore.updateSettings({ provider: choice.provider.providerId, model: choice.model.modelId, reasoning: effort })
   }
 

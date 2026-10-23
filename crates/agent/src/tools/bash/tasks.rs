@@ -155,7 +155,7 @@ impl BashTasks {
         if signal.is_cancelled() {
             return error_result(ABORTED_MESSAGE);
         }
-        let mut process = match Process::spawn(&args, &cwd).await {
+        let mut process = match Process::spawn(&args, &cwd) {
             Ok(process) => process,
             Err(error) => return error_result(error),
         };

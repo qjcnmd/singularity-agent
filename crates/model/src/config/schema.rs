@@ -49,11 +49,7 @@ pub(crate) fn parse_chat_output_tokens_field(
 pub(crate) fn validate_reasoning_variants(
     protocol: ProviderApiProtocol,
     variants: &[String],
-    default_variant: Option<&str>,
 ) -> Result<(), ProviderError> {
-    if default_variant.is_some_and(|value| !variants.iter().any(|variant| variant == value)) {
-        return Err(configuration_error("default_variant 指定的档位未在 reasoning_variants 中声明"));
-    }
     for (index, variant) in variants.iter().enumerate() {
         validate_identifier(variant, "推理档位")?;
         if variants[..index].contains(variant) {

@@ -171,7 +171,6 @@ fn model_definition(
             .max_output_tokens
             .ok_or_else(|| configuration_error("请填写最大输出 Token。"))?,
         reasoning_variants: model.reasoning_variants,
-        default_variant: model.default_variant,
         chat_output_tokens_field: model.chat_output_tokens_field.filter(|field| !field.is_empty()),
         thinking_wire_format: model.thinking_wire_format,
     };
@@ -236,7 +235,6 @@ fn catalog_from_data(data: &UserConfigFile) -> RedactedModelCatalog {
                     max_context_tokens: Some(model.max_context_tokens),
                     max_output_tokens: Some(model.max_output_tokens),
                     reasoning_variants: model.reasoning_variants.clone(),
-                    default_variant: model.default_variant.clone(),
                     thinking_wire_format: model.thinking_wire_format.clone(),
                     chat_output_tokens_field: model.chat_output_tokens_field.clone(),
                 })
