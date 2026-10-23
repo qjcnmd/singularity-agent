@@ -1,12 +1,10 @@
 /**
- * 代码高亮：Shiki 引擎、明暗两套主题的 token，以及渲染 token 的 React hook。
- * Markdown 代码块从这里取高亮结果。
+ * 代码高亮：按需加载 Shiki 语言语法并生成支持明暗双主题的 Token。
  */
 import { createElement, useEffect, useMemo, useState, type CSSProperties } from 'react'
 
 /**
- * 支持高亮的语言。每个语言的 import 必须写成静态字符串，打包时才会拆成单独的分块，
- * 所以语言名和加载函数写在同一个对象里；语言清单直接取对象的键，不另写一份。
+ * 支持高亮的语言加载表；使用静态 `import()` 让打包器按语言拆包。
  */
 const LANGUAGE_LOADERS = {
   javascript: () => import('@shikijs/langs/javascript'),
@@ -24,17 +22,16 @@ const LANGUAGE_ALIASES: Record<string, LanguageId> = {
   js: 'javascript', jsx: 'javascript', ts: 'typescript', rs: 'rust', md: 'markdown', sh: 'bash',
 }
 
-/** 将围栏语言名或文件扩展名解析为已加载语言；未知语言保留纯文本。 */
+/** 将代码块标记或扩展名映射为支持的语言 ID，不支持的语言返回 `'text'`。 */
 function languageIdFor(language: string): LanguageId | 'text' {
   const name = language.trim().split(/\s+/)[0].toLowerCase()
   if (Object.hasOwn(LANGUAGE_LOADERS, name)) return name as LanguageId
   return Object.hasOwn(LANGUAGE_ALIASES, name) ? LANGUAGE_ALIASES[name] : 'text'
 }
 
-/** 高亮器类型直接取自库的导出，不另写一份简化的类型。 */
 type Highlighter = Awaited<ReturnType<typeof import('@shikijs/core')['createHighlighterCore']>>
 
-/** 每个 token 携带明暗两套配色（库的 --shiki-light/--shiki-dark CSS 变量）。 */
+/** 每个 Token 同时带有 `--shiki-light` 和 `--shiki-dark` CSS 变量。 */
 type HighlightedLines = ReturnType<Highlighter['codeToTokens']>['tokens']
 
 let highlighterPromise: Promise<Highlighter> | null = null
@@ -77,7 +74,6 @@ function tokenize(highlighter: Highlighter, code: string, lang: LanguageId): Hig
   }).tokens
 }
 
-/** 单行高亮 token 的库类型。 */
 type CodeLine = HighlightedLines[number]
 
 /** 状态里只记录语言是否加载完成；token 每次渲染时按当前代码计算，不在 Promise 回调里写回。
@@ -90,7 +86,7 @@ export function useCodeTokens(code: string, language: string) {
     let current = true
     void loadLanguage(lang).then(
       highlighter => { if (current) setLoaded({ highlighter, language: lang }) },
-      // 语言分块或高亮失败：保持 null，落回既有原文展示，不留下未处理的拒绝。
+      // 语言分块加载失败时保持 null，回退为纯文本展示。
       () => {},
     )
     return () => { current = false }
@@ -98,11 +94,10 @@ export function useCodeTokens(code: string, language: string) {
   return useMemo(() => {
     if (loaded === null || loaded.language !== lang) return null
     try { return tokenize(loaded.highlighter, code, lang) }
-    catch { return null } // 高亮失败时仍显示原文，与异步加载失败保持同一行为。
+    catch { return null } // 分词失败时回退为纯文本展示。
   }, [loaded, code, lang])
 }
 
-/** 高亮就绪后的单行 token。 */
 export function CodeTokens({ tokens }: { tokens: CodeLine }) {
   return tokens.map((token, column) => createElement('span', {
     key: column,

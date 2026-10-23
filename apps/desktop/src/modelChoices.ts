@@ -1,6 +1,5 @@
 import type { ModelSelection, RedactedModelCatalog } from './protocol'
 
-/** 当前任务的选择优先于全局默认值。 */
 export function effectiveSelection(selection: ModelSelection | null | undefined, catalog: RedactedModelCatalog | undefined): ModelSelection | null {
   return selection ?? catalog?.defaultSelection ?? null
 }
@@ -11,8 +10,7 @@ export const reasoningGrades = [
 ] as const
 const effortOrder: readonly string[] = ['off', 'none', ...reasoningGrades, 'ultra', 'on']
 
-/** 所有已配置 variant 都可选；off 控制 thinking 关闭。排序只消费变体数组本身：
- *  返回排序后的副本，不改动输入，未知档位按它们在输入中的稳定次序排在已知档位之后。 */
+/** 按从弱到强的固定顺序排列思考档位；未知档位保持原顺序排在末尾。 */
 export function sortReasoningVariants(variants: readonly string[] | null | undefined): string[] {
   const rank = (id: string) => {
     const index = effortOrder.indexOf(id)
@@ -21,7 +19,7 @@ export function sortReasoningVariants(variants: readonly string[] | null | undef
   return [...(variants ?? [])].sort((left, right) => rank(left) - rank(right))
 }
 
-/** 在当前模型目录里查找所选模型，选择器和发送前检查共用；找不到返回 undefined。 */
+/** 在当前模型目录中校验并查找所选模型及思考档位，不合法或不存在时返回 `undefined`。 */
 export function selectedModel(catalog: RedactedModelCatalog | undefined, selection: ModelSelection | null) {
   const provider = catalog?.providers.find(provider => provider.providerId === selection?.provider)
   const model = provider?.models.find(model => model.modelId === selection?.model)

@@ -1,7 +1,7 @@
 use super::message::Message;
 use super::tool::ModelToolSchema;
 
-/// 与协议无关的一次模型请求；每次发送尝试的 ID 由请求执行代码分配。
+/// 发给提供方的一次模型请求，包含上下文消息、已加载的图片 data URL、工具定义和输出上限。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelTurnRequest {
     pub messages: Vec<Message>,

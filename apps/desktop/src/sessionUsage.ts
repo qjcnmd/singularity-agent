@@ -8,7 +8,7 @@ export function sessionUsage(session: SessionView | null): SessionModelUsage | n
   return usage.usagePresent || usage.ttftRequests > 0 ? usage : null
 }
 
-/** 缓存命中率（cached_tokens / input_tokens），无输入时返回 null */
+/** 缓存命中率（`cachedInputTokens / inputTokens`）；任一有输入请求未报告缓存字段或总输入为 0 时返回 `null`。 */
 export function cacheHitPercent(usage: SessionModelUsage): number | null {
   return !usage.cacheUsageComplete || usage.inputTokens === 0 ? null : usage.cachedInputTokens / usage.inputTokens * 100
 }

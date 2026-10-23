@@ -1,126 +1,68 @@
 import { interruptionText, compactionText } from './copy'
 import { hasErrorItem, type SessionView } from './execution'
-import type { HistoryItem, ThreadTurn, ToolStatus, TurnStatus } from './protocol'
+import type { HistoryItem, ThreadTurn } from './protocol'
 
-interface TimelineItemBase {
+export type TimelineContent = HistoryItem
+  | { type: 'duration'; startedAt: string; finishedAt?: string }
+  | { type: 'terminal'; status: 'failed' | 'interrupted'; text: string }
+
+/** 只补充排列和阅读位置；历史条目原样交给组件。 */
+export interface TimelineRow {
   key: string
-  /** 是否对应已保存的历史；只有已保存的条目能作为阅读位置，临时输出不能。 */
-  stable?: boolean
-  title: string
-  fact: HistoryItem | null
-  summary: string
-  filePath: string | null
-  /** 没有内容条目的回合错误或停止提示使用此状态。 */
-  status?: TurnStatus
+  stable: boolean
+  item: TimelineContent
 }
 
-export type TimelineItemModel = TimelineItemBase & (
-  | { kind: 'tool'; fact: Extract<HistoryItem, { type: 'tool' }> }
-  | { kind: 'duration'; fact: null; timing: { startedAt: string; finishedAt?: string } }
-  | { kind: 'user' }
-  | { kind: 'assistant' }
-  | { kind: 'thinking' }
-  | { kind: 'compaction' }
-  | { kind: 'terminal' }
-)
-
-export function timelineStatus(item: TimelineItemModel): ToolStatus | TurnStatus | 'recorded' {
-  return item.status ?? (item.fact && 'status' in item.fact ? item.fact.status : 'recorded')
-}
-
-export function timelineBody(item: TimelineItemModel): string {
-  if (item.fact?.type === 'compaction') return item.fact.summary
-  if (item.fact?.type === 'compaction_result') return compactionResultText(item.fact)
-  return item.fact && 'text' in item.fact ? item.fact.text : item.summary
-}
-
-const projectedItems = new WeakMap<HistoryItem, { item: TimelineItemModel; cwd: string; userHome: string | null | undefined }>()
-
-export function buildTimeline(session: SessionView | null, userHome?: string | null): TimelineItemModel[] {
+export function buildTimeline(session: SessionView | null): TimelineRow[] {
   if (!session) return []
-  const result: TimelineItemModel[] = []
+  const result: TimelineRow[] = []
   const turns = session.facts
   const failure = session.runtime.failure
-  const activeTurn = session.runtime.phase === 'idle' ? undefined : session.facts.at(-1)
+  const activeTurn = session.runtime.phase === 'idle' ? undefined : turns.at(-1)
   for (const turn of turns) {
-    const active = turn === activeTurn
-    const failureFromRuntime = turn === session.facts.at(-1)
-      && failure?.source === 'turn'
-    for (const item of projectTurn(turn, session.summary.cwd, userHome, active, failureFromRuntime)) result.push(item)
+    const failureFromRuntime = turn === turns.at(-1) && failure?.source === 'turn'
+    result.push(...turnRows(turn, turn === activeTurn, failureFromRuntime))
   }
-  // 写入失败可能只留下实时反馈；按条目身份关联，不比较错误文字。
+  // 日志写入失败时错误可能只保存在运行状态中，已有相同错误条目时不重复显示。
   if (failure && !turns.some(turn => hasErrorItem(turn, failure.error))) {
-    result.push(failedItem('terminal:failed', failure.source === 'compaction'
-      ? `${compactionText.failed}：${failure.error.message}` : failure.error.message))
+    result.push({ key: 'terminal:failed', stable: false, item: { type: 'terminal', status: 'failed',
+      text: failure.source === 'compaction' ? `${compactionText.failed}：${failure.error.message}` : failure.error.message } })
   }
   if (session.runtime.pendingMessages.length === 0) return result
-  // 用户消息落盘的事件可能先于下一份运行快照到达，按身份判断，不重复显示。
+  // 用户消息写入事件可能先于运行快照到达，按 ID 去重。
   const savedMessages = new Set(turns.flatMap(turn => turn.items.filter(item => item.type === 'message' && item.role === 'user').map(item => item.id)))
   for (const message of session.runtime.pendingMessages) {
     if (savedMessages.has(message.itemId)) continue
-    result.push({
-      key: `pending:${message.itemId}`, kind: 'user', title: '你', summary: '', filePath: null,
-      fact: { id: message.itemId, type: 'message', role: 'user', status: 'completed', text: message.text, images: message.images },
-    })
+    result.push({ key: `pending:${message.itemId}`, stable: false,
+      item: { id: message.itemId, type: 'message', role: 'user', status: 'completed', text: message.text, images: message.images } })
   }
   return result
 }
 
-function projectTurn(turn: ThreadTurn, cwd: string, userHome: string | null | undefined, active: boolean, failureFromRuntime: boolean): TimelineItemModel[] {
-  const startedAt = turn.startedAt
-  const result: TimelineItemModel[] = []
-  const group = turn.turnId
-  let workStartIndex = -1
-  for (const fact of turn.items) {
-    const cached = projectedItems.get(fact)
-    let item: TimelineItemModel
-    if (cached?.cwd === cwd && cached.userHome === userHome) {
-      item = cached.item
-    } else {
-      const key = fact.type === 'compaction' || fact.type === 'compaction_result'
-        ? `compaction:${fact.id}` : `content:${group}:${fact.id}`
-      if (fact.type === 'tool') {
-        const filePath = pathFromArgs(fact.name, fact.args)
-        const summary = filePath !== null ? displayPath(filePath, cwd, userHome)
-          : toolSummary(fact.name, fact.args) || firstLine(fact.result?.output ?? '')
-        item = { key, fact, kind: 'tool', title: fact.name === 'ask_user_question' ? '询问用户' : filePath?.replace(/\\/g, '/').endsWith('/SKILL.md') ? '读取技能' : fact.name,
-          summary, filePath }
-      } else {
-        const kind = fact.type === 'compaction' || fact.type === 'compaction_result' ? 'compaction' : fact.type === 'message' ? fact.role : fact.type
-        let title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'compaction' ? compactionText.completed : '思考'
-        if (fact.type === 'compaction_result') title = fact.status === 'failed' ? compactionText.failed : compactionResultText(fact)
-        item = { key, fact, kind, title, summary: '', filePath: null }
-      }
-      if (!('status' in fact) || fact.status !== 'running' || fact.type === 'tool') item.stable = true
-      projectedItems.set(fact, { item, cwd, userHome })
-    }
-    if (item.kind !== 'user' && workStartIndex < 0) workStartIndex = result.length
-    result.push(item)
-  }
+function turnRows(turn: ThreadTurn, active: boolean, failureFromRuntime: boolean): TimelineRow[] {
+  const result: TimelineRow[] = turn.items.map(item => ({
+    key: item.type === 'compaction' || item.type === 'compaction_result'
+      ? `compaction:${item.id}` : `content:${turn.turnId}:${item.id}`,
+    stable: !('status' in item) || item.status !== 'running' || item.type === 'tool',
+    item,
+  }))
   if (turn.finishedAt || active) {
+    const workStartIndex = turn.items.findIndex(item => item.type !== 'message' || item.role !== 'user')
     result.splice(workStartIndex < 0 ? result.length : workStartIndex, 0, {
-      key: `content:${group}:duration`, stable: true, kind: 'duration', title: '',
-      timing: { startedAt, finishedAt: turn.finishedAt },
-      fact: null, summary: '', filePath: null,
+      key: `content:${turn.turnId}:duration`, stable: true,
+      item: { type: 'duration', startedAt: turn.startedAt, finishedAt: turn.finishedAt },
     })
   }
-  if (turn.status === 'interrupted') result.push({ ...interruptedItem(`content:${group}:terminal`, turn.manuallyStopped), stable: true })
+  if (turn.status === 'interrupted') result.push({
+    key: `content:${turn.turnId}:terminal`, stable: true,
+    item: { type: 'terminal', status: turn.manuallyStopped ? 'interrupted' : 'failed', text: interruptionText(turn.manuallyStopped) },
+  })
   // 保存失败时没有回合错误详情，具体原因由运行状态显示。
-  const failureShown = hasErrorItem(turn, turn.error)
-  if (turn.status === 'failed' && !failureShown && (turn.error || !failureFromRuntime)) {
-    result.push({ ...failedItem(`content:${group}:terminal`, turn.error?.message ?? '执行失败'), stable: true })
+  if (turn.status === 'failed' && !hasErrorItem(turn, turn.error) && (turn.error || !failureFromRuntime)) {
+    result.push({ key: `content:${turn.turnId}:terminal`, stable: true,
+      item: { type: 'terminal', status: 'failed', text: turn.error?.message ?? '执行失败' } })
   }
   return result
-}
-
-function interruptedItem(key: string, manuallyStopped: boolean): TimelineItemModel {
-  const title = interruptionText(manuallyStopped)
-  return { key, kind: 'terminal', title, fact: null, summary: manuallyStopped ? '' : title,
-    filePath: null, status: manuallyStopped ? 'interrupted' : 'failed' }
-}
-
-function failedItem(key: string, message: string): TimelineItemModel {
-  return { key, kind: 'terminal', title: '执行失败', fact: null, summary: message, filePath: null, status: 'failed' }
 }
 
 export function toolArgument(name: string, args: unknown): string | null {
@@ -137,7 +79,7 @@ export function backgroundToolSummary(name: string, args: unknown): string | nul
   return typeof taskId === 'string' ? `${action} · ${taskId}` : action
 }
 
-function toolSummary(name: string, args: unknown): string {
+export function toolSummary(name: string, args: unknown): string {
   const background = backgroundToolSummary(name, args)
   if (background !== null) return background
   if (name === 'ask_user_question') {
@@ -152,7 +94,7 @@ function toolSummary(name: string, args: unknown): string {
   return firstLine(toolArgument(name, args) ?? '')
 }
 
-function displayPath(path: string, cwd: string, userHome?: string | null): string {
+export function displayPath(path: string, cwd: string, userHome?: string | null): string {
   const normalized = path.replace(/\\/g, '/')
   const root = cwd.replace(/\\/g, '/').replace(/\/$/, '')
   if (normalized.toLowerCase().startsWith(`${root.toLowerCase()}/`)) return normalized.slice(root.length + 1)
@@ -162,13 +104,13 @@ function displayPath(path: string, cwd: string, userHome?: string | null): strin
   return path
 }
 
-function pathFromArgs(name: string, args: unknown): string | null {
+export function pathFromArgs(name: string, args: unknown): string | null {
   if (name !== 'read') return null
   const value = toolArgument(name, args)
   return value?.trim() ? value : null
 }
 
-function firstLine(text: string): string {
+export function firstLine(text: string): string {
   return text.split(/\r?\n/, 1)[0]?.trim() ?? ''
 }
 
@@ -181,6 +123,6 @@ export function formatTurnDuration(milliseconds: number): string {
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m${seconds % 60}s`
 }
 
-function compactionResultText(item: Extract<HistoryItem, { type: 'compaction_result' }>): string {
+export function compactionResultText(item: Extract<HistoryItem, { type: 'compaction_result' }>): string {
   return item.message ?? (item.status === 'running' ? compactionText.running : item.status === 'completed' ? compactionText.unchanged : item.status === 'interrupted' ? compactionText.unfinished : compactionText.failed)
 }

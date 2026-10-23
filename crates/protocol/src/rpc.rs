@@ -1,4 +1,4 @@
-//! 工作台 RPC 边界的方法、参数与结果类型之间的关联。
+//! 工作台全部 RPC 方法名、请求参数与返回类型的对应关系。
 
 use crate::*;
 use serde::Deserialize;
@@ -21,7 +21,7 @@ pub struct BackgroundTaskParams {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct FileSearchParams {
-    pub workspace_id: String,
+    pub workspace_root: String,
     pub query: String,
 }
 
@@ -35,7 +35,7 @@ pub struct WorkspaceAddParams {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceParams {
-    pub workspace_id: String,
+    pub workspace_root: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,7 +77,7 @@ pub struct SessionParams {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStartParams {
-    pub workspace_id: String,
+    pub workspace_root: String,
     pub selection: crate::ModelSelection,
     pub text: String,
     pub images: Vec<crate::ImageUpload>,

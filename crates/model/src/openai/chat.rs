@@ -127,7 +127,7 @@ fn openai_message_payload_with_reasoning(
     if let Some(ProviderMessageMetadata::Chat { reasoning_field, reasoning_details, .. }) =
         super::message_metadata_for(message, selection, provider_name, endpoint)
     {
-        // 有 reasoning_details 时只发它，不再重复发思考文本。
+        // 有 reasoning_details 时只发结构化片段，避免和思考文本重复。
         if !reasoning_details.is_empty() {
             payload["reasoning_details"] = json!(reasoning_details);
         } else {

@@ -15,7 +15,7 @@ pub async fn handle(
 ) -> RpcResponse {
     let result = async {
         if let RpcRequest::McpReconnect(params) = request {
-            let cwd = app.mcp_directory(params.workspace_id.as_deref())?;
+            let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
             let inspect = async { app.mcp.reconnect(&params.server_id, &cwd).await.map_err(invalid_request) };
             return value(unless_shutdown(shutdown, inspect).await?);
         }
@@ -28,7 +28,7 @@ pub async fn handle(
             return value(app.stop_background_task(&params.session_id, &params.task_id).await?);
         }
         if let RpcRequest::WorkspaceRemove(params) = request {
-            return value(app.remove_workspace(&params.workspace_id).await?);
+            return value(app.remove_workspace(&params.workspace_root).await?);
         }
         if let RpcRequest::SessionDelete(params) = request {
             return value(app.delete_session(&params.session_id).await?);
@@ -68,31 +68,31 @@ fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError
         | RpcRequest::BackgroundTaskStop(_)
         | RpcRequest::WorkspaceRemove(_)
         | RpcRequest::SessionDelete(_) => Err(invalid_request("该方法不由同步 AppServer 分发。")),
-        RpcRequest::SkillsList(params) => value(app.skills(&params.workspace_id)?),
-        RpcRequest::FileSearch(params) => value(app.file_search(&params.workspace_id, &params.query)?),
+        RpcRequest::SkillsList(params) => value(app.skills(&params.workspace_root)?),
+        RpcRequest::FileSearch(params) => value(app.file_search(&params.workspace_root, &params.query)?),
         RpcRequest::WorkspaceAdd(params) => value(app.add_workspace(&params.root)?),
         RpcRequest::ModelSaveProvider(params) => {
             value(app.save_provider(params.provider, params.api_key.as_deref())?)
         }
         RpcRequest::ModelRemoveProvider(params) => value(app.remove_provider(&params.provider_id)?),
         RpcRequest::McpList(params) => {
-            let cwd = app.mcp_directory(params.workspace_id.as_deref())?;
+            let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
             value(app.mcp.list(&cwd).map_err(invalid_request)?)
         }
         RpcRequest::McpSave(params) => {
-            let cwd = app.mcp_directory(params.workspace_id.as_deref())?;
+            let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
             value(app.mcp.save(params.server, &cwd).map_err(invalid_request)?)
         }
         RpcRequest::McpRemove(params) => {
-            let cwd = app.mcp_directory(params.workspace_id.as_deref())?;
+            let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
             value(app.mcp.remove(&params.server_id, &cwd).map_err(invalid_request)?)
         }
         RpcRequest::McpToggle(params) => {
-            let cwd = app.mcp_directory(params.workspace_id.as_deref())?;
+            let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
             value(app.mcp.toggle(&params.server_id, params.enabled, &cwd).map_err(invalid_request)?)
         }
         RpcRequest::SessionStart(params) => value(app.start_session(
-            &params.workspace_id,
+            &params.workspace_root,
             params.selection,
             input(params.text, params.images)?,
         )?),

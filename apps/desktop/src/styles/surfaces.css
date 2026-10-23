@@ -76,7 +76,7 @@
 @keyframes theme-icon-enter { from { opacity: 0; transform: rotate(-25deg) scale(.8); } to { opacity: 1; transform: none; } }
 ::view-transition-old(root), ::view-transition-new(root) { animation-duration: 220ms; }
 @media (prefers-reduced-motion: reduce) { .theme-icon svg { animation: none; } }
-/* 代码高亮配色（基于 Shiki 主题变量） */
+/* 代码高亮配色（引用 Shiki 生成的 CSS 变量） */
 .code-token { color: var(--shiki-light); }
 [data-theme=dark] .code-token { color: var(--shiki-dark); }
 [data-theme=dark] .sg-rail { background: #44464c; }

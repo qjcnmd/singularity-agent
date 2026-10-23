@@ -18,7 +18,7 @@ impl ThinkingWireFormat {
     /// 配置里没写 thinking_wire_format 时的默认值。
     pub(crate) const DEFAULT: Self = Self::ReasoningEffort;
 
-    /// 配置文件里的写法；解析配置、错误提示和模型发现都用这里的名称。
+    /// `config.json` 中的字段取值；配置解析和错误提示都用这里的名称。
     pub(crate) fn wire_name(self) -> &'static str {
         match self {
             Self::ThinkingType => "thinking_type",

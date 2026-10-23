@@ -9,7 +9,7 @@ use singularity_model::{ModelTurnRequest, ModelTurnResponse};
 use singularity_protocol::TurnEvent;
 use tokio_util::sync::CancellationToken;
 
-/// 本轮每次请求都带上的指令消息和工具定义，以及它们的 Token 估算。
+/// 本轮每次请求都会带上的指令消息和工具定义。
 #[derive(Debug, Clone)]
 pub(crate) struct RequestDefinitions {
     pub(crate) messages: Vec<Message>,
@@ -17,7 +17,7 @@ pub(crate) struct RequestDefinitions {
 }
 
 impl RequestDefinitions {
-    /// 指令和工具定义共同占用的输入预算。
+    /// 估算指令消息和工具定义占用的输入 Token 数。
     pub(crate) fn estimated_tokens(&self) -> u64 {
         let instructions = self
             .messages
@@ -119,7 +119,7 @@ impl RequestContext {
         self.definitions.as_ref().expect("definitions are loaded before model requests")
     }
 
-    /// 当前上下文占用估算：最近一次实际用量加上之后新增的内容；输出预算和自动压缩共用。
+    /// 估算下一次请求的输入 Token 数（最近一次实际用量加上新增消息，或全量估算），供自动压缩判断使用。
     pub(super) fn context_pressure_tokens(&self) -> u64 {
         let writer = lock_writer(&self.session);
         context::estimated_tokens(
@@ -193,7 +193,7 @@ impl Agent {
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        // 重发的结果直接返回，即使再次超限也不再压缩。
+        // 压缩后只重发一次，仍然超限时直接把错误返回给调用方。
         self.drain_inputs(on_event, cancellation).await?;
         self.requests.request_response(on_event, cancellation).await
     }

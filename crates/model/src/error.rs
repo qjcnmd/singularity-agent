@@ -33,7 +33,7 @@ impl std::fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 impl ProviderError {
-    /// 创建一条带稳定 kind 的提供方错误。
+    /// 创建不带重试延迟的提供方错误。
     pub fn new(kind: ModelErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -69,11 +69,11 @@ impl ProviderError {
     }
 }
 
-/// 提供方错误响应体里表示上下文超限的线上错误码；只做全等匹配。
+/// 提供方响应体里表示上下文超限的错误码；只做全等匹配。
 const PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
 /// 提供方明确返回的限流错误码，允许自动重试。
 const PROVIDER_RATE_LIMIT_EXCEEDED_CODE: &str = "rate_limit_exceeded";
-/// 配额耗尽的线上错误码：重试没有意义，归到认证/账务这一类不可重试的错误。
+/// 配额耗尽的错误码：重试没有意义，归入不可重试的认证/账务错误。
 const PROVIDER_INSUFFICIENT_QUOTA_CODE: &str = "insufficient_quota";
 /// 附在非 2xx 错误上的提供方诊断文本长度上限（字符数）。
 pub(crate) const MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS: usize = 256;
@@ -87,9 +87,8 @@ pub(crate) struct ProviderErrorBodyFields {
     pub(crate) message: Option<String>,
 }
 
-/// 从提供方的 error 对象（{"code": "...", "type": "...", "message": "..."}）里取结构化
-/// 字段；不是对象或字段类型不符，都当作没提供。流内事件、200 载荷里的内嵌错误和非
-/// 2xx 响应体共用这一个提取点。
+/// 从提供方的 error 对象（{"code": "...", "type": "...", "message": "..."}）里提取字段；
+/// 不是对象或字段类型不符时按未提供处理。SSE 错误事件、200 响应体中的内嵌错误和非 2xx 响应体共用。
 pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
     let text = |field: &str| error.get(field).and_then(Value::as_str).map(str::to_string);
     ProviderErrorBodyFields {
@@ -120,7 +119,7 @@ pub(crate) fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields 
         .unwrap_or_default()
 }
 
-/// 线上错误码到具体 kind 的精确映射（全等匹配，不靠文本推断）；没命中就返回 None，分类由调用方决定。
+/// 提供方错误码到 `ModelErrorKind` 的精确映射（全等匹配，不按错误文本猜测）；未命中时返回 `None`，由调用方决定分类。
 pub(crate) fn provider_error_kind_for_code(code: Option<&str>) -> Option<ModelErrorKind> {
     match code {
         Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE) => Some(ModelErrorKind::ContextLengthExceeded),
@@ -169,7 +168,7 @@ pub(crate) fn bounded_provider_error_diagnostic(text: &str) -> String {
     diagnostic
 }
 
-/// 从线上 message 取出的、有长度上限的非空诊断；回退内容由协议调用方决定。
+/// 提取截断后的非空错误说明；为空时由调用方提供默认说明。
 pub(crate) fn bounded_wire_detail(fields: &ProviderErrorBodyFields) -> Option<String> {
     fields
         .message
@@ -178,9 +177,8 @@ pub(crate) fn bounded_wire_detail(fields: &ProviderErrorBodyFields) -> Option<St
         .filter(|text| !text.is_empty())
 }
 
-/// 构造内嵌的提供方错误（来自流内事件或 200 载荷）：已知线上错误码映射到对应的
-/// kind（上下文溢出触发强制压缩、限流保持可重试、配额归入不可重试的认证类），
-/// 未知码保持 UnknownProviderError，不自动重试，并带上提供方原文和码。
+/// 构造流内事件或 200 响应体中的提供方错误：已知错误码映射到对应分类（上下文超限触发压缩、限流可重试、配额耗尽归入认证错误），
+/// 未知错误码归为 `UnknownProviderError`（不自动重试），并附上提供方原文和错误码。
 pub(crate) fn provider_embedded_error(
     fields: &ProviderErrorBodyFields,
     fallback_message: &str,

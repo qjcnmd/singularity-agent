@@ -115,7 +115,7 @@
   font-size: 11px;
 }
 
-/* 对话内的 disclosure 共用一条紧凑行与有界输出。 */
+/* 思考与工具调用折叠行 */
 .activity-step, .reasoning-row { min-width: 0; }
 .activity-toggle { position: relative; display: flex; align-items: center; width: 100%; min-width: 0; height: 24px; padding: 0; border: 0; border-radius: 6px; background: transparent; text-align: left; color: var(--ink-soft); cursor: pointer; overflow: hidden; font-size: 14px; line-height: 24px; }
 
@@ -183,7 +183,7 @@
 .code-block-header { display: flex; align-items: center; justify-content: space-between; padding: 4px 10px; font-size: 12px; color: var(--ink-soft); border-bottom: 1px solid var(--line); }
 .code-block pre { margin: 0; background: transparent; }
 
-/* 对话控件留在阅读面旁边，位于其滚动流之外。 */
+/* 外层定位容器：把“回到最新”按钮固定在滚动容器外层 */
 .conversation-surface { position: relative; display: flex; min-height: 0; min-width: 0; }
 .conversation-surface > .conversation-scroll { flex: 1; min-width: 0; padding-inline: 0; }
 

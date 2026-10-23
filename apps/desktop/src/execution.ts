@@ -29,11 +29,11 @@ function replaceMessage(turn: ThreadTurn, messageId: string, completed: HistoryI
   items.splice(position < 0 ? items.length : position, 0, ...completed)
   return { ...turn, items }
 }
-/** 历史读取与流式更新直接操作协议条目，不另建一套执行对象。 */
+/** 把回合事件增量合并到已有的回合列表中。 */
 export function acceptExecutionEvent(facts: ThreadTurn[], event: TurnEventEnvelope): ThreadTurn[] {
   if (event.method === 'context/loaded') return facts
   const id = event.turnId ?? facts.at(-1)?.turnId
-  // 尚无回合时，独立压缩没有可显示的历史。
+  // 还没有任何回合时，手动压缩事件挂不到具体回合上，直接跳过。
   if (id === undefined) return facts
   const index = facts.findIndex(turn => turn.turnId === id)
   if (event.method === 'turn/started' && index < 0) {

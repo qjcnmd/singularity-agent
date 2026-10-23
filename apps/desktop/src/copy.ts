@@ -5,7 +5,6 @@ export function workspaceName(workspace: Workspace): string {
   return workspace.root.slice(workspace.root.lastIndexOf('/') + 1) || workspace.root
 }
 
-/** 直接显示协议状态；已保存的摘要没有执行状态。 */
 export const factStatusText: Record<ToolStatus | TurnStatus | 'recorded', string> = {
   recorded: '已记录',
   pending: '等待执行',
@@ -29,7 +28,7 @@ export const turnStatusText: Record<TurnStatus, string> = {
   interrupted: '任务已停止',
 }
 
-/** 用户停止与异常中断共用同一判断，正文和侧栏不能各自推断来源。 */
+/** 根据是否由用户主动停止返回对应的中断提示文案。 */
 export function interruptionText(manuallyStopped: boolean): string {
   return manuallyStopped ? factStatusText.interrupted : '任务异常中断'
 }
@@ -42,7 +41,6 @@ export const compactionText = {
   unchanged: '没有可压缩的内容',
 } as const
 
-/** Token 数量的紧凑展示；编辑输入保留精确容量。 */
 export function formatTokenCount(value: number): string {
   if (value < 1000) return String(value)
   if (value < 1_000_000) return `${Number((value / 1000).toFixed(1))}K`

@@ -23,7 +23,7 @@ pub async fn discover(base_url: &str, api_key: &str) -> Result<Vec<DiscoveredMod
             configuration_error(format!("模型查询客户端无法启动（{}）。", transport_error_source(error)))
         })?;
     let request = client.get(crate::openai::models_endpoint(base_url));
-    // 未保存的密钥是这次查询的纯输入；没提供时用已存的密钥（可能为空）。
+    // 有密钥时附带 Bearer 认证头，空密钥直接发匿名请求。
     let request = if api_key.is_empty() {
         request
     } else {
@@ -80,7 +80,7 @@ fn discovery_response_error(message: impl Into<String>) -> ProviderError {
 }
 
 fn discovery_http_error(status: u16) -> ProviderError {
-    // 模型发现不调度重试，直接使用共同的状态分类。
+    // 模型发现由用户手动触发，不自动重试，只复用 HTTP 状态码的错误分类。
     ProviderError::new(
         crate::error::provider_error_kind_for_http_status(status),
         format!("获取模型失败：HTTP {status}。仍可手动添加模型。"),

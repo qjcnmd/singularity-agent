@@ -1,5 +1,5 @@
-//! 提供方模型配置的结构与校验：只有纯结构类型（config.json 反序列化的目标）和不产生
-//! 副作用的校验函数；快照捕获、提供方解析和用户配置文件的读写流程见父模块 config。
+//! 模型配置字段的校验：检查标识符、思考字段格式、Chat 输出上限字段名和推理档位。
+//! 提供方解析和 `config.json` 读写见父模块 `config`。
 
 use super::{ProviderApiProtocol, ProviderError, ThinkingWireFormat, configuration_error};
 use crate::openai::wire::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD;
@@ -48,6 +48,7 @@ pub(crate) fn parse_chat_output_tokens_field(
 
 pub(crate) fn validate_reasoning_variants(
     protocol: ProviderApiProtocol,
+    thinking_wire_format: ThinkingWireFormat,
     variants: &[String],
 ) -> Result<(), ProviderError> {
     for (index, variant) in variants.iter().enumerate() {
@@ -57,6 +58,9 @@ pub(crate) fn validate_reasoning_variants(
         }
         if protocol == ProviderApiProtocol::Responses && variant == "on" {
             return Err(configuration_error("Responses 须选择具体思考档位，不支持 on 开关"));
+        }
+        if thinking_wire_format == ThinkingWireFormat::ReasoningEffort && variant == "on" {
+            return Err(configuration_error("reasoning_effort 须选择具体思考档位，不支持 on 开关"));
         }
     }
     Ok(())

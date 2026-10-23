@@ -35,12 +35,12 @@ type ModelEditorProps = {
   discover: () => Promise<DiscoveredModel[]>
 }
 
-/** 模型编辑弹窗负责草稿与校验；父级确认身份并更新列表。 */
+/** 单个模型的添加与编辑弹窗。 */
 export function ModelEditor({ index, initial, protocol, onConfirm, onClose, discover }: ModelEditorProps) {
   const [draft, setDraft] = useState(() => toDraft(initial))
   const [error, setError] = useState<string | null>(null)
   const variants = draft.reasoningVariants ?? []
-  const [options, setOptions] = useState(() => reasoningOptionsFor(variants, protocol))
+  const [options, setOptions] = useState(() => reasoningOptionsFor(draft, protocol))
   const draftRef = useRef(draft)
   draftRef.current = draft
   const revision = useRef(0)
@@ -80,7 +80,7 @@ export function ModelEditor({ index, initial, protocol, onConfirm, onClose, disc
       const previous = draftRef.current
       const next = fillDraft(previous, found, protocol)
       setDraft(next)
-      setOptions(reasoningOptionsFor([...found.reasoningVariants, ...(next.reasoningVariants ?? [])], protocol))
+      setOptions(reasoningOptionsFor(next, protocol, found.reasoningVariants))
       if (found.maxContextTokens === null && found.maxOutputTokens === null && found.reasoningVariants.length === 0) setFeedback('未获取模型参数')
     } catch (error) {
       if (current === revision.current) setError(error instanceof Error ? error.message : String(error))
@@ -93,9 +93,9 @@ export function ModelEditor({ index, initial, protocol, onConfirm, onClose, disc
     const output = parseCapacity(draft.outputText)
     const capacityError = capacityConfigurationError(context, output)
     if (capacityError !== null) return capacityError
-    const reasoningError = reasoningConfigurationError(variants, protocol)
+    const reasoningError = reasoningConfigurationError(draft, protocol)
     if (reasoningError !== null) return reasoningError
-    // 文本容量只在此解析一次；列表此后保存数值，展示使用紧凑 token 格式。
+    // 将容量输入解析为数值后再传给上层保存。
     const { contextText, outputText, ...model } = draft
     const next: ModelInput = { ...model, maxContextTokens: context, maxOutputTokens: output }
     return onConfirm(next)

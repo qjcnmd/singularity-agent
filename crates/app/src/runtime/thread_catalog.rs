@@ -1,6 +1,6 @@
 //! 会话文件的创建、打开、列出、读取历史和删除。
 //!
-//! 会话日志是唯一保存任务内容的地方，本模块只负责找到和打开文件，不另存副本。
+//! 会话内容保存在各自的 JSONL 日志文件中，本模块负责定位和读写这些文件。
 
 use std::path::{Path, PathBuf};
 
@@ -8,7 +8,7 @@ use singularity_agent::session::{SessionData, SessionError, SessionManager};
 use singularity_protocol::{ThreadHistory, ThreadSummary};
 use uuid::Uuid;
 
-use crate::runtime::history::{IndexedTurn, index_turn_history, summarize_thread};
+use crate::runtime::history::{index_turn_history, summarize_thread};
 
 /// 数据目录内保存会话文件的子目录名。
 pub const SESSIONS_DIR_NAME: &str = "sessions";
@@ -61,10 +61,7 @@ impl ThreadCatalog {
                 continue;
             };
             match open_thread_read_only(&self.sessions_dir, thread_id) {
-                Ok(session) => {
-                    let (summary, _) = thread_facts(&session);
-                    threads.push(summary);
-                }
+                Ok(session) => threads.push(summarize_thread(&session)),
                 Err(CatalogError::NotFound(_)) => {}
                 Err(error) => return Err(error),
             }
@@ -121,12 +118,6 @@ fn open_thread_read_only(sessions_dir: &Path, thread_id: &str) -> Result<Session
     Ok(session)
 }
 
-/// 划分一次回合，同时生成任务摘要；摘要和完整历史共用同一次划分。
-fn thread_facts(session: &SessionData) -> (ThreadSummary, Vec<IndexedTurn>) {
-    let turns = index_turn_history(session.entries());
-    (summarize_thread(session, &turns), turns)
-}
-
 /// 查找、打开或删除会话文件时的错误。
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -159,8 +150,8 @@ impl CatalogError {
 
 /// 从会话日志生成完整历史和任务摘要。
 pub fn read_thread_history(session: &SessionData) -> Result<ThreadHistory, CatalogError> {
-    let (summary, turns) = thread_facts(session);
-    let turns = turns
+    let summary = summarize_thread(session);
+    let turns = index_turn_history(session.entries())
         .iter()
         .map(|turn| turn.project(session))
         .collect::<Result<_, _>>()

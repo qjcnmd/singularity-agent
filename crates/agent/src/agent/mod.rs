@@ -57,7 +57,7 @@ pub enum AgentError {
     OutputTruncated,
     #[error("{0}")]
     InvalidSummary(String),
-    /// 压缩失败；对应条目已经显示了失败，外层不再重复报错，只决定是否继续任务。
+    /// 压缩失败；压缩条目本身已显示失败原因，外层据此避免重复显示同一错误。
     #[error("{source}")]
     Compaction {
         item_id: String,

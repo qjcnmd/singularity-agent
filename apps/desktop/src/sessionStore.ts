@@ -33,7 +33,7 @@ export interface AppState extends PersistedView, SyncState {
 }
 
 
-/** 管理任务切换、历史读取和事件同步的状态；判断哪次读取结果仍然有效的规则在内部。 */
+/** 管理任务切换、会话读取和流式事件同步。 */
 export class SessionStore {
   protected state: AppState = {
     ...loadPersisted(),
@@ -52,8 +52,7 @@ export class SessionStore {
   private readonly listeners = new Set<() => void>()
   private notification: number | null = null
   private viewSave: ReturnType<typeof setTimeout> | null = null
-  /** Store 持有的连接。设置、补全等局部查询直接复用它；传输生命周期（start/stop）
-   *  与状态同步由 Store 独占。 */
+  /** 与后端通信的 RPC 客户端；设置和候选搜索也通过它发起请求。 */
   readonly transport = new RpcClient(frame => this.onFrame(frame), connection => this.patch({ connection }))
   protected readonly drafts = new DraftStore(
     drafts => this.patch({ drafts }),
@@ -101,48 +100,48 @@ export class SessionStore {
   }
 
   async selectSession(sessionId: string): Promise<void> {
-    const workspaceId = Object.entries(this.state.bootstrap?.sessionsByWorkspace ?? {})
+    const workspaceRoot = Object.entries(this.state.bootstrap?.sessionsByWorkspace ?? {})
       .find(([, sessions]) => sessions.some(session => session.threadId === sessionId))?.[0]
-    if (workspaceId === undefined) return
+    if (workspaceRoot === undefined) return
     this.selectionRequest += 1
     if (sessionId === this.state.selectedSessionId) {
       if (this.state.session === null) await this.readSession(sessionId)
       return
     }
-    this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session: null,
+    this.patch({ selectedWorkspaceRoot: workspaceRoot, selectedSessionId: sessionId, session: null,
       sessionLoad: { status: 'loading', error: null } })
     this.saveSelection()
     await this.readSession(sessionId)
   }
 
   /** 空白页共用一份待发送草稿；第一条消息发送时才建立会话。 */
-  newTask(workspaceId = this.state.selectedWorkspaceId): void {
-    if (workspaceId === null) return
+  newTask(workspaceRoot = this.state.selectedWorkspaceRoot): void {
+    if (workspaceRoot === null) return
     this.selectionRequest += 1
     this.latestRead = null
-    this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: null, session: null,
+    this.patch({ selectedWorkspaceRoot: workspaceRoot, selectedSessionId: null, session: null,
       sessionLoad: { status: 'idle', error: null } })
-    if (this.state.sidebarView.collapsed.includes(workspaceId)) {
+    if (this.state.sidebarView.collapsed.includes(workspaceRoot)) {
       this.saveView({ sidebarView: { ...this.state.sidebarView,
-        collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceId) } })
+        collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceRoot) } })
     }
     this.saveSelection()
     if (this.resyncing === null) this.flushFrames()
   }
 
   draftKey(): string | null {
-    return this.state.selectedSessionId ?? (this.state.selectedWorkspaceId === null ? null : 'new-task')
+    return this.state.selectedSessionId ?? (this.state.selectedWorkspaceRoot === null ? null : 'new-task')
   }
 
   protected async startSession(params: SessionStartParams, selection: number): Promise<void> {
     const started = await this.transport.rpc('session.start', params)
-    this.applySync(acceptSessionStart(this.state, params.workspaceId, started))
+    this.applySync(acceptSessionStart(this.state, started))
     // 提交已成功；读取正文的结果不影响草稿清理，期间切换页面也不跳回。
     if (selection === this.selectionRequest) void this.selectSession(started.summary.threadId)
   }
 
-  sessions(workspaceId = this.state.selectedWorkspaceId): ThreadSummary[] {
-    return workspaceId === null ? [] : this.state.bootstrap?.sessionsByWorkspace[workspaceId] ?? []
+  sessions(workspaceRoot = this.state.selectedWorkspaceRoot): ThreadSummary[] {
+    return workspaceRoot === null ? [] : this.state.bootstrap?.sessionsByWorkspace[workspaceRoot] ?? []
   }
 
   private async readSession(sessionId: string): Promise<void> {
@@ -169,7 +168,7 @@ export class SessionStore {
     }
   }
 
-  /** 读取是否仍代表当前选择：有更新的请求或选择时，旧读取不写入状态。 */
+  /** 判断读取返回时是否仍对应当前选中的任务，避免过期响应覆盖新选择。 */
   private readIsCurrent(request: symbol, sessionId: string): boolean {
     return request === this.latestRead && this.state.selectedSessionId === sessionId
   }
@@ -180,7 +179,7 @@ export class SessionStore {
       if (frame.type === 'session_changed' || frame.type === 'session_settled' || frame.type === 'background_task_updated') this.applyFrame(frame)
       return
     }
-    // 正在重同步或初始化加载时暂存接收到的事件，就绪后再回放
+    // 重同步、读取会话或等待初始目录期间先暂存流式帧，完成后再按序回放。
     if (this.resyncing !== null || this.latestRead != null
       || (frame.type !== 'ready' && this.state.bootstrap === null)) {
       this.queuedFrames.push(frame)
@@ -213,9 +212,9 @@ export class SessionStore {
       try {
         const bootstrap = await this.transport.rpc('app.bootstrap', {})
         this.applySync(resetBaseline(this.state, bootstrap))
-        const workspaceId = this.state.selectedWorkspaceId
-        if (workspaceId !== null && this.state.selectedSessionId === null) {
-          void this.newTask(workspaceId)
+        const workspaceRoot = this.state.selectedWorkspaceRoot
+        if (workspaceRoot !== null && this.state.selectedSessionId === null) {
+          void this.newTask(workspaceRoot)
         }
         const { selectedSessionId } = this.state
         if (selectedSessionId !== null) {
@@ -315,16 +314,16 @@ export class SessionStore {
       if (pruned.selectionDropped) {
         this.latestRead = null
         this.selectionRequest += 1
-        patch.selectedWorkspaceId = pruned.selectedWorkspaceId
+        patch.selectedWorkspaceRoot = pruned.selectedWorkspaceRoot
         patch.selectedSessionId = pruned.selectedSessionId
         patch.sessionLoad = { status: 'idle', error: null }
       }
     }
     this.patch(patch, progress)
-    if (patch.selectedWorkspaceId !== undefined || patch.selectedSessionId !== undefined) this.saveSelection()
+    if (patch.selectedWorkspaceRoot !== undefined || patch.selectedSessionId !== undefined) this.saveSelection()
     // 当前任务已移出目录、项目仍在：沿用新建入口，继续在同一项目中工作。
-    if (patch.selectedSessionId === null && patch.selectedWorkspaceId != null) {
-      void this.newTask(patch.selectedWorkspaceId)
+    if (patch.selectedSessionId === null && patch.selectedWorkspaceRoot != null) {
+      void this.newTask(patch.selectedWorkspaceRoot)
     }
   }
 

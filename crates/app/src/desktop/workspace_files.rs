@@ -1,7 +1,7 @@
-//! 已登记 Workspace 内的有界文件候选搜索。
+//! 已添加项目目录内的文件候选搜索（最多返回 12 条）。
 //!
-//! 这里只做目录遍历和过滤；原生文件夹选择窗口在 `apps/desktop/desktop/main.ts`。扫描失败照常返回
-//! Err，只有「条目在扫描期间消失」这种瞬时情况按没有候选跳过。
+//! 这里只做目录遍历和过滤；原生文件夹选择窗口在 `apps/desktop/desktop/main.ts`。扫描失败直接报错，
+//! 扫描期间文件被删除则跳过。
 
 use singularity_protocol::FileCandidate;
 

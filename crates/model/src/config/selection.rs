@@ -1,4 +1,4 @@
-//! 从配置快照解析选中的提供方、模型参数和思考档位。
+//! 从 `config.json` 解析选中的提供方连接参数、模型容量与推理档位。
 
 use super::*;
 
@@ -71,9 +71,9 @@ pub(super) fn resolve_model_definition(
     let max_context_tokens = model_file.max_context_tokens;
     let max_output_tokens = model_file.max_output_tokens;
     let reasoning_variants = model_file.reasoning_variants.as_deref().unwrap_or_default();
-    validate_reasoning_variants(protocol, reasoning_variants)?;
     let thinking_wire_format =
         parse_thinking_wire_format(model_file.thinking_wire_format.as_deref(), protocol)?;
+    validate_reasoning_variants(protocol, thinking_wire_format, reasoning_variants)?;
     let chat_output_tokens_field =
         parse_chat_output_tokens_field(model_file.chat_output_tokens_field.as_deref(), protocol)?;
     if max_context_tokens == 0 || max_output_tokens == 0 {

@@ -1,5 +1,5 @@
-//! 对外公开的检查载荷：provider 的重放状态和文件系统的具体实现类型留在各自
-//! 模块内，任意工具的参数保持 JSON。
+//! 技能列表、文件搜索、目录选择，以及当前回合加载的指令与工具名称。
+//! 供工作台展示和补全使用。
 
 use serde::Serialize;
 
@@ -31,7 +31,7 @@ pub struct DirectoryPickResult {
     pub path: Option<String>,
 }
 
-/// 本进程最近一次实际装配的请求前缀；技能和工具仅供名称浏览。
+/// 本轮请求实际加载的指令文件、技能名称和工具名称，供工作台查看上下文。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

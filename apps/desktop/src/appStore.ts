@@ -1,3 +1,4 @@
+import { workspaceKey } from './workspace'
 import { SessionStore, type AppState, type QuestionDraft } from './sessionStore'
 import { actionOrigin } from './storeActions'
 export { actionOrigin, hasInlineActionError, pendingKey } from './storeActions'
@@ -49,9 +50,9 @@ class AppStore extends SessionStore {
     const phase = selectedSessionPhase(state)
     const active = phase === 'running' || phase === 'compacting'
     const submitPending = this.isPending('session.submit', actionOrigin.session(state.selectedSessionId))
-    // 按任务选择、连接、任务读取和运行阶段给出第一项阻止原因。
+    // 按优先级检查当前不能发送的原因。
     let blockedReason: string | null = null
-    if (state.selectedWorkspaceId === null) blockedReason = '请先选择项目'
+    if (state.selectedWorkspaceRoot === null) blockedReason = '请先选择项目'
     else if (state.connection !== 'ready') blockedReason = '连接未就绪'
     else if (state.bootstrapLoad.status !== 'idle') blockedReason = state.bootstrapLoad.status === 'error' ? '项目读取失败' : '正在读取项目'
     else if (state.sessionLoad.status === 'loading') blockedReason = '正在读取任务'
@@ -60,15 +61,15 @@ class AppStore extends SessionStore {
     else if (phase === 'stopping') blockedReason = '正在停止'
     else if (submitPending) blockedReason = '正在发送…'
     else if (!active && !this.modelAvailable()) blockedReason = '请选择模型'
-    return { canSubmit: state.drafts !== null && state.selectedWorkspaceId !== null && blockedReason === null && (draft.text.trim() !== '' || draft.images.length > 0), blockedReason } as const
+    return { canSubmit: state.drafts !== null && state.selectedWorkspaceRoot !== null && blockedReason === null && (draft.text.trim() !== '' || draft.images.length > 0), blockedReason } as const
   }
 
   async submitDraft(): Promise<boolean> {
     const { canSubmit } = this.submissionState()
     const sessionId = this.state.selectedSessionId
-    const workspaceId = this.state.selectedWorkspaceId
+    const workspaceRoot = this.state.selectedWorkspaceRoot
     const key = this.draftKey()
-    if (!canSubmit || workspaceId === null || key === null) return false
+    if (!canSubmit || workspaceRoot === null || key === null) return false
     const draft = this.inputDraft()
     const selection = this.modelSelection()
     const navigation = this.selectionRequest
@@ -76,7 +77,7 @@ class AppStore extends SessionStore {
       const input = { text: draft.text, images: await Promise.all(draft.images.map(imageUpload)) }
       if (sessionId === null) {
         if (selection === null) throw new Error('请选择模型')
-        await this.startSession({ ...input, workspaceId, selection }, navigation)
+        await this.startSession({ ...input, workspaceRoot, selection }, navigation)
       } else await this.transport.rpc('session.submit', { ...input, sessionId })
       await this.drafts.clearIfUnchanged(key, draft)
     })
@@ -131,16 +132,16 @@ class AppStore extends SessionStore {
     return this.sessionAction('session.updateSettings', sessionId => ({ sessionId, selection }))
   }
 
-  async removeWorkspace(workspaceId: string): Promise<boolean> {
-    const sessions = this.state.bootstrap?.sessionsByWorkspace[workspaceId] ?? []
+  async removeWorkspace(workspaceRoot: string): Promise<boolean> {
+    const sessions = this.state.bootstrap?.sessionsByWorkspace[workspaceRoot] ?? []
     const removedDrafts = sessions.map(session => session.threadId)
-    return this.action('workspace.remove', actionOrigin.inline('workspace.remove', workspaceId), async () => {
-      await this.transport.rpc('workspace.remove', { workspaceId })
+    return this.action('workspace.remove', actionOrigin.inline('workspace.remove', workspaceRoot), async () => {
+      await this.transport.rpc('workspace.remove', { workspaceRoot })
       this.clearSessionAnchors(removedDrafts)
       const workspaceAppearance = { ...this.state.workspaceAppearance }
-      delete workspaceAppearance[workspaceId]
+      delete workspaceAppearance[workspaceRoot]
       this.saveView({ workspaceAppearance, sidebarView: {
-        collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceId),
+        collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceRoot),
       } })
       await this.drafts.remove(removedDrafts, '项目已移除')
     })
@@ -167,7 +168,7 @@ class AppStore extends SessionStore {
       const result = await this.transport.rpc('directory.pick', {})
       if (result.path === null) return
       const workspace = await this.transport.rpc('workspace.add', { root: result.path })
-      this.newTask(workspace.workspaceId)
+      this.newTask(workspaceKey(workspace.root))
     })
   }
 
@@ -244,8 +245,8 @@ class AppStore extends SessionStore {
     this.saveView({ backgroundOpen })
   }
 
-  setWorkspaceAppearance(workspaceId: string, appearance: WorkspaceAppearance): void {
-    this.saveView({ workspaceAppearance: { ...this.state.workspaceAppearance, [workspaceId]: appearance } })
+  setWorkspaceAppearance(workspaceRoot: string, appearance: WorkspaceAppearance): void {
+    this.saveView({ workspaceAppearance: { ...this.state.workspaceAppearance, [workspaceRoot]: appearance } })
   }
 
   setMessageFontSize(value: number): void {
@@ -260,7 +261,7 @@ class AppStore extends SessionStore {
 
 export const appStore = new AppStore()
 
-/** 默认按字段引用订阅；消费者若只显示部分内容，可显式提供自己的比较规则。 */
+/** 订阅指定的状态字段；默认按字段引用比较，也可传入自定义相等判断。 */
 export function useAppStore<K extends keyof AppState>(
   fields: readonly K[],
   equal?: (previous: Pick<AppState, K>, next: Pick<AppState, K>) => boolean,

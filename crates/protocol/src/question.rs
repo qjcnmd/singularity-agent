@@ -1,4 +1,4 @@
-//! 当前回合向用户提问与提交答案的合同。
+//! `ask_user_question` 工具的问题、选项与用户回答类型。
 
 use serde::{Deserialize, Serialize};
 

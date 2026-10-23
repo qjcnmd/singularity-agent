@@ -173,7 +173,7 @@ impl SessionManager {
     }
 
     /// 使用事先分配的 ID 追加执行记录，保存的内容和实时显示的条目对应同一个 ID。
-    pub(crate) fn append_record_with_id(&mut self, id: String, record: LedgerRecord) -> Result<String> {
+    pub fn append_record_with_id(&mut self, id: String, record: LedgerRecord) -> Result<String> {
         self.append_entry(SessionEntry::Record { id, timestamp: now_iso(), record })
     }
 
@@ -193,7 +193,7 @@ impl SessionManager {
     }
 
     pub(super) fn append_entry(&mut self, entry: SessionEntry) -> Result<String> {
-        // 上次追加失败，文件末尾可能有半行；重新打开截掉之前不再写入。
+        // 上次写入失败可能留下残缺行，必须重新打开并截掉残缺末尾后才能继续追加。
         if let Some(error) = &self.append_error {
             return Err(SessionError::Io(std::io::Error::new(
                 error.kind(),
@@ -210,7 +210,7 @@ impl SessionManager {
     }
 
     fn write_append(&mut self, handle: &mut impl Write, bytes: &[u8]) -> Result<()> {
-        // 写入失败可能留下半行。这半行留给下次打开时截掉，在那之前不再追加。
+        // 记下写入错误，阻止后续追加把新记录拼在残缺行后面。
         let result = handle
             .write_all(bytes)
             .and_then(|()| handle.write_all(b"\n"))

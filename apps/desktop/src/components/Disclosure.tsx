@@ -1,15 +1,9 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 
 /**
- * 高度披露：内容自行决定高度，容器按量到的像素过渡 `height`。
+ * 展开/收起面板：通过 `ResizeObserver` 测量内层实际像素高度并驱动外层 `height` 过渡。
  *
- * 高度由内层量出。按容器轨道比例推算要在过渡中才与实际内容一致，会把文档流里的
- * 下方内容提前推开。内层始终挂载，`overflow: hidden` 只裁剪绘制、不改布局高度，
- * 收起状态下也能读到真实高度。
- *
- * 高度过渡结束前保留正在关闭的内容，过渡结束即卸载；开启“减少动效”时立即卸载。
- * 内容高度为 0 的披露不产生高度过渡，子树保持挂载，容器是 `inert` 且高度为 0，
- * 不参与交互也不占位。
+ * 展开时挂载内容并过渡到实测高度；收起时先过渡到 `0px`，过渡结束后卸载内容（开启“减少动效”时立即卸载）。
  */
 export function Disclosure({ open, children }: { open: boolean; children: ReactNode }) {
   const [mounted, setMounted] = useState(open)

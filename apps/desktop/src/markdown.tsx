@@ -1,7 +1,6 @@
-//! 正文渲染：Markdown（GFM、数学公式）与代码块布局。
-//!
-//! 模型正文的 Markdown 渲染和代码块布局，各处共用。时间线条目的状态不在这里，
-//! 代码高亮在 highlight。
+/**
+ * 正文渲染：Markdown（GFM、数学公式）、流式文本平滑揭示与代码块高亮。
+ */
 
 import { isValidElement, memo, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { useReducedMotion } from 'motion/react'
@@ -86,7 +85,6 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   return <div className="code-block"><div className="code-block-header"><span>{language || '代码'}</span><CopyButton text={text} label="复制代码" /></div>{language ? <HighlightedCode code={text} language={language} /> : <pre><code>{text}</code></pre>}</div>
 }
 
-/** 代码块布局；高亮 token 由公共 highlight 模块提供，未就绪时落回原文。 */
 const HighlightedCode = memo(function HighlightedCode({ code, language }: { code: string; language: string }) {
   const tokens = useCodeTokens(code, language)
   return <pre className="highlighted-code"><code>{tokens === null ? code : tokens.map((line, row) => <span key={row}><CodeTokens tokens={line} />{row < tokens.length - 1 ? '\n' : ''}</span>)}</code></pre>

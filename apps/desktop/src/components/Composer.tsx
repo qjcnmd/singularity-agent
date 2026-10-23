@@ -23,7 +23,7 @@ export const Composer = memo(ComposerView)
 
 function ComposerView({ centered }: { centered: boolean }) {
   const reducedMotion = useReducedMotion()
-  const state = useAppStore(['drafts', 'questionDrafts', 'actionErrors', 'pendingActions', 'bootstrap', 'bootstrapLoad', 'connection', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'liveSessions', 'sessionLoad', 'theme', 'workspaceAppearance'])
+  const state = useAppStore(['drafts', 'questionDrafts', 'actionErrors', 'pendingActions', 'bootstrap', 'bootstrapLoad', 'connection', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'liveSessions', 'sessionLoad', 'theme', 'workspaceAppearance'])
   const { text: draft, images: imageDraft } = appStore.inputDraft()
   const sessionId = state.selectedSessionId
   const draftKey = appStore.draftKey()
@@ -57,7 +57,7 @@ function ComposerView({ centered }: { centered: boolean }) {
   const usage = useMemo(() => sessionUsage(state.session), [state.session])
   useEffect(() => {
     setCaret(textarea.current?.selectionStart ?? draft.length)
-  }, [draft, state.selectedSessionId, state.selectedWorkspaceId])
+  }, [draft, state.selectedSessionId, state.selectedWorkspaceRoot])
   useEffect(() => setSuggestionIndex((index) => Math.min(index, Math.max(0, suggestions.length - 1))), [suggestions.length])
   const { canSubmit, blockedReason } = appStore.submissionState()
 
@@ -153,7 +153,7 @@ function ComposerView({ centered }: { centered: boolean }) {
         <textarea
           ref={textarea}
           disabled={inputDisabled}
-          placeholder={state.selectedWorkspaceId === null ? '请先选择项目' : undefined}
+          placeholder={state.selectedWorkspaceRoot === null ? '请先选择项目' : undefined}
           value={draft}
           onSelect={event => { setCaret(event.currentTarget.selectionStart) }}
           onChange={(event) => {
@@ -205,7 +205,7 @@ function ComposerView({ centered }: { centered: boolean }) {
           <div className="composer-context">
             {!pendingQuestion && <>
             {imageInput.picker}
-            <ComposerTools key={state.selectedSessionId ?? state.selectedWorkspaceId} imageInput={imageInput}
+            <ComposerTools key={state.selectedSessionId ?? state.selectedWorkspaceRoot} imageInput={imageInput}
               theme={state.theme} occupancy={occupancy}
               compactDisabled={!appStore.modelAvailable() || !hasTurns || state.connection !== 'ready' || phase !== 'idle' || state.pendingActions.has(pendingKey('session.compact', sessionOrigin))} />
             </>}

@@ -6,7 +6,7 @@ const hasDraft = (draft: Draft | undefined) => draft !== undefined && (draft.tex
 
 export type DraftSnapshot = Readonly<Record<string, Draft>>
 
-/** 草稿存储失败保留当前操作的反馈；由工作台决定反馈显示的位置。 */
+/** IndexedDB 草稿读写失败错误，附带恢复建议。 */
 export class DraftStorageError extends Error {
   constructor(message: string, readonly recovery: string) {
     super(message)
@@ -14,7 +14,7 @@ export class DraftStorageError extends Error {
   }
 }
 
-/** 草稿的唯一可变所有者；发布给工作台的快照与内部使用同一份不可变引用。 */
+/** 管理各任务的输入草稿（文字、图片和未启动任务的模型选择），同步到 IndexedDB。 */
 export class DraftStore {
   private snapshot: DraftSnapshot | null = null
   private loading: Promise<DraftSnapshot | null> | null = null
@@ -39,7 +39,7 @@ export class DraftStore {
     return this.snapshot?.[sessionId] ?? emptyDraft
   }
 
-  /** 编辑立即更新内存；落盘失败时保留页面内的内容并报告存储错误。 */
+  /** 编辑时先更新内存快照；写入 IndexedDB 失败时保留当前页面内的草稿并报错。 */
   async set(sessionId: string, draft: Draft): Promise<boolean> {
     if (this.snapshot === null) return false
     const drafts = { ...this.snapshot }
@@ -60,7 +60,7 @@ export class DraftStore {
     if (this.snapshot?.[sessionId] === submitted) await this.set(sessionId, emptyDraft)
   }
 
-  /** 删除或移除已成功；草稿删除成功后才更新快照，失败保留原记录并说明部分完成。 */
+  /** 任务或项目删除后清理对应草稿；IndexedDB 删除成功后才更新内存快照。 */
   async remove(sessionIds: string[], completed: string): Promise<void> {
     try {
       await removeDrafts(sessionIds)
@@ -107,7 +107,6 @@ async function persistDraft(id: string, draft: Draft): Promise<void> {
   await complete(transaction)
 }
 
-/** 删除或移除成功后，一次提交对应任务的草稿删除。 */
 async function removeDrafts(ids: string[]): Promise<void> {
   const transaction = (await openDatabase()).transaction('drafts', 'readwrite')
   const store = transaction.objectStore('drafts')
@@ -129,7 +128,7 @@ async function loadDrafts(): Promise<Record<string, Draft>> {
   return result
 }
 
-/** 图片字节在发送边界编码；草稿保留 File，避免每次编辑文字复制 Base64。 */
+/** 发送时才把图片编码为 Data URL；草稿阶段只存 `File` 对象，避免每次输入文字都复制大段 Base64。 */
 export function imageUpload(file: File): Promise<ImageUpload> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()

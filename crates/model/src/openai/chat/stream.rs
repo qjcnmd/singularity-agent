@@ -48,7 +48,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         let raw = std::str::from_utf8(data)
             .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_utf8"))?
             .trim();
-        // [DONE] 表示流结束；读取循环随后停止，之后的数据不再处理。
+        // [DONE] 表示流结束；标记完成后读取循环立即停止。
         if raw == "[DONE]" {
             self.done = true;
             return Ok(());

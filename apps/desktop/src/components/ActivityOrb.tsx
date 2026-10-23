@@ -18,7 +18,7 @@ function OrbCanvas({ fast }: { fast: boolean }) {
     const tick = (now: number) => {
       const elapsed = last === null ? 0 : Math.min((now - last) / 1000, 0.1)
       last = now
-      // 速度按已用时间积分，改速度不影响当前 phase。
+      // 按帧间隔乘以当前速率累加相位，切换状态时动画连续不跳变。
       render(elapsed * speed.current)
       frame = requestAnimationFrame(tick)
     }

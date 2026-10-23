@@ -6,7 +6,7 @@ import { Dialog } from './Dialog'
 
 const accept = '.png,.jpg,.jpeg,.webp,.gif,.bmp'
 
-/** 粘贴、拖入和文件选择共用 File 草稿；编码发生在发送边界。 */
+/** 处理粘贴、拖放和文件选择图片，加入草稿 `File` 列表（发送时再编码为 Data URL）。 */
 export function useImageInput(add: (images: File[]) => void, disabled = false) {
   const input = useRef<HTMLInputElement>(null)
   const receive = (files: File[]) => {
@@ -32,7 +32,6 @@ export function useImageInput(add: (images: File[]) => void, disabled = false) {
   return { handlers, picker, open: () => input.current?.click(), disabled }
 }
 
-/** 输入与历史只在图片来源上不同，缩略图及大图交互由同一个呈现维护。 */
 export function DraftImages({ images, remove }: { images: File[]; remove?: (index: number) => void }) {
   return <div className="image-list">{images.map((image, index) => <ImageTile key={index} name={image.name} file={image} remove={remove && (() => remove(index))} />)}</div>
 }

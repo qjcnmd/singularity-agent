@@ -1,4 +1,4 @@
-//! 任务的运行快照、临时显示内容和事件发布。
+//! 任务运行态视图、流式与待处理项状态及事件发布。
 use super::*;
 use singularity_protocol::{
     SessionFailure, SessionReadResult, SessionRuntime, StreamEvent, TurnEventEnvelope,
@@ -32,9 +32,8 @@ impl Conversation {
         let view = self.lock_view();
         let phase = self.phase();
         let writer = lock_writer(&self.writer);
-        let turns = crate::runtime::history::index_turn_history(writer.entries());
         singularity_protocol::SessionStartResult {
-            summary: crate::runtime::history::summarize_thread(&writer, &turns),
+            summary: crate::runtime::history::summarize_thread(&writer),
             status: singularity_protocol::SessionStatus { phase, failure: view.failure.clone() },
             revision: view.last_event_revision,
         }
@@ -109,8 +108,7 @@ impl Conversation {
     }
     pub(super) fn summary(&self) -> singularity_protocol::ThreadSummary {
         let writer = lock_writer(&self.writer);
-        let turns = crate::runtime::history::index_turn_history(writer.entries());
-        crate::runtime::history::summarize_thread(&writer, &turns)
+        crate::runtime::history::summarize_thread(&writer)
     }
     pub(super) fn publish_summary(&self, view: &mut ConversationView) {
         view.last_event_revision =

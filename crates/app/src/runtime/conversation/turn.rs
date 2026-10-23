@@ -1,6 +1,6 @@
 //! 一个回合的完整执行：准备模型和指令、运行 Agent、保存并发布最终状态。
-//! 回合开始记录（operation_started）先于本回合的其他内容写入日志；结束记录
-//! （operation_finished，含状态和错误）先保存再发布结束事件。
+//! 回合开始记录（`operation_started`）先于本回合的其他内容写入日志；结束记录
+//! （`operation_finished`，含状态和错误）先写入日志再发布结束事件。
 
 use std::sync::Arc;
 
@@ -150,10 +150,10 @@ impl Conversation {
             Arc::clone(&controls.questions),
             Arc::clone(&self.bash_tasks),
         );
-        // 开始记录只保存回合 ID；输入消息由 Agent 之后单独保存，两次写入不是一个事务。
+        // 开始记录的 ID 就是回合 ID；输入消息由 Agent 之后单独保存，两次写入不是一个事务。
         let mut writer = lock_writer(&writer);
         let started_at = writer
-            .append_record(LedgerRecord::OperationStarted { turn_id: controls.turn_id.clone() })
+            .append_record_with_id(controls.turn_id.clone(), LedgerRecord::OperationStarted)
             .map_err(preparation_error)?;
         Ok((agent, started_at))
     }

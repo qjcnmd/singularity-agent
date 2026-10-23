@@ -1,4 +1,4 @@
-//! MCP 设置与连接检查的桌面合同。
+//! MCP 服务器配置、连接状态与设置 RPC 的参数类型。
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -40,7 +40,7 @@ pub struct McpServerInput {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct McpListParams {
-    pub workspace_id: Option<String>,
+    pub workspace_root: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,7 +48,7 @@ pub struct McpListParams {
 #[serde(rename_all = "camelCase")]
 pub struct McpSaveParams {
     pub server: McpServerInput,
-    pub workspace_id: Option<String>,
+    pub workspace_root: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,7 +56,7 @@ pub struct McpSaveParams {
 #[serde(rename_all = "camelCase")]
 pub struct McpServerParams {
     pub server_id: String,
-    pub workspace_id: Option<String>,
+    pub workspace_root: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,10 +65,10 @@ pub struct McpServerParams {
 pub struct McpToggleParams {
     pub server_id: String,
     pub enabled: bool,
-    pub workspace_id: Option<String>,
+    pub workspace_root: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct McpToolInfo {

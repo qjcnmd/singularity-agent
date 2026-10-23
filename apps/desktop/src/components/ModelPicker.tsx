@@ -12,14 +12,13 @@ interface ModelChoice {
 }
 
 interface ModelPickerProps {
-  /** 只声明本组件读取的字段：父级按同一份清单订阅。 */
-  state: Pick<AppState, 'bootstrap' | 'session' | 'selectedWorkspaceId' | 'selectedSessionId' | 'pendingActions'>
+  state: Pick<AppState, 'bootstrap' | 'session' | 'selectedWorkspaceRoot' | 'selectedSessionId' | 'pendingActions'>
 }
 
 export function ModelPicker({ state }: ModelPickerProps) {
   const selection = appStore.modelSelection()
   // 切换任务关闭浮层并丢弃待处理的滑块编辑；同一任务切换模型保留浮层。
-  const scope = JSON.stringify([state.selectedWorkspaceId, state.selectedSessionId])
+  const scope = JSON.stringify([state.selectedWorkspaceRoot, state.selectedSessionId])
   return <ModelPickerControls key={scope} state={state} selection={selection} />
 }
 
@@ -97,7 +96,7 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
         popoverTarget={popupId}
         type="button"
         className="sg-trigger"
-        disabled={state.selectedWorkspaceId === null}
+        disabled={state.selectedWorkspaceRoot === null}
         aria-haspopup="dialog"
         aria-expanded={open}
         title={effortLabel ? `${modelLabel} · ${effortLabel}` : modelLabel}

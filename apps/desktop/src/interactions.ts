@@ -39,7 +39,7 @@ export function usePopoverFocus(
   }, [open, container, initialFocus])
 }
 
-/** 只有当前可操作的控件参与焦点导航。 */
+/** 筛选容器内当前可见、未禁用且未被 `inert`/`aria-hidden` 隐藏的可聚焦元素。 */
 export function focusableElements(root: HTMLElement): HTMLElement[] {
   return [...root.querySelectorAll<HTMLElement>('button, input, select, textarea, summary, a[href], [tabindex]')]
     .filter(node => !node.matches(':disabled, [tabindex="-1"]') && !node.closest('[inert], [aria-hidden="true"]') && node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden')
@@ -57,7 +57,6 @@ export function navigateList(key: string, buttons: HTMLElement[]): boolean {
   return true
 }
 
-/** 点击控件外关闭。 */
 export function useDismissOnOutside(
   container: RefObject<HTMLElement | null>, active: boolean, onClose: () => void,
 ) {

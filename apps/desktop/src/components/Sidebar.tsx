@@ -1,3 +1,4 @@
+import { workspaceKey } from '../workspace'
 import { Ellipsis, FolderMinus, Plus } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useId, useRef, useState } from 'react'
@@ -21,7 +22,7 @@ type PendingDialog =
 
 export const Sidebar = memo(SidebarView)
 
-const sidebarFields = ['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceId', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'workspaceAppearance'] as const
+const sidebarFields = ['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceRoot', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'workspaceAppearance'] as const
 type SidebarState = Pick<AppState, typeof sidebarFields[number]>
 
 /** 浅比较侧栏依赖的状态，避免无关后台事件触发重渲染。 */
@@ -80,26 +81,27 @@ function SidebarView() {
           </div>
           <div className="workspace-list">
             {state.bootstrap?.workspaces.map((item) => {
-              const sessions = state.bootstrap?.sessionsByWorkspace[item.workspaceId] ?? []
+              const root = workspaceKey(item.root)
+              const sessions = state.bootstrap?.sessionsByWorkspace[root] ?? []
               const titleOf = sessionTitles(sessions)
-              const expanded = !collapsed.has(item.workspaceId)
-              const visible = showAll.has(item.workspaceId) ? sessions : sessions.slice(0, 5)
-              return <section key={item.workspaceId}>
+              const expanded = !collapsed.has(root)
+              const visible = showAll.has(root) ? sessions : sessions.slice(0, 5)
+              return <section key={root}>
                 <WorkspaceButton
                   workspace={item}
-                  selected={item.workspaceId === state.selectedWorkspaceId}
+                  selected={root === state.selectedWorkspaceRoot}
                   expanded={expanded}
-                  appearance={state.workspaceAppearance[item.workspaceId] ?? defaultWorkspaceAppearance}
+                  appearance={state.workspaceAppearance[root] ?? defaultWorkspaceAppearance}
                   onToggle={() => {
                     const next = new Set(collapsed)
-                    if (next.has(item.workspaceId)) {
-                      next.delete(item.workspaceId)
+                    if (next.has(root)) {
+                      next.delete(root)
                       setShowAll(previous => {
                         const reset = new Set(previous)
-                        reset.delete(item.workspaceId)
+                        reset.delete(root)
                         return reset
                       })
-                    } else next.add(item.workspaceId)
+                    } else next.add(root)
                     appStore.setSidebarView({ collapsed: [...next] })
                   }}
                   onRemove={() => setDialog({ kind: 'remove', workspace: item })}
@@ -112,12 +114,12 @@ function SidebarView() {
                       className="quiet-button"
                       onClick={() => setShowAll(previous => {
                         const next = new Set(previous)
-                        if (next.has(item.workspaceId)) next.delete(item.workspaceId)
-                        else next.add(item.workspaceId)
+                        if (next.has(root)) next.delete(root)
+                        else next.add(root)
                         return next
                       })}
                     >
-                      {showAll.has(item.workspaceId) ? '收起' : `显示更多 (${sessions.length - 5})`}
+                      {showAll.has(workspaceKey(item.root)) ? '收起' : `显示更多 (${sessions.length - 5})`}
                     </button>
                   )}
                 </div></Disclosure>
@@ -151,9 +153,9 @@ function WorkspaceButton({ workspace, selected, expanded, appearance, onToggle, 
         <span className="workspace-name"><strong>{name}</strong></span>
         <ExpandChevron expanded={expanded} className="workspace-chevron" />
       </button>
-      <button type="button" className="icon-button workspace-new" onClick={() => void appStore.newTask(workspace.workspaceId)} aria-label={`在 ${name} 新建任务`}><Plus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
+      <button type="button" className="icon-button workspace-new" onClick={() => void appStore.newTask(workspaceKey(workspace.root))} aria-label={`在 ${name} 新建任务`}><Plus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
       <button type="button" className="icon-button workspace-remove" onClick={onRemove} aria-label={`移除项目 ${name}`} title="移除项目" aria-haspopup="dialog"><FolderMinus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
-      <WorkspaceAppearancePicker id={appearanceId} open={appearanceOpen} appearance={appearance} onChange={value => appStore.setWorkspaceAppearance(workspace.workspaceId, value)} onToggle={setAppearanceOpen} />
+      <WorkspaceAppearancePicker id={appearanceId} open={appearanceOpen} appearance={appearance} onChange={value => appStore.setWorkspaceAppearance(workspaceKey(workspace.root), value)} onToggle={setAppearanceOpen} />
     </div>
   )
 }
@@ -202,7 +204,7 @@ function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () =
   const [name, setName] = useState('')
   const { actionErrors, pendingActions } = useAppStore(['actionErrors', 'pendingActions'])
   const method = state.kind === 'rename' ? 'session.rename' : 'workspace.remove'
-  const origin = state.kind === 'none' ? null : actionOrigin.inline(method, state.kind === 'rename' ? state.session.threadId : state.workspace.workspaceId)
+  const origin = state.kind === 'none' ? null : actionOrigin.inline(method, state.kind === 'rename' ? state.session.threadId : workspaceKey(state.workspace.root))
   const busy = origin !== null && pendingActions.has(pendingKey(method, origin))
   const close = () => { if (!busy) onClose() }
   const initialName = state.kind === 'rename' ? state.session.title ?? '' : ''
@@ -231,7 +233,7 @@ function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () =
   }
   const title = '移除项目'
   const targetName = workspaceName(state.workspace)
-  const confirm = async () => { if (await appStore.removeWorkspace(state.workspace.workspaceId)) onClose() }
+  const confirm = async () => { if (await appStore.removeWorkspace(workspaceKey(state.workspace.root))) onClose() }
   return (
     <Dialog open onClose={close} labelledBy="confirm-title" className="confirm-modal">
       <header className="modal-header"><div><span>确认操作</span><h2 id="confirm-title">{title}</h2></div><button type="button" className="icon-button" data-autofocus disabled={busy} onClick={close} aria-label="关闭">×</button></header>
@@ -257,7 +259,6 @@ function relativeTime(value: string): string {
   return days < 7 ? `${days}天` : new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric' }).format(then)
 }
 
-/** 侧栏使用的图标：添加项目（打开文件夹选择）。 */
 function FolderIcon() {
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M20 12v8H3V5h6l3 3h3M19 3v6M16 6h6" /></svg>
 }

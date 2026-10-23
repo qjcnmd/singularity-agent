@@ -46,12 +46,12 @@ impl AppServer {
         Ok(workspace)
     }
 
-    pub async fn remove_workspace(self: &std::sync::Arc<Self>, workspace_id: &str) -> Result<(), RpcError> {
+    pub async fn remove_workspace(self: &std::sync::Arc<Self>, workspace_root: &str) -> Result<(), RpcError> {
         let app = std::sync::Arc::clone(self);
-        let workspace_id = workspace_id.to_owned();
+        let workspace_root = workspace_root.to_owned();
         let close = tokio::task::spawn_blocking(move || {
             let lifecycle = app.lock_lifecycle();
-            let workspace = app.workspace(&workspace_id)?;
+            let workspace = app.workspace(&workspace_root)?;
             let mut sessions = app.lock_sessions();
             let belongs = |conversation: &std::sync::Arc<crate::runtime::Conversation>| {
                 matches!(
@@ -66,7 +66,7 @@ impl AppServer {
                     "等待处理完成，或停止后台命令并删除相关任务后重试。",
                 ));
             }
-            app.workspaces.remove(&workspace_id).map_err(workspace_error)?;
+            app.workspaces.remove(&workspace_root).map_err(workspace_error)?;
             sessions.retain(|_, conversation| {
                 if belongs(conversation) {
                     conversation.set_closing(true);
@@ -87,14 +87,14 @@ impl AppServer {
         Ok(())
     }
 
-    pub fn workspace(&self, workspace_id: &str) -> Result<Workspace, RpcError> {
+    pub fn workspace(&self, workspace_root: &str) -> Result<Workspace, RpcError> {
         self.workspaces
-            .find(workspace_id)
+            .find(workspace_root)
             .ok_or_else(|| workspace_error(WorkspaceError::NotFound))
     }
 
-    pub fn skills(&self, workspace_id: &str) -> Result<singularity_protocol::SkillCatalog, RpcError> {
-        let root = self.workspace(workspace_id)?.root;
+    pub fn skills(&self, workspace_root: &str) -> Result<singularity_protocol::SkillCatalog, RpcError> {
+        let root = self.workspace(workspace_root)?.root;
         let catalog = singularity_core::skills::SkillCatalog::discover(Path::new(&root), &self.home);
         Ok(singularity_protocol::SkillCatalog {
             skills: catalog
@@ -110,13 +110,13 @@ impl AppServer {
         })
     }
 
-    /// 查询已登记工作区内的文件候选；候选数量由补全界面的调用者决定。
+    /// 搜索指定项目目录内的文件候选（最多返回 12 条）。
     pub fn file_search(
         &self,
-        workspace_id: &str,
+        workspace_root: &str,
         query: &str,
     ) -> Result<Vec<singularity_protocol::FileCandidate>, RpcError> {
-        let root = self.workspace(workspace_id)?.root;
+        let root = self.workspace(workspace_root)?.root;
         workspace_files::search_files(&root, query).map_err(invalid_request)
     }
 }
@@ -127,19 +127,13 @@ fn group_threads(
     workspaces: &[Workspace],
     threads: Vec<ThreadSummary>,
 ) -> Result<BTreeMap<String, Vec<ThreadSummary>>, String> {
-    let mut grouped: BTreeMap<String, (singularity_core::CanonicalWorkspacePath, Vec<ThreadSummary>)> =
-        workspaces
-            .iter()
-            .map(|workspace| {
-                singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
-                    .map(|identity| (workspace.workspace_id.clone(), (identity, Vec::new())))
-            })
-            .collect::<Result<_, _>>()?;
+    let mut grouped: BTreeMap<String, Vec<ThreadSummary>> =
+        workspaces.iter().map(|workspace| (workspace.root.to_lowercase(), Vec::new())).collect();
     for thread in threads {
-        let identity = singularity_core::CanonicalWorkspacePath::from_saved(&thread.cwd)?;
-        if let Some((_, bucket)) = grouped.values_mut().find(|(workspace, _)| workspace == &identity) {
+        let directory = singularity_core::CanonicalWorkspacePath::from_saved(&thread.cwd)?;
+        if let Some(bucket) = grouped.get_mut(directory.key()) {
             bucket.push(thread);
         }
     }
-    Ok(grouped.into_iter().map(|(workspace_id, (_, threads))| (workspace_id, threads)).collect())
+    Ok(grouped)
 }

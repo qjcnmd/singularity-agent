@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! 执行事件的合同与公共协议对象。
+//! 前后端与各 crate 共用的 RPC 请求、事件、历史和配置类型。
 
 mod app;
 mod background;

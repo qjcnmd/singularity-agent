@@ -45,7 +45,7 @@ async function start(): Promise<void> {
   })
   backend = new Backend(app.isPackaged ? join(process.resourcesPath, 'runtime', 'singularity.exe') : join(app.getAppPath(), 'desktop-runtime', 'singularity.exe'))
   backend.on('failure', (error: Error) => {
-    // 窗口还没建好时，start() 只报告一次被拒绝的 ready promise。
+    // 窗口建立前的启动失败由 await backend.ready 统一报错退出。
     if (!window || window.isDestroyed()) return
     window.webContents.send('singularity:failure')
     void dialog.showMessageBox({ type: 'error', title: 'Singularity', message: '工作台后端已停止', detail: error.message, buttons: ['退出'] }).then(() => app.quit())

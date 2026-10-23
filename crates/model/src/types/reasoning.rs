@@ -8,8 +8,7 @@ pub(crate) const DEFAULT_CHAT_REASONING_FIELD: &str = "reasoning_content";
 pub(crate) const CHAT_REASONING_FIELDS: &[&str] =
     &[DEFAULT_CHAT_REASONING_FIELD, "reasoning", "reasoning_text"];
 
-/// 提供方私有的推理状态：在适配器边界内可以安全重放，不展示，也不进入公开会话、trace、
-/// 评估或错误结构。类型公开是因为 harness 持有轮次之间的推理重放边界。
+/// 随助手消息保存在会话日志中的提供方续接信息，用于后续请求向同一模型回传思考字段；转换前端历史条目时不展示。
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "protocol", rename_all = "snake_case")]
 pub enum ProviderMessageMetadata {

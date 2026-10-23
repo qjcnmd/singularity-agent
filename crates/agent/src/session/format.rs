@@ -1,7 +1,7 @@
 //! 会话日志的格式定义和文件头检查。
 //!
-//! 回合结束记录（operation_finished）只保存最终状态、错误和是否由用户停止。成功的回复
-//! 随消息保存请求记录，其他请求单独记录；指令和工具定义不写日志，每轮重新读取。
+//! 回合结束记录（`operation_finished`）保存最终状态、错误和是否由用户停止。产出可见内容的普通回复
+//! 随消息保存请求耗时与用量，其余请求（重试、无输出的失败请求和摘要请求）单独记为 `model_request`；指令和工具定义不写日志，每轮重新读取。
 
 use serde::{Deserialize, Serialize};
 use singularity_protocol::TurnStatus;
@@ -46,7 +46,7 @@ pub enum SessionMetadata {
     },
 }
 
-/// 执行记录：回合开始与结束、模型请求、后台命令和中断前的输出。不进入模型上下文。
+/// 执行记录：回合开始与结束、未生成消息的模型请求和后台命令状态。不进入模型上下文。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "recordType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LedgerRecord {
@@ -54,15 +54,12 @@ pub enum LedgerRecord {
     BackgroundTaskUpdated {
         task: singularity_protocol::BackgroundTask,
     },
-    /// 一次没有产生已保存回复的模型请求（失败、取消或摘要请求）。
+    /// 一次没有产生可见回复消息的模型请求（重试、无输出的失败/取消或摘要请求）。
     ModelRequest {
         observation: singularity_protocol::RequestObservation,
     },
-    /// 回合开始。
-    OperationStarted {
-        #[serde(rename = "turnId")]
-        turn_id: String,
-    },
+    /// 回合开始，记录 ID 就是回合 ID。
+    OperationStarted,
     /// 回合结束：完成、失败或中断，失败时带错误详情。
     OperationFinished {
         #[serde(rename = "turnId")]
@@ -104,7 +101,7 @@ pub enum SessionEntry {
 }
 
 impl SessionEntry {
-    /// 这一行包含的请求记录：成功回复的消息自带记录，其他请求是单独的一行。
+    /// 取出这一行的模型请求记录（来自带请求记录的助手消息或单独的 `ModelRequest` 记录）。
     pub fn request_observation(&self) -> Option<&singularity_protocol::RequestObservation> {
         match self {
             Self::Message { observation, .. } => observation.as_ref(),

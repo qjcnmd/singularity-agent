@@ -61,8 +61,13 @@ export function App() {
       <Sidebar />
       {!state.sidebarCollapsed ? <ResizeSeparator value={state.sidebarWidth} onChange={(value) => appStore.setSidebarWidth(value)} /> : <div />}
       <div className="app-content" style={{ '--background-width': `${state.backgroundWidth}px` } as CSSProperties} onKeyDown={event => {
-        if (!state.backgroundOpen) return
-        if (event.key === 'Escape') { event.stopPropagation(); closeBackground() }
+        if (!state.backgroundOpen || event.defaultPrevented) return
+        if (event.key === 'Escape') {
+          // 弹窗和原生浮层先处理 Escape，避免同时关闭后面的侧栏。
+          if (document.querySelector(':modal, :popover-open')) return
+          event.stopPropagation()
+          closeBackground()
+        }
         if (event.key !== 'Tab' || !compactViewport) return
         const nodes = [backgroundToggle.current, ...(backgroundPanel.current ? focusableElements(backgroundPanel.current) : [])]
           .filter((node): node is HTMLElement => node !== null && node.getClientRects().length > 0)
@@ -131,8 +136,8 @@ const MainContent = memo(function MainContent({ compactViewport, onOpenBackgroun
   compactViewport: boolean
   onOpenBackground: (button: HTMLButtonElement) => void
 }) {
-  const state = useAppStore(['selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'backgroundOpen', 'actionErrors', 'actionErrorOrigin', 'pendingActions'])
-  const items = useMemo(() => buildTimeline(state.session, state.bootstrap?.userHome), [state.session, state.bootstrap?.userHome])
+  const state = useAppStore(['selectedSessionId', 'selectedWorkspaceRoot', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'backgroundOpen', 'actionErrors', 'actionErrorOrigin', 'pendingActions'])
+  const items = useMemo(() => buildTimeline(state.session), [state.session])
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspaceSessions = appStore.sessions()
   // 页头和侧栏用同一套标题规则；任务还不在项目列表里时，只显示用户起的名字或“新任务”。

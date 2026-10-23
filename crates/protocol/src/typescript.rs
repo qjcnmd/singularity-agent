@@ -1,4 +1,4 @@
-//! 按实际 RPC DTO 确定性生成的客户端声明，与桌面程序一起构建和分发。
+//! 从协议类型生成前端 TypeScript 声明（`apps/desktop/src/protocol.generated.ts`）。
 
 use std::{
     any::TypeId,
@@ -37,7 +37,7 @@ impl TypeVisitor for Bindings {
     }
 }
 
-/// wire DTO 里的数值按 JSON number 导出。
+/// 生成前端使用的全部 TypeScript 类型声明和 `RpcContract` 接口；64 位整数按 `number` 导出。
 pub fn client_types() -> String {
     let mut bindings = Bindings {
         config: Config::default().with_large_int("number"),

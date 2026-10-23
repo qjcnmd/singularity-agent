@@ -1,13 +1,12 @@
 import { useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 import { appStore, type AppState } from '../appStore'
-import { type TimelineItemModel } from '../timeline'
+import { type TimelineRow } from '../timeline'
 import { TimelineItem } from './TimelineItem'
 import { defaultAnchor } from '../viewPersistence'
 
 interface Props {
-  /** 只声明本组件读取的字段：父级按同一份清单订阅。 */
-  state: Pick<AppState, 'selectedSessionId' | 'session' | 'sessionLoad' | 'pendingActions'>
-  items: TimelineItemModel[]
+  state: Pick<AppState, 'selectedSessionId' | 'session' | 'sessionLoad' | 'bootstrap'>
+  items: TimelineRow[]
 }
 
 export function Conversation({ state, items }: Props) {
@@ -69,7 +68,7 @@ export function Conversation({ state, items }: Props) {
     updateScrollState(node)
     const anchor = appStore.viewportAnchor()
     const floor = Math.max(0, node.scrollHeight - node.clientHeight)
-    // 程序化恢复与 Chromium 收缩钳制都保留阅读意图。
+    // 忽略代码设置 scrollTop 或内容高度收缩导致的被动滚动，只响应用户主动滚动。
     const movedByReader = Math.abs(node.scrollTop - Math.min(observedTop.current, floor)) > 0.5
     observedTop.current = node.scrollTop
     if (!movedByReader) return
@@ -96,7 +95,7 @@ export function Conversation({ state, items }: Props) {
     node.focus({ preventScroll: true })
   }
 
-  // 空白新任务由父层 hero 负责；这里只处理已选任务的读取中与读取失败。
+  // 空白新任务由外层 MainContent 处理；这里只处理已选任务的读取中与读取失败状态。
   if (state.session === null) {
     if (state.sessionLoad.status === 'error' && state.sessionLoad.error !== null) {
       return (
@@ -114,7 +113,7 @@ export function Conversation({ state, items }: Props) {
   return (
     <div className="conversation-surface"><div className="conversation-scroll" ref={viewport} tabIndex={0} aria-label="任务内容" onScroll={onScroll} onClickCapture={preserveDisclosurePosition}>
       <div className="conversation-document">
-        {items.map(item => <TimelineItem key={item.key} item={item} sessionId={sessionId ?? undefined} />)}
+        {items.map(item => <TimelineItem key={item.key} item={item.item} itemKey={item.key} cwd={state.session!.summary.cwd} userHome={state.bootstrap?.userHome} sessionId={sessionId ?? undefined} />)}
       </div>
 
     </div>

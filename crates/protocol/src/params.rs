@@ -133,7 +133,7 @@ pub enum HistoryItem {
 }
 
 impl HistoryItem {
-    /// 条目 ID。
+    /// 返回条目的唯一标识。
     pub fn id(&self) -> &str {
         match self {
             Self::Message { id, .. }
@@ -175,7 +175,7 @@ pub struct Thread {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-/// 回合的 ID 和状态。
+/// 回合开始和结束事件中携带的回合标识与状态。
 pub struct Turn {
     pub turn_id: String,
     pub status: TurnStatus,
@@ -212,7 +212,7 @@ pub struct SessionModelUsage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
-/// 回合生命周期状态。
+/// 回合、消息或压缩条目的执行状态。
 pub enum TurnStatus {
     Running,
     Completed,

@@ -21,7 +21,7 @@ impl SseFrameDecoder {
     fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         let mut last_newline = None;
         for &byte in chunk {
-            // CR 已经结束上一行；紧随其后的 LF 即使在下一段 chunk 中，也不再结束一行。
+            // CR 已经结束上一行；紧随其后的 LF 即使跨 chunk 到达也直接跳过，避免多切出空行。
             let follows_cr = self.previous_cr;
             self.previous_cr = byte == b'\r';
             if follows_cr && byte == b'\n' {
@@ -66,7 +66,7 @@ impl SseFrameDecoder {
         } else {
             (line, &[] as &[u8])
         };
-        // Responses 的事件内容都在 data 字段的 JSON 里，其他 SSE 字段不参与执行。
+        // Chat 和 Responses 的流事件内容都在 data 行里，忽略 event、id、retry 等其他 SSE 字段。
         if field == b"data" {
             if !self.event_data.is_empty() {
                 self.event_data.push(b'\n');
@@ -106,7 +106,7 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
 
     loop {
         let chunk = provider_future(cancellation, response.chunk()).await?;
-        // 读取与取消可能同时就绪；即使 select 返回数据，也不再分发已取消请求的帧。
+        // 读取与取消同时就绪时若先拿到数据，仍优先按已取消退出，避免处理已取消请求的数据。
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
         }
@@ -126,7 +126,6 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
     }
 }
 
-/// 流式响应格式错误。
 pub(crate) fn provider_stream_malformed_error(message: &'static str, reason: &'static str) -> ProviderError {
     ProviderError::diagnostic(ModelErrorKind::JsonSchemaViolation, message, vec![reason.to_string()])
 }

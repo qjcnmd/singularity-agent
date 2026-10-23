@@ -1,4 +1,4 @@
-//! 图片入口共用的识别与快照：上传和 read 只在取得字节的方式上不同。
+//! 用户上传、`read` 工具和 MCP 工具返回图片的格式识别、解码校验与文件读写。
 
 use std::io::{Cursor, Read};
 use std::path::Path;
@@ -8,7 +8,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{ImageFormat, ImageReader};
 use singularity_protocol::{ImageAttachment, ImageUpload};
 
-/// 已校验的图片字节；控制请求复制时共享像素，不复制大块数据。
+/// 已校验的图片附件和文件内容；克隆时通过 `Arc` 共享字节。
 #[derive(Debug, Clone, PartialEq)]
 pub struct InputImage {
     pub attachment: ImageAttachment,
@@ -36,7 +36,7 @@ impl InputImage {
         Self::prepare(name, bytes)
     }
 
-    /// 读取一次文件内容，后续保存和模型请求使用这份快照。
+    /// 读取图片文件并校验格式和尺寸。
     pub(crate) fn read(path: &Path, mut reader: impl Read) -> Result<Self, String> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).map_err(|error| format!("无法读取图片：{error}"))?;
@@ -89,7 +89,7 @@ fn data_url(mime: &str, bytes: &[u8]) -> String {
     format!("data:{mime};base64,{}", STANDARD.encode(bytes))
 }
 
-/// 从持久快照构造视觉输入；源文件后续的变化不会改变历史。
+/// 从会话图片目录读取已保存的图片并编码成 data URL，供模型请求和界面预览使用。
 pub(crate) fn load_image(directory: &Path, attachment: &ImageAttachment) -> std::io::Result<String> {
     uuid::Uuid::parse_str(&attachment.id)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;

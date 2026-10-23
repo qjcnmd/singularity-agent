@@ -1,3 +1,4 @@
+import { workspaceKey } from './workspace'
 import { acceptExecutionEvent, finishTurn, readExecution, type SessionView } from './execution'
 import type { SessionReadResult, SessionStartResult, SessionRuntime, StreamEnvelope, AppBootstrap, TurnEventEnvelope, ThreadSummary, ModelCatalogResult } from './protocol'
 
@@ -38,15 +39,15 @@ function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSe
   }
 }
 
-/** 应用全局 bootstrap 元数据快照 */
+/** 合并 `app.bootstrap` 快照，同时保留读取期间已收到更新的事件修订版本。 */
 export function acceptBootstrap(state: SyncState, bootstrap: AppBootstrap): SyncState {
   if (state.bootstrap !== null && bootstrap.revision < state.bootstrap.revision) return state
   const sessionsByWorkspace = { ...bootstrap.sessionsByWorkspace }
   // 目录读取期间任务仍可更新；保留在这次读取开始之后收到的摘要。
-  for (const [workspaceId, sessions] of Object.entries(state.bootstrap?.sessionsByWorkspace ?? {})) {
-    const incoming = sessionsByWorkspace[workspaceId] ?? []
+  for (const [workspaceRoot, sessions] of Object.entries(state.bootstrap?.sessionsByWorkspace ?? {})) {
+    const incoming = sessionsByWorkspace[workspaceRoot] ?? []
     const newer = sessions.filter(session => (state.liveSessions[session.threadId]?.summaryRevision ?? 0) > bootstrap.revision)
-    if (newer.length > 0) sessionsByWorkspace[workspaceId] = sortSessions([
+    if (newer.length > 0) sessionsByWorkspace[workspaceRoot] = sortSessions([
       ...newer, ...incoming.filter(item => !newer.some(session => session.threadId === item.threadId)),
     ])
   }
@@ -66,48 +67,48 @@ function sortSessions(sessions: ThreadSummary[]): ThreadSummary[] {
 }
 
 /** 标题和结束状态只替换所属项目中的一行，其他项目保持原来的引用。 */
-function acceptSummary(state: SyncState, summary: ThreadSummary, revision: number, workspaceId?: string): SyncState {
+function acceptSummary(state: SyncState, summary: ThreadSummary, revision: number): SyncState {
   const bootstrap = state.bootstrap
   const previous = state.liveSessions[summary.threadId]
   if (!bootstrap || revision <= Math.max(bootstrap.revision, previous?.summaryRevision ?? 0)) return state
-  workspaceId ??= bootstrap.workspaces.find(workspace => workspace.root.toLowerCase() === summary.cwd.toLowerCase())?.workspaceId
-  if (!workspaceId) return state
-  const sessions = bootstrap.sessionsByWorkspace[workspaceId] ?? []
+  const workspaceRoot = workspaceKey(summary.cwd)
+  if (!(workspaceRoot in bootstrap.sessionsByWorkspace)) return state
+  const sessions = bootstrap.sessionsByWorkspace[workspaceRoot] ?? []
   return { ...state,
     liveSessions: { ...state.liveSessions, [summary.threadId]: {
       ...(previous ?? { phase: 'idle', failure: null, backgroundTasks: [], revision: 0 }), summaryRevision: revision,
     } },
     session: state.session?.summary.threadId === summary.threadId ? { ...state.session, summary } : state.session,
     bootstrap: { ...bootstrap, sessionsByWorkspace: { ...bootstrap.sessionsByWorkspace,
-      [workspaceId]: sortSessions([summary, ...sessions.filter(item => item.threadId !== summary.threadId)]),
+      [workspaceRoot]: sortSessions([summary, ...sessions.filter(item => item.threadId !== summary.threadId)]),
     } },
   }
 }
 
 /** 首次发送只更新这个任务，不改变整个目录的事件序号。 */
-export function acceptSessionStart(state: SyncState, workspaceId: string, started: SessionStartResult): SyncState {
+export function acceptSessionStart(state: SyncState, started: SessionStartResult): SyncState {
   if (state.bootstrap!.revision >= started.revision) return state
   const next = acceptLiveSession(state, started.summary.threadId, started.status, started.revision)
-  return acceptSummary(next, started.summary, started.revision, workspaceId)
+  return acceptSummary(next, started.summary, started.revision)
 }
 
-/** 根据目录快照剔除已删除任务的活动状态和无效选择。 */
+/** 根据最新目录剔除已删除项目的选中态与已删除任务的内存状态，并在未选中项目时默认选中第一个项目。 */
 export function pruneStaleSelection(
   bootstrap: AppBootstrap,
-  state: Pick<SyncState, 'liveSessions' | 'session'> & { selectedWorkspaceId: string | null; selectedSessionId: string | null },
+  state: Pick<SyncState, 'liveSessions' | 'session'> & { selectedWorkspaceRoot: string | null; selectedSessionId: string | null },
 ) {
-  const workspaces = new Set(bootstrap.workspaces.map(workspace => workspace.workspaceId))
+  const workspaces = new Set(bootstrap.workspaces.map(workspace => workspaceKey(workspace.root)))
   const sessions = new Set(Object.values(bootstrap.sessionsByWorkspace).flat().map(session => session.threadId))
   const liveSessions = Object.fromEntries(Object.entries(state.liveSessions).filter(([id]) => sessions.has(id)))
   const session = state.session !== null && !sessions.has(state.session.summary.threadId) ? null : state.session
-  const workspaceRemoved = state.selectedWorkspaceId !== null && !workspaces.has(state.selectedWorkspaceId)
+  const workspaceRemoved = state.selectedWorkspaceRoot !== null && !workspaces.has(state.selectedWorkspaceRoot)
   const sessionRemoved = state.selectedSessionId !== null && !sessions.has(state.selectedSessionId)
   const selectionDropped = workspaceRemoved || sessionRemoved
   return {
     liveSessions,
     session: selectionDropped ? null : session,
     selectionDropped,
-    selectedWorkspaceId: workspaceRemoved ? null : state.selectedWorkspaceId,
+    selectedWorkspaceRoot: workspaceRemoved ? null : state.selectedWorkspaceRoot,
     selectedSessionId: selectionDropped ? null : state.selectedSessionId,
   }
 }

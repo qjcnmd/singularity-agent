@@ -11,7 +11,7 @@ use crate::params::Turn;
 pub struct TurnErrorDetail {
     pub cause: TurnFailureCause,
     pub message: String,
-    /// 已经显示了这次失败的条目（如压缩条目）；界面据此不再重复显示原因。
+    /// 已经显示了这次失败的条目 ID（如压缩条目），界面据此避免重复报错。
     #[serde(rename = "itemId", default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub item_id: Option<String>,
@@ -54,7 +54,6 @@ pub enum TurnEvent {
         item_id: String,
         result: crate::ToolResult,
     },
-    #[serde(rename = "provider/attempt")]
     #[cfg_attr(feature = "typescript", ts(skip))]
     ProviderAttempt { observation: crate::RequestObservation },
     #[serde(rename = "turn/completed")]
@@ -63,8 +62,7 @@ pub enum TurnEvent {
         manually_stopped: bool,
         finished_at: String,
     },
-    /// 提问或压缩阶段变化，只触发运行快照发布。
-    #[serde(rename = "turn/sessionStateChanged")]
+    /// 提问或压缩状态变化，通知外层推送最新的 `SessionRuntime`。
     #[cfg_attr(feature = "typescript", ts(skip))]
     SessionStateChanged {},
     #[serde(rename = "turn/error")]

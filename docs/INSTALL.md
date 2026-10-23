@@ -1,10 +1,8 @@
-# 安装与配置指南
+# 安装与配置
 
-Singularity 是面向 Windows 的本地 Coding Agent，由 Electron 桌面工作台和 Rust 后端组成。安装包自带完整运行时。
+本文介绍发布包的安装、模型和 MCP 配置、项目指令与技能，以及数据目录。从源码构建见[开发指南](development.md)。
 
----
-
-## 1. 快速开始（发布包）
+## 安装发布包
 
 ### 系统要求
 - **操作系统**：Windows 10 / 11 (x86-64)
@@ -12,44 +10,12 @@ Singularity 是面向 Windows 的本地 Coding Agent，由 Electron 桌面工作
 - **可选依赖**：根据被开发项目的需要，安装对应语言工具链（如 Node.js、Python、Rust、`ripgrep` 等）
 
 ### 运行
-1. 解压发布压缩包到任意本地目录。
-2. 双击运行 `Singularity.exe`。
-3. 应用通过私有 stdio 管道与本地 Rust 后端通信，无需配置端口或网络代理。
+1. 把发布包解压到任意本地目录，保留完整目录，运行时不需要另装 Node.js。
+2. 双击运行 `Singularity.exe`。不需要配置端口或网络代理。
    - **窗口行为**：点击窗口关闭按钮会最小化至系统托盘，后台任务继续执行；右键托盘图标选择“退出”可完全结束程序。
-   - **快捷键**：<kbd>Ctrl</kbd> + <kbd>R</kbd> 可重载前端界面，不会中断 Rust 核心进程。
+   - **快捷键**：<kbd>Ctrl</kbd> + <kbd>R</kbd> 重新加载界面，不会中断正在运行的任务。
 
----
-
-## 2. 从源码构建
-
-如需二次开发或自行打包，请准备以下构建环境：
-- **Rust**：1.96.0+ (MSVC 工具链)
-- **C++ 构建工具**：Visual Studio Build Tools（勾选 Desktop development with C++）
-- **Node.js**：v24.x 与 npm 11.x
-- **Git for Windows**
-
-```powershell
-# 1. 克隆代码仓库
-git clone https://github.com/qjcnmd/singularity-agent.git
-Set-Location singularity-agent
-
-# 2. 编译前端桌面界面
-npm --prefix apps/desktop ci
-npm --prefix apps/desktop run build
-
-# 3. 编译 Rust 后端
-cargo build --release --locked --package singularity_app --bins
-
-# 4. 拷贝后端产物到桌面资源目录并打包
-npm --prefix apps/desktop run prepare:runtime -- release
-npm --prefix apps/desktop run package
-```
-
-打包完成后，绿色免安装产物位于 `apps/desktop/release/win-unpacked/`。直接拷贝该目录至任意 Windows 机器即可运行。
-
----
-
-## 3. 模型 Provider 配置
+## 模型配置
 
 可通过工作台界面的 **“设置 > 模型”** 可视化配置，也可直接编辑数据目录下的配置文件：
 - **模型配置与 API Key**：`~/.singularity/config.json`，保存时一起原子替换。文件包含密钥，请勿泄露或提交到版本控制。
@@ -60,7 +26,7 @@ npm --prefix apps/desktop run package
 
 默认模型只用于空白页的初始选择；首次发送保存该任务的模型，之后沿用它或在任务内切换。
 
-模型容量可通过“获取模型参数”读取提供方返回的值；提供方未返回时手动填写。工作台用档位按钮配置可用思考程度，使用时在模型选择器中切换。任务未选择思考档位时，使用提供方默认行为。
+模型容量可通过“获取可用模型”或“获取模型参数”读取提供方返回的值；提供方未返回时手动填写。工作台用档位按钮配置可用思考程度，使用时在模型选择器中切换。任务未选择思考档位时，使用提供方默认行为。
 
 `~/.singularity/config.json`：
 ```json
@@ -87,13 +53,13 @@ npm --prefix apps/desktop run package
 }
 ```
 
-`reasoning_variants` 直接填写提供方接受的档位名称，例如 `["off", "low", "high"]`。仅支持开关的 Chat 模型可填写 `["off", "on"]`。
+`reasoning_variants` 直接填写提供方接受的档位名称，例如 `["off", "low", "high"]`。Chat 模型使用 `thinking_type` 或 `enable_thinking` 开关字段时，可填写 `["off", "on"]`；默认的 `reasoning_effort` 字段和 Responses 协议须填写具体档位或 `off`，不接受 `on`。
 
 ### `base_url` 规范与常见厂商示例
 
 `api_protocol` 必须在提供方上设置为 `chat` 或 `responses`，该提供方的所有模型统一使用它。模型配置不包含协议字段。
 
-系统会在 `base_url` 后追加 `/chat/completions`、`/responses` 或 `/models`。请填写 API 根地址，按服务商要求保留版本号和自定义路径，不填写完整接口地址：
+系统会在 `base_url` 后追加 `/chat/completions`、`/responses` 或 `/models`。请填写 API 根地址，按提供方要求保留版本号和自定义路径，不填写完整接口地址：
 
 | 提供方 | 推荐 `base_url` | 协议类型 (`api_protocol`) |
 | --- | --- | --- |
@@ -105,18 +71,16 @@ npm --prefix apps/desktop run package
 
 ### 模型请求格式
 
-不同端点使用的思考和输出字段可在模型设置中指定：
+不同 Chat 端点使用的思考和输出字段可在 `config.json` 的模型条目中指定：
 
 | 字段 | 默认值 | 作用说明 |
 | --- | --- | --- |
 | `thinking_wire_format` | `reasoning_effort` | 思考模式字段：`reasoning_effort`、`thinking_type` (Anthropic 风格) 或 `enable_thinking` (布尔值) |
 | `chat_output_tokens_field` | `max_tokens` | Chat 协议指定输出上限的字段名，可切换为 `max_completion_tokens` |
 
----
+## MCP 工具
 
-## 4. MCP (Model Context Protocol) 工具
-
-通过 **“设置 > MCP”** 可添加本地（stdio）或远程（Streamable HTTP）服务器。配置持久化于 `~/.singularity/mcp.json`：
+通过 **“设置 > MCP”** 可添加本地（stdio）或远程（Streamable HTTP）服务器。配置保存在 `~/.singularity/mcp.json`：
 
 ```json
 {
@@ -146,9 +110,7 @@ npm --prefix apps/desktop run package
 - **连接状态**：打开设置只查看已有状态，不会主动连接。每轮开始时复用正常的连接并重新获取工具列表，服务器更新工具后下一轮生效。连接失败时可点击“重试连接”。工具在一轮中途被服务器移除时，调用会直接失败，不会自动重试。
 - **环境要求**：本地 stdio 服务需要在系统 PATH 中安装对应的运行环境（如 Node.js 或 Python）。
 
----
-
-## 5. 项目指令与技能 (Skills)
+## 项目指令与技能
 
 ### 项目指令 (`AGENTS.md`)
 Agent 在每轮开始时完整读取指令，同一轮内不变，压缩不会重新读取。按以下顺序合并，越靠后越具体：
@@ -174,11 +136,9 @@ description: 审查代码改动并生成专业建议
 3. 用户全局目录 `~/.singularity/skills/`
 4. 用户主目录 `~/.agents/skills/`
 
----
+## 数据目录
 
-## 6. 数据存储与目录维护
-
-系统所有配置、凭据与任务会话集中存储于数据根目录：
+所有配置、凭据与会话日志保存在数据根目录：
 - **默认路径**：`%USERPROFILE%\.singularity`
 - **自定义路径**：设置系统环境变量 `SINGULARITY_HOME` 为指定的绝对路径；未设置或只含空白时使用默认目录。
 
@@ -190,7 +150,8 @@ description: 审查代码改动并生成专业建议
 | `mcp.json` | MCP 服务器列表、环境变量与开关状态 |
 | `workspaces.json` | 已添加的项目及其目录 |
 | `sessions/<id>.jsonl` | 每个任务的完整历史（当前格式为 v1） |
-| `sessions/images/` | 会话中发送或读取的图片快照文件 |
+| `sessions/images/<id>/` | 各任务中发送或读取的图片文件 |
+| `AGENTS.md` | 用户全局指令（可选） |
 | `skills/` | 用户级全局技能脚本与说明 |
 
 ### 数据备份与升级

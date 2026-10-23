@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-//! 各 crate 共享的文件权限与 workspace 规则。
+//! 各 crate 共用的数据目录、项目路径、AGENTS.md 加载、技能发现与基础工具函数。
 
 mod project_instructions;
 pub mod skills;
@@ -11,7 +11,7 @@ pub use project_instructions::{InstructionFile, load_agent_instructions};
 pub use user_home::resolve_home;
 pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace, saved_directory_matches};
 
-/// 项目根目录标记文件名（`.git`）。
+/// 向上查找项目根目录（AGENTS.md 与项目技能的查找上界）时识别的 `.git` 标记。
 pub(crate) const PROJECT_ROOT_MARKER: &str = ".git";
 
 /// 将 Duration 转换为毫秒数，溢出时封顶 u64::MAX。
@@ -49,7 +49,7 @@ pub fn utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
-/// 递归创建应用数据目录。
+/// 递归创建目录，失败时在错误中附带目录路径。
 pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(path).map_err(|error| format!("failed to create {}: {error}", path.display()))
 }

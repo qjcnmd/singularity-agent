@@ -277,7 +277,7 @@ impl BashTasks {
                     BackgroundTaskState::Failed { message, .. } => Some(format!("failed: {message}")),
                     _ => None,
                 };
-                // 通知先入箱，再公开终态；移除项目不会漏掉尚未消费的完成通知。
+                // 先把完成通知放进输入队列，再标记命令结束，避免 `has_work` 在两者之间误判为空闲。
                 if let Some(status) = status {
                     self.inbox
                         .lock()

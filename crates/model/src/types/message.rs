@@ -1,5 +1,5 @@
 use super::{ModelToolCall, ProviderBlockMetadata, ProviderMessageMetadata};
-/// 模型协议编码时使用的角色，通知在边界映射为 user。
+/// 发给模型时的消息角色；后台通知作为 `user` 消息发送。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ModelRole {
@@ -18,7 +18,7 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<ProviderBlockMetadata>,
     },
-    /// 图片像素保存在会话所属目录，消息只保留不可变快照描述。
+    /// 图片文件保存在 `sessions/images/<会话 ID>/` 下，消息里只记录图片 ID、名称、类型和尺寸。
     Image(singularity_protocol::ImageAttachment),
     /// 思考正文只保存一次，签名和加密内容跟随对应块。
     Thinking {
@@ -47,7 +47,7 @@ pub enum Message {
     #[serde(rename_all = "camelCase")]
     Assistant {
         content: Vec<ContentBlock>,
-        /// 模型提供方的私有推理状态，用于 Responses 这类协议重放推理的连续性。
+        /// 提供方专用的推理续接信息（Chat 的思考字段名与 `reasoning_details`、Responses 的来源标识），仅在后续请求发往同一提供方、模型、协议和地址时附带。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_metadata: Option<ProviderMessageMetadata>,
     },
@@ -57,7 +57,7 @@ pub enum Message {
         /// 对应的工具调用 ID；名称和参数由原始 ToolCall 记录提供，这里不重复。
         tool_call_id: String,
         is_error: bool,
-        /// 观测到的工具执行耗时；结果未知或没有执行时缺省。
+        /// 工具实际执行的耗时（毫秒）；未执行或结果未知时为空。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
         /// read 实际读取到的源文件范围；只有 read 的成功结果才带这个字段。
@@ -78,7 +78,7 @@ impl Message {
         }
     }
 
-    /// 用户消息和任务标题共用展示文字；借用原文，模型仍消费 content。
+    /// 用户消息第一段文本（`index == 0`）若有展开技能前的原始输入（`display_text`），界面和标题显示原始输入，模型仍读取展开后的 `content`。
     pub fn text_for_display<'a>(&'a self, index: usize, text: &'a str) -> &'a str {
         match self {
             Self::User { display_text: Some(display), .. } if index == 0 => display,
@@ -99,7 +99,7 @@ impl Message {
         })
     }
 
-    /// 消息里的工具调用载荷。
+    /// 按消息中的顺序遍历所有工具调用。
     pub fn tool_calls(&self) -> impl Iterator<Item = &ModelToolCall> {
         self.content().iter().filter_map(|block| match block {
             ContentBlock::ToolCall(call) => Some(call),
@@ -115,7 +115,7 @@ impl Message {
         }
     }
 
-    /// provider 的推理重放数据；只有 assistant 消息会带。
+    /// 助手消息携带的提供方续接信息；其他角色返回 `None`。
     pub fn provider_metadata(&self) -> Option<&ProviderMessageMetadata> {
         match self {
             Self::Assistant { provider_metadata, .. } => provider_metadata.as_ref(),

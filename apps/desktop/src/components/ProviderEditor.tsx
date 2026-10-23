@@ -66,7 +66,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
     setFailure(null)
     setFetching(true)
     try {
-      // 复用当前 RPC 传输通道执行模型发现
+      // 通过后端查询提供方的可用模型列表
       const found = await queryModels()
       if (revision !== discoveryRevision.current) return
       if (found.length === 0) {
@@ -120,7 +120,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
         setFailure(`模型 ${id}：${capacityError}`)
         return
       }
-      const reasoningError = reasoningConfigurationError(model.reasoningVariants, protocol)
+      const reasoningError = reasoningConfigurationError(model, protocol)
       if (reasoningError !== null) {
         setFailure(`模型 ${id}：${reasoningError}`)
         return
@@ -169,7 +169,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
               {models.length === 0 && <p className="sg-model-empty">尚无模型。</p>}
               <div className="sg-model-list">
                 {models.map((model, index) => {
-                  const reasoningError = reasoningConfigurationError(model.reasoningVariants, protocol)
+                  const reasoningError = reasoningConfigurationError(model, protocol)
                   return (
                   <div key={index} className="sg-model-entry">
                     <div className="sg-model-row">

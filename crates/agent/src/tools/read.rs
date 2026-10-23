@@ -1,4 +1,4 @@
-//! read 工具：有界地流式读取指定文件，支持按 offset 与 limit 读取一段行范围。
+//! `read` 工具：读取文本文件（支持按 `offset` 和 `limit` 分页）或图片文件。
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};

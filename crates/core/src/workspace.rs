@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::display_path;
 
-/// 规范化的工作区路径结构，封装原生路径、展示路径与不区分大小写的比较键。
+/// 已规范化的项目目录路径；相等比较忽略大小写和斜杠方向。
 #[derive(Debug, Clone)]
 pub struct CanonicalWorkspacePath {
     native: PathBuf,
@@ -14,7 +14,7 @@ pub struct CanonicalWorkspacePath {
 }
 
 impl CanonicalWorkspacePath {
-    /// 从已保存的路径字符串恢复规范路径对象。
+    /// 从已保存的绝对路径构造，只整理路径组件，不访问文件系统。
     pub fn from_saved(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
         if !path.is_absolute() {
@@ -29,12 +29,17 @@ impl CanonicalWorkspacePath {
         Self { native, display, comparison_key }
     }
 
-    /// 获取供底层文件系统 API 使用的原生路径。
+    /// 文件系统调用使用的原生路径。
     pub fn as_path(&self) -> &Path {
         &self.native
     }
 
-    /// 获取供协议和界面展示的统一路径字符串。
+    /// 忽略大小写的目录键，用于项目分组。
+    pub fn key(&self) -> &str {
+        &self.comparison_key
+    }
+
+    /// 界面显示和保存使用的正斜杠路径（去掉 Windows `\\?\` 前缀）。
     pub fn display(&self) -> &str {
         &self.display
     }
@@ -48,7 +53,7 @@ impl PartialEq for CanonicalWorkspacePath {
 
 impl Eq for CanonicalWorkspacePath {}
 
-/// 比较两个已保存的路径是否指向相同的工作区目录。
+/// 按忽略大小写的规范形式比较两个已保存的绝对路径。
 pub fn saved_directory_matches(left: &str, right: &str) -> Result<bool, String> {
     let left = CanonicalWorkspacePath::from_saved(left)?;
     let right = CanonicalWorkspacePath::from_saved(right)?;

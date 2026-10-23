@@ -7,7 +7,7 @@ impl Conversation {
         &self.bash_tasks
     }
 
-    /// 界面和模型工具共用后台命令管理器的查询结果。
+    /// 返回当前任务的后台命令列表，供界面展示。
     pub fn background_tasks(&self) -> Vec<singularity_protocol::BackgroundTask> {
         self.bash_tasks.list()
     }

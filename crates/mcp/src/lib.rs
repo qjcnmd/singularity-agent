@@ -23,8 +23,8 @@ type ConnectionCell = Arc<tokio::sync::Mutex<ConnectionState>>;
 
 struct ConnectionState {
     connection: Option<Arc<Connection>>,
-    // 设置页读取最近发现结果，不另发发现请求。
-    catalog: Result<Vec<Tool>, String>,
+    // 设置页只需最近发现的名称和说明，完整工具定义交给本轮执行。
+    catalog: Result<Vec<McpToolInfo>, String>,
 }
 
 type Connections = BTreeMap<(String, String), (ServerConfig, ConnectionCell)>;
@@ -204,7 +204,18 @@ impl McpManager {
             tools
         });
         state.connection = Some(Arc::clone(&connection));
-        state.catalog = tools.clone();
+        state.catalog = tools
+            .as_ref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| McpToolInfo {
+                        name: tool.name.to_string(),
+                        description: tool.description.as_deref().unwrap_or_default().into(),
+                    })
+                    .collect()
+            })
+            .map_err(Clone::clone);
         tools.map(|tools| (connection, tools))
     }
 
@@ -313,13 +324,7 @@ impl McpManager {
             }
             (Ok(tools), Some(_)) => {
                 inspection.status = McpConnectionStatus::Connected;
-                inspection.tools = tools
-                    .iter()
-                    .map(|tool| McpToolInfo {
-                        name: tool.name.to_string(),
-                        description: tool.description.as_deref().unwrap_or_default().into(),
-                    })
-                    .collect();
+                inspection.tools = tools.clone();
             }
             (Ok(_), None) => {}
         }

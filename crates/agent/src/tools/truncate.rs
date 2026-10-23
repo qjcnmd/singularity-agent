@@ -1,17 +1,17 @@
-//! 工具输出文本的安全截断算法。
+//! 工具输出文本的截断与上限常量。
 //!
-//! 按行数或按字节数对工具返回的内容做有界截断，避免超大的命令输出或文件读取撑爆模型
-//! 上下文。上限数值只在下面的常量里声明一处，工具描述和运行时提示都由这里生成。
+//! 按行数（2000 行）或字节数（50KB）限制工具返回的文本长度，避免超长输出占满模型上下文。
+//! 上限数值统一在此定义，供工具描述和截断提示使用。
 
 pub const DEFAULT_MAX_LINES: usize = 2000;
 pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
 
-/// 展示上限的 KB 数值，工具描述与运行时提示共用；改上限时不必再同步文案。
+/// 展示上限的 KB 数值，工具描述与截断提示共用。
 pub const fn default_max_kb() -> usize {
     DEFAULT_MAX_BYTES / 1024
 }
 
-/// read 与 bash 共用的展示上限说明文字。
+/// `read` 与 `bash` 工具说明共用的上限描述。
 pub fn default_cap_summary() -> String {
     format!("{DEFAULT_MAX_LINES} lines or {}KB", default_max_kb())
 }
@@ -22,14 +22,14 @@ pub enum TruncatedBy {
     Bytes,
 }
 
-/// 截断的结果。content 是截断后的安全文本，其余字段记录这次截断的元信息。
+/// 尾部截断结果：保留后的文本、触发截断的维度与实际保留行数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Truncation {
     pub content: String,
     pub truncated_by: Option<TruncatedBy>,
     /// 截断后实际保留下来的行数。
     pub output_lines: usize,
-    /// 只在保留尾部的场景下有意义：末尾那行本身就超限时，是否只保留了它的尾部。
+    /// 末尾那行本身超过字节上限时，是否只保留了该行尾部。
     pub last_line_partial: bool,
 }
 
@@ -44,8 +44,8 @@ pub fn format_size(bytes: usize) -> String {
     }
 }
 
-/// 保留尾部（bash 用）：留下最后 DEFAULT_MAX_LINES 行，且总字节不超过 DEFAULT_MAX_BYTES。
-/// 末尾那行本身就超限时，改为保留它的尾部（截断到 UTF-8 字符边界，last_line_partial = true）。
+/// 保留文本尾部（供 `bash` 和 MCP 工具输出使用）：最多保留最后 `DEFAULT_MAX_LINES` 行且不超过 `DEFAULT_MAX_BYTES`。
+/// 末尾单行超过字节上限时，只保留该行尾部的完整 UTF-8 字符（`last_line_partial = true`）。
 pub fn truncate_tail(content: &str) -> Truncation {
     let max_lines = DEFAULT_MAX_LINES;
     let max_bytes = DEFAULT_MAX_BYTES;

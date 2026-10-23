@@ -1,4 +1,4 @@
-/* 共享玻璃表面让对话文字落在安静、易读的画布上。 */
+/* 工作台整体布局、侧边栏、通用按钮与顶部标题栏 */
 
 .app-shell {
   --sidebar-duration: 280ms;
@@ -409,7 +409,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .header-button { min-width: 29px; padding: 0 6px; }
 }
 
-/* 常驻对话与单个可调整大小的后台命令面板共享工作区。 */
+/* 对话主区与可调节宽度的右侧运行状态侧栏 */
 .app-content { display: flex; min-width: 0; min-height: 0; position: relative; overflow: hidden; }
 
 .sidebar-toggle[aria-expanded=true] { background: var(--surface-hover); }

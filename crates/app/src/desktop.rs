@@ -1,4 +1,4 @@
-//! 桌面端传输：围绕共享的 AppServer 对接 Electron。
+//! 桌面端服务入口：连接 `AppServer` 与 Electron 进程的 stdio 传输。
 
 mod app_server;
 mod rpc;

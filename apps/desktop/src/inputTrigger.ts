@@ -1,4 +1,4 @@
-/** 技能只在开头或空白后触发；文件引用沿用原有词首规则。 */
+/** 识别光标前的 `/`（仅在行首或空白后且不含路径分隔符时触发技能候选）或 `@`（非词中位置触发文件候选）。 */
 export function inputTrigger(text: string, caret: number): { kind: 'skill' | 'file'; start: number; end: number; query: string } | null {
   for (let start = caret - 1; start >= 0; start--) {
     const marker = text[start]

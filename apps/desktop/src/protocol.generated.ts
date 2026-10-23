@@ -30,7 +30,7 @@ export type EmptyParams = Record<string, never>;
 
 export type FileCandidate = { path: string, };
 
-export type FileSearchParams = { workspaceId: string, query: string, };
+export type FileSearchParams = { workspaceRoot: string, query: string, };
 
 export type HistoryItem = { "type": "message", id: string, status: TurnStatus, role: HistoryMessageRole, text: string, images?: Array<ImageAttachment>, } | { "type": "thinking", id: string, status: TurnStatus, text: string, } | { "type": "tool", id: string, status: ToolStatus, name: string, args: JsonValue, result: ToolResult | null, } | { "type": "compaction", id: string, summary: string, } | { "type": "compaction_result", id: string, status: TurnStatus, message: string | null, };
 
@@ -48,17 +48,17 @@ export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in
 
 export type McpConnectionStatus = "not_connected" | "connecting" | "connected" | "failed" | "disabled";
 
-export type McpListParams = { workspaceId: string | null, };
+export type McpListParams = { workspaceRoot: string | null, };
 
-export type McpSaveParams = { server: McpServerInput, workspaceId: string | null, };
+export type McpSaveParams = { server: McpServerInput, workspaceRoot: string | null, };
 
 export type McpServerInput = { serverId: string, enabled: boolean, startupTimeoutSec: number, toolTimeoutSec: number, transport: McpTransportConfig, };
 
-export type McpServerParams = { serverId: string, workspaceId: string | null, };
+export type McpServerParams = { serverId: string, workspaceRoot: string | null, };
 
 export type McpServerState = { server: McpServerInput, status: McpConnectionStatus, error: string | null, tools: Array<McpToolInfo>, };
 
-export type McpToggleParams = { serverId: string, enabled: boolean, workspaceId: string | null, };
+export type McpToggleParams = { serverId: string, enabled: boolean, workspaceRoot: string | null, };
 
 export type McpToolInfo = { name: string, description: string, };
 
@@ -68,7 +68,7 @@ export type ModelCatalogResult = { catalog: RedactedModelCatalog, revision: numb
 
 export type ModelConfigurationInput = { modelId: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<string> | null, thinkingWireFormat: string | null,
 /**
- * Chat 输出上限使用的 wire 字段名；`None` 表示发送 `max_tokens`。
+ * Chat 请求里表示最大输出 Token 的字段名；`None` 表示发送 `max_tokens`。
  */
 chatOutputTokensField: string | null, };
 
@@ -120,11 +120,7 @@ export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspac
 
 export type RpcResponse = { "type": "success", result: JsonValue, } | { "type": "error", error: RpcError, };
 
-export type SessionFailure = { source: SessionOperation,
-/**
- * 未保存到会话历史的失败原因；已保存的结果通过历史与执行事件展示。
- */
-error: TurnErrorDetail, };
+export type SessionFailure = { source: SessionOperation, error: TurnErrorDetail, };
 
 export type SessionImageParams = { sessionId: string, imageId: string, };
 
@@ -166,7 +162,7 @@ export type SessionPhase = "idle" | "running" | "compacting" | "stopping";
 
 export type SessionReadResult = {
 /**
- * 快照包含的最后一个会话事件在全局流中的位置。
+ * 该任务最近一次发出事件的序号；前端用来忽略更早的旧事件。
  */
 revision: number, history: ThreadHistory, runtime: SessionRuntime,
 /**
@@ -182,7 +178,7 @@ export type SessionRuntime = { phase: SessionPhase, selection: ModelSelection, c
  */
 usage: SessionModelUsage, };
 
-export type SessionStartParams = { workspaceId: string, selection: ModelSelection, text: string, images: Array<ImageUpload>, };
+export type SessionStartParams = { workspaceRoot: string, selection: ModelSelection, text: string, images: Array<ImageUpload>, };
 
 export type SessionStartResult = { summary: ThreadSummary, status: SessionStatus, revision: number, };
 
@@ -218,7 +214,7 @@ export type Turn = { turnId: string, status: TurnStatus, };
 
 export type TurnErrorDetail = { cause: TurnFailureCause, message: string,
 /**
- * 已经显示了这次失败的条目（如压缩条目）；界面据此不再重复显示原因。
+ * 已经显示了这次失败的条目 ID（如压缩条目），界面据此避免重复报错。
  */
 itemId?: string, };
 
@@ -236,11 +232,11 @@ export type UserQuestionAnswer = { id: string, selected: Array<string>, text: st
 
 export type UserQuestionOption = { label: string, description: string | null, };
 
-export type Workspace = { workspaceId: string, root: string, };
+export type Workspace = { root: string, };
 
 export type WorkspaceAddParams = { root: string, };
 
-export type WorkspaceParams = { workspaceId: string, };
+export type WorkspaceParams = { workspaceRoot: string, };
 
 export interface RpcContract {
   "app.bootstrap": { params: EmptyParams; result: AppBootstrap }

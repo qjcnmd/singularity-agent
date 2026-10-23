@@ -1,4 +1,4 @@
-// 桌面视图及默认值；运行态由 Store 独立维护。
+// 持久保存在 localStorage 中的界面偏好（侧栏宽度、主题、字号、阅读锚点等）及默认值。
 import type { ViewportAnchor } from './protocol'
 
 export const defaultAnchor = (): ViewportAnchor => ({
@@ -16,7 +16,7 @@ const storageKey = 'singularity.app.view.v1'
 export interface PersistedView {
   theme: 'light' | 'dark'
   messageFontSize: number
-  selectedWorkspaceId: string | null
+  selectedWorkspaceRoot: string | null
   selectedSessionId: string | null
   sidebarWidth: number
   sidebarCollapsed: boolean
@@ -35,7 +35,7 @@ export function loadPersisted(): PersistedView {
   const fallback: PersistedView = {
     theme: 'light',
     messageFontSize: messageFontSize.default,
-    selectedWorkspaceId: null,
+    selectedWorkspaceRoot: null,
     selectedSessionId: null,
     sidebarWidth: 280,
     sidebarCollapsed: false,
@@ -54,8 +54,8 @@ export function loadPersisted(): PersistedView {
 }
 
 export function persistView(value: PersistedView): void {
-  const { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, backgroundWidth, sidebarView, backgroundOpen, workspaceAppearance, viewportAnchors } = value
-  const view: PersistedView = { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, backgroundWidth, sidebarView, backgroundOpen, workspaceAppearance, viewportAnchors }
+  const { theme, messageFontSize, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, sidebarCollapsed, backgroundWidth, sidebarView, backgroundOpen, workspaceAppearance, viewportAnchors } = value
+  const view: PersistedView = { theme, messageFontSize, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, sidebarCollapsed, backgroundWidth, sidebarView, backgroundOpen, workspaceAppearance, viewportAnchors }
   localStorage.setItem(storageKey, JSON.stringify(view))
 }
 

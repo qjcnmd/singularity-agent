@@ -119,7 +119,7 @@ fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
             ContentBlock::Text { text, .. } | ContentBlock::Thinking { thinking: text, .. } => {
                 estimate_tokens_of(text) + 4
             }
-            // 仅用于发送前的启发式压力判断；下一次请求会优先沿用提供方的实际用量。
+            // 没有提供方实际用量时按尺寸估算图片 Token；拿到回复后优先使用提供方上报的用量。
             ContentBlock::Image(image) => {
                 u64::from(image.width).div_ceil(32) * u64::from(image.height).div_ceil(32) + 128
             }
@@ -151,7 +151,7 @@ fn input_tokens(
                 entry,
                 SessionEntry::Compaction { .. }
                     | SessionEntry::Record {
-                        record: LedgerRecord::OperationStarted { .. },
+                        record: LedgerRecord::OperationStarted,
                         ..
                     }
             )
@@ -204,7 +204,7 @@ pub(crate) fn compaction_prefix(session: &SessionData, keep_recent_ratio: f64) -
     if cut == 0 {
         return None;
     }
-    // 已有摘要留在开头，与普通请求的前缀一致；只剩摘要本身可总结时不再压缩。
+    // 已有摘要留在开头，与普通请求一致；如果切点前只有上一份摘要，说明没有新对话可总结。
     let updating = matches!(entries[0], SessionEntry::Compaction { .. });
     if updating && cut == 1 {
         return None;

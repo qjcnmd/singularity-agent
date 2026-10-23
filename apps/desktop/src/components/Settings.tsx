@@ -12,7 +12,7 @@ import { Palette, Boxes, Plug } from 'lucide-react'
 type ProviderEditorState = null | 'new' | RedactedProvider
 
 export function Settings() {
-  const state = useAppStore(['bootstrap', 'settingsOpen', 'messageFontSize', 'actionErrors', 'pendingActions', 'selectedWorkspaceId'])
+  const state = useAppStore(['bootstrap', 'settingsOpen', 'messageFontSize', 'actionErrors', 'pendingActions', 'selectedWorkspaceRoot'])
   const [page, setPage] = useState<'appearance' | 'models' | 'mcp'>('appearance')
   const [editor, setEditor] = useState<ProviderEditorState>(null)
   const [editorVersion, setEditorVersion] = useState(0)
@@ -134,7 +134,7 @@ export function Settings() {
             <Disclosure open={editor === 'new'}><ProviderEditor key={editorVersion} state={state} active={state.settingsOpen && page === 'models' && editor === 'new'} onDone={() => setEditor(null)} /></Disclosure>
           </section>
           <section className="sg-settings-page" aria-label="MCP 设置" hidden={page !== 'mcp'}>
-            {state.settingsOpen && <McpSettings workspaceId={state.selectedWorkspaceId} active={page === 'mcp'} busy={mcpBusy} onBusyChange={setMcpBusy} />}
+            {state.settingsOpen && <McpSettings workspaceRoot={state.selectedWorkspaceRoot} active={page === 'mcp'} busy={mcpBusy} onBusyChange={setMcpBusy} />}
           </section>
         </main>
       </div>

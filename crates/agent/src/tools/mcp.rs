@@ -1,4 +1,4 @@
-//! MCP 结果接入现有工具结果；图片复用校验、快照和会话保存路径。
+//! 调用 MCP 工具，校验返回的图片并截断超长文本输出。
 
 use super::{ToolExecution, error_result};
 use crate::image::InputImage;

@@ -1,7 +1,7 @@
 import type * as Wire from './protocol.generated'
 export type * from './protocol.generated'
 
-/** 连接生命周期只描述传输层确实会宣告的状态；RPC 失败码另见 RpcErrorCode。 */
+/** 渲染进程与后端管道的连接状态。 */
 export type ConnectionStatus = 'connecting' | 'ready' | 'recovering'
 
 export type RpcMethod = keyof Wire.RpcContract

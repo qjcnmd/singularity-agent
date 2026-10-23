@@ -20,7 +20,7 @@ pub struct ModelConfigurationSnapshot {
 }
 
 impl ModelConfigurationSnapshot {
-    /// 上下文窗口的 Token 数。
+    /// 转为 `u64` 的上下文窗口容量，供 Token 预算计算使用。
     pub fn context_window(&self) -> u64 {
         u64::from(self.max_context_tokens)
     }

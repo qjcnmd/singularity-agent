@@ -1,4 +1,4 @@
-//! 桌面工作台 RPC 与事件合同。
+//! 工作台状态、设置与事件推送的数据类型。
 
 use std::collections::BTreeMap;
 
@@ -11,7 +11,6 @@ use crate::{SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
-    pub workspace_id: String,
     pub root: String,
 }
 
@@ -67,13 +66,12 @@ pub enum SessionOperation {
     Compaction,
 }
 
-/// 未能写入历史的操作错误；已保存的回合结果直接从历史读取。
+/// 启动失败或未能写入日志的操作错误；已写入日志的回合失败直接从历史读取。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionFailure {
     pub source: SessionOperation,
-    /// 未保存到会话历史的失败原因；已保存的结果通过历史与执行事件展示。
     pub error: crate::TurnErrorDetail,
 }
 
@@ -130,7 +128,7 @@ pub struct ContextUsage {
     pub capacity: u64,
 }
 
-/// 可编辑的模型取值；取值是否合法由 runtime 的配置解析负责校验。
+/// 模型设置表单读写的一项模型配置；保存时由 `singularity_model` 检查取值。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -140,7 +138,7 @@ pub struct ModelConfigurationInput {
     pub max_output_tokens: Option<u32>,
     pub reasoning_variants: Option<Vec<String>>,
     pub thinking_wire_format: Option<String>,
-    /// Chat 输出上限使用的 wire 字段名；`None` 表示发送 `max_tokens`。
+    /// Chat 请求里表示最大输出 Token 的字段名；`None` 表示发送 `max_tokens`。
     pub chat_output_tokens_field: Option<String>,
 }
 
@@ -185,7 +183,7 @@ pub struct ProviderConfigurationInput {
     pub models: Vec<ModelConfigurationInput>,
 }
 
-/// provider 宣告可用的模型，供编辑草稿显式采用。
+/// 从提供方 `/models` 接口查到的模型信息，供设置页填入表单。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -213,7 +211,7 @@ pub struct AppBootstrap {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionReadResult {
-    /// 快照包含的最后一个会话事件在全局流中的位置。
+    /// 该任务最近一次发出事件的序号；前端用来忽略更早的旧事件。
     pub revision: u64,
     pub history: ThreadHistory,
     pub runtime: SessionRuntime,
@@ -246,8 +244,7 @@ pub struct RpcError {
 }
 
 impl RpcError {
-    /// 创建带恢复建议的工作台错误。未提交的草稿由前端自己保存，
-    /// 错误载荷里不再回传用户输入。
+    /// 创建带错误码、原因和恢复建议的 RPC 错误。
     pub fn new(code: RpcErrorCode, message: impl Into<String>, recovery: impl Into<String>) -> Self {
         Self {
             code,
@@ -322,7 +319,7 @@ pub struct SessionStartResult {
     pub revision: u64,
 }
 
-/// 模型配置的局部读取结果；序号用于拒绝晚到的旧工作台快照。
+/// 保存或删除提供方后的模型目录及最新事件序号，前端据此忽略更早的旧列表。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

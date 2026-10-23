@@ -1,4 +1,4 @@
-//! 私有 mcp.json 的持久化模型与设置边界转换。
+//! `mcp.json` 的读写、配置校验和敏感信息脱敏。
 
 use serde::{Deserialize, Serialize};
 use singularity_protocol::{McpServerInput, McpTransportConfig};
@@ -96,7 +96,7 @@ impl ServerConfig {
         Ok(())
     }
 
-    /// 网络异常、服务器 stderr 和服务端错误可能含令牌，发布前去掉配置中的敏感值。
+    /// 网络错误、服务器 stderr 和服务端报错可能带有密钥，返回或打印前把配置中的敏感值替换掉。
     pub fn redact(&self, mut error: String) -> String {
         let mut values: Vec<&str> = match &self.transport {
             McpTransportConfig::Stdio { env, .. } => env

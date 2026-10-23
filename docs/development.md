@@ -1,17 +1,22 @@
-# 开发与调试指南
+# 开发指南
 
-本文介绍 Singularity 的本地开发、调试、测试与发布流程。
-产品定位与边界见[宪章](constitution.md)，完整运行流程见[架构图](../architecture.html)，模块职责与源码入口见[架构说明](architecture.md)，安装配置见[安装指南](INSTALL.md)。
-
----
+本文介绍从源码构建、本地调试、检查和打包。运行边界和模块职责见[架构说明](architecture.md)，配置文件和数据目录见[安装与配置](INSTALL.md)。
 
 ## 1. 本地启动与调试
 
+### 环境要求
+
+- **Rust**：1.96.0+（MSVC 工具链）
+- **C++ 构建工具**：Visual Studio Build Tools（勾选 Desktop development with C++）
+- **Node.js**：v24.x 与 npm 11.x
+- **Git for Windows**
+
 ### 首次拉取与完整编译
 
-在仓库根目录下运行以下命令，完成前端依赖安装与完整启动准备：
-
 ```powershell
+git clone https://github.com/qjcnmd/singularity-agent.git
+Set-Location singularity-agent
+
 # 1. 安装前端依赖
 npm --prefix apps/desktop ci
 
@@ -28,7 +33,7 @@ npm --prefix apps/desktop start
 
 ### 日常迭代流程
 
-Rust 后端启动后直接通过标准输入/输出处理 RPC，Electron 启动它时不传模式参数。
+Rust 后端启动后直接通过标准输入/输出处理 RPC。
 
 - **纯前端修改**：重新运行 `npm --prefix apps/desktop run build`，在工作台窗口中按 <kbd>Ctrl</kbd> + <kbd>R</kbd> 即可即时看到最新界面变更。
 - **Rust 后端修改**：
@@ -49,11 +54,9 @@ $env:SINGULARITY_HOME = "$PWD/outputs/dev-sandbox"
 npm --prefix apps/desktop start
 ```
 
----
-
 ## 2. 质量检查与代码格式化
 
-检查范围按 [仓库指令](../AGENTS.md#验证与交付) 中本次改动的影响确定。以下命令供对应检查使用。
+按本次改动的范围选用下面的命令，什么时候跑哪些见[仓库指令](../AGENTS.md#检查)。
 
 ### 代码排版与格式化
 仓库根目录下配置了统一的 `rustfmt.toml`（行宽上限 110 字符）：
@@ -84,11 +87,9 @@ cargo test --workspace --locked
 npm --prefix apps/desktop test
 ```
 
----
-
 ## 3. 跨端协议同步 (TypeScript DTO)
 
-Rust 的 `protocol` crate 维护了后端与前端通信的核心 DTO 与 RPC 方法契约。当修改了 `crates/protocol/src/` 中的结构体或枚举后，需要重新导出 TypeScript 类型声明：
+`protocol` crate 定义前后端通信的 DTO 与 RPC 方法。修改 `crates/protocol/src/` 中的结构体或枚举后，需要重新导出 TypeScript 类型声明：
 
 ```powershell
 # 自动重新生成 apps/desktop/src/protocol.generated.ts
@@ -97,15 +98,9 @@ cargo run -p singularity_protocol --features typescript --example export_types
 
 导出后请通过 `git status` 确认生成的前端类型定义，并检查前端调用方的类型匹配。
 
----
-
 ## 4. 现场验证
 
-功能完成后，在构建后的 Electron 工作台中实际操作本次改动涉及的功能。按影响检查结果、出错、停止、重复操作和重读历史后的表现，只检查受影响部分。
-
-数据目录、模型调用和临时文件处理按[仓库指令](../AGENTS.md#验证与交付)执行。
-
----
+功能完成后，在构建后的 Electron 工作台中实际操作本次改动涉及的功能。按影响检查结果、出错、停止、重复操作和重读历史后的表现，只检查受影响部分。数据目录、模型调用等约定见[仓库指令](../AGENTS.md#验证环境与交付)。
 
 ## 5. 打包构建与发布
 

@@ -1,11 +1,10 @@
-//! 已添加项目的列表，保存在数据目录的 `workspaces.json`（仅当前用户可读写）。
+//! 已添加项目的列表，保存在数据目录的 `workspaces.json`。
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use singularity_protocol::Workspace;
-use uuid::Uuid;
 
 const WORKSPACE_REGISTRY_FILE_NAME: &str = "workspaces.json";
 
@@ -57,12 +56,13 @@ impl WorkspaceStore {
         self.lock().workspaces.clone()
     }
 
-    /// 按项目 ID 查找已登记的项目。
-    pub fn find(&self, workspace_id: &str) -> Option<Workspace> {
+    /// 按目录查找已登记的项目。
+    pub fn find(&self, workspace_root: &str) -> Option<Workspace> {
+        let key = singularity_core::CanonicalWorkspacePath::from_saved(workspace_root).ok()?;
         self.lock()
             .workspaces
             .iter()
-            .find(|workspace| workspace.workspace_id == workspace_id)
+            .find(|workspace| workspace.root.to_lowercase() == key.key())
             .cloned()
     }
 
@@ -71,36 +71,35 @@ impl WorkspaceStore {
         let canonical =
             singularity_core::canonicalize_workspace(root).map_err(WorkspaceError::InvalidInput)?;
         self.update(|registry| {
-            for workspace in &registry.workspaces {
-                let existing = singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
-                    .map_err(WorkspaceError::InvalidInput)?;
-                if existing == canonical {
-                    return Err(WorkspaceError::InvalidInput("此项目已经添加。".into()));
-                }
+            if registry
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.root.to_lowercase() == canonical.key())
+            {
+                return Err(WorkspaceError::InvalidInput("此项目已经添加。".into()));
             }
-            let workspace = Workspace {
-                workspace_id: Uuid::new_v4().to_string(),
-                root: canonical.display().to_string(),
-            };
+            let workspace = Workspace { root: canonical.display().to_string() };
             registry.workspaces.push(workspace.clone());
             Ok(workspace)
         })
     }
 
     /// 移除登记；目录中的文件及会话历史由各自所有者管理。
-    pub fn remove(&self, workspace_id: &str) -> Result<(), WorkspaceError> {
+    pub fn remove(&self, workspace_root: &str) -> Result<(), WorkspaceError> {
+        let key = singularity_core::CanonicalWorkspacePath::from_saved(workspace_root)
+            .map_err(WorkspaceError::InvalidInput)?;
         self.update(|registry| {
             let position = registry
                 .workspaces
                 .iter()
-                .position(|workspace| workspace.workspace_id == workspace_id)
+                .position(|workspace| workspace.root.to_lowercase() == key.key())
                 .ok_or(WorkspaceError::NotFound)?;
             registry.workspaces.remove(position);
             Ok(())
         })
     }
 
-    // 持久化成功后才发布编辑后的 registry。读/改/写全程串行，并发修改不会互相覆盖。
+    // 磁盘写入成功后才更新内存中的项目列表；持锁串行更新，避免并发修改互相覆盖。
     fn update<T>(
         &self,
         edit: impl FnOnce(&mut RegistryFile) -> Result<T, WorkspaceError>,

@@ -28,8 +28,8 @@ impl SpillWriter {
     }
 }
 
-/// 累计输出的状态：内存里只保留末尾部分（最多 2×50KB），并统计行数和字节数。
-/// 第一次丢弃内容之前先建临时文件写入已有输出，之后每段输出都追加进去；
+/// 累计输出的状态：内存里保留末尾部分（最多 100KB），并统计总行数和总字节数。
+/// 输出首次超过显示上限（2000 行或 50KB）时创建临时文件写入已有缓冲，之后每段输出都追加进去；
 /// 写入失败时记下原因，结果里改为说明完整输出没能保存。
 #[derive(Default)]
 pub(super) struct CaptureState {
@@ -71,15 +71,15 @@ impl CaptureState {
         Some(content)
     }
 
-    /// 接收一段已解码的输出；首次超出显示上限时保存完整文本，再裁掉超长缓冲。
-    /// 之后每段输出都追加到文件；保存失败后只报告原因，不再重试。
+    /// 接收一段已解码的输出；首次超出显示上限时把已有输出写入临时文件，再把内存缓冲限制在 100KB 内。
+    /// 之后每段输出都追加到文件；保存失败后记下错误。
     pub(super) fn ingest(&mut self, text: &str) {
         self.total_bytes += text.len();
         self.completed_lines += text.bytes().filter(|byte| *byte == b'\n').count();
         if let Some(Ok(spill)) = &mut self.spill
             && let Err(error) = spill.file.write_all(text.as_bytes())
         {
-            // 追加失败后文件内容已经不完整，结果里不再给出它的路径。
+            // 追加失败后临时文件内容已不完整，结果里改报保存失败原因。
             self.spill = Some(Err(error));
         }
         self.tail.push_str(text);

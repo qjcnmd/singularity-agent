@@ -1,4 +1,4 @@
-//! OpenAI 两种协议共用的响应解析原语。
+//! Chat 与 Responses 共用的工具参数和 Token 用量解析。
 use crate::error::ProviderError;
 use crate::provider::contract::provider_response_validation_error;
 use crate::types::ModelUsage;
@@ -17,7 +17,7 @@ pub(crate) fn parse_tool_call_arguments(value: Option<&Value>) -> Result<Value, 
     ))
 }
 
-/// 解析工具参数 JSON 字符串；解析失败时保留原始字符串供预检阶段报错。
+/// 解析工具参数 JSON 字符串；不是合法 JSON 时保留原始字符串，交由工具参数检查报错。
 pub(crate) fn parse_tool_arguments(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }

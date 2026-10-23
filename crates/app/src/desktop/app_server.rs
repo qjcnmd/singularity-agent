@@ -128,12 +128,12 @@ impl AppServer {
     /// 收到第一条消息才创建任务；空白页在后端没有任务和日志文件。
     pub fn start_session(
         self: &Arc<Self>,
-        workspace_id: &str,
+        workspace_root: &str,
         selection: singularity_protocol::ModelSelection,
         input: UserInput,
     ) -> Result<singularity_protocol::SessionStartResult, RpcError> {
         let _lifecycle = self.lock_lifecycle();
-        let workspace = self.workspace(workspace_id)?;
+        let workspace = self.workspace(workspace_root)?;
         let thread = self.catalog.create_thread(&workspace.root, selection).map_err(catalog_error)?;
         let conversation = self.insert_conversation(thread);
         conversation.start(&input).map_err(conversation_error)?;

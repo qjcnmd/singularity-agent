@@ -1,6 +1,6 @@
 //! 从会话日志生成工作台看到的历史、任务摘要和累计用量。
 //! 历史只包含用户能看到的消息、思考、工具和压缩内容，不带原始日志行或
-//! 提供方私有字段；任务列表和完整历史共用同一次回合划分。
+//! 提供方私有字段；任务摘要直接读取最近回合的状态，完整历史才划分全部回合。
 
 use singularity_agent::session::{LedgerRecord, SessionData, SessionEntry, SessionError, SessionMetadata};
 use singularity_model::{ContentBlock, Message};
@@ -114,7 +114,8 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
     let mut turns: Vec<IndexedTurn> = Vec::new();
     for (position, entry) in entries.iter().enumerate() {
         if let SessionEntry::Record {
-            record: LedgerRecord::OperationStarted { turn_id, .. },
+            id: turn_id,
+            record: LedgerRecord::OperationStarted,
             ..
         } = entry
         {
@@ -259,9 +260,19 @@ pub fn accumulate_request_usage(
 }
 
 /// 任务列表里的一项：标题、时间和最近一个回合的状态。
-pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> ThreadSummary {
+pub(crate) fn summarize_thread(session: &SessionData) -> ThreadSummary {
     let mut title = None;
-    let last_turn = turns.last();
+    // 回合串行写入，最近的开始或结束记录就能说明最后一轮的状态。
+    let last_turn = session.entries().iter().rev().find_map(|entry| match entry {
+        SessionEntry::Record {
+            record: LedgerRecord::OperationStarted, ..
+        } => Some((TurnStatus::Interrupted, false)),
+        SessionEntry::Record {
+            record: LedgerRecord::OperationFinished { outcome, user_stopped, .. },
+            ..
+        } => Some((*outcome, *outcome == TurnStatus::Interrupted && *user_stopped)),
+        _ => None,
+    });
     // 最近一次命名优先；未命名时使用第一条用户输入。
     for entry in session.entries().iter().rev() {
         if let SessionEntry::Metadata {
@@ -296,7 +307,7 @@ pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> 
         created_at,
         updated_at,
         title,
-        status: last_turn.map(|turn| turn.status),
-        manually_stopped: last_turn.is_some_and(|turn| turn.manually_stopped),
+        status: last_turn.map(|(status, _)| status),
+        manually_stopped: last_turn.is_some_and(|(_, manually_stopped)| manually_stopped),
     }
 }

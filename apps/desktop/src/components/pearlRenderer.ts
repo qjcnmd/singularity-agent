@@ -10,7 +10,7 @@ export function createPearlRenderer(canvas: HTMLCanvasElement) {
   canvas.height = pixels
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   const radius = size * 0.435
-  // 丝带形状与配色固定，运行时只变换两张纹理；渐变与路径不再每帧重建。
+  // 预先绘制两张固定丝带纹理，每帧只做旋转与缩放变换。
   const ribbons = [0, 1].map(index => {
     const sprite = document.createElement('canvas')
     sprite.width = canvas.width

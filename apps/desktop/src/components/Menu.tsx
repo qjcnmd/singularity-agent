@@ -3,13 +3,12 @@ import { createPortal } from 'react-dom'
 import { focusableElements, navigateList } from '../interactions'
 
 interface MenuEntry {
-  /** 列表 key；动作由条目自己的 onSelect 承担，不再由调用方按 ID 分派。 */
   id: string
   label: string
   onSelect: () => void
 }
 
-/** 将任务菜单放在触发按钮附近；原生 Popover 负责关闭与层叠。 */
+/** 锚定在触发按钮旁的弹出菜单，使用原生 Popover 管理关闭与层叠。 */
 export function Menu({ anchor, entries, onClose, label }: {
   anchor: RefObject<HTMLElement | null>
   entries: MenuEntry[]
