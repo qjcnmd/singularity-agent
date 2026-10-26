@@ -43,6 +43,9 @@ pub enum Message {
         /// 技能引用展开前的用户文字；模型消费 content，界面保持原始显示。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_text: Option<String>,
+        /// 用户附上的文件路径，界面显示为附件卡片；模型读取的路径已写进 content。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
     },
     #[serde(rename_all = "camelCase")]
     Assistant {
@@ -83,6 +86,14 @@ impl Message {
         match self {
             Self::User { display_text: Some(display), .. } if index == 0 => display,
             _ => text,
+        }
+    }
+
+    /// 用户消息附上的文件路径；其他角色为空。
+    pub fn files(&self) -> &[String] {
+        match self {
+            Self::User { files, .. } => files,
+            _ => &[],
         }
     }
 
@@ -130,6 +141,7 @@ impl Message {
         Self::User {
             content: vec![ContentBlock::text(text)],
             display_text: None,
+            files: Vec::new(),
         }
     }
     /// 构造 Harness 或技能目录指令。

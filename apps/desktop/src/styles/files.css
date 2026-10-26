@@ -1,0 +1,22 @@
+/* 右侧文件栏：顶部标签页，下方是路径和只读内容 */
+.file-panel { display: flex; flex-direction: column; min-width: 0; height: 100vh; border-left: 1px solid var(--line); background: var(--canvas); overflow: hidden; }
+.file-tabs { display: flex; flex: none; gap: 2px; padding: 8px 8px 0; overflow-x: auto; scrollbar-width: none; border-bottom: 1px solid var(--line); }
+.file-tab { display: flex; flex: none; align-items: center; max-width: 200px; border-radius: 10px 10px 0 0; color: var(--ink-soft); }
+.file-tab:hover { background: var(--surface-hover); }
+.file-tab[data-selected=true] { background: var(--surface-muted); color: var(--ink); }
+.file-tab > button[role=tab] { min-width: 0; height: 32px; padding: 0 4px 0 12px; border: 0; background: none; color: inherit; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.file-tab-close { display: grid; place-items: center; flex: none; width: 22px; height: 22px; margin-right: 5px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--ink-faint); cursor: pointer; }
+.file-tab-close:hover { background: var(--surface-hover); color: var(--ink); }
+.file-toolbar { display: flex; flex: none; align-items: center; gap: 8px; min-height: 36px; padding: 0 10px 0 16px; color: var(--ink-faint); font-size: 12px; }
+.file-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+.file-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.file-body > .detail-empty { padding: 16px; }
+.file-markdown { padding: 4px 20px 24px; }
+.file-code { padding: 4px 0 24px; font: 12.5px/1.6 var(--font-mono); }
+.file-code .tool-line { padding-right: 16px; }
+/* 回复里能在文件栏打开的路径 */
+.timeline-body code.file-link { cursor: pointer; text-decoration: underline dotted transparent; text-underline-offset: 3px; transition: text-decoration-color 120ms; }
+.timeline-body code.file-link:hover, .timeline-body code.file-link:focus-visible { text-decoration-color: currentColor; outline: none; }
+@media (max-width: 760px) {
+  .file-panel { position: fixed; z-index: 26; inset: 0 0 0 auto; width: min(100vw, 480px); box-shadow: var(--shadow-floating); }
+}

@@ -14,7 +14,7 @@ struct RegistryFile {
     workspaces: Vec<Workspace>,
 }
 
-/// 输入无效、项目不存在、保存失败三类错误；RPC 入口据此给出不同的处理建议。
+/// 输入无效、项目不存在、保存失败三类错误；RPC 入口据此返回错误码和原因。
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
     #[error("{0}")]
@@ -58,11 +58,10 @@ impl WorkspaceStore {
 
     /// 按目录查找已登记的项目。
     pub fn find(&self, workspace_root: &str) -> Option<Workspace> {
-        let key = singularity_core::CanonicalWorkspacePath::from_saved(workspace_root).ok()?;
         self.lock()
             .workspaces
             .iter()
-            .find(|workspace| workspace.root.to_lowercase() == key.key())
+            .find(|workspace| singularity_core::same_saved_path(&workspace.root, workspace_root))
             .cloned()
     }
 
@@ -74,7 +73,7 @@ impl WorkspaceStore {
             if registry
                 .workspaces
                 .iter()
-                .any(|workspace| workspace.root.to_lowercase() == canonical.key())
+                .any(|workspace| singularity_core::same_saved_path(&workspace.root, canonical.display()))
             {
                 return Err(WorkspaceError::InvalidInput("此项目已经添加。".into()));
             }
@@ -92,7 +91,7 @@ impl WorkspaceStore {
             let position = registry
                 .workspaces
                 .iter()
-                .position(|workspace| workspace.root.to_lowercase() == key.key())
+                .position(|workspace| singularity_core::same_saved_path(&workspace.root, key.display()))
                 .ok_or(WorkspaceError::NotFound)?;
             registry.workspaces.remove(position);
             Ok(())

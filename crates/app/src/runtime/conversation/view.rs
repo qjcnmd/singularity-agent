@@ -9,7 +9,7 @@ pub(super) struct ConversationView {
     pub(super) activity: super::activity::Activity,
     pub(super) failure: Option<SessionFailure>,
     usage: singularity_protocol::SessionModelUsage,
-    context: Option<singularity_protocol::InjectedContext>,
+    pub(super) context: Option<singularity_protocol::InjectedContext>,
 }
 impl ConversationView {
     pub(super) fn new(usage: singularity_protocol::SessionModelUsage) -> Self {
@@ -76,6 +76,7 @@ impl Conversation {
                         item_id: request.item_id(),
                         text: input.text.clone(),
                         images: input.images.iter().map(|image| image.attachment.clone()).collect(),
+                        files: input.files.clone(),
                     })
                 })
                 .collect(),
@@ -118,7 +119,11 @@ impl Conversation {
     pub(super) fn on_event(&self, event: TurnEvent) {
         self.publish_event(&mut self.lock_view(), event);
     }
-    pub(super) fn publish_event(&self, view: &mut ConversationView, event: TurnEvent) {
+    pub(super) fn publish_event(&self, view: &mut ConversationView, mut event: TurnEvent) {
+        // 请求结束先发 ProviderAttempt 累计用量，再发完成的回复；回复带上此刻的会话累计。
+        if let TurnEvent::MessageFinished { items, .. } = &mut event {
+            singularity_agent::message::attach_usage(items, &view.usage);
+        }
         match &event {
             TurnEvent::SessionStateChanged {} => {
                 self.publish_changed(view);

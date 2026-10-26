@@ -1,4 +1,5 @@
 import '../styles/model-picker.css'
+import { EffortSlider } from './EffortSlider'
 import { ExpandChevron } from './ExpandChevron'
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import { usePopoverFocus, useSelectionGuard, focusableElements, navigateList } from '../interactions'
@@ -28,20 +29,26 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
   const [open, setOpen] = useState(false)
   const popupId = useId()
   const popup = useRef<HTMLDivElement>(null)
+  const trigger = useRef<HTMLButtonElement>(null)
+  // 只在打开前定位一次：水平中心对准按钮中心，底边在按钮上方 8px，左右至少离窗口边缘 8px。
+  const placePopover = (node: HTMLElement) => {
+    const rect = trigger.current?.getBoundingClientRect()
+    if (!rect) return
+    const width = node.offsetWidth || 220
+    node.style.left = `${Math.min(Math.max(8, rect.left + rect.width / 2 - width / 2), window.innerWidth - width - 8)}px`
+    node.style.bottom = `${window.innerHeight - rect.top + 8}px`
+  }
   const [previewIndex, setPreviewIndex] = useState<number | null>(null)
   const committing = useRef(false)
   const queuedEffort = useRef<number | null>(null)
-  const dragging = useRef(false)
   const catalog = state.bootstrap?.modelCatalog
   const currentChoice = selectedModel(catalog, selection)
   const variants = sortReasoningVariants(currentChoice?.model.reasoningVariants)
   const resolvedEffort = currentChoice?.effort ?? null
   const resolvedIndex = variants.findIndex((variant) => variant === resolvedEffort)
   const sliderIndex = previewIndex ?? Math.max(0, resolvedIndex)
-  const effortSelected = previewIndex !== null || resolvedIndex >= 0
-  const displayedEffort = effortSelected ? variants[Math.round(sliderIndex)] ?? '' : ''
   useEffect(() => {
-    if (!committing.current && !dragging.current) setPreviewIndex(null)
+    if (!committing.current) setPreviewIndex(null)
   }, [selection, open])
   useLayoutEffect(() => () => { queuedEffort.current = null }, [])
   const selectionGuard = useSelectionGuard()
@@ -49,7 +56,7 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
   const origin = actionOrigin.session(sessionId)
   const pending = state.pendingActions.has(pendingKey('session.updateSettings', origin))
 
-  usePopoverFocus(open, popup, '.sg-native-slider:not(:disabled), .sg-menu button:not(:disabled)')
+  usePopoverFocus(open, popup, '.sg-option[aria-pressed=true], .sg-menu button:not(:disabled)')
 
   const chooseModel = async (choice: ModelChoice) => {
     const effort = choice.model.reasoningVariants?.some((variant) => variant === resolvedEffort)
@@ -78,7 +85,7 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
       }
     } finally {
       committing.current = false
-      if (!dragging.current) setPreviewIndex(null)
+      setPreviewIndex(null)
     }
   }
 
@@ -93,21 +100,22 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
       if (menu && navigateList(event.key, focusableElements(menu).filter(node => node.tagName === 'BUTTON'))) event.preventDefault()
     }}>
       <button
+        ref={trigger}
         popoverTarget={popupId}
         type="button"
         className="sg-trigger"
         disabled={state.selectedWorkspaceRoot === null}
         aria-haspopup="dialog"
         aria-expanded={open}
-        title={effortLabel ? `${modelLabel} · ${effortLabel}` : modelLabel}
         {...selectionGuard()}
       >
         <span className="sg-triggerLabel">{modelLabel}</span>
-        {effortLabel !== null && <span className="sg-triggerEffort">{effortLabel}</span>}
+        {effortLabel !== null && <span className="sg-triggerEffort">· {effortLabel}</span>}
         <ExpandChevron expanded={open} size={12} className="sg-chevron" />
       </button>
 
       <div ref={popup} id={popupId} popover="auto" className="picker-disclosure model-popover" inert={!open} aria-hidden={!open}
+        onBeforeToggle={event => { if (event.newState === 'open') placePopover(event.currentTarget) }}
         onToggle={event => setOpen(event.newState === 'open')}><div>
         <div className="sg-menu" role="dialog" aria-label="模型与推理等级">
           <div className="sg-menuBody">
@@ -141,36 +149,9 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
             </div>
           </div>
           {variants.length > 0 && <div className="sg-divider" />}
-          {variants.length > 0 && (
-            <div className="sg-effortPad">
-              <div className="sg-effortHead"><span className="sg-effortTitle">思考程度</span><strong className="sg-effortValue">{displayedEffort}</strong></div>
-              <div className="sg-track">
-                <div className="sg-range" aria-hidden="true">
-                  <div className="sg-rail" />
-                  <div className="sg-fill" style={{ width: !effortSelected ? '0' : variants.length === 1 ? 'calc(100% + 12px)' : sliderIndex <= 0 ? '0' : `calc(${sliderIndex / (variants.length - 1) * 100}% + 12px)` }} />
-                  {variants.map((variant, index) => <div key={variant} className={`sg-tick${effortSelected && index <= Math.round(sliderIndex) ? ' sg-tick-on' : ''}`} style={{ left: `${variants.length > 1 ? index / (variants.length - 1) * 100 : 100}%` }} />)}
-                  <div className="sg-thumb" style={{ left: `${variants.length > 1 ? sliderIndex / (variants.length - 1) * 100 : 100}%`, opacity: effortSelected ? 1 : 0 }} />
-                </div>
-                <input className="sg-native-slider" type="range" min={0} max={Math.max(0, variants.length - 1)} step="any" value={sliderIndex}
-                  aria-label="思考程度" aria-valuetext={displayedEffort || '未选择'} aria-busy={pending}
-                  // 档位连续调整由本组件排队；模型切换保存期间等新模型生效后再调整。
-                  disabled={(pending && !committing.current) || (variants.length === 1 && resolvedIndex === 0)}
-                  onChange={event => setPreviewIndex(Number(event.currentTarget.value))}
-                  onPointerDown={event => { dragging.current = true; event.currentTarget.setPointerCapture(event.pointerId) }}
-                  onPointerCancel={() => { dragging.current = false; setPreviewIndex(null) }}
-                  onPointerUp={event => { dragging.current = false; void chooseEffort(Number(event.currentTarget.value)) }}
-                  onKeyDown={event => {
-                    const delta = ['ArrowRight', 'ArrowUp', 'PageUp'].includes(event.key) ? 1 : ['ArrowLeft', 'ArrowDown', 'PageDown'].includes(event.key) ? -1 : 0
-                    if (!delta && event.key !== 'Home' && event.key !== 'End') return
-                    event.preventDefault()
-                    const next = event.key === 'Home' ? 0 : event.key === 'End' ? variants.length - 1 : Math.max(0, Math.min(variants.length - 1, Math.round(previewIndex ?? resolvedIndex) + delta))
-                    void chooseEffort(next)
-                  }}
-                  onBlur={() => { if (dragging.current) { dragging.current = false; void chooseEffort(sliderIndex) } }}
-                />
-              </div>
-            </div>
-          )}
+          {variants.length > 0 && <fieldset className="effort-field" disabled={(pending && !committing.current) || (variants.length === 1 && resolvedIndex === 0)}>
+            <EffortSlider variants={variants} selectedIndex={sliderIndex} onCommit={index => { void chooseEffort(index) }} />
+          </fieldset>}
 
         </div>
       </div></div>

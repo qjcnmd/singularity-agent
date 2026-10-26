@@ -9,15 +9,22 @@ mod file;
 mod format;
 mod manager;
 
+use format::Result;
+
 pub use format::{
-    CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
-    SessionMetadata, text_item_id, thinking_item_id, tool_item_id,
+    CompactionEntry, LedgerRecord, SessionEntry, SessionError, SessionMetadata, text_item_id,
+    thinking_item_id, tool_item_id,
 };
 pub use manager::{SessionData, SessionManager};
 
 /// 生成会话 JSONL 文件名：`{session_id}.jsonl`。
 pub fn session_file_name(session_id: &str) -> String {
     format!("{session_id}.jsonl")
+}
+
+/// 会话图片的保存、读取和删除共用的目录。
+pub fn session_images_directory(sessions_dir: &std::path::Path, session_id: &str) -> std::path::PathBuf {
+    sessions_dir.join("images").join(session_id)
 }
 
 pub(crate) fn new_entry_id() -> String {

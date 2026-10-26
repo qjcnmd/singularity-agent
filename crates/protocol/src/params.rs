@@ -89,24 +89,36 @@ pub enum HistoryMessageRole {
     Assistant,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(tag = "type", rename_all = "snake_case")]
 /// 工作台显示的一条历史：只含显示需要的字段，不含提供方私有的续接数据。
 ///
 /// 回合的 ID 和状态保存在 ThreadTurn 上，条目里不重复。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum HistoryItem {
     Message {
         id: String,
         status: TurnStatus,
         role: HistoryMessageRole,
         text: String,
+        /// 消息写入日志的时间；还在流式生成时为空。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(optional))]
+        at: Option<String>,
+        /// 截至这条回复时整个会话的累计用量（含这条回复的请求），只出现在助手消息的最后一段正文上。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(optional))]
+        stats: Option<SessionModelUsage>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[cfg_attr(
             feature = "typescript",
             ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
         )]
         images: Vec<crate::ImageAttachment>,
+        /// 用户随消息附上的文件路径；模型按路径自己读取，文件本身不复制。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(feature = "typescript", ts(as = "Option<Vec<String>>", optional))]
+        files: Vec<String>,
     },
     Thinking {
         id: String,
@@ -154,6 +166,10 @@ pub struct ThreadTurn {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub finished_at: Option<String>,
+    /// 这一回合收到第一个生成增量的时间，由第一条有计时的助手消息的保存时间减去生成耗时得到。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub first_token_at: Option<String>,
     pub turn_id: String,
     pub status: TurnStatus,
     /// 中断是否由用户停止；没有结束记录的回合为 false。
@@ -185,7 +201,7 @@ pub struct Turn {
 ///
 /// 每次请求尝试计一次，重试也计入，与日志中的请求记录一致。首 Token 耗时只统计
 /// 实际测到的请求，Token 数只统计上报了用量的请求。
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionModelUsage {

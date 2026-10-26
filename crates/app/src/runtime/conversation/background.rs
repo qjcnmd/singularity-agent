@@ -12,38 +12,26 @@ impl Conversation {
         self.bash_tasks.list()
     }
 
-    pub(super) fn listen_background(
-        self: &Arc<Self>,
-        mut updates: tokio::sync::mpsc::Receiver<singularity_agent::tools::BashTaskUpdate>,
-    ) {
-        let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
-            while let Some(update) = updates.recv().await {
-                let Some(conversation) = weak.upgrade() else { break };
-                match update {
-                    singularity_agent::tools::BashTaskUpdate::Updated(task) => {
-                        let wake = !task.state.is_running();
-                        {
-                            let mut view = conversation.lock_view();
-                            view.last_event_revision =
-                                (conversation.publish)(StreamEvent::BackgroundTaskUpdated {
-                                    session_id: conversation.thread().thread_id,
-                                    payload: Box::new(singularity_protocol::BackgroundTaskUpdate {
-                                        phase: conversation.phase(),
-                                        task,
-                                    }),
-                                });
-                        }
-                        if wake && let Some(operation) = conversation.pending_operation() {
-                            conversation.spawn_operation(operation);
-                        }
-                    }
-                    singularity_agent::tools::BashTaskUpdate::Failed(message) => {
-                        conversation.background_error(message)
-                    }
+    pub(super) fn on_background_update(self: &Arc<Self>, update: singularity_agent::tools::BashTaskUpdate) {
+        match update {
+            singularity_agent::tools::BashTaskUpdate::Updated(task) => {
+                let wake = !task.state.is_running();
+                {
+                    let mut view = self.lock_view();
+                    view.last_event_revision = (self.publish)(StreamEvent::BackgroundTaskUpdated {
+                        session_id: self.thread().thread_id,
+                        payload: Box::new(singularity_protocol::BackgroundTaskUpdate {
+                            phase: self.phase(),
+                            task,
+                        }),
+                    });
+                }
+                if wake && let Some(operation) = self.pending_operation() {
+                    self.spawn_operation(operation);
                 }
             }
-        });
+            singularity_agent::tools::BashTaskUpdate::Failed(message) => self.background_error(message),
+        }
     }
     pub(super) fn background_error(&self, message: String) {
         let mut view = self.lock_view();

@@ -7,13 +7,11 @@ import type {
 
 export class RpcFailure extends Error {
   readonly code: string
-  readonly recovery: string
 
-  constructor(code: string, message: string, recovery: string) {
+  constructor(code: string, message: string) {
     super(message)
     this.name = 'RpcFailure'
     this.code = code
-    this.recovery = recovery
   }
 }
 
@@ -24,6 +22,7 @@ declare global {
       connect(): Promise<StreamEnvelope>
       onFrame(listener: (frame: StreamEnvelope) => void): () => void
       onFailure(listener: () => void): () => void
+      pathForFile(file: File): string
     }
   }
 }
@@ -67,11 +66,11 @@ export class RpcClient {
       envelope = await window.singularity.rpc({ method, params })
     } catch {
       this.setStatus('recovering')
-      throw new RpcFailure('unavailable', '工作台后端不可用。', '请重新启动桌面应用。')
+      throw new RpcFailure('unavailable', '工作台后端不可用。')
     }
     if (envelope.type === 'error') {
       const error = envelope.error
-      throw new RpcFailure(error.code, error.message, error.recovery)
+      throw new RpcFailure(error.code, error.message)
     }
     return envelope.result
   }

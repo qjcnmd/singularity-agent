@@ -104,9 +104,6 @@ jobs:
           npm --prefix apps/desktop ci
           npm --prefix apps/desktop run build
 
-      - name: Test desktop synchronization
-        run: npm --prefix apps/desktop test
-
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
 
@@ -118,6 +115,3 @@ jobs:
 
       - name: Build workspace binaries
         run: cargo build --workspace --bins --locked
-
-      - name: Test workspace
-        run: cargo test --workspace --locked

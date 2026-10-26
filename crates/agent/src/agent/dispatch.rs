@@ -145,18 +145,11 @@ impl Agent {
         execution: ToolExecution,
         on_event: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<()> {
-        self.append_message(&item_id, tool_result_message(&call_id, &execution), &execution.images)
-            .await?;
-        on_event(TurnEvent::ToolFinished {
-            item_id,
-            result: singularity_protocol::ToolResult {
-                output: execution.content,
-                images: execution.images.into_iter().map(|image| image.attachment).collect(),
-                is_error: execution.is_error,
-                duration_ms: execution.duration_ms,
-                read_source: execution.read_source,
-            },
-        });
+        let message = tool_result_message(&call_id, &execution);
+        let result =
+            crate::message::public_tool_result(&message).expect("tool execution produces a tool result");
+        self.append_message(&item_id, message, &execution.images).await?;
+        on_event(TurnEvent::ToolFinished { item_id, result });
         Ok(())
     }
 }

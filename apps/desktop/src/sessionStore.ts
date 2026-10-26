@@ -1,20 +1,26 @@
-import { reduceUnread, initialSyncState, acceptBootstrap, acceptSessionStart, acceptSessionRead, resetBaseline, reduceStream, pruneStaleSelection, type SyncState } from './sync'
+import { reduceUnread, initialSyncState, acceptSessionStart, acceptSessionRead, resetBaseline, reduceStream, pruneStaleSelection, type SyncState } from './sync'
 import { loadPersisted, persistView, type PersistedView } from './viewPersistence'
 import { RpcFailure, RpcClient } from './rpcClient'
-import type { ConnectionStatus, StreamEnvelope, AppBootstrap, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
+import type { ConnectionStatus, StreamEnvelope, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
 import { actionOrigin, pendingKey } from './storeActions'
-import { DraftStore, DraftStorageError, type DraftSnapshot } from './drafts'
+import { DraftStore, type DraftSnapshot } from './drafts'
 
 
 export interface ActionError {
   code: string
   message: string
-  recovery: string
 }
 
 interface SessionLoadState {
   status: 'idle' | 'loading' | 'error'
   error: ActionError | null
+}
+
+/** 右侧文件栏的一个标签页；同一任务目录下的同一路径只开一个。 */
+export interface FileTab {
+  id: string; path: string; cwd: string; title: string
+  /** 每次打开（包括再次点开已打开的文件）加一，文件栏据此重新读取，显示的是文件当前的内容。 */
+  opened: number
 }
 
 export interface QuestionDraft { itemId: string; index: number; answers: UserQuestionAnswer[] }
@@ -29,7 +35,10 @@ export interface AppState extends PersistedView, SyncState {
   pendingActions: ReadonlySet<string>
   actionErrors: Readonly<Record<string, ActionError>>
   actionErrorOrigin: string | null
+  page: 'chat' | 'instructions' | 'skills' | 'mcp'
   settingsOpen: boolean
+  fileTabs: readonly FileTab[]
+  activeFileTab: string | null
 }
 
 
@@ -47,17 +56,17 @@ export class SessionStore {
     pendingActions: new Set(),
     actionErrors: {},
     actionErrorOrigin: null,
+    page: 'chat',
     settingsOpen: false,
+    fileTabs: [],
+    activeFileTab: null,
   }
   private readonly listeners = new Set<() => void>()
   private notification: number | null = null
   private viewSave: ReturnType<typeof setTimeout> | null = null
   /** 与后端通信的 RPC 客户端；设置和候选搜索也通过它发起请求。 */
   readonly transport = new RpcClient(frame => this.onFrame(frame), connection => this.patch({ connection }))
-  protected readonly drafts = new DraftStore(
-    drafts => this.patch({ drafts }),
-    (error, sessionId) => this.reportError(error, sessionId === null ? 'draft.storage' : actionOrigin.session(sessionId)),
-  )
+  protected readonly drafts = new DraftStore(drafts => this.patch({ drafts }))
   private started = false
   private queuedFrames: StreamEnvelope[] = []
 
@@ -104,6 +113,7 @@ export class SessionStore {
       .find(([, sessions]) => sessions.some(session => session.threadId === sessionId))?.[0]
     if (workspaceRoot === undefined) return
     this.selectionRequest += 1
+    this.patch({ page: 'chat' })
     if (sessionId === this.state.selectedSessionId) {
       if (this.state.session === null) await this.readSession(sessionId)
       return
@@ -116,6 +126,7 @@ export class SessionStore {
 
   /** 空白页共用一份待发送草稿；第一条消息发送时才建立会话。 */
   newTask(workspaceRoot = this.state.selectedWorkspaceRoot): void {
+    this.patch({ page: 'chat' })
     if (workspaceRoot === null) return
     this.selectionRequest += 1
     this.latestRead = null
@@ -189,10 +200,14 @@ export class SessionStore {
   }
 
   private applyFrame(frame: StreamEnvelope): void {
+    if (frame.type === 'ready') {
+      void this.resync()
+      return
+    }
     if (frame.type === 'app_read_failed' && frame.revision > this.state.revision) {
       this.patch({ bootstrapLoad: { status: 'error', error: frame.error } })
     }
-    const { state, effect } = reduceStream(this.state, frame)
+    const state = reduceStream(this.state, frame)
     this.applySync(state, (frame.type === 'background_task_updated' && frame.payload.task.state.status === 'running')
       || (frame.type === 'turn_event' && (
         frame.payload.method === 'item/textDelta'
@@ -201,8 +216,6 @@ export class SessionStore {
       && state.liveSessions[frame.sessionId]?.revision === frame.revision) {
       this.retainQuestionDraft(frame.sessionId, frame.payload.pendingQuestion?.itemId)
     }
-    if (this.state.bootstrapLoad.status === 'error') return
-    if (effect === 'resync') void this.resync()
   }
 
   resync(): Promise<void> {
@@ -242,16 +255,6 @@ export class SessionStore {
     for (const frame of queued) this.onFrame(frame)
   }
 
-  async refreshBootstrap(): Promise<void> {
-    if (this.state.connection !== 'ready') return this.resync()
-    try {
-      const bootstrap = await this.transport.rpc('app.bootstrap', {})
-      this.updateBootstrap(bootstrap)
-    } catch (error) {
-      this.reportError(error, 'app')
-    }
-  }
-
   protected async action(
     method: string,
     origin: string,
@@ -288,19 +291,13 @@ export class SessionStore {
   }
 
   private toActionError(error: unknown): ActionError {
-    if (error instanceof RpcFailure || error instanceof DraftStorageError) {
-      return { code: error instanceof DraftStorageError ? 'storage' : error.code, message: error.message, recovery: error.recovery }
+    if (error instanceof RpcFailure) {
+      return { code: error.code, message: error.message }
     }
     return {
       code: 'internal',
       message: error instanceof Error ? error.message : '发生了未知错误。',
-      recovery: '',
     }
-  }
-
-  private updateBootstrap(bootstrap: AppBootstrap): void {
-    this.applySync(acceptBootstrap(this.state, bootstrap))
-    if (this.resyncing === null && this.latestRead == null) this.flushFrames()
   }
 
   protected applySync(state: SyncState, progress = false): void {

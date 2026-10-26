@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, type MouseEvent, type RefObject } from 'react'
 
-export function hasTextSelection(): boolean {
+function hasTextSelection(): boolean {
   const selection = window.getSelection()
   return selection !== null && !selection.isCollapsed && selection.toString() !== ''
 }

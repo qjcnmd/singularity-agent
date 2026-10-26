@@ -53,11 +53,10 @@ impl PartialEq for CanonicalWorkspacePath {
 
 impl Eq for CanonicalWorkspacePath {}
 
-/// 按忽略大小写的规范形式比较两个已保存的绝对路径。
-pub fn saved_directory_matches(left: &str, right: &str) -> Result<bool, String> {
-    let left = CanonicalWorkspacePath::from_saved(left)?;
-    let right = CanonicalWorkspacePath::from_saved(right)?;
-    Ok(left == right)
+/// 已保存路径的等价比较：两边都是显示形式（正斜杠绝对路径），忽略大小写。
+/// 项目登记的查找、登记和移除判断共用；输入是保存的字符串，不访问文件系统。
+pub fn same_saved_path(left: &str, right: &str) -> bool {
+    left.to_lowercase() == right.to_lowercase()
 }
 
 /// 检查并规范化已存在的本地目录为工作区路径。

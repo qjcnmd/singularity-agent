@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use singularity_protocol::{BackgroundTask, BackgroundTaskState};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -32,27 +32,24 @@ struct Entry {
 /// 一个会话的后台命令查询与进程所有权；保存终态后释放内存条目，不接管历史 PID。
 pub struct BashTasks {
     entries: Mutex<BTreeMap<String, Arc<Entry>>>,
-    updates: mpsc::Sender<BashTaskUpdate>,
+    on_update: Arc<dyn Fn(BashTaskUpdate) + Send + Sync>,
     writer: crate::session::SessionWriter,
     inbox: crate::agent::SteeringInboxHandle,
 }
 
 impl BashTasks {
-    /// 创建管理器与状态事件队列，保存复用会话写者。
+    /// 保存复用会话写者；每次更新直接发布，发布完成后才继续执行。
     pub fn new(
         writer: crate::session::SessionWriter,
         inbox: crate::agent::SteeringInboxHandle,
-    ) -> (Arc<Self>, mpsc::Receiver<BashTaskUpdate>) {
-        let (updates, receiver) = mpsc::channel(32);
-        (
-            Arc::new(Self {
-                entries: Mutex::new(BTreeMap::new()),
-                updates,
-                writer,
-                inbox,
-            }),
-            receiver,
-        )
+        on_update: Arc<dyn Fn(BashTaskUpdate) + Send + Sync>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            entries: Mutex::new(BTreeMap::new()),
+            on_update,
+            writer,
+            inbox,
+        })
     }
 
     /// 界面和工具共用的后台列表；实时输出覆盖运行记录，历史中未结束的命令标为中断。
@@ -209,7 +206,7 @@ impl BashTasks {
         if let Err(error) = started {
             return process.finish(Outcome::Failed(error.to_string())).await.0;
         }
-        let _ = self.updates.send(BashTaskUpdate::Updated(task)).await;
+        (self.on_update)(BashTaskUpdate::Updated(task));
         // 保存开始记录期间可能已经收到停止；这时等进程回收、最终状态保存后再返回。
         if signal.is_cancelled() || entry.cancel.is_cancelled() {
             entry.cancel.cancel();
@@ -253,7 +250,7 @@ impl BashTasks {
                         task.output = output;
                         task.clone()
                     };
-                    let _ = self.updates.send(BashTaskUpdate::Updated(task)).await;
+                    (self.on_update)(BashTaskUpdate::Updated(task));
                 }
                 ProcessEvent::Finished(outcome) => break outcome,
             }
@@ -285,7 +282,7 @@ impl BashTasks {
                         .enqueue(crate::agent::QueuedInput::background(task.task_id.clone(), status));
                 }
                 *entry.task.lock().expect("bash task lock") = task.clone();
-                let _ = self.updates.send(BashTaskUpdate::Updated(task)).await;
+                (self.on_update)(BashTaskUpdate::Updated(task));
                 let completion = match outcome {
                     Outcome::CleanupFailed(message) => Err(message),
                     _ => Ok(()),
@@ -301,7 +298,7 @@ impl BashTasks {
                 };
                 // 未保存的结果不能从日志读回，保留它和错误，直到本次会话关闭。
                 *entry.task.lock().expect("bash task lock") = task;
-                let _ = self.updates.send(BashTaskUpdate::Failed(error.clone())).await;
+                (self.on_update)(BashTaskUpdate::Failed(error.clone()));
                 entry.done.send_replace(Some(Err(error)));
             }
         }

@@ -2,22 +2,11 @@
 
 use super::*;
 
-/// 解析好的提供方连接设置；Debug 输出隐藏地址和密钥。
+/// 解析好的提供方连接设置。
 pub(crate) struct OpenAiProviderConfig {
     pub(crate) provider_name: String,
     pub(crate) base_url: String,
     pub(crate) api_key: String,
-}
-
-impl std::fmt::Debug for OpenAiProviderConfig {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("OpenAiProviderConfig")
-            .field("provider_name", &self.provider_name)
-            .field("base_url", &"[redacted]")
-            .field("api_key", &"[redacted]")
-            .finish()
-    }
 }
 
 /// 一次从配置解析完成的模型选择。

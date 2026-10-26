@@ -1,266 +1,57 @@
-.context-ring { width: 20px; height: 20px; transform: rotate(-90deg); }
-.context-ring circle { fill: none; stroke: currentColor; stroke-width: 2; opacity: .35; }
-.context-ring circle + circle { opacity: 1; }
-.context-tooltip { display: none; position: absolute; bottom: 180px; left: 0; z-index: 30; width: max-content; max-width: min(260px, 90vw); padding: 7px 11px; border: 1px solid var(--line); border-radius: 12px; color: var(--ink); text-align: center; font-size: 12px; line-height: 1.5; pointer-events: none; }
-.context-tooltip > span, .context-tooltip > strong { display: block; }
-.context-tooltip > span { color: var(--ink-faint); }
-.context-tooltip > strong { color: var(--ink); font-weight: 400; }
-.composer-region {
-  position: relative;
-  z-index: 5;
-  padding: 0 16px 8px;
-  /* 输入区按实际高度占位，对话滚动区使用剩余空间。 */
-  background: var(--surface);
-}
-.composer-card {
-  position: relative;
-  z-index: 1;
-  width: min(100%, 780px);
-  margin: 0 auto;
-  overflow: visible;
-  border: 1px solid var(--material-edge);
-  border-radius: var(--radius-xl);
-  background: var(--composer-background);
-  box-shadow: 0 2px 8px rgb(0 0 0 / 4%);
-}
+/* 输入区：卡片、加号菜单、模型选择、水球、输入建议、问答卡片、用量数据 */
+.composer-region { position: relative; z-index: 4; width: 100%; max-width: 780px; margin: 0 auto; padding: 0 28px 16px; }
+/* 输入区始终固定在底部，浮在消息上方，消息从玻璃后面滚过；底部渐变保证用量数据可读 */
+.app-main .composer-region { position: absolute; width: auto; left: 0; right: var(--panel-space); bottom: 0; padding-top: 18px; transition: right var(--smooth-dur) var(--smooth);
+  background: linear-gradient(to bottom, transparent 0, transparent 55%, color-mix(in srgb, var(--thread-bg, var(--canvas)) 92%, transparent) 88%); }
+/* 玻璃质感：半透明白底 + 背景模糊 + 顶部高光边，聚焦时只加深阴影，不变色 */
+.composer-card { position: relative; padding: 12px 12px 10px 16px; border: 1px solid color-mix(in srgb, var(--glass-base) 75%, transparent); border-radius: 24px;
+  background: color-mix(in srgb, var(--glass-base) 66%, transparent); backdrop-filter: blur(22px) saturate(180%);
+  box-shadow: 0 0 0 .5px rgb(0 0 0 / 9%), inset 0 1px 0 color-mix(in srgb, var(--glass-base) 85%, transparent), 0 12px 32px -14px rgb(0 0 0 / 20%), 0 2px 6px -2px rgb(0 0 0 / 5%);
+  transition: box-shadow 200ms, background 200ms; }
+.composer-card:focus-within { background: color-mix(in srgb, var(--glass-base) 76%, transparent); box-shadow: 0 0 0 .5px rgb(0 0 0 / 11%), inset 0 1px 0 color-mix(in srgb, var(--glass-base) 90%, transparent), 0 16px 40px -14px rgb(0 0 0 / 26%), 0 2px 8px -2px rgb(0 0 0 / 6%); }
+@media (prefers-reduced-transparency: reduce) { .composer-card { background: var(--glass-base); backdrop-filter: none; } }
+.composer-card textarea { display: block; width: 100%; min-height: 46px; max-height: 200px; border: 0; outline: 0; resize: none; background: transparent; font: 14.5px/1.55 var(--font-sans); field-sizing: content; }
+.composer-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0 0 -4px; }
+.composer-actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
 
-/* 不可用态输入框虚线边框 */
 
-.composer-card.is-unavailable { border-style: dashed; }
-.composer-card > textarea {
-  field-sizing: content;
-  width: 100%;
-  min-height: 48px;
-  max-height: 220px;
-  resize: none;
-  display: block;
-  overflow-y: auto;
-  padding: 18px 20px 0;
-  border: 0;
-  outline: 0;
-  background: transparent;
-  color: var(--ink);
-  font-size: 16px;
-  line-height: 24px;
-}
-.composer-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 14px 10px 10px;
-}
-.composer-context {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-/* 输入框下方的会话用量统计条 */
-.composer-stats {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-wrap: wrap;
-  gap: 0 8px;
-  width: min(100%, 780px);
-  margin: 0 auto;
-  padding: 8px 4px 0;
-  min-width: 0;
-  overflow: hidden;
-}
-.composer-stat {
-  flex: 0 0 auto;
-  padding: 3px 10px;
-  color: var(--ink-soft);
-  font-size: 12px;
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
+/* 加号直接打开附件选择 */
+.attach-button { display: grid; place-items: center; flex: none; width: 34px; height: 34px; padding: 0; border: 1px solid rgb(0 0 0 / 8%); border-radius: 50%; background: color-mix(in srgb, var(--glass-base) 70%, transparent); box-shadow: 0 1px 2px rgb(0 0 0 / 5%); color: var(--ink-soft); cursor: pointer; transition: background 120ms, color 120ms, transform var(--spring-dur) var(--spring); }
+.attach-button:hover:not(:disabled) { background: var(--surface-hover); color: var(--ink); }
+.attach-button:active:not(:disabled) { transform: scale(.94); transition-duration: 80ms; }
+.attach-button:disabled { opacity: .45; cursor: default; }
 
-.composer-actions {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.submit-button, .stop-button {
-  width: 34px;
-  height: 34px;
-  flex: 0 0 34px;
-  display: grid;
-  place-items: center;
-  padding: 0;
-  border: 0;
-  border-radius: 50%;
-  background: transparent;
-  color: var(--ink-on-accent);
-  cursor: pointer;
-}
-.submit-button:hover, .stop-button:hover {
-  background: transparent;
-}
-.submit-button:disabled {
-  background: transparent;
-  box-shadow: none;
-  cursor: default;
-  opacity: 1;
-}
-.activity-orb { position: relative; display: block; width: 34px; height: 34px; }
-.orb-canvas { position: absolute; top: 50%; left: 50%; width: calc(100% / .87); height: calc(100% / .87); transform: translate(-50%, -50%); pointer-events: none; }
-.stop-button:disabled { cursor: default; }
+/* 水球 */
+.water-orb { position: relative; display: block; padding: 0; border: 0; border-radius: 50%; background: transparent; cursor: pointer; filter: drop-shadow(0 4px 7px color-mix(in srgb, var(--accent) 30%, transparent)); transition: transform var(--spring-dur) var(--spring), filter 180ms; }
+.water-orb canvas { display: block; border-radius: 50%; }
+.water-orb:hover:not([aria-disabled="true"]) { transform: translateY(-2px); filter: drop-shadow(0 8px 14px color-mix(in srgb, var(--accent) 36%, transparent)); }
+.water-orb:active:not([aria-disabled="true"]) { transform: scale(.94); transition-duration: 90ms; }
+.water-orb[aria-disabled="true"] { cursor: default; }
 
-/* 候选建议 */
-.composer-candidate-anchor {
-  position: relative;
-  width: min(100%, 780px);
-  margin: 0 auto;
-}
-.composer-candidate-anchor > .picker-disclosure {
-  position: absolute;
-  bottom: 8px;
-  left: 0;
-  width: 100%;
-  z-index: 2;
-}
-.composer-candidate-anchor > .picker-disclosure > div { border-radius: 16px; }
-.composer-project { position: absolute; bottom: 8px; left: 0; width: 100%; }
-.composer-candidates {
-  max-height: 240px;
-  overflow-y: auto;
-}
-.composer-candidates button {
-  width: 100%;
-  display: flex;
-  justify-content: space-between;
-  gap: 15px;
-  padding: 9px 12px;
-  border: 0;
-  border-bottom: 1px solid var(--line);
-  background: transparent;
-  text-align: left;
-  cursor: pointer;
-}
-.composer-candidates button:hover, .composer-candidates button[aria-selected="true"] {
-  background: var(--surface-muted);
-}
-.composer-candidates span {
-  color: var(--ink-faint);
-  font-size: 11.5px;
-}
-.composer-candidates .skill-candidate {
-  justify-content: flex-start;
-  align-items: center;
-}
-.composer-candidates .skill-candidate strong {
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-.composer-candidates .skill-candidate span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.candidate-message {
-  display: grid;
-  gap: 2px;
-  margin: 0;
-  padding: 10px 14px;
-  color: var(--ink-soft);
-  font-size: 12px;
-}
-.candidate-error { color: var(--danger); }
+/* @文件 / Skill 建议 */
+.composer-candidates { position: relative; max-height: 260px; overflow-y: auto; padding: 5px; background: var(--raised); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow-floating); }
+/* 每个候选都是单行：名字一列、说明一列，放不下的部分用省略号 */
+.composer-candidates button { display: grid; grid-template-columns: minmax(0, 190px) minmax(0, 1fr); align-items: baseline; gap: 12px; width: 100%; padding: 7px 10px; border: 0; border-radius: 10px; background: transparent; cursor: pointer; text-align: left; }
+.composer-candidates button[aria-selected="true"] { background: var(--accent-soft); }
+.composer-candidates strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 13px var(--font-mono); }
+.composer-candidates span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-faint); font-size: 12px; }
 
-/* 工具栏加号按钮与菜单变形展开动画 */
-.t-morph {
-  --tools-menu-height: 220px;
-  --tools-menu-width: 200px;
-  position: relative;
-  width: 34px;
-  height: 34px;
-  border-radius: var(--morph-r-closed);
-  overflow: clip;
-  /* 锚定左下角展开 */
-  transform-origin: bottom left;
-  transition:
-    width var(--morph-close-dur) var(--morph-close-ease),
-    height var(--morph-close-dur) var(--morph-close-ease),
-    border-radius var(--morph-close-dur) var(--morph-close-ease);
-}
-.t-morph[data-open="true"] {
-  width: var(--tools-menu-width);
-  height: var(--tools-menu-height);
-  border-radius: var(--morph-r-open);
-  transition:
-    width var(--morph-open-dur) var(--morph-ease),
-    height var(--morph-open-dur) var(--morph-ease),
-    border-radius var(--morph-open-dur) var(--morph-ease);
-}
-/* 加号按钮淡出与旋转成关闭图标 */
-.t-morph-plus {
-  position: absolute;
-  inset: auto auto 0 0;
-  width: 34px; height: 34px;
-  display: grid; place-items: center;
-  border: 0; background: transparent; cursor: pointer;
-  transition:
-    opacity var(--morph-fade-dur) var(--morph-close-ease),
-    transform var(--morph-open-dur) var(--morph-close-ease),
-    filter var(--morph-fade-dur) var(--morph-close-ease);
-}
-.t-morph-plus svg {
-  transition: transform var(--morph-open-dur) var(--morph-close-ease);
-}
-.t-morph[data-open="true"] .t-morph-plus {
-  opacity: 0;
-  transform: translateX(var(--morph-slide));
-  filter: blur(var(--morph-blur));
-  pointer-events: none;
-}
-.t-morph[data-open="true"] .t-morph-plus svg {
-  transform: scale(var(--morph-scale)) rotate(var(--morph-rotate));
-}
-/* 菜单面板滑入与显现 */
-.t-morph-menu {
-  position: absolute;
-  inset: 0;
-  opacity: 0;
-  transform: translateX(calc(-1 * var(--morph-slide))) scale(var(--morph-scale));
-  filter: blur(var(--morph-blur));
-  pointer-events: none;
-  transition:
-    opacity var(--morph-fade-dur) var(--morph-close-ease),
-    transform var(--morph-open-dur) var(--morph-close-ease),
-    filter var(--morph-fade-dur) var(--morph-close-ease);
-}
-.t-morph[data-open="true"] .t-morph-menu {
-  opacity: 1;
-  transform: translateX(0) scale(1);
-  filter: blur(0);
-  pointer-events: auto;
-}
+.composer-context { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.workspace-picker-trigger { display: inline-flex; align-items: center; gap: 7px; min-width: 0; height: 32px; padding: 0 8px 0 10px; border: 0; border-radius: 999px; background: transparent; color: var(--ink-soft); font-weight: 500; cursor: pointer; transition: background 120ms, transform var(--spring-dur) var(--spring); }
+.workspace-picker-trigger span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-picker-trigger:hover { background: var(--surface-hover); color: var(--ink); }
+.workspace-picker-trigger:active { transform: scale(.96); transition-duration: 80ms; }
+.workspace-picker-trigger svg:last-child { color: var(--ink-faint); }
 
-@media (prefers-reduced-motion: reduce) {
-  .t-morph, .t-morph-plus, .t-morph-menu { transition: none !important; }
-  .t-morph-plus svg { transition: none; }
-}
 
-/* 工具栏容器与定位 */
-.composer-tools { position: relative; flex: 0 0 34px; width: 34px; height: 34px; }
-.composer-tools .t-morph { position: absolute; bottom: 0; left: 0; background: var(--surface); box-shadow: var(--shadow-soft); }
-.composer-tools .t-morph[data-open="true"] { box-shadow: var(--shadow-floating); }
-.composer-tools .t-morph-plus { padding: 0; color: var(--ink-soft); }
-.composer-tools .t-morph-plus:hover { background: var(--surface-hover); }
-.composer-tools .t-morph-menu { width: var(--tools-menu-width); height: var(--tools-menu-height); padding: 14px; display: grid; grid-template-rows: repeat(4, 48px); }
-.composer-tools-item { display: flex; align-items: center; gap: 12px; width: 100%; height: 44px; border: 0; border-radius: 10px; padding: 0 10px; background: transparent; color: var(--ink); text-align: left; white-space: nowrap; cursor: pointer; }
-.composer-tools-icon { display: grid; place-items: center; flex: 0 0 20px; color: inherit; }
-.composer-tools-item:hover { background: var(--surface-hover); }
-.composer-tools-item[aria-disabled=true], .composer-tools-item:disabled { color: var(--ink-faint); cursor: default; }
-.composer-tools > .context-tooltip[data-open=true] { display: block; }
-
-@media (max-width: 760px) {
-  .composer-region { padding: 0 10px 10px; }
-  .composer-toolbar { gap: 6px; }
-  .composer-context { gap: 4px; }
-}
+.composer-candidate-anchor { position: relative; }
+.composer-candidate-anchor > .picker-disclosure { position: absolute; bottom: 6px; left: 0; right: 0; z-index: 8; }
+.composer-candidates button strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-card textarea:focus-visible { outline: none; }
+.hero-workspace { position: relative; min-width: 0; }
+.hero-workspace > .picker-disclosure { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 10; min-width: 180px; }
+.workspace-picker-options { display: grid; padding: 5px; max-height: 240px; overflow-y: auto; }
+.workspace-picker-options button { display: flex; align-items: center; gap: 7px; padding: 7px 8px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; text-align: left; }
+.workspace-picker-options button span:nth-child(2) { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-picker-options button:hover { background: var(--surface-hover); }
+.workspace-picker-options button[aria-pressed=true] { color: var(--accent); }

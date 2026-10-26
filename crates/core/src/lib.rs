@@ -9,7 +9,7 @@ pub mod workspace;
 
 pub use project_instructions::{InstructionFile, load_agent_instructions};
 pub use user_home::resolve_home;
-pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace, saved_directory_matches};
+pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace, same_saved_path};
 
 /// 向上查找项目根目录（AGENTS.md 与项目技能的查找上界）时识别的 `.git` 标记。
 pub(crate) const PROJECT_ROOT_MARKER: &str = ".git";
@@ -26,6 +26,16 @@ pub fn now_iso() -> String {
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
         ))
         .expect("utc timestamp always formats")
+}
+
+/// 把 `now_iso` 格式的时间往前推若干毫秒；无法解析时返回 None。
+pub fn iso_minus_millis(timestamp: &str, millis: u64) -> Option<String> {
+    let format = time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+    );
+    let parsed = time::PrimitiveDateTime::parse(timestamp, &format).ok()?;
+    let shifted = parsed.checked_sub(time::Duration::milliseconds(i64::try_from(millis).ok()?))?;
+    shifted.format(&format).ok()
 }
 
 /// 规范化路径显示：替换为正斜杠，并处理 Windows 的 UNC 与 verbatim 扩展前缀。

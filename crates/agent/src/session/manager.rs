@@ -32,29 +32,11 @@ pub struct SessionData {
     pub(super) header_timestamp: String,
 }
 
-impl std::fmt::Debug for SessionManager {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionManager").field("data", &self.data).finish()
-    }
-}
-
 impl Deref for SessionManager {
     type Target = SessionData;
 
     fn deref(&self) -> &Self::Target {
         &self.data
-    }
-}
-
-impl std::fmt::Debug for SessionData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionData")
-            .field("file", &self.file)
-            .field("cwd", &self.cwd)
-            .field("session_id", &self.session_id)
-            .field("header_timestamp", &self.header_timestamp)
-            .field("entries_count", &self.entries.len())
-            .finish()
     }
 }
 
@@ -117,7 +99,7 @@ impl SessionData {
     /// 这个任务的图片目录：`sessions/images/<任务 ID>`。
     pub fn image_directory(&self) -> PathBuf {
         let parent = self.file.parent().expect("session has a parent directory");
-        parent.join("images").join(&self.session_id)
+        super::session_images_directory(parent, &self.session_id)
     }
 
     /// 只允许读取这份历史实际引用的图片，不接受任意文件路径。
@@ -203,23 +185,17 @@ impl SessionManager {
         let timestamp = entry.timestamp().to_string();
         let serialized = serde_json::to_string(&entry)?;
         let mut handle = OpenOptions::new().append(true).open(&self.file)?;
-        let bytes_to_write = serialized.as_bytes();
-        self.write_append(&mut handle, bytes_to_write)?;
+        // 记下写入错误，阻止后续追加把新记录拼在残缺行后面。
+        handle
+            .write_all(serialized.as_bytes())
+            .and_then(|()| handle.write_all(b"\n"))
+            .map_err(|error| {
+                let error = Arc::new(error);
+                self.append_error = Some(Arc::clone(&error));
+                SessionError::Io(std::io::Error::new(error.kind(), error))
+            })?;
         self.data.entries.push(entry);
         Ok(timestamp)
-    }
-
-    fn write_append(&mut self, handle: &mut impl Write, bytes: &[u8]) -> Result<()> {
-        // 记下写入错误，阻止后续追加把新记录拼在残缺行后面。
-        let result = handle
-            .write_all(bytes)
-            .and_then(|()| handle.write_all(b"\n"))
-            .and_then(|()| handle.flush());
-        result.map_err(|error| {
-            let error = Arc::new(error);
-            self.append_error = Some(Arc::clone(&error));
-            SessionError::Io(std::io::Error::new(error.kind(), error))
-        })
     }
 }
 

@@ -1,147 +1,52 @@
+import { workspaceKey } from './workspace'
+import { workspaceName } from './copy'
 import { actionToastTransition } from './motion'
-import { focusableElements } from './interactions'
-import { SidebarToggle } from './components/SidebarToggle'
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import { ContextPanel } from './components/ContextPanel'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, type CSSProperties } from 'react'
 import { Composer } from './components/Composer'
 import { Conversation } from './components/Conversation'
 import { Settings } from './components/Settings'
 import { Sidebar } from './components/Sidebar'
-import { BackgroundTasks, BackgroundTasksButton } from './components/BackgroundTasks'
+import { RunPanel } from './components/RunPanel'
+import { InstructionsPage, SkillsPage, McpPage } from './components/ManagePages'
 import { hasInlineActionError, useAppStore, appStore } from './appStore'
 import { buildTimeline } from './timeline'
+import { bubbleVariables } from './bubbleColors'
+import { clampFilePanelWidth } from './viewPersistence'
+import { FilePanel } from './components/FilePanel'
 import { sessionTitles } from './sessionTitle'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
 export function App() {
-  const state = useAppStore(['theme', 'messageFontSize', 'selectedSessionId', 'sidebarCollapsed', 'sidebarWidth', 'backgroundWidth', 'backgroundOpen'])
+  const state = useAppStore(['theme', 'messageFontSize', 'assistantBubble', 'userBubble', 'sidebarCollapsed', 'sidebarWidth', 'fileTabs', 'filePanelWidth'])
+  const filePanelOpen = state.fileTabs.length > 0
   useLayoutEffect(() => { document.documentElement.dataset.theme = state.theme }, [state.theme])
   useLayoutEffect(() => { document.documentElement.style.setProperty('--message-font-size', `${state.messageFontSize}px`) }, [state.messageFontSize])
-  const [compactViewport, setCompactViewport] = useState(() => window.matchMedia('(max-width: 1000px)').matches)
-  const [detailTab, setDetailTab] = useState<'context' | 'background'>('context')
-  const detailOpener = useRef<HTMLButtonElement | null>(null)
-  const backgroundToggle = useRef<HTMLButtonElement>(null)
-  const backgroundPanel = useRef<HTMLElement>(null)
-  const reducedMotion = useReducedMotion()
-  const panelTransition = { duration: reducedMotion ? 0 : 0.16, ease: 'easeOut' as const }
-
-  const closeBackground = () => {
-    appStore.setBackgroundOpen(false)
-    requestAnimationFrame(() => {
-      const opener = detailOpener.current
-      if (opener?.isConnected) opener.focus()
-      else backgroundToggle.current?.focus()
-    })
-  }
-  useEffect(() => {
-    const media = window.matchMedia('(max-width: 1000px)')
-    const update = () => setCompactViewport(media.matches)
-    media.addEventListener('change', update)
-    return () => media.removeEventListener('change', update)
-  }, [])
-  useEffect(() => {
-    if (!state.backgroundOpen) return
-    let frame = requestAnimationFrame(() => { frame = requestAnimationFrame(() => backgroundPanel.current?.querySelector<HTMLButtonElement>('button')?.focus()) })
-    return () => cancelAnimationFrame(frame)
-  }, [state.backgroundOpen, compactViewport])
-
-  useEffect(() => {
-    appStore.start()
-    return () => appStore.stop()
-  }, [])
-  const sidebarWidth = state.sidebarCollapsed ? 0 : state.sidebarWidth
-  const columns = `${sidebarWidth}px 0 minmax(0, 1fr)`
-  const shellStyle = {
-    gridTemplateColumns: columns,
+  useLayoutEffect(() => {
+    for (const [name, value] of Object.entries(bubbleVariables(state))) document.documentElement.style.setProperty(name, value)
+  }, [state.theme, state.assistantBubble, state.userBubble])
+  useEffect(() => { appStore.start(); return () => appStore.stop() }, [])
+  const style = {
+    gridTemplateColumns: `${state.sidebarCollapsed ? 0 : state.sidebarWidth}px 0 minmax(0, 1fr) 0 ${filePanelOpen ? clampFilePanelWidth(state.filePanelWidth) : 0}px`,
     '--sidebar-width': `${state.sidebarWidth}px`,
   } as CSSProperties
-
-  return (
-    <div className="app-shell" style={shellStyle}>
-      <Sidebar />
-      {!state.sidebarCollapsed ? <ResizeSeparator value={state.sidebarWidth} onChange={(value) => appStore.setSidebarWidth(value)} /> : <div />}
-      <div className="app-content" style={{ '--background-width': `${state.backgroundWidth}px` } as CSSProperties} onKeyDown={event => {
-        if (!state.backgroundOpen || event.defaultPrevented) return
-        if (event.key === 'Escape') {
-          // 弹窗和原生浮层先处理 Escape，避免同时关闭后面的侧栏。
-          if (document.querySelector(':modal, :popover-open')) return
-          event.stopPropagation()
-          closeBackground()
-        }
-        if (event.key !== 'Tab' || !compactViewport) return
-        const nodes = [backgroundToggle.current, ...(backgroundPanel.current ? focusableElements(backgroundPanel.current) : [])]
-          .filter((node): node is HTMLElement => node !== null && node.getClientRects().length > 0)
-        const first = nodes[0], last = nodes.at(-1)
-        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
-        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
-      }}>
-        <SidebarToggle
-          side="right"
-          expanded={state.backgroundOpen}
-          controls="background-panel"
-          buttonRef={backgroundToggle}
-          className="background-toggle"
-          onClick={() => {
-            if (state.backgroundOpen) closeBackground()
-            else {
-              detailOpener.current = backgroundToggle.current
-              appStore.setBackgroundOpen(true)
-            }
-          }}
-        />
-      <MainContent compactViewport={compactViewport} onOpenBackground={button => {
-        setDetailTab('background')
-        detailOpener.current = button
-        appStore.setBackgroundOpen(true)
-        requestAnimationFrame(() => backgroundPanel.current?.querySelector<HTMLButtonElement>('button')?.focus())
-      }} />
-      <aside id="background-panel" className={`background-panel${state.backgroundOpen ? ' is-open' : ''}`} aria-label="运行状态" aria-hidden={!state.backgroundOpen} inert={!state.backgroundOpen} ref={backgroundPanel}>
-        <ResizeSeparator side="right" value={state.backgroundWidth} onChange={(value) => appStore.setBackgroundWidth(value)} />
-        <AnimatePresence initial={false} mode="wait">
-          {state.backgroundOpen && (
-            <motion.div
-              key="background"
-              className="right-panel-content"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              transition={panelTransition}
-            >
-              <h2 className="detail-heading">运行状态</h2>
-              <div className="detail-tabs" role="tablist" aria-label="运行状态分类">
-                {(['context', 'background'] as const).map(tab => <button key={tab} type="button" role="tab" id={`detail-tab-${tab}`}
-                  aria-selected={detailTab === tab} aria-controls="detail-body" tabIndex={detailTab === tab ? 0 : -1}
-                  onClick={() => setDetailTab(tab)} onKeyDown={event => {
-                    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
-                    event.preventDefault()
-                    const next = tab === 'context' ? 'background' : 'context'
-                    setDetailTab(next)
-                    document.getElementById(`detail-tab-${next}`)?.focus()
-                  }}>{tab === 'context' ? '上下文' : '后台命令'}</button>)}
-              </div>
-              <div id="detail-body" className="detail-section" role="tabpanel" aria-labelledby={`detail-tab-${detailTab}`}>
-                {detailTab === 'context' ? <ContextPanel /> : <BackgroundTasks />}
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </aside>
-      </div>
-      <Settings />
-    </div>
-  )
+  return <div className="app-shell" style={style}>
+    <Sidebar />
+    {!state.sidebarCollapsed ? <ResizeSeparator label="调整侧栏宽度" value={state.sidebarWidth} onChange={value => appStore.setSidebarWidth(value)} /> : <div />}
+    <MainContent />
+    {filePanelOpen ? <ResizeSeparator label="调整文件栏宽度" reversed value={clampFilePanelWidth(state.filePanelWidth)} onChange={value => appStore.setFilePanelWidth(value)} /> : <div />}
+    <FilePanel />
+    <Settings />
+  </div>
 }
 
-const MainContent = memo(function MainContent({ compactViewport, onOpenBackground }: {
-  compactViewport: boolean
-  onOpenBackground: (button: HTMLButtonElement) => void
-}) {
-  const state = useAppStore(['selectedSessionId', 'selectedWorkspaceRoot', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'backgroundOpen', 'actionErrors', 'actionErrorOrigin', 'pendingActions'])
+const MainContent = memo(function MainContent() {
+  const state = useAppStore(['page', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'backgroundOpen', 'actionErrors', 'actionErrorOrigin'])
   const items = useMemo(() => buildTimeline(state.session), [state.session])
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
+  const workspace = state.bootstrap?.workspaces.find(workspace => workspaceKey(workspace.root) === state.selectedWorkspaceRoot)
   const workspaceSessions = appStore.sessions()
   // 页头和侧栏用同一套标题规则；任务还不在项目列表里时，只显示用户起的名字或“新任务”。
-  const sessionTitle = state.session === null ? '选择一个任务' : sessionTitles(workspaceSessions)(
+  const sessionTitle = state.session === null ? '' : sessionTitles(workspaceSessions)(
     workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.summary,
   )
   const reducedMotion = useReducedMotion()
@@ -156,54 +61,53 @@ const MainContent = memo(function MainContent({ compactViewport, onOpenBackgroun
   }, [visibleError, state.actionErrorOrigin])
 
   return (
-      <main className={`app-main${empty && state.bootstrapLoad.status === 'idle' ? ' is-empty' : ''}`} inert={compactViewport && state.backgroundOpen} onPointerDownCapture={() => {
+      <main className={`app-main${state.page !== 'chat' ? ' is-manage' : empty && state.bootstrapLoad.status === 'idle' ? ' is-empty' : ''}${state.page === 'chat' && state.selectedSessionId && state.backgroundOpen ? ' has-panel' : ''}`} onPointerDownCapture={() => {
         if (!state.sidebarCollapsed && window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
       }}>
-        {!empty && <header className="conversation-header">
-          <h1>{sessionTitle}</h1>
-          <BackgroundTasksButton onOpen={onOpenBackground} />
-        </header>}
+        <header className="conversation-header">
+          {state.page === 'chat' && state.selectedSessionId && <h1>{sessionTitle}{workspace && <small>{workspaceName(workspace)}</small>}</h1>}
+          {state.page === 'chat' && state.selectedSessionId && <RunPanel key={state.selectedSessionId} />}
+        </header>
+        {state.page === 'instructions' ? <InstructionsPage /> : state.page === 'skills' ? <SkillsPage /> : state.page === 'mcp' ? <McpPage /> : <>
         {state.bootstrapLoad.status !== 'idle' ? (
           <section className="empty-state" aria-live="polite" aria-busy={state.bootstrapLoad.status === 'loading'}>
             <h2>{state.bootstrapLoad.status === 'loading' ? '正在读取项目列表' : '项目列表无法读取'}</h2>
             {state.bootstrapLoad.error && <>
               <p>{state.bootstrapLoad.error.message}</p>
-              {state.bootstrapLoad.error.recovery && <p className="empty-recovery">{state.bootstrapLoad.error.recovery}</p>}
               <button type="button" className="secondary-button" onClick={() => void appStore.resync()}>重试</button>
             </>}
           </section>
         ) : !empty && <Conversation state={state} items={items} />}
-        <Composer centered={empty && state.bootstrapLoad.status === 'idle'} />
+        <Composer />
+        </>}
         <AnimatePresence>
           {visibleError !== null && <motion.div key="action-toast" className="action-toast" role="status"
             initial={{ opacity: reducedMotion ? 1 : 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            transition={{ ...actionToastTransition, duration: reducedMotion ? 0 : actionToastTransition.duration }}>
+            transition={reducedMotion ? { duration: 0 } : actionToastTransition}>
             <strong>{visibleError.message}</strong>
-            {visibleError.recovery && <span>{visibleError.recovery}</span>}
           </motion.div>}
         </AnimatePresence>
       </main>
   )
 })
-
-function ResizeSeparator({ value, onChange, side = 'left' }: { value: number; onChange: (value: number) => void; side?: 'left' | 'right' }) {
+/** 拖动或用左右方向键调宽度；reversed 用于右侧的栏，往左拖变宽。 */
+function ResizeSeparator({ label, value, onChange, reversed = false }: { label: string; value: number; onChange: (value: number) => void; reversed?: boolean }) {
   const start = useRef<{ x: number; value: number } | null>(null)
   return (
     <div
-      className={`resize-separator ${side === 'left' ? 'separator-sidebar' : 'separator-background'}`}
+      className="resize-separator separator-sidebar"
       role="separator"
-      aria-label={side === 'left' ? '调整侧栏宽度' : '调整运行状态侧栏宽度'}
+      aria-label={label}
       aria-orientation="vertical"
       aria-valuenow={value}
       tabIndex={0}
       onPointerDown={(event) => {
         event.currentTarget.setPointerCapture(event.pointerId)
-        const width = side === 'right' ? event.currentTarget.parentElement?.getBoundingClientRect().width ?? value : value
-        start.current = { x: event.clientX, value: width }
+        start.current = { x: event.clientX, value }
       }}
       onPointerMove={(event) => {
         if (!event.currentTarget.hasPointerCapture(event.pointerId) || start.current === null) return
-        const delta = (event.clientX - start.current.x) * (side === 'right' ? -1 : 1)
+        const delta = (event.clientX - start.current.x) * (reversed ? -1 : 1)
         onChange(start.current.value + delta)
       }}
       onPointerUp={(event) => {
@@ -213,7 +117,7 @@ function ResizeSeparator({ value, onChange, side = 'left' }: { value: number; on
       onKeyDown={(event) => {
         if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
         event.preventDefault()
-        const direction = (event.key === 'ArrowRight' ? 1 : -1) * (side === 'right' ? -1 : 1)
+        const direction = (event.key === 'ArrowRight' ? 1 : -1) * (reversed ? -1 : 1)
         onChange(value + direction * 12)
       }}
     />

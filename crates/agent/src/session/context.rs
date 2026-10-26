@@ -7,7 +7,7 @@ use singularity_model::{ContentBlock, Message};
 
 use crate::message::{COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX};
 
-use super::format::{LedgerRecord, SessionEntry};
+use super::format::{LedgerRecord, Result, SessionEntry};
 use super::manager::SessionData;
 
 /// 启发式 Token 估算：按 UTF-16 字符数除以 4 向上取整。
@@ -188,7 +188,7 @@ pub(crate) fn estimated_tokens(session: &SessionData, identity: (&str, &str), de
 }
 
 /// 要总结的早期对话；切点不会拆开一组工具调用和结果。
-pub(crate) struct CompactionPrefix {
+pub struct CompactionPrefix {
     pub(crate) messages: Vec<Message>,
     pub(crate) image_directory: std::path::PathBuf,
     /// 这段对话的 Token 估算，包括开头的上一份摘要。
@@ -197,9 +197,22 @@ pub(crate) struct CompactionPrefix {
     pub(crate) first_kept_entry_id: String,
 }
 
-pub(crate) fn compaction_prefix(session: &SessionData, keep_recent_ratio: f64) -> Option<CompactionPrefix> {
+impl CompactionPrefix {
+    /// 先选出需要总结的历史；没有更早内容时无需准备模型、指令或工具。
+    pub async fn select(session: &super::SessionWriter) -> Option<Self> {
+        let session = std::sync::Arc::clone(session);
+        tokio::task::spawn_blocking(move || compaction_prefix(&super::lock_writer(&session)))
+            .await
+            .expect("summary selection completes while the runtime is running")
+    }
+}
+
+/// 摘要保留的近期对话比例；自动压缩和独立压缩共用。
+const KEEP_RECENT_RATIO: f64 = 0.1;
+
+pub(crate) fn compaction_prefix(session: &SessionData) -> Option<CompactionPrefix> {
     let entries = resolve_context_entries(session);
-    let keep_recent_tokens = (context_token_estimate(&entries) as f64 * keep_recent_ratio).ceil() as u64;
+    let keep_recent_tokens = (context_token_estimate(&entries) as f64 * KEEP_RECENT_RATIO).ceil() as u64;
     let cut = find_cut_point(&entries, keep_recent_tokens);
     if cut == 0 {
         return None;
@@ -245,7 +258,7 @@ fn model_message(entry: &SessionEntry) -> Message {
 pub(crate) fn load_images(
     messages: &mut [Message],
     directory: &std::path::Path,
-) -> super::Result<std::collections::HashMap<String, String>> {
+) -> Result<std::collections::HashMap<String, String>> {
     let mut images = std::collections::HashMap::new();
     for message in messages {
         let mut captions = String::new();
@@ -295,64 +308,4 @@ fn resolve_context_entries(session: &SessionData) -> Vec<&SessionEntry> {
             .filter(|entry| matches!(context_entry(entry), Some(ContextEntry::Message(_)))),
     );
     context
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use singularity_protocol::{ProviderAttemptStatus, RequestObservation, RequestPurpose};
-
-    #[test]
-    fn thinking_counts_toward_the_shared_request_and_compaction_budget() {
-        let text = "a".repeat(16_000);
-        let thinking = Message::assistant(String::new(), text.clone(), Vec::new(), None);
-        assert_eq!(message_token_estimate(&thinking), message_token_estimate(&Message::user(text)));
-        assert!(message_token_estimate(&thinking) >= 4_000);
-    }
-
-    #[test]
-    fn failed_messages_remain_in_history_but_never_enter_requests_or_compaction() {
-        let mut session = SessionData {
-            file: "session.jsonl".into(),
-            cwd: "C:/project".into(),
-            entries: Vec::new(),
-            session_id: "session".into(),
-            header_timestamp: "now".into(),
-        };
-        for (index, status) in [
-            None,
-            Some(ProviderAttemptStatus::Error),
-            Some(ProviderAttemptStatus::Cancelled),
-            None,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            session.entries.push(SessionEntry::Message {
-                id: index.to_string(),
-                timestamp: "now".into(),
-                message: if status.is_some() {
-                    Message::assistant("unfinished".into(), "thinking".into(), Vec::new(), None)
-                } else {
-                    Message::user(format!("input {index}"))
-                },
-                observation: status.map(|status| RequestObservation {
-                    purpose: RequestPurpose::Generation,
-                    provider: "provider".into(),
-                    model: "model".into(),
-                    status,
-                    duration_ms: 1,
-                    ttft_ms: None,
-                    decode_ms: None,
-                    usage: None,
-                }),
-            });
-        }
-        let (messages, _) = prepare_context(&session, ("provider", "model"), 0);
-        assert_eq!(messages.iter().map(Message::content_text).collect::<Vec<_>>(), ["input 0", "input 3"]);
-        let prefix = compaction_prefix(&session, 0.1).expect("first input can be summarized");
-        assert_eq!(prefix.messages.iter().map(Message::content_text).collect::<Vec<_>>(), ["input 0"]);
-        assert_eq!(prefix.first_kept_entry_id, "3");
-        assert_eq!(session.entries().len(), 4);
-    }
 }

@@ -87,7 +87,7 @@ async function start(): Promise<void> {
       const selected: DirectoryPickResult = { path: result.canceled ? null : result.filePaths[0] }
       return { type: 'success', result: selected }
     } catch (error) {
-      return { type: 'error', error: { code: 'internal', message: `无法选择文件夹：${String(error)}`, recovery: '请重试添加工作区。' } }
+      return { type: 'error', error: { code: 'internal', message: `无法选择文件夹：${String(error)}` } }
     }
   })
   tray = new Tray(icon.resize({ width: 20, height: 20 }))

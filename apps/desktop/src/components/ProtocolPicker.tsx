@@ -1,3 +1,4 @@
+import { Check } from 'lucide-react'
 import { useId, useRef, useState } from 'react'
 import { navigateList } from '../interactions'
 import { ExpandChevron } from './ExpandChevron'
@@ -29,7 +30,7 @@ export function ProtocolPicker({ value, onChange }: { value: ProviderApiProtocol
         onChange(id)
         popup.current!.hidePopover()
         anchor.current?.focus()
-      }}><span>{label}</span><span aria-hidden="true">{value === id ? '✓' : ''}</span></button>)}
+      }}><span>{label}</span>{value === id && <Check size={15} aria-hidden="true" />}</button>)}
     </div></Disclosure></div>
   </div>
 }

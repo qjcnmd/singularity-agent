@@ -133,7 +133,9 @@ pub(crate) fn provider_error_kind_for_code(code: Option<&str>) -> Option<ModelEr
 pub(crate) fn provider_error_kind_for_http_status(status: u16) -> ModelErrorKind {
     match status {
         crate::HTTP_STATUS_UNAUTHORIZED | crate::HTTP_STATUS_FORBIDDEN => ModelErrorKind::AuthError,
-        crate::HTTP_STATUS_REQUEST_TIMEOUT | crate::HTTP_STATUS_RATE_LIMITED => ModelErrorKind::Temporary,
+        crate::HTTP_STATUS_REQUEST_TIMEOUT
+        | crate::HTTP_STATUS_CONFLICT
+        | crate::HTTP_STATUS_RATE_LIMITED => ModelErrorKind::Temporary,
         status if (400..=499).contains(&status) => ModelErrorKind::InvalidRequest,
         status if (500..=599).contains(&status) => ModelErrorKind::Temporary,
         _ => ModelErrorKind::UnknownProviderError,

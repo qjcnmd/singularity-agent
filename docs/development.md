@@ -78,15 +78,6 @@ cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D w
 cargo check --workspace --all-targets
 ```
 
-### 回归测试
-
-公式渲染和样式共用 `package.json` 中指定的 KaTeX 版本；`overrides` 同时约束 Markdown 插件的传递依赖。更新时检查行内公式、独立公式、矩阵和错误公式。
-
-```powershell
-cargo test --workspace --locked
-npm --prefix apps/desktop test
-```
-
 ## 3. 跨端协议同步 (TypeScript DTO)
 
 `protocol` crate 定义前后端通信的 DTO 与 RPC 方法。修改 `crates/protocol/src/` 中的结构体或枚举后，需要重新导出 TypeScript 类型声明：
@@ -101,6 +92,8 @@ cargo run -p singularity_protocol --features typescript --example export_types
 ## 4. 现场验证
 
 功能完成后，在构建后的 Electron 工作台中实际操作本次改动涉及的功能。按影响检查结果、出错、停止、重复操作和重读历史后的表现，只检查受影响部分。数据目录、模型调用等约定见[仓库指令](../AGENTS.md#验证环境与交付)。
+
+公式渲染和样式共用 `package.json` 中指定的 KaTeX 版本；Mermaid 图同样固定版本，更新时检查流程图、时序图、语法错误的图和横向很宽的图；同时在系统“减少动态效果”开启时检查一次（Playwright 默认按未开启模拟，需设 `reducedMotion: 'reduce'`），这时全局过渡样式会让刚改的尺寸读回旧值。`overrides` 同时约束 Markdown 插件的传递依赖。更新时检查行内公式、独立公式、矩阵和错误公式。
 
 ## 5. 打包构建与发布
 
@@ -119,4 +112,4 @@ npm --prefix apps/desktop run package
 产物输出于 `apps/desktop/release/win-unpacked/`，包含 `Singularity.exe` 与完整运行时依赖。
 
 ### CI
-- **CI 工作流** (`.github/workflows/ci.yml`)：推送到 `main` 时运行 Rust 格式化检查、Clippy、编译、Rust 与前端同步测试及依赖检查。
+- **CI 工作流** (`.github/workflows/ci.yml`)：推送到 `main` 时运行 Rust 格式化检查、Clippy、编译、前端构建及依赖检查。

@@ -21,7 +21,7 @@ static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
 });
 const NAME: &str = "read";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadArgs {
     pub(crate) path: String,

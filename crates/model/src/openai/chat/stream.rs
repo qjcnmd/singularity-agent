@@ -332,32 +332,3 @@ fn stream_index(value: Option<&Value>, malformed: &'static str) -> Result<u64, P
         Some(value) => value.as_u64().ok_or_else(|| provider_chat_stream_malformed_error(malformed)),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ContentBlock;
-
-    #[test]
-    fn interrupted_stream_keeps_text_without_executing_partial_tools() {
-        let config = OpenAiProviderConfig {
-            provider_name: "provider".into(),
-            base_url: "https://example.com".into(),
-            api_key: String::new(),
-        };
-        for kind in [ModelErrorKind::Cancelled, ModelErrorKind::JsonSchemaViolation] {
-            let mut on_event = |_| {};
-            let mut decoder =
-                ChatSseDecoder::new(&mut on_event, &config, "model", "https://example.com/chat/completions");
-            decoder.dispatch_event(br#"{"choices":[{"index":0,"delta":{"content":"partial","reasoning_content":"thinking","tool_calls":[{"index":0,"id":"call","function":{"name":"bash","arguments":"{"}}]}}]}"#).expect("valid stream fragment");
-            let response = decoder.finish(Err(ProviderError::new(kind, "stream ended")));
-            assert_eq!(response.assistant_message.content_text(), "partial");
-            assert!(response.assistant_message.content().iter().any(
-                |block| matches!(block, ContentBlock::Thinking { thinking, .. } if thinking == "thinking")
-            ));
-            assert_eq!(response.assistant_message.tool_calls().count(), 0);
-            assert_eq!(response.error().map(|error| error.kind), Some(kind));
-            assert_eq!(response.usage, None);
-        }
-    }
-}

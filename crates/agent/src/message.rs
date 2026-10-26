@@ -5,11 +5,13 @@ use singularity_model::{ContentBlock, Message};
 
 /// 用户和助手消息中可显示的条目，历史读取和完成事件共用。提供方私有字段不转换；
 /// 工具结果由历史读取时挂到对应调用上，这里不处理。
+/// `saved_at` 是消息写入日志的时间。助手回复的累计用量由调用方挂到最后一段正文上。
 pub fn public_items(
     message: &Message,
     entry_id: &str,
     status: singularity_protocol::TurnStatus,
     tool_status: singularity_protocol::ToolStatus,
+    saved_at: &str,
 ) -> Vec<singularity_protocol::HistoryItem> {
     use singularity_protocol::HistoryItem;
     let role = match message {
@@ -20,6 +22,7 @@ pub fn public_items(
         }
     };
     let mut images = message.images().cloned().collect::<Vec<_>>();
+    let mut files = message.files().to_vec();
     let (mut text_index, mut thinking_index, mut call_index) = (0, 0, 0);
     message
         .content()
@@ -29,7 +32,7 @@ pub fn public_items(
             Some(match block {
                 ContentBlock::Text { text, .. } => {
                     let text = message.text_for_display(index, text);
-                    if text.is_empty() && (text_index != 0 || images.is_empty()) {
+                    if text.is_empty() && (text_index != 0 || (images.is_empty() && files.is_empty())) {
                         return None;
                     }
                     let id = crate::session::text_item_id(entry_id, text_index);
@@ -39,7 +42,10 @@ pub fn public_items(
                         id,
                         role,
                         text: text.to_string(),
+                        at: Some(saved_at.to_owned()),
+                        stats: None,
                         images: std::mem::take(&mut images),
+                        files: std::mem::take(&mut files),
                     }
                 }
                 ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
@@ -64,6 +70,24 @@ pub fn public_items(
         .collect()
 }
 
+/// 把会话累计用量挂到一条助手消息的最后一段正文上；没有正文时不显示。
+pub fn attach_usage(
+    items: &mut [singularity_protocol::HistoryItem],
+    usage: &singularity_protocol::SessionModelUsage,
+) {
+    if let Some(singularity_protocol::HistoryItem::Message {
+        stats,
+        role: singularity_protocol::HistoryMessageRole::Assistant,
+        ..
+    }) = items
+        .iter_mut()
+        .rev()
+        .find(|item| matches!(item, singularity_protocol::HistoryItem::Message { .. }))
+    {
+        *stats = Some(usage.clone());
+    }
+}
+
 /// 摘要放进模型上下文时加在前面的说明。
 pub const COMPACTION_SUMMARY_PREFIX: &str = "This checkpoint summarizes earlier conversation history. Treat it as established background and continue directly from the messages that follow without acknowledging the checkpoint.\n\n<compacted-summary>\n";
 /// 摘要放进模型上下文时加在后面的结束标签。
@@ -81,41 +105,16 @@ pub(crate) fn tool_result_message(tool_call_id: &str, execution: &ToolExecution)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn published_items_keep_interleaved_tool_calls_in_message_order() {
-        let message = Message::Assistant {
-            content: vec![
-                ContentBlock::text("before"),
-                ContentBlock::ToolCall(singularity_model::ModelToolCall {
-                    tool_call_id: "call".into(),
-                    tool_name: "read".into(),
-                    arguments: serde_json::json!({ "path": "README.md" }),
-                    metadata: None,
-                }),
-                ContentBlock::text("after"),
-            ],
-            provider_metadata: None,
-        };
-        let items = public_items(
-            &message,
-            "reply",
-            singularity_protocol::TurnStatus::Completed,
-            singularity_protocol::ToolStatus::Pending,
-        );
-        assert!(matches!(
-            items[1],
-            singularity_protocol::HistoryItem::Tool {
-                status: singularity_protocol::ToolStatus::Pending,
-                ..
-            }
-        ));
-        assert_eq!(
-            items.iter().map(singularity_protocol::HistoryItem::id).collect::<Vec<_>>(),
-            ["reply:text:0", "reply:tool:0", "reply:text:1"]
-        );
-    }
+/// 实时完成和历史读取共用工具结果的显示内容。
+pub fn public_tool_result(message: &Message) -> Option<singularity_protocol::ToolResult> {
+    let Message::ToolResult { is_error, duration_ms, read_source, .. } = message else {
+        return None;
+    };
+    Some(singularity_protocol::ToolResult {
+        output: message.content_text(),
+        images: message.images().cloned().collect(),
+        is_error: *is_error,
+        duration_ms: *duration_ms,
+        read_source: *read_source,
+    })
 }

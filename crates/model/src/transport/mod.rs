@@ -4,4 +4,4 @@
 pub(crate) mod http;
 pub(crate) mod stream;
 
-pub(crate) use http::{provider_client, provider_error_from_http_status, provider_future, retry_after_delay};
+pub(crate) use http::{provider_client, provider_future, retry_after_delay};

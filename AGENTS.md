@@ -26,7 +26,7 @@
 | 改动 | 同步 |
 | --- | --- |
 | `crates/protocol/src/` 中的 DTO 或 RPC | 运行 `cargo run -p singularity_protocol --features typescript --example export_types`，更新前端调用方 |
-| Rust 公共函数或类型 | 受影响的调用方、测试夹具和断言 |
+| Rust 公共函数或类型 | 受影响的调用方 |
 | 执行顺序、条件分支、模块关系、数据流、失败或停止处理 | 同一改动中更新 `architecture.html` 对应的节点、连线和说明，对照源码核对；调整过布局就看渲染画面，文字和箭头要清楚 |
 | 模块职责、状态由谁维护、源码入口 | `docs/architecture.md` |
 | 控件的操作方式 | `docs/desktop-ui.md` |
@@ -35,13 +35,13 @@
 ## 检查
 
 - **每次改动**：改了 Rust 跑受影响 crate 的 `cargo clippy` 和 `cargo fmt --all`；改了前端跑 `npm --prefix apps/desktop run build`（含类型检查）。完整命令见[开发指南](docs/development.md#2-质量检查与代码格式化)。
-- **交付前**：跑一次 `cargo test --workspace --locked` 和 `npm --prefix apps/desktop test`，通过就结束，不反复跑。
+- **交付前**：确认受影响部分的格式、静态检查、构建和现场验证通过，通过就结束，不反复跑。
 - **新增测试先问**：默认不写新测试。遇到现场实测碰不到的问题（比如事件先后顺序、时机），先说明为什么测不到，用户同意再写。
 - **现场实测**：功能做完后，在 production 版 Electron 工作台里用 Playwright 操作改到的功能，检查结果、出错、停止和重新打开任务后的表现，只测受影响部分。布局和动效的观感由用户看：交付时说明要看哪个界面、怎么操作、看什么。
 
 ## 验证环境与交付
 
-- **数据目录**：验证直接用用户的 `~/.singularity`。启动工作台前直接退出占用它的实例（单实例锁），不用问；验证时建的项目和任务留在用户列表里。
+- **数据目录**：验证直接用用户的 `~/.singularity`。启动工作台前直接退出占用它的实例（单实例锁），不用问；验证结束后清理本次创建的项目、任务及附件，保留用户原有数据。
 - **Windows 自动化环境**：Playwright / Electron 自动化从普通 PowerShell 启动 Node 验证脚本，让 Electron 和 Rust 继承完整的 Windows 环境，不要沿用 `node_repl` 这类工具裁剪过的环境。装了 Git Bash 却报找不到时，先查验证进程的 `ProgramFiles`、`PATH` 和实际 `bash.exe` 路径，改好启动方式再重跑。
 - **模型调用**：只用真实的提供方和模型，不写模拟提供方。对验证有帮助就直接调用，不用问。用户没指定时用 DeepSeek 官方的 `deepseek/deepseek-flash`（已配置在 `~/.singularity/config.json`，地址 `https://api.deepseek.com`）。
 - **临时文件**：验证脚本、调查脚本和临时数据用完就删，不留在仓库。

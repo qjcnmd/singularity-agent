@@ -4,7 +4,7 @@
 
 use crate::agent::request::RequestDefinitions;
 use crate::request_execution::output_budget_tokens;
-use crate::session::context::CompactionPrefix;
+pub use crate::session::context::CompactionPrefix;
 use crate::session::context::estimate_tokens_of;
 
 use crate::agent::{AgentError, Result};
@@ -49,7 +49,7 @@ impl PreparedCompaction {
         definitions: RequestDefinitions,
         model: &ModelConfigurationSnapshot,
     ) -> crate::agent::Result<Self> {
-        let overhead_tokens = definitions.estimated_tokens();
+        let overhead_tokens = definitions.estimated_tokens;
         let mut messages = definitions.messages;
         messages.extend(prefix.messages);
         let images = crate::session::context::load_images(&mut messages, &prefix.image_directory)?;

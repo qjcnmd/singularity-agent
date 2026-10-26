@@ -2,10 +2,9 @@ import { workspaceKey } from './workspace'
 import { SessionStore, type AppState, type QuestionDraft } from './sessionStore'
 import { actionOrigin } from './storeActions'
 export { actionOrigin, hasInlineActionError, pendingKey } from './storeActions'
-export type { AppState, ActionError } from './sessionStore'
+export type { AppState, ActionError, FileTab } from './sessionStore'
 import { effectiveSelection, selectedModel } from './modelChoices'
-import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
-export type { WorkspaceAppearance } from './viewPersistence'
+import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, clampFilePanelWidth, type PersistedView } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { emptyDraft, imageUpload, type Draft } from './drafts'
 import type { ModelSelection, ProviderConfigurationInput, RpcMethod, RpcParams, ViewportAnchor } from './protocol'
@@ -17,6 +16,11 @@ type SessionActionMethod = {
 }[RpcMethod]
 
 class AppStore extends SessionStore {
+  setPage(page: AppState['page']): void {
+    this.selectionRequest += 1
+    this.patch({ page })
+  }
+
   setDraft(text: string): void {
     const id = this.draftKey()
     if (id === null) return
@@ -32,6 +36,12 @@ class AppStore extends SessionStore {
   setImages(id: string, images: Draft['images'], append = false): void {
     const draft = this.drafts.get(id)
     void this.drafts.set(id, { ...draft, images: append ? [...draft.images, ...images] : images })
+  }
+
+  /** 附件按路径去重；append 为 false 时整体替换（用于移除）。 */
+  setFiles(id: string, files: string[], append = false): void {
+    const draft = this.drafts.get(id)
+    void this.drafts.set(id, { ...draft, files: append ? [...new Set([...draft.files, ...files])] : files })
   }
 
   modelSelection(): ModelSelection | null {
@@ -59,9 +69,10 @@ class AppStore extends SessionStore {
     else if (state.selectedSessionId !== null && state.session === null) blockedReason = state.sessionLoad.status === 'error'
       ? '任务读取失败' : '正在读取任务'
     else if (phase === 'stopping') blockedReason = '正在停止'
+    else if (state.session?.runtime.pendingQuestion) blockedReason = '请先回答问题'
     else if (submitPending) blockedReason = '正在发送…'
     else if (!active && !this.modelAvailable()) blockedReason = '请选择模型'
-    return { canSubmit: state.drafts !== null && state.selectedWorkspaceRoot !== null && blockedReason === null && (draft.text.trim() !== '' || draft.images.length > 0), blockedReason } as const
+    return { canSubmit: state.drafts !== null && state.selectedWorkspaceRoot !== null && blockedReason === null && (draft.text.trim() !== '' || draft.images.length > 0 || draft.files.length > 0), blockedReason } as const
   }
 
   async submitDraft(): Promise<boolean> {
@@ -73,8 +84,9 @@ class AppStore extends SessionStore {
     const draft = this.inputDraft()
     const selection = this.modelSelection()
     const navigation = this.selectionRequest
+    this.setViewportAnchor(defaultAnchor())
     return this.action('session.submit', actionOrigin.session(sessionId), async () => {
-      const input = { text: draft.text, images: await Promise.all(draft.images.map(imageUpload)) }
+      const input = { text: draft.text, images: await Promise.all(draft.images.map(imageUpload)), files: draft.files }
       if (sessionId === null) {
         if (selection === null) throw new Error('请选择模型')
         await this.startSession({ ...input, workspaceRoot, selection }, navigation)
@@ -120,7 +132,7 @@ class AppStore extends SessionStore {
     return this.action('session.delete', actionOrigin.session(sessionId), async () => {
       await this.transport.rpc('session.delete', { sessionId })
       this.clearSessionAnchors([sessionId])
-      await this.drafts.remove([sessionId], '任务已删除')
+      await this.drafts.remove([sessionId])
     })
   }
 
@@ -138,12 +150,10 @@ class AppStore extends SessionStore {
     return this.action('workspace.remove', actionOrigin.inline('workspace.remove', workspaceRoot), async () => {
       await this.transport.rpc('workspace.remove', { workspaceRoot })
       this.clearSessionAnchors(removedDrafts)
-      const workspaceAppearance = { ...this.state.workspaceAppearance }
-      delete workspaceAppearance[workspaceRoot]
-      this.saveView({ workspaceAppearance, sidebarView: {
+      this.saveView({ sidebarView: {
         collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceRoot),
       } })
-      await this.drafts.remove(removedDrafts, '项目已移除')
+      await this.drafts.remove(removedDrafts)
     })
   }
 
@@ -153,6 +163,14 @@ class AppStore extends SessionStore {
         const result = await this.transport.rpc('model.saveProvider', { provider, apiKey: apiKey || undefined })
         this.applySync(acceptModelCatalog(this.state, result))
       })
+  }
+
+  async refreshModels(): Promise<void> {
+    try {
+      this.applySync(acceptModelCatalog(this.state, await this.transport.rpc('model.read', {})))
+    } catch (error) {
+      this.reportError(error, 'app')
+    }
   }
 
   async removeProvider(providerId: string): Promise<boolean> {
@@ -178,10 +196,6 @@ class AppStore extends SessionStore {
 
   setSidebarWidth(sidebarWidth: number): void {
     this.saveView({ sidebarWidth: clampSidebarWidth(sidebarWidth) }, true)
-  }
-
-  setBackgroundWidth(backgroundWidth: number): void {
-    this.saveView({ backgroundWidth: clampSidebarWidth(backgroundWidth) }, true)
   }
 
   toggleSidebar(): void {
@@ -245,9 +259,6 @@ class AppStore extends SessionStore {
     this.saveView({ backgroundOpen })
   }
 
-  setWorkspaceAppearance(workspaceRoot: string, appearance: WorkspaceAppearance): void {
-    this.saveView({ workspaceAppearance: { ...this.state.workspaceAppearance, [workspaceRoot]: appearance } })
-  }
 
   setMessageFontSize(value: number): void {
     this.saveView({ messageFontSize: normalizeMessageFontSize(value) })
@@ -255,6 +266,36 @@ class AppStore extends SessionStore {
 
   setTheme(theme: PersistedView['theme']): void {
     this.saveView({ theme })
+  }
+
+  /** 打开文件标签；已打开时切过去并重新读取。路径按任务工作目录解析，所以同名相对路径在不同项目里是不同的标签。 */
+  openFile(path: string, cwd: string, title = path.split(/[\\/]/).filter(Boolean).pop() ?? path): void {
+    const id = `${cwd}\u0000${path}`
+    const fileTabs = this.state.fileTabs.some(tab => tab.id === id)
+      ? this.state.fileTabs.map(tab => tab.id === id ? { ...tab, opened: tab.opened + 1 } : tab)
+      : [...this.state.fileTabs, { id, path, cwd, title, opened: 0 }]
+    this.patch({ fileTabs, activeFileTab: id })
+  }
+
+  closeFile(id: string): void {
+    const index = this.state.fileTabs.findIndex(tab => tab.id === id)
+    if (index < 0) return
+    const fileTabs = this.state.fileTabs.filter(tab => tab.id !== id)
+    // 关掉当前标签时切到右边一个，没有就左边一个。
+    const activeFileTab = this.state.activeFileTab !== id ? this.state.activeFileTab : (fileTabs[index] ?? fileTabs[index - 1])?.id ?? null
+    this.patch({ fileTabs, activeFileTab })
+  }
+
+  selectFile(id: string): void {
+    this.patch({ activeFileTab: id })
+  }
+
+  setFilePanelWidth(value: number): void {
+    this.saveView({ filePanelWidth: clampFilePanelWidth(value) }, true)
+  }
+
+  setBubbleColor(kind: 'assistantBubble' | 'userBubble', id: string): void {
+    this.saveView({ [kind]: id })
   }
 }
 

@@ -9,63 +9,90 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
-/// 文字与图片作为一个输入一起接受和交付。
-#[derive(Debug, Clone, PartialEq, Default)]
+/// 文字、图片和附件路径作为一个输入一起接受和交付。
+#[derive(Debug, Clone)]
 pub struct UserInput {
     pub text: String,
     pub images: Vec<crate::image::InputImage>,
+    /// 附件文件的绝对路径；只交给模型路径，由模型用读取工具查看内容。
+    pub files: Vec<String>,
 }
 
 impl UserInput {
-    /// 检查工作台提交的输入；图片只在这里识别和解码一次。
+    /// 检查工作台提交的输入；图片只在这里识别和解码一次，附件只检查路径指向现有文件。
     pub fn from_uploads(
         text: String,
         images: Vec<singularity_protocol::ImageUpload>,
+        files: Vec<String>,
     ) -> Result<Self, String> {
-        if text.trim().is_empty() && images.is_empty() {
+        if text.trim().is_empty() && images.is_empty() && files.is_empty() {
             return Err("输入不能为空。".into());
+        }
+        if let Some(missing) = files.iter().find(|path| !std::path::Path::new(path).is_file()) {
+            return Err(format!("找不到附件：{missing}"));
         }
         Ok(Self {
             text,
             images: images.into_iter().map(crate::image::InputImage::upload).collect::<Result<_, _>>()?,
+            files,
         })
     }
 
-    /// 按当前目录展开空白分隔的 `/技能名`；手动输入与菜单选择共用，正文由模型读取。
-    pub(super) fn model_text(&self, cwd: &std::path::Path, home: &std::path::Path) -> String {
-        static REFERENCE: LazyLock<regex::Regex> = LazyLock::new(|| {
-            regex::Regex::new(r"(?P<prefix>^|\s)/(?P<name>\S+)").expect("skill reference pattern is valid")
-        });
-        if !REFERENCE.is_match(&self.text) {
-            return self.text.clone();
+    /// 模型看到的文字：附件路径列在正文后面。
+    pub(super) fn text_with_files(&self, text: String) -> String {
+        if self.files.is_empty() {
+            return text;
         }
-        let skills = singularity_core::skills::SkillCatalog::discover(cwd, home);
-        REFERENCE
-            .replace_all(&self.text, |captures: &regex::Captures<'_>| {
-                match skills
-                    .skills
-                    .iter()
-                    .find(|skill| skill.user_invocable && skill.name == captures["name"])
-                {
-                    Some(skill) => {
-                        format!("{}read {}", &captures["prefix"], singularity_core::display_path(&skill.path))
-                    }
-                    None => captures[0].to_string(),
-                }
-            })
-            .into_owned()
+        let list = self.files.iter().map(|path| format!("- {path}")).collect::<Vec<_>>().join(
+            "
+",
+        );
+        if text.trim().is_empty() {
+            format!(
+                "附件：
+{list}"
+            )
+        } else {
+            format!(
+                "{text}
+
+附件：
+{list}"
+            )
+        }
     }
 }
 
+/// 按当前目录展开空白分隔的 `/技能名`；手动输入与菜单选择共用，正文由模型读取。
+pub(super) fn expand_skill_references(text: &str, cwd: &std::path::Path, home: &std::path::Path) -> String {
+    static REFERENCE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?P<prefix>^|\s)/(?P<name>\S+)").expect("skill reference pattern is valid")
+    });
+    if !REFERENCE.is_match(text) {
+        return text.to_owned();
+    }
+    let skills = singularity_core::skills::SkillCatalog::discover(cwd, home);
+    REFERENCE
+        .replace_all(text, |captures: &regex::Captures<'_>| {
+            match skills.skills.iter().find(|skill| skill.user_invocable && skill.name == captures["name"]) {
+                Some(skill) => {
+                    format!("{}read {}", &captures["prefix"], singularity_core::display_path(&skill.path))
+                }
+                None => captures[0].to_string(),
+            }
+        })
+        .into_owned()
+}
+
 /// 队列中的一项输入；消息 ID 在入队时分配，保存失败后重试仍用同一个。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct QueuedInput {
     pub input: QueuedInputKind,
     pub(super) message_id: String,
 }
 
 /// 区分用户消息和后台命令完成通知；通知不会显示成用户输入。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum QueuedInputKind {
     User(UserInput),
     Background { task_id: String, status: String },
@@ -139,13 +166,6 @@ impl SteeringInbox {
 
 /// 任务、Agent 和后台命令共用的输入队列。
 pub type SteeringInboxHandle = Arc<Mutex<SteeringInbox>>;
-
-impl SteeringInbox {
-    /// 新建一个由任务长期持有的输入队列。
-    pub fn default_handle() -> SteeringInboxHandle {
-        Arc::new(Mutex::new(Self::default()))
-    }
-}
 
 /// 给输入队列加锁；锁中毒说明之前已经 panic，直接终止。
 pub(super) fn lock_inbox(queue: &Mutex<SteeringInbox>) -> std::sync::MutexGuard<'_, SteeringInbox> {

@@ -1,18 +1,28 @@
 .mcp-status, .mcp-endpoint { color: var(--ink-faint); font-size: 12px; overflow-wrap: anywhere; }
 .mcp-switch { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; white-space: nowrap; }
-.mcp-switch input { width: auto; }
-.mcp-tools { display: grid; gap: 10px; }
 .mcp-tools > p { margin: 0; white-space: pre-wrap; }
 .mcp-tools > button { justify-self: start; }
-.mcp-tool { border-top: 1px solid var(--line); padding-top: 10px; overflow-wrap: anywhere; }
 .mcp-tool strong { font-size: 12px; }
 .mcp-tool p { font-size: 12px; color: var(--ink-soft); margin: 4px 0 0; white-space: pre-wrap; }
 .mcp-editor { min-height: 0; padding: 0; }
-.mcp-editor-scroll { display: grid; gap: 14px; min-width: 0; margin: 0; border: 0; padding: 20px; overflow-y: auto; }
 .mcp-editor textarea { resize: vertical; min-height: 60px; font-family: var(--font-mono); }
-.mcp-editor footer { padding: 14px 20px; border-top: 1px solid var(--line); flex: none; }
 .mcp-timeouts { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 @media (max-width: 640px) {
   .mcp-row-head { flex-wrap: wrap; }
   .mcp-row-head .sg-row-actions { width: 100%; justify-content: flex-end; }
 }
+
+.mcp-row-head .sg-row-identity { display: grid; gap: 2px; }
+.mcp-dot { width: 9px; height: 9px; flex: none; margin: 0 4px; border-radius: 50%; background: #c7c7cc; }
+.mcp-dot.status-connected { background: var(--positive); }
+.mcp-dot.status-failed { background: var(--danger); }
+.mcp-dot.status-connecting { background: var(--warning); animation: breathe 1.2s ease-in-out infinite; }
+.mcp-tools { display: grid; gap: 10px; padding: 2px 16px 16px 52px; }
+.mcp-tool { border-top: 1px solid var(--line); padding-top: 10px; overflow-wrap: anywhere; border: 0; padding: 0; }
+.mcp-editor-modal { width: 520px; }
+.mcp-editor-scroll { display: grid; gap: 14px; min-width: 0; margin: 0; border: 0; overflow-y: auto; padding: 10px 24px 4px; }
+.mcp-editor footer { border-top: 1px solid var(--line); flex: none; display: flex; justify-content: flex-end; gap: 8px; border: 0; padding: 16px 20px 20px; }
+.mcp-switch input { position: relative; appearance: none; width: 38px; height: 23px; border: 0; border-radius: 999px; background: var(--switch-off); cursor: pointer; transition: background 200ms; }
+.mcp-switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 19px; height: 19px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgb(0 0 0 / 22%); transition: transform var(--spring-dur) var(--spring); }
+.mcp-switch input:checked { background: var(--positive); }
+.mcp-switch input:checked::after { transform: translateX(15px); }

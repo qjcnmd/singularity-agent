@@ -5,9 +5,9 @@ export const defaultAnchor = (): ViewportAnchor => ({
   mode: 'following', anchorItemId: null, offset: 0,
 })
 
-export const messageFontSize = { min: 12, max: 24, default: 16 }
+export const messageFontSize = { min: 12, max: 24, default: 14.5 }
 export function normalizeMessageFontSize(value: number): number {
-  return Number.isFinite(value) ? Math.min(messageFontSize.max, Math.max(messageFontSize.min, Math.round(value))) : messageFontSize.default
+  return Number.isFinite(value) ? Math.min(messageFontSize.max, Math.max(messageFontSize.min, value)) : messageFontSize.default
 }
 
 const storageKey = 'singularity.app.view.v1'
@@ -16,47 +16,51 @@ const storageKey = 'singularity.app.view.v1'
 export interface PersistedView {
   theme: 'light' | 'dark'
   messageFontSize: number
+  /** 会话气泡配色，取调色盘颜色的 id（palette.ts）。 */
+  assistantBubble: string
+  userBubble: string
   selectedWorkspaceRoot: string | null
   selectedSessionId: string | null
   sidebarWidth: number
+  filePanelWidth: number
   sidebarCollapsed: boolean
-  backgroundWidth: number
   sidebarView: { collapsed: string[] }
   backgroundOpen: boolean
-  workspaceAppearance: Record<string, WorkspaceAppearance>
   viewportAnchors: Record<string, ViewportAnchor>
-}
-
-export interface WorkspaceAppearance {
-  color: string
 }
 
 export function loadPersisted(): PersistedView {
   const fallback: PersistedView = {
     theme: 'light',
     messageFontSize: messageFontSize.default,
+    assistantBubble: 'neutral',
+    userBubble: 'blue',
     selectedWorkspaceRoot: null,
     selectedSessionId: null,
-    sidebarWidth: 280,
+    sidebarWidth: 268,
+    filePanelWidth: 480,
     sidebarCollapsed: false,
-    backgroundWidth: 280,
     sidebarView: { collapsed: [] },
     backgroundOpen: false,
-    workspaceAppearance: {},
     viewportAnchors: {},
   }
   try {
     const stored = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as PersistedView | null
-    return stored ?? fallback
+    // 新增的偏好在旧记录里没有，补上默认值。
+    return stored ? { ...fallback, ...stored } : fallback
   } catch {
     return fallback
   }
 }
 
 export function persistView(value: PersistedView): void {
-  const { theme, messageFontSize, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, sidebarCollapsed, backgroundWidth, sidebarView, backgroundOpen, workspaceAppearance, viewportAnchors } = value
-  const view: PersistedView = { theme, messageFontSize, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, sidebarCollapsed, backgroundWidth, sidebarView, backgroundOpen, workspaceAppearance, viewportAnchors }
+  const { theme, messageFontSize, assistantBubble, userBubble, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, viewportAnchors } = value
+  const view: PersistedView = { theme, messageFontSize, assistantBubble, userBubble, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, viewportAnchors }
   localStorage.setItem(storageKey, JSON.stringify(view))
+}
+
+export function clampFilePanelWidth(value: number): number {
+  return Math.min(Math.max(320, innerWidth - 640), Math.max(320, value))
 }
 
 export function clampSidebarWidth(value: number): number {

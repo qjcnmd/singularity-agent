@@ -7,8 +7,8 @@ use time::format_description::well_known::Rfc2822;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{ModelErrorKind, ProviderError, provider_error_kind_for_http_status};
-use crate::{HTTP_STATUS_CONFLICT, PROVIDER_TIMEOUT_SECONDS};
+use crate::PROVIDER_TIMEOUT_SECONDS;
+use crate::error::{ModelErrorKind, ProviderError};
 
 pub(crate) fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
     headers
@@ -55,16 +55,6 @@ pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
         .build()
         .map_err(provider_transport_error)?;
     Ok(CLIENT.get_or_init(|| client).clone())
-}
-
-/// 根据非 2xx HTTP 状态码构造 ProviderError。
-pub(crate) fn provider_error_from_http_status(status: u16) -> ProviderError {
-    let kind = match status {
-        HTTP_STATUS_CONFLICT => ModelErrorKind::Temporary,
-        _ => provider_error_kind_for_http_status(status),
-    };
-    let message = format!("Provider returned HTTP {status}.");
-    ProviderError::new(kind, message)
 }
 
 /// 提取网络传输异常的最内层错误原因；剥离可能含凭据的 URL，并限制最大长度。

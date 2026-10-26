@@ -18,7 +18,7 @@ pub struct Skill {
     pub disable_model_invocation: bool,
 }
 
-/// 无效文件如实记进 diagnostics，不因此隐藏其他可用技能。
+/// 无效文件如实记进 diagnostics，只在工作台展示，不进入模型提示词。
 #[derive(Debug, Default)]
 pub struct SkillCatalog {
     pub skills: Vec<Skill>,
@@ -173,15 +173,10 @@ impl SkillCatalog {
             .model_skills()
             .map(|s| format!("- {}: {} (path: {})", s.name, s.description, s.path.display()))
             .collect();
-        if !lines.is_empty() {
-            lines.insert(0, "Available skills: when a skill matches the user's task, use the read tool on its path to load the complete instructions. Relative resources in a skill are resolved from that skill file's directory.".into());
+        if lines.is_empty() {
+            return String::new();
         }
-        if !self.diagnostics.is_empty() {
-            lines.push(format!(
-                "Skill discovery errors (these skills are unavailable):\n{}",
-                self.diagnostics.join("\n")
-            ));
-        }
+        lines.insert(0, "Available skills: when a skill matches the user's task, use the read tool on its path to load the complete instructions. Relative resources in a skill are resolved from that skill file's directory.".into());
         lines.join("\n")
     }
 }

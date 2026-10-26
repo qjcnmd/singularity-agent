@@ -1,3 +1,4 @@
+import { X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { appStore } from '../appStore'
 import type { McpConnectionStatus, McpServerInput, McpServerState } from '../protocol'
@@ -92,11 +93,7 @@ export function McpSettings({ workspaceRoot, active, busy, onBusyChange }: {
     } finally { onBusyChange(false) }
   }
 
-  return <section className="mcp-settings" aria-labelledby="mcp-settings-title" aria-busy={loading}>
-    <header className="sg-view-header">
-      <h3 id="mcp-settings-title">MCP</h3>
-      <p>执行任务时自动连接，连接配置和开关在下次运行时更新。每轮运行读取当前指令和工具清单，轮内保持一致。</p>
-    </header>
+  return <section className="mcp-settings" aria-label="MCP" aria-busy={loading}>
     {error && editor === null && removing === null && <p role="alert" className="form-error">{error} <button type="button" className="quiet-button" disabled={busy || loading} onClick={() => void retryLoad()}>重新读取</button></p>}
     <div className="sg-provider-list">
       {servers.map(result => {
@@ -105,11 +102,11 @@ export function McpSettings({ workspaceRoot, active, busy, onBusyChange }: {
         return <div className="sg-row-card" key={server.serverId}>
           <div className="sg-row-head mcp-row-head">
             <button type="button" className="sg-provider-toggle" aria-expanded={open} aria-controls={`mcp-tools-${server.serverId}`} onClick={() => setExpanded(open ? null : server.serverId)}>
-              <span className="sg-row-identity"><strong>{server.serverId}</strong><span className="mcp-status">{result.status === 'connected' ? `${result.tools.length} 个工具` : connectionLabels[result.status]}</span></span>
+              <span className={`mcp-dot status-${result.status}`} /><span className="sg-row-identity"><strong>{server.serverId}</strong><span className="mcp-status">{result.status === 'connected' ? `${result.tools.length} 个工具` : connectionLabels[result.status]}</span></span>
               <ExpandChevron expanded={open} size={16} />
             </button>
             <span className="sg-row-actions">
-              <label className="mcp-switch"><input type="checkbox" role="switch" aria-label={`启用 MCP ${server.serverId}`} checked={server.enabled} disabled={busy || loading} onChange={event => { const enabled = event.target.checked; void mutate(() => appStore.transport.rpc('mcp.toggle', { serverId: server.serverId, enabled, workspaceRoot })) }} />启用</label>
+              <label className="mcp-switch"><input type="checkbox" role="switch" aria-label={`启用 MCP ${server.serverId}`} checked={server.enabled} disabled={busy || loading} onChange={event => { const enabled = event.target.checked; void mutate(() => appStore.transport.rpc('mcp.toggle', { serverId: server.serverId, enabled, workspaceRoot })) }} /></label>
               <button type="button" className="quiet-button" disabled={busy || loading} aria-label={`编辑 MCP ${server.serverId}`} onClick={() => { setError(null); setEditor(server) }}>编辑</button>
               <button type="button" className="quiet-button danger" disabled={busy || loading} aria-label={`删除 MCP ${server.serverId}`} onClick={() => { setError(null); setRemoving(server) }}>删除</button>
             </span>
@@ -125,9 +122,9 @@ export function McpSettings({ workspaceRoot, active, busy, onBusyChange }: {
       {!loading && !error && servers.length === 0 && <p className="sg-provider-empty">尚未配置 MCP 服务器。</p>}
     </div>
     <div className="sg-add-actions"><button type="button" className="sg-add-card-btn" disabled={busy || loading} onClick={() => { setError(null); setEditor('new') }}>＋ 添加 MCP</button></div>
-    <Dialog open={editor !== null} onClose={() => { if (!busy) setEditor(null) }} labelledBy="mcp-editor-title">
-      <header className="modal-header"><h2 id="mcp-editor-title">{editor === 'new' ? '添加 MCP' : '编辑 MCP'}</h2><button type="button" className="quiet-button" disabled={busy} onClick={() => setEditor(null)}>取消</button></header>
-      {editor !== null && <McpEditor key={editor === 'new' ? 'new' : editor.serverId} server={editor === 'new' ? undefined : editor} busy={busy} error={error} onSave={async server => {
+    <Dialog open={editor !== null} onClose={() => { if (!busy) setEditor(null) }} labelledBy="mcp-editor-title" className="mcp-editor-modal">
+      <header className="modal-header"><h2 id="mcp-editor-title">{editor === 'new' ? '添加 MCP' : '编辑 MCP'}</h2><button type="button" className="icon-button" aria-label="关闭" disabled={busy} onClick={() => setEditor(null)}><X size={18} /></button></header>
+      {editor !== null && <McpEditor key={editor === 'new' ? 'new' : editor.serverId} server={editor === 'new' ? undefined : editor} onCancel={() => setEditor(null)} busy={busy} error={error} onSave={async server => {
         if (editor === 'new' && servers.some(current => current.server.serverId === server.serverId)) throw new Error('该 MCP 名称已存在，请编辑已有服务器。')
         if (await mutate(() => appStore.transport.rpc('mcp.save', { server, workspaceRoot }))) setEditor(null)
       }} />}
@@ -144,7 +141,7 @@ export function McpSettings({ workspaceRoot, active, busy, onBusyChange }: {
   </section>
 }
 
-function McpEditor({ server, busy, error, onSave }: { server?: McpServerInput; busy: boolean; error: string | null; onSave: (server: McpServerInput) => Promise<void> }) {
+function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServerInput; onCancel: () => void; busy: boolean; error: string | null; onSave: (server: McpServerInput) => Promise<void> }) {
   const [id, setId] = useState(server?.serverId ?? '')
   const [type, setType] = useState(server?.transport.type ?? 'stdio')
   const stdio = server?.transport.type === 'stdio' ? server.transport : null
@@ -165,7 +162,7 @@ function McpEditor({ server, busy, error, onSave }: { server?: McpServerInput; b
     setFailure(null)
     try {
       await onSave({ serverId: id.trim(), enabled: server?.enabled ?? true, startupTimeoutSec: startup, toolTimeoutSec: timeout,
-        transport: type === 'stdio' ? { type, command: command.trim(), args: args === '' ? [] : args.split('\n'), cwd: cwd.trim() || null, env: stringMap(env, '环境变量') }
+        transport: type === 'stdio' ? { type, command: command.trim(), args: args.split('\n').filter(line => line.trim() !== ''), cwd: cwd.trim() || null, env: stringMap(env, '环境变量') }
           : { type, url: url.trim(), headers: stringMap(headers, '请求头') },
       })
     } catch (error) { setFailure(error instanceof Error ? error.message : '配置格式无效。') }
@@ -173,16 +170,16 @@ function McpEditor({ server, busy, error, onSave }: { server?: McpServerInput; b
 
   return <form className="sg-editor mcp-editor" onSubmit={event => void save(event)}>
     <fieldset className="mcp-editor-scroll" disabled={busy}>
-      <label className="sg-field"><span>名称</span><input className="sg-input" aria-label="MCP 名称" required pattern="[A-Za-z0-9_-]+" disabled={!!server} value={id} onChange={event => setId(event.target.value)} placeholder="chrome_devtools" /></label>
+      <label className="sg-field"><span>名称</span><input className="sg-input" aria-label="MCP 名称" required pattern="[A-Za-z0-9_-]+" disabled={!!server} value={id} onChange={event => setId(event.target.value)} /></label>
       <label className="sg-field"><span>连接方式</span><select className="sg-input" aria-label="MCP 连接方式" value={type} onChange={event => setType(event.target.value as typeof type)}><option value="stdio">本地进程（stdio）</option><option value="http">远程服务（Streamable HTTP）</option></select></label>
       {type === 'stdio' ? <>
-        <label className="sg-field"><span>命令</span><input className="sg-input" aria-label="MCP 命令" required value={command} onChange={event => setCommand(event.target.value)} placeholder="npx" /></label>
-        <label className="sg-field"><span>参数（每行一个）</span><textarea className="sg-input" aria-label="MCP 参数" rows={3} value={args} onChange={event => setArgs(event.target.value)} placeholder={'-y\nchrome-devtools-mcp@latest'} /></label>
+        <label className="sg-field"><span>命令</span><input className="sg-input" aria-label="MCP 命令" required value={command} onChange={event => setCommand(event.target.value)} /></label>
+        <label className="sg-field"><span>参数（每行一个）</span><textarea className="sg-input" aria-label="MCP 参数" rows={3} value={args} onChange={event => setArgs(event.target.value)} /></label>
         <label className="sg-field"><span>工作目录（留空使用任务的项目目录）</span><input className="sg-input" aria-label="MCP 工作目录" value={cwd} onChange={event => setCwd(event.target.value)} /></label>
         <label className="sg-field"><span>环境变量（JSON 对象）</span><textarea className="sg-input" aria-label="MCP 环境变量" rows={3} spellCheck={false} value={env} onChange={event => setEnv(event.target.value)} /></label>
       </> : <>
-        <label className="sg-field"><span>服务地址</span><input className="sg-input" aria-label="MCP 服务地址" type="url" required value={url} onChange={event => setUrl(event.target.value)} placeholder="https://example.com/mcp" /></label>
-        <label className="sg-field"><span>请求头（JSON 对象）</span><textarea className="sg-input" aria-label="MCP 请求头" rows={3} spellCheck={false} value={headers} onChange={event => setHeaders(event.target.value)} placeholder={'{"Authorization": "Bearer token"}'} /></label>
+        <label className="sg-field"><span>服务地址</span><input className="sg-input" aria-label="MCP 服务地址" type="url" required value={url} onChange={event => setUrl(event.target.value)} /></label>
+        <label className="sg-field"><span>请求头（JSON 对象）</span><textarea className="sg-input" aria-label="MCP 请求头" rows={3} spellCheck={false} value={headers} onChange={event => setHeaders(event.target.value)} /></label>
       </>}
       <div className="mcp-timeouts">
         <label className="sg-field">
@@ -214,7 +211,7 @@ function McpEditor({ server, busy, error, onSave }: { server?: McpServerInput; b
       </div>
       {(failure || error) && <p role="alert" className="form-error">{failure || error}</p>}
     </fieldset>
-    <footer><button type="submit" className="primary-button" disabled={busy}>{busy ? '保存中…' : '保存 MCP'}</button></footer>
+    <footer><button type="button" className="secondary-button" disabled={busy} onClick={onCancel}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? '保存中…' : '保存 MCP'}</button></footer>
   </form>
 }
 

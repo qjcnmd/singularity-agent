@@ -16,10 +16,7 @@ pub(crate) fn search_files(directory: &str, query: &str) -> Result<Vec<FileCandi
     let root = singularity_core::canonicalize_workspace(directory)?;
     let mut pending = vec![root.as_path().to_path_buf()];
     let mut candidates = Vec::new();
-    while let Some(directory) = pending.pop() {
-        if candidates.len() >= MAX_FILE_CANDIDATES {
-            break;
-        }
+    'search: while let Some(directory) = pending.pop() {
         let directory_entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && directory != root.as_path() => {
@@ -41,9 +38,6 @@ pub(crate) fn search_files(directory: &str, query: &str) -> Result<Vec<FileCandi
         }
         entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
         for entry in entries {
-            if candidates.len() >= MAX_FILE_CANDIDATES {
-                break;
-            }
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 // 条目已经不存在就跳过；权限之类的错误仍然上报。
@@ -73,6 +67,9 @@ pub(crate) fn search_files(directory: &str, query: &str) -> Result<Vec<FileCandi
             let relative = singularity_core::display_path(relative);
             if relative.to_lowercase().contains(&query) {
                 candidates.push(FileCandidate { path: relative });
+                if candidates.len() == MAX_FILE_CANDIDATES {
+                    break 'search;
+                }
             }
         }
     }

@@ -1,0 +1,45 @@
+.field { display: grid; gap: 6px; }
+.field > span { font-size: 12.5px; font-weight: 500; color: var(--ink-soft); }
+.input { width: 100%; min-height: 36px; padding: 7px 11px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--card); outline: none; font-size: 13.5px; transition: border-color 140ms, box-shadow 140ms; }
+textarea.input { resize: vertical; line-height: 1.5; font-family: var(--font-mono); font-size: 12.5px; }
+.input:hover:not(:disabled) { border-color: #c9c9ce; }
+.input:focus { border-color: var(--accent); box-shadow: 0 0 0 3.5px color-mix(in srgb, var(--accent) 16%, transparent); }
+.input:disabled { background: var(--surface-muted); color: var(--ink-faint); }
+.form-error { margin: 0; padding: 8px 11px; border-radius: 10px; background: var(--danger-soft); color: #c4291f; font-size: 12.5px; }
+
+
+
+/* 侧栏入口打开的管理页：自定义指令、Skills、MCP */
+.manage-scroll { flex: 1; min-height: 0; overflow-y: auto; width: 100%; }
+.manage-page { width: 100%; max-width: 860px; margin: 0 auto; padding: 72px 36px 40px; }
+.manage-page > header { margin-bottom: 20px; }
+.manage-page h2 { margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -.02em; }
+.app-main.is-manage .conversation-header { background: transparent; backdrop-filter: none; }
+
+.manage-page:has(.instructions-layout) { min-height: 100%; display: flex; flex-direction: column; }
+.instructions-layout { flex: 1; display: grid; grid-template-columns: 200px 1fr; gap: 18px; align-items: start; }
+.instruction-targets { position: relative; display: grid; gap: 2px; }
+.instruction-targets button:hover:not([aria-current]) { background: var(--surface-hover); }
+.instruction-targets button { position: relative; display: flex; align-items: center; gap: 9px; min-height: 46px; padding: 6px 12px; border: 0; border-radius: 12px; background: transparent; cursor: pointer; text-align: left; z-index: 1; transition: background 150ms; }
+.instruction-targets .selection-slider { border-radius: 12px; }
+.target-label { display: grid; }
+.target-label strong { font-weight: 600; }
+.instruction-editor { display: flex; flex-direction: column; align-self: stretch; gap: 10px; padding: 14px; border: 1px solid var(--line); border-radius: 18px; background: var(--card); }
+.editor-path { color: var(--ink-faint); font: 12px var(--font-mono); overflow-wrap: anywhere; }
+.instruction-editor textarea { flex: 1; min-height: 320px; font-size: 13px; }
+.instruction-editor footer { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+
+.skill-details { display: grid; gap: 8px; justify-items: start; padding: 0 16px 16px 58px; }
+.skill-details .instruction-body { margin: 0; width: 100%; }
+/* Skill 的描述可能较长，允许换行完整显示 */
+.skill-card .row-card-title small { white-space: normal; line-height: 1.5; margin-top: 2px; }
+
+.card-list { display: grid; gap: 10px; }
+.row-card { border: 1px solid var(--line); border-radius: 16px; background: var(--card); overflow: hidden; transition: border-color 160ms, box-shadow 200ms; }
+.row-card-head { display: flex; align-items: center; gap: 6px; padding: 6px 10px 6px 6px; }
+.row-card-toggle { flex: 1; min-width: 0; display: flex; align-items: center; gap: 12px; padding: 6px 8px; border: 0; border-radius: 12px; background: transparent; cursor: pointer; text-align: left; }
+.row-card-title { flex: 1; min-width: 0; display: grid; }
+.row-card-title strong { font-weight: 600; }
+.row-card-title small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-faint); font-size: 12px; }
+.provider-avatar { display: grid; place-items: center; width: 32px; height: 32px; flex: none; border-radius: 10px; background: var(--accent-soft); color: var(--accent); font-weight: 700; }
+.endpoint { padding: 4px 8px; border-radius: 8px; background: var(--surface-muted); font: 12px var(--font-mono); overflow-wrap: anywhere; }

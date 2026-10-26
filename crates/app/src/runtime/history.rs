@@ -24,13 +24,27 @@ impl IndexedTurn {
         let mut items = Vec::new();
         let started_at = session.entries()[self.entries.start].timestamp().to_owned();
         let mut finished_at = None;
+        let mut first_token_at = None;
         let mut tool_items = std::collections::HashMap::new();
+        // 每条回复显示截至当时的会话累计用量：先累计本回合之前的请求，再随条目推进。
+        let mut usage = session_usage(&session.entries()[..self.entries.start]);
         for entry in &session.entries()[self.entries.clone()] {
+            if let Some(observation) = entry.request_observation() {
+                accumulate_request_usage(&mut usage, observation);
+            }
             match entry {
-                SessionEntry::Message { message, id, observation, .. } => match message {
+                SessionEntry::Message { message, id, observation, timestamp, .. } => match message {
                     Message::Developer { .. } | Message::Notification { .. } => {}
                     Message::User { .. } | Message::Assistant { .. } => {
                         let mut calls = message.tool_calls();
+                        // 收到第一个生成增量的时间 = 消息保存时间 - 生成耗时。
+                        if first_token_at.is_none()
+                            && matches!(message, Message::Assistant { .. })
+                            && let Some(decode_ms) =
+                                observation.as_ref().and_then(|observation| observation.decode_ms)
+                        {
+                            first_token_at = singularity_core::iso_minus_millis(timestamp, decode_ms);
+                        }
                         let status = match observation.as_ref().map(|observation| observation.status) {
                             Some(singularity_protocol::ProviderAttemptStatus::Error) => TurnStatus::Failed,
                             Some(singularity_protocol::ProviderAttemptStatus::Cancelled) => {
@@ -38,12 +52,17 @@ impl IndexedTurn {
                             }
                             _ => TurnStatus::Completed,
                         };
-                        for item in singularity_agent::message::public_items(
+                        let mut public = singularity_agent::message::public_items(
                             message,
                             id,
                             status,
                             ToolStatus::Interrupted,
-                        ) {
+                            timestamp,
+                        );
+                        if observation.is_some() {
+                            singularity_agent::message::attach_usage(&mut public, &usage);
+                        }
+                        for item in public {
                             if matches!(item, HistoryItem::Tool { .. }) {
                                 let call = calls.next().expect("public tools follow message order");
                                 tool_items.insert(call.tool_call_id.clone(), items.len());
@@ -51,13 +70,7 @@ impl IndexedTurn {
                             items.push(item);
                         }
                     }
-                    Message::ToolResult {
-                        tool_call_id,
-                        is_error,
-                        duration_ms,
-                        read_source,
-                        ..
-                    } => {
+                    Message::ToolResult { tool_call_id, .. } => {
                         // 结果写回调用所在的位置，界面拿到的是完整的工具条目。
                         let position = *tool_items.get(tool_call_id).ok_or_else(|| {
                             SessionError::InvalidSession(format!(
@@ -67,18 +80,14 @@ impl IndexedTurn {
                         let HistoryItem::Tool { result, status, .. } = &mut items[position] else {
                             unreachable!("tool positions contain calls");
                         };
-                        *status = if *is_error {
+                        let displayed = singularity_agent::message::public_tool_result(message)
+                            .expect("matched a tool result message");
+                        *status = if displayed.is_error {
                             ToolStatus::Failed
                         } else {
                             ToolStatus::Completed
                         };
-                        *result = Some(singularity_protocol::ToolResult {
-                            output: message.content_text(),
-                            images: message.images().cloned().collect(),
-                            is_error: *is_error,
-                            duration_ms: *duration_ms,
-                            read_source: *read_source,
-                        });
+                        *result = Some(displayed);
                     }
                 },
                 SessionEntry::Compaction { compaction, id, .. } => {
@@ -99,6 +108,7 @@ impl IndexedTurn {
         Ok(ThreadTurn {
             started_at,
             finished_at,
+            first_token_at,
             turn_id: self.turn_id.clone(),
             status: self.status,
             manually_stopped: self.manually_stopped,
@@ -106,6 +116,11 @@ impl IndexedTurn {
             items,
         })
     }
+}
+
+/// 用户主动停止造成的中断；写入结束记录和读取历史共用这一判定。
+pub(crate) fn is_manually_stopped(outcome: TurnStatus, user_stopped: bool) -> bool {
+    outcome == TurnStatus::Interrupted && user_stopped
 }
 
 /// 按回合开始记录划分日志，只记下范围、最终状态、错误和是否手动停止；
@@ -147,7 +162,7 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
         {
             last.status = *outcome;
             last.error = error.clone();
-            last.manually_stopped = *outcome == TurnStatus::Interrupted && *user_stopped;
+            last.manually_stopped = is_manually_stopped(*outcome, *user_stopped);
         }
     }
     turns
@@ -270,7 +285,7 @@ pub(crate) fn summarize_thread(session: &SessionData) -> ThreadSummary {
         SessionEntry::Record {
             record: LedgerRecord::OperationFinished { outcome, user_stopped, .. },
             ..
-        } => Some((*outcome, *outcome == TurnStatus::Interrupted && *user_stopped)),
+        } => Some((*outcome, is_manually_stopped(*outcome, *user_stopped))),
         _ => None,
     });
     // 最近一次命名优先；未命名时使用第一条用户输入。
@@ -298,7 +313,9 @@ pub(crate) fn summarize_thread(session: &SessionData) -> ThreadSummary {
     let created_at = session.created_at().to_string();
     let updated_at = session
         .entries()
-        .last()
+        .iter()
+        .rev()
+        .find(|entry| !matches!(entry, SessionEntry::Metadata { .. }))
         .map(|entry| entry.timestamp().to_owned())
         .unwrap_or_else(|| created_at.clone());
     ThreadSummary {

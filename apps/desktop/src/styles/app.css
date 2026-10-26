@@ -1,4 +1,5 @@
 @import './shell.css';
+@import './pages.css';
 @import './conversation.css';
 @import './composer.css';
 @import './settings.css';
@@ -7,3 +8,4 @@
 @import './images.css';
 @import './questions.css';
 @import './background-tasks.css';
+@import './files.css';

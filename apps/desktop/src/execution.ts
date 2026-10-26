@@ -45,6 +45,7 @@ export function acceptExecutionEvent(facts: ThreadTurn[], event: TurnEventEnvelo
     case 'item/updated': turn = upsert(turn, event.params.item); break
     case 'item/textDelta': {
       const { itemId: id, thinking, delta } = event.params
+      if (turn.firstTokenAt === undefined && delta !== '') turn = { ...turn, firstTokenAt: new Date().toISOString() }
       const previous = turn.items.find(item => item.id === id)
       const text = (previous && 'text' in previous ? previous.text : '') + delta
       turn = upsert(turn, thinking ? { type: 'thinking', id, status: 'running', text }

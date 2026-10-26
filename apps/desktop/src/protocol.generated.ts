@@ -24,15 +24,27 @@ export type DirectoryPickResult = { path: string | null, };
 
 export type DiscoverModelsParams = { providerId: string, baseUrl: string, apiKey?: string | null, };
 
-export type DiscoveredModel = { modelId: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<string>, };
-
 export type EmptyParams = Record<string, never>;
 
 export type FileCandidate = { path: string, };
 
+export type FileReadParams = { cwd: string, path: string, };
+
 export type FileSearchParams = { workspaceRoot: string, query: string, };
 
-export type HistoryItem = { "type": "message", id: string, status: TurnStatus, role: HistoryMessageRole, text: string, images?: Array<ImageAttachment>, } | { "type": "thinking", id: string, status: TurnStatus, text: string, } | { "type": "tool", id: string, status: ToolStatus, name: string, args: JsonValue, result: ToolResult | null, } | { "type": "compaction", id: string, summary: string, } | { "type": "compaction_result", id: string, status: TurnStatus, message: string | null, };
+export type HistoryItem = { "type": "message", id: string, status: TurnStatus, role: HistoryMessageRole, text: string,
+/**
+ * 消息写入日志的时间；还在流式生成时为空。
+ */
+at?: string,
+/**
+ * 截至这条回复时整个会话的累计用量（含这条回复的请求），只出现在助手消息的最后一段正文上。
+ */
+stats?: SessionModelUsage, images?: Array<ImageAttachment>,
+/**
+ * 用户随消息附上的文件路径；模型按路径自己读取，文件本身不复制。
+ */
+files?: Array<string>, } | { "type": "thinking", id: string, status: TurnStatus, text: string, } | { "type": "tool", id: string, status: ToolStatus, name: string, args: JsonValue, result: ToolResult | null, } | { "type": "compaction", id: string, summary: string, } | { "type": "compaction_result", id: string, status: TurnStatus, message: string | null, };
 
 export type HistoryMessageRole = "user" | "assistant";
 
@@ -40,9 +52,21 @@ export type ImageAttachment = { id: string, name: string, mimeType: string, widt
 
 export type ImageUpload = { name: string, dataUrl: string, };
 
-export type InjectedContext = { instructions: Array<InstructionFile>, skills: Array<string>, tools: Array<string>, };
+export type InjectedContext = { instructions: Array<InstructionFile>,
+/**
+ * 内置工具名。
+ */
+tools: Array<string>,
+/**
+ * MCP 服务器提供的工具名。
+ */
+mcpTools: Array<string>, };
 
 export type InstructionFile = { path: string, content: string, global: boolean, };
+
+export type InstructionsReadParams = { workspaceRoot: string | null, };
+
+export type InstructionsSaveParams = { workspaceRoot: string | null, content: string, };
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
 
@@ -80,7 +104,7 @@ export type PendingQuestion = {
  */
 itemId: string, questions: Array<UserQuestion>, };
 
-export type PendingUserMessage = { itemId: string, text: string, images: Array<ImageAttachment>, };
+export type PendingUserMessage = { itemId: string, text: string, images: Array<ImageAttachment>, files: Array<string>, };
 
 export type ProviderApiProtocol = "chat" | "responses";
 
@@ -114,7 +138,7 @@ error: string | null, defaultSelection: ModelSelection | null, providers: Array<
 
 export type RedactedProvider = { apiProtocol: ProviderApiProtocol, providerId: string, displayName: string | null, baseUrl: string, credentialConfigured: boolean, models: Array<ModelConfigurationInput>, };
 
-export type RpcError = { code: RpcErrorCode, message: string, recovery: string, };
+export type RpcError = { code: RpcErrorCode, message: string, };
 
 export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "configuration_invalid" | "provider_unavailable" | "internal";
 
@@ -178,19 +202,29 @@ export type SessionRuntime = { phase: SessionPhase, selection: ModelSelection, c
  */
 usage: SessionModelUsage, };
 
-export type SessionStartParams = { workspaceRoot: string, selection: ModelSelection, text: string, images: Array<ImageUpload>, };
+export type SessionStartParams = { workspaceRoot: string, selection: ModelSelection, text: string, images: Array<ImageUpload>,
+/**
+ * 附件文件的绝对路径。
+ */
+files: Array<string>, };
 
 export type SessionStartResult = { summary: ThreadSummary, status: SessionStatus, revision: number, };
 
 export type SessionStatus = { phase: SessionPhase, failure: SessionFailure | null, };
 
-export type SessionTextParams = { sessionId: string, text: string, images: Array<ImageUpload>, };
+export type SessionTextParams = { sessionId: string, text: string, images: Array<ImageUpload>, files: Array<string>, };
 
 export type SkillCatalog = { skills: Array<SkillMetadata>, diagnostics: Array<string>, };
 
-export type SkillMetadata = { name: string, description: string, };
+export type SkillMetadata = { name: string, description: string,
+/**
+ * SKILL.md 的完整路径。
+ */
+path: string, };
 
 export type StreamEnvelope = { revision: number, } & ({ "type": "ready" } | { "type": "app_changed", payload: AppBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: TurnEventEnvelope, } | { "type": "session_settled", sessionId: string, payload: SessionRuntime, summary: ThreadSummary, } | { "type": "session_summary_changed", summary: ThreadSummary, } | { "type": "background_task_updated", sessionId: string, payload: BackgroundTaskUpdate, } | { "type": "app_read_failed", error: RpcError, });
+
+export type TextDocument = { path: string, content: string, };
 
 export type ThreadHistory = { summary: ThreadSummary, turns: Array<ThreadTurn>, };
 
@@ -200,7 +234,11 @@ export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, 
  */
 manuallyStopped: boolean, };
 
-export type ThreadTurn = { startedAt: string, finishedAt?: string, turnId: string, status: TurnStatus,
+export type ThreadTurn = { startedAt: string, finishedAt?: string,
+/**
+ * 这一回合收到第一个生成增量的时间，由第一条有计时的助手消息的保存时间减去生成耗时得到。
+ */
+firstTokenAt?: string, turnId: string, status: TurnStatus,
 /**
  * 中断是否由用户停止；没有结束记录的回合为 false。
  */
@@ -242,11 +280,15 @@ export interface RpcContract {
   "app.bootstrap": { params: EmptyParams; result: AppBootstrap }
   "directory.pick": { params: EmptyParams; result: DirectoryPickResult }
   "file.search": { params: FileSearchParams; result: Array<FileCandidate> }
+  "file.read": { params: FileReadParams; result: TextDocument }
   "skills.list": { params: WorkspaceParams; result: SkillCatalog }
+  "instructions.read": { params: InstructionsReadParams; result: TextDocument }
+  "instructions.save": { params: InstructionsSaveParams; result: TextDocument }
   "workspace.add": { params: WorkspaceAddParams; result: Workspace }
   "workspace.remove": { params: WorkspaceParams; result: null }
+  "model.read": { params: EmptyParams; result: ModelCatalogResult }
   "model.saveProvider": { params: ProviderSaveParams; result: ModelCatalogResult }
-  "model.discover": { params: DiscoverModelsParams; result: Array<DiscoveredModel> }
+  "model.discover": { params: DiscoverModelsParams; result: Array<string> }
   "model.removeProvider": { params: ProviderParams; result: ModelCatalogResult }
   "mcp.list": { params: McpListParams; result: Array<McpServerState> }
   "mcp.save": { params: McpSaveParams; result: Array<McpServerState> }
@@ -262,6 +304,7 @@ export interface RpcContract {
   "session.answerQuestion": { params: QuestionAnswerParams; result: null }
   "session.abort": { params: SessionParams; result: null }
   "session.compact": { params: SessionParams; result: null }
+  "session.context": { params: SessionParams; result: null }
   "session.stopBackgroundTask": { params: BackgroundTaskParams; result: null }
   "session.updateSettings": { params: UpdateSettingsParams; result: null }
 }

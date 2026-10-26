@@ -1,15 +1,17 @@
 //! 持有进程、作业对象和输出，前台转后台时整体转交，不重新启动命令。
 
 use std::path::Path;
+use std::process::Stdio;
 use std::time::Duration;
 
+use process_wrap::tokio::{ChildWrapper, CommandWrap, CreationFlags, JobObject, KillOnDrop};
 use singularity_protocol::BackgroundTaskState;
+use tokio::process::Command;
 use tokio::time::{Instant, Interval};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::registry::{ABORTED_MESSAGE, ToolExecution};
 
-use super::job_object::{self, ManagedChild};
 use super::pump::OutputStreams;
 use super::shell::bash_path;
 use super::spec::BashArgs;
@@ -44,7 +46,7 @@ impl Outcome {
 }
 
 pub(super) struct Process {
-    managed: ManagedChild,
+    child: Box<dyn ChildWrapper>,
     output: OutputStreams,
     capture: CaptureState,
     progress: Interval,
@@ -57,17 +59,28 @@ impl Process {
     pub(super) fn spawn(args: &BashArgs, cwd: &Path) -> Result<Self, String> {
         let shell = bash_path()?;
         let started = Instant::now();
-        let mut managed = job_object::spawn_in_job(&shell, &args.command, cwd)
-            .map_err(|error| format!("failed to spawn shell {shell}: {error}"))?;
+        let mut command = Command::new(&shell);
+        command
+            .args(["-c", &args.command])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut wrapped = CommandWrap::from(command);
+        wrapped
+            .wrap(CreationFlags(windows::Win32::System::Threading::CREATE_NO_WINDOW))
+            .wrap(JobObject)
+            .wrap(KillOnDrop);
+        let mut child = wrapped.spawn().map_err(|error| format!("failed to spawn shell {shell}: {error}"))?;
         let output = OutputStreams::new(
-            managed.child.stdout().take().expect("bash stdout is piped"),
-            managed.child.stderr().take().expect("bash stderr is piped"),
+            child.stdout().take().expect("bash stdout is piped"),
+            child.stderr().take().expect("bash stderr is piped"),
         );
         let mut progress = tokio::time::interval(Duration::from_millis(100));
         progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let timeout_ms = args.timeout_ms.map(std::num::NonZeroU64::get);
         Ok(Self {
-            managed,
+            child,
             output,
             capture: CaptureState::default(),
             progress,
@@ -86,7 +99,7 @@ impl Process {
                     "Command timed out after {} ms and was terminated", self.timeout_ms.expect("deadline has timeout")
                 ))),
                 // 先等主进程；finish 再终止并等待整棵进程树。
-                status = self.managed.child.inner_mut().wait() => return ProcessEvent::Finished(match status {
+                status = self.child.inner_mut().wait() => return ProcessEvent::Finished(match status {
                     Ok(status) => match status.code() {
                         Some(code) => Outcome::Exited(code),
                         None => Outcome::Failed("Command terminated without an exit code".to_string()),
@@ -108,11 +121,19 @@ impl Process {
 
     /// 回收整树后才给出终态；主进程正常退出也不能遗留后代。
     pub(super) async fn finish(mut self, mut outcome: Outcome) -> (ToolExecution, Outcome) {
-        let failures = self.managed.reclaim().await;
+        let mut failures = Vec::new();
+        if let Err(error) = self.child.start_kill() {
+            failures.push(format!("failed to terminate the command process tree: {error}"));
+        }
+        // 包装层的 wait 等待整个作业退出，包括主进程留下的后代。
+        match tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => failures.push(format!("failed to wait for the command process tree: {error}")),
+            Err(_) => failures.push("the command process tree did not exit within 5000 ms".into()),
+        }
         let drain = tokio::time::sleep(OUTPUT_DRAIN_GRACE);
         tokio::pin!(drain);
         let mut truncated = false;
-        let mut failures = failures;
         while self.output.is_open() {
             tokio::select! {
                 biased;

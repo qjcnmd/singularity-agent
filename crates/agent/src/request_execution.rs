@@ -97,6 +97,7 @@ pub(crate) async fn execute_request(
                 &id,
                 item_status,
                 singularity_protocol::ToolStatus::Interrupted,
+                &singularity_core::now_iso(),
             )
         } else {
             Vec::new()
@@ -119,7 +120,7 @@ pub(crate) async fn execute_request(
                 None => storage,
             }));
         }
-        on_event(TurnEvent::ProviderAttempt { observation });
+        on_event(TurnEvent::ProviderAttempt { observation: observation.clone() });
         let Some(error) = error else {
             return Ok((response, id));
         };

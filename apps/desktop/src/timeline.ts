@@ -1,10 +1,12 @@
 import { interruptionText, compactionText } from './copy'
 import { hasErrorItem, type SessionView } from './execution'
-import type { HistoryItem, ThreadTurn } from './protocol'
+import type { HistoryItem, PendingQuestion, ThreadTurn } from './protocol'
 
 export type TimelineContent = HistoryItem
-  | { type: 'duration'; startedAt: string; finishedAt?: string }
+  | { type: 'duration'; startedAt: string; firstTokenAt?: string; finishedAt?: string }
   | { type: 'terminal'; status: 'failed' | 'interrupted'; text: string }
+  | { type: 'typing' }
+  | { type: 'question'; request: PendingQuestion }
 
 /** 只补充排列和阅读位置；历史条目原样交给组件。 */
 export interface TimelineRow {
@@ -18,41 +20,48 @@ export function buildTimeline(session: SessionView | null): TimelineRow[] {
   const result: TimelineRow[] = []
   const turns = session.facts
   const failure = session.runtime.failure
-  const activeTurn = session.runtime.phase === 'idle' ? undefined : turns.at(-1)
   for (const turn of turns) {
     const failureFromRuntime = turn === turns.at(-1) && failure?.source === 'turn'
-    result.push(...turnRows(turn, turn === activeTurn, failureFromRuntime))
+    result.push(...turnRows(turn, failureFromRuntime))
   }
   // 日志写入失败时错误可能只保存在运行状态中，已有相同错误条目时不重复显示。
   if (failure && !turns.some(turn => hasErrorItem(turn, failure.error))) {
     result.push({ key: 'terminal:failed', stable: false, item: { type: 'terminal', status: 'failed',
       text: failure.source === 'compaction' ? `${compactionText.failed}：${failure.error.message}` : failure.error.message } })
   }
+  // 等待回答的提问替换对应的提问工具卡片，回答后恢复成普通工具卡片。
+  const question = session.runtime.pendingQuestion
+  const asking = question ? result.findIndex(row => row.item.type === 'tool' && row.item.id === question.itemId) : -1
+  if (question && asking >= 0) result[asking] = { key: `question:${question.itemId}`, stable: false, item: { type: 'question', request: question } }
   if (session.runtime.pendingMessages.length === 0) return result
   // 用户消息写入事件可能先于运行快照到达，按 ID 去重。
   const savedMessages = new Set(turns.flatMap(turn => turn.items.filter(item => item.type === 'message' && item.role === 'user').map(item => item.id)))
   for (const message of session.runtime.pendingMessages) {
     if (savedMessages.has(message.itemId)) continue
     result.push({ key: `pending:${message.itemId}`, stable: false,
-      item: { id: message.itemId, type: 'message', role: 'user', status: 'completed', text: message.text, images: message.images } })
+      item: { id: message.itemId, type: 'message', role: 'user', status: 'completed', text: message.text, images: message.images, files: message.files } })
   }
   return result
 }
 
-function turnRows(turn: ThreadTurn, active: boolean, failureFromRuntime: boolean): TimelineRow[] {
+function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): TimelineRow[] {
   const result: TimelineRow[] = turn.items.map(item => ({
     key: item.type === 'compaction' || item.type === 'compaction_result'
       ? `compaction:${item.id}` : `content:${turn.turnId}:${item.id}`,
     stable: !('status' in item) || item.status !== 'running' || item.type === 'tool',
     item,
   }))
-  if (turn.finishedAt || active) {
+  // 准备新回合或独立压缩不会重新启动上一轮的计时；进行中的回合收到首个 token 后才显示时间行。
+  if (turn.finishedAt || (turn.status === 'running' && turn.firstTokenAt)) {
     const workStartIndex = turn.items.findIndex(item => item.type !== 'message' || item.role !== 'user')
     result.splice(workStartIndex < 0 ? result.length : workStartIndex, 0, {
       key: `content:${turn.turnId}:duration`, stable: true,
-      item: { type: 'duration', startedAt: turn.startedAt, finishedAt: turn.finishedAt },
+      item: { type: 'duration', startedAt: turn.startedAt, firstTokenAt: turn.firstTokenAt, finishedAt: turn.finishedAt },
     })
   }
+  // 回合进行中但没有正在输出或执行的条目，说明在等模型回复：显示“正在输入”气泡。
+  const working = turn.items.some(item => 'status' in item && (item.status === 'running' || item.status === 'pending'))
+  if (turn.status === 'running' && !working) result.push({ key: `content:${turn.turnId}:typing`, stable: false, item: { type: 'typing' } })
   if (turn.status === 'interrupted') result.push({
     key: `content:${turn.turnId}:terminal`, stable: true,
     item: { type: 'terminal', status: turn.manuallyStopped ? 'interrupted' : 'failed', text: interruptionText(turn.manuallyStopped) },
@@ -71,16 +80,14 @@ export function toolArgument(name: string, args: unknown): string | null {
   return typeof value === 'string' ? value : null
 }
 
-export function backgroundToolSummary(name: string, args: unknown): string | null {
+function backgroundToolSummary(name: string): string | null {
   if (name === 'task_list') return '列出后台命令'
   if (name !== 'task_output' && name !== 'task_stop') return null
-  const taskId = record(args).task_id
-  const action = name === 'task_output' ? '查看后台命令输出' : '停止后台命令'
-  return typeof taskId === 'string' ? `${action} · ${taskId}` : action
+  return name === 'task_output' ? '查看后台命令输出' : '停止后台命令'
 }
 
 export function toolSummary(name: string, args: unknown): string {
-  const background = backgroundToolSummary(name, args)
+  const background = backgroundToolSummary(name)
   if (background !== null) return background
   if (name === 'ask_user_question') {
     const questions = record(args).questions
@@ -120,9 +127,23 @@ function record(value: unknown): Record<string, unknown> {
 
 export function formatTurnDuration(milliseconds: number): string {
   const seconds = Math.max(0, Math.floor(milliseconds / 1000))
-  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m${seconds % 60}s`
+  return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m${seconds % 60}s` : `${Math.floor(seconds / 3600)}h${Math.floor(seconds % 3600 / 60)}m`
 }
 
 export function compactionResultText(item: Extract<HistoryItem, { type: 'compaction_result' }>): string {
   return item.message ?? (item.status === 'running' ? compactionText.running : item.status === 'completed' ? compactionText.unchanged : item.status === 'interrupted' ? compactionText.unfinished : compactionText.failed)
+}
+
+export function formatClock(value: string, includeDate = false): string {
+  const date = new Date(value)
+  const clock = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+  return includeDate && date.toDateString() !== new Date().toDateString() ? `${date.getMonth() + 1}/${date.getDate()} ${clock}` : clock
+}
+
+export function backgroundTaskId(item: Extract<HistoryItem, { type: 'tool' }>): string | null {
+  if (item.name !== 'bash' || !item.result) return null
+  try {
+    const output: unknown = JSON.parse(item.result.output)
+    return typeof output === 'object' && output !== null && 'taskId' in output && typeof output.taskId === 'string' ? output.taskId : null
+  } catch { return null }
 }

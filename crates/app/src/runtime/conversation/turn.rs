@@ -40,7 +40,7 @@ impl Conversation {
         let prepared = tokio::task::spawn_blocking(move || conversation.prepare_turn(&preparing))
             .await
             .expect("turn preparation completes while the runtime is running");
-        let (mut agent, started_at) = match prepared {
+        let (mut agent, started_at, context_window) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 return if controls.finish_cancel() {
@@ -50,7 +50,7 @@ impl Conversation {
                 };
             }
         };
-        self.lock_state().last_context_window = Some(agent.context_window());
+        self.lock_state().last_context_window = Some(context_window);
         let turn_id = controls.turn_id.clone();
         let writer = Arc::clone(&self.writer);
         let turn = Turn {
@@ -121,7 +121,7 @@ impl Conversation {
                 });
             }
         };
-        let manually_stopped = turn_status == TurnStatus::Interrupted && cancel_accepted;
+        let manually_stopped = crate::runtime::history::is_manually_stopped(turn_status, cancel_accepted);
         if let Some(error) = &error {
             sink(TurnEvent::TurnFailed { error: error.clone(), finished_at });
         } else {
@@ -141,24 +141,41 @@ impl Conversation {
     fn prepare_turn(
         &self,
         controls: &crate::runtime::conversation::TurnControls,
-    ) -> Result<(Agent, String), TurnErrorDetail> {
+    ) -> Result<(Agent, String, u64), TurnErrorDetail> {
         let writer = Arc::clone(&self.writer);
         let inbox = Arc::clone(&self.lock_state().steering_inbox);
-        let agent = Agent::new(
-            self.prepare_request_context(&self.thread())?,
-            inbox,
-            Arc::clone(&controls.questions),
-            Arc::clone(&self.bash_tasks),
-        );
+        let context = self.prepare_request_context(&self.thread())?;
+        let context_window = context.context_window();
+        let agent = Agent::new(context, inbox, Arc::clone(&controls.questions), Arc::clone(&self.bash_tasks));
         // 开始记录的 ID 就是回合 ID；输入消息由 Agent 之后单独保存，两次写入不是一个事务。
         let mut writer = lock_writer(&writer);
         let started_at = writer
             .append_record_with_id(controls.turn_id.clone(), LedgerRecord::OperationStarted)
             .map_err(preparation_error)?;
-        Ok((agent, started_at))
+        Ok((agent, started_at, context_window))
     }
 
     /// 普通回合与独立压缩共用的准备步骤；每次都重新读取模型配置和项目指令。
+    /// 回合开始前查看上下文：本次启动已加载过就沿用，否则按回合开始时的规则加载一次，
+    /// 结果和回合加载时一样通过 context/loaded 发布。
+    pub async fn inspect_context(self: &Arc<Self>) -> Result<(), String> {
+        if self.lock_view().context.is_some() {
+            return Ok(());
+        }
+        let conversation = Arc::clone(self);
+        let requests =
+            tokio::task::spawn_blocking(move || conversation.prepare_request_context(&conversation.thread()))
+                .await
+                .expect("context preparation completes while the runtime is running")
+                .map_err(|error| error.message)?;
+        let context = requests
+            .inspect_context(&tokio_util::sync::CancellationToken::new())
+            .await
+            .map_err(|error| error.to_string())?;
+        self.on_event(TurnEvent::ContextLoaded { context });
+        Ok(())
+    }
+
     pub(super) fn prepare_request_context(&self, thread: &Thread) -> Result<RequestContext, TurnErrorDetail> {
         let provider = OpenAiProvider::new(&self.models, &thread.model).map_err(preparation_error)?;
         let instruction_home = self.home.clone();

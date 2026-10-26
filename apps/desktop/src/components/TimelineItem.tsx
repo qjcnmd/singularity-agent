@@ -1,17 +1,19 @@
 import { ExpandChevron } from './ExpandChevron'
-import { AttachedImages } from './Images'
+import { AttachedImages, FileChips } from './Images'
+import { QuestionPanel } from './QuestionPanel'
 import { Disclosure } from './Disclosure'
-import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { memo, useEffect, useState, type ReactNode } from 'react'
 import { CommandOutput } from './CommandOutput'
-import { CircleAlert, ListCollapse } from 'lucide-react'
+import { CircleAlert, CircleCheck, CircleX, FileText, Sparkles, SquareTerminal, Pencil, MessageCircleQuestion } from 'lucide-react'
 import { motion, useReducedMotion } from 'motion/react'
-import { disclosureTransition } from '../motion'
+import { enter, pop } from '../motion'
+import { useAppStore } from '../appStore'
 import { useSelectionGuard } from '../interactions'
 import { MarkdownBody } from '../markdown'
-import { compactionText, factStatusText } from '../copy'
+import { compactionText, factStatusText, formatTokenCount } from '../copy'
 import { readOutputLines } from '../readOutput'
-import { compactionResultText, displayPath, firstLine, formatTurnDuration, pathFromArgs, toolSummary, toolArgument, type TimelineContent } from '../timeline'
-import type { HistoryItem } from '../protocol'
+import { backgroundTaskId, formatClock, compactionResultText, displayPath, firstLine, formatTurnDuration, pathFromArgs, toolSummary, toolArgument, type TimelineContent } from '../timeline'
+import type { HistoryItem, SessionModelUsage, ToolStatus } from '../protocol'
 
 const previewLineCount = 8
 
@@ -30,61 +32,92 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
   const canCollapse = hiddenLines > 0
   const [expanded, setExpanded] = useState(item.type !== 'tool')
   const selectionGuard = useSelectionGuard()
+  const reduced = useReducedMotion()
 
   if (item.type === 'duration') return <TurnDuration itemKey={itemKey} {...item} />
+  if (item.type === 'question') return <motion.article {...enter} transition={reduced ? { duration: 0 } : pop} style={{ originX: 0, originY: 1 }}
+    className="timeline-item message-item timeline-assistant timeline-question" data-item-id={itemKey}>
+    <QuestionPanel key={item.request.itemId} request={item.request} />
+  </motion.article>
+  if (item.type === 'typing') return <motion.article {...enter} transition={reduced ? { duration: 0 } : pop} style={{ originX: 0, originY: 1 }}
+    className="timeline-item message-item timeline-assistant" data-item-id={itemKey} aria-label="正在输入">
+    <div className="message-bubble typing-bubble"><i /><i /><i /></div>
+  </motion.article>
 
   if (item.type === 'terminal') {
-    if (item.status === 'failed') return <div className="turn-error" data-item-id={itemKey} role="alert">
-      <CircleAlert size={15} strokeWidth={1.6} aria-hidden="true" /><span>{item.text}</span>
-    </div>
-    return <span className="stopped-marker" data-item-id={itemKey}>{item.text}</span>
+    if (item.status === 'failed') return <div className="message-item timeline-assistant" data-item-id={itemKey} role="alert"><div className="message-bubble error-bubble">{item.text}</div></div>
+    return <article className="timeline-item activity-step" data-item-id={itemKey}><div className="activity-toggle"><CircleX size={13} className="bad" /><span className="step-title">已停止</span></div></article>
   }
 
   if (item.type === 'message') {
     const body = canCollapse && !expanded ? userLines.slice(0, previewLineCount).join('\n') : item.text
     return (
-      <article
+      <motion.article initial={{ opacity: 0, y: item.role === 'user' ? 36 : 10, scale: item.role === 'user' ? .84 : .9 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={reduced ? { duration: 0 } : { ...pop, opacity: { duration: .16 } }} style={{ originX: item.role === 'user' ? 1 : 0, originY: 1 }}
         className={`timeline-item message-item timeline-${item.role} status-${item.status}`}
         data-item-id={itemKey}
         aria-label={`${item.role === 'user' ? '你' : 'Singularity'}，${factStatusText[item.status]}`}
       >
+        {item.role === 'user' && item.at && <time className="msg-time" dateTime={item.at}>{formatClock(item.at, true)}</time>}
+        <div className={`message-bubble${item.status === 'failed' ? ' error-bubble' : ''}`}>
         <div className="timeline-body message-body">{item.role === 'user' ? <div className="user-text">{body}</div> : <MarkdownBody text={body} streaming={item.status === 'running'} />}</div>
         {sessionId && item.images && <AttachedImages sessionId={sessionId} images={item.images} />}
+        {item.files && <FileChips files={item.files} />}
         {canCollapse && (
           <button type="button" className="expand-button" aria-expanded={expanded} {...selectionGuard(() => setExpanded((value) => !value))}>
             {expanded ? '收起' : `展开全文 · 还有 ${hiddenLines} 行`}
           </button>
         )}
-      </article>
+        </div>
+        {item.role === 'assistant' && <MessageStatsLine stats={item.stats} at={item.at} />}
+      </motion.article>
     )
   }
 
   if (item.type === 'thinking') return <ReasoningRow item={item} itemKey={itemKey} />
   if (item.type === 'compaction' || item.type === 'compaction_result') return <CompactionRow item={item} itemKey={itemKey} />
 
+  return <ToolCard item={item} itemKey={itemKey} cwd={cwd} userHome={userHome} sessionId={sessionId} />
+})
+
+function ToolCard({ item, itemKey, cwd, userHome, sessionId }: Omit<Props, 'item'> & { item: Extract<HistoryItem, { type: 'tool' }> }) {
+  const reduced = useReducedMotion()
+  const [expanded, setExpanded] = useState(false)
+  const selectionGuard = useSelectionGuard()
+  const taskId = backgroundTaskId(item)
+  const { liveSessions } = useAppStore(['liveSessions'], (previous, next) =>
+    previous.liveSessions[sessionId ?? '']?.backgroundTasks === next.liveSessions[sessionId ?? '']?.backgroundTasks)
+  const task = taskId ? liveSessions[sessionId ?? '']?.backgroundTasks.find(task => task.taskId === taskId) : undefined
+  const status: ToolStatus = task ? task.state.status === 'running' ? 'running'
+    : task.state.status === 'stopped' || task.state.status === 'interrupted' ? 'interrupted'
+    : task.state.status === 'failed' || (task.state.status === 'exited' && task.state.exitCode !== 0) ? 'failed' : 'completed' : item.status
+  // 转入后台的命令，工具首次返回的只是任务 ID 和“运行中”；输出、耗时和失败原因以后台任务的最新状态为准。
+  const shown = task ? { ...item, result: {
+    output: task.state.status === 'failed' ? [task.output, task.state.message].filter(Boolean).join('\n') : task.output,
+    isError: status === 'failed',
+    durationMs: 'durationMs' in task.state ? task.state.durationMs : undefined,
+  } } : item
   const filePath = pathFromArgs(item.name, item.args)
   const title = item.name === 'ask_user_question' ? '询问用户' : filePath?.replace(/\\/g, '/').endsWith('/SKILL.md') ? '读取技能' : item.name
   const summary = filePath !== null ? displayPath(filePath, cwd, userHome) : toolSummary(item.name, item.args) || firstLine(item.result?.output ?? '')
 
   return (
-    <article className={`timeline-item activity-step timeline-tool status-${item.status}`} data-item-id={itemKey} aria-label={`${title}，${factStatusText[item.status]}`}>
+    <motion.article {...enter} transition={reduced ? { duration: 0 } : pop} className={`timeline-item activity-step timeline-tool status-${status}`} data-item-id={itemKey} aria-label={`${title}，${factStatusText[status]}`}>
       <button type="button" className="activity-toggle" {...selectionGuard(() => setExpanded(value => !value))} aria-expanded={expanded}>
-        <StepLabel title={title} muted={title === 'read'} icon={<StepIcon name={item.name} />} />
-        <ExpandChevron expanded={expanded} className="step-chevron" />
-        <span className="step-separator" aria-hidden="true">·</span>
+        <StepLabel title={title} icon={<StepIcon name={item.name} status={status} />} />
         <span className="step-summary">{summary}</span>
-        {item.status === 'interrupted' && <span className="item-status">{factStatusText.interrupted}</span>}
-        {item.status === 'pending' && <span className="item-status">{factStatusText.pending}</span>}
+        {status === 'interrupted' && <span className="item-status">{factStatusText.interrupted}</span>}
+        {status === 'pending' && <span className="item-status">{factStatusText.pending}</span>}
+        <ExpandChevron expanded={expanded} className="step-chevron" />
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
-        {item.result?.durationMs !== undefined && <div className="tool-duration">耗时 {formatTurnDuration(item.result.durationMs)}</div>}
-        <div className="timeline-body activity-output"><ToolOutput item={item} filePath={filePath} />{sessionId && item.result?.images && <AttachedImages sessionId={sessionId} images={item.result.images} />}</div>
+        {shown.result?.durationMs !== undefined && <div className="tool-duration">耗时 {formatTurnDuration(shown.result.durationMs)}</div>}
+        <div className="timeline-body activity-output"><ToolOutput item={shown} filePath={filePath} />{sessionId && item.result?.images && <AttachedImages sessionId={sessionId} images={item.result.images} />}</div>
       </div></Disclosure>
-    </article>
+    </motion.article>
   )
-})
+}
 
-function TurnDuration({ itemKey, startedAt, finishedAt }: { itemKey: string; startedAt: string; finishedAt?: string }) {
+function TurnDuration({ itemKey, startedAt, firstTokenAt, finishedAt }: { itemKey: string; startedAt: string; firstTokenAt?: string; finishedAt?: string }) {
   const [now, setNow] = useState(Date.now)
   useEffect(() => {
     if (finishedAt) return
@@ -92,102 +125,72 @@ function TurnDuration({ itemKey, startedAt, finishedAt }: { itemKey: string; sta
     return () => window.clearInterval(timer)
   }, [finishedAt])
   const elapsed = (finishedAt ? Date.parse(finishedAt) : now) - Date.parse(startedAt)
-  return <div className="turn-duration" data-item-id={itemKey} role={finishedAt ? undefined : 'timer'} aria-label="本轮执行时间">{finishedAt ? '本轮耗时' : '执行中'} · {formatTurnDuration(elapsed)}</div>
+  return <div className="turn-duration" data-item-id={itemKey} role={finishedAt ? undefined : 'timer'} aria-label="本轮执行时间">{firstTokenAt && <time dateTime={firstTokenAt}>{formatClock(firstTokenAt)}</time>}<span>{formatTurnDuration(elapsed)}</span></div>
 }
 
-function StepLabel({ title, muted = false, icon }: { title: string; muted?: boolean; icon?: ReactNode }) {
+function StepLabel({ title, icon }: { title: string; icon?: ReactNode }) {
   return <span className="step-label">
     {icon !== undefined && <span className="step-icon" aria-hidden="true">{icon}</span>}
-    <span className={`step-title execution-title${muted ? ' muted-execution-title' : ''}`}>{title}</span>
+    <span className="step-title">{title}</span>
   </span>
 }
 
 function ReasoningRow({ item, itemKey }: { item: Extract<HistoryItem, { type: 'thinking' }>; itemKey: string }) {
-  const reducedMotion = useReducedMotion()
+  const reduced = useReducedMotion()
   const [expanded, setExpanded] = useState(false)
-  const [closing, setClosing] = useState(false)
-  const showFullText = expanded || closing
-  const [canExpand, setCanExpand] = useState(false)
-  const summaryRef = useRef<HTMLSpanElement>(null)
-  const measureRef = useRef<HTMLSpanElement>(null)
   const guard = useSelectionGuard()
   const running = item.status === 'running'
-  const text = item.text.trim().replace(/\n[\t \r]*\n+/g, '\n')
-  const summary = running ? text.slice(text.lastIndexOf('\n') + 1) : text.split('\n')[0]
-  useLayoutEffect(() => {
-    const node = summaryRef.current, measure = measureRef.current
-    if (!node || !measure) return
-    const update = () => {
-      if (showFullText) return
-      setCanExpand(text.includes('\n') || measure.getBoundingClientRect().width > node.clientWidth + 1)
-    }
-    update()
-    const observer = new ResizeObserver(update)
-    observer.observe(node)
-    observer.observe(measure)
-    return () => observer.disconnect()
-  }, [text, summary, showFullText])
-  useLayoutEffect(() => {
-    const node = summaryRef.current
-    if (!node) return
-    if (showFullText || !running) { node.scrollLeft = 0; return }
-    const start = node.scrollLeft
-    const end = Math.max(0, node.scrollWidth - node.clientWidth)
-    if (reducedMotion || end <= start) { node.scrollLeft = end; return }
-    const started = performance.now()
-    let frame: number
-    const follow = (now: number) => {
-      const progress = Math.min(1, (now - started) / 80)
-      node.scrollLeft = start + (end - start) * (1 - (1 - progress) ** 3)
-      if (progress < 1) frame = requestAnimationFrame(follow)
-    }
-    frame = requestAnimationFrame(follow)
-    return () => cancelAnimationFrame(frame)
-  }, [summary, running, showFullText, reducedMotion])
-  return <article className={`timeline-item reasoning-row status-${item.status}${showFullText ? ' is-expanded' : ''}`} data-item-id={itemKey}>
-    {/* 保持同一个节点，避免溢出状态切换时替换控件、重启光泽动画和丢失测量对象。 */}
-    <motion.button initial={false} animate={{ height: expanded ? 'auto' : 24 }} transition={disclosureTransition(expanded, reducedMotion)} onAnimationComplete={() => { if (!expanded) setClosing(false) }} type="button" className="activity-toggle" tabIndex={canExpand ? 0 : -1} aria-disabled={!canExpand} aria-expanded={canExpand ? expanded : undefined} {...guard(() => {
-      if (!canExpand) return
-      setClosing(expanded && !reducedMotion)
-      setExpanded(value => !value)
-    })}>
-      <StepLabel title="思考" muted />
-      {canExpand ? <ExpandChevron expanded={expanded} className="step-chevron" /> : <span className="step-chevron" aria-hidden="true" />}
-      <span className="step-separator" aria-hidden="true">·</span>
-      <span className={`step-summary${running && !showFullText ? ' follows-end' : ''}`} ref={summaryRef}>
-        {showFullText ? text : summary}
-        <span className="reasoning-summary-measure" aria-hidden="true" ref={measureRef}>{summary}</span>
+  const text = item.text.trim()
+  // 思考中保持固定宽度，单行显示最新文字，新字从右侧进入、旧字在左侧淡出，块不随每行长短变宽变窄。
+  const ticker = running && !expanded
+  // 和工具卡片同一套展开方式：标题行不动，全文在下方展开；展开时标题行的摘要淡出，避免同一句话出现两次。
+  return <motion.article {...enter} transition={reduced ? { duration: 0 } : pop} className={`timeline-item activity-step reasoning-row status-${item.status}${ticker ? ' is-streaming' : ''}`} data-item-id={itemKey}>
+    <button type="button" className="activity-toggle" aria-expanded={expanded} {...guard(() => setExpanded(value => !value))}>
+      <Sparkles size={13} className={running ? 'pulse' : undefined} />
+      <span className={`step-title${running ? ' activity-shimmer' : ''}`}>{running ? '思考中' : '思考'}</span>
+      <span className={`step-summary reasoning-summary${ticker ? ' is-ticker' : ''}`}>
+        {ticker ? <span>{text.replace(/\s+/g, ' ').slice(-400)}</span> : text.split('\n')[0]}
       </span>
-      {running && <span className="sr-only">进行中</span>}
-    </motion.button>
-  </article>
+      <ExpandChevron expanded={expanded} size={13} />
+    </button>
+    <Disclosure open={expanded}><div className="activity-expanded reasoning-body">{text}</div></Disclosure>
+  </motion.article>
 }
 
 function CompactionRow({ item, itemKey }: { item: Extract<HistoryItem, { type: 'compaction' | 'compaction_result' }>; itemKey: string }) {
+  const reduced = useReducedMotion()
   const [expanded, setExpanded] = useState(false)
   const summary = item.type === 'compaction' ? item.summary : compactionResultText(item)
   const title = item.type === 'compaction' ? compactionText.completed : item.status === 'failed' ? compactionText.failed : summary
   const canExpand = summary !== '' && summary !== title
   const guard = useSelectionGuard()
-  const status = item.type === 'compaction' ? 'recorded' : item.status
-  return <article className={`timeline-item activity-step timeline-compaction status-${status}`} data-item-id={itemKey}>
+  const status = item.type === 'compaction' ? 'completed' : item.status
+  return <motion.article {...enter} transition={reduced ? { duration: 0 } : pop} className={`timeline-item activity-step timeline-compaction status-${status}`} data-item-id={itemKey}>
     <button type="button" className="activity-toggle compaction-toggle" aria-expanded={canExpand ? expanded : undefined} aria-disabled={!canExpand}
       {...guard(() => { if (canExpand) setExpanded(value => !value) })}>
-      <ListCollapse size={16} strokeWidth={1.6} aria-hidden="true" />
+      <StepIcon name="compaction" status={status} />
       <span className="compaction-label" role="status">{title}</span>
       {canExpand && <ExpandChevron expanded={expanded} size={14} />}
     </button>
     <Disclosure open={expanded}><div className="activity-expanded compaction-summary"><MarkdownBody text={summary} /></div></Disclosure>
-  </article>
+  </motion.article>
 }
 
 function ToolOutput({ item: fact, filePath }: { item: Extract<HistoryItem, { type: 'tool' }>; filePath: string | null }) {
   const input = fact.args
-  const output = fact.result?.output ?? ''
+  const background = ['bash', 'task_list', 'task_output', 'task_stop'].includes(fact.name)
+  // 后台任务标识供模型与后端关联任务，展示参数和结构化结果时省略。
+  const displayJson = (key: string, value: unknown) => background && (key === 'taskId' || key === 'task_id') ? undefined : value
+  const parameters = JSON.stringify(input, displayJson, 2)
+  let output = fact.result?.output ?? ''
+  if (background && output !== '') {
+    try { output = JSON.stringify(JSON.parse(output), displayJson, 2) }
+    catch { /* 普通命令输出和工具错误是文本，原样显示。 */ }
+  }
   const command = fact.name === 'bash' ? toolArgument(fact.name, input) : null
   if (command !== null) return <CommandOutput command={command} output={output} />
   const hasReadLines = fact.result?.readSource !== undefined && fact.result?.readSource.lineCount > 0
-  if (filePath !== null && (output !== '' || hasReadLines) && fact.name === 'read' && fact.status !== 'failed') return <div>
+  if (filePath !== null && (output !== '' || hasReadLines) && fact.status !== 'failed') return <div>
     <div className="tool-output-header">{filePath}</div>
     {/* 后端提供 readSource 时为读取的正文行标上源文件行号。 */}
     {fact.result?.readSource
@@ -198,7 +201,7 @@ function ToolOutput({ item: fact, filePath }: { item: Extract<HistoryItem, { typ
   </div>
   return (
     <div>
-      <ToolSection label="参数"><pre><code>{JSON.stringify(input, null, 2) || '（空）'}</code></pre></ToolSection>
+      {parameters && parameters !== '{}' && <ToolSection label="参数"><pre><code>{parameters}</code></pre></ToolSection>}
       {output !== '' && (
         <ToolSection label={fact.status === 'failed' ? '错误' : '输出'}>
           <pre><code>{output}</code></pre>
@@ -215,8 +218,24 @@ function ToolSection({ label, children }: { label: string; children: ReactNode }
   </section>
 }
 
-function StepIcon({ name }: { name: string }) {
-  const path = name === 'bash' ? 'm4 6 5 6-5 6m8 0h8'
-    : 'M14 2H5v20h14V7zM14 2v6h5M8 12h8M8 16h8'
-  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d={path} /></svg>
+function StepIcon({ name, status }: { name: string; status: ToolStatus }) {
+  if (status === 'running') return <span className="spinner" />
+  if (status === 'completed') return <CircleCheck size={13} className="ok" />
+  if (status === 'failed') return <CircleAlert size={13} className="bad" />
+  if (status === 'interrupted') return <CircleX size={13} className="bad" />
+  const Icon = name === 'bash' ? SquareTerminal : name === 'ask_user_question' ? MessageCircleQuestion : name === 'write' || name === 'edit' ? Pencil : FileText
+  return <Icon size={13} />
+}
+
+/** 截至这条回复时整个会话的累计：平均首 token 时间、平均输出速度、总用量和缓存命中率。 */
+function MessageStatsLine({ stats, at }: { stats?: SessionModelUsage; at?: string }) {
+  const parts: string[] = []
+  if (stats && stats.ttftRequests > 0) parts.push(`TTFT ${(stats.ttftMs / stats.ttftRequests / 1000).toFixed(1)}s`)
+  if (stats && stats.decodeMs > 0) parts.push(`${Math.round(stats.decodeTokens * 1000 / stats.decodeMs)} tok/s`)
+  if (stats?.usagePresent) parts.push(`${formatTokenCount(stats.totalTokens)} tokens`)
+  // 向下取整：只有全部命中时才显示 100%。
+  if (stats?.usagePresent && stats.cacheUsageComplete && stats.inputTokens > 0) parts.push(`${Math.floor(stats.cachedInputTokens / stats.inputTokens * 100)}%`)
+  if (at) parts.push(formatClock(at))
+  // 文字只留数值，悬停时说明各项含义。
+  return parts.length ? <p className="turn-stats" title="平均首 token 时间 · 平均输出速度 · 会话总用量 · 缓存命中率 · 时间">{parts.join(' · ')}</p> : null
 }

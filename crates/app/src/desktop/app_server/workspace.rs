@@ -29,7 +29,7 @@ impl AppServer {
             .iter()
             .map(|(id, conversation)| (id.clone(), conversation.status()))
             .collect();
-        let sessions_by_workspace = group_threads(&workspaces, threads).map_err(internal_error)?;
+        let sessions_by_workspace = group_threads(&workspaces, threads);
         Ok(AppBootstrap {
             user_home: std::env::home_dir().and_then(|home| home.into_os_string().into_string().ok()),
             session_states,
@@ -54,16 +54,12 @@ impl AppServer {
             let workspace = app.workspace(&workspace_root)?;
             let mut sessions = app.lock_sessions();
             let belongs = |conversation: &std::sync::Arc<crate::runtime::Conversation>| {
-                matches!(
-                    singularity_core::saved_directory_matches(&workspace.root, &conversation.thread().cwd),
-                    Ok(true)
-                )
+                singularity_core::same_saved_path(&conversation.thread().cwd, &workspace.root)
             };
             if sessions.values().any(|conversation| belongs(conversation) && conversation.has_work()) {
                 return Err(RpcError::new(
                     singularity_protocol::RpcErrorCode::WorkspaceBusy,
                     format!("项目 {} 仍有运行中的任务、后台命令或待处理输入。", workspace.root),
-                    "等待处理完成，或停止后台命令并删除相关任务后重试。",
                 ));
             }
             app.workspaces.remove(&workspace_root).map_err(workspace_error)?;
@@ -104,10 +100,41 @@ impl AppServer {
                 .map(|skill| singularity_protocol::SkillMetadata {
                     name: skill.name,
                     description: skill.description,
+                    path: singularity_core::display_path(&skill.path),
                 })
                 .collect(),
             diagnostics: catalog.diagnostics,
         })
+    }
+
+    /// 全局指令是应用数据目录下的 AGENTS.md，项目指令是项目根目录下的 AGENTS.md；文件不存在时内容为空。
+    pub fn read_instructions(
+        &self,
+        workspace_root: Option<&str>,
+    ) -> Result<singularity_protocol::TextDocument, RpcError> {
+        read_document(&self.instructions_path(workspace_root)?)
+    }
+
+    /// 保存后在下一轮任务开始时生效；先写临时文件再替换，读取方不会看到写了一半的内容。
+    pub fn save_instructions(
+        &self,
+        workspace_root: Option<&str>,
+        content: &str,
+    ) -> Result<singularity_protocol::TextDocument, RpcError> {
+        let path = self.instructions_path(workspace_root)?;
+        let temporary = path.with_extension("md.tmp");
+        std::fs::write(&temporary, content)
+            .and_then(|()| std::fs::rename(&temporary, &path))
+            .map_err(|error| internal_error(format!("{}: {error}", path.display())))?;
+        read_document(&path)
+    }
+
+    fn instructions_path(&self, workspace_root: Option<&str>) -> Result<std::path::PathBuf, RpcError> {
+        let directory = match workspace_root {
+            Some(root) => std::path::PathBuf::from(self.workspace(root)?.root),
+            None => self.home.clone(),
+        };
+        Ok(directory.join("AGENTS.md"))
     }
 
     /// 搜索指定项目目录内的文件候选（最多返回 12 条）。
@@ -121,19 +148,30 @@ impl AppServer {
     }
 }
 
+fn read_document(path: &Path) -> Result<singularity_protocol::TextDocument, RpcError> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(internal_error(format!("{}: {error}", path.display()))),
+    };
+    Ok(singularity_protocol::TextDocument {
+        path: singularity_core::display_path(path),
+        content,
+    })
+}
+
 /// 按会话日志里记录的工作目录把任务分到已登记的项目；项目登记不保存任务列表，
 /// 每次读取都重新分组。不属于任何项目的任务不显示。
 fn group_threads(
     workspaces: &[Workspace],
     threads: Vec<ThreadSummary>,
-) -> Result<BTreeMap<String, Vec<ThreadSummary>>, String> {
+) -> BTreeMap<String, Vec<ThreadSummary>> {
     let mut grouped: BTreeMap<String, Vec<ThreadSummary>> =
         workspaces.iter().map(|workspace| (workspace.root.to_lowercase(), Vec::new())).collect();
     for thread in threads {
-        let directory = singularity_core::CanonicalWorkspacePath::from_saved(&thread.cwd)?;
-        if let Some(bucket) = grouped.get_mut(directory.key()) {
+        if let Some(bucket) = grouped.get_mut(&thread.cwd.to_lowercase()) {
             bucket.push(thread);
         }
     }
-    Ok(grouped)
+    grouped
 }

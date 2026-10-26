@@ -35,7 +35,7 @@ pub async fn run(
     let result = async {
         write(
             &mut output,
-            &app.frame(StreamEvent::Ready),
+            &singularity_protocol::StreamEnvelope { revision: app.revision(), event: StreamEvent::Ready },
         )
         .await?;
         loop {

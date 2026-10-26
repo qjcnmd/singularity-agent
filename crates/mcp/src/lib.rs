@@ -45,12 +45,6 @@ pub struct McpTool {
     connection: Arc<Connection>,
 }
 
-impl std::fmt::Debug for McpTool {
-    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        out.debug_struct("McpTool").field("name", &self.name).finish_non_exhaustive()
-    }
-}
-
 impl McpTool {
     /// 调用服务器原始工具；取消通知与超时由 SDK 处理，调用不会自动重试。
     pub async fn call(
@@ -156,11 +150,12 @@ impl McpManager {
             config.servers.get(id).is_some_and(|current| current.enabled && current == previous)
         });
         let mut entries = Vec::new();
+        let directory = directory_key(cwd);
         for (id, config) in config.servers {
             if !config.enabled || only.is_some_and(|only| only != id) {
                 continue;
             }
-            let key = (directory_key(cwd), id.clone());
+            let key = (directory.clone(), id.clone());
             if reconnect {
                 connections.remove(&key);
             }

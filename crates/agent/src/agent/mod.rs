@@ -14,6 +14,7 @@
 //! crate::request_execution，输入队列在 self::inbox；事件类型是 singularity_protocol::TurnEvent。
 
 mod compaction;
+pub use compaction::compaction_unneeded;
 mod dispatch;
 mod inbox;
 mod questions;
@@ -103,6 +104,15 @@ pub struct RequestContext {
     config: AgentConfig,
 }
 impl RequestContext {
+    /// 按回合开始时的同一套规则加载指令和工具目录，只返回给工作台查看的内容，不发送请求。
+    pub async fn inspect_context(
+        mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<singularity_protocol::InjectedContext> {
+        let (_, context) = self.load_definitions(cancellation).await?;
+        Ok(context)
+    }
+
     /// 提供方和文件指令在创建时确定；技能和 MCP 工具在第一次请求前加载。
     pub fn new(
         provider: OpenAiProvider,
@@ -133,7 +143,7 @@ pub struct Agent {
     inbox: SteeringInboxHandle,
 }
 impl Agent {
-    /// 为普通回合绑定输入、提问和工具执行状态。
+    /// 本轮加载的指令和工具定义由 `RequestContext` 持有；停止、提问和工具执行状态在这里绑定。
     pub fn new(
         requests: RequestContext,
         inbox: SteeringInboxHandle,
@@ -177,6 +187,7 @@ impl Agent {
                 &assistant_result_entry_id,
                 singularity_protocol::TurnStatus::Completed,
                 singularity_protocol::ToolStatus::Pending,
+                &singularity_core::now_iso(),
             );
             on_event(TurnEvent::MessageFinished {
                 message_id: assistant_result_entry_id.clone(),
@@ -239,23 +250,32 @@ impl Agent {
             }
         };
         let images: Vec<_> = input.images.iter().map(|image| image.attachment.clone()).collect();
-        let pending_input = input.clone();
+        let text = input.text.clone();
         let cwd = lock_writer(&self.requests.session).cwd().to_path_buf();
         let home = self.requests.config.instruction_home.clone();
-        let model_text = tokio::task::spawn_blocking(move || pending_input.model_text(&cwd, &home))
-            .await
-            .expect("skill references resolve while the runtime is running");
+        let model_text =
+            tokio::task::spawn_blocking(move || inbox::expand_skill_references(&text, &cwd, &home))
+                .await
+                .expect("skill references resolve while the runtime is running");
+        let model_text = input.text_with_files(model_text);
         let display_text = (model_text != input.text).then(|| input.text.clone());
         let mut content = vec![singularity_model::ContentBlock::text(model_text)];
         content.extend(images.iter().cloned().map(singularity_model::ContentBlock::Image));
-        let message = Message::User { content, display_text };
+        let message = Message::User {
+            content,
+            display_text,
+            files: input.files.clone(),
+        };
         self.append_message(&request.message_id, message, &input.images).await?;
         lock_inbox(&self.inbox).confirm_saved(&request.message_id);
         on_event(TurnEvent::ItemUpdated {
             item: singularity_protocol::HistoryItem::Message {
                 id: request.item_id(),
                 text: input.text.clone(),
+                at: Some(singularity_core::now_iso()),
+                stats: None,
                 images,
+                files: input.files.clone(),
                 role: singularity_protocol::HistoryMessageRole::User,
                 status: singularity_protocol::TurnStatus::Completed,
             },
@@ -287,10 +307,5 @@ impl Agent {
         })
         .await
         .expect("message writer completes while the runtime is running")?)
-    }
-
-    /// 本轮模型的上下文窗口。
-    pub fn context_window(&self) -> u64 {
-        self.requests.context_window()
     }
 }

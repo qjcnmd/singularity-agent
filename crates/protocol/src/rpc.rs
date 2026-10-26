@@ -38,6 +38,30 @@ pub struct WorkspaceParams {
     pub workspace_root: String,
 }
 
+/// 读取全局指令（不带项目）或某个项目根目录下的 AGENTS.md。
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct InstructionsReadParams {
+    pub workspace_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct InstructionsSaveParams {
+    pub workspace_root: Option<String>,
+    pub content: String,
+}
+
+/// 工作台文件栏读取的文件；`path` 可以是绝对路径、`~/` 开头或相对 `cwd`（任务的工作目录）。
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct FileReadParams {
+    pub cwd: String,
+    pub path: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -81,6 +105,8 @@ pub struct SessionStartParams {
     pub selection: crate::ModelSelection,
     pub text: String,
     pub images: Vec<crate::ImageUpload>,
+    /// 附件文件的绝对路径。
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +116,7 @@ pub struct SessionTextParams {
     pub session_id: String,
     pub text: String,
     pub images: Vec<crate::ImageUpload>,
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,11 +168,15 @@ rpc_methods! {
     AppBootstrap => "app.bootstrap" (EmptyParams) -> crate::AppBootstrap,
     DirectoryPick => "directory.pick" (EmptyParams) -> DirectoryPickResult,
     FileSearch => "file.search" (FileSearchParams) -> Vec<FileCandidate>,
+    FileRead => "file.read" (FileReadParams) -> TextDocument,
     SkillsList => "skills.list" (WorkspaceParams) -> SkillCatalog,
+    InstructionsRead => "instructions.read" (InstructionsReadParams) -> TextDocument,
+    InstructionsSave => "instructions.save" (InstructionsSaveParams) -> TextDocument,
     WorkspaceAdd => "workspace.add" (WorkspaceAddParams) -> Workspace,
     WorkspaceRemove => "workspace.remove" (WorkspaceParams) -> (),
+    ModelRead => "model.read" (EmptyParams) -> ModelCatalogResult,
     ModelSaveProvider => "model.saveProvider" (ProviderSaveParams) -> ModelCatalogResult,
-    ModelDiscover => "model.discover" (DiscoverModelsParams) -> Vec<DiscoveredModel>,
+    ModelDiscover => "model.discover" (DiscoverModelsParams) -> Vec<String>,
     ModelRemoveProvider => "model.removeProvider" (ProviderParams) -> ModelCatalogResult,
     McpList => "mcp.list" (McpListParams) -> Vec<McpServerState>,
     McpSave => "mcp.save" (McpSaveParams) -> Vec<McpServerState>,
@@ -161,6 +192,7 @@ rpc_methods! {
     SessionAnswerQuestion => "session.answerQuestion" (crate::QuestionAnswerParams) -> (),
     SessionAbort => "session.abort" (SessionParams) -> (),
     SessionCompact => "session.compact" (SessionParams) -> (),
+    SessionContext => "session.context" (SessionParams) -> (),
     BackgroundTaskStop => "session.stopBackgroundTask" (BackgroundTaskParams) -> (),
     SessionUpdateSettings => "session.updateSettings" (UpdateSettingsParams) -> (),
 }

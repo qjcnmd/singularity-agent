@@ -25,7 +25,6 @@ export function CopyButton({ text, label = '复制' }: { text: string; label?: s
   }
   return <button type="button" className="quiet-button" aria-live="polite"
     aria-label={copyStatus === 'error' ? `${label}失败，点击重试` : undefined}
-    title={copyStatus === 'error' ? '请重试或手动选择文字复制。' : undefined}
     {...guard(() => { void copy() })}>
     {copyStatus === 'copied' ? '已复制' : copyStatus === 'error' ? '复制失败，重试' : label}
   </button>

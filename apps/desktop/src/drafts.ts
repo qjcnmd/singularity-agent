@@ -1,37 +1,24 @@
 import type { ModelSelection, ImageUpload } from './protocol'
 
-export interface Draft { text: string; images: File[]; selection?: ModelSelection }
-export const emptyDraft: Draft = { text: '', images: [] }
-const hasDraft = (draft: Draft | undefined) => draft !== undefined && (draft.text !== '' || draft.images.length > 0 || draft.selection !== undefined)
+/** files 是附件文件的绝对路径，发送时只把路径交给后端。 */
+export interface Draft { text: string; images: File[]; files: string[]; selection?: ModelSelection }
+export const emptyDraft: Draft = { text: '', images: [], files: [] }
+const hasDraft = (draft: Draft | undefined) => draft !== undefined && (draft.text !== '' || draft.images.length > 0 || draft.files.length > 0 || draft.selection !== undefined)
 
 export type DraftSnapshot = Readonly<Record<string, Draft>>
 
-/** IndexedDB 草稿读写失败错误，附带恢复建议。 */
-export class DraftStorageError extends Error {
-  constructor(message: string, readonly recovery: string) {
-    super(message)
-    this.name = 'DraftStorageError'
-  }
-}
-
-/** 管理各任务的输入草稿（文字、图片和未启动任务的模型选择），同步到 IndexedDB。 */
+/** 管理各任务的输入草稿（文字、图片、附件和未启动任务的模型选择），同步到 IndexedDB。 */
 export class DraftStore {
   private snapshot: DraftSnapshot | null = null
-  private loading: Promise<DraftSnapshot | null> | null = null
+  private loading: Promise<DraftSnapshot> | null = null
 
-  constructor(
-    private readonly onChange: (drafts: DraftSnapshot) => void,
-    private readonly onError: (error: DraftStorageError, sessionId: string | null) => void,
-  ) {}
+  constructor(private readonly onChange: (drafts: DraftSnapshot) => void) {}
 
-  load(): Promise<DraftSnapshot | null> {
+  load(): Promise<DraftSnapshot> {
     if (this.snapshot !== null) return Promise.resolve(this.snapshot)
-    return this.loading ??= loadDrafts().then(drafts => {
+    return this.loading ??= loadDrafts().catch(() => ({})).then(drafts => {
       this.publish(drafts)
       return drafts
-    }, error => {
-      this.onError(new DraftStorageError(`无法读取草稿：${error instanceof Error ? error.message : String(error)}`, '检查本地存储空间后刷新页面。'), null)
-      return null
     }).finally(() => { this.loading = null })
   }
 
@@ -39,20 +26,15 @@ export class DraftStore {
     return this.snapshot?.[sessionId] ?? emptyDraft
   }
 
-  /** 编辑时先更新内存快照；写入 IndexedDB 失败时保留当前页面内的草稿并报错。 */
+  /** 编辑立即生效；自动保存失败不影响当前输入和发送。 */
   async set(sessionId: string, draft: Draft): Promise<boolean> {
     if (this.snapshot === null) return false
     const drafts = { ...this.snapshot }
     if (hasDraft(draft)) drafts[sessionId] = draft
     else delete drafts[sessionId]
     this.publish(drafts)
-    try {
-      await persistDraft(sessionId, draft)
-      return true
-    } catch {
-      this.onError(new DraftStorageError('草稿暂时只能保留在当前页面。', '请保留页面并检查本地存储空间后重试。'), sessionId)
-      return false
-    }
+    await persistDraft(sessionId, draft).catch(() => {})
+    return true
   }
 
   /** 发送期间继续编辑的内容仍保留。 */
@@ -60,13 +42,9 @@ export class DraftStore {
     if (this.snapshot?.[sessionId] === submitted) await this.set(sessionId, emptyDraft)
   }
 
-  /** 任务或项目删除后清理对应草稿；IndexedDB 删除成功后才更新内存快照。 */
-  async remove(sessionIds: string[], completed: string): Promise<void> {
-    try {
-      await removeDrafts(sessionIds)
-    } catch (error) {
-      throw new DraftStorageError(`${completed}，但草稿清理失败：${error instanceof Error ? error.message : String(error)}`, '草稿仍保存在本机，请检查本地存储状态。')
-    }
+  /** 清理失败不影响已完成的任务删除或项目移除。 */
+  async remove(sessionIds: string[]): Promise<void> {
+    await removeDrafts(sessionIds).catch(() => {})
     if (this.snapshot !== null) {
       const drafts = { ...this.snapshot }
       for (const id of sessionIds) delete drafts[id]
@@ -121,7 +99,8 @@ async function loadDrafts(): Promise<Record<string, Draft>> {
   request.onsuccess = () => {
     const cursor = request.result
     if (!cursor) return
-    result[String(cursor.key)] = cursor.value as Draft
+    // 加入附件之前保存的草稿没有 files 字段。
+    result[String(cursor.key)] = { ...cursor.value as Draft, files: (cursor.value as Partial<Draft>).files ?? [] }
     cursor.continue()
   }
   await complete(transaction)

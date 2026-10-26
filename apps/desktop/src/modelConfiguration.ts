@@ -1,4 +1,4 @@
-import type { DiscoveredModel, ModelConfigurationInput, ProviderApiProtocol } from './protocol'
+import type { ModelConfigurationInput, ProviderApiProtocol } from './protocol'
 import { reasoningGrades } from './modelChoices'
 
 /** 解析支持 `K`/`M` 后缀的 Token 容量输入；空值或非法值返回 `null`。 */
@@ -35,7 +35,7 @@ function supportsThinkingToggle(model: ReasoningConfiguration, protocol: Provide
 /** 模型弹窗和提供方保存共用思考选项规则，切换协议后也能直接指出不适用的档位。 */
 export function reasoningConfigurationError(model: ReasoningConfiguration, protocol: ProviderApiProtocol): string | null {
   const declared = model.reasoningVariants ?? []
-  if (declared.some(variant => !variant || /[\s\x00-\x1f\x7f]/.test(variant))) return '思考档位无效，请重新获取模型参数或取消选择此档位。'
+  if (declared.some(variant => !variant || /[\s\x00-\x1f\x7f]/.test(variant))) return '思考档位无效，请取消选择此档位。'
   if (new Set(declared).size !== declared.length) return '思考选项不能重名。'
   if (protocol === 'responses' && declared.includes('on')) return 'Responses 须选择具体思考档位，不支持 on 开关。'
   if (declared.includes('on') && !supportsThinkingToggle(model, protocol)) return 'reasoning_effort 须选择具体思考档位，不支持 on 开关。'
@@ -60,40 +60,10 @@ export function applyProtocol(model: ModelConfigurationInput, apiProtocol: Provi
     chatOutputTokensField: apiProtocol === 'responses' ? null : model.chatOutputTokensField }
 }
 
-/** 将选中的探测模型合并到列表，只填补空白字段，不覆盖用户已填的配置。 */
-export function mergeDiscoveredModels(
-  rows: ModelConfigurationInput[],
-  candidates: DiscoveredModel[],
-  picked: ReadonlySet<string>,
-  protocol: ProviderApiProtocol,
-): ModelConfigurationInput[] {
-  const next = [...rows]
-  for (const candidate of candidates) {
-    if (!picked.has(candidate.modelId)) continue
-    const at = next.findIndex(row => row.modelId.trim() === candidate.modelId)
-    const current = at < 0 ? { ...blankModel(), modelId: candidate.modelId } : next[at]
-    const merged = mergeDiscoveredModel(current, candidate, protocol)
-    if (at < 0) next.push(merged)
-    else next[at] = merged
-  }
-  return next
-}
-
-export function mergeDiscoveredModel(current: ModelConfigurationInput, candidate: DiscoveredModel, protocol: ProviderApiProtocol): ModelConfigurationInput {
-  const merged = { ...current }
-  for (const field of ['maxContextTokens', 'maxOutputTokens', 'reasoningVariants'] as const) {
-    if (current[field] !== null) continue
-    const value = candidate[field]
-    if (value === null || (field === 'reasoningVariants' && candidate.reasoningVariants.length === 0)) continue
-    Object.assign(merged, { [field]: value })
-  }
-  return applyProtocol(merged, protocol)
-}
-
 /** 只提供能发送的开关；不适用的已选值仍显示，供用户取消并修正配置。 */
-export function reasoningOptionsFor(model: ReasoningConfiguration, protocol: ProviderApiProtocol, discovered: readonly string[] = []): string[] {
+export function reasoningOptionsFor(model: ReasoningConfiguration, protocol: ProviderApiProtocol): string[] {
   const supportsToggle = supportsThinkingToggle(model, protocol)
-  const variants = [...discovered.filter(variant => variant !== 'on' || supportsToggle), ...(model.reasoningVariants ?? [])]
+  const variants = model.reasoningVariants ?? []
   const toggle = supportsToggle && variants.includes('on')
     && variants.every(variant => variant === 'off' || variant === 'on')
   const options = toggle ? ['off', 'on'] : ['off', ...reasoningGrades, ...(supportsToggle ? ['on'] : [])]

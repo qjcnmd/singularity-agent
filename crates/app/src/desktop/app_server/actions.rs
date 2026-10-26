@@ -13,7 +13,7 @@ impl AppServer {
     pub fn submit(self: &Arc<Self>, session_id: &str, input: UserInput) -> Result<(), RpcError> {
         let _lifecycle = self.lock_lifecycle();
         let conversation = self.open_action_conversation(session_id)?;
-        conversation.start(&input).map_err(conversation_error)?;
+        conversation.start(input).map_err(conversation_error)?;
         Ok(())
     }
 
@@ -43,6 +43,19 @@ impl AppServer {
         let conversation = self.open_action_conversation(session_id)?;
         apply(&conversation)?;
         Ok(())
+    }
+
+    /// 打开任务时查看下一轮会加载的指令和工具；结果通过 context/loaded 事件送达。
+    pub async fn inspect_context(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {
+        let app = Arc::clone(self);
+        let id = session_id.to_string();
+        let conversation = tokio::task::spawn_blocking(move || {
+            let _lifecycle = app.lock_lifecycle();
+            app.open_conversation(&id)
+        })
+        .await
+        .expect("conversation lookup completes while the backend is running")?;
+        conversation.inspect_context().await.map_err(internal_error)
     }
 
     pub fn compact(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {

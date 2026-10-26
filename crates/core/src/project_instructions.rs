@@ -20,7 +20,21 @@ pub fn load_agent_instructions(cwd: &Path, home: &Path) -> Result<Vec<Instructio
             directories.push(directory);
         }
     }
-    load_instruction_directories(directories, home)
+    let mut files = Vec::new();
+    for directory in directories {
+        let path = directory.join(PROJECT_INSTRUCTIONS_FILE_NAME);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("project_instruction_file_read_failed:{}:{error}", path.display()));
+            }
+        };
+        if !content.trim().is_empty() {
+            files.push(InstructionFile { path, content, global: directory == home });
+        }
+    }
+    Ok(files)
 }
 
 /// 一份实际加载的指令文件。
@@ -29,24 +43,6 @@ pub struct InstructionFile {
     pub path: PathBuf,
     pub content: String,
     pub global: bool,
-}
-
-fn load_instruction_directories(
-    directories: Vec<PathBuf>,
-    home: &Path,
-) -> Result<Vec<InstructionFile>, String> {
-    let mut files = Vec::new();
-    for directory in directories {
-        let Some(content) = read_project_instruction_file(&directory)? else {
-            continue;
-        };
-        if content.trim().is_empty() {
-            continue;
-        }
-        let path = directory.join(PROJECT_INSTRUCTIONS_FILE_NAME);
-        files.push(InstructionFile { path, content, global: directory == home });
-    }
-    Ok(files)
 }
 
 /// 返回 workspace root 到 cwd 之间需要检查指令的目录，两端都包含。
@@ -60,13 +56,4 @@ fn instruction_directories(workspace_root: &Path, cwd: &Path) -> Vec<PathBuf> {
     let mut directories = cwd.ancestors().take(depth + 1).map(Path::to_path_buf).collect::<Vec<_>>();
     directories.reverse();
     directories
-}
-
-fn read_project_instruction_file(directory: &Path) -> Result<Option<String>, String> {
-    let path = directory.join(PROJECT_INSTRUCTIONS_FILE_NAME);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => Ok(Some(content)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("project_instruction_file_read_failed:{}:{error}", path.display())),
-    }
 }

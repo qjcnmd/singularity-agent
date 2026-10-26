@@ -92,6 +92,7 @@ pub struct PendingUserMessage {
     pub item_id: String,
     pub text: String,
     pub images: Vec<crate::ImageAttachment>,
+    pub files: Vec<String>,
 }
 
 /// 提供方、模型和可选推理档位；配置、会话和桌面请求共用。
@@ -183,17 +184,6 @@ pub struct ProviderConfigurationInput {
     pub models: Vec<ModelConfigurationInput>,
 }
 
-/// 从提供方 `/models` 接口查到的模型信息，供设置页填入表单。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct DiscoveredModel {
-    pub model_id: String,
-    pub max_context_tokens: Option<u32>,
-    pub max_output_tokens: Option<u32>,
-    pub reasoning_variants: Vec<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -240,17 +230,12 @@ pub enum RpcErrorCode {
 pub struct RpcError {
     pub code: RpcErrorCode,
     pub message: String,
-    pub recovery: String,
 }
 
 impl RpcError {
-    /// 创建带错误码、原因和恢复建议的 RPC 错误。
-    pub fn new(code: RpcErrorCode, message: impl Into<String>, recovery: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            recovery: recovery.into(),
-        }
+    /// 创建带错误码和实际原因的 RPC 错误。
+    pub fn new(code: RpcErrorCode, message: impl Into<String>) -> Self {
+        Self { code, message: message.into() }
     }
 }
 

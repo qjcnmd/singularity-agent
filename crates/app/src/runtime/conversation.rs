@@ -55,7 +55,7 @@ pub enum ConversationError {
 }
 
 impl Conversation {
-    /// 用已打开的会话日志建立任务，并开始监听后台命令的状态变化。
+    /// 用已打开的会话日志建立任务，后台命令直接通知这个会话。
     pub fn new(
         session: singularity_agent::session::SessionManager,
         home: std::path::PathBuf,
@@ -81,30 +81,39 @@ impl Conversation {
             model,
         };
         let usage = crate::runtime::history::session_usage(session.entries());
+        let context_window = configured_context_window(&models, &thread.model);
         let writer = Arc::new(Mutex::new(session));
-        let inbox = singularity_agent::agent::SteeringInbox::default_handle();
-        let (bash_tasks, updates) =
-            singularity_agent::tools::BashTasks::new(Arc::clone(&writer), Arc::clone(&inbox));
-        let conversation = Arc::new(Self {
-            view: Mutex::new(view::ConversationView::new(usage)),
-            publish,
-            changed: tokio::sync::Notify::new(),
-            home,
-            models,
-            mcp,
-            state: Mutex::new(ConversationState {
-                thread,
-                turn: TurnLifecycle::Idle,
-                steering_inbox: inbox,
-                last_context_window: None,
-                auto_resume: true,
-                closing: false,
-            }),
-            writer,
-            bash_tasks,
-        });
-        conversation.listen_background(updates);
-        conversation
+        let inbox = Arc::new(std::sync::Mutex::new(singularity_agent::agent::SteeringInbox::default()));
+        Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
+            let weak = weak.clone();
+            let bash_tasks = singularity_agent::tools::BashTasks::new(
+                Arc::clone(&writer),
+                Arc::clone(&inbox),
+                Arc::new(move |update| {
+                    if let Some(conversation) = weak.upgrade() {
+                        conversation.on_background_update(update);
+                    }
+                }),
+            );
+            Self {
+                view: Mutex::new(view::ConversationView::new(usage)),
+                publish,
+                changed: tokio::sync::Notify::new(),
+                home,
+                models,
+                mcp,
+                state: Mutex::new(ConversationState {
+                    thread,
+                    turn: TurnLifecycle::Idle,
+                    steering_inbox: inbox,
+                    last_context_window: context_window,
+                    auto_resume: true,
+                    closing: false,
+                }),
+                writer,
+                bash_tasks,
+            }
+        })
     }
 
     /// 任务 ID、工作目录和当前模型选择的副本。
@@ -210,4 +219,22 @@ impl Conversation {
     fn lock_state(&self) -> std::sync::MutexGuard<'_, ConversationState> {
         self.state.lock().expect("conversation state lock poisoned")
     }
+}
+
+/// 重新打开任务时还没有跑过回合，先用配置里的上下文窗口，让日志里已有的用量能直接显示；
+/// 之后每轮开始时改用该轮实际解析出的窗口。找不到模型时保持未知。
+fn configured_context_window(
+    models: &singularity_model::ModelConfigManager,
+    selection: &singularity_protocol::ModelSelection,
+) -> Option<u64> {
+    models
+        .redacted_catalog()
+        .providers
+        .into_iter()
+        .find(|provider| provider.provider_id == selection.provider)?
+        .models
+        .into_iter()
+        .find(|model| model.model_id == selection.model)?
+        .max_context_tokens
+        .map(u64::from)
 }

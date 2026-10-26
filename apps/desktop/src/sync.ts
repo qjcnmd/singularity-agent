@@ -40,7 +40,7 @@ function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSe
 }
 
 /** 合并 `app.bootstrap` 快照，同时保留读取期间已收到更新的事件修订版本。 */
-export function acceptBootstrap(state: SyncState, bootstrap: AppBootstrap): SyncState {
+function acceptBootstrap(state: SyncState, bootstrap: AppBootstrap): SyncState {
   if (state.bootstrap !== null && bootstrap.revision < state.bootstrap.revision) return state
   const sessionsByWorkspace = { ...bootstrap.sessionsByWorkspace }
   // 目录读取期间任务仍可更新；保留在这次读取开始之后收到的摘要。
@@ -147,28 +147,24 @@ export function acceptSessionRead(state: SyncState, source: SessionReadResult): 
   } } }
 }
 
-type SyncEffect = 'resync'
-interface SyncReduction { state: SyncState; effect: SyncEffect | null }
-
-export function reduceStream(state: SyncState, frame: StreamEnvelope): SyncReduction {
-  if (frame.type === 'ready') return { state, effect: 'resync' }
-  if (frame.revision <= state.revision) return { state, effect: null }
+export function reduceStream(state: SyncState, frame: Exclude<StreamEnvelope, { type: 'ready' }>): SyncState {
+  if (frame.revision <= state.revision) return state
   const next = { ...state, revision: frame.revision }
   switch (frame.type) {
     case 'app_read_failed':
-      return { state: next, effect: null }
+      return next
     case 'app_changed':
-      return { state: acceptBootstrap(next, frame.payload), effect: null }
+      return acceptBootstrap(next, frame.payload)
     case 'session_summary_changed':
-      return { state: acceptSummary(next, frame.summary, frame.revision), effect: null }
+      return acceptSummary(next, frame.summary, frame.revision)
     case 'session_changed':
-      return { state: acceptLiveSession(next, frame.sessionId, frame.payload, frame.revision), effect: null }
+      return acceptLiveSession(next, frame.sessionId, frame.payload, frame.revision)
     case 'turn_event': {
       const previous = state.liveSessions[frame.sessionId]
-      return { state: acceptLiveSession(next, frame.sessionId, {
+      return acceptLiveSession(next, frame.sessionId, {
         phase: frame.payload.phase,
         failure: previous?.failure ?? null,
-      }, frame.revision, frame.payload), effect: null }
+      }, frame.revision, frame.payload)
     }
     case 'background_task_updated': {
       const previous = state.liveSessions[frame.sessionId]
@@ -176,14 +172,14 @@ export function reduceStream(state: SyncState, frame: StreamEnvelope): SyncReduc
       const task = frame.payload.task
       const backgroundTasks = tasks.some(value => value.taskId === task.taskId)
         ? tasks.map(value => value.taskId === task.taskId ? task : value) : [...tasks, task]
-      return { state: acceptLiveSession(next, frame.sessionId, {
+      return acceptLiveSession(next, frame.sessionId, {
         phase: frame.payload.phase,
         failure: previous?.failure ?? null, backgroundTasks,
-      }, frame.revision), effect: null }
+      }, frame.revision)
     }
     case 'session_settled': {
       let accepted = acceptLiveSession(next, frame.sessionId, frame.payload, frame.revision)
-      if (accepted === next) return { state: next, effect: null }
+      if (accepted === next) return next
       const session = accepted.session
       const turn = session?.facts.at(-1)
       // 保存失败时没有 turn/error 事件；结束页面上的临时输出，不补造已保存的结果或时间。
@@ -192,7 +188,7 @@ export function reduceStream(state: SyncState, frame: StreamEnvelope): SyncReduc
           facts: [...session.facts.slice(0, -1), finishTurn(turn, 'failed')],
         } }
       }
-      return { state: acceptSummary(accepted, frame.summary, frame.revision), effect: null }
+      return acceptSummary(accepted, frame.summary, frame.revision)
     }
   }
 }

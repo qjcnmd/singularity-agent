@@ -14,24 +14,28 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct RequestDefinitions {
     pub(crate) messages: Vec<Message>,
     pub(crate) tools: Vec<singularity_model::ModelToolSchema>,
+    pub(crate) estimated_tokens: u64,
 }
 
 impl RequestDefinitions {
-    /// 估算指令消息和工具定义占用的输入 Token 数。
-    pub(crate) fn estimated_tokens(&self) -> u64 {
-        let instructions = self
-            .messages
+    /// 定义在本轮内不变，加载时一次计算预算，普通请求和摘要请求直接复用。
+    fn new(messages: Vec<Message>, tools: Vec<singularity_model::ModelToolSchema>) -> Self {
+        let instructions = messages
             .iter()
             .map(|message| context::estimate_tokens_of(&message.content_text()) + 4)
             .sum::<u64>();
-        let tools = if self.tools.is_empty() {
+        let tool_tokens = if tools.is_empty() {
             0
         } else {
             context::estimate_tokens_of(
-                &serde_json::to_string(&self.tools).expect("tool schemas are serializable"),
+                &serde_json::to_string(&tools).expect("tool schemas are serializable"),
             ) + 4
         };
-        instructions + tools
+        Self {
+            messages,
+            tools,
+            estimated_tokens: instructions + tool_tokens,
+        }
     }
 }
 
@@ -65,17 +69,18 @@ impl RequestContext {
     ) -> Result<(RequestDefinitions, singularity_protocol::InjectedContext)> {
         let home = self.config.instruction_home.clone();
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
+        let skill_cwd = cwd.clone();
         let loaded = std::mem::take(&mut self.config.initial_instructions);
         let skills = tokio::task::spawn_blocking(move || {
-            singularity_core::skills::SkillCatalog::discover(&cwd, &home)
+            singularity_core::skills::SkillCatalog::discover(&skill_cwd, &home)
         })
         .await
         .expect("skill discovery completes while the runtime is running");
-        let cwd = lock_writer(&self.session).cwd().to_path_buf();
         let discovered = self.mcp.discover(&cwd, cancellation).await;
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
+        let mcp_tools: Vec<String> = discovered.tools.iter().map(|tool| tool.name.clone()).collect();
         self.registry.set_mcp_tools(discovered.tools);
         let registry = &self.registry;
         let mut developer =
@@ -109,10 +114,11 @@ impl RequestContext {
                     global: file.global,
                 })
                 .collect(),
-            skills: skills.model_skills().map(|skill| skill.name.clone()).collect(),
-            tools: tools.iter().map(|tool| tool.name.clone()).collect(),
+            // provider_schemas 先列内置工具，再列 MCP 工具。
+            tools: tools[..tools.len() - mcp_tools.len()].iter().map(|tool| tool.name.clone()).collect(),
+            mcp_tools,
         };
-        Ok((RequestDefinitions { messages, tools }, context))
+        Ok((RequestDefinitions::new(messages, tools), context))
     }
 
     pub(super) fn request_definitions(&self) -> &RequestDefinitions {
@@ -125,7 +131,7 @@ impl RequestContext {
         context::estimated_tokens(
             &writer,
             self.provider.model_identity(),
-            self.request_definitions().estimated_tokens(),
+            self.request_definitions().estimated_tokens,
         )
     }
 
@@ -138,7 +144,7 @@ impl RequestContext {
         let definitions = self.request_definitions();
         let tools = definitions.tools.clone();
         let mut messages = definitions.messages.clone();
-        let overhead_tokens = definitions.estimated_tokens();
+        let overhead_tokens = definitions.estimated_tokens;
         let (provider, model_name) = self.provider.model_identity();
         let identity = (provider.to_owned(), model_name.to_owned());
         let session = std::sync::Arc::clone(&self.session);

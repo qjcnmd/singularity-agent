@@ -3,7 +3,7 @@
 //! Singularity 的 Agent：模型与工具循环、会话日志和内置工具。
 //!
 //! - agent：一轮执行的入口；
-//! - session：JSONL 会话日志的读写，格式版本见 `session::CURRENT_SESSION_VERSION`；
+//! - session：JSONL 会话日志的读写，格式版本固定为 1；
 //! - compaction：摘要请求的构造和校验；
 //! - message：把消息转换成工作台历史条目；
 //! - prompts：Developer 指令；
@@ -11,7 +11,7 @@
 
 pub mod agent;
 pub mod compaction;
-pub mod image;
+mod image;
 pub mod message;
 mod prompts;
 mod request_execution;

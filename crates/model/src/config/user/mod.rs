@@ -49,8 +49,12 @@ pub(crate) struct UserConfigModel {
 /// 读取完整配置；文件不存在时返回 None。
 pub(crate) fn read_user_config_file(directory: &Path) -> Result<Option<UserConfigFile>, ProviderError> {
     let path = directory.join(USER_CONFIG_FILE_NAME);
-    let Some(config_text) = read_optional_config_text(&path)? else {
-        return Ok(None);
+    let config_text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(configuration_error(format!("无法读取模型配置 {}：{error}", path.display())));
+        }
     };
     let config: UserConfigFile = serde_json::from_str(&config_text).map_err(|error| {
         let reason = match error.classify() {
@@ -67,15 +71,6 @@ pub(crate) fn read_user_config_file(directory: &Path) -> Result<Option<UserConfi
         ))
     })?;
     Ok(Some(config))
-}
-
-/// 文件不存在时返回 None，其他读取错误保留路径与系统原因。
-fn read_optional_config_text(path: &Path) -> Result<Option<String>, ProviderError> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(configuration_error(format!("无法读取模型配置 {}：{error}", path.display()))),
-    }
 }
 
 /// 序列化后原子替换整个配置：被删掉的提供方、模型和推理档位随保存消失。

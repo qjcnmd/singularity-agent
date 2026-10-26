@@ -79,16 +79,18 @@ impl AppServer {
             .unwrap_or_else(|| Ok(self.home.clone()))
     }
 
-    pub fn frame(&self, event: StreamEvent) -> StreamEnvelope {
-        StreamEnvelope { revision: self.revision(), event }
-    }
-
     pub fn save_provider(
         &self,
         provider: ProviderConfigurationInput,
         api_key: Option<&str>,
     ) -> Result<singularity_protocol::ModelCatalogResult, RpcError> {
         self.update_models(|models| models.save_provider(provider, api_key))
+    }
+
+    /// 设置页只重读模型配置，不依赖项目和会话日志。
+    pub fn read_models(&self) -> singularity_protocol::ModelCatalogResult {
+        let _publication = self.lock_app_publication();
+        self.model_catalog_result(self.models.redacted_catalog())
     }
 
     pub fn remove_provider(
@@ -106,9 +108,17 @@ impl AppServer {
     ) -> Result<singularity_protocol::ModelCatalogResult, RpcError> {
         let _publication = self.lock_app_publication();
         let catalog = update(&self.models).map_err(model_error)?;
+        Ok(self.model_catalog_result(catalog))
+    }
+
+    // 重读也取得新序号，避免此前生成的工作台快照覆盖刚读到的文件配置。
+    fn model_catalog_result(
+        &self,
+        catalog: singularity_protocol::RedactedModelCatalog,
+    ) -> singularity_protocol::ModelCatalogResult {
         let mut revision = self.revision.lock().expect("stream revision lock poisoned");
         *revision += 1;
-        Ok(singularity_protocol::ModelCatalogResult { catalog, revision: *revision })
+        singularity_protocol::ModelCatalogResult { catalog, revision: *revision }
     }
 
     pub async fn discover_models(
@@ -116,7 +126,7 @@ impl AppServer {
         provider_id: &str,
         base_url: &str,
         api_key: Option<&str>,
-    ) -> Result<Vec<singularity_protocol::DiscoveredModel>, RpcError> {
+    ) -> Result<Vec<String>, RpcError> {
         // 先取出本次查询用的密钥，网络请求期间不持有配置锁。
         let api_key =
             self.models.discovery_credential(provider_id, api_key).map_err(model_discovery_error)?;
@@ -136,7 +146,7 @@ impl AppServer {
         let workspace = self.workspace(workspace_root)?;
         let thread = self.catalog.create_thread(&workspace.root, selection).map_err(catalog_error)?;
         let conversation = self.insert_conversation(thread);
-        conversation.start(&input).map_err(conversation_error)?;
+        conversation.start(input).map_err(conversation_error)?;
         Ok(conversation.start_result())
     }
 

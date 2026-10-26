@@ -5,13 +5,15 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+  /* 上面的时长会让每个元素的每次尺寸变化都变成过渡，紧接着读取仍得到旧值；mermaid 排版要读到新尺寸。 */
+  .mermaid-stage * { transition: none !important; }
 }
 
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes modal-in { from { opacity: 0; transform: translateY(5px) scale(0.995); } }
 
-.context-menu { z-index: 100; min-width: 210px; max-width: min(360px, calc(100vw - 16px)); max-height: min(420px, calc(100vh - 16px)); overflow: auto; padding: 5px; border: 1px solid var(--line); border-radius: 16px; animation: menu-enter 120ms ease-out; }
-.context-menu button { display: flex; justify-content: space-between; gap: 24px; width: 100%; padding: 8px 11px; border: 0; text-align: left; background: transparent; color: var(--ink); border-radius: 10px; }
+.context-menu { z-index: 100; min-width: 160px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow: auto; padding: 5px; border: 1px solid var(--line); border-radius: 14px; animation: menu-enter var(--spring-dur) var(--spring); }
+.context-menu button { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; height: 34px; padding: 0 10px; border: 0; text-align: left; background: transparent; color: var(--ink); border-radius: 9px; font-size: 13.5px; cursor: pointer; }
 .context-menu button:hover, .context-menu button:focus-visible { background: var(--surface-hover); }
 /* 原生 Popover 的触发按钮就是定位锚点；8px 外边距保留窗口边缘空间。 */
 .context-menu, .protocol-dropdown, .workspace-appearance-picker {
@@ -25,16 +27,14 @@
 }
 @position-try --popover-right { left: auto; right: 0; }
 .protocol-dropdown { width: anchor-size(width); }
-/* 折叠面板高度过渡动画 */
-.content-disclosure { overflow: hidden; height: 0; transition: height var(--disclosure-collapse-duration) var(--disclosure-collapse-ease); }
-.content-disclosure.is-open { height: auto; transition: height var(--disclosure-duration) var(--disclosure-ease); }
-/* 内部内容淡入淡出与模糊滤镜 */
-.content-disclosure > div { overflow: hidden; opacity: 0; filter: blur(2px); transition: opacity var(--disclosure-collapse-duration) var(--disclosure-collapse-ease), filter var(--disclosure-collapse-duration) var(--disclosure-collapse-ease); }
-.content-disclosure.is-open > div { opacity: 1; filter: blur(0); transition: opacity var(--disclosure-duration) var(--disclosure-ease), filter var(--disclosure-duration) var(--disclosure-ease); }
-/* 折叠指示箭头垂直翻转动画 */
-.expand-chevron { display: inline-flex; transform: scaleY(1); transform-origin: center; transition: transform var(--disclosure-collapse-duration) var(--disclosure-collapse-ease); }
-.expand-chevron.is-open { transform: scaleY(-1); transition: transform var(--disclosure-duration) var(--disclosure-ease); }
-.expand-chevron path { vector-effect: non-scaling-stroke; }
+/* 沿用 Disclosure 的实测高度，让展开内容从原位置向下长。 */
+.content-disclosure { overflow: hidden; height: 0; transition: height var(--disclosure-duration) var(--smooth); }
+.content-disclosure.is-open { height: auto; }
+.content-disclosure > div { overflow: hidden; }
+.expand-chevron { display: block; flex: none; color: var(--ink-faint); transition: transform var(--disclosure-duration) var(--smooth); }
+.expand-chevron.is-open { transform: rotate(90deg); }
+.sg-trigger .expand-chevron, .workspace-picker-trigger .expand-chevron, .protocol-trigger .expand-chevron { transform: rotate(90deg); }
+.sg-trigger .expand-chevron.is-open, .workspace-picker-trigger .expand-chevron.is-open, .protocol-trigger .expand-chevron.is-open { transform: rotate(270deg); }
 /* 下拉浮层显隐动画 */
 .picker-disclosure {
   display: none;
@@ -50,36 +50,34 @@
   display: block;
   opacity: 1;
   transform: translateY(0) scale(1);
-  transition-duration: var(--disclosure-duration);
-  transition-timing-function: var(--disclosure-ease);
+  transition-duration: var(--spring-dur);
+  transition-timing-function: var(--spring);
 }
 @starting-style {
   .picker-disclosure.is-open, .picker-disclosure:popover-open { opacity: 0; transform: translateY(6px) scale(.96); }
 }
 .picker-disclosure > div { overflow: hidden; background: var(--surface); border-radius: 12px; box-shadow: inset 0 0 0 1px var(--line), var(--shadow-floating); }
-@keyframes menu-enter { from { opacity: 0; } to { opacity: 1; } }
+@keyframes menu-enter { from { opacity: 0; transform: translateY(-4px) scale(.96); } to { opacity: 1; transform: none; } }
 
 @media (prefers-reduced-motion: reduce) {
   /* 响应系统的减少动态效果偏好 */
-  .content-disclosure, .content-disclosure > div, .picker-disclosure, .expand-chevron, .protocol-dropdown, .workspace-appearance-picker { transition: none !important; }
+  .activity-step, .reasoning-summary, .content-disclosure, .content-disclosure > div, .picker-disclosure, .expand-chevron, .protocol-dropdown, .workspace-appearance-picker { transition: none !important; }
   .context-menu, .context-menu > button { animation: none; }
 }
 
 /* 浮动面板毛玻璃效果 */
-.modal, .context-menu, .context-tooltip, .workspace-appearance-picker, .action-toast {
+.context-menu {
   background: var(--glass);
   border-color: var(--glass-edge);
   backdrop-filter: blur(24px) saturate(180%);
   box-shadow: var(--glass-shadow);
 }
-.theme-icon svg { animation: theme-icon-enter 220ms ease-out; }
-@keyframes theme-icon-enter { from { opacity: 0; transform: rotate(-25deg) scale(.8); } to { opacity: 1; transform: none; } }
-::view-transition-old(root), ::view-transition-new(root) { animation-duration: 220ms; }
-@media (prefers-reduced-motion: reduce) { .theme-icon svg { animation: none; } }
 /* 代码高亮配色（引用 Shiki 生成的 CSS 变量） */
 .code-token { color: var(--shiki-light); }
 [data-theme=dark] .code-token { color: var(--shiki-dark); }
-[data-theme=dark] .sg-rail { background: #44464c; }
 
 .user-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .katex-display { overflow-x: auto; overflow-y: hidden; }
+
+.modal[open] { animation: modal-pop var(--spring-dur) var(--spring); }
+@keyframes modal-pop { from { opacity: 0; transform: translateY(12px) scale(.96); } }

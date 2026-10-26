@@ -2,7 +2,6 @@
 
 mod discovery;
 pub(crate) mod manager;
-mod model_metadata;
 pub(crate) mod schema;
 pub(crate) mod selection;
 pub(crate) mod user;

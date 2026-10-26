@@ -5,7 +5,7 @@ use singularity_protocol::{SessionFailure, SessionOperation, StreamEvent, TurnSt
 impl Conversation {
     /// 首条和后续消息都放进输入队列；空闲时占用任务并返回要启动的回合，
     /// 运行中只排队，等当前回合消费或结束后接着处理。
-    fn submit(self: &Arc<Self>, input: &UserInput) -> Result<Option<Operation>, ConversationError> {
+    fn submit(self: &Arc<Self>, input: UserInput) -> Result<Option<Operation>, ConversationError> {
         let mut view = self.lock_view();
         let mut state = self.lock_state();
         if state.closing {
@@ -17,7 +17,7 @@ impl Conversation {
             SessionPhase::Stopping => return Err(ConversationError::Busy),
         };
         let mut inbox = state.steering_inbox.lock().expect("turn inbox lock poisoned");
-        inbox.enqueue(QueuedInput::new(input.clone()));
+        inbox.enqueue(QueuedInput::new(input));
         drop(inbox);
         state.auto_resume = true;
         if !start {
@@ -84,7 +84,7 @@ impl Conversation {
         self.changed.notify_waiters();
     }
     /// 接受用户输入并启动所需执行；后续回合由会话接续。
-    pub fn start(self: &Arc<Self>, input: &UserInput) -> Result<(), ConversationError> {
+    pub fn start(self: &Arc<Self>, input: UserInput) -> Result<(), ConversationError> {
         if let Some(operation) = self.submit(input)? {
             self.spawn_operation(operation);
         }

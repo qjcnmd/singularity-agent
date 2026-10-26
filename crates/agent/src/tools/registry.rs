@@ -11,7 +11,7 @@ use super::bash;
 use super::read;
 
 /// 工具调用的执行结果。若工具执行失败（如路径不存在或命令返回非零），通过 `is_error: true` 反馈给模型。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ToolExecution {
     pub content: String,
     pub images: Vec<crate::image::InputImage>,
@@ -48,7 +48,6 @@ pub(crate) struct ToolContext {
 }
 
 /// 参数已检查并解析好的工具调用。
-#[derive(Debug)]
 pub(crate) enum PreparedTool {
     Read(read::ReadArgs),
     Question(super::question::QuestionArgs),
@@ -88,7 +87,6 @@ type ToolParser = fn(&Value) -> Result<PreparedTool, ToolExecution>;
 
 /// 本轮可用的工具：内置工具（bash、后台命令管理、read、ask_user_question）加上本轮
 /// 发现的 MCP 工具。发给模型的工具定义、参数检查和执行分发都在这里。
-#[derive(Debug)]
 pub(crate) struct ToolRegistrySnapshot {
     tools: Vec<(ModelToolSchema, ToolParser)>,
     mcp: Vec<singularity_mcp::McpTool>,

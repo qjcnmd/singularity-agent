@@ -2,14 +2,13 @@
 //!
 //! 两种协议的编码和解码在各自的模块；可取消的网络等待和 SSE 分帧在 transport。
 
-use std::fmt;
-
 use tokio_util::sync::CancellationToken;
 
 use crate::config::selection::{OpenAiProviderConfig, SelectedModel};
 use crate::config::{ModelConfigManager, ModelConfigurationSnapshot};
 use crate::error::{
-    ProviderError, bounded_provider_error_diagnostic, parse_provider_error_body, provider_error_kind_for_code,
+    ProviderError, bounded_provider_error_diagnostic, parse_provider_error_body,
+    provider_error_kind_for_code, provider_error_kind_for_http_status,
 };
 use crate::openai::{
     chat_completions_endpoint, openai_chat_stream_request_payload, openai_responses_stream_request_payload,
@@ -17,9 +16,7 @@ use crate::openai::{
 };
 use crate::provider::ProviderStreamEvent;
 use crate::provider::contract::ProviderApiProtocol;
-use crate::transport::{
-    provider_client, provider_error_from_http_status, provider_future, retry_after_delay,
-};
+use crate::transport::{provider_client, provider_future, retry_after_delay};
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
 
 /// 按所选模型的协议发送 Chat Completions 或 Responses 流式请求。
@@ -27,16 +24,6 @@ pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     selected_model: SelectedModel,
     client: reqwest::Client,
-}
-
-impl fmt::Debug for OpenAiProvider {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("OpenAiProvider")
-            .field("config", &self.config)
-            .field("client", &"[redacted]")
-            .finish()
-    }
 }
 
 impl OpenAiProvider {
@@ -142,8 +129,11 @@ impl OpenAiProvider {
         cancellation: &CancellationToken,
     ) -> ProviderError {
         let status_code = response.status().as_u16();
-        let mut error = provider_error_from_http_status(status_code)
-            .with_retry_after(retry_after_delay(response.headers()));
+        let mut error = ProviderError::new(
+            provider_error_kind_for_http_status(status_code),
+            format!("Provider returned HTTP {status_code}."),
+        )
+        .with_retry_after(retry_after_delay(response.headers()));
         let body = match provider_future(cancellation, response.bytes()).await {
             Ok(body) => body,
             Err(read_error) if read_error.kind == crate::ModelErrorKind::Cancelled => return read_error,

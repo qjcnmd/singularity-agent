@@ -1,8 +1,9 @@
+import { Plus, X } from 'lucide-react'
 import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import { formatTokenCount } from '../copy'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
-import type { DiscoveredModel, ProviderConfigurationInput, RedactedProvider } from '../protocol'
-import { applyProtocol, blankModel, capacityConfigurationError, mergeDiscoveredModels, reasoningConfigurationError } from '../modelConfiguration'
+import type { ProviderConfigurationInput, RedactedProvider } from '../protocol'
+import { applyProtocol, blankModel, capacityConfigurationError, reasoningConfigurationError } from '../modelConfiguration'
 import { ModelEditor } from './ModelEditor'
 import { Dialog } from './Dialog'
 import { ProtocolPicker } from './ProtocolPicker'
@@ -27,7 +28,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
   const busy = state.pendingActions.has(pendingKey('model.saveProvider', origin))
   const [fetching, setFetching] = useState(false)
   const [failure, setFailure] = useState<string | null>(null)
-  const [candidates, setCandidates] = useState<DiscoveredModel[] | null>(null)
+  const [candidates, setCandidates] = useState<string[] | null>(null)
   const [picked, setPicked] = useState<Set<string>>(new Set())
   const discoveryRevision = useRef(0)
   useLayoutEffect(() => {
@@ -47,12 +48,6 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
     return null
   }
 
-  function queryModels() {
-    return appStore.transport.rpc('model.discover', {
-      providerId: providerId.trim(), baseUrl, apiKey: apiKey.trim() || null,
-    })
-  }
-
   function toggleCandidate(modelId: string) {
     setPicked(current => {
       const next = new Set(current)
@@ -67,22 +62,26 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
     setFetching(true)
     try {
       // 通过后端查询提供方的可用模型列表
-      const found = await queryModels()
+      const found = await appStore.transport.rpc('model.discover', {
+        providerId: providerId.trim(), baseUrl, apiKey: apiKey.trim() || null,
+      })
       if (revision !== discoveryRevision.current) return
       if (found.length === 0) {
-        setFailure('提供方没有返回可用模型，仍可手动添加。')
+        setFailure('提供方没有返回可用模型。')
         return
       }
       setCandidates(found)
-      setPicked(new Set(found.filter(candidate => models.some(model => model.modelId.trim() === candidate.modelId)).map(model => model.modelId)))
+      setPicked(new Set(found.filter(id => models.some(model => model.modelId.trim() === id))))
     } catch (error) {
-      if (revision === discoveryRevision.current) setFailure(error instanceof Error ? error.message : '获取模型失败，仍可手动添加。')
+      if (revision === discoveryRevision.current) setFailure(error instanceof Error ? error.message : '获取模型失败。')
     } finally {
       if (revision === discoveryRevision.current) setFetching(false)
     }
   }
   const adopt = () => {
-    setModels(rows => mergeDiscoveredModels(rows, candidates ?? [], picked, protocol))
+    setModels(rows => [...rows, ...(candidates ?? [])
+      .filter(id => picked.has(id) && !rows.some(model => model.modelId.trim() === id))
+      .map(modelId => ({ ...blankModel(), modelId }))])
     setCandidates(null)
   }
   const save = async (event: FormEvent) => {
@@ -137,31 +136,22 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
     <>
       <form className="sg-editor" onSubmit={event => void save(event)} noValidate>
         <fieldset disabled={busy} className="provider-fields">
-          {provider?.displayName && provider.displayName !== providerId && <span className="provider-id">提供方 ID：{providerId}</span>}
           {!provider && <label className="sg-field">
               <span>提供方 ID</span>
-              <input className="sg-input" autoFocus value={providerId} onChange={event => setProviderId(event.target.value)} placeholder="例如 my-provider" />
+              <input className="sg-input" autoFocus value={providerId} onChange={event => setProviderId(event.target.value)} />
             </label>}
           <label className="sg-field">
             <span>API 密钥</span>
-            <input className="sg-input" type="password" autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={provider?.credentialConfigured ? '已配置——输入新值可替换' : '可选，服务需要认证时填写'} />
+            <input className="sg-input" type="password" autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} />
           </label>
-          <div className="sg-customized-body">
-            <label className="sg-field">
-              <span>显示名称</span>
-              <input className="sg-input" value={name} onChange={event => setName(event.target.value)} placeholder={providerId} />
-            </label>
-            <label className="sg-field">
-              <span>API 地址</span>
-              <input className="sg-input" value={baseUrl} onChange={event => setBaseUrl(event.target.value)} placeholder="https://api.example.com/v1" />
-            </label>
-            <div className="sg-field">
-              <span>API 协议</span>
-              <ProtocolPicker value={protocol} onChange={setProtocol} />
-            </div>
+          <div className="field-row">
+            <label className="sg-field"><span>显示名称</span><input className="sg-input" value={name} onChange={event => setName(event.target.value)} /></label>
+            <div className="sg-field"><span>API 协议</span><ProtocolPicker value={protocol} onChange={setProtocol} /></div>
+          </div>
+          <label className="sg-field"><span>API 地址</span><input className="sg-input" value={baseUrl} onChange={event => setBaseUrl(event.target.value)} /></label>
             <section className="sg-model-catalog" aria-label="模型目录">
               <div className="sg-model-catalog-head">
-                <span className="sg-model-catalog-title">模型目录</span>
+                <strong>模型目录</strong>
                 <span className="sg-row-actions">
                   <button type="button" className="quiet-button" disabled={fetching || !baseUrl.trim()} onClick={() => void discover()}>{fetching ? '正在询问提供方…' : '获取可用模型'}</button>
                 </span>
@@ -173,19 +163,18 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
                   return (
                   <div key={index} className="sg-model-entry">
                     <div className="sg-model-row">
-                      <span>{model.modelId}</span>
-                      <small>{model.maxContextTokens === null ? '' : `${formatTokenCount(model.maxContextTokens)} 上下文`}</small>
+                      <span className="catalog-id">{model.modelId}</span>
+                      <small>{model.maxContextTokens === null ? '' : `${formatTokenCount(model.maxContextTokens)} 上下文`}{model.reasoningVariants?.length ? ` · ${model.reasoningVariants.join(' / ')}` : ''}</small>
                       <button type="button" className="quiet-button" onClick={() => setModelEditor({ index, draft: applyProtocol(model, protocol) })}>编辑</button>
-                      <button type="button" className="sg-icon-btn sg-icon-btn-danger" aria-label={`删除模型 ${index + 1}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}>×</button>
+                      <button type="button" className="sg-icon-btn sg-icon-btn-danger" aria-label={`删除模型 ${model.modelId}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}><X size={14} /></button>
                     </div>
                     {reasoningError && <p className="form-error" role="alert">{reasoningError}</p>}
                   </div>
                   )
                 })}
               </div>
-              <button type="button" className="sg-add-model-btn" onClick={() => setModelEditor({ index: null, draft: blankModel() })}>＋ 添加模型</button>
+              <button type="button" className="sg-add-model-btn" onClick={() => setModelEditor({ index: null, draft: blankModel() })}><Plus size={14} />添加模型</button>
             </section>
-          </div>
           {failure && <p className="form-error" role="alert">{failure}</p>}
           {saveError && <p className="form-error" role="alert">{saveError.message}</p>}
           <footer className="sg-editor-actions">
@@ -195,32 +184,28 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
         </fieldset>
       </form>
       {active && modelEditor && <ModelEditor
-        index={modelEditor.index} initial={modelEditor.draft} protocol={protocol} discover={queryModels}
+        index={modelEditor.index} initial={modelEditor.draft} protocol={protocol}
         onConfirm={draft => commitModel(modelEditor.index, draft)} onClose={() => setModelEditor(null)}
       />}
-      <Dialog open={active && candidates !== null} onClose={() => setCandidates(null)} labelledBy="discovered-models-title" className="confirm-modal model-discovery-modal">
+      <Dialog open={active && candidates !== null} onClose={() => setCandidates(null)} labelledBy="discovered-models-title" className="model-discovery-modal">
         <header className="modal-header">
           <h2 id="discovered-models-title">选择可用模型</h2>
-          <button type="button" className="icon-button" onClick={() => setCandidates(null)} aria-label="关闭模型列表">×</button>
+          <button type="button" className="icon-button" onClick={() => setCandidates(null)} aria-label="关闭模型列表"><X size={18} /></button>
         </header>
         <div className="model-candidates">
-          {candidates?.map(candidate => (
-            <label key={candidate.modelId}>
-              <input type="checkbox" checked={picked.has(candidate.modelId)} onChange={() => toggleCandidate(candidate.modelId)} />
+          {candidates?.map(id => (
+            <label key={id} className={`candidate-row${picked.has(id) ? ' checked' : ''}`}>
+              <input type="checkbox" checked={picked.has(id)} onChange={() => toggleCandidate(id)} />
               <span>
-                {candidate.modelId}
-                {(candidate.reasoningVariants.length > 0 || candidate.maxContextTokens !== null) && <small>
-                  {candidate.reasoningVariants.join(' / ')}
-                  {candidate.maxContextTokens ? `${candidate.reasoningVariants.length ? ' · ' : ''}${formatTokenCount(candidate.maxContextTokens)}` : ''}
-                </small>}
+                <strong>{id}</strong>
               </span>
-              {models.some(model => model.modelId.trim() === candidate.modelId) && <small>更新配置</small>}
+              {models.some(model => model.modelId.trim() === id) && <em>已添加</em>}
             </label>
           ))}
         </div>
         <footer className="sg-editor-actions">
           <button type="button" className="sg-secondary-btn" onClick={() => setCandidates(null)}>取消</button>
-          <button type="button" className="sg-primary-btn" onClick={adopt}>添加模型</button>
+          <button type="button" className="sg-primary-btn" disabled={picked.size === 0} onClick={adopt}>添加模型</button>
         </footer>
       </Dialog>
     </>

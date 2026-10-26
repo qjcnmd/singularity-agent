@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use singularity_model::Message;
 /// 开发阶段固定为 1，格式随当前实现更新；发布前再确定版本策略。
-pub const CURRENT_SESSION_VERSION: u32 = 1;
+const CURRENT_SESSION_VERSION: u32 = 1;
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("session io error: {0}")]
@@ -27,7 +27,7 @@ pub enum SessionError {
 
 pub type Result<T> = std::result::Result<T, SessionError>;
 /// 摘要和它之后保留的第一条记录；被总结的原始记录仍在日志中。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionEntry {
     pub summary: String,
@@ -35,7 +35,7 @@ pub struct CompactionEntry {
     pub first_kept_entry_id: String,
 }
 /// 任务设置：模型选择或任务名称。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "metadataType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionMetadata {
     ThreadSettings {
@@ -47,7 +47,7 @@ pub enum SessionMetadata {
 }
 
 /// 执行记录：回合开始与结束、未生成消息的模型请求和后台命令状态。不进入模型上下文。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "recordType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LedgerRecord {
     /// 后台命令的开始和终态；进度只在内存中发布。
@@ -73,7 +73,7 @@ pub enum LedgerRecord {
 }
 
 /// 日志里文件头之后的一行。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionEntry {
     Message {
