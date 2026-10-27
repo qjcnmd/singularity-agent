@@ -237,7 +237,10 @@ impl McpManager {
         let mut discovered = BTreeMap::new();
         while !pending.is_empty() {
             tokio::select! {
-                () = signal.cancelled() => break,
+                () = signal.cancelled() => {
+                    pending.shutdown().await;
+                    break;
+                }
                 entry = pending.join_next() => {
                     let (id, result) = entry.expect("pending discovery task").expect("MCP discovery worker completes");
                     discovered.insert(id, result);

@@ -1,5 +1,6 @@
 use super::*;
 use crate::provider::contract::finalize_provider_response;
+use crate::types::ModelUsage;
 
 /// 读取并解码一次 Chat 流式响应。
 pub(crate) async fn read_chat_sse_stream(
@@ -22,6 +23,11 @@ struct ChatToolAccumulator {
     arguments: String,
 }
 
+enum ChatReasoningSource {
+    TopLevel,
+    Details,
+}
+
 /// Chat SSE 解码器。正文和思考文本边收边发出；工具参数和提供方私有数据在流结束后
 /// 一次性整理进最终回复。
 struct ChatSseDecoder<'a> {
@@ -29,12 +35,14 @@ struct ChatSseDecoder<'a> {
     model_name: &'a str,
     endpoint: &'a str,
     content: String,
-    reasoning_content: String,
+    thinking: String,
+    // 首次非空文本确定可显示来源；后续增量和最终消息始终使用该来源，私有 details 仍完整保存。
+    reasoning_source: Option<ChatReasoningSource>,
     reasoning_field: Option<String>,
     reasoning_details: Vec<Value>,
     tool_calls: BTreeMap<u64, ChatToolAccumulator>,
     finish_reason: Option<String>,
-    usage: Option<Value>,
+    usage: Option<ModelUsage>,
     done: bool,
     on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send),
 }
@@ -62,7 +70,12 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             ));
         }
         if let Some(usage) = payload.get("usage").filter(|value| value.is_object()) {
-            self.usage = Some(usage.clone());
+            self.usage = parse_usage(
+                Some(usage),
+                "prompt_tokens",
+                "completion_tokens",
+                "/prompt_tokens_details/cached_tokens",
+            );
         }
         let Some(choices) = payload.get("choices").and_then(Value::as_array) else {
             if payload.get("choices").is_some() {
@@ -105,8 +118,13 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             // 兼容端点可能在同一块里用多个键携带同一段 reasoning（实测双键同文），故只取第一个非空键。
             if let Some((field, reasoning)) = chat_reasoning_text(delta) {
                 self.reasoning_field.get_or_insert_with(|| field.to_string());
-                if !reasoning.is_empty() {
-                    self.reasoning_content.push_str(reasoning);
+                if !reasoning.is_empty()
+                    && matches!(
+                        self.reasoning_source.get_or_insert(ChatReasoningSource::TopLevel),
+                        ChatReasoningSource::TopLevel
+                    )
+                {
+                    self.thinking.push_str(reasoning);
                     (self.on_event)(ProviderStreamEvent::ReasoningTextDelta { delta: reasoning.to_string() });
                 }
             }
@@ -155,20 +173,12 @@ impl<'a> ChatSseDecoder<'a> {
                 None => Err(provider_chat_stream_malformed_error("finish_reason_missing")),
             }
         });
-        let thinking = if self.reasoning_content.is_empty() {
-            self.reasoning_details
-                .iter()
-                .filter_map(|detail| detail.as_object().and_then(chat_reasoning_detail_text))
-                .collect()
-        } else {
-            self.reasoning_content
-        };
         let stop_reason = match stop_reason {
             Ok(reason) => reason,
             Err(error) => {
                 return ModelTurnResponse::failed(
                     error,
-                    Message::assistant(self.content, thinking, Vec::new(), None),
+                    Message::assistant(self.content, self.thinking, Vec::new(), None),
                 );
             }
         };
@@ -194,13 +204,8 @@ impl<'a> ChatSseDecoder<'a> {
             }
         });
         finalize_provider_response(ModelTurnResponse {
-            assistant_message: Message::assistant(self.content, thinking, tool_calls, replay),
-            usage: parse_usage(
-                self.usage.as_ref(),
-                "prompt_tokens",
-                "completion_tokens",
-                "/prompt_tokens_details/cached_tokens",
-            ),
+            assistant_message: Message::assistant(self.content, self.thinking, tool_calls, replay),
+            usage: self.usage,
             stop_reason,
         })
     }
@@ -216,7 +221,8 @@ impl<'a> ChatSseDecoder<'a> {
             model_name,
             endpoint,
             content: String::new(),
-            reasoning_content: String::new(),
+            thinking: String::new(),
+            reasoning_source: None,
             reasoning_field: None,
             reasoning_details: Vec::new(),
             tool_calls: BTreeMap::new(),
@@ -227,17 +233,20 @@ impl<'a> ChatSseDecoder<'a> {
         }
     }
 
-    /// 接收一组 reasoning_details 片段：检查格式后合并到已有片段。提供方没有通过
-    /// reasoning_content / reasoning 给出思考文本时，才把片段里的文本作为思考增量发出；
-    /// 其他字段（包括加密数据）只保存，不显示。
+    /// 接收一组 reasoning_details 片段：检查格式后合并到已有片段。
+    /// 首次非空思考来自 details 时，后续仅从 details 累积并发出可显示文本；私有字段始终保存。
     fn receive_reasoning_details(&mut self, details: &[Value]) -> Result<(), ProviderError> {
         for detail in details {
             let Some(detail) = detail.as_object() else {
                 return Err(provider_chat_stream_malformed_error("reasoning_detail_not_object"));
             };
-            if self.reasoning_content.is_empty()
-                && let Some(text) = chat_reasoning_detail_text(detail)
+            if let Some(text) = chat_reasoning_detail_text(detail)
+                && matches!(
+                    self.reasoning_source.get_or_insert(ChatReasoningSource::Details),
+                    ChatReasoningSource::Details
+                )
             {
+                self.thinking.push_str(text);
                 (self.on_event)(ProviderStreamEvent::ReasoningTextDelta { delta: text.to_string() });
             }
             append_reasoning_detail(&mut self.reasoning_details, detail);

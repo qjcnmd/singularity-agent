@@ -9,7 +9,7 @@ const MAX_FILE_CANDIDATES: usize = 12;
 
 /// 查找路径中包含 query 的候选，找到 12 项后停止遍历。
 pub(crate) fn search_files(directory: &str, query: &str) -> Result<Vec<FileCandidate>, String> {
-    let query = query.trim().to_lowercase();
+    let query = query.trim().replace('\\', "/").to_lowercase();
     if query.is_empty() {
         return Ok(Vec::new());
     }

@@ -138,13 +138,19 @@ impl AppServer {
     /// 收到第一条消息才创建任务；空白页在后端没有任务和日志文件。
     pub fn start_session(
         self: &Arc<Self>,
-        workspace_root: &str,
-        selection: singularity_protocol::ModelSelection,
-        input: UserInput,
+        params: singularity_protocol::SessionStartParams,
     ) -> Result<singularity_protocol::SessionStartResult, RpcError> {
         let _lifecycle = self.lock_lifecycle();
-        let workspace = self.workspace(workspace_root)?;
-        let thread = self.catalog.create_thread(&workspace.root, selection).map_err(catalog_error)?;
+        let workspace = self.workspace(&params.workspace_root)?;
+        let input = UserInput::from_uploads(
+            params.text,
+            params.images,
+            params.files,
+            std::path::Path::new(&workspace.root),
+            &self.home,
+        )
+        .map_err(invalid_request)?;
+        let thread = self.catalog.create_thread(&workspace.root, params.selection).map_err(catalog_error)?;
         let conversation = self.insert_conversation(thread);
         conversation.start(input).map_err(conversation_error)?;
         Ok(conversation.start_result())

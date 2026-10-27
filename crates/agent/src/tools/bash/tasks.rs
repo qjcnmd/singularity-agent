@@ -26,10 +26,23 @@ pub enum BashTaskUpdate {
 struct Entry {
     task: Mutex<BackgroundTask>,
     cancel: CancellationToken,
-    done: watch::Sender<Option<Result<(), String>>>,
+    done: watch::Sender<Option<Result<(), CompletionError>>>,
 }
 
-/// 一个会话的后台命令查询与进程所有权；保存终态后释放内存条目，不接管历史 PID。
+enum CompletionError {
+    Cleanup(String),
+    Store(String),
+}
+
+impl CompletionError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Cleanup(message) | Self::Store(message) => message,
+        }
+    }
+}
+
+/// 一个会话的后台命令查询与进程所有权；成功收尾后释放内存条目，不接管历史 PID。
 pub struct BashTasks {
     entries: Mutex<BTreeMap<String, Arc<Entry>>>,
     on_update: Arc<dyn Fn(BashTaskUpdate) + Send + Sync>,
@@ -54,6 +67,10 @@ impl BashTasks {
 
     /// 界面和工具共用的后台列表；实时输出覆盖运行记录，历史中未结束的命令标为中断。
     pub fn list(&self) -> Vec<BackgroundTask> {
+        self.project_tasks(|task, state| BackgroundTask { state: state.clone(), ..task.clone() })
+    }
+
+    fn project_tasks<T>(&self, project: impl Fn(&BackgroundTask, &BackgroundTaskState) -> T) -> Vec<T> {
         let writer = lock_writer(&self.writer);
         let entries = self.entries.lock().expect("bash task entries lock");
         let mut tasks = BTreeMap::new();
@@ -62,7 +79,7 @@ impl BashTasks {
                 tasks.insert(&task.task_id, task);
             }
         }
-        tasks.into_values().map(|task| current_task(task, &entries)).collect()
+        tasks.into_values().map(|task| current_task(task, &entries, &project)).collect()
     }
 
     /// 命令执行、回收或保存终态期间仍占用会话；完成通知入队后才释放。
@@ -76,7 +93,7 @@ impl BashTasks {
 
     /// 给模型的列表只含 ID、命令、说明和状态，输出由 task_output 按需读取。
     pub(crate) fn tool_list(&self) -> ToolExecution {
-        let tasks: Vec<_> = self.list().iter().map(task_summary).collect();
+        let tasks = self.project_tasks(task_summary);
         ToolExecution::text(serde_json::to_string(&tasks).expect("task summaries serialize"))
     }
 
@@ -98,7 +115,7 @@ impl BashTasks {
                 }
             }
             if let Some(Err(error)) = &*done.borrow() {
-                return error_result(error.clone());
+                return error_result(error.message());
             }
         }
         self.task(task_id).map(|task| task_result(&task, true)).unwrap_or_else(error_result)
@@ -113,13 +130,13 @@ impl BashTasks {
                 wait_done(&mut done).await;
             }
             if let Some(Err(error)) = &*done.borrow() {
-                return Err(error.clone());
+                return Err(error.message().to_owned());
             }
         }
         self.task(task_id).map(|task| task_result(&task, false))
     }
 
-    /// 停止并等待全部活进程；此后仍可启动新命令。
+    /// 停止并等待全部活进程；只返回回收错误，已结束命令的保存失败不阻止关闭或删除。
     pub async fn shutdown(&self) -> Result<(), String> {
         let entries: Vec<_> =
             self.entries.lock().expect("bash task entries lock").values().cloned().collect();
@@ -130,7 +147,7 @@ impl BashTasks {
         for entry in entries {
             let mut done = entry.done.subscribe();
             wait_done(&mut done).await;
-            if let Some(Err(error)) = &*done.borrow() {
+            if let Some(Err(CompletionError::Cleanup(error))) = &*done.borrow() {
                 failures.push(error.clone());
             }
         }
@@ -237,7 +254,12 @@ impl BashTasks {
             .rev()
             .filter_map(recorded_task)
             .find(|task| task.task_id == task_id)
-            .map(|task| current_task(task, &entries))
+            .map(|task| {
+                current_task(task, &entries, |task, state| BackgroundTask {
+                    state: state.clone(),
+                    ..task.clone()
+                })
+            })
             .ok_or_else(|| format!("Unknown background task: {task_id}"))
     }
 
@@ -265,6 +287,11 @@ impl BashTasks {
             writer.append_record(LedgerRecord::BackgroundTaskUpdated { task: saved_task })
         })
         .await;
+        let completion = match (&outcome, &saved) {
+            (Outcome::CleanupFailed(message), _) => Err(CompletionError::Cleanup(message.clone())),
+            (_, Err(error)) => Err(CompletionError::Store(error.to_string())),
+            _ => Ok(()),
+        };
         match saved {
             Ok(_) => {
                 let status = match &task.state {
@@ -283,12 +310,11 @@ impl BashTasks {
                 }
                 *entry.task.lock().expect("bash task lock") = task.clone();
                 (self.on_update)(BashTaskUpdate::Updated(task));
-                let completion = match outcome {
-                    Outcome::CleanupFailed(message) => Err(message),
-                    _ => Ok(()),
-                };
+                let finished = completion.is_ok();
                 entry.done.send_replace(Some(completion));
-                self.entries.lock().expect("bash task entries lock").remove(&task_id);
+                if finished {
+                    self.entries.lock().expect("bash task entries lock").remove(&task_id);
+                }
             }
             Err(error) => {
                 let error = error.to_string();
@@ -298,14 +324,14 @@ impl BashTasks {
                 };
                 // 未保存的结果不能从日志读回，保留它和错误，直到本次会话关闭。
                 *entry.task.lock().expect("bash task lock") = task;
-                (self.on_update)(BashTaskUpdate::Failed(error.clone()));
-                entry.done.send_replace(Some(Err(error)));
+                (self.on_update)(BashTaskUpdate::Failed(error));
+                entry.done.send_replace(Some(completion));
             }
         }
     }
 }
 
-async fn wait_done(done: &mut watch::Receiver<Option<Result<(), String>>>) {
+async fn wait_done(done: &mut watch::Receiver<Option<Result<(), CompletionError>>>) {
     while done.borrow().is_none() {
         if done.changed().await.is_err() {
             break;
@@ -323,20 +349,23 @@ fn recorded_task(entry: &SessionEntry) -> Option<&BackgroundTask> {
     }
 }
 
-fn current_task(task: &BackgroundTask, entries: &BTreeMap<String, Arc<Entry>>) -> BackgroundTask {
+fn current_task<T>(
+    task: &BackgroundTask,
+    entries: &BTreeMap<String, Arc<Entry>>,
+    project: impl FnOnce(&BackgroundTask, &BackgroundTaskState) -> T,
+) -> T {
     if task.state.is_running() {
         if let Some(entry) = entries.get(&task.task_id) {
-            return entry.task.lock().expect("bash task lock").clone();
+            let task = entry.task.lock().expect("bash task lock");
+            return project(&task, &task.state);
         }
-        let mut task = task.clone();
-        task.state = BackgroundTaskState::Interrupted;
-        return task;
+        return project(task, &BackgroundTaskState::Interrupted);
     }
-    task.clone()
+    project(task, &task.state)
 }
 
 fn task_result(task: &BackgroundTask, include_output: bool) -> ToolExecution {
-    let mut summary = task_summary(task);
+    let mut summary = task_summary(task, &task.state);
     if include_output {
         summary["output"] = serde_json::json!(task.output);
     }
@@ -347,11 +376,11 @@ fn task_result(task: &BackgroundTask, include_output: bool) -> ToolExecution {
     result
 }
 
-fn task_summary(task: &BackgroundTask) -> serde_json::Value {
+fn task_summary(task: &BackgroundTask, state: &BackgroundTaskState) -> serde_json::Value {
     serde_json::json!({
         "taskId": task.task_id,
         "command": task.command,
         "description": task.description,
-        "state": task.state,
+        "state": state,
     })
 }

@@ -98,7 +98,13 @@ impl CaptureState {
     /// 结束捕获，返回显示用的正文和完整输出文件的说明。
     /// 调用方把文件说明放在命令结束原因之后。
     pub(super) fn finish(self) -> (String, Option<String>) {
-        (self.final_output(), self.spill_note())
+        let note = self.spill_note();
+        let content = if self.is_truncated() {
+            self.final_output()
+        } else {
+            self.tail
+        };
+        (content, note)
     }
 
     fn spill_note(&self) -> Option<String> {

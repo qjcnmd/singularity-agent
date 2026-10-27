@@ -21,6 +21,9 @@ fn compaction_summary(summary: &str) -> String {
 }
 
 const UNKNOWN_TOOL_OUTCOME: &str = "[previous execution was interrupted; outcome unknown. Inspect the current state before deciding whether to repeat an action with side effects.]";
+const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
+const CONTENT_BLOCK_OVERHEAD_TOKENS: u64 = 4;
+const TOOL_RESULT_OVERHEAD_TOKENS: u64 = 4;
 
 /// 把日志记录转换成模型消息；工具调用没有结果（如被中断）时补一条“结果未知”，
 /// 让每个调用都有对应结果。
@@ -61,12 +64,12 @@ fn project_messages(entries: &[&SessionEntry]) -> Vec<Message> {
     messages
 }
 
-fn context_token_estimate(entries: &[&SessionEntry]) -> u64 {
+fn context_token_estimate(entries: &[&SessionEntry], image_directory: &std::path::Path) -> u64 {
     let mut tokens = 0;
     let mut calls = 0;
     let mut results = 0;
     for entry in entries {
-        tokens += entry_token_estimate(entry);
+        tokens += entry_token_estimate(entry, image_directory);
         if let SessionEntry::Message { message, .. } = entry {
             calls += message.tool_calls().count();
             if message.tool_call_id().is_some() {
@@ -74,8 +77,9 @@ fn context_token_estimate(entries: &[&SessionEntry]) -> u64 {
             }
         }
     }
-    let unknown_result_tokens =
-        content_token_estimate(&[ContentBlock::text(UNKNOWN_TOOL_OUTCOME.to_string())], true);
+    let unknown_result_tokens = MESSAGE_OVERHEAD_TOKENS
+        + text_block_token_estimate(UNKNOWN_TOOL_OUTCOME)
+        + TOOL_RESULT_OVERHEAD_TOKENS;
     tokens + calls.saturating_sub(results) as u64 * unknown_result_tokens
 }
 
@@ -99,37 +103,53 @@ fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
 }
 
 /// 估算一条记录的 Token；指令和工具定义由 Agent 另外估算。
-pub(crate) fn entry_token_estimate(entry: &SessionEntry) -> u64 {
+fn entry_token_estimate(entry: &SessionEntry, image_directory: &std::path::Path) -> u64 {
     match context_entry(entry) {
-        Some(ContextEntry::Message(message)) => message_token_estimate(message),
-        Some(ContextEntry::Summary(summary)) => estimate_tokens_of(&compaction_summary(summary)) + 8,
+        Some(ContextEntry::Message(message)) => {
+            let tokens = message_token_estimate(message);
+            let captions = image_captions(message, image_directory);
+            if captions.is_empty() {
+                tokens
+            } else {
+                tokens.saturating_add(text_block_token_estimate(&captions))
+            }
+        }
+        Some(ContextEntry::Summary(summary)) => {
+            MESSAGE_OVERHEAD_TOKENS + text_block_token_estimate(&compaction_summary(summary))
+        }
         None => 0,
     }
 }
 
-pub(crate) fn message_token_estimate(message: &singularity_model::Message) -> u64 {
+pub(crate) fn message_token_estimate(message: &Message) -> u64 {
     content_token_estimate(message.content(), matches!(message, Message::ToolResult { .. }))
+}
+
+fn text_block_token_estimate(text: &str) -> u64 {
+    estimate_tokens_of(text) + CONTENT_BLOCK_OVERHEAD_TOKENS
 }
 
 /// 思考文本也计入预算；不回传思考的模型可能因此稍早压缩。
 fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
-    let mut tokens = 4u64;
+    let mut tokens = MESSAGE_OVERHEAD_TOKENS;
     for block in content {
         tokens = tokens.saturating_add(match block {
             ContentBlock::Text { text, .. } | ContentBlock::Thinking { thinking: text, .. } => {
-                estimate_tokens_of(text) + 4
+                text_block_token_estimate(text)
             }
             // 没有提供方实际用量时按尺寸估算图片 Token；拿到回复后优先使用提供方上报的用量。
             ContentBlock::Image(image) => {
                 u64::from(image.width).div_ceil(32) * u64::from(image.height).div_ceil(32) + 128
             }
             ContentBlock::ToolCall(call) => {
-                estimate_tokens_of(&call.tool_name) + estimate_tokens_of(&call.arguments.to_string()) + 4
+                estimate_tokens_of(&call.tool_name)
+                    + estimate_tokens_of(&call.arguments.to_string())
+                    + CONTENT_BLOCK_OVERHEAD_TOKENS
             }
         });
     }
     if tool_result {
-        tokens += 4;
+        tokens += TOOL_RESULT_OVERHEAD_TOKENS;
     }
     tokens
 }
@@ -142,6 +162,7 @@ fn input_tokens(
     identity: (&str, &str),
     definition_tokens: u64,
 ) -> u64 {
+    let image_directory = session.image_directory();
     let latest = session
         .entries()
         .iter()
@@ -167,9 +188,11 @@ fn input_tokens(
             .position(|entry| entry.id() == id)
             .expect("latest assistant belongs to the active context")
             + 1;
-        return usage.total_tokens.saturating_add(context_token_estimate(&entries[after..]));
+        return usage
+            .total_tokens
+            .saturating_add(context_token_estimate(&entries[after..], &image_directory));
     }
-    context_token_estimate(entries).saturating_add(definition_tokens)
+    context_token_estimate(entries, &image_directory).saturating_add(definition_tokens)
 }
 
 /// 生成请求用的消息和输入 Token 估算；图片由调用方在锁外读取。
@@ -212,8 +235,10 @@ const KEEP_RECENT_RATIO: f64 = 0.1;
 
 pub(crate) fn compaction_prefix(session: &SessionData) -> Option<CompactionPrefix> {
     let entries = resolve_context_entries(session);
-    let keep_recent_tokens = (context_token_estimate(&entries) as f64 * KEEP_RECENT_RATIO).ceil() as u64;
-    let cut = find_cut_point(&entries, keep_recent_tokens);
+    let image_directory = session.image_directory();
+    let keep_recent_tokens =
+        (context_token_estimate(&entries, &image_directory) as f64 * KEEP_RECENT_RATIO).ceil() as u64;
+    let cut = find_cut_point(&entries, keep_recent_tokens, &image_directory);
     if cut == 0 {
         return None;
     }
@@ -225,8 +250,8 @@ pub(crate) fn compaction_prefix(session: &SessionData) -> Option<CompactionPrefi
     let selected = &entries[..cut];
     Some(CompactionPrefix {
         messages: project_messages(selected),
-        image_directory: session.image_directory(),
-        estimated_tokens: context_token_estimate(selected),
+        estimated_tokens: context_token_estimate(selected, &image_directory),
+        image_directory,
         updating,
         first_kept_entry_id: entries[cut].id().to_string(),
     })
@@ -234,10 +259,14 @@ pub(crate) fn compaction_prefix(session: &SessionData) -> Option<CompactionPrefi
 
 /// 从后往前累加到保留预算；若当前记录是工具结果，继续退到整组调用之前。
 /// 预算为零时仍保留最后一个完整单元。
-fn find_cut_point(entries: &[&SessionEntry], keep_recent_tokens: u64) -> usize {
+fn find_cut_point(
+    entries: &[&SessionEntry],
+    keep_recent_tokens: u64,
+    image_directory: &std::path::Path,
+) -> usize {
     let mut accumulated = 0u64;
     for index in (0..entries.len()).rev() {
-        accumulated = accumulated.saturating_add(entry_token_estimate(entries[index]));
+        accumulated = accumulated.saturating_add(entry_token_estimate(entries[index], image_directory));
         if accumulated >= keep_recent_tokens
             && !matches!(entries[index], SessionEntry::Message { message: Message::ToolResult { .. }, .. })
         {
@@ -254,6 +283,22 @@ fn model_message(entry: &SessionEntry) -> Message {
     }
 }
 
+/// 请求附加的一个文本块；生成与预算都按整块处理，避免多张图片分别向上取整。
+fn image_captions(message: &Message, directory: &std::path::Path) -> String {
+    let mut captions = String::new();
+    for (index, image) in message.images().enumerate() {
+        captions.push_str(&format!(
+            "\n[Image #{}: {}; {} × {}; saved copy: {}]",
+            index + 1,
+            image.name,
+            image.width,
+            image.height,
+            directory.join(&image.id).display()
+        ));
+    }
+    captions
+}
+
 /// 在写者锁外读取消息引用的图片，并在消息末尾附上图片的名称、尺寸和保存位置。
 pub(crate) fn load_images(
     messages: &mut [Message],
@@ -261,18 +306,10 @@ pub(crate) fn load_images(
 ) -> Result<std::collections::HashMap<String, String>> {
     let mut images = std::collections::HashMap::new();
     for message in messages {
-        let mut captions = String::new();
-        for (index, image) in message.images().enumerate() {
+        for image in message.images() {
             images.insert(image.id.clone(), crate::image::load_image(directory, image)?);
-            captions.push_str(&format!(
-                "\n[Image #{}: {}; {} × {}; saved copy: {}]",
-                index + 1,
-                image.name,
-                image.width,
-                image.height,
-                directory.join(&image.id).display()
-            ));
         }
+        let captions = image_captions(message, directory);
         if !captions.is_empty() {
             let content = match message {
                 Message::Developer { content }

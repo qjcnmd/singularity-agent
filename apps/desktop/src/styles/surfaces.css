@@ -10,13 +10,12 @@
 }
 
 @keyframes fade-in { from { opacity: 0; } }
-@keyframes modal-in { from { opacity: 0; transform: translateY(5px) scale(0.995); } }
 
 .context-menu { z-index: 100; min-width: 160px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow: auto; padding: 5px; border: 1px solid var(--line); border-radius: 14px; animation: menu-enter var(--spring-dur) var(--spring); }
 .context-menu button { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; height: 34px; padding: 0 10px; border: 0; text-align: left; background: transparent; color: var(--ink); border-radius: 9px; font-size: 13.5px; cursor: pointer; }
 .context-menu button:hover, .context-menu button:focus-visible { background: var(--surface-hover); }
 /* 原生 Popover 的触发按钮就是定位锚点；8px 外边距保留窗口边缘空间。 */
-.context-menu, .protocol-dropdown, .workspace-appearance-picker {
+.context-menu, .protocol-dropdown {
   position: fixed;
   position-anchor: auto;
   inset: auto;
@@ -61,7 +60,7 @@
 
 @media (prefers-reduced-motion: reduce) {
   /* 响应系统的减少动态效果偏好 */
-  .activity-step, .reasoning-summary, .content-disclosure, .content-disclosure > div, .picker-disclosure, .expand-chevron, .protocol-dropdown, .workspace-appearance-picker { transition: none !important; }
+  .activity-step, .reasoning-summary, .content-disclosure, .content-disclosure > div, .picker-disclosure, .expand-chevron, .protocol-dropdown { transition: none !important; }
   .context-menu, .context-menu > button { animation: none; }
 }
 

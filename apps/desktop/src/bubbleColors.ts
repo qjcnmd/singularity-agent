@@ -10,9 +10,14 @@ export function bubbleVariables(view: Pick<PersistedView, 'assistantBubble' | 'u
   const user = paletteColor(view.userBubble) ?? paletteColor(defaultBubbleColors.userBubble)!
   const neutral = assistant.id === 'neutral'
   return {
+    '--accent': neutral ? 'var(--default-accent)' : assistant.solid,
+    '--accent-soft': neutral ? 'var(--default-accent-soft)' : `color-mix(in srgb, ${assistant.solid} 10%, var(--canvas))`,
+    '--ink-on-accent': neutral ? '#fff' : assistant.ink,
     '--assistant-bubble-bg': neutral ? 'var(--canvas)' : `color-mix(in srgb, ${assistant.solid} 10%, var(--canvas))`,
     '--assistant-bubble-border': neutral ? 'var(--line)' : `color-mix(in srgb, ${assistant.solid} 22%, var(--canvas))`,
     '--assistant-bubble-ink': 'var(--ink)',
+    '--assistant-selection-bg': `color-mix(in srgb, ${neutral ? 'var(--accent)' : assistant.solid} 10%, var(--canvas))`,
+    '--assistant-selection-border': `color-mix(in srgb, ${neutral ? 'var(--accent)' : assistant.solid} 55%, var(--line))`,
     '--user-bubble-bg': user.solid, '--user-bubble-border': user.solid, '--user-bubble-ink': user.ink,
   }
 }

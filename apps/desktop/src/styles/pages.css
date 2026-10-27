@@ -10,36 +10,39 @@ textarea.input { resize: vertical; line-height: 1.5; font-family: var(--font-mon
 
 
 /* 侧栏入口打开的管理页：自定义指令、Skills、MCP */
-.manage-scroll { flex: 1; min-height: 0; overflow-y: auto; width: 100%; }
+/* 入场位移和异步内容会短暂改变溢出状态，固定滚动条占位以免居中页面横跳。 */
+.manage-scroll { flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; width: 100%; }
 .manage-page { width: 100%; max-width: 860px; margin: 0 auto; padding: 72px 36px 40px; }
-.manage-page > header { margin-bottom: 20px; }
+.manage-page > header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+.skills-count { color: var(--ink-soft); font-size: 14px; font-variant-numeric: tabular-nums; }
+.skills-refresh { display: grid; place-items: center; flex: none; width: 32px; height: 32px; margin-left: auto; padding: 0; border: 0; border-radius: 8px; background: transparent; color: var(--ink-soft); cursor: pointer; transition: background 120ms, color 120ms; }
+.skills-refresh:hover { background: var(--surface-hover); color: var(--ink); }
+.skills-refresh[aria-disabled="true"] { cursor: default; }
+/* 暂停而非移除动画，完成时停在当前位置，不跳回起点。 */
+.skills-refresh svg { animation: spin .8s linear infinite paused; }
+.skills-refresh[aria-busy="true"] svg { animation-play-state: running; }
+@media (prefers-reduced-motion: reduce) { .skills-refresh svg { animation: none; } }
 .manage-page h2 { margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -.02em; }
 .app-main.is-manage .conversation-header { background: transparent; backdrop-filter: none; }
 
 .manage-page:has(.instructions-layout) { min-height: 100%; display: flex; flex-direction: column; }
 .instructions-layout { flex: 1; display: grid; grid-template-columns: 200px 1fr; gap: 18px; align-items: start; }
-.instruction-targets { position: relative; display: grid; gap: 2px; }
-.instruction-targets button:hover:not([aria-current]) { background: var(--surface-hover); }
-.instruction-targets button { position: relative; display: flex; align-items: center; gap: 9px; min-height: 46px; padding: 6px 12px; border: 0; border-radius: 12px; background: transparent; cursor: pointer; text-align: left; z-index: 1; transition: background 150ms; }
-.instruction-targets .selection-slider { border-radius: 12px; }
-.target-label { display: grid; }
-.target-label strong { font-weight: 600; }
-.instruction-editor { display: flex; flex-direction: column; align-self: stretch; gap: 10px; padding: 14px; border: 1px solid var(--line); border-radius: 18px; background: var(--card); }
+.instruction-targets { display: grid; gap: 10px; }
+.instruction-targets button { min-height: 46px; cursor: pointer; text-align: left; font-weight: 400; background: var(--canvas); border-color: var(--line); color: var(--ink); transition: background 120ms, transform var(--spring-dur) var(--spring); }
+.instruction-targets button:hover:not(:disabled) { background: var(--side-hover); }
+.instruction-targets button:active:not(:disabled) { transform: scale(.97); transition-duration: 80ms; }
+.instruction-targets button[aria-current] { background: var(--assistant-selection-bg); border-color: var(--assistant-selection-border); }
+.instruction-targets button:disabled { cursor: default; opacity: .6; }
+.instruction-editor { display: flex; flex-direction: column; align-self: stretch; gap: 14px; min-width: 0; }
 .editor-path { color: var(--ink-faint); font: 12px var(--font-mono); overflow-wrap: anywhere; }
-.instruction-editor textarea { flex: 1; min-height: 320px; font-size: 13px; }
+.instruction-editor textarea { flex: 1; min-height: 320px; padding: 20px; border-color: var(--line); border-radius: 20px; font: 15.5px/1.85 var(--font-sans); }
 .instruction-editor footer { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.instruction-save-notice { position: fixed; top: 24px; left: 0; right: 0; z-index: 30; display: flex; justify-content: center; pointer-events: none; }
+.instruction-save-notice > div { display: flex; align-items: center; gap: 8px; padding: 10px 16px; border: 1px solid var(--line); border-radius: 999px; background: var(--raised); box-shadow: var(--shadow-soft); color: var(--ink); font-size: 14px; }
+.instruction-save-notice svg { color: var(--positive); }
 
-.skill-details { display: grid; gap: 8px; justify-items: start; padding: 0 16px 16px 58px; }
-.skill-details .instruction-body { margin: 0; width: 100%; }
-/* Skill 的描述可能较长，允许换行完整显示 */
-.skill-card .row-card-title small { white-space: normal; line-height: 1.5; margin-top: 2px; }
-
-.card-list { display: grid; gap: 10px; }
-.row-card { border: 1px solid var(--line); border-radius: 16px; background: var(--card); overflow: hidden; transition: border-color 160ms, box-shadow 200ms; }
-.row-card-head { display: flex; align-items: center; gap: 6px; padding: 6px 10px 6px 6px; }
-.row-card-toggle { flex: 1; min-width: 0; display: flex; align-items: center; gap: 12px; padding: 6px 8px; border: 0; border-radius: 12px; background: transparent; cursor: pointer; text-align: left; }
-.row-card-title { flex: 1; min-width: 0; display: grid; }
-.row-card-title strong { font-weight: 600; }
-.row-card-title small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-faint); font-size: 12px; }
-.provider-avatar { display: grid; place-items: center; width: 32px; height: 32px; flex: none; border-radius: 10px; background: var(--accent-soft); color: var(--accent); font-weight: 700; }
-.endpoint { padding: 4px 8px; border-radius: 8px; background: var(--surface-muted); font: 12px var(--font-mono); overflow-wrap: anywhere; }
+.skill-list { display: grid; gap: 8px; }
+.skill-card { display: grid; grid-template-rows: 22px 22px; gap: 6px; width: 100%; min-width: 0; height: 74px; padding: 12px; border: 0; border-radius: 10px; background: var(--canvas); color: var(--ink); font-size: 14px; line-height: 22px; text-align: left; cursor: pointer; transition: background 120ms; }
+.skill-card > :is(strong, span) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skill-card strong { font-weight: 600; }
+.skill-card:hover { background: var(--surface-hover); }

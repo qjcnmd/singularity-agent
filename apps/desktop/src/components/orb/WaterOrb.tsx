@@ -14,6 +14,7 @@ export type WaterOrbProps = {
   enabled: boolean
   size: number
   label: string
+  color: string
   onPress?: () => void
 }
 
@@ -22,13 +23,12 @@ const resolution = 200
 const clamp = (value: number) => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0))
 const hexToRgb = (hex: string): [number, number, number] => { const n = parseInt(hex.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255] }
 
-export function WaterOrb({ percent, compacting, enabled, size, label, onPress }: WaterOrbProps) {
+export function WaterOrb({ percent, compacting, enabled, size, label, color, onPress }: WaterOrbProps) {
   const guard = useSelectionGuard()
-  const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()
   const canvas = useRef<HTMLCanvasElement>(null)
   // 每帧读最新属性，不触发 React 重渲染
-  const latest = useRef({ occupancy: clamp(percent / 100), compacting, color: hexToRgb(accent) })
-  latest.current = { occupancy: clamp(percent / 100), compacting, color: hexToRgb(accent) }
+  const latest = useRef({ occupancy: clamp(percent / 100), compacting, color: hexToRgb(color) })
+  latest.current = { occupancy: clamp(percent / 100), compacting, color: hexToRgb(color) }
 
   useEffect(() => {
     const element = canvas.current!

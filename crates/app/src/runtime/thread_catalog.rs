@@ -8,7 +8,7 @@ use singularity_agent::session::{SessionData, SessionError, SessionManager, sess
 use singularity_protocol::{ThreadHistory, ThreadSummary};
 use uuid::Uuid;
 
-use crate::runtime::history::{index_turn_history, summarize_thread};
+use crate::runtime::history::{index_turn_history, session_usage, summarize_thread};
 
 /// 数据目录内保存会话文件的子目录名。
 pub const SESSIONS_DIR_NAME: &str = "sessions";
@@ -151,9 +151,12 @@ impl CatalogError {
 /// 从会话日志生成完整历史和任务摘要。
 pub fn read_thread_history(session: &SessionData) -> Result<ThreadHistory, CatalogError> {
     let summary = summarize_thread(session);
-    let turns = index_turn_history(session.entries())
+    let indexed_turns = index_turn_history(session.entries());
+    let mut usage =
+        session_usage(&session.entries()[..indexed_turns.first().map_or(0, |turn| turn.entries.start)]);
+    let turns = indexed_turns
         .iter()
-        .map(|turn| turn.project(session))
+        .map(|turn| turn.project(session, &mut usage))
         .collect::<Result<_, _>>()
         .map_err(|error| CatalogError::session(&summary.thread_id, session.path(), error))?;
     Ok(ThreadHistory { summary, turns })

@@ -43,6 +43,6 @@
 
 - **数据目录**：验证直接用用户的 `~/.singularity`。启动工作台前直接退出占用它的实例（单实例锁），不用问；验证结束后清理本次创建的项目、任务及附件，保留用户原有数据。
 - **Windows 自动化环境**：Playwright / Electron 自动化从普通 PowerShell 启动 Node 验证脚本，让 Electron 和 Rust 继承完整的 Windows 环境，不要沿用 `node_repl` 这类工具裁剪过的环境。装了 Git Bash 却报找不到时，先查验证进程的 `ProgramFiles`、`PATH` 和实际 `bash.exe` 路径，改好启动方式再重跑。
-- **模型调用**：只用真实的提供方和模型，不写模拟提供方。对验证有帮助就直接调用，不用问。用户没指定时用 DeepSeek 官方的 `deepseek/deepseek-flash`（已配置在 `~/.singularity/config.json`，地址 `https://api.deepseek.com`）。
+- **模型调用**：只用真实的提供方和模型，不写模拟提供方。对验证有帮助就直接调用，不用问。用户没指定时用 Codex/GPT-6-luna
 - **临时文件**：验证脚本、调查脚本和临时数据用完就删，不留在仓库。
 - **试用包**：每次功能做完、检查通过后，按[开发指南](docs/development.md#5-打包构建与发布)打包，退出正在运行的 Singularity，用 `apps/desktop/release/win-unpacked/` 的内容整体替换 `Desktop/Singularity`。桌面只保留这一份，不另建“新版”、日期或版本号目录；用户数据在 `~/.singularity`，不受影响。

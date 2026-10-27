@@ -158,22 +158,43 @@ impl Conversation {
     /// 普通回合与独立压缩共用的准备步骤；每次都重新读取模型配置和项目指令。
     /// 回合开始前查看上下文：本次启动已加载过就沿用，否则按回合开始时的规则加载一次，
     /// 结果和回合加载时一样通过 context/loaded 发布。
-    pub async fn inspect_context(self: &Arc<Self>) -> Result<(), String> {
-        if self.lock_view().context.is_some() {
-            return Ok(());
+    pub async fn inspect_context(
+        self: &Arc<Self>,
+        signal: tokio_util::sync::CancellationToken,
+    ) -> Result<(), String> {
+        {
+            let view = self.lock_view();
+            let mut state = self.lock_state();
+            if signal.is_cancelled()
+                || view.context.is_some()
+                || state.closing
+                || state.turn.is_busy()
+                || state.context_preview.is_some()
+            {
+                return Ok(());
+            }
+            state.context_preview = Some(signal.clone());
         }
         let conversation = Arc::clone(self);
-        let requests =
-            tokio::task::spawn_blocking(move || conversation.prepare_request_context(&conversation.thread()))
-                .await
-                .expect("context preparation completes while the runtime is running")
-                .map_err(|error| error.message)?;
-        let context = requests
-            .inspect_context(&tokio_util::sync::CancellationToken::new())
+        let result = async {
+            let requests = tokio::task::spawn_blocking(move || {
+                conversation.prepare_request_context(&conversation.thread())
+            })
             .await
-            .map_err(|error| error.to_string())?;
-        self.on_event(TurnEvent::ContextLoaded { context });
-        Ok(())
+            .expect("context preparation completes while the runtime is running")
+            .map_err(|error| error.message)?;
+            requests.inspect_context(&signal).await.map_err(|error| error.to_string())
+        }
+        .await;
+        let mut view = self.lock_view();
+        let result = if signal.is_cancelled() {
+            Ok(())
+        } else {
+            result.map(|context| self.publish_event(&mut view, TurnEvent::ContextLoaded { context }))
+        };
+        self.lock_state().context_preview = None;
+        self.changed.notify_waiters();
+        result
     }
 
     pub(super) fn prepare_request_context(&self, thread: &Thread) -> Result<RequestContext, TurnErrorDetail> {

@@ -10,9 +10,17 @@ impl AppServer {
     }
 
     /// 输入直接进入会话队列；启动和收尾期间同样接受，按顺序执行。
-    pub fn submit(self: &Arc<Self>, session_id: &str, input: UserInput) -> Result<(), RpcError> {
+    pub fn submit(self: &Arc<Self>, params: singularity_protocol::SessionTextParams) -> Result<(), RpcError> {
         let _lifecycle = self.lock_lifecycle();
-        let conversation = self.open_action_conversation(session_id)?;
+        let conversation = self.open_action_conversation(&params.session_id)?;
+        let input = UserInput::from_uploads(
+            params.text,
+            params.images,
+            params.files,
+            std::path::Path::new(&conversation.thread().cwd),
+            &self.home,
+        )
+        .map_err(invalid_request)?;
         conversation.start(input).map_err(conversation_error)?;
         Ok(())
     }
@@ -46,16 +54,20 @@ impl AppServer {
     }
 
     /// 打开任务时查看下一轮会加载的指令和工具；结果通过 context/loaded 事件送达。
-    pub async fn inspect_context(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {
+    pub async fn inspect_context(
+        self: &Arc<Self>,
+        session_id: &str,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), RpcError> {
         let app = Arc::clone(self);
         let id = session_id.to_string();
         let conversation = tokio::task::spawn_blocking(move || {
             let _lifecycle = app.lock_lifecycle();
-            app.open_conversation(&id)
+            app.open_action_conversation(&id)
         })
         .await
         .expect("conversation lookup completes while the backend is running")?;
-        conversation.inspect_context().await.map_err(internal_error)
+        conversation.inspect_context(shutdown.child_token()).await.map_err(internal_error)
     }
 
     pub fn compact(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {
@@ -93,7 +105,7 @@ impl AppServer {
         .await
         .expect("delete preparation completes while the backend is running")?;
         if let Some((conversation, _)) = &pending {
-            self.stop_sessions(std::slice::from_ref(conversation)).await?;
+            conversation.stop().await.map_err(invalid_request)?;
         }
         let app = Arc::clone(self);
         let id = session_id.to_string();

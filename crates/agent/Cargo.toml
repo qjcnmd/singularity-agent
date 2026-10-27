@@ -19,7 +19,6 @@ uuid = { workspace = true, features = ["v7"] }
 singularity_model = { path = "../model" }
 singularity_mcp = { path = "../mcp" }
 singularity_protocol = { path = "../protocol" }
-regex.workspace = true
 thiserror.workspace = true
 base64 = "0.22"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }

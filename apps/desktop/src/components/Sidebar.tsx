@@ -1,6 +1,6 @@
 import { SelectionSlider } from './SelectionSlider'
 import { workspaceKey } from '../workspace'
-import { Ellipsis, X, Minus, Plus, SquarePen, ScrollText, Sparkles, Plug, Settings as SettingsIcon } from 'lucide-react'
+import { X, Minus, Plus, SquarePen, ScrollText, Sparkles, Plug, Settings as SettingsIcon } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useId, useRef, useState } from 'react'
 import { useSelectionGuard } from '../interactions'
@@ -182,18 +182,18 @@ function SessionButton({
   const status = sessionState(session, live)
   return (
     <div data-selected={selected} className={`session-row${selected ? ' is-selected' : ''}`} onContextMenu={event => { event.preventDefault(); setMenuOpen(true) }}>
-      <button type="button" className="session-main" {...mainGuard(() => {
+      <button ref={anchor} type="button" className="session-main" aria-haspopup="menu" aria-expanded={menuOpen}
+        onKeyDown={event => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); setMenuOpen(true) } }} {...mainGuard(() => {
         appStore.selectSession(session.threadId)
         if (window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
       })}>
-        <span className={`session-status status-${live && live.phase !== 'idle' ? 'running' : unread && !selected ? status.className : 'idle'}`} aria-hidden="true" />
         <span className="session-label">
           <strong className={live && live.phase !== 'idle' ? 'activity-shimmer' : undefined}>{title}</strong>
           {session.status !== null && <time dateTime={session.updatedAt}>{relativeTime(session.updatedAt)}</time>}
         </span>
+        <span className={`session-status status-${live && live.phase !== 'idle' ? 'running' : unread && !selected ? status.className : 'idle'}`} aria-hidden="true" />
         <span className="sr-only">{status.label}</span>
       </button>
-      <span className="session-actions"><button ref={anchor} type="button" className="icon-button" aria-label="任务菜单" aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen(value => !value)}><Ellipsis size={16} strokeWidth={1.6} aria-hidden="true" /></button></span>
       {menuOpen && <Menu anchor={anchor} label="任务菜单" onClose={() => setMenuOpen(false)} entries={[{ id: 'rename', label: '重命名', onSelect: onRename }, { id: 'delete', label: '删除任务', onSelect: onDelete }]} />}
     </div>
   )

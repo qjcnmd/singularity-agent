@@ -57,6 +57,11 @@ impl Conversation {
 
     /// 关闭后拒绝新操作，也不再自动启动回合；删除失败时重新打开。
     pub fn set_closing(&self, closing: bool) {
-        self.lock_state().closing = closing;
+        let _view = self.lock_view();
+        let mut state = self.lock_state();
+        state.closing = closing;
+        if closing && let Some(preview) = &state.context_preview {
+            preview.cancel();
+        }
     }
 }

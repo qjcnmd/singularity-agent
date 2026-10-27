@@ -270,7 +270,17 @@ class AppStore extends SessionStore {
 
   /** 打开文件标签；已打开时切过去并重新读取。路径按任务工作目录解析，所以同名相对路径在不同项目里是不同的标签。 */
   openFile(path: string, cwd: string, title = path.split(/[\\/]/).filter(Boolean).pop() ?? path): void {
-    const id = `${cwd}\u0000${path}`
+    let target = path.trim().replace(/\\/g, '/')
+    if (target.startsWith('~/') && this.state.bootstrap?.userHome) {
+      target = `${this.state.bootstrap.userHome.replace(/\\/g, '/')}/${target.slice(2)}`
+    }
+    const directory = cwd.replace(/\\/g, '/').replace(/\/+$/, '')
+    // 文件 URL 统一相对路径和目录层级；文件名中的百分号、# 和 ? 保留原意。
+    const encodePath = (value: string) => encodeURI(value).replace(/[?#]/g, encodeURIComponent)
+    const id = new URL(
+      encodePath(/^[a-z]:\//i.test(target) ? `file:///${target}` : target),
+      encodePath(directory.startsWith('//') ? `file:${directory}/` : `file:///${directory}/`),
+    ).href.toLowerCase()
     const fileTabs = this.state.fileTabs.some(tab => tab.id === id)
       ? this.state.fileTabs.map(tab => tab.id === id ? { ...tab, opened: tab.opened + 1 } : tab)
       : [...this.state.fileTabs, { id, path, cwd, title, opened: 0 }]

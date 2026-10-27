@@ -16,7 +16,7 @@ interface SessionLoadState {
   error: ActionError | null
 }
 
-/** 右侧文件栏的一个标签页；同一任务目录下的同一路径只开一个。 */
+/** 右侧文件栏的一个标签页；同一文件的不同路径写法只开一个。 */
 export interface FileTab {
   id: string; path: string; cwd: string; title: string
   /** 每次打开（包括再次点开已打开的文件）加一，文件栏据此重新读取，显示的是文件当前的内容。 */

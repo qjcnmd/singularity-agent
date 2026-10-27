@@ -1,5 +1,5 @@
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 import { ArrowDown } from 'lucide-react'
 import { appStore, type AppState } from '../appStore'
 import { type TimelineRow } from '../timeline'
@@ -14,6 +14,8 @@ interface Props {
 
 export function Conversation({ state, items }: Props) {
   const sessionId = state.selectedSessionId
+  const currentItems = useRef(items)
+  currentItems.current = items
   const itemIdentity = useMemo(() => items.map((item) => item.key).join('\u0000'), [items])
   const viewport = useRef<HTMLDivElement>(null)
   const observedTop = useRef(0)
@@ -89,7 +91,9 @@ export function Conversation({ state, items }: Props) {
   }, [itemIdentity, sessionId, state.session?.runtime.phase])
 
   const saveReadingPosition = (node: HTMLDivElement, element: HTMLElement) => {
-    const index = items.findIndex(item => item.key === element.dataset.itemId)
+    const anchorElement = element.closest<HTMLElement>('.tool-group') ?? element
+    const items = currentItems.current
+    const index = items.findIndex(item => item.key === anchorElement.dataset.itemId)
     // 重试会撤回流式片段；用它之前最近的已保存条目记录位置。
     const stable = items.slice(0, index + 1).findLast(item => item.stable)
       ?? items.slice(index + 1).find(item => item.stable)
@@ -99,9 +103,8 @@ export function Conversation({ state, items }: Props) {
       offset: target.getBoundingClientRect().top - node.getBoundingClientRect().top })
   }
 
-  const preserveDisclosurePosition = (event: MouseEvent<HTMLDivElement>) => {
-    const button = event.target instanceof Element ? event.target.closest('button[aria-expanded], summary') : null
-    const item = button?.closest<HTMLElement>('[data-item-id]')
+  const preserveDisclosurePosition = useCallback((element: HTMLElement) => {
+    const item = element.closest<HTMLElement>('[data-item-id]')
     const node = viewport.current
     if (item === undefined || item === null || node === null) return
     cancelAnimationFrame(frame.current)
@@ -114,7 +117,8 @@ export function Conversation({ state, items }: Props) {
       if (node.scrollHeight - node.clientHeight - node.scrollTop < 32) { appStore.setViewportAnchor(defaultAnchor()); followLatest() }
       updateScrollState(node)
     }, 400)
-  }
+  }, [])
+
 
   const onScroll = () => {
     const node = viewport.current
@@ -175,11 +179,11 @@ export function Conversation({ state, items }: Props) {
   }
 
   return (
-    <div className="conversation-surface"><div className="conversation-scroll" ref={viewport} tabIndex={0} aria-label="任务内容" onScroll={onScroll} onWheel={interruptFollow} onTouchStart={interruptFollow} onPointerDown={interruptFollow} onKeyDown={event => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) interruptFollow() }} onClickCapture={preserveDisclosurePosition}>
+    <div className="conversation-surface"><div className="conversation-scroll" ref={viewport} tabIndex={0} aria-label="任务内容" onScroll={onScroll} onWheel={interruptFollow} onTouchStart={interruptFollow} onPointerDown={interruptFollow} onKeyDown={event => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) interruptFollow() }}>
       {/* 切换任务时整页淡入，消息不各自弹出；任务里新出现的消息才逐条弹出。 */}
       <motion.div key={sessionId} className="conversation-document" onContextMenu={openColorPicker}
         initial={reduced ? false : { opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: .2, ease: 'easeOut' }}>
-        <AnimatePresence initial={false}>{items.map(item => <TimelineItem key={item.key} item={item.item} itemKey={item.key} cwd={state.session!.summary.cwd} userHome={state.bootstrap?.userHome} sessionId={sessionId ?? undefined} />)}</AnimatePresence>
+        <AnimatePresence initial={false}>{items.map(item => <TimelineItem key={item.key} item={item.item} itemKey={item.key} onDisclosureChange={preserveDisclosurePosition} cwd={state.session!.summary.cwd} userHome={state.bootstrap?.userHome} sessionId={sessionId ?? undefined} />)}</AnimatePresence>
       </motion.div>
 
     </div>

@@ -1,4 +1,4 @@
-import { Square } from 'lucide-react'
+import { LoaderCircle, Square } from 'lucide-react'
 import { memo, useId, useState } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type ActionError, type AppState } from '../appStore'
 import type { BackgroundTask } from '../protocol'
@@ -51,7 +51,7 @@ const BackgroundTaskRow = memo(function BackgroundTaskRow({ task, sessionId, pen
       <button type="button" className="task-stop" disabled={pending || !connected}
         aria-busy={pending} aria-label={`${error ? '重试停止' : '停止'}后台命令：${description}`}
         onClick={() => void appStore.stopBackgroundTask(sessionId, task.taskId)}>
-        {pending ? <span className="spinner" /> : <Square size={9} fill="currentColor" strokeWidth={0} />}
+        {pending ? <LoaderCircle size={13} className="spinner" aria-hidden="true" /> : <Square size={9} fill="currentColor" strokeWidth={0} />}
       </button>
     </div>
     {error && <div className="background-task-error" role="alert">

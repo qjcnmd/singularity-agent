@@ -47,6 +47,9 @@ impl Conversation {
     ) -> Operation {
         let controls = Arc::new(TurnControls::new(uuid::Uuid::new_v4().to_string()));
         controls.set_compacting(source == SessionOperation::Compaction);
+        if let Some(preview) = &state.context_preview {
+            preview.cancel();
+        }
         state.turn = TurnLifecycle::Running(Arc::clone(&controls));
         drop(state);
         view.begin();
@@ -123,7 +126,8 @@ impl Conversation {
             tokio::pin!(changed);
             changed.as_mut().enable();
             match self.phase() {
-                SessionPhase::Idle => break,
+                SessionPhase::Idle if self.lock_state().context_preview.is_none() => break,
+                SessionPhase::Idle => {}
                 SessionPhase::Running | SessionPhase::Compacting => {
                     let _ = self.abort();
                 }
@@ -138,6 +142,7 @@ impl Conversation {
     }
     /// 删除期间拒绝新操作；失败时由 guard 重新开放。
     pub fn begin_delete(self: &Arc<Self>) -> Result<DeleteGuard, ConversationError> {
+        let _view = self.lock_view();
         let mut state = self.lock_state();
         if state.closing {
             return Err(ConversationError::Busy);

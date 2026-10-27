@@ -76,6 +76,8 @@ pub(super) struct ConversationState {
     pub(super) last_context_window: Option<u64>,
     pub(super) auto_resume: bool,
     pub(super) closing: bool,
+    /// 尚未完成的上下文预览；关闭和新执行取消它，关闭等待其收尾。
+    pub(super) context_preview: Option<CancellationToken>,
 }
 
 impl ConversationState {

@@ -62,14 +62,18 @@ impl Connection {
         let connect = async {
             let service = match &config.transport {
                 McpTransportConfig::Stdio { command, args, cwd: configured_cwd, env } => {
+                    let directory = configured_cwd
+                        .as_ref()
+                        .map(|path| cwd.join(path))
+                        .unwrap_or_else(|| cwd.to_path_buf());
+                    let executable = if Path::new(command).components().count() > 1 {
+                        directory.join(command)
+                    } else {
+                        command.into()
+                    };
                     let mut command =
-                        which_command(command).map_err(|error| format!("无法启动 MCP：{error}"))?;
-                    command.args(args).envs(env).current_dir(
-                        configured_cwd
-                            .as_ref()
-                            .map(|path| cwd.join(path))
-                            .unwrap_or_else(|| cwd.to_path_buf()),
-                    );
+                        which_command(executable).map_err(|error| format!("无法启动 MCP：{error}"))?;
+                    command.args(args).envs(env).current_dir(directory);
                     #[cfg(windows)]
                     let command = {
                         use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};

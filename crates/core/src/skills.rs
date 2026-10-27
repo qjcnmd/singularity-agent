@@ -18,6 +18,21 @@ pub struct Skill {
     pub disable_model_invocation: bool,
 }
 
+impl Skill {
+    /// 显式选择时完整读取入口；辅助资源仍由模型按需读取，不受工具输出截断限制。
+    pub fn load_instructions(&self) -> Result<String, String> {
+        let content = fs::read_to_string(&self.path)
+            .map_err(|error| format!("无法加载技能 /{}（{}）：{error}", self.name, self.path.display()))?;
+        let directory = self.path.parent().expect("discovered skills have a parent directory");
+        Ok(format!(
+            "<skill>\nName: {}\nPath: {}\nBase directory: {}\nUser-selected skill instructions follow. Already loaded; do not read SKILL.md again to activate it. Resolve relative resources from the base directory using absolute tool paths.\n\n{content}\n</skill>",
+            self.name,
+            crate::display_path(&self.path),
+            crate::display_path(directory),
+        ))
+    }
+}
+
 /// 无效文件如实记进 diagnostics，只在工作台展示，不进入模型提示词。
 #[derive(Debug, Default)]
 pub struct SkillCatalog {
@@ -39,7 +54,7 @@ fn enabled() -> bool {
     true
 }
 
-/// 发现阶段只读 frontmatter；正文由模型通过 read 读取。
+/// 发现阶段只读 frontmatter；正文在显式选择时加载，或由模型按需读取。
 fn discover_skill(path: &Path, file: fs::File) -> Result<Skill, String> {
     let mut lines = BufReader::new(file).lines();
     let first = lines

@@ -14,7 +14,7 @@ import { selectedSessionPhase } from '../sessionState'
 
 export const Composer = memo(ComposerView)
 
-function ComposerView() {
+function ComposerView({ accent }: { accent: string }) {
   const reducedMotion = useReducedMotion()
   const selectionGuard = useSelectionGuard()
   const state = useAppStore(['drafts', 'questionDrafts', 'actionErrors', 'pendingActions', 'bootstrap', 'bootstrapLoad', 'connection', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'liveSessions', 'sessionLoad', 'theme'])
@@ -101,7 +101,7 @@ function ComposerView() {
     return () => observer.disconnect()
   }, [])
   const showsStop = busy && (pendingQuestion || (draft.trim() === '' && imageDraft.length === 0 && fileDraft.length === 0))
-  const orb = <WaterOrb size={40} percent={occupancy?.percent ?? 0} compacting={phase === 'compacting'}
+  const orb = <WaterOrb size={40} color={accent} percent={occupancy?.percent ?? 0} compacting={phase === 'compacting'}
     enabled={showsStop ? phase !== 'stopping' && !state.pendingActions.has(pendingKey('session.abort', sessionOrigin)) : canSubmit}
     label={showsStop ? phase === 'stopping' ? '正在停止当前回合' : '停止当前回合' : blockedReason ?? '发送消息'}
     onPress={() => { if (showsStop) void appStore.stopActive(); else void appStore.submitDraft() }} />

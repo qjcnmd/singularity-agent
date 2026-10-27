@@ -18,8 +18,6 @@
 .status-running { display: inline-flex; align-items: center; gap: 5px; padding-left: 7px; border-left: 1px solid rgb(0 0 0 / 10%); }
 .status-running i { width: 7px; height: 7px; border-radius: 50%; background: var(--positive); animation: breathe 1.6s ease-in-out infinite; }
 
-/* 原生 popover 默认居中显示，这里改成由 JS 定位 */
-.popover[popover] { position: fixed; inset: auto; margin: 0; overflow: visible; color: inherit; }
 
 
 @keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
@@ -45,7 +43,7 @@
 .icon-button:active:not(:disabled) { transform: scale(.9); transition-duration: 80ms; }
 .icon-button:disabled { opacity: .4; cursor: default; }
 .icon-button.small { width: 26px; height: 26px; border-radius: 7px; }
-.spinner { width: 13px; height: 13px; border-radius: 50%; border: 1.8px solid color-mix(in srgb, currentColor 25%, transparent); border-top-color: currentColor; animation: spin .75s linear infinite; flex: none; }
+.spinner { display: block; width: 13px; height: 13px; transform-origin: center; animation: spin .75s linear infinite; flex: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 
@@ -56,7 +54,15 @@
 .sidebar { display: flex; flex-direction: column; width: 100%; min-width: 220px; height: 100%; padding: 10px 8px; overflow: hidden; }
 .sidebar-brand { display: flex; align-items: center; height: 40px; padding: 0 4px 0 10px; }
 .sidebar-brand .icon-button { margin-left: auto; }
-.side-nav { display: grid; gap: 1px; padding: 6px 0 4px; }
+.side-nav { display: grid; gap: 0; margin: 6px 0 4px; }
+.side-nav .nav-item { position: relative; border-radius: 0; background: var(--canvas); transition: background 120ms; }
+.side-nav .nav-item:first-child { border-radius: 8px 8px 0 0; }
+.side-nav .nav-item:last-child { border-radius: 0 0 8px 8px; }
+.side-nav .nav-item + .nav-item::before { content: ''; position: absolute; inset: 0 12px auto; height: 1px; background: var(--line); pointer-events: none; }
+.side-nav .nav-item:focus-visible { z-index: 1; }
+.side-nav .nav-item:hover { background: var(--side-hover); }
+.side-nav .nav-item.is-active { background: var(--side-selected); }
+.side-nav .nav-item:active { transform: none; background: color-mix(in srgb, var(--accent) 16%, var(--canvas)); }
 .nav-item { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; border: 0; border-radius: 10px; background: transparent; color: var(--nav-ink); font-weight: 500; cursor: pointer; text-align: left; transition: background 120ms, transform var(--spring-dur) var(--spring); }
 .nav-item svg { color: var(--ink-soft); }
 .nav-item:hover { background: var(--side-hover); }
@@ -70,15 +76,16 @@
 .workspace-row { display: flex; align-items: center; gap: 2px; height: 34px; padding-right: 2px; border-radius: 10px; }
 .workspace-row:hover { background: var(--side-hover); }
 .workspace-row.is-selected { background: var(--side-selected); }
-.workspace-button { flex: 1; min-width: 0; display: flex; align-items: center; gap: 4px; height: 30px; padding: 0 4px; border: 0; background: transparent; cursor: pointer; text-align: left; }
+.workspace-button { flex: 1; min-width: 0; display: flex; align-items: center; gap: 4px; height: 34px; padding: 0 4px 0 10px; border: 0; background: transparent; cursor: pointer; text-align: left; }
 
 .session-list { position: relative; padding: 1px 0 6px; }
 .session-row { position: relative; z-index: 1; display: flex; align-items: center; height: 34px; border-radius: 10px; overflow: hidden; }
 .session-row:not(.is-selected):hover { background: var(--side-hover); }
-/* 选中背景由列表下方的滑块提供。 */
+/* 选中背景由列表下方的滑块提供；会话选择沿用助手调色盘颜色。 */
+.session-list { --side-selected: var(--assistant-selection-bg); --side-selected-ink: var(--ink); }
 .selection-slider { position: absolute; top: 0; left: 0; right: 0; z-index: 0; border-radius: 10px; background: var(--side-selected); pointer-events: none;
   transition: transform var(--smooth-dur) var(--smooth), height var(--smooth-dur) var(--smooth), opacity 140ms; }
-.session-main { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; height: 100%; padding: 0 6px 0 12px; border: 0; background: transparent; cursor: pointer; text-align: left; color: var(--nav-ink); transition: color var(--smooth-dur) var(--smooth); }
+.session-main { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; height: 100%; padding: 0 6px 0 10px; border: 0; background: transparent; cursor: pointer; text-align: left; color: var(--nav-ink); transition: color var(--smooth-dur) var(--smooth); }
 /* 选中时只变色、不加粗，颜色和滑块同步渐变，文字宽度不跳 */
 .session-row.is-selected .session-main { color: var(--side-selected-ink); }
 .session-main time { flex: none; color: var(--ink-faint); font-size: 11.5px; font-weight: 400; transition: opacity 120ms; }
@@ -86,8 +93,6 @@
 .session-status.status-failed { background: var(--danger); }
 .session-status.status-running { background: var(--accent); animation: breathe 1.6s ease-in-out infinite; }
 @keyframes breathe { 50% { transform: scale(.55); opacity: .45; } }
-.session-row:hover .session-actions, .session-actions[aria-expanded="true"], .session-actions:focus-visible { opacity: 1; }
-.session-row:hover time { opacity: 0; }
 
 .sidebar-section { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .sidebar-shell { flex: none; height: 100%; overflow: hidden; background: var(--side-bg); box-shadow: inset -1px 0 0 var(--side-line); position: relative; min-width: 0; }
@@ -106,16 +111,12 @@
 .app-main { --panel-space: 0px; position: relative; flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--thread-bg, var(--canvas)); grid-column: 3; min-height: 0; height: 100%; overflow: hidden; }
 .conversation-header { position: absolute; inset: 0 0 auto 0; z-index: 5; display: flex; align-items: center; gap: 10px; height: 54px; padding: 0 24px 0 20px; background: color-mix(in srgb, var(--thread-bg, var(--canvas)) 76%, transparent); backdrop-filter: blur(18px) saturate(170%); overflow: visible; }
 .workspace-name { min-width: 0; }
-.workspace-button strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 13.5px; display: block; }
+.workspace-button strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 13.5px; line-height: 20px; display: block; }
 .workspace-chevron { flex: none; }
 .workspace-new, .workspace-remove { opacity: 0; width: 26px; height: 26px; }
 .workspace-row:hover :is(.workspace-new, .workspace-remove), .workspace-row:focus-within :is(.workspace-new, .workspace-remove) { opacity: 1; }
 .session-label { display: flex; align-items: center; flex: 1; min-width: 0; gap: 6px; }
 .session-label strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: inherit; font-weight: inherit; flex: 1; }
-.session-actions { position: absolute; opacity: 0; background: var(--side-selected); top: 4px; right: 4px; border-radius: 7px; }
-.session-actions .icon-button { width: 26px; height: 26px; }
-.session-row:focus-within .session-actions { opacity: 1; }
-.session-row:focus-within time { opacity: 0; }
 .session-status.status-completed { background: var(--positive); }
 .session-status.status-interrupted { background: var(--danger); }
 @media (max-width: 760px) {
@@ -126,9 +127,8 @@
   .resize-separator { display: none; }
   .conversation-header { padding-left: 64px; }
 }
-/* 圆环调色盘：气泡右键和项目图标共用；弹出层本身透明，外观和动画在里面的 surface 上 */
-.color-popover { margin: 0; padding: 0; border: 0; background: transparent; box-shadow: none; backdrop-filter: none; overflow: visible; }
-.color-popover:not(.workspace-appearance-picker) { position: fixed; inset: auto; }
+/* 圆环调色盘：弹出层本身透明，外观和动画在里面的 surface 上 */
+.color-popover { position: fixed; inset: auto; margin: 0; padding: 0; border: 0; background: transparent; box-shadow: none; backdrop-filter: none; overflow: visible; }
 /* 只有一圈球，没有底板 */
 .color-popover-surface { padding: 4px; }
 .color-wheel { position: relative; }

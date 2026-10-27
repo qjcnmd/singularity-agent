@@ -20,17 +20,20 @@ pub(crate) struct IndexedTurn {
 
 impl IndexedTurn {
     /// 生成这个回合的公开历史；工具结果合并到对应的调用条目里。
-    pub fn project(&self, session: &SessionData) -> Result<ThreadTurn, SessionError> {
+    /// usage 从本回合之前的累计值开始，随本回合条目推进。
+    pub fn project(
+        &self,
+        session: &SessionData,
+        usage: &mut SessionModelUsage,
+    ) -> Result<ThreadTurn, SessionError> {
         let mut items = Vec::new();
         let started_at = session.entries()[self.entries.start].timestamp().to_owned();
         let mut finished_at = None;
         let mut first_token_at = None;
         let mut tool_items = std::collections::HashMap::new();
-        // 每条回复显示截至当时的会话累计用量：先累计本回合之前的请求，再随条目推进。
-        let mut usage = session_usage(&session.entries()[..self.entries.start]);
         for entry in &session.entries()[self.entries.clone()] {
             if let Some(observation) = entry.request_observation() {
-                accumulate_request_usage(&mut usage, observation);
+                accumulate_request_usage(usage, observation);
             }
             match entry {
                 SessionEntry::Message { message, id, observation, timestamp, .. } => match message {
@@ -60,7 +63,7 @@ impl IndexedTurn {
                             timestamp,
                         );
                         if observation.is_some() {
-                            singularity_agent::message::attach_usage(&mut public, &usage);
+                            singularity_agent::message::attach_usage(&mut public, usage);
                         }
                         for item in public {
                             if matches!(item, HistoryItem::Tool { .. }) {

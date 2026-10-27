@@ -1,10 +1,13 @@
-import { interruptionText, compactionText } from './copy'
-import { hasErrorItem, type SessionView } from './execution'
-import type { HistoryItem, PendingQuestion, ThreadTurn } from './protocol'
+import { compactionText } from './copy'
+import { hasErrorItem } from './execution'
+import type { HistoryItem, PendingQuestion, SessionRuntime, ThreadTurn } from './protocol'
 
-export type TimelineContent = HistoryItem
+export type ToolItem = Extract<HistoryItem, { type: 'tool' }>
+export type ToolGroup = { type: 'tool_group'; name: string; rows: Array<{ key: string; item: ToolItem }> }
+
+export type TimelineContent = HistoryItem | ToolGroup
   | { type: 'duration'; startedAt: string; firstTokenAt?: string; finishedAt?: string }
-  | { type: 'terminal'; status: 'failed' | 'interrupted'; text: string }
+  | { type: 'terminal'; status: 'failed' | 'interrupted'; text: string; at?: string }
   | { type: 'typing' }
   | { type: 'question'; request: PendingQuestion }
 
@@ -15,28 +18,32 @@ export interface TimelineRow {
   item: TimelineContent
 }
 
-export function buildTimeline(session: SessionView | null): TimelineRow[] {
-  if (!session) return []
-  const result: TimelineRow[] = []
-  const turns = session.facts
-  const failure = session.runtime.failure
-  for (const turn of turns) {
-    const failureFromRuntime = turn === turns.at(-1) && failure?.source === 'turn'
-    result.push(...turnRows(turn, failureFromRuntime))
-  }
+/** 只有事实或上一回合的保存失败状态变化时，才重新排列历史。 */
+export function buildHistoryRows(turns: ThreadTurn[] | undefined, failureFromRuntime: boolean): TimelineRow[] {
+  return turns?.flatMap(turn => turnRows(turn, failureFromRuntime && turn === turns.at(-1))) ?? []
+}
+
+export function buildTimeline(rows: TimelineRow[], turns: ThreadTurn[] | undefined, runtime: Pick<SessionRuntime, 'failure' | 'pendingQuestion' | 'pendingMessages'> | undefined): TimelineRow[] {
+  if (!runtime) return rows
+  const failure = runtime.failure
+  const question = runtime.pendingQuestion
+  let result = rows
   // 日志写入失败时错误可能只保存在运行状态中，已有相同错误条目时不重复显示。
-  if (failure && !turns.some(turn => hasErrorItem(turn, failure.error))) {
-    result.push({ key: 'terminal:failed', stable: false, item: { type: 'terminal', status: 'failed',
-      text: failure.source === 'compaction' ? `${compactionText.failed}：${failure.error.message}` : failure.error.message } })
+  if (failure && !turns?.some(turn => hasErrorItem(turn, failure.error))) {
+    result = [...result, { key: 'terminal:failed', stable: false, item: { type: 'terminal', status: 'failed',
+      text: failure.source === 'compaction' ? `${compactionText.failed}：${failure.error.message}` : failure.error.message } }]
   }
   // 等待回答的提问替换对应的提问工具卡片，回答后恢复成普通工具卡片。
-  const question = session.runtime.pendingQuestion
   const asking = question ? result.findIndex(row => row.item.type === 'tool' && row.item.id === question.itemId) : -1
-  if (question && asking >= 0) result[asking] = { key: `question:${question.itemId}`, stable: false, item: { type: 'question', request: question } }
-  if (session.runtime.pendingMessages.length === 0) return result
+  if (question && asking >= 0) {
+    result = [...result]
+    result[asking] = { key: `question:${question.itemId}`, stable: false, item: { type: 'question', request: question } }
+  }
+  if (runtime.pendingMessages.length === 0) return result
   // 用户消息写入事件可能先于运行快照到达，按 ID 去重。
-  const savedMessages = new Set(turns.flatMap(turn => turn.items.filter(item => item.type === 'message' && item.role === 'user').map(item => item.id)))
-  for (const message of session.runtime.pendingMessages) {
+  const savedMessages = new Set(rows.flatMap(row => row.item.type === 'message' && row.item.role === 'user' ? [row.item.id] : []))
+  result = [...result]
+  for (const message of runtime.pendingMessages) {
     if (savedMessages.has(message.itemId)) continue
     result.push({ key: `pending:${message.itemId}`, stable: false,
       item: { id: message.itemId, type: 'message', role: 'user', status: 'completed', text: message.text, images: message.images, files: message.files } })
@@ -45,7 +52,8 @@ export function buildTimeline(session: SessionView | null): TimelineRow[] {
 }
 
 function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): TimelineRow[] {
-  const result: TimelineRow[] = turn.items.map(item => ({
+  const items = mergeAdjacentThinking(turn.items)
+  const result: TimelineRow[] = items.map(item => ({
     key: item.type === 'compaction' || item.type === 'compaction_result'
       ? `compaction:${item.id}` : `content:${turn.turnId}:${item.id}`,
     stable: !('status' in item) || item.status !== 'running' || item.type === 'tool',
@@ -53,7 +61,7 @@ function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): TimelineRow[] 
   }))
   // 准备新回合或独立压缩不会重新启动上一轮的计时；进行中的回合收到首个 token 后才显示时间行。
   if (turn.finishedAt || (turn.status === 'running' && turn.firstTokenAt)) {
-    const workStartIndex = turn.items.findIndex(item => item.type !== 'message' || item.role !== 'user')
+    const workStartIndex = items.findIndex(item => item.type !== 'message' || item.role !== 'user')
     result.splice(workStartIndex < 0 ? result.length : workStartIndex, 0, {
       key: `content:${turn.turnId}:duration`, stable: true,
       item: { type: 'duration', startedAt: turn.startedAt, firstTokenAt: turn.firstTokenAt, finishedAt: turn.finishedAt },
@@ -64,14 +72,45 @@ function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): TimelineRow[] 
   if (turn.status === 'running' && !working) result.push({ key: `content:${turn.turnId}:typing`, stable: false, item: { type: 'typing' } })
   if (turn.status === 'interrupted') result.push({
     key: `content:${turn.turnId}:terminal`, stable: true,
-    item: { type: 'terminal', status: turn.manuallyStopped ? 'interrupted' : 'failed', text: interruptionText(turn.manuallyStopped) },
+    item: { type: 'terminal', status: 'interrupted', text: turn.manuallyStopped ? '已停止' : '已中断', at: turn.finishedAt },
   })
   // 保存失败时没有回合错误详情，具体原因由运行状态显示。
   if (turn.status === 'failed' && !hasErrorItem(turn, turn.error) && (turn.error || !failureFromRuntime)) {
     result.push({ key: `content:${turn.turnId}:terminal`, stable: true,
-      item: { type: 'terminal', status: 'failed', text: turn.error?.message ?? '执行失败' } })
+      item: { type: 'terminal', status: 'failed', text: turn.error?.message ?? '执行失败', at: turn.finishedAt } })
   }
-  return result
+  return groupAdjacentTools(result)
+}
+
+/** 提问保持独立，避免把等待用户回答的入口藏在折叠组里。 */
+function groupAdjacentTools(rows: TimelineRow[]): TimelineRow[] {
+  const grouped: TimelineRow[] = []
+  for (const row of rows) {
+    const tool = row.item
+    const previous = grouped.at(-1)
+    if (tool.type !== 'tool' || tool.name === 'ask_user_question') {
+      grouped.push(row)
+    } else if (previous?.item.type === 'tool' && previous.item.name === tool.name) {
+      grouped[grouped.length - 1] = { ...previous, item: { type: 'tool_group', name: tool.name,
+        rows: [{ key: previous.key, item: previous.item }, { key: row.key, item: tool }] } }
+    } else if (previous?.item.type === 'tool_group' && previous.item.name === tool.name) {
+      previous.item.rows.push({ key: row.key, item: tool })
+    } else grouped.push(row)
+  }
+  return grouped
+}
+
+/** 仅合并相邻思考的展示，保留首项 ID；工具、正文和回合边界不会被跨越。 */
+function mergeAdjacentThinking(items: HistoryItem[]): HistoryItem[] {
+  const merged: HistoryItem[] = []
+  for (const item of items) {
+    const previous = merged.at(-1)
+    if (item.type === 'thinking' && previous?.type === 'thinking') {
+      merged[merged.length - 1] = { ...previous, status: item.status,
+        text: [previous.text, item.text].filter(Boolean).join('\n\n') }
+    } else merged.push(item)
+  }
+  return merged
 }
 
 export function toolArgument(name: string, args: unknown): string | null {

@@ -56,7 +56,7 @@ export function DiagramViewer({ svg, width, height, style, onClose }: { svg: str
   const release = (event: PointerEvent<HTMLDivElement>) => {
     const current = drag.current
     drag.current = null
-    if (current && !current.moved && !(event.target as Element).closest('.diagram-viewer-canvas svg > g')) onClose()
+    if (current && !current.moved && !document.elementFromPoint(event.clientX, event.clientY)?.closest('.diagram-viewer-canvas svg > g')) onClose()
   }
 
   return <Dialog open onClose={onClose} labelledBy="diagram-viewer-title" className="diagram-viewer">

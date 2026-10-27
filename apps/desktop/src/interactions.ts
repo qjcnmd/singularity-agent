@@ -9,7 +9,7 @@ function hasTextSelection(): boolean {
  * 拖选不触发控件：按下或释放时存在文字选区就不激活。
  * 未拦截时由调用方自己决定行为；原生链接等控件不需要 activate。
  */
-export function useSelectionGuard() {
+export function useSelectionGuard(beforeActivate?: (element: HTMLElement) => void) {
   const selectedAtPointerDown = useRef(false)
   return (activate?: () => void) => ({
     onPointerDown: () => {
@@ -23,9 +23,27 @@ export function useSelectionGuard() {
         return
       }
       selectedAtPointerDown.current = false
-      activate?.()
+      if (activate) {
+        beforeActivate?.(event.currentTarget)
+        activate()
+      }
     },
   })
+}
+
+/** 展开正文可点击收起，同时保留文字选择和内部控件的独立操作。 */
+export function useBodyCollapse(collapse: (() => void) | undefined, beforeCollapse?: (element: HTMLElement) => void) {
+  const guard = useSelectionGuard(beforeCollapse)(collapse)
+  return {
+    onPointerDown: guard.onPointerDown,
+    onClick: (event: MouseEvent<HTMLElement>) => {
+      const control = event.target instanceof Element
+        ? event.target.closest('a, button, input, textarea, select, summary, [role="button"], [tabindex], [contenteditable="true"]')
+        : null
+      if (control && event.currentTarget.contains(control)) return
+      guard.onClick(event)
+    },
+  }
 }
 
 /** 原生按钮打开 Popover 后，设置各选择器的首次焦点。 */

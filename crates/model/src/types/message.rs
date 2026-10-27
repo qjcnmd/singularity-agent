@@ -40,7 +40,7 @@ pub enum Message {
     #[serde(rename_all = "camelCase")]
     User {
         content: Vec<ContentBlock>,
-        /// 技能引用展开前的用户文字；模型消费 content，界面保持原始显示。
+        /// 附加技能正文和附件路径前的用户文字；模型消费 content，界面保持原始显示。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_text: Option<String>,
         /// 用户附上的文件路径，界面显示为附件卡片；模型读取的路径已写进 content。
@@ -81,7 +81,7 @@ impl Message {
         }
     }
 
-    /// 用户消息第一段文本（`index == 0`）若有展开技能前的原始输入（`display_text`），界面和标题显示原始输入，模型仍读取展开后的 `content`。
+    /// 用户消息第一段文本（`index == 0`）若有原始输入（`display_text`），界面和标题显示原文，模型读取含技能正文和附件路径的 `content`。
     pub fn text_for_display<'a>(&'a self, index: usize, text: &'a str) -> &'a str {
         match self {
             Self::User { display_text: Some(display), .. } if index == 0 => display,

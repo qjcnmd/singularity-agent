@@ -109,6 +109,7 @@ impl Conversation {
                     last_context_window: context_window,
                     auto_resume: true,
                     closing: false,
+                    context_preview: None,
                 }),
                 writer,
                 bash_tasks,
@@ -125,6 +126,7 @@ impl Conversation {
     pub fn has_work(&self) -> bool {
         let state = self.lock_state();
         state.turn.is_busy()
+            || state.context_preview.is_some()
             || self.bash_tasks.is_busy()
             || !state.steering_inbox.lock().expect("turn inbox lock poisoned").pending().is_empty()
     }
@@ -210,6 +212,9 @@ impl Conversation {
         let mut writer = lock_writer(&self.writer);
         writer.append_metadata(SessionMetadata::ThreadSettings { selection: selection.clone() })?;
         state.thread.model = selection.clone();
+        if let Some(preview) = &state.context_preview {
+            preview.cancel();
+        }
         drop(writer);
         drop(state);
         self.publish_changed(&mut view);

@@ -30,6 +30,9 @@ pub(crate) struct BashArgs {
 
 impl BashArgs {
     pub(crate) fn validate(self) -> Result<Self, ToolExecution> {
+        if self.description.is_empty() {
+            return Err(error_result("description must not be empty"));
+        }
         if self.yield_time_ms > MAX_WAIT_MS {
             return Err(error_result("yield_time_ms must be between 0 and 30000"));
         }

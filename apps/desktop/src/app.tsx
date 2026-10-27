@@ -1,7 +1,7 @@
 import { workspaceKey } from './workspace'
 import { workspaceName } from './copy'
 import { actionToastTransition } from './motion'
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, type CSSProperties } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { Composer } from './components/Composer'
 import { Conversation } from './components/Conversation'
 import { Settings } from './components/Settings'
@@ -9,7 +9,7 @@ import { Sidebar } from './components/Sidebar'
 import { RunPanel } from './components/RunPanel'
 import { InstructionsPage, SkillsPage, McpPage } from './components/ManagePages'
 import { hasInlineActionError, useAppStore, appStore } from './appStore'
-import { buildTimeline } from './timeline'
+import { buildHistoryRows, buildTimeline } from './timeline'
 import { bubbleVariables } from './bubbleColors'
 import { clampFilePanelWidth } from './viewPersistence'
 import { FilePanel } from './components/FilePanel'
@@ -18,11 +18,14 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
 export function App() {
   const state = useAppStore(['theme', 'messageFontSize', 'assistantBubble', 'userBubble', 'sidebarCollapsed', 'sidebarWidth', 'fileTabs', 'filePanelWidth'])
+  const [accent, setAccent] = useState(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())
   const filePanelOpen = state.fileTabs.length > 0
   useLayoutEffect(() => { document.documentElement.dataset.theme = state.theme }, [state.theme])
   useLayoutEffect(() => { document.documentElement.style.setProperty('--message-font-size', `${state.messageFontSize}px`) }, [state.messageFontSize])
   useLayoutEffect(() => {
     for (const [name, value] of Object.entries(bubbleVariables(state))) document.documentElement.style.setProperty(name, value)
+    // CSS 是主题色的唯一来源；写入主题与气泡变量后再把解析值交给画布。
+    setAccent(getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())
   }, [state.theme, state.assistantBubble, state.userBubble])
   useEffect(() => { appStore.start(); return () => appStore.stop() }, [])
   const style = {
@@ -32,16 +35,24 @@ export function App() {
   return <div className="app-shell" style={style}>
     <Sidebar />
     {!state.sidebarCollapsed ? <ResizeSeparator label="调整侧栏宽度" value={state.sidebarWidth} onChange={value => appStore.setSidebarWidth(value)} /> : <div />}
-    <MainContent />
+    <MainContent accent={accent} />
     {filePanelOpen ? <ResizeSeparator label="调整文件栏宽度" reversed value={clampFilePanelWidth(state.filePanelWidth)} onChange={value => appStore.setFilePanelWidth(value)} /> : <div />}
     <FilePanel />
     <Settings />
   </div>
 }
 
-const MainContent = memo(function MainContent() {
+const MainContent = memo(function MainContent({ accent }: { accent: string }) {
   const state = useAppStore(['page', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'backgroundOpen', 'actionErrors', 'actionErrorOrigin'])
-  const items = useMemo(() => buildTimeline(state.session), [state.session])
+  const facts = state.session?.facts
+  const runtime = state.session?.runtime
+  const failure = runtime?.failure
+  const pendingQuestion = runtime?.pendingQuestion
+  const pendingMessages = runtime?.pendingMessages
+  const failureFromRuntime = failure?.source === 'turn'
+  const historyRows = useMemo(() => buildHistoryRows(facts, failureFromRuntime), [facts, failureFromRuntime])
+  // 这里只依赖影响临时条目的字段；上下文用量、阶段和后台状态不改变排列。
+  const items = useMemo(() => buildTimeline(historyRows, facts, runtime), [historyRows, facts, failure, pendingQuestion, pendingMessages])
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspace = state.bootstrap?.workspaces.find(workspace => workspaceKey(workspace.root) === state.selectedWorkspaceRoot)
   const workspaceSessions = appStore.sessions()
@@ -78,7 +89,7 @@ const MainContent = memo(function MainContent() {
             </>}
           </section>
         ) : !empty && <Conversation state={state} items={items} />}
-        <Composer />
+        <Composer accent={accent} />
         </>}
         <AnimatePresence>
           {visibleError !== null && <motion.div key="action-toast" className="action-toast" role="status"

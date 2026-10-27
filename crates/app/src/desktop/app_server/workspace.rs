@@ -122,11 +122,17 @@ impl AppServer {
         content: &str,
     ) -> Result<singularity_protocol::TextDocument, RpcError> {
         let path = self.instructions_path(workspace_root)?;
-        let temporary = path.with_extension("md.tmp");
+        let temporary = path.with_extension(format!("md.{}.tmp", uuid::Uuid::now_v7()));
         std::fs::write(&temporary, content)
             .and_then(|()| std::fs::rename(&temporary, &path))
-            .map_err(|error| internal_error(format!("{}: {error}", path.display())))?;
-        read_document(&path)
+            .map_err(|error| {
+                let _ = std::fs::remove_file(&temporary);
+                internal_error(format!("{}: {error}", path.display()))
+            })?;
+        Ok(singularity_protocol::TextDocument {
+            path: singularity_core::display_path(&path),
+            content: content.to_owned(),
+        })
     }
 
     fn instructions_path(&self, workspace_root: Option<&str>) -> Result<std::path::PathBuf, RpcError> {

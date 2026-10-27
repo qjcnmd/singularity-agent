@@ -38,9 +38,7 @@ async fn dispatch(
         }
         RpcRequest::WorkspaceRemove(params) => value(app.remove_workspace(&params.workspace_root).await?),
         RpcRequest::SessionDelete(params) => value(app.delete_session(&params.session_id).await?),
-        RpcRequest::SessionContext(params) => {
-            value(unless_shutdown(shutdown, app.inspect_context(&params.session_id)).await?)
-        }
+        RpcRequest::SessionContext(params) => value(app.inspect_context(&params.session_id, shutdown).await?),
         RpcRequest::DirectoryPick(_) => Err(invalid_request("目录选择由 Electron 处理。")),
         RpcRequest::AppBootstrap(_) => blocking(move || app.bootstrap()).await,
         RpcRequest::SkillsList(params) => blocking(move || app.skills(&params.workspace_root)).await,
@@ -90,16 +88,7 @@ async fn dispatch(
             })
             .await
         }
-        RpcRequest::SessionStart(params) => {
-            blocking(move || {
-                app.start_session(
-                    &params.workspace_root,
-                    params.selection,
-                    input(params.text, params.images, params.files)?,
-                )
-            })
-            .await
-        }
+        RpcRequest::SessionStart(params) => blocking(move || app.start_session(params)).await,
         RpcRequest::SessionRead(params) => blocking(move || app.read_session(&params.session_id)).await,
         RpcRequest::SessionImageRead(params) => {
             blocking(move || app.image_data(&params.session_id, &params.image_id)).await
@@ -107,10 +96,7 @@ async fn dispatch(
         RpcRequest::SessionRename(params) => {
             blocking(move || app.rename_session(&params.session_id, &params.name)).await
         }
-        RpcRequest::SessionSubmit(params) => {
-            blocking(move || app.submit(&params.session_id, input(params.text, params.images, params.files)?))
-                .await
-        }
+        RpcRequest::SessionSubmit(params) => blocking(move || app.submit(params)).await,
         RpcRequest::SessionAnswerQuestion(params) => {
             blocking(move || app.answer_question(&params.session_id, &params.item_id, params.answers)).await
         }
@@ -139,14 +125,6 @@ async fn unless_shutdown<T>(
         result = work => result,
         () = shutdown.cancelled() => Err(RpcError::new(RpcErrorCode::Internal, "工作台正在退出。")),
     }
-}
-
-fn input(
-    text: String,
-    images: Vec<singularity_protocol::ImageUpload>,
-    files: Vec<String>,
-) -> Result<singularity_agent::agent::UserInput, RpcError> {
-    singularity_agent::agent::UserInput::from_uploads(text, images, files).map_err(invalid_request)
 }
 
 fn value(output: impl Serialize) -> Result<Value, RpcError> {

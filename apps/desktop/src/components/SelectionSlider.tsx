@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type RefObject } from 'react'
+import { useEffect, useRef, useState, type RefObject } from 'react'
 
 /** “滑动”切换效果用的选中背景：一个垫在整列选项下面的色块，滑到带 data-selected 的那一项。
  * 色块在所有选项下层，滑过时不会盖住文字，也不会被单个选项裁切。
@@ -6,7 +6,7 @@ import { useLayoutEffect, useRef, useState, type RefObject } from 'react'
 export function SelectionSlider({ container, activeKey }: { container: RefObject<HTMLElement | null>; activeKey: string | null }) {
   const [box, setBox] = useState<{ top: number; height: number; visible: boolean; animate: boolean }>({ top: 0, height: 0, visible: false, animate: false })
   const wasVisible = useRef(false)
-  useLayoutEffect(() => {
+  useEffect(() => {
     const root = container.current
     if (!root) return
     const measure = () => {
@@ -20,7 +20,9 @@ export function SelectionSlider({ container, activeKey }: { container: RefObject
     // 列表里有行插入、删除或展开时跟着移动
     const observer = new ResizeObserver(measure)
     observer.observe(root)
-    return () => observer.disconnect()
+    const rows = new MutationObserver(measure)
+    rows.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-selected'] })
+    return () => { observer.disconnect(); rows.disconnect() }
   }, [container, activeKey])
   return <span className="selection-slider" aria-hidden="true" style={{
     transform: `translateY(${box.top}px)`, height: box.height, opacity: box.visible ? 1 : 0,

@@ -250,14 +250,7 @@ impl Agent {
             }
         };
         let images: Vec<_> = input.images.iter().map(|image| image.attachment.clone()).collect();
-        let text = input.text.clone();
-        let cwd = lock_writer(&self.requests.session).cwd().to_path_buf();
-        let home = self.requests.config.instruction_home.clone();
-        let model_text =
-            tokio::task::spawn_blocking(move || inbox::expand_skill_references(&text, &cwd, &home))
-                .await
-                .expect("skill references resolve while the runtime is running");
-        let model_text = input.text_with_files(model_text);
+        let model_text = input.text_with_files();
         let display_text = (model_text != input.text).then(|| input.text.clone());
         let mut content = vec![singularity_model::ContentBlock::text(model_text)];
         content.extend(images.iter().cloned().map(singularity_model::ContentBlock::Image));

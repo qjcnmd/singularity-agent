@@ -10,9 +10,8 @@ const connectionLabels: Record<McpConnectionStatus, string> = {
   not_connected: '尚未连接', connecting: '连接中…', connected: '已连接', failed: '连接失败', disabled: '已关闭',
 }
 
-export function McpSettings({ workspaceRoot, active, busy, onBusyChange }: {
-  workspaceRoot: string | null; active: boolean; busy: boolean; onBusyChange: (busy: boolean) => void
-}) {
+export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null }) {
+  const [busy, setBusy] = useState(false)
   const [servers, setServers] = useState<McpServerState[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -34,22 +33,20 @@ export function McpSettings({ workspaceRoot, active, busy, onBusyChange }: {
   }, [workspaceRoot])
 
   useEffect(() => {
-    if (!active) return
     setLoading(true)
     setError(null)
     void load()
     return () => { revision.current += 1 }
-    // 进入 MCP 分类只读取状态；保持挂载让分类切换保留编辑草稿。
-  }, [active, load])
+  }, [load])
 
   useEffect(() => {
-    if (!active || busy || loading || error) return
+    if (busy || loading || error) return
     // 页面可见时持续读取后端状态；上次读取结束后再计时，不启动服务器。
     const timer = window.setTimeout(() => {
       void load()
     }, 1000)
     return () => window.clearTimeout(timer)
-  }, [active, busy, loading, error, servers, load])
+  }, [busy, loading, error, servers, load])
 
   async function reconnect(serverId: string) {
     const version = ++revision.current
@@ -66,7 +63,7 @@ export function McpSettings({ workspaceRoot, active, busy, onBusyChange }: {
 
   async function mutate(action: () => Promise<McpServerState[]>) {
     if (busy) return false
-    onBusyChange(true)
+    setBusy(true)
     setError(null)
     const version = ++revision.current
     try {
@@ -80,17 +77,17 @@ export function McpSettings({ workspaceRoot, active, busy, onBusyChange }: {
       if (version === revision.current) setError(error instanceof Error ? error.message : '保存 MCP 配置失败。')
       return false
     }
-    finally { onBusyChange(false) }
+    finally { setBusy(false) }
   }
 
   async function retryLoad() {
     if (busy) return
-    onBusyChange(true)
+    setBusy(true)
     setLoading(true)
     setError(null)
     try {
       await load()
-    } finally { onBusyChange(false) }
+    } finally { setBusy(false) }
   }
 
   return <section className="mcp-settings" aria-label="MCP" aria-busy={loading}>

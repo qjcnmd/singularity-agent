@@ -6,7 +6,7 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Mutex},
 };
 
 /// 文字、图片和附件路径作为一个输入一起接受和交付。
@@ -16,14 +16,18 @@ pub struct UserInput {
     pub images: Vec<crate::image::InputImage>,
     /// 附件文件的绝对路径；只交给模型路径，由模型用读取工具查看内容。
     pub files: Vec<String>,
+    /// 接受输入时读取的技能全文；原始任务文字单独保留供界面显示。
+    skill_instructions: String,
 }
 
 impl UserInput {
-    /// 检查工作台提交的输入；图片只在这里识别和解码一次，附件只检查路径指向现有文件。
+    /// 接受输入前完成校验、图片解码和技能读取；失败时不进入队列。
     pub fn from_uploads(
         text: String,
         images: Vec<singularity_protocol::ImageUpload>,
         files: Vec<String>,
+        cwd: &std::path::Path,
+        home: &std::path::Path,
     ) -> Result<Self, String> {
         if text.trim().is_empty() && images.is_empty() && files.is_empty() {
             return Err("输入不能为空。".into());
@@ -32,56 +36,58 @@ impl UserInput {
             return Err(format!("找不到附件：{missing}"));
         }
         Ok(Self {
+            skill_instructions: load_selected_skills(&text, cwd, home)?,
             text,
             images: images.into_iter().map(crate::image::InputImage::upload).collect::<Result<_, _>>()?,
             files,
         })
     }
 
-    /// 模型看到的文字：附件路径列在正文后面。
-    pub(super) fn text_with_files(&self, text: String) -> String {
-        if self.files.is_empty() {
-            return text;
+    /// 模型看到的文字：原始任务后附所选技能，附件路径列在最后。
+    pub(super) fn text_with_files(&self) -> String {
+        let mut text = self.text.clone();
+        text.push_str(&self.skill_instructions);
+        if !self.files.is_empty() {
+            if text.trim().is_empty() {
+                text.clear();
+            } else {
+                text.push_str("\n\n");
+            }
+            text.push_str("附件：");
+            for path in &self.files {
+                text.push_str("\n- ");
+                text.push_str(path);
+            }
         }
-        let list = self.files.iter().map(|path| format!("- {path}")).collect::<Vec<_>>().join(
-            "
-",
-        );
-        if text.trim().is_empty() {
-            format!(
-                "附件：
-{list}"
-            )
-        } else {
-            format!(
-                "{text}
-
-附件：
-{list}"
-            )
-        }
+        text
     }
 }
 
-/// 按当前目录展开空白分隔的 `/技能名`；手动输入与菜单选择共用，正文由模型读取。
-pub(super) fn expand_skill_references(text: &str, cwd: &std::path::Path, home: &std::path::Path) -> String {
-    static REFERENCE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?P<prefix>^|\s)/(?P<name>\S+)").expect("skill reference pattern is valid")
-    });
-    if !REFERENCE.is_match(text) {
-        return text.to_owned();
+/// 按空白分隔的引用顺序读取技能，同一技能只加载一次，未知名称不影响原文。
+fn load_selected_skills(text: &str, cwd: &std::path::Path, home: &std::path::Path) -> Result<String, String> {
+    let mut references = text
+        .split_whitespace()
+        .filter_map(|word| word.strip_prefix('/'))
+        .filter(|name| !name.is_empty())
+        .peekable();
+    if references.peek().is_none() {
+        return Ok(String::new());
     }
-    let skills = singularity_core::skills::SkillCatalog::discover(cwd, home);
-    REFERENCE
-        .replace_all(text, |captures: &regex::Captures<'_>| {
-            match skills.skills.iter().find(|skill| skill.user_invocable && skill.name == captures["name"]) {
-                Some(skill) => {
-                    format!("{}read {}", &captures["prefix"], singularity_core::display_path(&skill.path))
-                }
-                None => captures[0].to_string(),
-            }
-        })
-        .into_owned()
+    let catalog = singularity_core::skills::SkillCatalog::discover(cwd, home);
+    let mut selected = std::collections::HashSet::new();
+    let mut instructions = String::new();
+    for name in references {
+        let Some(skill) = catalog.skills.iter().find(|skill| skill.user_invocable && skill.name == name)
+        else {
+            continue;
+        };
+        if selected.insert(&skill.path) {
+            let content = skill.load_instructions()?;
+            instructions.push_str("\n\n");
+            instructions.push_str(&content);
+        }
+    }
+    Ok(instructions)
 }
 
 /// 队列中的一项输入；消息 ID 在入队时分配，保存失败后重试仍用同一个。
