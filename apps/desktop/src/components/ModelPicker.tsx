@@ -2,7 +2,7 @@ import '../styles/model-picker.css'
 import { EffortSlider } from './EffortSlider'
 import { ExpandChevron } from './ExpandChevron'
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
-import { usePopoverFocus, useSelectionGuard, focusableElements, navigateList } from '../interactions'
+import { usePopoverFocus, focusableElements, navigateList } from '../interactions'
 import { sortReasoningVariants, selectedModel } from '../modelChoices'
 import type { ModelSelection, ModelConfigurationInput, RedactedProvider } from '../protocol'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
@@ -34,7 +34,7 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
   const placePopover = (node: HTMLElement) => {
     const rect = trigger.current?.getBoundingClientRect()
     if (!rect) return
-    const width = node.offsetWidth || 220
+    const width = parseFloat(getComputedStyle(node).width)
     node.style.left = `${Math.min(Math.max(8, rect.left + rect.width / 2 - width / 2), window.innerWidth - width - 8)}px`
     node.style.bottom = `${window.innerHeight - rect.top + 8}px`
   }
@@ -51,7 +51,6 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
     if (!committing.current) setPreviewIndex(null)
   }, [selection, open])
   useLayoutEffect(() => () => { queuedEffort.current = null }, [])
-  const selectionGuard = useSelectionGuard()
   const sessionId = state.selectedSessionId
   const origin = actionOrigin.session(sessionId)
   const pending = state.pendingActions.has(pendingKey('session.updateSettings', origin))
@@ -107,7 +106,6 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
         disabled={state.selectedWorkspaceRoot === null}
         aria-haspopup="dialog"
         aria-expanded={open}
-        {...selectionGuard()}
       >
         <span className="sg-triggerLabel">{modelLabel}</span>
         {effortLabel !== null && <span className="sg-triggerEffort">· {effortLabel}</span>}
@@ -135,9 +133,7 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
                         aria-pressed={isSelected}
                         disabled={pending}
                         className="sg-option"
-                        {...selectionGuard(() => {
-                          void chooseModel({ provider, model })
-                        })}
+                        onClick={() => { void chooseModel({ provider, model }) }}
                       >
                         <span className="sg-modelName">{model.modelId}</span>
                         <span className="sg-check">{isSelected && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>}</span>

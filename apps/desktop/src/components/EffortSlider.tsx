@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type RefObject } from 'react'
 import { animate, motion, useReducedMotion, useAnimationFrame, useMotionValue, useMotionValueEvent, useTransform, type MotionValue } from 'motion/react'
 
 /** 滑块直径；滑块嵌在轨道里，四周留 thumbInset 的边。 */
-const thumbSize = 28
+const thumbSize = 18
 const thumbInset = 3
 /** 滑块中心到轨道两端的最小距离。 */
 const edge = thumbSize / 2 + thumbInset
@@ -108,7 +108,7 @@ function Sparks({ ratio, track }: { ratio: MotionValue<number>; track: RefObject
       credit.current -= 1
       if (fill > 40 && items.current.length < Math.round(5 + level * 13)) {
         const speed = (50 + level * 190) * (.7 + Math.random() * .6)
-        items.current.push({ x: fill - edge - Math.random() * 8, y: 6 + Math.random() * (height - 12), vx: -speed, size: 1.4 + Math.random() * 1.8, age: 0, life: (fill - 10) / speed })
+        items.current.push({ x: fill - edge - Math.random() * 8, y: 4 + Math.random() * (height - 8), vx: -speed, size: 1.4 + Math.random() * 1.8, age: 0, life: (fill - 10) / speed })
       }
     }
     for (const spark of items.current) { spark.age += dt; spark.x += spark.vx * dt }

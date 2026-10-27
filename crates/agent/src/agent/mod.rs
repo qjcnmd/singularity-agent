@@ -52,6 +52,9 @@ pub enum AgentError {
     Session(#[from] SessionError),
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
+    /// 请求输入读取失败不代表日志无法追加，仍需保存本轮失败原因。
+    #[error("{0}")]
+    Context(#[from] std::io::Error),
     #[error("agent operation aborted")]
     Aborted,
     #[error("模型回复达到输出上限，内容未完成。请发送消息继续。")]
@@ -73,7 +76,7 @@ impl AgentError {
         match self {
             Self::Provider(_) | Self::OutputTruncated => Cause::Provider,
             Self::Session(_) => Cause::Store,
-            Self::Aborted | Self::InvalidSummary(_) => Cause::Internal,
+            Self::Context(_) | Self::Aborted | Self::InvalidSummary(_) => Cause::Internal,
             Self::Compaction { source, .. } => source.cause(),
         }
     }
@@ -174,7 +177,7 @@ impl Agent {
                 return Err(AgentError::Aborted);
             }
             self.drain_inputs(on_event, cancellation).await?;
-            let (response, assistant_result_entry_id) =
+            let (response, assistant_result_entry_id, saved_at) =
                 self.generate_response(on_event, cancellation).await?;
             let length_truncated = response.is_length_truncated();
             let assistant = response.assistant_message;
@@ -187,7 +190,7 @@ impl Agent {
                 &assistant_result_entry_id,
                 singularity_protocol::TurnStatus::Completed,
                 singularity_protocol::ToolStatus::Pending,
-                &singularity_core::now_iso(),
+                &saved_at,
             );
             on_event(TurnEvent::MessageFinished {
                 message_id: assistant_result_entry_id.clone(),
@@ -259,13 +262,13 @@ impl Agent {
             display_text,
             files: input.files.clone(),
         };
-        self.append_message(&request.message_id, message, &input.images).await?;
+        let saved_at = self.append_message(&request.message_id, message, &input.images).await?;
         lock_inbox(&self.inbox).confirm_saved(&request.message_id);
         on_event(TurnEvent::ItemUpdated {
             item: singularity_protocol::HistoryItem::Message {
                 id: request.item_id(),
                 text: input.text.clone(),
-                at: Some(singularity_core::now_iso()),
+                at: Some(saved_at),
                 stats: None,
                 images,
                 files: input.files.clone(),
@@ -277,13 +280,13 @@ impl Agent {
     }
 
     /// 先在写者锁外保存图片，再追加引用它们的消息，使用调用方事先分配的消息 ID；
-    /// 成功返回后调用方才发布完成事件。
+    /// 返回日志保存时间，成功返回后调用方才发布完成事件。
     async fn append_message(
         &self,
         id: &str,
         message: Message,
         images: &[crate::image::InputImage],
-    ) -> Result<()> {
+    ) -> Result<String> {
         let session = Arc::clone(&self.requests.session);
         let id = id.to_string();
         let images = images.to_vec();
@@ -295,8 +298,7 @@ impl Agent {
                 }
             }
             let mut writer = lock_writer(&session);
-            writer.append_message_with_id(&id, message, None)?;
-            Ok::<_, SessionError>(())
+            writer.append_message_with_id(&id, message, None)
         })
         .await
         .expect("message writer completes while the runtime is running")?)

@@ -1,44 +1,18 @@
 import { useLayoutEffect, useState } from 'react'
 import { appStore, type AppState } from './appStore'
-import type { FileCandidate, SkillCatalog } from './protocol'
+import type { SkillCatalog } from './protocol'
 
-type CandidateQuery<Result> =
+type SkillQuery =
   | { status: 'idle' }
   | { status: 'loading' }
-  | { status: 'ready'; result: Result }
+  | { status: 'ready'; result: SkillCatalog }
   | { status: 'error'; error: Error }
 
 type QueryScope = Pick<AppState, 'selectedWorkspaceRoot' | 'selectedSessionId' | 'connection'>
 
-export function useFileCandidates(query: string | undefined, scope: QueryScope) {
-  const { selectedWorkspaceRoot, selectedSessionId, connection } = scope
-  const [files, setFiles] = useState<CandidateQuery<FileCandidate[]>>({ status: 'idle' })
-  const [reload, setReload] = useState(0)
-  useLayoutEffect(() => {
-    // 切换任务或查询时先清除旧候选，避免插入其他任务的文件。
-    if (!query?.trim() || connection !== 'ready' || selectedWorkspaceRoot === null) {
-      setFiles({ status: 'idle' })
-      return
-    }
-    setFiles({ status: 'loading' })
-    let active = true
-    const queryTimer = setTimeout(() => {
-      void appStore.transport.rpc('file.search', {
-        workspaceRoot: selectedWorkspaceRoot,
-        query: query.trim(),
-      }).then(
-        result => { if (active) setFiles({ status: 'ready', result }) },
-        error => { if (active) setFiles({ status: 'error', error: error instanceof Error ? error : new Error(String(error)) }) },
-      )
-    }, 150)
-    return () => { active = false; clearTimeout(queryTimer) }
-  }, [query, selectedSessionId, selectedWorkspaceRoot, connection, reload])
-  return { ...files, retry: () => setReload(value => value + 1) }
-}
-
 export function useSkillCandidates(enabled: boolean, scope: QueryScope) {
   const { selectedWorkspaceRoot, selectedSessionId, connection } = scope
-  const [skills, setSkills] = useState<CandidateQuery<SkillCatalog>>({ status: 'idle' })
+  const [skills, setSkills] = useState<SkillQuery>({ status: 'idle' })
   const [reload, setReload] = useState(0)
   useLayoutEffect(() => {
     if (!enabled || connection !== 'ready' || selectedWorkspaceRoot === null) {

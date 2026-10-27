@@ -1,7 +1,7 @@
 import { workspaceKey } from '../workspace'
 import { Plus } from 'lucide-react'
 import { useRef, useState } from 'react'
-import { navigateList, useSelectionGuard, useDismissOnOutside } from '../interactions'
+import { navigateList, useDismissOnOutside } from '../interactions'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import { PickerSurface } from './PickerSurface'
 import { ExpandChevron } from './ExpandChevron'
@@ -14,7 +14,6 @@ export function WorkspacePicker({ state }: { state: Props }) {
   const [open, setOpen] = useState(false)
   const root = useRef<HTMLDivElement>(null)
   const anchor = useRef<HTMLButtonElement>(null)
-  const guard = useSelectionGuard()
   const workspaces = state.bootstrap?.workspaces ?? []
   const selected = workspaces.find(workspace => workspaceKey(workspace.root) === state.selectedWorkspaceRoot)
   useDismissOnOutside(root, open, () => setOpen(false))
@@ -38,10 +37,10 @@ export function WorkspacePicker({ state }: { state: Props }) {
       <span>{selected ? workspaceName(selected) : '选择项目'}</span><ExpandChevron expanded={open} size={12} />
     </button>
     <PickerSurface open={open}><div className="workspace-picker-options" id="workspace-picker-options" role="group" aria-label="项目选项">
-      {workspaces.map(workspace => <button key={workspaceKey(workspace.root)} type="button" aria-pressed={workspaceKey(workspace.root) === state.selectedWorkspaceRoot} {...guard(() => pick(workspaceKey(workspace.root)))}>
+      {workspaces.map(workspace => <button key={workspaceKey(workspace.root)} type="button" aria-pressed={workspaceKey(workspace.root) === state.selectedWorkspaceRoot} onClick={() => pick(workspaceKey(workspace.root))}>
         <span>{workspaceName(workspace)}</span><span aria-hidden="true">{workspaceKey(workspace.root) === state.selectedWorkspaceRoot ? '✓' : ''}</span>
       </button>)}
-      <button type="button" {...guard(() => pick('add'))}><Plus size={18} strokeWidth={1.7} aria-hidden="true" /><span>添加项目</span></button>
+      <button type="button" onClick={() => pick('add')}><Plus size={18} strokeWidth={1.7} aria-hidden="true" /><span>添加项目</span></button>
     </div></PickerSurface>
   </div>
 }

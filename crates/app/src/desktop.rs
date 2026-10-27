@@ -4,7 +4,6 @@ mod app_server;
 mod file_view;
 mod rpc;
 mod transport;
-mod workspace_files;
 pub(crate) mod workspace_store;
 
 pub(crate) use app_server::AppServer;

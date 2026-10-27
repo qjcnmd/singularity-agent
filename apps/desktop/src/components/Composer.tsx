@@ -1,4 +1,3 @@
-import { useSelectionGuard } from '../interactions'
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { actionOrigin, appStore, useAppStore, pendingKey } from '../appStore'
 import { ModelPicker } from './ModelPicker'
@@ -7,8 +6,8 @@ import { PickerSurface } from './PickerSurface'
 import { WaterOrb } from './orb/WaterOrb'
 import { motion, useReducedMotion } from 'motion/react'
 import { inputTrigger } from '../inputTrigger'
-import { useFileCandidates, useSkillCandidates } from '../inputCandidates'
-import { disclosureTransition } from '../motion'
+import { useSkillCandidates } from '../inputCandidates'
+import { smooth } from '../motion'
 import { DraftImages, FileChips, useAttachmentInput } from './Images'
 import { selectedSessionPhase } from '../sessionState'
 
@@ -16,8 +15,7 @@ export const Composer = memo(ComposerView)
 
 function ComposerView({ accent }: { accent: string }) {
   const reducedMotion = useReducedMotion()
-  const selectionGuard = useSelectionGuard()
-  const state = useAppStore(['drafts', 'questionDrafts', 'actionErrors', 'pendingActions', 'bootstrap', 'bootstrapLoad', 'connection', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'liveSessions', 'sessionLoad', 'theme'])
+  const state = useAppStore(['drafts', 'pendingActions', 'bootstrap', 'bootstrapLoad', 'connection', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'liveSessions', 'sessionLoad'])
   const { text: draft, images: imageDraft, files: fileDraft } = appStore.inputDraft()
   const sessionId = state.selectedSessionId
   const draftKey = appStore.draftKey()
@@ -28,16 +26,11 @@ function ComposerView({ accent }: { accent: string }) {
   const phase = selectedSessionPhase(state)
   const busy = phase === 'running' || phase === 'compacting' || phase === 'stopping'
   const [caret, setCaret] = useState(draft.length)
-  const trigger = inputTrigger(draft, caret)
-  const fileQuery = trigger?.kind === 'file' ? trigger.query : undefined
-  const skillQuery = trigger?.kind === 'skill' ? trigger.query : undefined
-  const skillMenu = skillQuery !== undefined
-  const files = useFileCandidates(fileQuery, state)
-  const skills = useSkillCandidates(skillMenu, state)
-  const candidates = skillMenu ? skills : files
-  const suggestions: { value: string; description: string }[] = skillMenu
-    ? (skills.status === 'ready' ? skills.result.skills : []).filter(skill => skill.name.startsWith(skillQuery)).map(skill => ({ value: skill.name, description: skill.description }))
-    : (files.status === 'ready' ? files.result : []).map(file => ({ value: file.path, description: '任务文件' }))
+  const trigger = pendingQuestion ? null : inputTrigger(draft, caret)
+  const skills = useSkillCandidates(trigger !== null, state)
+  const suggestions = trigger !== null && skills.status === 'ready'
+    ? skills.result.skills.filter(skill => skill.name.startsWith(trigger.query))
+    : []
   const [suggestionIndex, setSuggestionIndex] = useState(0)
   const [suggestionsOpen, setSuggestionsOpen] = useState(true)
   const textarea = useRef<HTMLTextAreaElement>(null)
@@ -55,7 +48,7 @@ function ComposerView({ accent }: { accent: string }) {
 
   const insertCandidate = (candidate: typeof suggestions[number]) => {
     if (trigger === null) return
-    const insertion = `${trigger.kind === 'skill' ? '/' : '@'}${candidate.value} `
+    const insertion = `/${candidate.name} `
     const position = trigger.start + insertion.length
     appStore.setDraft(draft.slice(0, trigger.start) + insertion + draft.slice(trigger.end))
     setCaret(position)
@@ -68,8 +61,7 @@ function ComposerView({ accent }: { accent: string }) {
     if (suggestion !== undefined) insertCandidate(suggestion)
   }
 
-  const showCandidateSurface = suggestionsOpen
-    && trigger !== null && (skillMenu || suggestions.length > 0 || (fileQuery !== undefined && files.status !== 'idle'))
+  const showCandidateSurface = suggestionsOpen && trigger !== null
 
   useLayoutEffect(() => {
     const anchor = candidateAnchor.current
@@ -108,8 +100,7 @@ function ComposerView({ accent }: { accent: string }) {
   return (
     <motion.section ref={region} className="composer-region" aria-label="任务输入区"
       layout={reducedMotion ? false : 'position'}
-      transition={{ layout: disclosureTransition(true, reducedMotion) }}>
-      {!pendingQuestion &&
+      transition={{ layout: reducedMotion ? { duration: 0 } : smooth }}>
       <div ref={candidateAnchor} className="composer-candidate-anchor">
         <PickerSurface open={showCandidateSurface}>
           <div ref={candidateList} className="composer-candidates" onKeyDown={event => {
@@ -119,38 +110,37 @@ function ComposerView({ accent }: { accent: string }) {
               textarea.current?.focus()
             }
           }}>
-            <div id="composer-suggestions" role="listbox" aria-label="输入建议" aria-busy={candidates.status === 'loading'}>
+            <div id="composer-suggestions" role="listbox" aria-label="输入建议" aria-busy={skills.status === 'loading'}>
             {suggestions.map((candidate, index) => (
               <button
                 type="button"
                 role="option"
-                className={skillMenu ? 'skill-candidate' : undefined}
                 aria-selected={suggestionIndex === index}
                 id={`composer-suggestion-${index}`}
-                key={candidate.value}
+                key={candidate.name}
+                onPointerMove={() => setSuggestionIndex(index)}
                 onMouseDown={event => event.preventDefault()}
-                {...selectionGuard(() => insertCandidate(candidate))}
+                onClick={() => insertCandidate(candidate)}
               >
-                <strong>{skillMenu ? '/' : '@'}{candidate.value}</strong><span>{candidate.description}</span>
+                <strong>/{candidate.name}</strong><span>{candidate.description}</span>
               </button>
             ))}
             </div>
-            {candidates.status === 'loading' && <p className="candidate-message" role="status">{skillMenu ? '正在读取 Skills…' : '正在搜索文件…'}</p>}
-            {skillMenu && skills.status === 'ready' && suggestions.length === 0 && <p className="candidate-message">{skills.result.skills.length === 0 ? '没有可用的 Skills' : '没有匹配的 Skills'}</p>}
-            {skillMenu && skills.status === 'ready' && skills.result.diagnostics.map(message => <p className="candidate-message candidate-error" role="alert" key={message}>{message}</p>)}
-            {fileQuery !== undefined && files.status === 'ready' && files.result.length === 0 && <p className="candidate-message">没有匹配的文件</p>}
-            {candidates.status === 'error' && (
+            {skills.status === 'loading' && <p className="candidate-message" role="status">正在读取 Skills…</p>}
+            {skills.status === 'ready' && suggestions.length === 0 && <p className="candidate-message">{skills.result.skills.length === 0 ? '没有可用的 Skills' : '没有匹配的 Skills'}</p>}
+            {skills.status === 'ready' && skills.result.diagnostics.map(message => <p className="candidate-message candidate-error" role="alert" key={message}>{message}</p>)}
+            {skills.status === 'error' && (
               <div className="candidate-message candidate-error" role="alert">
-                <strong>{candidates.error.message}</strong>
+                <strong>{skills.error.message}</strong>
                 <button ref={candidateRetry} type="button" className="secondary-button" onClick={() => {
-                  candidates.retry()
+                  skills.retry()
                   textarea.current?.focus()
-                }}>{skillMenu ? '重试读取 Skills' : '重试搜索文件'}</button>
+                }}>重试读取 Skills</button>
               </div>
             )}
           </div>
         </PickerSurface>
-      </div>}
+      </div>
       <div {...attachmentInput.handlers} className={`composer-card${inputDisabled ? ' is-unavailable' : ''}`}>
         <DraftImages images={imageDraft} remove={index => { if (draftKey !== null) appStore.setImages(draftKey, imageDraft.filter((_, at) => at !== index)) }} />
         <FileChips files={fileDraft} remove={index => { if (draftKey !== null) appStore.setFiles(draftKey, fileDraft.filter((_, at) => at !== index)) }} />
@@ -174,7 +164,7 @@ function ComposerView({ accent }: { accent: string }) {
               setSuggestionIndex((index) => (index + direction + suggestions.length) % suggestions.length)
               return
             }
-            if (showCandidateSurface && candidates.status === 'error' && event.key === 'Tab' && !event.shiftKey) {
+            if (showCandidateSurface && skills.status === 'error' && event.key === 'Tab' && !event.shiftKey) {
               event.preventDefault()
               candidateRetry.current?.focus()
               return
@@ -209,7 +199,7 @@ function ComposerView({ accent }: { accent: string }) {
             <button type="button" className="attach-button" aria-label="添加附件" title="添加附件" disabled={attachmentInput.disabled} onClick={attachmentInput.open}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true"><path d="M5 12h14M12 5v14" /></svg>
             </button>
-            <WorkspacePicker state={state} />
+            {sessionId === null && <WorkspacePicker state={state} />}
           </div>
           <div className="composer-actions"><ModelPicker state={state} />{orb}</div>
         </div>

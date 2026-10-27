@@ -32,12 +32,6 @@ pub struct SkillCatalog {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-pub struct FileCandidate {
-    pub path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct DirectoryPickResult {
     pub path: Option<String>,
 }

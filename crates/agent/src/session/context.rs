@@ -7,7 +7,7 @@ use singularity_model::{ContentBlock, Message};
 
 use crate::message::{COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX};
 
-use super::format::{LedgerRecord, Result, SessionEntry};
+use super::format::{LedgerRecord, SessionEntry};
 use super::manager::SessionData;
 
 /// 启发式 Token 估算：按 UTF-16 字符数除以 4 向上取整。
@@ -303,7 +303,7 @@ fn image_captions(message: &Message, directory: &std::path::Path) -> String {
 pub(crate) fn load_images(
     messages: &mut [Message],
     directory: &std::path::Path,
-) -> Result<std::collections::HashMap<String, String>> {
+) -> std::io::Result<std::collections::HashMap<String, String>> {
     let mut images = std::collections::HashMap::new();
     for message in messages {
         for image in message.images() {

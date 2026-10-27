@@ -13,7 +13,6 @@ export const pop = toTransition(popPreset)
 export const actionToastTransition = pop
 /** 消息、卡片和弹出的调色盘共用的出现动画：从下方略缩小处弹出。 */
 export const enter = { initial: { opacity: 0, y: 10, scale: .9 }, animate: { opacity: 1, y: 0, scale: 1 } }
-export const disclosureTransition = (_expanded: boolean, reduced: boolean | null): Transition => reduced ? { duration: 0 } : smooth
 
 function springCurve({ damping, response }: { damping: number; response: number }) {
   const stiffness = (2 * Math.PI / response) ** 2
@@ -45,5 +44,5 @@ export function applyCssSprings() {
   root.setProperty('--smooth', calm.easing)
   root.setProperty('--smooth-dur', `${calm.duration}ms`)
   for (const name of ['--disclosure-duration', '--disclosure-collapse-duration']) root.setProperty(name, `${Math.round(calm.duration * .6)}ms`)
-  for (const name of ['--disclosure-ease', '--disclosure-collapse-ease']) root.setProperty(name, calm.easing)
+  root.setProperty('--disclosure-collapse-ease', calm.easing)
 }

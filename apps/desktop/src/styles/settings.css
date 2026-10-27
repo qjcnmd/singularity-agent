@@ -1,7 +1,7 @@
 .modal::backdrop { background: rgb(20 20 30 / 28%); backdrop-filter: blur(3px); animation: fade-in 200ms ease-out; }
 .modal-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 20px 6px 24px; }
-.modal-header h2 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -.01em; }
-.modal-header small { display: block; color: var(--ink-faint); font-size: 12px; font-weight: 500; }
+.modal-header h2 { margin: 0; font-size: 16px; font-weight: 600; }
+.modal-header small { display: block; color: var(--ink-faint); font-size: 12px; font-weight: 400; }
 .model-editor-scroll p { margin: 0; color: var(--ink-soft); }
 .confirm-modal { width: 420px; }
 
@@ -11,8 +11,8 @@ dialog.sg-settings-modal { width: min(640px, calc(100vw - 48px)); max-height: mi
 dialog.sg-settings-modal[open] { display: flex; }
 .sg-settings-content { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 24px 24px; }
 .settings-section + .settings-section { margin-top: 20px; }
-.settings-section > h3 { margin: 0 0 8px 4px; color: var(--ink-faint); font-size: 12px; font-weight: 500; }
-.settings-group { border: 1px solid var(--line); border-radius: 14px; background: var(--canvas); overflow: hidden; }
+.settings-section > h3 { margin: 0 0 8px 4px; color: var(--ink-faint); font-size: 12px; font-weight: 400; }
+.settings-group { border: 1px solid var(--line); border-radius: 12px; background: var(--canvas); overflow: hidden; }
 .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; min-height: 48px; padding: 8px 14px; border: 0; background: none; color: inherit; font: inherit; text-align: left; }
 .settings-group > * + * { border-top: 1px solid var(--line); }
 .settings-add { color: var(--accent); cursor: pointer; }
@@ -25,22 +25,19 @@ dialog.sg-settings-modal[open] { display: flex; }
 .stepper .input { width: 64px; text-align: center; }
 
 /* MCP 页的服务器卡片和添加按钮 */
-.sg-provider-list { display: grid; gap: 10px; }
-.sg-add-card-btn { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; height: 44px; margin-top: 10px; border: 1.5px dashed var(--line-strong); border-radius: 16px; background: transparent; color: var(--ink-soft); font-weight: 500; cursor: pointer; transition: border-color 120ms, color 120ms, background 120ms; }
-.sg-add-card-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
-.sg-row-card { border: 1px solid var(--line); border-radius: 16px; background: var(--canvas); overflow: hidden; }
+.sg-provider-list { display: grid; gap: 8px; }
+.sg-add-card-btn { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; height: 44px; margin-top: 10px; border: 1px solid var(--line); border-radius: 12px; background: transparent; color: var(--ink-soft); font-weight: 400; cursor: pointer; transition: border-color 120ms, color 120ms, background 120ms; }
+.sg-add-card-btn:hover:not(:disabled) { background: var(--fill-subtle); color: var(--ink); }
+.sg-row-card { border: 1px solid var(--line); border-radius: 12px; background: var(--canvas); overflow: hidden; }
 .settings-provider.is-open { background: color-mix(in srgb, var(--surface-muted) 45%, var(--canvas)); }
 .sg-row-head { display: flex; align-items: center; gap: 6px; padding: 4px 10px 4px 6px; }
 .sg-provider-toggle:hover { background: var(--surface-hover); }
 .row-card-title { flex: 1; min-width: 0; display: grid; }
-.row-card-title strong { font-weight: 600; }
+.row-card-title strong { font-weight: 400; }
 .row-card-title small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-faint); font-size: 12px; }
-.provider-avatar { display: grid; place-items: center; width: 32px; height: 32px; flex: none; border-radius: 10px; background: var(--accent-soft); color: var(--accent); font-weight: 700; }
+.provider-avatar { display: grid; place-items: center; width: 32px; height: 32px; flex: none; border-radius: 10px; background: var(--accent-soft); color: var(--accent); font-weight: 400; }
 .credential { flex: none; padding: 2px 8px; border-radius: 999px; background: var(--surface-muted); color: var(--ink-faint); font-size: 11.5px; }
 .credential.on { background: color-mix(in srgb, var(--positive) 12%, var(--canvas)); color: #1f8a3b; }
-.mcp-tools { gap: 8px; justify-items: start; }
-.mcp-tool strong { font: 600 12.5px var(--font-mono); }
-.mcp-tool p { margin: 0; color: var(--ink-soft); font-size: 12.5px; }
 :is(.sg-provider-empty, .sg-model-empty) { margin: 6px 0; color: var(--ink-faint); font-size: 13px; }
 
 .provider-fields { display: grid; gap: 12px; margin: 0; padding: 0; border: 0; min-width: 0; }
@@ -51,16 +48,16 @@ dialog.sg-settings-modal[open] { display: flex; }
 .sg-model-list { display: grid; }
 .sg-model-row { display: flex; align-items: center; gap: 8px; min-height: 38px; padding: 0 4px 0 10px; border-radius: 10px; overflow: hidden; }
 .sg-model-row:hover { background: var(--fill-hover); }
-.catalog-id { font: 500 13px var(--font-mono); }
+.catalog-id { font: 13px var(--font-sans); }
 .sg-model-row small { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-faint); font-size: 12px; }
-.sg-add-model-btn { display: inline-flex; align-items: center; gap: 4px; margin-top: 6px; padding: 6px 10px; border: 0; border-radius: 9px; background: transparent; color: var(--accent); font-weight: 500; cursor: pointer; }
+.sg-add-model-btn { display: inline-flex; align-items: center; gap: 4px; margin-top: 6px; padding: 6px 10px; border: 0; border-radius: 9px; background: transparent; color: var(--accent); font-weight: 400; cursor: pointer; }
 .sg-add-model-btn:hover { background: var(--accent-soft); }
 .sg-editor-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 dialog.model-editor-modal, dialog.mcp-editor-modal, dialog.model-discovery-modal { width: 520px; }
 dialog.mcp-editor-modal .mcp-editor-scroll { max-height: calc(100vh - 220px); }
 .model-reasoning-options { margin: 0; padding: 0; border: 0; }
-.model-reasoning-options legend { margin-bottom: 6px; color: var(--ink-soft); font-size: 12.5px; font-weight: 500; }
+.model-reasoning-options legend { margin-bottom: 6px; color: var(--ink-soft); font-size: 12.5px; font-weight: 400; }
 .reasoning-options-grid { display: flex; flex-wrap: wrap; gap: 6px; }
 .reasoning-option { height: 30px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--card); cursor: pointer; font-size: 13px; transition: all 140ms, transform var(--spring-dur) var(--spring); }
 .reasoning-option:active { transform: scale(.94); transition-duration: 80ms; }
@@ -69,23 +66,23 @@ dialog.mcp-editor-modal .mcp-editor-scroll { max-height: calc(100vh - 220px); }
 .candidate-row.checked { border-color: var(--accent); background: var(--accent-soft); }
 .candidate-row input { accent-color: var(--accent); width: 16px; height: 16px; }
 .candidate-row span { flex: 1; display: grid; }
-.candidate-row strong { font: 500 13px var(--font-mono); }
+.candidate-row strong { font: 13px var(--font-sans); }
 .candidate-row em { color: var(--accent); font-size: 12px; font-style: normal; }
 
 .modal:not([open]) { display: none; }
-.modal { padding: 0; border: 0; border-radius: 22px; background: var(--raised); color: inherit; box-shadow: var(--shadow-floating); max-width: calc(100vw - 48px); max-height: calc(100vh - 48px); overflow: hidden; margin: auto; display: flex; flex-direction: column; font-size: 14px; }
+.modal { padding: 0; border: 1px solid var(--line); border-radius: 16px; background: var(--raised); color: inherit; box-shadow: var(--shadow-floating); max-width: calc(100vw - 48px); max-height: calc(100vh - 48px); overflow: hidden; margin: auto; display: flex; flex-direction: column; font-size: 14px; }
 .sg-provider-toggle { flex: 1; min-width: 0; display: flex; align-items: center; gap: 12px; padding: 6px 8px; border: 0; border-radius: 12px; background: transparent; cursor: pointer; text-align: left; color: inherit; }
 .sg-row-actions { display: flex; align-items: center; gap: 4px; }
 .sg-row-identity { flex: 1; min-width: 0; display: grid; gap: 2px; }
 .sg-editor { padding: 4px 18px 18px; }
 .sg-field { display: grid; gap: 6px; min-width: 0; }
-.sg-field > span { font-size: 12.5px; font-weight: 500; color: var(--ink-soft); }
+.sg-field > span { font-size: 12.5px; font-weight: 400; color: var(--ink-soft); }
 .sg-input { width: 100%; min-height: 36px; padding: 7px 11px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--card); color: inherit; outline: none; font-size: 13.5px; transition: border-color 140ms, box-shadow 140ms; }
 .sg-input:hover:not(:disabled) { border-color: #c9c9ce; }
 .sg-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3.5px color-mix(in srgb, var(--accent) 16%, transparent); }
 .sg-input:disabled { background: var(--surface-muted); color: var(--ink-faint); }
-textarea.sg-input { resize: vertical; line-height: 1.5; font: 12.5px var(--font-mono); }
-.sg-primary-btn, .sg-secondary-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 34px; padding: 0 14px; border: 0; border-radius: 10px; font-weight: 500; font-size: 13.5px; cursor: pointer; white-space: nowrap; transition: background 120ms, transform var(--spring-dur) var(--spring); }
+textarea.sg-input { resize: vertical; line-height: 1.5; font: 12.5px var(--font-sans); }
+.sg-primary-btn, .sg-secondary-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 34px; padding: 0 14px; border: 0; border-radius: 10px; font-weight: 400; font-size: 13.5px; cursor: pointer; white-space: nowrap; transition: background 120ms, transform var(--spring-dur) var(--spring); }
 .sg-primary-btn { background: var(--accent); color: #fff; }
 .sg-secondary-btn { background: var(--surface-muted); }
 .sg-primary-btn:active:not(:disabled), .sg-secondary-btn:active:not(:disabled) { transform: scale(.96); transition-duration: 80ms; }

@@ -2,7 +2,6 @@ import { LoaderCircle, Square } from 'lucide-react'
 import { memo, useId, useState } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type ActionError, type AppState } from '../appStore'
 import type { BackgroundTask } from '../protocol'
-import { useSelectionGuard } from '../interactions'
 import { CommandOutput } from './CommandOutput'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
@@ -38,12 +37,11 @@ const BackgroundTaskRow = memo(function BackgroundTaskRow({ task, sessionId, pen
 }) {
   const [expanded, setExpanded] = useState(false)
   const outputId = useId()
-  const guard = useSelectionGuard()
   const description = task.description || task.command
   return <article className="task-card">
     <div className="task-row">
       <button type="button" className="expandable-toggle" aria-expanded={expanded} aria-controls={outputId}
-        {...guard(() => setExpanded(value => !value))}>
+        onClick={() => setExpanded(value => !value)}>
         <ExpandChevron expanded={expanded} size={14} />
         <span className="task-name">{description}</span>
       </button>

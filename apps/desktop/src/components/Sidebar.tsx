@@ -1,9 +1,8 @@
 import { SelectionSlider } from './SelectionSlider'
 import { workspaceKey } from '../workspace'
-import { X, Minus, Plus, SquarePen, ScrollText, Sparkles, Plug, Settings as SettingsIcon } from 'lucide-react'
+import { X, Minus, Plus, Folder, FolderOpen } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useId, useRef, useState } from 'react'
-import { useSelectionGuard } from '../interactions'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
 import type { ThreadSummary, Workspace } from '../protocol'
 import { sessionTitles } from '../sessionTitle'
@@ -71,9 +70,9 @@ function SidebarView() {
         </header>
 
         <nav className="side-nav">
-          <button className={`nav-item${state.page === 'chat' && state.selectedSessionId === null ? ' is-active' : ''}`} type="button" onClick={() => appStore.newTask()}><SquarePen size={16} strokeWidth={1.7} />新建任务</button>
-          {([{ page: 'instructions', label: '自定义指令', Icon: ScrollText }, { page: 'skills', label: 'Skills', Icon: Sparkles }, { page: 'mcp', label: 'MCP', Icon: Plug }] as const).map(({ page, label, Icon }) =>
-            <button key={page} type="button" className={`nav-item${state.page === page ? ' is-active' : ''}`} onClick={() => appStore.setPage(page)}><Icon size={16} strokeWidth={1.7} />{label}</button>)}
+          <button className={`nav-item${state.page === 'chat' && state.selectedSessionId === null ? ' is-active' : ''}`} type="button" onClick={() => appStore.newTask()}>新建任务</button>
+          {([{ page: 'instructions', label: '自定义指令' }, { page: 'skills', label: 'Skills' }, { page: 'mcp', label: 'MCP' }] as const).map(({ page, label }) =>
+            <button key={page} type="button" className={`nav-item${state.page === page ? ' is-active' : ''}`} onClick={() => appStore.setPage(page)}>{label}</button>)}
         </nav>
         <section className="sidebar-section workspace-section">
           <div className="section-heading">
@@ -131,7 +130,7 @@ function SidebarView() {
           </div>
         </section>
         <footer className="sidebar-footer">
-          <button type="button" className="nav-item" onClick={() => appStore.setSettingsOpen(true)}><SettingsIcon size={16} strokeWidth={1.7} />设置</button>
+          <button type="button" className="nav-item" onClick={() => appStore.setSettingsOpen(true)}>设置</button>
         </footer>
       </div></aside>
       <SidebarDialog state={dialog} onClose={() => setDialog(current => current === dialog ? { kind: 'none' } : current)} />
@@ -140,16 +139,16 @@ function SidebarView() {
 }
 
 function WorkspaceButton({ workspace, selected, expanded, onToggle, onRemove }: { workspace: Workspace; selected: boolean; expanded: boolean; onToggle: () => void; onRemove: () => void }) {
-  const guard = useSelectionGuard()
   const name = workspaceName(workspace)
   return (
     <div className={`workspace-row${selected ? ' is-selected' : ''}`}>
       <button
         type="button"
         className="workspace-button"
-        {...guard(onToggle)}
+        onClick={onToggle}
         aria-expanded={expanded}
       >
+        {expanded ? <FolderOpen size={16} strokeWidth={1.5} className="workspace-folder" aria-hidden="true" /> : <Folder size={16} strokeWidth={1.5} className="workspace-folder" aria-hidden="true" />}
         <span className="workspace-name"><strong>{name}</strong></span>
         <ExpandChevron expanded={expanded} size={13} className="workspace-chevron" />
       </button>
@@ -176,17 +175,16 @@ function SessionButton({
   onRename: () => void
   onDelete: () => void
 }) {
-  const mainGuard = useSelectionGuard()
   const [menuOpen, setMenuOpen] = useState(false)
   const anchor = useRef<HTMLButtonElement>(null)
   const status = sessionState(session, live)
   return (
     <div data-selected={selected} className={`session-row${selected ? ' is-selected' : ''}`} onContextMenu={event => { event.preventDefault(); setMenuOpen(true) }}>
       <button ref={anchor} type="button" className="session-main" aria-haspopup="menu" aria-expanded={menuOpen}
-        onKeyDown={event => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); setMenuOpen(true) } }} {...mainGuard(() => {
+        onKeyDown={event => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); setMenuOpen(true) } }} onClick={() => {
         appStore.selectSession(session.threadId)
         if (window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
-      })}>
+      }}>
         <span className="session-label">
           <strong className={live && live.phase !== 'idle' ? 'activity-shimmer' : undefined}>{title}</strong>
           {session.status !== null && <time dateTime={session.updatedAt}>{relativeTime(session.updatedAt)}</time>}

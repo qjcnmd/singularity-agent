@@ -1,33 +1,33 @@
 /* 模型选择 */
 .sg-trigger:hover { background: var(--surface-hover); }
 .sg-trigger:active { transform: scale(.96); transition-duration: 80ms; }
-.sg-triggerLabel { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent); font-weight: 600; }
+.sg-triggerLabel { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent); font-weight: 400; }
 .sg-triggerEffort { flex: none; color: var(--ink-soft); }
 .sg-groups { max-height: 240px; overflow-y: auto; }
-.sg-groupTitle { margin: 0; padding: 6px 8px 2px; color: var(--ink-faint); font-size: 11.5px; font-weight: 500; }
-.sg-option { display: flex; align-items: center; justify-content: space-between; width: 100%; min-height: 29px; padding: 4px 8px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; text-align: left; font-size: 13px; font-weight: 500; }
+.sg-groupTitle { margin: 0; padding: 7px 9px 3px; color: var(--ink-faint); font-size: 12px; font-weight: 400; }
+.sg-option { display: flex; align-items: center; justify-content: space-between; width: 100%; min-height: 32px; padding: 5px 9px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; text-align: left; font-size: 14px; font-weight: 400; }
 .sg-option:hover, .sg-option:focus-visible { background: var(--surface-hover); outline: none; }
 .sg-option svg { color: var(--accent); }
 .effort { padding: 6px 8px 8px; }
-.effort-head { margin-bottom: 8px; text-align: center; font-size: 15px; font-weight: 650; transition: color 200ms; }
-.track { position: relative; height: 34px; margin: 4px 0; border-radius: 17px; background: var(--surface-muted); cursor: grab; touch-action: none; user-select: none; }
+.effort-head { margin-bottom: 6px; text-align: center; font-size: 13px; font-weight: 400; transition: color 200ms; }
+.track { position: relative; height: 24px; margin: 4px 0; border-radius: 12px; background: var(--surface-muted); cursor: grab; touch-action: none; user-select: none; }
 .track:active { cursor: grabbing; }
 /* 已选部分按档位着色，里面的闪点向左飘，像往右冲刺的尾气；位置和闪点都由 EffortSlider 逐帧驱动 */
-.track-fill { position: absolute; left: 0; top: 0; bottom: 0; overflow: hidden; border-radius: 17px; }
+.track-fill { position: absolute; left: 0; top: 0; bottom: 0; overflow: hidden; border-radius: 12px; }
 .track-fill .spark { position: absolute; left: 0; top: 0; width: 3px; height: 3px; margin: -1.5px 0 0 -1.5px; border-radius: 50%; background: #fff; opacity: 0; pointer-events: none; }
-.track-thumb { position: absolute; top: 3px; width: 28px; height: 28px; margin-left: -14px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 .5px rgb(0 0 0 / 10%), 0 1px 2px rgb(0 0 0 / 16%); pointer-events: none; transition: box-shadow 160ms; }
+.track-thumb { position: absolute; top: 3px; width: 18px; height: 18px; margin-left: -9px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 .5px rgb(0 0 0 / 10%), 0 1px 2px rgb(0 0 0 / 16%); pointer-events: none; transition: box-shadow 160ms; }
 .track-thumb[data-pressed="true"] { box-shadow: 0 0 0 .5px rgb(0 0 0 / 12%), 0 1px 4px rgb(0 0 0 / 24%); }
 .track input { position: absolute; width: 1px; height: 1px; margin: 0; opacity: 0; pointer-events: none; }
 .track:has(input:focus-visible) .track-thumb { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 
 .sg-root { min-width: 0; position: relative; max-width: 240px; width: max-content; }
-.sg-trigger { display: flex; align-items: center; gap: 4px; max-width: 240px; height: 34px; padding: 0 8px 0 11px; border: 0; border-radius: 999px; background: transparent; color: var(--ink-faint); font-weight: 500; cursor: pointer; transition: transform var(--spring-dur) var(--spring); width: 100%; min-width: 0; }
+.sg-trigger { display: flex; align-items: center; gap: 4px; max-width: 240px; height: 34px; padding: 0 8px 0 11px; border: 0; border-radius: 999px; background: transparent; color: var(--ink-faint); font-weight: 400; cursor: pointer; transition: transform var(--spring-dur) var(--spring); width: 100%; min-width: 0; }
 .sg-modelName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sg-check { color: var(--accent); }
 .sg-divider { height: 1px; margin: 4px 6px; background: var(--line); }
 .effort-field { padding: 0; margin: 0; border: 0; min-width: 0; }
 .effort-field:disabled { opacity: .45; }
 /* 固定宽度，打开时由 ModelPicker 按按钮中心定位；打开期间换模型、按钮变宽变窄，浮层也不移动。 */
-.sg-root > .model-popover { position: fixed; inset: auto; width: 220px; margin: 0; padding: 0; border: 0; overflow: visible; background: transparent; color: inherit; }
+.sg-root > .model-popover { position: fixed; inset: auto; width: 240px; margin: 0; padding: 0; border: 0; overflow: visible; background: transparent; color: inherit; }
 .sg-menu { padding: 5px; }

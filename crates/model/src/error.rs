@@ -119,6 +119,25 @@ pub(crate) fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields 
         .unwrap_or_default()
 }
 
+/// HTTP 错误共用的有界诊断；只补充原因，不改变调用方选定的错误分类。
+pub(crate) fn append_provider_http_diagnostic(
+    message: &mut String,
+    fields: &ProviderErrorBodyFields,
+    body: &[u8],
+) {
+    let facts = provider_wire_facts(fields);
+    if !facts.is_empty() {
+        message.push_str(&format!(" ({})", facts.join(", ")));
+    }
+    let diagnostic = match fields.message.as_deref() {
+        Some(message) => bounded_provider_error_diagnostic(message),
+        None => bounded_provider_error_diagnostic(&String::from_utf8_lossy(body)),
+    };
+    if !diagnostic.is_empty() {
+        message.push_str(&format!(" Provider diagnostic: {diagnostic}"));
+    }
+}
+
 /// 提供方错误码到 `ModelErrorKind` 的精确映射（全等匹配，不按错误文本猜测）；未命中时返回 `None`，由调用方决定分类。
 pub(crate) fn provider_error_kind_for_code(code: Option<&str>) -> Option<ModelErrorKind> {
     match code {

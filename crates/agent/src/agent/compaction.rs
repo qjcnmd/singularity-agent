@@ -97,7 +97,7 @@ impl RequestContext {
             tokio::task::spawn_blocking(move || PreparedCompaction::new(prefix, definitions, &model))
                 .await
                 .expect("summary preparation completes while the runtime is running")?;
-        let (response, _) = execute_request(
+        let (response, _, _) = execute_request(
             &self.provider,
             &self.session,
             &prepared.request,

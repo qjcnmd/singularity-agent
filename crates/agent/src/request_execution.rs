@@ -26,6 +26,7 @@ pub(crate) fn output_budget_tokens(
 }
 
 /// 发送一次请求，可重试的错误最多尝试三次。每次尝试使用新的消息 ID，等待期间可停止。
+/// 成功返回回复、记录 ID 和日志保存时间。
 pub(crate) async fn execute_request(
     provider: &OpenAiProvider,
     session: &SessionWriter,
@@ -33,7 +34,7 @@ pub(crate) async fn execute_request(
     on_event: &mut (dyn FnMut(TurnEvent) + Send),
     cancellation: &CancellationToken,
     purpose: RequestPurpose,
-) -> Result<(ModelTurnResponse, String), AgentError> {
+) -> Result<(ModelTurnResponse, String, String), AgentError> {
     if request.max_output_tokens == 0 {
         return Err(AgentError::Provider(singularity_model::ProviderError::new(
             ModelErrorKind::InvalidRequest,
@@ -91,13 +92,14 @@ pub(crate) async fn execute_request(
             ProviderAttemptStatus::Cancelled => TurnStatus::Interrupted,
             ProviderAttemptStatus::Error => TurnStatus::Failed,
         };
-        let items = if purpose == RequestPurpose::Generation && error.is_some() && !retry {
+        // 先用公开投影决定是否保存失败片段；时间在保存成功后补入，不重复转换正文。
+        let mut items = if purpose == RequestPurpose::Generation && error.is_some() && !retry {
             public_items(
                 &response.assistant_message,
                 &id,
                 item_status,
                 singularity_protocol::ToolStatus::Interrupted,
-                &singularity_core::now_iso(),
+                "",
             )
         } else {
             Vec::new()
@@ -114,15 +116,18 @@ pub(crate) async fn execute_request(
             }
         })
         .await;
-        if let Err(storage) = saved {
-            return Err(AgentError::Session(match error {
-                Some(error) => SessionError::InvalidSession(format!("{error}; 保存失败：{storage}")),
-                None => storage,
-            }));
-        }
+        let saved_at = match saved {
+            Ok(timestamp) => timestamp,
+            Err(storage) => {
+                return Err(AgentError::Session(match error {
+                    Some(error) => SessionError::InvalidSession(format!("{error}; 保存失败：{storage}")),
+                    None => storage,
+                }));
+            }
+        };
         on_event(TurnEvent::ProviderAttempt { observation: observation.clone() });
         let Some(error) = error else {
-            return Ok((response, id));
+            return Ok((response, id, saved_at));
         };
         if retry {
             on_event(TurnEvent::MessageDiscarded { message_id: id });
@@ -136,6 +141,11 @@ pub(crate) async fn execute_request(
             continue;
         }
         if purpose == RequestPurpose::Generation {
+            for item in &mut items {
+                if let singularity_protocol::HistoryItem::Message { at, .. } = item {
+                    *at = Some(saved_at.clone());
+                }
+            }
             on_event(TurnEvent::MessageFinished { message_id: id, items });
         }
         return Err(if error.kind == ModelErrorKind::Cancelled {

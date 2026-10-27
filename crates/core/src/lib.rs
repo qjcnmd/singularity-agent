@@ -50,15 +50,6 @@ pub fn display_path(path: &std::path::Path) -> String {
     }
 }
 
-/// 按字节预算截取 UTF-8 字符串前缀，按字符边界对齐；返回切片与是否截断。
-pub fn utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
-    if text.len() <= max_bytes {
-        return (text, false);
-    }
-    let end = text.floor_char_boundary(max_bytes);
-    (&text[..end], true)
-}
-
 /// 递归创建目录，失败时在错误中附带目录路径。
 pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(path).map_err(|error| format!("failed to create {}: {error}", path.display()))

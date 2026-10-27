@@ -9,12 +9,12 @@
 .conversation-header h1 { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 600; }
 .conversation-header h1 small { margin-left: 8px; color: var(--ink-faint); font-weight: 400; font-size: 12.5px; }
 .topbar-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
-.status-chip { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 11px 0 8px; border: 1px solid rgb(0 0 0 / 8%); border-radius: 999px;
-  background: color-mix(in srgb, var(--glass-base) 72%, transparent); backdrop-filter: blur(14px); color: var(--ink-soft); font-size: 12.5px; font-weight: 600; font-variant-numeric: tabular-nums; cursor: pointer;
+.status-chip { display: inline-flex; align-items: center; gap: 7px; height: 28px; padding: 0 10px 0 8px; border: 1px solid var(--line); border-radius: 999px;
+  background: var(--canvas); color: var(--ink-soft); font-size: 12px; font-weight: 400; font-variant-numeric: tabular-nums; cursor: pointer;
   transition: background 120ms, box-shadow 160ms, transform var(--spring-dur) var(--spring); }
-.status-chip:hover { background: var(--raised); color: var(--ink); }
+.status-chip:hover { background: var(--fill-subtle); color: var(--ink); }
 .status-chip:active { transform: scale(.95); transition-duration: 80ms; }
-.status-chip.is-open { background: var(--raised); color: var(--ink); box-shadow: 0 0 0 .5px rgb(0 0 0 / 8%), 0 6px 16px -8px rgb(0 0 0 / 25%); }
+.status-chip.is-open { background: var(--fill); color: var(--ink); }
 .status-running { display: inline-flex; align-items: center; gap: 5px; padding-left: 7px; border-left: 1px solid rgb(0 0 0 / 10%); }
 .status-running i { width: 7px; height: 7px; border-radius: 50%; background: var(--positive); animation: breathe 1.6s ease-in-out infinite; }
 
@@ -23,7 +23,7 @@
 @keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
 
 /* ---------- 按钮 ---------- */
-:is(.secondary-button, .primary-button, .danger-button) { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 34px; padding: 0 14px; border: 0; border-radius: 10px; background: var(--surface-muted); font-weight: 500; font-size: 13.5px; cursor: pointer; white-space: nowrap; transition: background 120ms, transform var(--spring-dur) var(--spring), opacity 120ms; }
+:is(.secondary-button, .primary-button, .danger-button) { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 34px; padding: 0 14px; border: 0; border-radius: 10px; background: var(--surface-muted); font-weight: 400; font-size: 13.5px; cursor: pointer; white-space: nowrap; transition: background 120ms, transform var(--spring-dur) var(--spring), opacity 120ms; }
 :is(.secondary-button, .primary-button, .danger-button):hover:not(:disabled) { background: var(--button-hover); }
 :is(.secondary-button, .primary-button, .danger-button):active:not(:disabled) { transform: scale(.96); transition-duration: 80ms; }
 :is(.secondary-button, .primary-button, .danger-button):disabled { opacity: .45; cursor: default; }
@@ -32,7 +32,7 @@
 .danger-button { background: var(--danger); color: #fff; }
 .danger-button:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 88%, #000); }
 :is(.primary-button, .secondary-button).small { height: 28px; padding: 0 10px; font-size: 12.5px; border-radius: 8px; }
-.quiet-button { height: 28px; padding: 0 9px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-soft); font-size: 12.5px; font-weight: 500; cursor: pointer; white-space: nowrap; transition: background 120ms, transform var(--spring-dur) var(--spring); }
+.quiet-button { height: 28px; padding: 0 9px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-soft); font-size: 12.5px; font-weight: 400; cursor: pointer; white-space: nowrap; transition: background 120ms, transform var(--spring-dur) var(--spring); }
 .quiet-button:hover:not(:disabled) { background: var(--surface-hover); color: var(--ink); }
 .quiet-button:active:not(:disabled) { transform: scale(.95); transition-duration: 80ms; }
 .quiet-button:disabled { opacity: .45; cursor: default; }
@@ -47,49 +47,44 @@
 @keyframes spin { to { transform: rotate(360deg); } }
 
 
-/* 白底侧栏；选中背景在列表下方滑动。 */
-.app-shell { display: grid; grid-template-rows: minmax(0, 1fr); height: 100vh; transition: grid-template-columns var(--smooth-dur) var(--smooth); overflow: hidden; background: var(--canvas); --side-bg: var(--sidebar); --side-hover: var(--surface-muted); --side-selected: color-mix(in srgb, var(--accent) 9%, var(--canvas)); --side-selected-ink: color-mix(in srgb, var(--accent) 80%, #000); --side-line: var(--line); }
+/* 浅灰侧栏，选中底色跟随调色盘；会话选中背景在列表下方滑动。 */
+.app-shell { display: grid; grid-template-rows: minmax(0, 1fr); height: 100vh; transition: grid-template-columns var(--smooth-dur) var(--smooth); overflow: hidden; background: var(--canvas); --side-bg: var(--sidebar); --side-hover: rgb(0 0 0 / 3.5%); --side-selected: color-mix(in srgb, var(--accent) 9%, var(--canvas)); --side-selected-ink: color-mix(in srgb, var(--accent) 80%, #000); --side-line: var(--line); }
 /* 深色底上把强调色压暗会看不清，选中项直接用强调色。 */
-[data-theme=dark] .app-shell { --side-selected-ink: var(--accent); }
+[data-theme=dark] .app-shell { --side-selected-ink: var(--accent); --side-hover: rgb(255 255 255 / 5%); }
 .sidebar { display: flex; flex-direction: column; width: 100%; min-width: 220px; height: 100%; padding: 10px 8px; overflow: hidden; }
-.sidebar-brand { display: flex; align-items: center; height: 40px; padding: 0 4px 0 10px; }
+.sidebar-brand { display: flex; align-items: center; height: 40px; padding: 0 2px 0 10px; }
 .sidebar-brand .icon-button { margin-left: auto; }
-.side-nav { display: grid; gap: 0; margin: 6px 0 4px; }
-.side-nav .nav-item { position: relative; border-radius: 0; background: var(--canvas); transition: background 120ms; }
-.side-nav .nav-item:first-child { border-radius: 8px 8px 0 0; }
-.side-nav .nav-item:last-child { border-radius: 0 0 8px 8px; }
-.side-nav .nav-item + .nav-item::before { content: ''; position: absolute; inset: 0 12px auto; height: 1px; background: var(--line); pointer-events: none; }
+.side-nav { display: grid; gap: 1px; margin: 4px 0 4px; }
 .side-nav .nav-item:focus-visible { z-index: 1; }
-.side-nav .nav-item:hover { background: var(--side-hover); }
-.side-nav .nav-item.is-active { background: var(--side-selected); }
-.side-nav .nav-item:active { transform: none; background: color-mix(in srgb, var(--accent) 16%, var(--canvas)); }
-.nav-item { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; border: 0; border-radius: 10px; background: transparent; color: var(--nav-ink); font-weight: 500; cursor: pointer; text-align: left; transition: background 120ms, transform var(--spring-dur) var(--spring); }
+.side-nav .nav-item:active { transform: none; }
+.nav-item { display: flex; align-items: center; gap: 10px; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: transparent; color: var(--nav-ink); font-weight: 400; cursor: pointer; text-align: left; transition: background 120ms, transform var(--spring-dur) var(--spring); }
 .nav-item svg { color: var(--ink-soft); }
 .nav-item:hover { background: var(--side-hover); }
 .sidebar-footer { flex: none; display: grid; padding-top: 6px; }
 .nav-item:active { transform: scale(.97); transition-duration: 80ms; }
-.nav-item.is-active { background: var(--side-selected); color: var(--side-selected-ink); }
+.nav-item.is-active { background: var(--side-selected); color: var(--side-selected-ink); font-weight: 400; }
 .nav-item.is-active svg { color: currentColor; }
-.section-heading { display: flex; align-items: center; justify-content: space-between; padding: 14px 6px 4px 10px; color: var(--ink-faint); font-size: 12px; font-weight: 500; }
+.section-heading { display: flex; align-items: center; justify-content: space-between; padding: 16px 4px 4px 10px; color: var(--ink-faint); font-size: 12px; font-weight: 400; }
 .workspace-list { flex: 1; overflow-y: auto; margin: 0 -8px; padding: 0 8px 12px; }
 
-.workspace-row { display: flex; align-items: center; gap: 2px; height: 34px; padding-right: 2px; border-radius: 10px; }
+.workspace-row { display: flex; align-items: center; gap: 2px; height: 34px; padding-right: 2px; border-radius: 8px; }
 .workspace-row:hover { background: var(--side-hover); }
 .workspace-row.is-selected { background: var(--side-selected); }
-.workspace-button { flex: 1; min-width: 0; display: flex; align-items: center; gap: 4px; height: 34px; padding: 0 4px 0 10px; border: 0; background: transparent; cursor: pointer; text-align: left; }
+.workspace-button { flex: 1; min-width: 0; display: flex; align-items: center; gap: 4px; height: 34px; padding: 0 4px 0 10px; color: var(--nav-ink); border: 0; background: transparent; cursor: pointer; text-align: left; }
 
 .session-list { position: relative; padding: 1px 0 6px; }
-.session-row { position: relative; z-index: 1; display: flex; align-items: center; height: 34px; border-radius: 10px; overflow: hidden; }
+.session-row { position: relative; z-index: 1; display: flex; align-items: center; height: 32px; border-radius: 8px; overflow: hidden; }
 .session-row:not(.is-selected):hover { background: var(--side-hover); }
 /* 选中背景由列表下方的滑块提供；会话选择沿用助手调色盘颜色。 */
 .session-list { --side-selected: var(--assistant-selection-bg); --side-selected-ink: var(--ink); }
-.selection-slider { position: absolute; top: 0; left: 0; right: 0; z-index: 0; border-radius: 10px; background: var(--side-selected); pointer-events: none;
+.selection-slider { position: absolute; top: 0; left: 0; right: 0; z-index: 0; border-radius: 8px; background: var(--side-selected); pointer-events: none;
   transition: transform var(--smooth-dur) var(--smooth), height var(--smooth-dur) var(--smooth), opacity 140ms; }
-.session-main { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; height: 100%; padding: 0 6px 0 10px; border: 0; background: transparent; cursor: pointer; text-align: left; color: var(--nav-ink); transition: color var(--smooth-dur) var(--smooth); }
+.session-main { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; height: 100%; padding: 0 6px 0 var(--session-indent); border: 0; background: transparent; cursor: pointer; text-align: left; color: var(--nav-ink); transition: color var(--smooth-dur) var(--smooth); }
 /* 选中时只变色、不加粗，颜色和滑块同步渐变，文字宽度不跳 */
 .session-row.is-selected .session-main { color: var(--side-selected-ink); }
 .session-main time { flex: none; color: var(--ink-faint); font-size: 11.5px; font-weight: 400; transition: opacity 120ms; }
-.session-status { width: 7px; height: 7px; flex: none; border-radius: 50%; background: transparent; }
+/* 状态圆点放在缩进区里，中心对齐上面项目行的文件夹图标（距行左 10px、宽 16px，中心 18px），不挤占会话名 */
+.session-status { position: absolute; left: 14.5px; top: 50%; width: 7px; height: 7px; margin-top: -3.5px; border-radius: 50%; background: transparent; }
 .session-status.status-failed { background: var(--danger); }
 .session-status.status-running { background: var(--accent); animation: breathe 1.6s ease-in-out infinite; }
 @keyframes breathe { 50% { transform: scale(.55); opacity: .45; } }
@@ -111,8 +106,12 @@
 .app-main { --panel-space: 0px; position: relative; flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--thread-bg, var(--canvas)); grid-column: 3; min-height: 0; height: 100%; overflow: hidden; }
 .conversation-header { position: absolute; inset: 0 0 auto 0; z-index: 5; display: flex; align-items: center; gap: 10px; height: 54px; padding: 0 24px 0 20px; background: color-mix(in srgb, var(--thread-bg, var(--canvas)) 76%, transparent); backdrop-filter: blur(18px) saturate(170%); overflow: visible; }
 .workspace-name { min-width: 0; }
-.workspace-button strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 13.5px; line-height: 20px; display: block; }
+.workspace-button strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 400; font-size: 13.5px; line-height: 20px; display: block; }
 .workspace-chevron { flex: none; }
+/* 文件夹图标占 16px + 8px 间距，会话名和下面的“显示更多”缩进到与项目名文字对齐 */
+.workspace-folder { flex: none; margin-right: 4px; color: var(--ink-soft); }
+.session-list { --session-indent: 34px; }
+.session-list > .quiet-button { margin-left: calc(var(--session-indent) - 9px); }
 .workspace-new, .workspace-remove { opacity: 0; width: 26px; height: 26px; }
 .workspace-row:hover :is(.workspace-new, .workspace-remove), .workspace-row:focus-within :is(.workspace-new, .workspace-remove) { opacity: 1; }
 .session-label { display: flex; align-items: center; flex: 1; min-width: 0; gap: 6px; }

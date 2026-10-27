@@ -20,7 +20,7 @@ use super::spec::BashArgs;
 /// 已保存的开始、结束，或仅供显示的输出更新。
 pub enum BashTaskUpdate {
     Updated(BackgroundTask),
-    Failed(String),
+    Failed { task: BackgroundTask, error: String },
 }
 
 struct Entry {
@@ -323,8 +323,8 @@ impl BashTasks {
                     duration_ms: result.duration_ms.expect("process duration"),
                 };
                 // 未保存的结果不能从日志读回，保留它和错误，直到本次会话关闭。
-                *entry.task.lock().expect("bash task lock") = task;
-                (self.on_update)(BashTaskUpdate::Failed(error));
+                *entry.task.lock().expect("bash task lock") = task.clone();
+                (self.on_update)(BashTaskUpdate::Failed { task, error });
                 entry.done.send_replace(Some(completion));
             }
         }

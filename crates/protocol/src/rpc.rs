@@ -19,14 +19,6 @@ pub struct BackgroundTaskParams {
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct FileSearchParams {
-    pub workspace_root: String,
-    pub query: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkspaceAddParams {
     pub root: String,
 }
@@ -167,7 +159,6 @@ macro_rules! rpc_methods {
 rpc_methods! {
     AppBootstrap => "app.bootstrap" (EmptyParams) -> crate::AppBootstrap,
     DirectoryPick => "directory.pick" (EmptyParams) -> DirectoryPickResult,
-    FileSearch => "file.search" (FileSearchParams) -> Vec<FileCandidate>,
     FileRead => "file.read" (FileReadParams) -> TextDocument,
     SkillsList => "skills.list" (WorkspaceParams) -> SkillCatalog,
     InstructionsRead => "instructions.read" (InstructionsReadParams) -> TextDocument,

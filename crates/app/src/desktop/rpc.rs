@@ -48,9 +48,6 @@ async fn dispatch(
         RpcRequest::InstructionsSave(params) => {
             blocking(move || app.save_instructions(params.workspace_root.as_deref(), &params.content)).await
         }
-        RpcRequest::FileSearch(params) => {
-            blocking(move || app.file_search(&params.workspace_root, &params.query)).await
-        }
         RpcRequest::FileRead(params) => blocking(move || read_text_file(&params.cwd, &params.path)).await,
         RpcRequest::WorkspaceAdd(params) => blocking(move || app.add_workspace(&params.root)).await,
         RpcRequest::ModelRead(_) => blocking(move || Ok(app.read_models())).await,

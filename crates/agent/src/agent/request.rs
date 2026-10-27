@@ -140,7 +140,7 @@ impl RequestContext {
         &mut self,
         on_event: &mut (dyn FnMut(TurnEvent) + Send),
         cancellation: &CancellationToken,
-    ) -> Result<(ModelTurnResponse, String)> {
+    ) -> Result<(ModelTurnResponse, String, String)> {
         let definitions = self.request_definitions();
         let tools = definitions.tools.clone();
         let mut messages = definitions.messages.clone();
@@ -158,7 +158,7 @@ impl RequestContext {
             };
             messages.extend(materials);
             let images = context::load_images(&mut messages, &directory)?;
-            Ok::<_, crate::session::SessionError>(ModelTurnRequest {
+            Ok::<_, std::io::Error>(ModelTurnRequest {
                 messages,
                 images,
                 tools,
@@ -186,7 +186,7 @@ impl Agent {
         &mut self,
         on_event: &mut (dyn FnMut(TurnEvent) + Send),
         cancellation: &CancellationToken,
-    ) -> Result<(ModelTurnResponse, String)> {
+    ) -> Result<(ModelTurnResponse, String, String)> {
         self.requests.reduce_context_if_needed(on_event, cancellation).await?;
         self.drain_inputs(on_event, cancellation).await?;
         let overflow = match self.requests.request_response(on_event, cancellation).await {

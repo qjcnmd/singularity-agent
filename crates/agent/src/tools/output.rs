@@ -124,9 +124,6 @@ impl CaptureState {
         }
         let tail_result = truncate_tail(&self.tail);
         let total_lines = self.total_lines();
-        // 缓冲上限是显示上限的两倍：裁过开头后仍超过显示上限，没裁过时就是全部输出。
-        // 所以走到这里一定能得到截断原因。
-        let truncated_by = tail_result.truncated_by.expect("truncated capture exceeds display budget");
         let start_line = total_lines.saturating_sub(tail_result.output_lines) + 1;
         let end_line = total_lines;
         let note = if tail_result.last_line_partial {
@@ -134,7 +131,7 @@ impl CaptureState {
                 "[Showing the last {} of output, ending at line {end_line}.]",
                 format_size(tail_result.content.len()),
             )
-        } else if truncated_by == TruncatedBy::Lines {
+        } else if tail_result.truncated_by == TruncatedBy::Lines {
             format!("[Showing lines {start_line}-{end_line} of {total_lines}.]")
         } else {
             format!(

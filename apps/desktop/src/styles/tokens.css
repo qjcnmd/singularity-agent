@@ -9,7 +9,7 @@
   --warning: #ff9500;
   color-scheme: light;
   --canvas: #ffffff;
-  --sidebar: #fff;
+  --sidebar: #f9f9f9;
   --surface: #ffffff;
   --surface-muted: #f4f4f6;
   /* 内容里的卡片、代码块和输入框；弹窗和浮层；半透明玻璃的底色 */
@@ -22,14 +22,14 @@
   --fill-hover: #f0f0f2;
   --button-hover: #ececef;
   --switch-off: #e1e1e5;
-  --nav-ink: #3a3a3f;
+  --nav-ink: #2f2f33;
   --surface-hover: rgb(0 0 0 / 4.5%);
   --ink: #1d1d1f;
   --ink-soft: #626268;
   --ink-faint: #9e9ea4;
   --ink-on-accent: #fff;
-  --line: #ebebee;
-  --line-strong: #dcdce0;
+  --line: #ececee;
+  --line-strong: #e0e0e3;
   --default-accent: #1783ff;
   --default-accent-soft: color-mix(in srgb, var(--default-accent) 10%, #fff);
   --accent: var(--default-accent);
@@ -37,11 +37,10 @@
   --danger: #ff3b30;
   --danger-soft: #fff0ef;
   --positive: #30b856;
-  --glass: #ffffff;
-  --glass-edge: #e6e6e6;
-  --glass-shadow: 0 12px 32px -12px rgb(0 0 0 / 18%), 0 4px 12px -6px rgb(0 0 0 / 8%);
+  /* 中性选中底：右键菜单和项目选择列表用，不随调色盘变色 */
+  --selected: rgb(0 0 0 / 5.5%);
   --shadow-soft: 0 1px 2px rgb(0 0 0 / 4%), 0 6px 20px -8px rgb(0 0 0 / 10%);
-  --shadow-floating: 0 22px 48px -16px rgb(0 0 0 / 24%), 0 4px 14px -4px rgb(0 0 0 / 8%);
+  --shadow-floating: 0 12px 32px -12px rgb(0 0 0 / 14%), 0 2px 6px -2px rgb(0 0 0 / 5%);
   /* 折叠展开和收起的动效变量由 main.tsx 在启动时按 motion.ts 写入 */
   --font-sans: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
   --font-mono: "Cascadia Code", Consolas, ui-monospace, monospace;
@@ -50,7 +49,11 @@
 * { box-sizing: border-box; }
 html, body, #root { width: 100%; height: 100%; margin: 0; }
 button, input, textarea, select { font: inherit; color: inherit; }
-button { color: inherit; }
+/* 控件里的 strong 只作结构标记，不使用浏览器默认粗体；正文加粗由正文样式负责。 */
+strong, b { font-weight: inherit; }
+button { color: inherit; user-select: none; }
+/* 界面控件不参与拖选；正文、文件内容和编辑区保留选字复制。 */
+:is(input, textarea, [contenteditable="true"], .timeline-body, .reasoning-body, .compaction-summary, .file-body, .file-path, .editor-path, .instruction-body, .form-error, .error-bubble, .background-task-error, .sg-model-config-error pre) { user-select: text; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #c7c7cc; border: 2px solid transparent; border-radius: 8px; background-clip: padding-box; }
@@ -67,7 +70,7 @@ button { color: inherit; }
 :root[data-theme=dark] {
   color-scheme: dark;
   --canvas: #202020;
-  --sidebar: #191919;
+  --sidebar: #181818;
   --surface: #202020;
   --surface-muted: #2f2f2f;
   --card: #262626;
@@ -92,13 +95,11 @@ button { color: inherit; }
   --danger: #ff453a;
   --danger-soft: #46201f;
   --positive: #30d158;
-  --glass: #242424;
-  --glass-edge: #333333;
-  --glass-shadow: 0 12px 36px -12px rgb(0 0 0 / 60%), 0 4px 12px -6px rgb(0 0 0 / 45%);
+  --selected: rgb(255 255 255 / 8%);
   --shadow-soft: 0 1px 3px rgb(0 0 0 / 40%), 0 4px 14px -6px rgb(0 0 0 / 35%);
   --shadow-floating: 0 12px 32px -8px rgb(0 0 0 / 55%), 0 4px 12px -4px rgb(0 0 0 / 40%);
 }
 
 :focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent); outline-offset: 2px; }
 svg { display: block; flex: none; }
-body { background: var(--canvas); color: var(--ink); font-family: var(--font-sans); font-size: 14px; line-height: 1.55; overflow: hidden; -webkit-font-smoothing: antialiased; }
+body { background: var(--canvas); color: var(--ink); font-family: var(--font-sans); font-size: 14px; line-height: 1.55; overflow: hidden; user-select: none; -webkit-font-smoothing: antialiased; }

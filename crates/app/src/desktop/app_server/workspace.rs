@@ -5,8 +5,7 @@ use std::path::Path;
 
 use singularity_protocol::{AppBootstrap, RedactedModelCatalog, RpcError, ThreadSummary, Workspace};
 
-use super::{AppServer, catalog_error, internal_error, invalid_request, workspace_error};
-use crate::desktop::workspace_files;
+use super::{AppServer, catalog_error, internal_error, workspace_error};
 use crate::desktop::workspace_store::WorkspaceError;
 
 impl AppServer {
@@ -141,16 +140,6 @@ impl AppServer {
             None => self.home.clone(),
         };
         Ok(directory.join("AGENTS.md"))
-    }
-
-    /// 搜索指定项目目录内的文件候选（最多返回 12 条）。
-    pub fn file_search(
-        &self,
-        workspace_root: &str,
-        query: &str,
-    ) -> Result<Vec<singularity_protocol::FileCandidate>, RpcError> {
-        let root = self.workspace(workspace_root)?.root;
-        workspace_files::search_files(&root, query).map_err(invalid_request)
     }
 }
 

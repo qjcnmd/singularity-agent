@@ -129,10 +129,11 @@ impl Connection {
                             )
                         })
                         .collect();
-                    let transport = StreamableHttpClientTransport::with_client(
-                        client,
-                        StreamableHttpClientTransportConfig::with_uri(url.clone()).custom_headers(headers),
-                    );
+                    let mut transport_config =
+                        StreamableHttpClientTransportConfig::with_uri(url.clone()).custom_headers(headers);
+                    // 会话过期也直接报告调用失败，不能由 SDK 重放可能有副作用的工具。
+                    transport_config.reinit_on_expired_session = false;
+                    let transport = StreamableHttpClientTransport::with_client(client, transport_config);
                     handler.serve(transport).await.map_err(|error| format!("MCP 初始化失败：{error}"))?
                 }
             };
@@ -179,27 +180,46 @@ impl Connection {
         signal: &CancellationToken,
     ) -> Result<CallToolResult, String> {
         let params = CallToolRequestParams::new(name.to_string()).with_arguments(args);
-        let request = self
-            .peer
-            .send_cancellable_request(
-                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
-                PeerRequestOptions::with_timeout(Duration::from_secs(self.config.tool_timeout_sec)),
+        let mut request_id = None;
+        // SDK 的响应超时仍会等待取消通知刷入管道；在这里统一限制发送和响应等待。
+        let reason = tokio::select! {
+            biased;
+            () = signal.cancelled() => "Operation aborted".to_string(),
+            result = tokio::time::timeout(Duration::from_secs(self.config.tool_timeout_sec), async {
+                let request = self.peer.send_cancellable_request(
+                    ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                    PeerRequestOptions::no_options(),
+                ).await?;
+                request_id = Some(request.id.clone());
+                request.await_response().await
+            }) => match result {
+                Ok(result) => {
+                    let result = result.map_err(|error| self.config.redact(format!("MCP 调用失败：{error}")))?;
+                    return match result {
+                        ServerResult::CallToolResult(result) => Ok(result),
+                        _ => Err("MCP 服务器返回了不支持的工具结果。".into()),
+                    };
+                }
+                Err(_) => format!("MCP 调用超过 {} 秒。", self.config.tool_timeout_sec),
+            },
+        };
+        if let Some(id) = request_id {
+            // 取消发送失败也保留共享连接，不打断同服务器的其他并行调用；远端可能继续执行。
+            match tokio::time::timeout(
+                Duration::from_secs(3),
+                self.peer
+                    .notify_cancelled(CancelledNotificationParam::new(Some(id), Some(reason.clone()))),
             )
             .await
-            .map_err(|error| self.config.redact(format!("MCP 调用失败：{error}")))?;
-        let id = request.id.clone();
-        let result = tokio::select! {
-            () = signal.cancelled() => {
-                self.peer.notify_cancelled(CancelledNotificationParam::new(Some(id), Some("User stopped the turn".into()))).await
-                    .map_err(|error| self.config.redact(format!("MCP 取消通知失败：{error}")))?;
-                return Err("Operation aborted".into());
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(self.config.redact(format!("{reason} MCP 取消通知失败：{error}")));
+                }
+                Err(_) => return Err(format!("{reason} MCP 取消通知超过 3 秒。")),
             }
-            result = request.await_response() => result,
-        }.map_err(|error| self.config.redact(format!("MCP 调用失败：{error}")))?;
-        match result {
-            ServerResult::CallToolResult(result) => Ok(result),
-            _ => Err("MCP 服务器返回了不支持的工具结果。".into()),
         }
+        Err(reason)
     }
 
     pub async fn close(&self) {

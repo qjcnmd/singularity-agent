@@ -90,8 +90,8 @@ impl Conversation {
         let mut runtime = self.runtime(&view);
         let background_tasks = self.background_tasks();
         let writer = lock_writer(&self.writer);
-        let mut history = crate::runtime::thread_catalog::read_thread_history(&writer)?;
-        runtime.usage = crate::runtime::history::session_usage(writer.entries());
+        let (mut history, usage) = crate::runtime::thread_catalog::read_thread_history(&writer)?;
+        runtime.usage = usage;
         view.activity.merge(&mut history);
         Ok(SessionReadResult {
             revision: view.last_event_revision,

@@ -30,11 +30,27 @@ impl Conversation {
                     self.spawn_operation(operation);
                 }
             }
-            singularity_agent::tools::BashTaskUpdate::Failed(message) => self.background_error(message),
+            singularity_agent::tools::BashTaskUpdate::Failed { task, error } => {
+                let mut view = self.lock_view();
+                self.set_background_failure(&mut view, error);
+                view.last_event_revision = (self.publish)(StreamEvent::BackgroundTaskUpdated {
+                    session_id: self.thread().thread_id,
+                    payload: Box::new(singularity_protocol::BackgroundTaskUpdate {
+                        phase: self.phase(),
+                        task,
+                    }),
+                });
+                self.publish_changed(&mut view);
+            }
         }
     }
     pub(super) fn background_error(&self, message: String) {
         let mut view = self.lock_view();
+        self.set_background_failure(&mut view, message);
+        self.publish_changed(&mut view);
+    }
+
+    fn set_background_failure(&self, view: &mut view::ConversationView, message: String) {
         self.pause_background_resume();
         view.failure = Some(SessionFailure {
             source: SessionOperation::Turn,
@@ -44,7 +60,6 @@ impl Conversation {
                 item_id: None,
             },
         });
-        self.publish_changed(&mut view);
     }
     /// 保存失败后保留待处理的输入，停止当前操作并暂停自动继续；用户下一条消息恢复。
     pub fn pause_background_resume(&self) {

@@ -3,20 +3,17 @@
 /* 输入区始终固定在底部，浮在消息上方，消息从玻璃后面滚过；底部渐变保证用量数据可读 */
 .app-main .composer-region { position: absolute; width: auto; left: 0; right: var(--panel-space); bottom: 0; padding-top: 18px; transition: right var(--smooth-dur) var(--smooth);
   background: linear-gradient(to bottom, transparent 0, transparent 55%, color-mix(in srgb, var(--thread-bg, var(--canvas)) 92%, transparent) 88%); }
-/* 玻璃质感：半透明白底 + 背景模糊 + 顶部高光边，聚焦时只加深阴影，不变色 */
-.composer-card { position: relative; padding: 12px 12px 10px 16px; border: 1px solid color-mix(in srgb, var(--glass-base) 75%, transparent); border-radius: 24px;
-  background: color-mix(in srgb, var(--glass-base) 66%, transparent); backdrop-filter: blur(22px) saturate(180%);
-  box-shadow: 0 0 0 .5px rgb(0 0 0 / 9%), inset 0 1px 0 color-mix(in srgb, var(--glass-base) 85%, transparent), 0 12px 32px -14px rgb(0 0 0 / 20%), 0 2px 6px -2px rgb(0 0 0 / 5%);
-  transition: box-shadow 200ms, background 200ms; }
-.composer-card:focus-within { background: color-mix(in srgb, var(--glass-base) 76%, transparent); box-shadow: 0 0 0 .5px rgb(0 0 0 / 11%), inset 0 1px 0 color-mix(in srgb, var(--glass-base) 90%, transparent), 0 16px 40px -14px rgb(0 0 0 / 26%), 0 2px 8px -2px rgb(0 0 0 / 6%); }
-@media (prefers-reduced-transparency: reduce) { .composer-card { background: var(--glass-base); backdrop-filter: none; } }
+/* 实色卡片：细描边加很轻的投影，聚焦时描边略深，不变色 */
+.composer-card { position: relative; padding: 12px 12px 10px 16px; border: 1px solid var(--line-strong); border-radius: 22px; background: var(--card);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 3%), 0 6px 20px -10px rgb(0 0 0 / 10%); transition: border-color 160ms, box-shadow 160ms; }
+.composer-card:focus-within { border-color: color-mix(in srgb, var(--ink) 18%, var(--line-strong)); box-shadow: 0 1px 2px rgb(0 0 0 / 3%), 0 8px 24px -10px rgb(0 0 0 / 12%); }
 .composer-card textarea { display: block; width: 100%; min-height: 46px; max-height: 200px; border: 0; outline: 0; resize: none; background: transparent; font: 14.5px/1.55 var(--font-sans); field-sizing: content; }
 .composer-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0 0 -4px; }
 .composer-actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
 
 
 /* 加号直接打开附件选择 */
-.attach-button { display: grid; place-items: center; flex: none; width: 34px; height: 34px; padding: 0; border: 1px solid rgb(0 0 0 / 8%); border-radius: 50%; background: color-mix(in srgb, var(--glass-base) 70%, transparent); box-shadow: 0 1px 2px rgb(0 0 0 / 5%); color: var(--ink-soft); cursor: pointer; transition: background 120ms, color 120ms, transform var(--spring-dur) var(--spring); }
+.attach-button { display: grid; place-items: center; flex: none; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--ink-soft); cursor: pointer; transition: background 120ms, color 120ms, transform var(--spring-dur) var(--spring); }
 .attach-button:hover:not(:disabled) { background: var(--surface-hover); color: var(--ink); }
 .attach-button:active:not(:disabled) { transform: scale(.94); transition-duration: 80ms; }
 .attach-button:disabled { opacity: .45; cursor: default; }
@@ -28,16 +25,16 @@
 .water-orb:active:not([aria-disabled="true"]) { transform: scale(.94); transition-duration: 90ms; }
 .water-orb[aria-disabled="true"] { cursor: default; }
 
-/* @文件 / Skill 建议 */
-.composer-candidates { position: relative; max-height: 260px; overflow-y: auto; padding: 5px; background: var(--raised); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow-floating); }
+/* Skill 候选 */
+.composer-candidates { position: relative; max-height: 280px; overflow-y: auto; padding: 6px; background: var(--raised); border: 1px solid var(--line-strong); border-radius: 16px; box-shadow: var(--shadow-floating); }
 /* 每个候选都是单行：名字一列、说明一列，放不下的部分用省略号 */
-.composer-candidates button { display: grid; grid-template-columns: minmax(0, 190px) minmax(0, 1fr); align-items: baseline; gap: 12px; width: 100%; padding: 7px 10px; border: 0; border-radius: 10px; background: transparent; cursor: pointer; text-align: left; }
+.composer-candidates button { display: grid; grid-template-columns: minmax(0, 190px) minmax(0, 1fr); align-items: baseline; gap: 12px; width: 100%; padding: 7px 10px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; text-align: left; }
 .composer-candidates button[aria-selected="true"] { background: var(--accent-soft); }
-.composer-candidates strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 13px var(--font-mono); }
-.composer-candidates span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-faint); font-size: 12px; }
+.composer-candidates strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-size: 13.5px; font-weight: 400; }
+.composer-candidates span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-faint); font-size: 13px; }
 
 .composer-context { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.workspace-picker-trigger { display: inline-flex; align-items: center; gap: 7px; min-width: 0; height: 32px; padding: 0 8px 0 10px; border: 0; border-radius: 999px; background: transparent; color: var(--ink-soft); font-weight: 500; cursor: pointer; transition: background 120ms, transform var(--spring-dur) var(--spring); }
+.workspace-picker-trigger { display: inline-flex; align-items: center; gap: 7px; min-width: 0; height: 32px; padding: 0 8px 0 10px; border: 0; border-radius: 999px; background: transparent; color: var(--ink-soft); font-weight: 400; cursor: pointer; transition: background 120ms, transform var(--spring-dur) var(--spring); }
 .workspace-picker-trigger span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-picker-trigger:hover { background: var(--surface-hover); color: var(--ink); }
 .workspace-picker-trigger:active { transform: scale(.96); transition-duration: 80ms; }
@@ -54,4 +51,4 @@
 .workspace-picker-options button { display: flex; align-items: center; gap: 7px; padding: 7px 8px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; text-align: left; }
 .workspace-picker-options button span:nth-child(2) { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-picker-options button:hover { background: var(--surface-hover); }
-.workspace-picker-options button[aria-pressed=true] { color: var(--accent); }
+.workspace-picker-options button[aria-pressed=true] { background: var(--selected); }

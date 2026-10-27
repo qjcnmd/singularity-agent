@@ -1,5 +1,4 @@
 import { useEffect, useRef } from 'react'
-import { useSelectionGuard } from '../../interactions'
 import { Fluid } from './fluid'
 import { Bubbles } from './bubbles'
 
@@ -24,7 +23,6 @@ const clamp = (value: number) => Math.max(0, Math.min(1, Number.isFinite(value) 
 const hexToRgb = (hex: string): [number, number, number] => { const n = parseInt(hex.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255] }
 
 export function WaterOrb({ percent, compacting, enabled, size, label, color, onPress }: WaterOrbProps) {
-  const guard = useSelectionGuard()
   const canvas = useRef<HTMLCanvasElement>(null)
   // 每帧读最新属性，不触发 React 重渲染
   const latest = useRef({ occupancy: clamp(percent / 100), compacting, color: hexToRgb(color) })
@@ -104,12 +102,11 @@ export function WaterOrb({ percent, compacting, enabled, size, label, color, onP
 
       // 翻滚时由粒子重建连续水面，不旋转一张画好的遮罩
       if (fluidBlend > 0) {
-        field.fill(0)
         physicalField.fill(0)
-        for (const particle of fluid.particles) { splat(particle.x, particle.y, physicalField); splat(particle.x, particle.y, field) }
+        for (const particle of fluid.particles) splat(particle.x, particle.y, physicalField)
         for (let y = 0; y < resolution; y++) for (let x = 0; x < resolution; x++) {
           let sum = 0
-          for (let k = -2; k <= 2; k++) sum += field[y * resolution + Math.max(0, Math.min(resolution - 1, x + k))]
+          for (let k = -2; k <= 2; k++) sum += physicalField[y * resolution + Math.max(0, Math.min(resolution - 1, x + k))]
           blurred[y * resolution + x] = sum / 5
         }
         for (let y = 0; y < resolution; y++) for (let x = 0; x < resolution; x++) {
@@ -208,7 +205,7 @@ export function WaterOrb({ percent, compacting, enabled, size, label, color, onP
   }, [size])
 
   return <button type="button" className="water-orb" style={{ width: size, height: size }} aria-label={label} aria-disabled={!enabled}
-    {...guard(() => { if (enabled) onPress?.() })}>
+    onClick={() => { if (enabled) onPress?.() }}>
     <canvas ref={canvas} style={{ width: size, height: size }} aria-hidden="true" />
   </button>
 }

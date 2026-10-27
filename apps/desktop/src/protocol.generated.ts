@@ -26,11 +26,7 @@ export type DiscoverModelsParams = { providerId: string, baseUrl: string, apiKey
 
 export type EmptyParams = Record<string, never>;
 
-export type FileCandidate = { path: string, };
-
 export type FileReadParams = { cwd: string, path: string, };
-
-export type FileSearchParams = { workspaceRoot: string, query: string, };
 
 export type HistoryItem = { "type": "message", id: string, status: TurnStatus, role: HistoryMessageRole, text: string,
 /**
@@ -279,7 +275,6 @@ export type WorkspaceParams = { workspaceRoot: string, };
 export interface RpcContract {
   "app.bootstrap": { params: EmptyParams; result: AppBootstrap }
   "directory.pick": { params: EmptyParams; result: DirectoryPickResult }
-  "file.search": { params: FileSearchParams; result: Array<FileCandidate> }
   "file.read": { params: FileReadParams; result: TextDocument }
   "skills.list": { params: WorkspaceParams; result: SkillCatalog }
   "instructions.read": { params: InstructionsReadParams; result: TextDocument }

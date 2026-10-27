@@ -46,7 +46,7 @@ pub struct McpTool {
 }
 
 impl McpTool {
-    /// 调用服务器原始工具；取消通知与超时由 SDK 处理，调用不会自动重试。
+    /// 调用服务器原始工具；连接负责总超时和有界取消通知，调用不会自动重试。
     pub async fn call(
         &self,
         arguments: serde_json::Map<String, serde_json::Value>,

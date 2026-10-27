@@ -26,7 +26,7 @@ pub enum TruncatedBy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Truncation {
     pub content: String,
-    pub truncated_by: Option<TruncatedBy>,
+    pub truncated_by: TruncatedBy,
     /// 截断后实际保留下来的行数。
     pub output_lines: usize,
     /// 末尾那行本身超过字节上限时，是否只保留了该行尾部。
@@ -44,22 +44,13 @@ pub fn format_size(bytes: usize) -> String {
     }
 }
 
-/// 保留文本尾部（供 `bash` 和 MCP 工具输出使用）：最多保留最后 `DEFAULT_MAX_LINES` 行且不超过 `DEFAULT_MAX_BYTES`。
+/// 为已超出展示预算的 Bash 或 MCP 输出选择尾部，保留最后 `DEFAULT_MAX_LINES` 行且不超过 `DEFAULT_MAX_BYTES`。
+/// 调用方先判定超限；捕获缓冲裁过开头时仍大于展示预算。
 /// 末尾单行超过字节上限时，只保留该行尾部的完整 UTF-8 字符（`last_line_partial = true`）。
 pub fn truncate_tail(content: &str) -> Truncation {
     let max_lines = DEFAULT_MAX_LINES;
     let max_bytes = DEFAULT_MAX_BYTES;
-    let total_bytes = content.len();
     let lines = content.split_terminator('\n');
-    let total_lines = lines.clone().count();
-    if total_lines <= max_lines && total_bytes <= max_bytes {
-        return Truncation {
-            content: content.to_string(),
-            truncated_by: None,
-            output_lines: total_lines,
-            last_line_partial: false,
-        };
-    }
     let mut output: Vec<&str> = Vec::new();
     let mut output_bytes = 0usize;
     // 截断类别由真正触发的那个边界决定：行数上限先命中就按行报告，否则按字节报告。
@@ -75,7 +66,7 @@ pub fn truncate_tail(content: &str) -> Truncation {
             if output.is_empty() {
                 return Truncation {
                     content: truncate_string_to_bytes_from_end(line, max_bytes),
-                    truncated_by: Some(TruncatedBy::Bytes),
+                    truncated_by: TruncatedBy::Bytes,
                     output_lines: 1,
                     last_line_partial: true,
                 };
@@ -91,7 +82,7 @@ pub fn truncate_tail(content: &str) -> Truncation {
     };
     Truncation {
         content,
-        truncated_by: Some(truncated_by),
+        truncated_by,
         output_lines: output.len(),
         last_line_partial: false,
     }

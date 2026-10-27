@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use super::{ProviderError, configuration_error, validate_base_url, validate_identifier};
 use crate::ModelErrorKind;
+use crate::error::{append_provider_http_diagnostic, parse_provider_error_body};
 use crate::transport::http::{client_builder, transport_error_source};
 
 /// 查询提供方的模型 ID；调用方只提供编辑器里的取值和解析好的凭据。
@@ -29,7 +30,7 @@ pub async fn discover(base_url: &str, api_key: &str) -> Result<Vec<String>, Prov
     };
     let response = request.send().await.map_err(discovery_transport_error)?;
     if !response.status().is_success() {
-        return Err(discovery_http_error(response.status().as_u16()));
+        return Err(discovery_http_error(response).await);
     }
     let body: Value = read_response_body(response).await?;
     read_listing(&body)
@@ -52,19 +53,25 @@ fn discovery_transport_error(error: reqwest::Error) -> ProviderError {
 }
 
 fn read_listing(body: &Value) -> Result<Vec<String>, ProviderError> {
-    let entries: Vec<(&str, &Value)> = if let Some(data) = body.get("data").and_then(Value::as_array) {
-        data.iter().filter_map(|entry| Some((entry.get("id")?.as_str()?, entry))).collect()
-    } else if let Some(models) = body.get("models").and_then(Value::as_object) {
-        models.iter().map(|(id, entry)| (id.as_str(), entry)).collect()
-    } else {
-        return Err(discovery_response_error("提供方未返回 data 模型列表或 models 目录。"));
-    };
     let mut models = BTreeSet::new();
-    for (id, entry) in entries {
+    let mut add_model = |id: &str, entry: &Value| {
         // 格式不对或 ID 不合法的条目直接跳过，不让整次发现失败。
         if entry.is_object() && validate_identifier(id, "model id").is_ok() {
             models.insert(id.to_string());
         }
+    };
+    if let Some(data) = body.get("data").and_then(Value::as_array) {
+        for entry in data {
+            if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                add_model(id, entry);
+            }
+        }
+    } else if let Some(directory) = body.get("models").and_then(Value::as_object) {
+        for (id, entry) in directory {
+            add_model(id, entry);
+        }
+    } else {
+        return Err(discovery_response_error("提供方未返回 data 模型列表或 models 目录。"));
     }
     Ok(models.into_iter().collect())
 }
@@ -73,10 +80,21 @@ fn discovery_response_error(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ModelErrorKind::JsonSchemaViolation, message)
 }
 
-fn discovery_http_error(status: u16) -> ProviderError {
+async fn discovery_http_error(response: reqwest::Response) -> ProviderError {
+    let status = response.status().as_u16();
     // 模型发现由用户手动触发，不自动重试，只复用 HTTP 状态码的错误分类。
-    ProviderError::new(
+    let mut error = ProviderError::new(
         crate::error::provider_error_kind_for_http_status(status),
         format!("获取模型失败：HTTP {status}。"),
-    )
+    );
+    match response.bytes().await {
+        Ok(body) => {
+            let fields = parse_provider_error_body(&body);
+            append_provider_http_diagnostic(&mut error.message, &fields, &body);
+        }
+        Err(read_error) => error
+            .message
+            .push_str(&format!(" 无法读取提供方错误响应（{}）。", transport_error_source(read_error))),
+    }
+    error
 }

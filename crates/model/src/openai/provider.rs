@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config::selection::{OpenAiProviderConfig, SelectedModel};
 use crate::config::{ModelConfigManager, ModelConfigurationSnapshot};
 use crate::error::{
-    ProviderError, bounded_provider_error_diagnostic, parse_provider_error_body,
-    provider_error_kind_for_code, provider_error_kind_for_http_status,
+    ProviderError, append_provider_http_diagnostic, parse_provider_error_body, provider_error_kind_for_code,
+    provider_error_kind_for_http_status,
 };
 use crate::openai::{
     chat_completions_endpoint, openai_chat_stream_request_payload, openai_responses_stream_request_payload,
@@ -149,17 +149,7 @@ impl OpenAiProvider {
         if let Some(kind) = provider_error_kind_for_code(fields.code.as_deref()) {
             error.kind = kind;
         }
-        let facts = crate::error::provider_wire_facts(&fields);
-        if !facts.is_empty() {
-            error.message.push_str(&format!(" ({})", facts.join(", ")));
-        }
-        let diagnostic = match fields.message.as_deref() {
-            Some(message) => bounded_provider_error_diagnostic(message),
-            None => bounded_provider_error_diagnostic(&String::from_utf8_lossy(&body)),
-        };
-        if !diagnostic.is_empty() {
-            error.message.push_str(&format!(" Provider diagnostic: {diagnostic}"));
-        }
+        append_provider_http_diagnostic(&mut error.message, &fields, &body);
         error
     }
 }

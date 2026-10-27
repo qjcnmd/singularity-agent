@@ -10,7 +10,7 @@
 .question-answer-row:active { transform: scale(.985); transition-duration: 80ms; }
 .question-answer-row[aria-checked="true"], .question-custom-answer[data-selected="true"] { border-color: var(--accent); background: var(--accent-soft); }
 .question-answer-row small { display: block; color: var(--ink-faint); font-size: 12px; }
-.question-option-mark { display: grid; place-items: center; width: 22px; height: 22px; flex: none; border-radius: 7px; background: var(--surface-muted); color: var(--ink-soft); font-size: 12px; font-weight: 600; }
+.question-option-mark { display: grid; place-items: center; width: 22px; height: 22px; flex: none; border-radius: 7px; background: var(--surface-muted); color: var(--ink-soft); font-size: 12px; font-weight: 400; }
 .question-answer-row[aria-checked="true"] .question-option-mark { background: var(--accent); color: #fff; }
 .question-custom-answer textarea { flex: 1; border: 0; outline: 0; resize: none; background: transparent; font: inherit; field-sizing: content; }
 .question-pager { display: flex; align-items: center; gap: 4px; color: var(--ink-faint); font-size: 12px; font-variant-numeric: tabular-nums; }

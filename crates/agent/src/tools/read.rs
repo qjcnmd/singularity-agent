@@ -134,7 +134,7 @@ fn execute_reader(
         if next_bytes > DEFAULT_MAX_BYTES {
             // 已有完整行留待下一页；首行本身超预算时展示不完整的前缀。
             if state.selected.is_empty() {
-                let (prefix, _) = singularity_core::utf8_prefix(&text, DEFAULT_MAX_BYTES);
+                let prefix = &text[..text.floor_char_boundary(DEFAULT_MAX_BYTES)];
                 state.selected.push(format!("{prefix}…[truncated]"));
                 state.incomplete_line = true;
             }
