@@ -21,6 +21,7 @@ singularity_mcp = { path = "../mcp" }
 singularity_protocol = { path = "../protocol" }
 thiserror.workspace = true
 base64 = "0.22"
+vte = { version = "0.15", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 
 [target.'cfg(windows)'.dependencies]

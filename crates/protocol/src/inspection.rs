@@ -36,24 +36,38 @@ pub struct DirectoryPickResult {
     pub path: Option<String>,
 }
 
-/// 本轮请求实际加载的指令文件和工具名称，供工作台查看上下文。
+/// 本轮请求实际加载的各上下文模块，供工作台查看上下文。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct InjectedContext {
-    pub instructions: Vec<InstructionFile>,
-    /// 内置工具名。
-    pub tools: Vec<String>,
-    /// MCP 服务器提供的工具名。
-    pub mcp_tools: Vec<String>,
+    pub modules: Vec<ContextModule>,
 }
 
-/// 当前上下文实际加载的全局或项目指令文件。
+/// 新建任务页上的一个上下文胶囊：一类指令、一组工具、Skills 或一个 MCP 服务器。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-pub struct InstructionFile {
-    pub path: String,
-    pub content: String,
-    pub global: bool,
+pub struct ContextModule {
+    pub id: String,
+    pub group: ContextGroup,
+    pub label: String,
+    /// 悬停说明：用途，以及包含的工具名、指令文件或连接错误。
+    pub detail: String,
+    /// 请求里这部分指令和工具定义的估算 Token 数；MCP 服务器尚未连接时为 0。
+    pub tokens: u64,
+    /// 基础能力，不能关闭。
+    pub locked: bool,
+    /// 本任务是否开着；新建任务页的预览里全部为 true。
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ContextGroup {
+    Instructions,
+    Tools,
+    Skills,
+    Mcp,
 }

@@ -44,6 +44,15 @@ class AppStore extends SessionStore {
     void this.drafts.set(id, { ...draft, files: append ? [...new Set([...draft.files, ...files])] : files })
   }
 
+  /** 新任务页的上下文胶囊：只记关掉的模块；随草稿保存，发送后和草稿一起清空，下次新建任务重新全开。 */
+  setModuleEnabled(id: string, enabled: boolean): void {
+    const key = this.draftKey()
+    if (key === null) return
+    const draft = this.inputDraft()
+    const rest = (draft.disabledModules ?? []).filter(disabled => disabled !== id)
+    void this.drafts.set(key, { ...draft, disabledModules: enabled ? rest : [...rest, id] })
+  }
+
   modelSelection(): ModelSelection | null {
     if (this.state.selectedSessionId !== null) return this.state.session?.runtime.selection ?? null
     return effectiveSelection(this.inputDraft().selection, this.state.bootstrap?.modelCatalog)
@@ -89,7 +98,7 @@ class AppStore extends SessionStore {
       const input = { text: draft.text, images: await Promise.all(draft.images.map(imageUpload)), files: draft.files }
       if (sessionId === null) {
         if (selection === null) throw new Error('请选择模型')
-        await this.startSession({ ...input, workspaceRoot, selection }, navigation)
+        await this.startSession({ ...input, workspaceRoot, selection, disabledModules: draft.disabledModules ?? [] }, navigation)
       } else await this.transport.rpc('session.submit', { ...input, sessionId })
       await this.drafts.clearIfUnchanged(key, draft)
     })
@@ -251,12 +260,12 @@ class AppStore extends SessionStore {
       () => this.transport.rpc(method, params(sessionId)))
   }
 
-  setSidebarView(value: Partial<PersistedView['sidebarView']>): void {
-    this.saveView({ sidebarView: { ...this.state.sidebarView, ...value } })
-  }
-
   setBackgroundOpen(backgroundOpen: boolean): void {
     this.saveView({ backgroundOpen })
+  }
+
+  setSidebarView(value: Partial<PersistedView['sidebarView']>): void {
+    this.saveView({ sidebarView: { ...this.state.sidebarView, ...value } })
   }
 
 

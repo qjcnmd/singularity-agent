@@ -1,4 +1,4 @@
-//! `read` 工具：读取文本文件（支持按 `offset` 和 `limit` 分页）或图片文件。
+//! `read` 工具：读取文本文件（支持按 `offset` 和 `limit` 分页）；图片文件由 `view_image` 负责。
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -14,7 +14,7 @@ use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, default_cap_summary,
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "Read a text file or view an image (PNG, JPEG, WebP, GIF first frame, BMP). Images are returned as visual input, not text. offset and limit only apply to text. Text output is limited to {} (whichever is hit first). Use the returned offset to continue with unread lines. A line larger than {}KB is explicitly marked incomplete; use bash to read that line in byte ranges.",
+        "Read a text file. Text output is limited to {} (whichever is hit first). Use the returned offset to continue with unread lines. A line larger than {}KB is explicitly marked incomplete; use bash to read that line in byte ranges.",
         default_cap_summary(),
         default_max_kb()
     )
@@ -56,24 +56,12 @@ pub(crate) fn execute(args: &ReadArgs, cwd: &Path, signal: &CancellationToken) -
         Err(error) => return error_result(format!("Could not read file: {}. {error}", args.path)),
     };
     let mut reader = BufReader::with_capacity(64 * 1024, file);
-    let image_format = match reader.fill_buf() {
-        Ok(bytes) => image::guess_format(bytes).ok(),
-        Err(error) => return error_result(format!("Could not read file: {}. {error}", args.path)),
-    };
-    if image_format.is_some() {
-        let image = match crate::image::InputImage::read(&full_path, reader) {
-            Ok(image) => image,
-            Err(error) => return error_result(error),
-        };
-        if signal.is_cancelled() {
-            return error_result(ABORTED_MESSAGE);
+    match reader.fill_buf() {
+        Ok(bytes) if image::guess_format(bytes).is_ok() => {
+            return error_result(format!("{} is an image file, not text.", args.path));
         }
-        let mut result = ToolExecution::text(format!(
-            "Read image: {} ({} × {})",
-            args.path, image.attachment.width, image.attachment.height
-        ));
-        result.images.push(image);
-        return result;
+        Ok(_) => {}
+        Err(error) => return error_result(format!("Could not read file: {}. {error}", args.path)),
     }
     execute_reader(&args.path, args.offset, args.limit, &mut reader, signal)
 }

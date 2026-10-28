@@ -150,7 +150,10 @@ impl AppServer {
             &self.home,
         )
         .map_err(invalid_request)?;
-        let thread = self.catalog.create_thread(&workspace.root, params.selection).map_err(catalog_error)?;
+        let thread = self
+            .catalog
+            .create_thread(&workspace.root, params.selection, params.disabled_modules)
+            .map_err(catalog_error)?;
         let conversation = self.insert_conversation(thread);
         conversation.start(input).map_err(conversation_error)?;
         Ok(conversation.start_result())

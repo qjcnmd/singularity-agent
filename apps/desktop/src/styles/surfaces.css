@@ -32,8 +32,8 @@
 .content-disclosure > div { overflow: hidden; }
 .expand-chevron { display: block; flex: none; color: var(--ink-faint); transition: transform var(--disclosure-duration) var(--smooth); }
 .expand-chevron.is-open { transform: rotate(90deg); }
-.sg-trigger .expand-chevron, .workspace-picker-trigger .expand-chevron, .protocol-trigger .expand-chevron { transform: rotate(90deg); }
-.sg-trigger .expand-chevron.is-open, .workspace-picker-trigger .expand-chevron.is-open, .protocol-trigger .expand-chevron.is-open { transform: rotate(270deg); }
+.sg-trigger .expand-chevron, .protocol-trigger .expand-chevron { transform: rotate(90deg); }
+.sg-trigger .expand-chevron.is-open, .protocol-trigger .expand-chevron.is-open { transform: rotate(270deg); }
 /* 下拉浮层显隐动画 */
 .picker-disclosure {
   display: none;

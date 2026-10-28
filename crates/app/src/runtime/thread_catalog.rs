@@ -28,10 +28,17 @@ impl ThreadCatalog {
         &self,
         cwd: &str,
         model: singularity_protocol::ModelSelection,
+        disabled_modules: Vec<String>,
     ) -> Result<SessionManager, CatalogError> {
         let thread_id = Uuid::now_v7().to_string();
-        SessionManager::create_with_id(Path::new(cwd), &self.sessions_dir, &thread_id, model)
-            .map_err(|error| self.session_error(&thread_id, error))
+        SessionManager::create_with_id(
+            Path::new(cwd),
+            &self.sessions_dir,
+            &thread_id,
+            model,
+            disabled_modules,
+        )
+        .map_err(|error| self.session_error(&thread_id, error))
     }
 
     /// 以写入方式打开日志并截掉未写完的末尾；返回的写者交给 Conversation 长期持有。

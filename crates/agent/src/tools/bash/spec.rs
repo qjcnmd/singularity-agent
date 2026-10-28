@@ -55,6 +55,8 @@ pub(crate) struct TaskIdArgs {
 pub(crate) struct TaskOutputArgs {
     pub(crate) task_id: String,
     #[serde(default)]
+    pub(crate) cursor: u64,
+    #[serde(default)]
     pub(crate) wait_ms: u64,
 }
 
@@ -100,11 +102,12 @@ pub(crate) fn task_list_spec() -> singularity_model::ModelToolSchema {
 pub(crate) fn task_output_spec() -> singularity_model::ModelToolSchema {
     singularity_model::ModelToolSchema {
         name: "task_output".to_string(),
-        description: "Read a background command's bounded accumulated output tail and current state, including saved output after reopening the session. wait_ms waits for a live command for at most 30000 ms; it does not restart the command or reset its timeout. Completion notifies you automatically, so avoid short polling loops.".to_string(),
+        description: "Read a background command's output after cursor and its current state, including saved output after reopening the session. Pass the previous next_cursor to read only new output; omit cursor or use 0 to reread. Cursors count UTF-8 bytes of plain output, excluding status and notices. Long output returns a bounded tail with omitted ranges and a full-output file when available. Reads never consume output. wait_ms waits for a live command for at most 30000 ms; cancelling the wait does not stop the command. Completion notifies you automatically, so avoid short polling loops.".to_string(),
         parameters_schema: json!({
             "type": "object",
             "properties": {
                 "task_id": { "type": "string" },
+                "cursor": { "type": "integer", "minimum": 0, "default": 0, "description": "Previous next_cursor; 0 rereads from the start, subject to the output limit" },
                 "wait_ms": { "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "default": 0 }
             },
             "required": ["task_id"], "additionalProperties": false

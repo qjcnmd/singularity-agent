@@ -9,11 +9,11 @@ import { actionToastTransition, smooth } from '../motion'
 import { McpSettings } from './McpSettings'
 import { CircleCheck, RefreshCw } from 'lucide-react'
 
-function PageFrame({ title, actions, children }: { title: string; actions?: ReactNode; children: ReactNode }) {
+function PageFrame({ title, actions, children }: { title?: string; actions?: ReactNode; children: ReactNode }) {
   const reduced = useReducedMotion()
   return <div className="manage-scroll">
     <motion.div className="manage-page" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={reduced ? { duration: 0 } : smooth}>
-      <header><h2>{title}</h2>{actions}</header>{children}
+      {title && <header><h2>{title}</h2>{actions}</header>}{children}
     </motion.div>
   </div>
 }
@@ -60,13 +60,13 @@ export function InstructionsPage() {
     } catch (error) { setError(error instanceof Error ? error.message : String(error)) }
     finally { setSaving(false) }
   }
-  return <PageFrame title="自定义指令">
+  return <PageFrame>
     <div className="instructions-layout">
-      <nav className="instruction-targets" aria-label="指令范围">
-        <button type="button" className="message-bubble" disabled={saving} aria-current={target === null ? 'true' : undefined} onClick={() => setTarget(null)}>全局指令</button>
+      <nav className="instruction-targets" aria-label="指令范围" role="tablist">
+        <button type="button" role="tab" disabled={saving} aria-selected={target === null} onClick={() => setTarget(null)}>全局</button>
         {state.bootstrap?.workspaces.map(workspace => {
           const root = workspaceKey(workspace.root)
-          return <button key={root} type="button" className="message-bubble" disabled={saving} aria-current={target === root ? 'true' : undefined} onClick={() => setTarget(root)}>
+          return <button key={root} type="button" role="tab" disabled={saving} aria-selected={target === root} onClick={() => setTarget(root)}>
             {workspaceName(workspace)}
           </button>
         })}

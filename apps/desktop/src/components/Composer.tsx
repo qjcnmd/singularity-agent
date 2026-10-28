@@ -1,8 +1,8 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { actionOrigin, appStore, useAppStore, pendingKey } from '../appStore'
 import { ModelPicker } from './ModelPicker'
-import { WorkspacePicker } from './WorkspacePicker'
 import { PickerSurface } from './PickerSurface'
+import { ContextCapsules } from './ContextCapsules'
 import { WaterOrb } from './orb/WaterOrb'
 import { motion, useReducedMotion } from 'motion/react'
 import { inputTrigger } from '../inputTrigger'
@@ -101,6 +101,7 @@ function ComposerView({ accent }: { accent: string }) {
     <motion.section ref={region} className="composer-region" aria-label="任务输入区"
       layout={reducedMotion ? false : 'position'}
       transition={{ layout: reducedMotion ? { duration: 0 } : smooth }}>
+      {sessionId === null && <ContextCapsules />}
       <div ref={candidateAnchor} className="composer-candidate-anchor">
         <PickerSurface open={showCandidateSurface}>
           <div ref={candidateList} className="composer-candidates" onKeyDown={event => {
@@ -199,7 +200,6 @@ function ComposerView({ accent }: { accent: string }) {
             <button type="button" className="attach-button" aria-label="添加附件" title="添加附件" disabled={attachmentInput.disabled} onClick={attachmentInput.open}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true"><path d="M5 12h14M12 5v14" /></svg>
             </button>
-            {sessionId === null && <WorkspacePicker state={state} />}
           </div>
           <div className="composer-actions"><ModelPicker state={state} />{orb}</div>
         </div>

@@ -5,7 +5,7 @@
 .file-list:empty { display: none; }
 .composer-card > .file-list { margin: 0 0 8px; }
 .message-body + .file-list, .image-list + .file-list { margin-top: 8px; }
-.file-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 240px; height: 30px; padding: 0 10px; border-radius: 10px; background: var(--fill); color: var(--ink); font-size: 12.5px; }
+.file-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 240px; height: 30px; padding: 0 10px; border-radius: 12px; background: var(--fill); color: var(--ink); font-size: var(--block-font-size); }
 .timeline-user .file-chip { background: rgb(255 255 255 / 20%); color: #fff; }
 .file-chip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-chip-remove { display: grid; place-items: center; width: 18px; height: 18px; margin-right: -4px; padding: 0; border: 0; border-radius: 50%; background: none; color: var(--ink-faint); cursor: pointer; }

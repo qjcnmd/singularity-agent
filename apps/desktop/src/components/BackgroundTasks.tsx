@@ -1,4 +1,4 @@
-import { LoaderCircle, Square } from 'lucide-react'
+import { LoaderCircle } from 'lucide-react'
 import { memo, useId, useState } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type ActionError, type AppState } from '../appStore'
 import type { BackgroundTask } from '../protocol'
@@ -38,24 +38,24 @@ const BackgroundTaskRow = memo(function BackgroundTaskRow({ task, sessionId, pen
   const [expanded, setExpanded] = useState(false)
   const outputId = useId()
   const description = task.description || task.command
-  return <article className="task-card">
-    <div className="task-row">
-      <button type="button" className="expandable-toggle" aria-expanded={expanded} aria-controls={outputId}
-        onClick={() => setExpanded(value => !value)}>
-        <ExpandChevron expanded={expanded} size={14} />
-        <span className="task-name">{description}</span>
-      </button>
-      <span className="task-status" role="status"><i />运行中</span>
+  return <article className="activity-step background-task">
+    <div className="background-task-head">
       <button type="button" className="task-stop" disabled={pending || !connected}
         aria-busy={pending} aria-label={`${error ? '重试停止' : '停止'}后台命令：${description}`}
+        title={pending ? '正在停止' : '停止命令'}
         onClick={() => void appStore.stopBackgroundTask(sessionId, task.taskId)}>
-        {pending ? <LoaderCircle size={13} className="spinner" aria-hidden="true" /> : <Square size={9} fill="currentColor" strokeWidth={0} />}
+        <LoaderCircle size={13} className="spinner" aria-hidden="true" />
+      </button>
+      <button type="button" className="activity-toggle" aria-expanded={expanded} aria-controls={outputId}
+        title={task.command} onClick={() => setExpanded(value => !value)}>
+        <span className="step-summary">{task.command}</span>
+        <ExpandChevron expanded={expanded} size={13} />
       </button>
     </div>
     {error && <div className="background-task-error" role="alert">
       <span>{error.message}</span>
     </div>}
-    <div id={outputId}><Disclosure open={expanded}><div className="task-details">
+    <div id={outputId}><Disclosure open={expanded}><div className="activity-expanded">
       <div className="timeline-body activity-output" tabIndex={0} aria-label={`${description}，命令与输出`}>
         <CommandOutput command={task.command} output={task.output} />
       </div>

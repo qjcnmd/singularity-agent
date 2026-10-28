@@ -99,6 +99,8 @@ pub(crate) fn tool_result_message(tool_call_id: &str, execution: &ToolExecution)
     Message::ToolResult {
         content,
         tool_call_id: tool_call_id.to_string(),
+        display_output: execution.display.as_ref().map(|display| display.output.clone()),
+        background_task_id: execution.display.as_ref().and_then(|display| display.background_task_id.clone()),
         is_error: execution.is_error,
         duration_ms: execution.duration_ms,
         read_source: execution.read_source,
@@ -107,11 +109,20 @@ pub(crate) fn tool_result_message(tool_call_id: &str, execution: &ToolExecution)
 
 /// 实时完成和历史读取共用工具结果的显示内容。
 pub fn public_tool_result(message: &Message) -> Option<singularity_protocol::ToolResult> {
-    let Message::ToolResult { is_error, duration_ms, read_source, .. } = message else {
+    let Message::ToolResult {
+        display_output,
+        background_task_id,
+        is_error,
+        duration_ms,
+        read_source,
+        ..
+    } = message
+    else {
         return None;
     };
     Some(singularity_protocol::ToolResult {
-        output: message.content_text(),
+        output: display_output.clone().unwrap_or_else(|| message.content_text()),
+        background_task_id: background_task_id.clone(),
         images: message.images().cloned().collect(),
         is_error: *is_error,
         duration_ms: *duration_ms,

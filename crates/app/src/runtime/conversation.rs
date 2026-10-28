@@ -79,6 +79,7 @@ impl Conversation {
             thread_id: session.session_id().to_owned(),
             cwd: session.cwd_string(),
             model,
+            disabled_modules: session.disabled_modules(),
         };
         let usage = crate::runtime::history::session_usage(session.entries());
         let context_window = configured_context_window(&models, &thread.model);

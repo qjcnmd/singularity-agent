@@ -34,12 +34,16 @@ pub struct CompactionEntry {
     #[serde(rename = "firstKeptEntryId")]
     pub first_kept_entry_id: String,
 }
-/// 任务设置：模型选择或任务名称。
+/// 任务设置：模型选择、创建时关闭的上下文模块或任务名称。
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "metadataType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionMetadata {
     ThreadSettings {
         selection: singularity_protocol::ModelSelection,
+    },
+    /// 创建任务时关闭的上下文模块 ID，只写这一次；全开时不写。
+    DisabledModules {
+        ids: Vec<String>,
     },
     ThreadName {
         name: String,

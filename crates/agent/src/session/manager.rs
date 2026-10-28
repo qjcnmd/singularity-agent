@@ -48,6 +48,7 @@ impl SessionManager {
         sessions_dir: &Path,
         session_id: &str,
         selection: singularity_protocol::ModelSelection,
+        disabled_modules: Vec<String>,
     ) -> Result<Self> {
         let cwd = singularity_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
         let cwd_display = cwd.display().to_string();
@@ -56,11 +57,17 @@ impl SessionManager {
         let header = SessionHeader::new(session_id.to_string(), cwd_display, now_iso());
         let mut header_bytes = serde_json::to_vec(&header)?;
         header_bytes.push(b'\n');
-        let entries = vec![SessionEntry::Metadata {
-            id: super::new_entry_id(),
-            timestamp: header.timestamp.clone(),
-            metadata: SessionMetadata::ThreadSettings { selection },
-        }];
+        let metadata = [SessionMetadata::ThreadSettings { selection }].into_iter().chain(
+            (!disabled_modules.is_empty())
+                .then_some(SessionMetadata::DisabledModules { ids: disabled_modules }),
+        );
+        let entries: Vec<_> = metadata
+            .map(|metadata| SessionEntry::Metadata {
+                id: super::new_entry_id(),
+                timestamp: header.timestamp.clone(),
+                metadata,
+            })
+            .collect();
         for entry in &entries {
             serde_json::to_writer(&mut header_bytes, entry)?;
             header_bytes.push(b'\n');
@@ -240,5 +247,19 @@ impl SessionData {
     /// 解析出的记录，按写入顺序排列。
     pub fn entries(&self) -> &[SessionEntry] {
         &self.entries
+    }
+
+    /// 创建任务时关闭的上下文模块 ID；全开的任务没有这条记录。
+    pub fn disabled_modules(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .find_map(|entry| match entry {
+                SessionEntry::Metadata {
+                    metadata: SessionMetadata::DisabledModules { ids },
+                    ..
+                } => Some(ids.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 }

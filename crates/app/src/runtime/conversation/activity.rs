@@ -60,6 +60,7 @@ impl Activity {
                 {
                     *result = Some(singularity_protocol::ToolResult {
                         output: output.clone(),
+                        background_task_id: None,
                         images: Vec::new(),
                         read_source: None,
                         is_error: false,

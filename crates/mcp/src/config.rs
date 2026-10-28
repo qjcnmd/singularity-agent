@@ -14,8 +14,6 @@ pub(crate) struct Configuration {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ServerConfig {
-    #[serde(default = "enabled")]
-    pub enabled: bool,
     #[serde(default = "startup_timeout")]
     pub startup_timeout_sec: u64,
     #[serde(default = "tool_timeout")]
@@ -24,9 +22,6 @@ pub(crate) struct ServerConfig {
     pub transport: McpTransportConfig,
 }
 
-fn enabled() -> bool {
-    true
-}
 fn startup_timeout() -> u64 {
     30
 }
@@ -37,7 +32,6 @@ fn tool_timeout() -> u64 {
 impl ServerConfig {
     pub fn from_input(input: McpServerInput) -> Self {
         Self {
-            enabled: input.enabled,
             startup_timeout_sec: input.startup_timeout_sec,
             tool_timeout_sec: input.tool_timeout_sec,
             transport: input.transport,
@@ -47,7 +41,6 @@ impl ServerConfig {
     pub fn into_input(self, server_id: String) -> McpServerInput {
         McpServerInput {
             server_id,
-            enabled: self.enabled,
             startup_timeout_sec: self.startup_timeout_sec,
             tool_timeout_sec: self.tool_timeout_sec,
             transport: self.transport,

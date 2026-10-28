@@ -6,7 +6,7 @@ import { ToolGroupRow } from './ToolGroupRow'
 import { toolDisplay } from '../toolDisplay'
 import { memo, useEffect, useState, type ReactNode } from 'react'
 import { CommandOutput } from './CommandOutput'
-import { CircleAlert, CircleCheck, CircleX, LoaderCircle, FileText, SquareTerminal, Pencil, MessageCircleQuestion } from 'lucide-react'
+import { CircleAlert, CircleCheck, CircleX, LoaderCircle, FileText, SquareTerminal, Image, MessageCircleQuestion } from 'lucide-react'
 import { motion, useReducedMotion } from 'motion/react'
 import { enter, pop } from '../motion'
 import { useAppStore } from '../appStore'
@@ -101,7 +101,7 @@ function ToolCard({ item, itemKey, cwd, userHome, sessionId, onDisclosureChange 
     previous.liveSessions[sessionId ?? '']?.backgroundTasks === next.liveSessions[sessionId ?? '']?.backgroundTasks)
   const { status, shown } = toolDisplay(item, liveSessions[sessionId ?? '']?.backgroundTasks)
   const filePath = pathFromArgs(item.name, item.args)
-  const title = item.name === 'ask_user_question' ? '询问用户' : filePath?.replace(/\\/g, '/').endsWith('/SKILL.md') ? '读取技能' : item.name
+  const title = item.name === 'ask_user_question' ? '询问用户' : item.name === 'skill' ? '读取技能' : item.name
   const summary = filePath !== null ? displayPath(filePath, cwd, userHome) : toolSummary(item.name, item.args) || firstLine(item.result?.output ?? '')
 
   return (
@@ -185,11 +185,11 @@ function CompactionRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemK
 function ToolOutput({ item: fact, filePath }: { item: Extract<HistoryItem, { type: 'tool' }>; filePath: string | null }) {
   const input = fact.args
   const background = ['bash', 'task_list', 'task_output', 'task_stop'].includes(fact.name)
-  // 后台任务标识供模型与后端关联任务，展示参数和结构化结果时省略。
+  // 内部关联字段不展示；命令输出原样保留，不按工具参数过滤业务数据。
   const displayJson = (key: string, value: unknown) => background && (key === 'taskId' || key === 'task_id') ? undefined : value
-  const parameters = JSON.stringify(input, displayJson, 2)
+  const parameters = JSON.stringify(input, (key, value: unknown) => fact.name === 'task_output' && key === 'cursor' ? undefined : displayJson(key, value), 2)
   let output = fact.result?.output ?? ''
-  if (background && output !== '') {
+  if (background && fact.name !== 'bash' && output !== '') {
     try { output = JSON.stringify(JSON.parse(output), displayJson, 2) }
     catch { /* 普通命令输出和工具错误是文本，原样显示。 */ }
   }
@@ -229,7 +229,7 @@ function StepIcon({ name, status }: { name: string; status: ToolStatus }) {
   if (status === 'completed') return <CircleCheck size={13} className="ok" />
   if (status === 'failed') return <CircleAlert size={13} className="bad" />
   if (status === 'interrupted') return <CircleX size={13} className="bad" />
-  const Icon = name === 'bash' ? SquareTerminal : name === 'ask_user_question' ? MessageCircleQuestion : name === 'write' || name === 'edit' ? Pencil : FileText
+  const Icon = name === 'bash' ? SquareTerminal : name === 'ask_user_question' ? MessageCircleQuestion : name === 'view_image' ? Image : FileText
   return <Icon size={13} />
 }
 

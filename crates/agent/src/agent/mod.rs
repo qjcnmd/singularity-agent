@@ -17,6 +17,7 @@ mod compaction;
 pub use compaction::compaction_unneeded;
 mod dispatch;
 mod inbox;
+pub mod modules;
 mod questions;
 pub(crate) mod request;
 
@@ -43,6 +44,8 @@ pub struct AgentConfig {
     pub instruction_home: std::path::PathBuf,
     /// 本轮在开始记录前读取的文件指令。
     pub initial_instructions: Vec<singularity_core::InstructionFile>,
+    /// 创建任务时关闭的上下文模块 ID，任务期间不变。
+    pub disabled_modules: Vec<String>,
 }
 
 /// Agent 循环可能返回的错误。

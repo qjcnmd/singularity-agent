@@ -1,7 +1,7 @@
 //! 组装模型请求：本轮的指令和工具定义，加上从会话日志生成的对话上下文。
 //! 发送、重试和保存请求记录在 crate::request_execution，普通请求和摘要请求共用。
 
-use super::{Agent, AgentError, RequestContext, Result};
+use super::{Agent, AgentError, RequestContext, Result, modules};
 use crate::request_execution::{execute_request, output_budget_tokens};
 use crate::session::{context, lock_writer};
 use singularity_model::Message;
@@ -22,12 +22,12 @@ impl RequestDefinitions {
     fn new(messages: Vec<Message>, tools: Vec<singularity_model::ModelToolSchema>) -> Self {
         let instructions = messages
             .iter()
-            .map(|message| context::estimate_tokens_of(&message.content_text()) + 4)
+            .map(|message| singularity_core::estimate_tokens_of(&message.content_text()) + 4)
             .sum::<u64>();
         let tool_tokens = if tools.is_empty() {
             0
         } else {
-            context::estimate_tokens_of(
+            singularity_core::estimate_tokens_of(
                 &serde_json::to_string(&tools).expect("tool schemas are serializable"),
             ) + 4
         };
@@ -37,14 +37,6 @@ impl RequestDefinitions {
             estimated_tokens: instructions + tool_tokens,
         }
     }
-}
-
-fn file_instruction_message(instructions: &str) -> Message {
-    // 转义正文里的结束标签，否则模型会以为指令在那里结束。
-    let instructions = instructions.replace("</file-instructions>", "<\\/file-instructions>");
-    Message::user(format!(
-        "<file-instructions>\nThese global and project file instructions apply to the current workspace. More specific files take precedence. Direct user instructions take precedence over these file instructions.\n{instructions}\n</file-instructions>"
-    ))
 }
 
 impl RequestContext {
@@ -62,7 +54,7 @@ impl RequestContext {
         Ok(())
     }
 
-    /// 读取本轮技能与工具目录，组装模型收到的定义。
+    /// 读取本轮技能与工具目录，按本任务开着的模块组装模型收到的定义。
     pub(super) async fn load_definitions(
         &mut self,
         cancellation: &CancellationToken,
@@ -70,55 +62,34 @@ impl RequestContext {
         let home = self.config.instruction_home.clone();
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
         let skill_cwd = cwd.clone();
-        let loaded = std::mem::take(&mut self.config.initial_instructions);
+        let instructions = std::mem::take(&mut self.config.initial_instructions);
+        let disabled = &self.config.disabled_modules;
         let skills = tokio::task::spawn_blocking(move || {
             singularity_core::skills::SkillCatalog::discover(&skill_cwd, &home)
         })
         .await
         .expect("skill discovery completes while the runtime is running");
-        let discovered = self.mcp.discover(&cwd, cancellation).await;
+        let skipped_servers: Vec<String> = disabled
+            .iter()
+            .filter_map(|id| id.strip_prefix(modules::MCP_PREFIX))
+            .map(str::to_owned)
+            .collect();
+        let discovered = self.mcp.discover(&cwd, cancellation, &skipped_servers).await;
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        let mcp_tools: Vec<String> = discovered.tools.iter().map(|tool| tool.name.clone()).collect();
-        self.registry.set_mcp_tools(discovered.tools);
-        let registry = &self.registry;
-        let mut developer =
-            crate::prompts::assemble_developer_instructions(&singularity_core::display_path(&cwd));
-        if !discovered.instructions.is_empty() {
-            developer.push_str(&format!("\n\n{}", discovered.instructions.join("\n\n")));
-        }
-        if !discovered.errors.is_empty() {
-            developer.push_str(&format!("\n\nUnavailable MCP servers:\n{}", discovered.errors.join("\n")));
-        }
-        let mut messages = vec![Message::developer(developer)];
-        let skill_prompt = skills.prompt();
-        if !skill_prompt.is_empty() {
-            messages.push(Message::developer(skill_prompt));
-        }
-        if !loaded.is_empty() {
-            let text = loaded
-                .iter()
-                .map(|file| format!("# Instructions from {}\n\n{}", file.path.display(), file.content))
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            messages.push(file_instruction_message(&text));
-        }
-        let tools = registry.provider_schemas();
-        let context = singularity_protocol::InjectedContext {
-            instructions: loaded
-                .into_iter()
-                .map(|file| singularity_protocol::InstructionFile {
-                    path: singularity_core::display_path(&file.path),
-                    content: file.content,
-                    global: file.global,
-                })
-                .collect(),
-            // provider_schemas 先列内置工具，再列 MCP 工具。
-            tools: tools[..tools.len() - mcp_tools.len()].iter().map(|tool| tool.name.clone()).collect(),
-            mcp_tools,
-        };
-        Ok((RequestDefinitions::new(messages, tools), context))
+        let assembly = modules::assemble(modules::ModuleInputs {
+            cwd: &singularity_core::display_path(&cwd),
+            instructions,
+            skills,
+            mcp: discovered,
+            disabled,
+        });
+        let tools = assembly.registry.provider_schemas();
+        let definitions = RequestDefinitions::new(assembly.messages, tools);
+        self.registry = assembly.registry;
+        let context = singularity_protocol::InjectedContext { modules: assembly.modules };
+        Ok((definitions, context))
     }
 
     pub(super) fn request_definitions(&self) -> &RequestDefinitions {

@@ -3,18 +3,13 @@
 //! 对话来自日志；指令和工具定义由 Agent 提供。普通请求、摘要请求、压缩判断和
 //! 超限后的重发都用这里生成的上下文。日志本身不被修改。
 
+use singularity_core::estimate_tokens_of;
 use singularity_model::{ContentBlock, Message};
 
 use crate::message::{COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX};
 
 use super::format::{LedgerRecord, SessionEntry};
 use super::manager::SessionData;
-
-/// 启发式 Token 估算：按 UTF-16 字符数除以 4 向上取整。
-pub(crate) fn estimate_tokens_of(text: &str) -> u64 {
-    let chars = text.encode_utf16().count() as u64;
-    chars.div_ceil(4)
-}
 
 fn compaction_summary(summary: &str) -> String {
     format!("{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}")
@@ -54,6 +49,8 @@ fn project_messages(entries: &[&SessionEntry]) -> Vec<Message> {
                 Message::ToolResult {
                     content: vec![ContentBlock::text(UNKNOWN_TOOL_OUTCOME)],
                     tool_call_id: call.tool_call_id.clone(),
+                    display_output: None,
+                    background_task_id: None,
                     is_error: true,
                     duration_ms: None,
                     read_source: None,

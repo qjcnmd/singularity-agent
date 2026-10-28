@@ -6,6 +6,26 @@ use tokio::process::{ChildStderr, ChildStdout};
 
 const PIPE_BUFFER_BYTES: usize = 64 * 1024;
 
+pub(super) struct OutputChunk {
+    pub(super) display: String,
+    pub(super) model: String,
+}
+
+#[derive(Default)]
+struct PlainText(String);
+
+impl vte::Perform for PlainText {
+    fn print(&mut self, character: char) {
+        self.0.push(character);
+    }
+
+    fn execute(&mut self, byte: u8) {
+        if matches!(byte, b'\t' | b'\n') {
+            self.0.push(char::from(byte));
+        }
+    }
+}
+
 pub(super) struct OutputStreams {
     stdout: OutputReader<ChildStdout>,
     stderr: OutputReader<ChildStderr>,
@@ -24,7 +44,7 @@ impl OutputStreams {
     }
 
     /// 两条流都结束才返回 None；一条流关闭后继续读取另一条。
-    pub(super) async fn next(&mut self) -> Option<io::Result<String>> {
+    pub(super) async fn next(&mut self) -> Option<io::Result<OutputChunk>> {
         loop {
             let chunk = tokio::select! {
                 chunk = self.stdout.next(), if !self.stdout.closed => chunk,
@@ -42,6 +62,8 @@ struct OutputReader<R> {
     reader: R,
     stream: &'static str,
     decoder: Utf8Decoder,
+    // stdout / stderr 各自保留解析状态，控制序列跨块或两条流交错时也不会泄漏到模型。
+    terminal: vte::Parser,
     buffer: Vec<u8>,
     closed: bool,
 }
@@ -52,12 +74,13 @@ impl<R: AsyncRead + Unpin> OutputReader<R> {
             reader,
             stream,
             decoder: Utf8Decoder::default(),
+            terminal: vte::Parser::new(),
             buffer: vec![0; PIPE_BUFFER_BYTES],
             closed: false,
         }
     }
 
-    async fn next(&mut self) -> Option<io::Result<String>> {
+    async fn next(&mut self) -> Option<io::Result<OutputChunk>> {
         while !self.closed {
             match self.reader.read(&mut self.buffer).await {
                 Ok(read) => {
@@ -65,7 +88,11 @@ impl<R: AsyncRead + Unpin> OutputReader<R> {
                     // 只有 EOF 才补全末尾残缺字符；取消读取不会伪造输出。
                     let text = self.decoder.decode(&self.buffer[..read], self.closed);
                     if !text.is_empty() {
-                        return Some(Ok(text));
+                        let mut model = PlainText::default();
+                        self.terminal.advance(&mut model, text.as_bytes());
+                        let mut display = String::new();
+                        push_visible(&mut display, &text);
+                        return Some(Ok(OutputChunk { display, model: model.0 }));
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -82,7 +109,7 @@ impl<R: AsyncRead + Unpin> OutputReader<R> {
     }
 }
 
-/// 过滤掉不可见的控制字符（保留 \t、\n 与 ANSI ESC），其余字节按 UTF-8 安全解码。
+/// 按 UTF-8 安全解码；控制字符留给后续的模型解析与界面投影。
 #[derive(Default)]
 pub(super) struct Utf8Decoder {
     pending: Vec<u8>,
@@ -98,7 +125,7 @@ impl Utf8Decoder {
         loop {
             match std::str::from_utf8(&self.pending[consumed..]) {
                 Ok(text) => {
-                    push_visible(&mut output, text);
+                    output.push_str(text);
                     consumed = self.pending.len();
                     break;
                 }
@@ -108,7 +135,7 @@ impl Utf8Decoder {
                         // valid_up_to 之前的前缀是合法 UTF-8。
                         let text = std::str::from_utf8(&self.pending[consumed..consumed + valid])
                             .expect("valid_up_to must describe valid UTF-8");
-                        push_visible(&mut output, text);
+                        output.push_str(text);
                         consumed += valid;
                     }
                     match error.error_len() {

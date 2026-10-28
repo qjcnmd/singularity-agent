@@ -5,12 +5,12 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use process_wrap::tokio::{ChildWrapper, CommandWrap, CreationFlags, JobObject, KillOnDrop};
-use singularity_protocol::BackgroundTaskState;
+use singularity_protocol::{BackgroundTaskState, CommandOutputSnapshot};
 use tokio::process::Command;
 use tokio::time::{Instant, Interval};
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::registry::{ABORTED_MESSAGE, ToolExecution};
+use crate::tools::registry::{ABORTED_MESSAGE, ToolDisplay, ToolExecution};
 
 use super::pump::OutputStreams;
 use super::shell::bash_path;
@@ -22,7 +22,10 @@ const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
     "[output truncated: a descendant process was still writing when the command exited]";
 
 pub(super) enum ProcessEvent {
-    Progress(String),
+    Progress {
+        display: String,
+        model: CommandOutputSnapshot,
+    },
     Finished(Outcome),
 }
 
@@ -49,6 +52,7 @@ pub(super) struct Process {
     child: Box<dyn ChildWrapper>,
     output: OutputStreams,
     capture: CaptureState,
+    model_capture: CaptureState,
     progress: Interval,
     started: Instant,
     deadline: Option<Instant>,
@@ -83,6 +87,7 @@ impl Process {
             child,
             output,
             capture: CaptureState::default(),
+            model_capture: CaptureState::default(),
             progress,
             started,
             deadline: timeout_ms.map(|ms| started + Duration::from_millis(ms)),
@@ -108,19 +113,32 @@ impl Process {
                 }),
                 _ = self.progress.tick() => {},
                 chunk = self.output.next(), if self.output.is_open() => match chunk {
-                    Some(Ok(chunk)) => tokio::task::block_in_place(|| self.capture.ingest(&chunk)),
+                    Some(Ok(chunk)) => tokio::task::block_in_place(|| {
+                        self.capture.ingest(&chunk.display);
+                        self.model_capture.ingest(&chunk.model);
+                    }),
                     Some(Err(error)) => return ProcessEvent::Finished(Outcome::Failed(error.to_string())),
                     None => {},
                 }
             }
             if let Some(output) = self.capture.current_output() {
-                return ProcessEvent::Progress(output);
+                return ProcessEvent::Progress {
+                    display: output,
+                    model: self.model_output(),
+                };
             }
         }
     }
 
+    pub(super) fn model_output(&self) -> CommandOutputSnapshot {
+        self.model_capture.snapshot()
+    }
+
     /// 回收整树后才给出终态；主进程正常退出也不能遗留后代。
-    pub(super) async fn finish(mut self, mut outcome: Outcome) -> (ToolExecution, Outcome) {
+    pub(super) async fn finish(
+        mut self,
+        mut outcome: Outcome,
+    ) -> (ToolExecution, Outcome, CommandOutputSnapshot) {
         let mut failures = Vec::new();
         if let Err(error) = self.child.start_kill() {
             failures.push(format!("failed to terminate the command process tree: {error}"));
@@ -139,7 +157,10 @@ impl Process {
                 biased;
                 _ = &mut drain => { truncated = true; break; }
                 chunk = self.output.next() => match chunk {
-                    Some(Ok(chunk)) => tokio::task::block_in_place(|| self.capture.ingest(&chunk)),
+                    Some(Ok(chunk)) => tokio::task::block_in_place(|| {
+                        self.capture.ingest(&chunk.display);
+                        self.model_capture.ingest(&chunk.model);
+                    }),
                     Some(Err(error)) => failures.push(error.to_string()),
                     None => {},
                 }
@@ -152,36 +173,41 @@ impl Process {
             };
             outcome = Outcome::CleanupFailed(format!("{primary}{}", failures.join("; ")));
         }
-        let (mut content, spill_note) = self.capture.finish();
-        let is_error = match &outcome {
-            Outcome::Exited(0) => false,
-            Outcome::Exited(code) => {
-                append_status(&mut content, &format!("Command exited with code {code}"));
-                true
-            }
-            Outcome::Stopped => {
-                append_status(&mut content, ABORTED_MESSAGE);
-                true
-            }
-            Outcome::Failed(message) | Outcome::CleanupFailed(message) => {
-                append_status(&mut content, message);
-                true
-            }
-        };
-        if content.is_empty() {
-            content = "(no output)".to_string();
+        let mut model_output = self.model_capture.snapshot();
+        model_output.incomplete = truncated;
+        let display = finished_output(self.capture, &outcome, truncated);
+        let mut execution = ToolExecution::text(finished_output(self.model_capture, &outcome, truncated));
+        if display != execution.content {
+            execution.display = Some(Box::new(ToolDisplay {
+                output: display,
+                background_task_id: None,
+            }));
         }
-        if truncated {
-            append_status(&mut content, OUTPUT_TRUNCATED_BACKGROUND_NOTE);
-        }
-        if let Some(note) = spill_note {
-            append_status(&mut content, &note);
-        }
-        let mut execution = ToolExecution::text(content);
-        execution.is_error = is_error;
+        execution.is_error = !matches!(outcome, Outcome::Exited(0));
         execution.duration_ms = Some(singularity_core::duration_millis(self.started.elapsed()));
-        (execution, outcome)
+        (execution, outcome, model_output)
     }
+}
+
+/// 模型与界面共享结束原因和截断提示规则，只使用各自的捕获正文。
+fn finished_output(capture: CaptureState, outcome: &Outcome, truncated: bool) -> String {
+    let (mut content, spill_note) = capture.finish();
+    match outcome {
+        Outcome::Exited(0) => {}
+        Outcome::Exited(code) => append_status(&mut content, &format!("Command exited with code {code}")),
+        Outcome::Stopped => append_status(&mut content, ABORTED_MESSAGE),
+        Outcome::Failed(message) | Outcome::CleanupFailed(message) => append_status(&mut content, message),
+    };
+    if content.is_empty() {
+        content = "(no output)".to_string();
+    }
+    if truncated {
+        append_status(&mut content, OUTPUT_TRUNCATED_BACKGROUND_NOTE);
+    }
+    if let Some(note) = spill_note {
+        append_status(&mut content, &note);
+    }
+    content
 }
 
 async fn wait_deadline(deadline: Option<Instant>) {

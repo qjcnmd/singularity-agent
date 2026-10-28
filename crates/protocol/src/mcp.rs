@@ -29,7 +29,6 @@ pub enum McpTransportConfig {
 #[serde(rename_all = "camelCase")]
 pub struct McpServerInput {
     pub server_id: String,
-    pub enabled: bool,
     pub startup_timeout_sec: u64,
     pub tool_timeout_sec: u64,
     pub transport: McpTransportConfig,
@@ -59,15 +58,6 @@ pub struct McpServerParams {
     pub workspace_root: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct McpToggleParams {
-    pub server_id: String,
-    pub enabled: bool,
-    pub workspace_root: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -85,7 +75,6 @@ pub enum McpConnectionStatus {
     Connecting,
     Connected,
     Failed,
-    Disabled,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,4 +86,6 @@ pub struct McpServerState {
     pub status: McpConnectionStatus,
     pub error: Option<String>,
     pub tools: Vec<McpToolInfo>,
+    /// 最近一次发现后，这台服务器的工具定义和说明在请求里的估算 Token 数；未连接过为 0。
+    pub tokens: u64,
 }

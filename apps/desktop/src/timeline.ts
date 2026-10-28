@@ -115,7 +115,7 @@ function mergeAdjacentThinking(items: HistoryItem[]): HistoryItem[] {
 
 export function toolArgument(name: string, args: unknown): string | null {
   const input = record(args)
-  const value = name === 'bash' ? input.command : name === 'read' ? input.path : undefined
+  const value = name === 'bash' ? input.command : name === 'read' || name === 'view_image' ? input.path : name === 'skill' ? input.name : undefined
   return typeof value === 'string' ? value : null
 }
 
@@ -151,7 +151,7 @@ export function displayPath(path: string, cwd: string, userHome?: string | null)
 }
 
 export function pathFromArgs(name: string, args: unknown): string | null {
-  if (name !== 'read') return null
+  if (name !== 'read' && name !== 'view_image') return null
   const value = toolArgument(name, args)
   return value?.trim() ? value : null
 }
@@ -180,9 +180,5 @@ export function formatClock(value: string, includeDate = false): string {
 }
 
 export function backgroundTaskId(item: Extract<HistoryItem, { type: 'tool' }>): string | null {
-  if (item.name !== 'bash' || !item.result) return null
-  try {
-    const output: unknown = JSON.parse(item.result.output)
-    return typeof output === 'object' && output !== null && 'taskId' in output && typeof output.taskId === 'string' ? output.taskId : null
-  } catch { return null }
+  return item.name === 'bash' ? item.result?.backgroundTaskId ?? null : null
 }

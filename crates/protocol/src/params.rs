@@ -65,6 +65,10 @@ pub struct ReadSource {
 #[serde(rename_all = "camelCase")]
 pub struct ToolResult {
     pub output: String,
+    /// bash 结果关联的后台命令，供界面跟随最新状态。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub background_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(
         feature = "typescript",
@@ -180,12 +184,13 @@ pub struct ThreadTurn {
     pub items: Vec<HistoryItem>,
 }
 
-/// 任务的 ID、工作目录和当前模型选择。
+/// 任务的 ID、工作目录、当前模型选择和创建时关闭的上下文模块。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Thread {
     pub thread_id: String,
     pub model: crate::ModelSelection,
     pub cwd: String,
+    pub disabled_modules: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

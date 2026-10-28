@@ -6,6 +6,9 @@
   --spring-dur: 450ms;
   --spring: ease;
   --message-font-size: 14.5px;
+  /* 卡片头与卡片正文、元信息：跟随消息字号整体缩放，保留固定层级。 */
+  --block-font-size: max(11.5px, calc(var(--message-font-size) - 2px));
+  --meta-font-size: max(10.5px, calc(var(--message-font-size) - 3px));
   --warning: #ff9500;
   color-scheme: light;
   --canvas: #ffffff;
@@ -53,7 +56,7 @@ button, input, textarea, select { font: inherit; color: inherit; }
 strong, b { font-weight: inherit; }
 button { color: inherit; user-select: none; }
 /* 界面控件不参与拖选；正文、文件内容和编辑区保留选字复制。 */
-:is(input, textarea, [contenteditable="true"], .timeline-body, .reasoning-body, .compaction-summary, .file-body, .file-path, .editor-path, .instruction-body, .form-error, .error-bubble, .background-task-error, .sg-model-config-error pre) { user-select: text; }
+:is(input, textarea, [contenteditable="true"], .timeline-body, .reasoning-body, .compaction-summary, .file-body, .file-path, .editor-path, .form-error, .error-bubble, .background-task-error, .sg-model-config-error pre) { user-select: text; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #c7c7cc; border: 2px solid transparent; border-radius: 8px; background-clip: padding-box; }

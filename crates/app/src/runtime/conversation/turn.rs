@@ -203,7 +203,11 @@ impl Conversation {
         let initial_instructions =
             singularity_core::load_agent_instructions(std::path::Path::new(&thread.cwd), &instruction_home)
                 .map_err(preparation_error)?;
-        let config = AgentConfig { instruction_home, initial_instructions };
+        let config = AgentConfig {
+            instruction_home,
+            initial_instructions,
+            disabled_modules: thread.disabled_modules.clone(),
+        };
         Ok(RequestContext::new(provider, config, Arc::clone(&self.writer), Arc::clone(&self.mcp)))
     }
 }

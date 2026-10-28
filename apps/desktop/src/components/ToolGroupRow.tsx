@@ -19,12 +19,14 @@ export function ToolGroupRow({ group, itemKey, sessionId, onDisclosureChange, ch
   for (const row of group.rows) counts[toolDisplay(row.item, liveSessions[sessionId ?? '']?.backgroundTasks).status]++
   return <article className="timeline-item tool-group" data-item-id={itemKey}>
     <button type="button" className="activity-toggle tool-group-toggle" aria-expanded={expanded} {...guard(() => setExpanded(value => !value))}>
-      {counts.completed > 0 && <CircleCheck size={13} className="ok" aria-hidden="true" />}
+      {counts.running > 0 ? <LoaderCircle size={13} className="spinner" aria-hidden="true" />
+        : counts.failed > 0 || counts.interrupted > 0 ? <CircleX size={13} className="bad" aria-hidden="true" />
+          : counts.completed > 0 ? <CircleCheck size={13} className="ok" aria-hidden="true" /> : null}
       <span className="step-title">{group.name}</span>
-      {counts.completed > 0 && <span aria-label={`成功 ${counts.completed} 次`}>×{counts.completed}</span>}
+      {counts.completed > 0 && <span aria-label={`成功 ${counts.completed} 次`}>{counts.running + counts.failed + counts.interrupted > 0 ? '成功 ' : ''}×{counts.completed}</span>}
       {counts.failed > 0 && <span className="step-label" aria-label={`失败 ${counts.failed} 次`}><CircleX size={13} className="bad" aria-hidden="true" />×{counts.failed}</span>}
       {counts.interrupted > 0 && <span className="step-label" aria-label={`中断 ${counts.interrupted} 次`}><CircleX size={13} className="bad" aria-hidden="true" />中断 ×{counts.interrupted}</span>}
-      {counts.running > 0 && <span className="step-label" aria-label={`运行中 ${counts.running} 次`}><LoaderCircle size={13} className="spinner" aria-hidden="true" />×{counts.running}</span>}
+      {counts.running > 0 && <span aria-label={`运行中 ${counts.running} 次`}>{counts.completed + counts.failed + counts.interrupted > 0 ? '运行中 ' : ''}×{counts.running}</span>}
       {counts.pending > 0 && <span>等待 ×{counts.pending}</span>}
       <ExpandChevron expanded={expanded} size={14} />
     </button>

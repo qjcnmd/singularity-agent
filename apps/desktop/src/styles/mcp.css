@@ -1,5 +1,4 @@
 .mcp-status, .mcp-endpoint { color: var(--ink-faint); font-size: 12px; overflow-wrap: anywhere; }
-.mcp-switch { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; white-space: nowrap; }
 .mcp-tools > p { margin: 0; white-space: pre-wrap; }
 .mcp-tools > button { justify-self: start; }
 .mcp-tool strong { font: 12px var(--font-sans); }
@@ -22,7 +21,3 @@
 .mcp-editor-modal { width: 520px; }
 .mcp-editor-scroll { display: grid; gap: 14px; min-width: 0; margin: 0; border: 0; overflow-y: auto; padding: 10px 24px 4px; }
 .mcp-editor footer { flex: none; display: flex; justify-content: flex-end; gap: 8px; border: 0; padding: 16px 20px 20px; }
-.mcp-switch input { position: relative; appearance: none; width: 38px; height: 23px; border: 0; border-radius: 999px; background: var(--switch-off); cursor: pointer; transition: background 200ms; }
-.mcp-switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 19px; height: 19px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgb(0 0 0 / 22%); transition: transform var(--spring-dur) var(--spring); }
-.mcp-switch input:checked { background: var(--positive); }
-.mcp-switch input:checked::after { transform: translateX(15px); }

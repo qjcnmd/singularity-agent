@@ -1,9 +1,9 @@
 import type { ModelSelection, ImageUpload } from './protocol'
 
-/** files 是附件文件的绝对路径，发送时只把路径交给后端。 */
-export interface Draft { text: string; images: File[]; files: string[]; selection?: ModelSelection }
+/** files 是附件文件的绝对路径，发送时只把路径交给后端；disabledModules 是新任务关闭的上下文模块 ID，只在空白页使用。 */
+export interface Draft { text: string; images: File[]; files: string[]; selection?: ModelSelection; disabledModules?: string[] }
 export const emptyDraft: Draft = { text: '', images: [], files: [] }
-const hasDraft = (draft: Draft | undefined) => draft !== undefined && (draft.text !== '' || draft.images.length > 0 || draft.files.length > 0 || draft.selection !== undefined)
+const hasDraft = (draft: Draft | undefined) => draft !== undefined && (draft.text !== '' || draft.images.length > 0 || draft.files.length > 0 || draft.selection !== undefined || (draft.disabledModules?.length ?? 0) > 0)
 
 export type DraftSnapshot = Readonly<Record<string, Draft>>
 

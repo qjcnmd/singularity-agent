@@ -10,13 +10,55 @@ export type BackgroundTask = { taskId: string, command: string, description: str
 /**
  * 输出的末尾部分；超长时附带完整输出文件的位置，与 bash 工具的结果相同。
  */
-output: string, state: BackgroundTaskState, };
+output: string, modelOutput: CommandOutputSnapshot, state: BackgroundTaskState, };
 
 export type BackgroundTaskParams = { sessionId: string, taskId: string, };
 
 export type BackgroundTaskState = { "status": "running" } | { "status": "exited", exitCode: number, durationMs: number, } | { "status": "stopped", durationMs: number, } | { "status": "failed", message: string, durationMs: number, } | { "status": "interrupted" };
 
 export type BackgroundTaskUpdate = { phase: SessionPhase, task: BackgroundTask, };
+
+export type CommandOutputSnapshot = {
+/**
+ * 最多 100 KiB 的纯文本尾部。
+ */
+text: string,
+/**
+ * 从命令输出起点累计的纯文本字节数。
+ */
+totalBytes: number,
+/**
+ * 完整纯文本输出文件的路径。
+ */
+fullOutput?: string,
+/**
+ * 保存完整输出时的错误。
+ */
+fileError?: string,
+/**
+ * 管道排空超时，输出尚未全部收齐。
+ */
+incomplete?: boolean, };
+
+export type ContextGroup = "instructions" | "tools" | "skills" | "mcp";
+
+export type ContextModule = { id: string, group: ContextGroup, label: string,
+/**
+ * 悬停说明：用途，以及包含的工具名、指令文件或连接错误。
+ */
+detail: string,
+/**
+ * 请求里这部分指令和工具定义的估算 Token 数；MCP 服务器尚未连接时为 0。
+ */
+tokens: number,
+/**
+ * 基础能力，不能关闭。
+ */
+locked: boolean,
+/**
+ * 本任务是否开着；新建任务页的预览里全部为 true。
+ */
+enabled: boolean, };
 
 export type ContextUsage = { used: number, capacity: number, };
 
@@ -48,17 +90,7 @@ export type ImageAttachment = { id: string, name: string, mimeType: string, widt
 
 export type ImageUpload = { name: string, dataUrl: string, };
 
-export type InjectedContext = { instructions: Array<InstructionFile>,
-/**
- * 内置工具名。
- */
-tools: Array<string>,
-/**
- * MCP 服务器提供的工具名。
- */
-mcpTools: Array<string>, };
-
-export type InstructionFile = { path: string, content: string, global: boolean, };
+export type InjectedContext = { modules: Array<ContextModule>, };
 
 export type InstructionsReadParams = { workspaceRoot: string | null, };
 
@@ -66,19 +98,21 @@ export type InstructionsSaveParams = { workspaceRoot: string | null, content: st
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
 
-export type McpConnectionStatus = "not_connected" | "connecting" | "connected" | "failed" | "disabled";
+export type McpConnectionStatus = "not_connected" | "connecting" | "connected" | "failed";
 
 export type McpListParams = { workspaceRoot: string | null, };
 
 export type McpSaveParams = { server: McpServerInput, workspaceRoot: string | null, };
 
-export type McpServerInput = { serverId: string, enabled: boolean, startupTimeoutSec: number, toolTimeoutSec: number, transport: McpTransportConfig, };
+export type McpServerInput = { serverId: string, startupTimeoutSec: number, toolTimeoutSec: number, transport: McpTransportConfig, };
 
 export type McpServerParams = { serverId: string, workspaceRoot: string | null, };
 
-export type McpServerState = { server: McpServerInput, status: McpConnectionStatus, error: string | null, tools: Array<McpToolInfo>, };
-
-export type McpToggleParams = { serverId: string, enabled: boolean, workspaceRoot: string | null, };
+export type McpServerState = { server: McpServerInput, status: McpConnectionStatus, error: string | null, tools: Array<McpToolInfo>,
+/**
+ * 最近一次发现后，这台服务器的工具定义和说明在请求里的估算 Token 数；未连接过为 0。
+ */
+tokens: number, };
 
 export type McpToolInfo = { name: string, description: string, };
 
@@ -202,7 +236,11 @@ export type SessionStartParams = { workspaceRoot: string, selection: ModelSelect
 /**
  * 附件文件的绝对路径。
  */
-files: Array<string>, };
+files: Array<string>,
+/**
+ * 创建时关闭的上下文模块 ID，任务期间不变。
+ */
+disabledModules: Array<string>, };
 
 export type SessionStartResult = { summary: ThreadSummary, status: SessionStatus, revision: number, };
 
@@ -240,7 +278,11 @@ firstTokenAt?: string, turnId: string, status: TurnStatus,
  */
 manuallyStopped: boolean, error?: TurnErrorDetail, items: Array<HistoryItem>, };
 
-export type ToolResult = { output: string, images?: Array<ImageAttachment>, readSource?: ReadSource, isError: boolean, durationMs?: number, };
+export type ToolResult = { output: string,
+/**
+ * bash 结果关联的后台命令，供界面跟随最新状态。
+ */
+backgroundTaskId?: string, images?: Array<ImageAttachment>, readSource?: ReadSource, isError: boolean, durationMs?: number, };
 
 export type ToolStatus = "pending" | "running" | "completed" | "failed" | "interrupted";
 
@@ -288,8 +330,8 @@ export interface RpcContract {
   "mcp.list": { params: McpListParams; result: Array<McpServerState> }
   "mcp.save": { params: McpSaveParams; result: Array<McpServerState> }
   "mcp.remove": { params: McpServerParams; result: Array<McpServerState> }
-  "mcp.toggle": { params: McpToggleParams; result: Array<McpServerState> }
   "mcp.reconnect": { params: McpServerParams; result: McpServerState }
+  "context.preview": { params: WorkspaceParams; result: Array<ContextModule> }
   "session.start": { params: SessionStartParams; result: SessionStartResult }
   "session.read": { params: SessionParams; result: SessionReadResult }
   "session.imageRead": { params: SessionImageParams; result: string }

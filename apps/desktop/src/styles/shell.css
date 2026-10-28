@@ -14,9 +14,6 @@
   transition: background 120ms, box-shadow 160ms, transform var(--spring-dur) var(--spring); }
 .status-chip:hover { background: var(--fill-subtle); color: var(--ink); }
 .status-chip:active { transform: scale(.95); transition-duration: 80ms; }
-.status-chip.is-open { background: var(--fill); color: var(--ink); }
-.status-running { display: inline-flex; align-items: center; gap: 5px; padding-left: 7px; border-left: 1px solid rgb(0 0 0 / 10%); }
-.status-running i { width: 7px; height: 7px; border-radius: 50%; background: var(--positive); animation: breathe 1.6s ease-in-out infinite; }
 
 
 

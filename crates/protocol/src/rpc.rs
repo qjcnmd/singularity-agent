@@ -99,6 +99,8 @@ pub struct SessionStartParams {
     pub images: Vec<crate::ImageUpload>,
     /// 附件文件的绝对路径。
     pub files: Vec<String>,
+    /// 创建时关闭的上下文模块 ID，任务期间不变。
+    pub disabled_modules: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,8 +174,8 @@ rpc_methods! {
     McpList => "mcp.list" (McpListParams) -> Vec<McpServerState>,
     McpSave => "mcp.save" (McpSaveParams) -> Vec<McpServerState>,
     McpRemove => "mcp.remove" (McpServerParams) -> Vec<McpServerState>,
-    McpToggle => "mcp.toggle" (McpToggleParams) -> Vec<McpServerState>,
     McpReconnect => "mcp.reconnect" (McpServerParams) -> McpServerState,
+    ContextPreview => "context.preview" (WorkspaceParams) -> Vec<ContextModule>,
     SessionStart => "session.start" (SessionStartParams) -> SessionStartResult,
     SessionRead => "session.read" (SessionParams) -> SessionReadResult,
     SessionImageRead => "session.imageRead" (SessionImageParams) -> String,

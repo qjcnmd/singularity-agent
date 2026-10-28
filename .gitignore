@@ -32,6 +32,7 @@ Thumbs.db
 outputs/
 
 # Local agent state and isolated worktrees.
+.claude/
 .codex/
 .workbuddy/
 .pi-subagents/

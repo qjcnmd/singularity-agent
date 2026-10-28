@@ -1,7 +1,9 @@
-//! Developer 指令：基本行为、运行环境和当前工作目录；工具说明随请求定义发送。
+//! Developer 指令：基本行为、运行环境和当前工作目录；工具说明随工具定义发送。
 
-/// 生成 Developer 指令；文件指令和技能列表由请求组装代码另外添加。
-pub(crate) fn assemble_developer_instructions(cwd: &str) -> String {
+/// 生成 Developer 指令；`tool_guidelines` 是本任务开着的工具模块各自提供的一行用法，
+/// 文件指令和技能列表由请求组装代码另外添加。
+pub(crate) fn assemble_developer_instructions(cwd: &str, tool_guidelines: &[&str]) -> String {
+    let tool_guidelines: String = tool_guidelines.iter().map(|line| format!("- {line}\n")).collect();
     // 写明平台和 shell，否则模型可能在 Git Bash 里写 cmd 语法（如 `cd /d`、`2>nul`），
     // 输出被重定向丢掉。
     format!(
@@ -9,7 +11,7 @@ pub(crate) fn assemble_developer_instructions(cwd: &str) -> String {
              harness. You help users by reading files, executing commands, editing code, and \
              writing new files.\n\n\
              Guidelines:\n\
-             - Use read for text files and images.\n\
+             {tool_guidelines}\
              - Use bash with rg for content searches and rg --files for file discovery; use Python or other commands for text edits, file writes, byte ranges, and structured processing.\n\
              - Be concise in your responses\n\
              - Show file paths clearly when working with files\n\n\

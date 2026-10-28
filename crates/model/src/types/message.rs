@@ -57,6 +57,12 @@ pub enum Message {
     #[serde(rename_all = "camelCase")]
     ToolResult {
         content: Vec<ContentBlock>,
+        /// 本地界面正文；未设置时显示 content，提供方编码始终只使用 content。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_output: Option<String>,
+        /// bash 结果关联的后台命令；仅供本地展示，不编码到模型请求。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_task_id: Option<String>,
         /// 对应的工具调用 ID；名称和参数由原始 ToolCall 记录提供，这里不重复。
         tool_call_id: String,
         is_error: bool,

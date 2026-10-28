@@ -12,9 +12,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::session::{LedgerRecord, SessionEntry, lock_writer};
-use crate::tools::registry::{ABORTED_MESSAGE, ToolExecution, error_result};
+use crate::tools::registry::{ABORTED_MESSAGE, ToolDisplay, ToolExecution, error_result};
 
 use super::exec::{Outcome, Process, ProcessEvent};
+use super::result::{state_text, task_result, task_summary};
 use super::spec::BashArgs;
 
 /// 已保存的开始、结束，或仅供显示的输出更新。
@@ -93,14 +94,30 @@ impl BashTasks {
 
     /// 给模型的列表只含 ID、命令、说明和状态，输出由 task_output 按需读取。
     pub(crate) fn tool_list(&self) -> ToolExecution {
-        let tasks = self.project_tasks(task_summary);
-        ToolExecution::text(serde_json::to_string(&tasks).expect("task summaries serialize"))
+        let tasks = self.project_tasks(|task, state| {
+            (
+                format!("{}: {} — {}\n{}", task.task_id, state_text(state), task.description, task.command),
+                task_summary(task, state),
+            )
+        });
+        let mut result = ToolExecution::text(if tasks.is_empty() {
+            "(no background tasks)".into()
+        } else {
+            tasks.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join("\n\n")
+        });
+        result.display = Some(Box::new(ToolDisplay {
+            output: serde_json::to_string(&tasks.into_iter().map(|(_, summary)| summary).collect::<Vec<_>>())
+                .expect("task summaries serialize"),
+            background_task_id: None,
+        }));
+        result
     }
 
-    /// 读取累计输出；只等待指定窗口，不取消后台命令。
+    /// 从显式游标读取模型正文；等待与读取不消费输出，也不取消后台命令。
     pub(crate) async fn output(
         &self,
         task_id: &str,
+        cursor: u64,
         wait_ms: u64,
         signal: &CancellationToken,
     ) -> ToolExecution {
@@ -118,7 +135,12 @@ impl BashTasks {
                 return error_result(error.message());
             }
         }
-        self.task(task_id).map(|task| task_result(&task, true)).unwrap_or_else(error_result)
+        if signal.is_cancelled() {
+            return error_result(ABORTED_MESSAGE);
+        }
+        self.task(task_id)
+            .map(|task| task_result(&task, Some(cursor), true))
+            .unwrap_or_else(error_result)
     }
 
     /// 取消后台命令并等待回收、保存终态；操作成功后返回命令结果。
@@ -133,7 +155,7 @@ impl BashTasks {
                 return Err(error.message().to_owned());
             }
         }
-        self.task(task_id).map(|task| task_result(&task, false))
+        self.task(task_id).map(|task| task_result(&task, None, false))
     }
 
     /// 停止并等待全部活进程；只返回回收错误，已结束命令的保存失败不阻止关闭或删除。
@@ -181,7 +203,7 @@ impl BashTasks {
                 tokio::select! {
                     biased;
                     event = process.next(&signal) => match event {
-                        ProcessEvent::Progress(progress) => { output = progress.clone(); on_update(progress).await; }
+                        ProcessEvent::Progress { display, .. } => { output = display.clone(); on_update(display).await; }
                         ProcessEvent::Finished(outcome) => return process.finish(outcome).await.0,
                     },
                     _ = &mut yield_at => break,
@@ -196,6 +218,7 @@ impl BashTasks {
             command: args.command,
             description: args.description,
             output,
+            model_output: process.model_output(),
             state: BackgroundTaskState::Running,
         };
         let task_id = task.task_id.clone();
@@ -228,12 +251,14 @@ impl BashTasks {
         if signal.is_cancelled() || entry.cancel.is_cancelled() {
             entry.cancel.cancel();
             self.clone().run_background(entry.clone(), process).await;
-            let mut result =
-                self.task(&task_id).map(|task| task_result(&task, false)).unwrap_or_else(error_result);
+            let mut result = self
+                .task(&task_id)
+                .map(|task| task_result(&task, Some(0), false))
+                .unwrap_or_else(error_result);
             result.is_error = true;
             return result;
         }
-        let result = task_result(&entry.task.lock().expect("bash task lock"), false);
+        let result = task_result(&entry.task.lock().expect("bash task lock"), Some(0), false);
         let manager = self.clone();
         tokio::spawn(async move {
             manager.run_background(entry, process).await;
@@ -266,10 +291,11 @@ impl BashTasks {
     async fn run_background(self: Arc<Self>, entry: Arc<Entry>, mut process: Process) {
         let outcome = loop {
             match process.next(&entry.cancel).await {
-                ProcessEvent::Progress(output) => {
+                ProcessEvent::Progress { display, model } => {
                     let task = {
                         let mut task = entry.task.lock().expect("bash task lock");
-                        task.output = output;
+                        task.output = display;
+                        task.model_output = model;
                         task.clone()
                     };
                     (self.on_update)(BashTaskUpdate::Updated(task));
@@ -277,9 +303,10 @@ impl BashTasks {
                 ProcessEvent::Finished(outcome) => break outcome,
             }
         };
-        let (result, outcome) = process.finish(outcome).await;
+        let (result, outcome, model_output) = process.finish(outcome).await;
         let mut task = entry.task.lock().expect("bash task lock").clone();
-        task.output = result.content;
+        task.output = result.display.map_or(result.content, |display| display.output);
+        task.model_output = model_output;
         task.state = outcome.state(result.duration_ms.expect("process duration"));
         let task_id = task.task_id.clone();
         let saved_task = task.clone();
@@ -362,25 +389,4 @@ fn current_task<T>(
         return project(task, &BackgroundTaskState::Interrupted);
     }
     project(task, &task.state)
-}
-
-fn task_result(task: &BackgroundTask, include_output: bool) -> ToolExecution {
-    let mut summary = task_summary(task, &task.state);
-    if include_output {
-        summary["output"] = serde_json::json!(task.output);
-    }
-    let mut result = ToolExecution::text(serde_json::to_string(&summary).expect("task result serializes"));
-    result.is_error = matches!(task.state,
-        BackgroundTaskState::Exited { exit_code, .. } if exit_code != 0)
-        || matches!(task.state, BackgroundTaskState::Failed { .. } | BackgroundTaskState::Interrupted);
-    result
-}
-
-fn task_summary(task: &BackgroundTask, state: &BackgroundTaskState) -> serde_json::Value {
-    serde_json::json!({
-        "taskId": task.task_id,
-        "command": task.command,
-        "description": task.description,
-        "state": state,
-    })
 }

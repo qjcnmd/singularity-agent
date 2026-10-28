@@ -78,12 +78,8 @@ async fn dispatch(
             })
             .await
         }
-        RpcRequest::McpToggle(params) => {
-            blocking(move || {
-                let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
-                app.mcp.toggle(&params.server_id, params.enabled, &cwd).map_err(invalid_request)
-            })
-            .await
+        RpcRequest::ContextPreview(params) => {
+            blocking(move || app.context_preview(&params.workspace_root)).await
         }
         RpcRequest::SessionStart(params) => blocking(move || app.start_session(params)).await,
         RpcRequest::SessionRead(params) => blocking(move || app.read_session(&params.session_id)).await,

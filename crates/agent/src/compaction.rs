@@ -5,7 +5,7 @@
 use crate::agent::request::RequestDefinitions;
 use crate::request_execution::output_budget_tokens;
 pub use crate::session::context::CompactionPrefix;
-use crate::session::context::estimate_tokens_of;
+use singularity_core::estimate_tokens_of;
 
 use crate::agent::{AgentError, Result};
 use singularity_model::{Message, ModelConfigurationSnapshot, ModelTurnRequest, ModelTurnResponse};

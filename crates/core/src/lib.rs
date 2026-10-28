@@ -14,6 +14,11 @@ pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace, same_saved_p
 /// 向上查找项目根目录（AGENTS.md 与项目技能的查找上界）时识别的 `.git` 标记。
 pub(crate) const PROJECT_ROOT_MARKER: &str = ".git";
 
+/// 启发式 Token 估算：按 UTF-16 字符数除以 4 向上取整。上下文预算和胶囊上的估算共用这条规则。
+pub fn estimate_tokens_of(text: &str) -> u64 {
+    (text.encode_utf16().count() as u64).div_ceil(4)
+}
+
 /// 将 Duration 转换为毫秒数，溢出时封顶 u64::MAX。
 pub fn duration_millis(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64

@@ -2,6 +2,29 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 给模型读取的命令纯文本输出快照，与界面展示正文分开保存。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommandOutputSnapshot {
+    /// 最多 100 KiB 的纯文本尾部。
+    pub text: String,
+    /// 从命令输出起点累计的纯文本字节数。
+    pub total_bytes: u64,
+    /// 完整纯文本输出文件的路径。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub full_output: Option<String>,
+    /// 保存完整输出时的错误。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub file_error: Option<String>,
+    /// 管道排空超时，输出尚未全部收齐。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "typescript", ts(as = "Option<bool>", optional))]
+    pub incomplete: bool,
+}
+
 /// 任务中的一个后台命令。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -12,6 +35,7 @@ pub struct BackgroundTask {
     pub description: String,
     /// 输出的末尾部分；超长时附带完整输出文件的位置，与 bash 工具的结果相同。
     pub output: String,
+    pub model_output: CommandOutputSnapshot,
     pub state: BackgroundTaskState,
 }
 

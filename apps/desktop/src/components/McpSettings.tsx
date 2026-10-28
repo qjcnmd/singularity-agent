@@ -1,13 +1,14 @@
 import { X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { appStore } from '../appStore'
+import { formatTokenCount } from '../copy'
 import type { McpConnectionStatus, McpServerInput, McpServerState } from '../protocol'
 import { Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 
 const connectionLabels: Record<McpConnectionStatus, string> = {
-  not_connected: '尚未连接', connecting: '连接中…', connected: '已连接', failed: '连接失败', disabled: '已关闭',
+  not_connected: '尚未连接', connecting: '连接中…', connected: '已连接', failed: '连接失败',
 }
 
 export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null }) {
@@ -99,19 +100,18 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
         return <div className="sg-row-card" key={server.serverId}>
           <div className="sg-row-head mcp-row-head">
             <button type="button" className="sg-provider-toggle" aria-expanded={open} aria-controls={`mcp-tools-${server.serverId}`} onClick={() => setExpanded(open ? null : server.serverId)}>
-              <span className={`mcp-dot status-${result.status}`} /><span className="sg-row-identity"><strong>{server.serverId}</strong><span className="mcp-status">{result.status === 'connected' ? `${result.tools.length} 个工具` : connectionLabels[result.status]}</span></span>
+              <span className={`mcp-dot status-${result.status}`} /><span className="sg-row-identity"><strong>{server.serverId}</strong><span className="mcp-status">{result.status === 'connected' ? `${result.tools.length} 个工具 · ≈ ${formatTokenCount(result.tokens).toLowerCase()} tokens` : connectionLabels[result.status]}</span></span>
               <ExpandChevron expanded={open} size={16} />
             </button>
             <span className="sg-row-actions">
-              <label className="mcp-switch"><input type="checkbox" role="switch" aria-label={`启用 MCP ${server.serverId}`} checked={server.enabled} disabled={busy || loading} onChange={event => { const enabled = event.target.checked; void mutate(() => appStore.transport.rpc('mcp.toggle', { serverId: server.serverId, enabled, workspaceRoot })) }} /></label>
               <button type="button" className="quiet-button" disabled={busy || loading} aria-label={`编辑 MCP ${server.serverId}`} onClick={() => { setError(null); setEditor(server) }}>编辑</button>
               <button type="button" className="quiet-button danger" disabled={busy || loading} aria-label={`删除 MCP ${server.serverId}`} onClick={() => { setError(null); setRemoving(server) }}>删除</button>
             </span>
           </div>
           <Disclosure open={open}><div id={`mcp-tools-${server.serverId}`} className="mcp-tools">
             <p className="mcp-endpoint">{server.transport.type === 'stdio' ? `${server.transport.command} ${server.transport.args.join(' ')}` : server.transport.url}</p>
-            {result.error && server.enabled && <p role="alert" className="form-error">{result.error}</p>}
-            {server.enabled && result.status === 'failed' && <button type="button" className="secondary-button" disabled={busy || loading} onClick={() => void reconnect(server.serverId)}>重试连接</button>}
+            {result.error && <p role="alert" className="form-error">{result.error}</p>}
+            {result.status === 'failed' && <button type="button" className="secondary-button" disabled={busy || loading} onClick={() => void reconnect(server.serverId)}>重试连接</button>}
             {result.tools.map(tool => <div key={tool.name} className="mcp-tool"><strong>{tool.name}</strong><p>{tool.description}</p></div>)}
           </div></Disclosure>
         </div>
@@ -158,7 +158,7 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
     if (busy) return
     setFailure(null)
     try {
-      await onSave({ serverId: id.trim(), enabled: server?.enabled ?? true, startupTimeoutSec: startup, toolTimeoutSec: timeout,
+      await onSave({ serverId: id.trim(), startupTimeoutSec: startup, toolTimeoutSec: timeout,
         transport: type === 'stdio' ? { type, command: command.trim(), args: args.split('\n').filter(line => line.trim() !== ''), cwd: cwd.trim() || null, env: stringMap(env, '环境变量') }
           : { type, url: url.trim(), headers: stringMap(headers, '请求头') },
       })

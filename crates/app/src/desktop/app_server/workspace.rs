@@ -106,6 +106,25 @@ impl AppServer {
         })
     }
 
+    /// 新建任务页的上下文胶囊：不连接 MCP 服务器，只读取指令、技能目录和已有连接的状态。
+    pub fn context_preview(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Vec<singularity_protocol::ContextModule>, RpcError> {
+        let root = self.workspace(workspace_root)?.root;
+        let cwd = Path::new(&root);
+        let instructions =
+            singularity_core::load_agent_instructions(cwd, &self.home).map_err(internal_error)?;
+        let skills = singularity_core::skills::SkillCatalog::discover(cwd, &self.home);
+        let servers = self.mcp.list(cwd).map_err(internal_error)?;
+        Ok(singularity_agent::agent::modules::preview(
+            &singularity_core::display_path(cwd),
+            instructions,
+            skills,
+            servers,
+        ))
+    }
+
     /// 全局指令是应用数据目录下的 AGENTS.md，项目指令是项目根目录下的 AGENTS.md；文件不存在时内容为空。
     pub fn read_instructions(
         &self,

@@ -24,14 +24,15 @@ textarea.input { resize: vertical; line-height: 1.5; font-family: var(--font-san
 .app-main.is-manage .conversation-header { background: transparent; backdrop-filter: none; }
 
 .manage-page:has(.instructions-layout) { min-height: 100%; display: flex; flex-direction: column; }
-.instructions-layout { flex: 1; display: grid; grid-template-columns: 200px 1fr; gap: 18px; align-items: start; }
-.instruction-targets { display: grid; gap: 2px; }
-.instruction-targets button { min-height: 34px; padding: 6px 12px; border: 0; border-radius: 8px; cursor: pointer; text-align: left; font-size: 13.5px; font-weight: 400; background: transparent; color: var(--ink); transition: background 120ms, transform var(--spring-dur) var(--spring); }
-.instruction-targets button:hover:not(:disabled) { background: var(--surface-hover); }
-.instruction-targets button:active:not(:disabled) { transform: scale(.97); transition-duration: 80ms; }
-.instruction-targets button[aria-current] { background: var(--assistant-selection-bg); font-weight: 400; }
-.instruction-targets button:disabled { cursor: default; opacity: .6; }
-.instruction-editor { display: flex; flex-direction: column; align-self: stretch; gap: 14px; min-width: 0; }
+.instructions-layout { flex: 1; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+/* 范围选择为顶部横向页签：选中项底部一条深色指示线，其余浅灰；超出时才允许横向滚动 */
+.instruction-targets { display: flex; gap: 4px; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; }
+.instruction-targets::-webkit-scrollbar { display: none; }
+.instruction-targets button { flex: none; padding: 8px 12px; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; background: transparent; color: var(--ink-soft); font-size: 13.5px; font-weight: 400; cursor: pointer; transition: color 120ms, border-color 120ms; white-space: nowrap; }
+.instruction-targets button:hover:not(:disabled) { color: var(--ink); }
+.instruction-targets button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); }
+.instruction-targets button:disabled { cursor: default; opacity: .5; }
+.instruction-editor { flex: 1; display: flex; flex-direction: column; align-self: stretch; gap: 14px; min-width: 0; }
 .editor-path { color: var(--ink-faint); font: 12px var(--font-sans); overflow-wrap: anywhere; }
 .instruction-editor textarea { flex: 1; min-height: 320px; padding: 20px; border-color: var(--line); border-radius: 12px; font: 15.5px/1.85 var(--font-sans); }
 .instruction-editor footer { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }

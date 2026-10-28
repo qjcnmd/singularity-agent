@@ -95,6 +95,20 @@ impl CaptureState {
         }
     }
 
+    /// 后台读取使用原始文本与绝对位置，提示文字不参与游标计算。
+    pub(super) fn snapshot(&self) -> singularity_protocol::CommandOutputSnapshot {
+        singularity_protocol::CommandOutputSnapshot {
+            text: self.tail.clone(),
+            total_bytes: self.total_bytes as u64,
+            full_output: self
+                .spill
+                .as_ref()
+                .and_then(|spill| spill.as_ref().ok().map(|spill| spill.path.to_string_lossy().into_owned())),
+            file_error: self.spill.as_ref().and_then(|spill| spill.as_ref().err().map(ToString::to_string)),
+            incomplete: false,
+        }
+    }
+
     /// 结束捕获，返回显示用的正文和完整输出文件的说明。
     /// 调用方把文件说明放在命令结束原因之后。
     pub(super) fn finish(self) -> (String, Option<String>) {

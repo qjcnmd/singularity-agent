@@ -10,7 +10,6 @@ pub use result::McpToolResult;
 
 use client::Connection;
 use config::{Configuration, ServerConfig};
-use rmcp::model::Tool;
 use singularity_protocol::{McpConnectionStatus, McpServerInput, McpServerState, McpToolInfo};
 use std::{
     collections::BTreeMap,
@@ -25,6 +24,8 @@ struct ConnectionState {
     connection: Option<Arc<Connection>>,
     // 设置页只需最近发现的名称和说明，完整工具定义交给本轮执行。
     catalog: Result<Vec<McpToolInfo>, String>,
+    // 新建任务页显示的估算：这台服务器的工具定义和说明在请求里占多少 Token。
+    tokens: u64,
 }
 
 type Connections = BTreeMap<(String, String), (ServerConfig, ConnectionCell)>;
@@ -57,12 +58,50 @@ impl McpTool {
     }
 }
 
-/// 一次工具发现的结果；连不上的服务器不提供工具，失败原因写进 Developer 指令告诉模型。
+/// 一台服务器本轮的发现结果；连不上时没有工具，失败原因在 `error`。
+pub struct McpServerDiscovery {
+    pub id: String,
+    pub tools: Vec<McpTool>,
+    /// 要写进 Developer 指令的内容：服务器自带的说明，或连接失败的原因。
+    pub prompt: Option<String>,
+    /// 这台服务器的工具定义和 `prompt` 在请求里的估算 Token 数。
+    pub tokens: u64,
+    pub error: Option<String>,
+}
+
+struct ServerTools {
+    tools: Vec<McpTool>,
+    prompt: Option<String>,
+    tokens: u64,
+}
+
+fn unavailable_prompt(id: &str, error: &str) -> String {
+    format!("Unavailable MCP server {id}:\n{error}")
+}
+
+/// 工具定义按发给模型的字段名序列化后估算，与请求里的工具定义同一种写法。
+fn definition_tokens(tools: &[McpTool]) -> u64 {
+    if tools.is_empty() {
+        return 0;
+    }
+    let schemas: Vec<_> = tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "parametersSchema": tool.input_schema,
+            })
+        })
+        .collect();
+    singularity_core::estimate_tokens_of(&serde_json::Value::Array(schemas).to_string()) + 4
+}
+
+/// 一次工具发现的结果；`error` 是 mcp.json 读不出来的原因，此时没有服务器。
 #[derive(Default)]
 pub struct McpDiscovery {
-    pub tools: Vec<McpTool>,
-    pub errors: Vec<String>,
-    pub instructions: Vec<String>,
+    pub servers: Vec<McpServerDiscovery>,
+    pub error: Option<String>,
 }
 
 impl McpManager {
@@ -78,7 +117,7 @@ impl McpManager {
         self.connections.lock().expect("MCP connection lock poisoned")
     }
 
-    /// 一次返回配置和已有连接状态，不启动服务器或查询工具。
+    /// 新建任务页预览用：读取已有连接留下的状态，不启动服务器或查询工具。
     pub fn list(&self, cwd: &Path) -> Result<Vec<McpServerState>, String> {
         let config = config::read(&self.home)?;
         Ok(Self::states(config, cwd, &self.lock()))
@@ -91,14 +130,6 @@ impl McpManager {
         config.validate(&id)?;
         self.update(&id, cwd, |all| {
             all.servers.insert(id.clone(), config);
-            Ok(())
-        })
-    }
-
-    /// 修改服务器开关，不删除配置。
-    pub fn toggle(&self, id: &str, enabled: bool, cwd: &Path) -> Result<Vec<McpServerState>, String> {
-        self.update(id, cwd, |all| {
-            all.servers.get_mut(id).ok_or("MCP 服务器不存在。")?.enabled = enabled;
             Ok(())
         })
     }
@@ -145,14 +176,12 @@ impl McpManager {
         if only.is_some_and(|id| !config.servers.contains_key(id)) {
             return Err("MCP 服务器不存在。".into());
         }
-        // 以 mcp.json 为准：配置已改或已停用的连接从表里移除，正在运行的回合仍持有旧连接直到结束。
-        connections.retain(|(_, id), (previous, _)| {
-            config.servers.get(id).is_some_and(|current| current.enabled && current == previous)
-        });
+        // 以 mcp.json 为准：配置已改的连接从表里移除，正在运行的回合仍持有旧连接直到结束。
+        connections.retain(|(_, id), (previous, _)| config.servers.get(id) == Some(previous));
         let mut entries = Vec::new();
         let directory = directory_key(cwd);
         for (id, config) in config.servers {
-            if !config.enabled || only.is_some_and(|only| only != id) {
+            if only.is_some_and(|only| only != id) {
                 continue;
             }
             let key = (directory.clone(), id.clone());
@@ -165,6 +194,7 @@ impl McpManager {
                     Arc::new(tokio::sync::Mutex::new(ConnectionState {
                         connection: None,
                         catalog: Ok(Vec::new()),
+                        tokens: 0,
                     })),
                 )
             });
@@ -175,10 +205,11 @@ impl McpManager {
     }
 
     async fn tools(
+        id: &str,
         cwd: &Path,
         config: ServerConfig,
         cell: &ConnectionCell,
-    ) -> Result<(Arc<Connection>, Vec<Tool>), String> {
+    ) -> Result<ServerTools, String> {
         // 同一项目的并发准备共用连接；失败的工具调用不会走这里重放。
         let mut state = cell.lock().await;
         let connection = match state.connection.as_ref().filter(|connection| !connection.is_closed()) {
@@ -188,18 +219,19 @@ impl McpManager {
                 match Connection::connect(cwd, config).await {
                     Ok(connection) => Arc::new(connection),
                     Err(error) => {
+                        state.tokens = singularity_core::estimate_tokens_of(&unavailable_prompt(id, &error));
                         state.catalog = Err(error.clone());
                         return Err(error);
                     }
                 }
             }
         };
-        let tools = connection.tools().await.map(|mut tools| {
+        let listed = connection.tools().await.map(|mut tools| {
             tools.sort_by(|a, b| a.name.cmp(&b.name));
             tools
         });
         state.connection = Some(Arc::clone(&connection));
-        state.catalog = tools
+        state.catalog = listed
             .as_ref()
             .map(|tools| {
                 tools
@@ -211,28 +243,51 @@ impl McpManager {
                     .collect()
             })
             .map_err(Clone::clone);
-        tools.map(|tools| (connection, tools))
+        let discovered = listed.map(|listed| {
+            let tools: Vec<_> = listed
+                .into_iter()
+                .map(|tool| McpTool {
+                    name: client::tool_alias(id, &tool.name),
+                    description: format!(
+                        "MCP server {id}, tool {}. {}",
+                        tool.name,
+                        tool.description.as_deref().unwrap_or("")
+                    ),
+                    original_name: tool.name.into_owned(),
+                    input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
+                    connection: Arc::clone(&connection),
+                })
+                .collect();
+            let prompt = connection.instructions().map(|text| format!("MCP server {id}:\n{text}"));
+            let tokens =
+                definition_tokens(&tools) + prompt.as_deref().map_or(0, singularity_core::estimate_tokens_of);
+            ServerTools { tools, prompt, tokens }
+        });
+        state.tokens = match &discovered {
+            Ok(found) => found.tokens,
+            Err(error) => singularity_core::estimate_tokens_of(&unavailable_prompt(id, error)),
+        };
+        discovered
     }
 
-    /// 每轮获取全部已启用工具；复用健康连接，重新读取目录。
+    /// 每轮获取全部服务器的工具（`skip` 里的服务器不连接）；复用健康连接，重新读取目录。
     /// BTreeMap 与名称排序保持请求定义顺序稳定。
-    pub async fn discover(&self, cwd: &Path, signal: &CancellationToken) -> McpDiscovery {
+    pub async fn discover(&self, cwd: &Path, signal: &CancellationToken, skip: &[String]) -> McpDiscovery {
         if signal.is_cancelled() {
             return McpDiscovery::default();
         }
-        let entries = match self.entries(cwd, None, false) {
+        let mut entries = match self.entries(cwd, None, false) {
             Ok(entries) => entries,
-            Err(error) => {
-                return McpDiscovery {
-                    errors: vec![error],
-                    ..Default::default()
-                };
-            }
+            Err(error) => return McpDiscovery { servers: Vec::new(), error: Some(error) },
         };
+        entries.retain(|(id, ..)| !skip.contains(id));
         let mut pending = tokio::task::JoinSet::new();
         for (id, config, cell) in entries {
             let cwd = cwd.to_path_buf();
-            pending.spawn(async move { (id, Self::tools(&cwd, config, &cell).await) });
+            pending.spawn(async move {
+                let found = Self::tools(&id, &cwd, config, &cell).await;
+                (id, found)
+            });
         }
         let mut discovered = BTreeMap::new();
         while !pending.is_empty() {
@@ -247,38 +302,36 @@ impl McpManager {
                 }
             }
         }
-        let mut result = McpDiscovery::default();
-        for (id, found) in discovered {
-            match found {
-                Ok((connection, tools)) => {
-                    if let Some(instructions) = connection.instructions() {
-                        result.instructions.push(format!("MCP server {id}:\n{instructions}"));
-                    }
-                    for tool in tools {
-                        result.tools.push(McpTool {
-                            name: client::tool_alias(&id, &tool.name),
-                            description: format!(
-                                "MCP server {id}, tool {}. {}",
-                                tool.name,
-                                tool.description.as_deref().unwrap_or("")
-                            ),
-                            original_name: tool.name.into_owned(),
-                            input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
-                            connection: Arc::clone(&connection),
-                        });
+        let servers = discovered
+            .into_iter()
+            .map(|(id, found)| match found {
+                Ok(found) => McpServerDiscovery {
+                    id,
+                    tools: found.tools,
+                    prompt: found.prompt,
+                    tokens: found.tokens,
+                    error: None,
+                },
+                Err(error) => {
+                    let prompt = unavailable_prompt(&id, &error);
+                    McpServerDiscovery {
+                        id,
+                        tools: Vec::new(),
+                        tokens: singularity_core::estimate_tokens_of(&prompt),
+                        prompt: Some(prompt),
+                        error: Some(error),
                     }
                 }
-                Err(error) => result.errors.push(format!("MCP {id}：{error}")),
-            }
-        }
-        result
+            })
+            .collect();
+        McpDiscovery { servers, error: None }
     }
 
     /// 用户明确重试时重建该项目的连接并发现工具，连接失败随服务器状态返回。
     pub async fn reconnect(&self, id: &str, cwd: &Path) -> Result<McpServerState, String> {
         if let Some((_, config, cell)) = self.entries(cwd, Some(id), true)?.pop() {
             // 连接失败保存在状态中，与执行准备失败使用同一份原因。
-            let _ = Self::tools(cwd, config, &cell).await;
+            let _ = Self::tools(id, cwd, config, &cell).await;
         }
         // 重连等待期间设置可能已修改，返回时读取当前配置和连接。
         let mut config = config::read(&self.home)?;
@@ -301,16 +354,14 @@ impl McpManager {
             status: McpConnectionStatus::NotConnected,
             error: None,
             tools: vec![],
+            tokens: 0,
         };
-        if !inspection.server.enabled {
-            inspection.status = McpConnectionStatus::Disabled;
-            return inspection;
-        }
         let Some(cell) = cell else { return inspection };
         let Ok(state) = cell.try_lock() else {
             inspection.status = McpConnectionStatus::Connecting;
             return inspection;
         };
+        inspection.tokens = state.tokens;
         match (&state.catalog, &state.connection) {
             (Err(error), _) => {
                 inspection.status = McpConnectionStatus::Failed;

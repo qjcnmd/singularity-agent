@@ -1,8 +1,6 @@
-import { memo, useEffect, useId, useState, type ReactNode } from 'react'
+import { memo, useEffect, useState } from 'react'
 import { appStore, useAppStore } from '../appStore'
-import { Disclosure } from './Disclosure'
-import { ExpandChevron } from './ExpandChevron'
-import type { InstructionFile } from '../protocol'
+import { CapsuleIcon, CapsuleTokens } from './ContextCapsules'
 
 export const ContextPanel = memo(function ContextPanel() {
   const state = useAppStore(['selectedSessionId', 'session'], (a, b) =>
@@ -24,35 +22,12 @@ export const ContextPanel = memo(function ContextPanel() {
       <button type="button" className="quiet-button" onClick={() => setAttempt(value => value + 1)}>重试</button></p>
     return <p className="detail-empty" role="status">读取中…</p>
   }
+  // 只列本任务开着的模块，和实际发送给模型的内容一致；胶囊只展示，不能在这里改。
   return <div className="context-panel" key={state.selectedSessionId}>
-    <Group title="指令" count={context.instructions.length}>
-      {context.instructions.map(instruction => <Instruction key={instruction.path} instruction={instruction} />)}
-    </Group>
-    <Names title="系统工具" names={context.tools} />
-    {context.mcpTools.length > 0 && <Names title="MCP 工具" names={context.mcpTools} />}
+    <div className="capsules">
+      {context.modules.filter(module => module.enabled).map(module => <span key={module.id} className="capsule capsule-static is-on" title={module.detail}>
+        <CapsuleIcon /><span className="capsule-name">{module.label}</span><CapsuleTokens tokens={module.tokens} />
+      </span>)}
+    </div>
   </div>
 })
-function Instruction({ instruction }: { instruction: InstructionFile }) {
-  const [open, setOpen] = useState(false)
-  const id = useId()
-  return <div className="context-instruction">
-    <button type="button" className="expandable-toggle" aria-expanded={open} aria-controls={id} onClick={() => setOpen(value => !value)}>
-      <ExpandChevron expanded={open} size={14} /><span className="instruction-label"><span>{instruction.global ? '全局指令' : '项目指令'}</span><small>{instruction.path}</small></span>
-    </button>
-    <div id={id}><Disclosure open={open}><pre className="instruction-body">{instruction.content}</pre></Disclosure></div>
-  </div>
-}
-
-function Names({ title, names }: { title: string; names: string[] }) {
-  return <Group title={title} count={names.length}><ul className="name-list">{names.map(name => <li key={name} title={name}>{name}</li>)}</ul></Group>
-}
-
-function Group({ title, count, children }: { title: string; count: number; children: ReactNode }) {
-  const [open, setOpen] = useState(false)
-  const id = useId()
-  return <section aria-label={title}>
-    <button type="button" className="expandable-toggle" aria-expanded={open} aria-controls={id} onClick={() => setOpen(value => !value)}>
-      <ExpandChevron expanded={open} size={13} /><strong>{title}</strong><span className="count">{count}</span>
-    </button><div id={id}><Disclosure open={open}><div className="expandable-body">{children}</div></Disclosure></div>
-  </section>
-}

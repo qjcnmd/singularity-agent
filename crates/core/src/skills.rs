@@ -19,13 +19,13 @@ pub struct Skill {
 }
 
 impl Skill {
-    /// 显式选择时完整读取入口；辅助资源仍由模型按需读取，不受工具输出截断限制。
+    /// 用户选择或模型调用 skill 工具时完整读取入口；辅助资源仍由模型按需读取，不受工具输出截断限制。
     pub fn load_instructions(&self) -> Result<String, String> {
         let content = fs::read_to_string(&self.path)
             .map_err(|error| format!("无法加载技能 /{}（{}）：{error}", self.name, self.path.display()))?;
         let directory = self.path.parent().expect("discovered skills have a parent directory");
         Ok(format!(
-            "<skill>\nName: {}\nPath: {}\nBase directory: {}\nUser-selected skill instructions follow. Already loaded; do not read SKILL.md again to activate it. Resolve relative resources from the base directory using absolute tool paths.\n\n{content}\n</skill>",
+            "<skill>\nName: {}\nPath: {}\nBase directory: {}\nSkill instructions follow. Already loaded; do not read SKILL.md again to activate it. Resolve relative resources from the base directory using absolute tool paths.\n\n{content}\n</skill>",
             self.name,
             crate::display_path(&self.path),
             crate::display_path(directory),
@@ -182,16 +182,14 @@ impl SkillCatalog {
         self.skills.iter().filter(|skill| !skill.disable_model_invocation)
     }
 
-    /// 列出名称、摘要和文件路径；完整指令由模型通过 read 工具加载。
+    /// 列出名称和摘要；完整指令由模型通过 skill 工具按名称加载。没有可公布的技能时为空。
     pub fn prompt(&self) -> String {
-        let mut lines: Vec<_> = self
-            .model_skills()
-            .map(|s| format!("- {}: {} (path: {})", s.name, s.description, s.path.display()))
-            .collect();
+        let mut lines: Vec<_> =
+            self.model_skills().map(|s| format!("- {}: {}", s.name, s.description)).collect();
         if lines.is_empty() {
             return String::new();
         }
-        lines.insert(0, "Available skills: when a skill matches the user's task, use the read tool on its path to load the complete instructions. Relative resources in a skill are resolved from that skill file's directory.".into());
+        lines.insert(0, "Available skills: when a skill matches the user's task, call the skill tool with its name to load the complete instructions.".into());
         lines.join("\n")
     }
 }
