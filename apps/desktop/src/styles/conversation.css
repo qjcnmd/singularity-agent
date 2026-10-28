@@ -5,6 +5,8 @@
 .timeline-item { min-width: 0; }
 .message-item { display: grid; justify-items: start; align-self: flex-start; max-width: min(88%, 680px); margin-top: 10px; }
 .message-bubble { min-width: 0; max-width: 100%; padding: 10px 16px; border-radius: 16px; border: 1px solid var(--assistant-bubble-border); background: var(--assistant-bubble-bg); color: var(--assistant-bubble-ink); font-size: var(--message-font-size); line-height: 1.6; overflow-wrap: anywhere; transition: background-color 350ms, border-color 350ms, color 350ms; }
+/* 我的气泡是实色，本身就有边界，不加投影。 */
+.timeline-assistant .message-bubble { box-shadow: var(--bubble-shadow); }
 .terminal-interruption { margin-top: 0; }
 .timeline-user { align-self: flex-end; justify-items: end; max-width: min(72%, 540px); }
 .timeline-user .message-bubble { color: var(--user-bubble-ink); border-color: var(--user-bubble-border); background: var(--user-bubble-bg); }
@@ -15,7 +17,7 @@
 .timeline-user .msg-time { margin: 0 6px 3px 0; }
 .turn-duration { display: inline-flex; gap: 10px; margin: 10px 0 0; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
 .turn-stats { margin: 4px 0 0; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
-.activity-step, .reasoning-row { display: grid; width: fit-content; max-width: min(640px, 100%); margin: 10px 0 0; border-radius: 16px; border: 1px solid var(--assistant-bubble-border); background: var(--assistant-bubble-bg); overflow: hidden; transition: background 120ms, width var(--disclosure-duration) var(--smooth); }
+.activity-step, .reasoning-row { display: grid; width: fit-content; max-width: min(640px, 100%); margin: 10px 0 0; border-radius: 16px; border: 1px solid var(--assistant-bubble-border); background: var(--assistant-bubble-bg); box-shadow: var(--bubble-shadow); overflow: hidden; transition: background 120ms, width var(--disclosure-duration) var(--smooth); }
 /* 正文按展开后的宽度排版，避免宽度过渡中换行导致高度反复改变。 */
 .activity-step:has(> .activity-toggle[aria-expanded=true]) { width: 640px; }
 .activity-step > .content-disclosure { contain: inline-size; }
@@ -25,7 +27,7 @@
 .activity-toggle { display: flex; align-items: center; gap: 7px; min-width: 0; width: 100%; min-height: 30px; padding: 0 16px; border: 0; background: none; color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.6; text-align: left; cursor: pointer; }
 .activity-toggle[aria-disabled=true] { cursor: default; }
 .tool-group { margin: 10px 0 0; min-width: 0; max-width: 100%; }
-.tool-group-toggle { width: fit-content; max-width: calc(100% - 24px); flex-wrap: wrap; height: auto; min-height: 30px; box-sizing: content-box; border: 1px solid var(--assistant-bubble-border); border-radius: 16px; background: var(--assistant-bubble-bg); }
+.tool-group-toggle { width: fit-content; max-width: calc(100% - 24px); flex-wrap: wrap; height: auto; min-height: 30px; box-sizing: content-box; border: 1px solid var(--assistant-bubble-border); border-radius: 16px; background: var(--assistant-bubble-bg); box-shadow: var(--bubble-shadow); }
 .tool-group-toggle:hover { background: color-mix(in srgb, var(--assistant-bubble-bg) 98%, var(--ink)); }
 .tool-group-items { display: grid; padding-left: 12px; }
 .step-label { display: inline-flex; align-items: center; flex: none; gap: 7px; }
