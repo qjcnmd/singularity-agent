@@ -1,0 +1,23 @@
+.activity-output:has(.edit-diff) { max-height: none; overflow: hidden; background: transparent; border-radius: 0; }
+.edit-diff { overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: transparent; }
+.edit-diff-header { display: flex; align-items: center; gap: 10px; min-height: 34px; padding: 5px 12px; background: transparent; border-bottom: 1px solid var(--line); font-size: var(--block-font-size); color: var(--ink-soft); }
+.edit-filename { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.edit-counts { display: inline-flex; flex: none; gap: 5px; font-variant-numeric: tabular-nums; }
+.edit-added-count { color: #008d35; }
+.edit-deleted-count { color: #cf222e; }
+.edit-diff-header .quiet-button { display: inline-flex; align-items: center; justify-content: center; margin-left: auto; padding: 4px; min-width: 24px; min-height: 24px; }
+.edit-diff-scroll { max-height: 360px; overflow: auto; outline-offset: -2px; scrollbar-gutter: stable; }
+.edit-hunk { width: max-content; min-width: 100%; }
+.edit-hunk + .edit-hunk { border-top: 1px solid var(--line); margin-top: 5px; padding-top: 5px; }
+.edit-line { display: flex; min-height: 25px; border-left: 4px solid transparent; font-family: var(--font-sans); font-size: var(--block-font-size); line-height: 25px; }
+.edit-line-number { position: sticky; left: 0; flex: 0 0 52px; padding-right: 12px; text-align: right; color: var(--ink-soft); user-select: none; background: transparent; font-variant-numeric: tabular-nums; }
+.timeline-body .edit-line > code { margin: 0; padding: 0 16px 0 0; border: 0; border-radius: 0; background: transparent; color: inherit; font: inherit; white-space: pre; tab-size: 4; }
+.edit-line-added { background: #e6f4e8; border-left-color: #00a83d; }
+.edit-line-deleted { background: #fbe8e6; border-left-color: #df2727; }
+.edit-line-added .edit-line-number { color: #008d35; background: #e6f4e8; }
+.edit-line-deleted .edit-line-number { color: #cf222e; background: #fbe8e6; }
+.edit-diff-note { margin: 0; padding: 9px 12px; border-top: 1px solid var(--line); color: var(--ink-soft); font-size: var(--meta-font-size); }
+[data-theme=dark] .edit-line-added, [data-theme=dark] .edit-line-added .edit-line-number { background: #163526; }
+[data-theme=dark] .edit-line-deleted, [data-theme=dark] .edit-line-deleted .edit-line-number { background: #462524; }
+[data-theme=dark] .edit-added-count, [data-theme=dark] .edit-line-added .edit-line-number { color: #5ed990; }
+[data-theme=dark] .edit-deleted-count, [data-theme=dark] .edit-line-deleted .edit-line-number { color: #ff938a; }

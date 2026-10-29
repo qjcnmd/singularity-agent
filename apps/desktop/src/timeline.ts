@@ -115,7 +115,7 @@ function mergeAdjacentThinking(items: HistoryItem[]): HistoryItem[] {
 
 export function toolArgument(name: string, args: unknown): string | null {
   const input = record(args)
-  const value = name === 'bash' ? input.command : name === 'read' || name === 'view_image' ? input.path : name === 'skill' ? input.name : undefined
+  const value = name === 'bash' ? input.command : name === 'read' || name === 'edit' || name === 'view_image' ? input.path : name === 'skill' ? input.name : undefined
   return typeof value === 'string' ? value : null
 }
 
@@ -151,7 +151,7 @@ export function displayPath(path: string, cwd: string, userHome?: string | null)
 }
 
 export function pathFromArgs(name: string, args: unknown): string | null {
-  if (name !== 'read' && name !== 'view_image') return null
+  if (name !== 'read' && name !== 'edit' && name !== 'view_image') return null
   const value = toolArgument(name, args)
   return value?.trim() ? value : null
 }

@@ -66,16 +66,21 @@ pub fn write_json_atomic<T: serde::Serialize + ?Sized>(
     path: &std::path::Path,
     value: &T,
 ) -> std::io::Result<()> {
-    use std::io::Write;
-
     let mut bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
     bytes.push(b'\n');
+    write_bytes_atomic(path, &bytes)
+}
+
+/// 同目录写入临时文件并刷盘，成功后替换目标；失败保留目标并清理临时文件。
+pub fn write_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     // 临时名只需在目标目录中唯一，不依赖目标文件名的字符编码。
     let temporary = parent.join(format!(".singularity-tmp-{}", uuid::Uuid::new_v4().simple()));
     let result = (|| -> std::io::Result<()> {
         let mut handle = std::fs::File::create_new(&temporary)?;
-        handle.write_all(&bytes)?;
+        handle.write_all(bytes)?;
         handle.sync_all()?;
         Ok(())
     })()

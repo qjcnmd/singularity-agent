@@ -73,11 +73,11 @@
 .project-trigger { color: var(--ink); anchor-name: --project-capsule; }
 .project-trigger .expand-chevron { transform: rotate(-90deg); }
 .project-trigger .expand-chevron.is-open { transform: rotate(90deg); }
-.project-menu { position: fixed; position-anchor: --project-capsule; bottom: calc(anchor(top) + 6px); left: anchor(left); position-try-fallbacks: flip-block; z-index: 10; width: max-content; min-width: anchor-size(width); max-width: 280px; }
-.project-menu .content-disclosure { border-radius: 16px; background: var(--assistant-bubble-bg); }
-.project-menu .content-disclosure.is-open { box-shadow: var(--shadow-soft); }
-.project-options { display: grid; padding: 4px; max-height: 240px; overflow-y: auto; border: 1px solid var(--assistant-bubble-border); border-radius: 16px; }
-.project-options button { display: flex; align-items: center; gap: 7px; height: 30px; padding: 0 8px 0 10px; border: 0; border-radius: 12px; background: transparent; color: var(--ink-soft); font-size: 12.5px; text-align: left; white-space: nowrap; cursor: pointer; transition: background 120ms; }
+.project-menu { position: fixed; position-anchor: --project-capsule; bottom: calc(anchor(top) + 6px); left: anchor(center); translate: -50% 0; position-try-fallbacks: flip-block; z-index: 10; width: max-content; min-width: anchor-size(width); max-width: 280px; }
+.project-menu .content-disclosure { border-radius: 10px; background: var(--assistant-bubble-bg); }
+.project-menu .content-disclosure.is-open { box-shadow: 0 2px 8px rgb(0 0 0 / 6%); }
+.project-options { display: grid; padding: 5px; max-height: 240px; overflow-y: auto; border: 1px solid var(--assistant-bubble-border); border-radius: 10px; }
+.project-options button { display: flex; align-items: center; gap: 7px; height: 32px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--ink-soft); font-size: 12.5px; text-align: left; white-space: nowrap; cursor: pointer; transition: background 120ms; }
 .project-options button:hover { background: color-mix(in srgb, var(--assistant-bubble-bg) 96%, var(--ink)); color: var(--ink); }
 .project-options button[aria-pressed=true] { color: var(--ink); }
 .project-options button > span:first-of-type { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }

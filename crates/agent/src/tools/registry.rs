@@ -10,6 +10,7 @@ use singularity_model::ModelToolSchema;
 use tokio_util::sync::CancellationToken;
 
 use super::bash;
+use super::edit;
 use super::read;
 use super::skill;
 use super::view_image;
@@ -63,6 +64,7 @@ pub(crate) struct ToolContext {
 
 /// 参数已检查并解析好的工具调用。
 pub(crate) enum PreparedTool {
+    Edit(edit::EditArgs),
     Read(read::ReadArgs),
     ViewImage(view_image::ViewImageArgs),
     Skill(skill::SkillArgs, Arc<SkillCatalog>),
@@ -83,6 +85,7 @@ impl PreparedTool {
     ) -> ToolExecution {
         let ToolContext { cwd, signal, bash_tasks } = context;
         match self {
+            Self::Edit(args) => edit::execute(args, cwd, signal).await,
             Self::Mcp(tool, args) => super::mcp::execute(tool, args, &signal).await,
             Self::Bash(args) => bash_tasks.execute(args, cwd, signal, on_update).await,
             Self::TaskList(_) => bash_tasks.tool_list(),
@@ -137,6 +140,10 @@ pub(crate) fn task_tools() -> Vec<BuiltinTool> {
 
 pub(crate) fn read_tool() -> BuiltinTool {
     (read::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Read))
+}
+
+pub(crate) fn edit_tool() -> BuiltinTool {
+    (edit::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Edit))
 }
 
 pub(crate) fn view_image_tool() -> BuiltinTool {

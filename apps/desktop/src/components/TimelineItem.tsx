@@ -1,4 +1,5 @@
 import { ExpandChevron } from './ExpandChevron'
+import { EditDiff } from './EditDiff'
 import { AttachedImages, FileChips } from './Images'
 import { QuestionPanel } from './QuestionPanel'
 import { Disclosure } from './Disclosure'
@@ -195,6 +196,7 @@ function ToolOutput({ item: fact, filePath }: { item: Extract<HistoryItem, { typ
   }
   const command = fact.name === 'bash' ? toolArgument(fact.name, input) : null
   if (command !== null) return <CommandOutput command={command} output={output} />
+  if (fact.name === 'edit' && filePath !== null && fact.status === 'completed') return <EditDiff path={filePath} output={output} />
   const hasReadLines = fact.result?.readSource !== undefined && fact.result?.readSource.lineCount > 0
   if (filePath !== null && (output !== '' || hasReadLines) && fact.status !== 'failed') return <div>
     <div className="tool-output-header">{filePath}</div>

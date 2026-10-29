@@ -86,7 +86,7 @@ Tokio 运行时由 `main` 持有。`Conversation` 长期持有会话写者和输
 
 输入检查通过后进入队列。会话空闲时立即创建本轮的 `TurnControls`，准备、执行和收尾都用它。准备阶段由 `Conversation::prepare_request_context` 解析模型、读取当前项目指令，再写入回合开始记录。Agent 随后扫描技能、发现 MCP 工具（跳过本任务关闭的服务器），按 `agent::agent::modules` 的模块组装本轮的指令和工具定义；同一轮的工具循环和自动压缩都复用这份定义，下一轮（包括重启后的第一轮）重新读取。全局和项目指令完整读取，不截断。
 
-每个上下文模块自带 Developer 片段、工具定义和估算 Token，模块之间互不引用：基础模块不提可选工具，各工具的一行用法跟着工具走，关掉一个模块时它的提示词和工具一起消失。工具说明只随工具定义发送；`bash` 和 `task_*`、系统提示词是锁定模块，其余模块按创建任务时记下的 ID 关闭。系统提示词、全局指令、项目指令、`bash`、`task_*`、`read`、`view_image`、`ask_user_question`、Skills 各一个模块，MCP 每个服务器一个；关掉的 MCP 服务器不连接，也不进入本轮模块清单；运行面板只显示开启的模块。新建任务页的 `context.preview` 复用同一份组装代码，MCP 用已有连接缓存的数字，不连接服务器。
+每个上下文模块自带 Developer 片段、工具定义和估算 Token，模块之间互不引用：基础模块不提可选工具，各工具的一行用法跟着工具走，关掉一个模块时它的提示词和工具一起消失。工具说明只随工具定义发送；`bash` 和 `task_*`、系统提示词是锁定模块，其余模块按创建任务时记下的 ID 关闭。系统提示词、全局指令、项目指令、`bash`、`task_*`、`read`、`edit`、`view_image`、`ask_user_question`、Skills 各一个模块，MCP 每个服务器一个；关掉的 MCP 服务器不连接，也不进入本轮模块清单；运行面板只显示开启的模块。新建任务页的 `context.preview` 复用同一份组装代码，MCP 用已有连接缓存的数字，不连接服务器。
 
 本轮加载的模块清单保存在 `Conversation` 中供运行状态小面板查看，由加载完成事件更新，并在读取任务时返回完整内容；输入排队、停止、提问和压缩等运行状态更新不重复发送。下一轮加载后替换。重启后还没跑过回合时，工作台通过 `session.context` 让 `Conversation::inspect_context` 按回合开始时的同一套规则加载一次（指令文件、Skills 目录、MCP 工具），结果同样以 context/loaded 发布；本次启动已有上下文时直接沿用。
 
@@ -275,3 +275,11 @@ MCP 图片直接把 Base64 内容交给图片入口解码，按实际字节识�
 | 管理页与运行状态 | [ManagePages.tsx](../apps/desktop/src/components/ManagePages.tsx) 读写指令和技能；[RunPanel.tsx](../apps/desktop/src/components/RunPanel.tsx) 显示上下文和后台命令 |
 
 运行流程变化时更新 `architecture.html`；职责、状态维护者或源码入口变化时更新本文。
+
+## 精确编辑文件
+
+`tools/edit.rs` 提供 `edit(path, edits)`：每项包含 `old_text` 和 `new_text`。同文件各项匹配同一份当前原文，必须唯一且不重叠，全部通过后一次写入。空替换文字表示删除；空原文、无变化、非 UTF-8 或含 NUL 的文件返回错误。匹配仅将 CRLF 与 LF 视为等价，其他字符严格相同；保留 BOM 和替换范围外的原字节，替换内容沿用目标片段的换行风格。
+
+文件路径先解析到实际目标；进程内共用按 Windows 路径归一化后的编辑锁，从读取持有到写入完成，不同文件仍可并发。队列等待可取消；提交前再次检查停止，提交开始后等待真实写入结果。锁只协调内置 edit，不协调 Bash、MCP 或外部进程。相互依赖的修改按先后调用，独立位置合并到一次 edits 中。
+
+`core::write_bytes_atomic` 将新内容写入同目录临时文件、刷盘后替换目标；JSON 配置写入复用同一入口。结果通过现有 ToolExecution 与工具结果消息保存，`edit_diff.rs` 使用 similar 生成带两行上下文的 unified diff 和完整增删行数，模型正文与本地展示共用该差异；内容最多 2000 行或 50 KiB，截断明确提示。`EditDiff.tsx` 解析已保存的展示正文、按文件语言高亮并显示行号；不依赖当前磁盘内容重建历史差异，历史不重放编辑。

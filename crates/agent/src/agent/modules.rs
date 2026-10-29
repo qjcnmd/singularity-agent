@@ -20,6 +20,7 @@ pub const PROJECT_INSTRUCTIONS: &str = "project-instructions";
 pub const BASH: &str = "bash";
 pub const TASKS: &str = "tasks";
 pub const READ: &str = "read";
+pub const EDIT: &str = "edit";
 pub const VIEW_IMAGE: &str = "view-image";
 pub const QUESTION: &str = "ask-user-question";
 pub const SKILLS: &str = "skills";
@@ -139,7 +140,7 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         }
     }
 
-    // 工具：bash 和后台命令锁定；read、view_image、提问各自一个模块。
+    // 工具：bash 和后台命令锁定；其他内置工具各自一个模块。
     let bash = tools::bash_tool();
     let task_tools = tools::task_tools();
     let bash_schemas = [bash.0.clone()];
@@ -164,6 +165,15 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
     registry.add_builtin(task_tools);
 
     let optional_tools = [
+        (
+            EDIT,
+            "edit",
+            "精确替换文本文件内容",
+            tools::edit_tool(),
+            Some(
+                "Use edit for targeted changes to existing text files; combine independent changes to one file in a single call.",
+            ),
+        ),
         (READ, "read", "读取文本文件", tools::read_tool(), Some("Use read for text files.")),
         (
             VIEW_IMAGE,

@@ -4,6 +4,8 @@
 //! 本轮发现的 MCP 工具定义，生成发给模型的工具 Schema，并在收到工具调用时校验参数、分发执行。
 
 mod bash;
+mod edit;
+mod edit_diff;
 mod mcp;
 mod output;
 mod question;
@@ -18,6 +20,7 @@ pub(crate) use registry::ToolContext;
 pub use registry::ToolExecution;
 pub(crate) use registry::{ABORTED_MESSAGE, error_result};
 pub(crate) use registry::{
-    PreparedTool, ToolRegistrySnapshot, bash_tool, question_tool, read_tool, task_tools, view_image_tool,
+    PreparedTool, ToolRegistrySnapshot, bash_tool, edit_tool, question_tool, read_tool, task_tools,
+    view_image_tool,
 };
 pub(crate) use skill::spec as skill_schema;

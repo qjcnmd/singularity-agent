@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
+import { Check, Copy, CircleAlert } from 'lucide-react'
 
-export function CopyButton({ text, label = '复制' }: { text: string; label?: string }) {
+export function CopyButton({ text, label = '复制', iconOnly = false }: { text: string; label?: string; iconOnly?: boolean }) {
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle')
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const revision = useRef(0)
@@ -22,8 +23,9 @@ export function CopyButton({ text, label = '复制' }: { text: string; label?: s
     }
   }
   return <button type="button" className="quiet-button" aria-live="polite"
-    aria-label={copyStatus === 'error' ? `${label}失败，点击重试` : undefined}
+    aria-label={copyStatus === 'error' ? `${label}失败，点击重试` : iconOnly ? copyStatus === 'copied' ? '已复制' : label : undefined}
     onClick={() => { void copy() }}>
-    {copyStatus === 'copied' ? '已复制' : copyStatus === 'error' ? '复制失败，重试' : label}
+    {iconOnly ? copyStatus === 'copied' ? <Check size={14} aria-hidden="true" /> : copyStatus === 'error' ? <CircleAlert size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />
+      : copyStatus === 'copied' ? '已复制' : copyStatus === 'error' ? '复制失败，重试' : label}
   </button>
 }

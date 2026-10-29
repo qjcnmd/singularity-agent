@@ -25,6 +25,8 @@
 /* 悬停只在行内叠加 2% 的浅色底，保持玻璃观感又给出可点提示 */
 .activity-step:has(> .activity-toggle:hover), .reasoning-row:has(> .activity-toggle:hover) { background: color-mix(in srgb, var(--assistant-bubble-bg) 98%, var(--ink)); }
 .activity-toggle { display: flex; align-items: center; gap: 7px; min-width: 0; width: 100%; min-height: 30px; padding: 0 16px; border: 0; background: none; color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.6; text-align: left; cursor: pointer; }
+.timeline-item.activity-step, .timeline-item.tool-group { --block-font-size: var(--message-font-size); }
+.timeline-item > .activity-toggle { min-height: 0; padding: 10px 16px; }
 .activity-toggle[aria-disabled=true] { cursor: default; }
 .tool-group { margin: 10px 0 0; min-width: 0; max-width: 100%; }
 .tool-group-toggle { width: fit-content; max-width: calc(100% - 24px); flex-wrap: wrap; height: auto; min-height: 30px; box-sizing: content-box; border: 1px solid var(--assistant-bubble-border); border-radius: 16px; background: var(--assistant-bubble-bg); box-shadow: var(--bubble-shadow); }
