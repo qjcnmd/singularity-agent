@@ -68,7 +68,7 @@ impl BashTasks {
 
     /// 界面和工具共用的后台列表；实时输出覆盖运行记录，历史中未结束的命令标为中断。
     pub fn list(&self) -> Vec<BackgroundTask> {
-        self.project_tasks(|task, state| BackgroundTask { state: state.clone(), ..task.clone() })
+        self.project_tasks(clone_task)
     }
 
     fn project_tasks<T>(&self, project: impl Fn(&BackgroundTask, &BackgroundTaskState) -> T) -> Vec<T> {
@@ -246,6 +246,7 @@ impl BashTasks {
         if let Err(error) = started {
             return process.finish(Outcome::Failed(error.to_string())).await.0;
         }
+        let result = task_result(&task, Some(0), false);
         (self.on_update)(BashTaskUpdate::Updated(task));
         // 保存开始记录期间可能已经收到停止；这时等进程回收、最终状态保存后再返回。
         if signal.is_cancelled() || entry.cancel.is_cancelled() {
@@ -258,7 +259,6 @@ impl BashTasks {
             result.is_error = true;
             return result;
         }
-        let result = task_result(&entry.task.lock().expect("bash task lock"), Some(0), false);
         let manager = self.clone();
         tokio::spawn(async move {
             manager.run_background(entry, process).await;
@@ -279,12 +279,7 @@ impl BashTasks {
             .rev()
             .filter_map(recorded_task)
             .find(|task| task.task_id == task_id)
-            .map(|task| {
-                current_task(task, &entries, |task, state| BackgroundTask {
-                    state: state.clone(),
-                    ..task.clone()
-                })
-            })
+            .map(|task| current_task(task, &entries, clone_task))
             .ok_or_else(|| format!("Unknown background task: {task_id}"))
     }
 
@@ -374,6 +369,10 @@ fn recorded_task(entry: &SessionEntry) -> Option<&BackgroundTask> {
         } => Some(task),
         _ => None,
     }
+}
+
+fn clone_task(task: &BackgroundTask, state: &BackgroundTaskState) -> BackgroundTask {
+    BackgroundTask { state: state.clone(), ..task.clone() }
 }
 
 fn current_task<T>(

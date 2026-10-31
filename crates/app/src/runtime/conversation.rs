@@ -21,11 +21,13 @@ use singularity_agent::agent::{QueuedInput, UserInput};
 use singularity_agent::session::{SessionMetadata, SessionWriter, lock_writer};
 use singularity_protocol::SessionPhase;
 
-use singularity_protocol::Thread;
 use singularity_protocol::TurnEvent;
 
 /// 一个已打开的任务。
 pub struct Conversation {
+    pub(crate) thread_id: String,
+    pub(crate) cwd: String,
+    pub(crate) disabled_modules: Vec<String>,
     view: Mutex<view::ConversationView>,
     publish: Arc<dyn Fn(singularity_protocol::StreamEvent) -> u64 + Send + Sync>,
     changed: tokio::sync::Notify,
@@ -75,14 +77,11 @@ impl Conversation {
                 _ => None,
             })
             .expect("session creation and parsing require an initial model selection");
-        let thread = Thread {
-            thread_id: session.session_id().to_owned(),
-            cwd: session.cwd_string(),
-            model,
-            disabled_modules: session.disabled_modules(),
-        };
+        let thread_id = session.session_id().to_owned();
+        let cwd = session.cwd_string();
+        let disabled_modules = session.disabled_modules();
         let usage = crate::runtime::history::session_usage(session.entries());
-        let context_window = configured_context_window(&models, &thread.model);
+        let context_window = configured_context_window(&models, &model);
         let writer = Arc::new(Mutex::new(session));
         let inbox = Arc::new(std::sync::Mutex::new(singularity_agent::agent::SteeringInbox::default()));
         Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
@@ -97,6 +96,9 @@ impl Conversation {
                 }),
             );
             Self {
+                thread_id,
+                cwd,
+                disabled_modules,
                 view: Mutex::new(view::ConversationView::new(usage)),
                 publish,
                 changed: tokio::sync::Notify::new(),
@@ -104,7 +106,7 @@ impl Conversation {
                 models,
                 mcp,
                 state: Mutex::new(ConversationState {
-                    thread,
+                    model,
                     turn: TurnLifecycle::Idle,
                     steering_inbox: inbox,
                     last_context_window: context_window,
@@ -118,9 +120,9 @@ impl Conversation {
         })
     }
 
-    /// 任务 ID、工作目录和当前模型选择的副本。
-    pub fn thread(&self) -> Thread {
-        self.lock_state().thread.clone()
+    /// 当前模型选择的副本。
+    pub(crate) fn model(&self) -> singularity_protocol::ModelSelection {
+        self.lock_state().model.clone()
     }
 
     /// 在同一次加锁中检查执行、后台命令和待处理输入，避免检查途中后台通知启动新回合。
@@ -207,12 +209,12 @@ impl Conversation {
         self.validate_model_selection(selection).map_err(ConversationError::Configuration)?;
         let mut view = self.lock_view();
         let mut state = self.lock_state();
-        if &state.thread.model == selection {
+        if &state.model == selection {
             return Ok(());
         }
         let mut writer = lock_writer(&self.writer);
         writer.append_metadata(SessionMetadata::ThreadSettings { selection: selection.clone() })?;
-        state.thread.model = selection.clone();
+        state.model = selection.clone();
         if let Some(preview) = &state.context_preview {
             preview.cancel();
         }

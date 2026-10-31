@@ -11,7 +11,7 @@ import { X } from 'lucide-react'
 type ProviderEditorState = null | 'new' | RedactedProvider
 
 export function Settings() {
-  const state = useAppStore(['theme', 'bootstrap', 'settingsOpen', 'messageFontSize', 'actionErrors', 'pendingActions', 'selectedWorkspaceRoot'])
+  const state = useAppStore(['theme', 'bootstrap', 'settingsOpen', 'messageFontSize', 'actionErrors', 'pendingActions'])
   const [editor, setEditor] = useState<ProviderEditorState>(null)
   const [editorVersion, setEditorVersion] = useState(0)
   const [removing, setRemoving] = useState<RedactedProvider | null>(null)
@@ -122,7 +122,7 @@ export function Settings() {
                   </div>
               )})}
               {editor !== 'new' && <button type="button" className="settings-row settings-add" disabled={unreadable || busy} onClick={() => openEditor('new')}>添加提供方</button>}
-              <Disclosure open={editor === 'new'}><div className="settings-provider is-open new-provider"><ProviderEditor key={editorVersion} state={state} active={state.settingsOpen && editor === 'new'} onDone={() => setEditor(null)} /></div></Disclosure>
+              <Disclosure open={editor === 'new'}><div className="settings-provider is-open"><ProviderEditor key={editorVersion} state={state} active={state.settingsOpen && editor === 'new'} onDone={() => setEditor(null)} /></div></Disclosure>
             </div>
         </section>
       </div>

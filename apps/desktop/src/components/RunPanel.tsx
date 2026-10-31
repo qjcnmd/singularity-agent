@@ -42,7 +42,7 @@ export function RunPanel() {
   }, [compactDone])
   const compacting = phase === 'compacting' || state.pendingActions.has(pendingKey('session.compact', actionOrigin.session(sessionId)))
   const compactDisabled = !appStore.modelAvailable() || !state.session?.facts.length || state.connection !== 'ready'
-    || phase !== 'idle' || compactDone || state.pendingActions.has(pendingKey('session.compact', actionOrigin.session(state.selectedSessionId)))
+    || phase !== 'idle' || compactDone || compacting
   const startCompact = () => {
     attempt.current = compaction?.id ?? ''
     void appStore.compact().then(accepted => { if (!accepted) attempt.current = null })

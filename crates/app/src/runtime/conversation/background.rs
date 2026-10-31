@@ -19,7 +19,7 @@ impl Conversation {
                 {
                     let mut view = self.lock_view();
                     view.last_event_revision = (self.publish)(StreamEvent::BackgroundTaskUpdated {
-                        session_id: self.thread().thread_id,
+                        session_id: self.thread_id.clone(),
                         payload: Box::new(singularity_protocol::BackgroundTaskUpdate {
                             phase: self.phase(),
                             task,
@@ -34,7 +34,7 @@ impl Conversation {
                 let mut view = self.lock_view();
                 self.set_background_failure(&mut view, error);
                 view.last_event_revision = (self.publish)(StreamEvent::BackgroundTaskUpdated {
-                    session_id: self.thread().thread_id,
+                    session_id: self.thread_id.clone(),
                     payload: Box::new(singularity_protocol::BackgroundTaskUpdate {
                         phase: self.phase(),
                         task,

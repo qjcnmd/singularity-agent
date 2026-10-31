@@ -9,7 +9,9 @@ pub mod workspace;
 
 pub use project_instructions::{InstructionFile, load_agent_instructions};
 pub use user_home::resolve_home;
-pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace, same_saved_path};
+pub use workspace::{
+    CanonicalWorkspacePath, canonicalize_workspace, same_saved_path, saved_path_key, workspace_key,
+};
 
 /// 向上查找项目根目录（AGENTS.md 与项目技能的查找上界）时识别的 `.git` 标记。
 pub(crate) const PROJECT_ROOT_MARKER: &str = ".git";

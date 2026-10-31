@@ -161,12 +161,12 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
                 {models.map((model, index) => {
                   const reasoningError = reasoningConfigurationError(model, protocol)
                   return (
-                  <div key={index} className="sg-model-entry">
+                  <div key={index}>
                     <div className="sg-model-row">
                       <span className="catalog-id">{model.modelId}</span>
                       <small>{model.maxContextTokens === null ? '' : `${formatTokenCount(model.maxContextTokens)} 上下文`}{model.reasoningVariants?.length ? ` · ${model.reasoningVariants.join(' / ')}` : ''}</small>
                       <button type="button" className="quiet-button" onClick={() => setModelEditor({ index, draft: applyProtocol(model, protocol) })}>编辑</button>
-                      <button type="button" className="sg-icon-btn sg-icon-btn-danger" aria-label={`删除模型 ${model.modelId}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}><X size={14} /></button>
+                      <button type="button" className="sg-icon-btn danger" aria-label={`删除模型 ${model.modelId}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}><X size={14} /></button>
                     </div>
                     {reasoningError && <p className="form-error" role="alert">{reasoningError}</p>}
                   </div>

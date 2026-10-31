@@ -55,10 +55,10 @@ impl Conversation {
         let state = self.lock_state();
         SessionRuntime {
             phase: state.turn.phase(),
-            selection: state.thread.model.clone(),
+            selection: state.model.clone(),
             context_usage: crate::runtime::history::context_usage(
                 lock_writer(&self.writer).entries(),
-                &state.thread.model,
+                &state.model,
                 state.last_context_window,
             ),
             pending_question: match &state.turn {
@@ -103,7 +103,7 @@ impl Conversation {
     }
     pub(super) fn publish_changed(&self, view: &mut ConversationView) {
         view.last_event_revision = (self.publish)(StreamEvent::SessionChanged {
-            session_id: self.thread().thread_id,
+            session_id: self.thread_id.clone(),
             payload: self.runtime(view),
         });
     }
@@ -148,15 +148,16 @@ impl Conversation {
             }
             _ => {}
         }
-        if self.phase() != SessionPhase::Idle {
+        let phase = self.phase();
+        if phase != SessionPhase::Idle {
             view.activity.apply(&event);
         }
         view.last_event_revision = (self.publish)(StreamEvent::TurnEvent {
-            session_id: self.thread().thread_id,
+            session_id: self.thread_id.clone(),
             payload: Box::new(TurnEventEnvelope {
                 turn_id: view.activity.turn_id(),
                 event,
-                phase: self.phase(),
+                phase,
             }),
         });
     }

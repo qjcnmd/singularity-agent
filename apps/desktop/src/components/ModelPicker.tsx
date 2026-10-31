@@ -109,40 +109,38 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
       >
         <span className="sg-triggerLabel">{modelLabel}</span>
         {effortLabel !== null && <span className="sg-triggerEffort">· {effortLabel}</span>}
-        <ExpandChevron expanded={open} size={12} className="sg-chevron" />
+        <ExpandChevron expanded={open} size={12} />
       </button>
 
       <div ref={popup} id={popupId} popover="auto" className="picker-disclosure model-popover" inert={!open} aria-hidden={!open}
         onBeforeToggle={event => { if (event.newState === 'open') placePopover(event.currentTarget) }}
         onToggle={event => setOpen(event.newState === 'open')}><div>
         <div className="sg-menu" role="dialog" aria-label="模型与推理等级">
-          <div className="sg-menuBody">
-            <div className="sg-groups">
-              {providers.length === 0 && <p className="candidate-message">尚未配置模型</p>}
-              {providers.map((provider) => (
-                <section key={provider.providerId} className="sg-group">
-                  <div className="sg-groupTitle">{provider.displayName ?? provider.providerId}</div>
-                  {provider.models.map((model) => {
-                    const isSelected =
-                      provider.providerId === currentChoice?.provider.providerId &&
-                      model.modelId === currentChoice.model.modelId
-                    return (
-                      <button
-                        key={model.modelId}
-                        type="button"
-                        aria-pressed={isSelected}
-                        disabled={pending}
-                        className="sg-option"
-                        onClick={() => { void chooseModel({ provider, model }) }}
-                      >
-                        <span className="sg-modelName">{model.modelId}</span>
-                        <span className="sg-check">{isSelected && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>}</span>
-                      </button>
-                    )
-                  })}
-                </section>
-              ))}
-            </div>
+          <div className="sg-groups">
+            {providers.length === 0 && <p className="candidate-message">尚未配置模型</p>}
+            {providers.map((provider) => (
+              <section key={provider.providerId}>
+                <div className="sg-groupTitle">{provider.displayName ?? provider.providerId}</div>
+                {provider.models.map((model) => {
+                  const isSelected =
+                    provider.providerId === currentChoice?.provider.providerId &&
+                    model.modelId === currentChoice.model.modelId
+                  return (
+                    <button
+                      key={model.modelId}
+                      type="button"
+                      aria-pressed={isSelected}
+                      disabled={pending}
+                      className="sg-option"
+                      onClick={() => { void chooseModel({ provider, model }) }}
+                    >
+                      <span className="sg-modelName">{model.modelId}</span>
+                      <span className="sg-check">{isSelected && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>}</span>
+                    </button>
+                  )
+                })}
+              </section>
+            ))}
           </div>
           {variants.length > 0 && <div className="sg-divider" />}
           {variants.length > 0 && <fieldset className="effort-field" disabled={(pending && !committing.current) || (variants.length === 1 && resolvedIndex === 0)}>

@@ -58,6 +58,9 @@ pub(crate) async fn execute(args: EditArgs, cwd: PathBuf, signal: CancellationTo
     if signal.is_cancelled() {
         return error_result(ABORTED_MESSAGE);
     }
+    if args.edits.is_empty() {
+        return error_result("edits must contain at least one replacement");
+    }
     let target = cwd.join(&args.path);
     let target = match tokio::task::spawn_blocking(move || target.canonicalize())
         .await
@@ -66,7 +69,7 @@ pub(crate) async fn execute(args: EditArgs, cwd: PathBuf, signal: CancellationTo
         Ok(target) => target,
         Err(error) => return error_result(format!("Could not edit {}: {error}", args.path)),
     };
-    let key = singularity_core::display_path(&target).to_lowercase();
+    let key = singularity_core::workspace_key(&target);
     let lock = {
         let mut files = FILE_EDITS.lock().expect("file edit registry lock poisoned");
         let lock = files.get(&key).and_then(Weak::upgrade).unwrap_or_default();
@@ -100,9 +103,6 @@ fn execute_locked(
 ) -> Result<ToolExecution, String> {
     if signal.is_cancelled() {
         return Err(ABORTED_MESSAGE.into());
-    }
-    if args.edits.is_empty() {
-        return Err("edits must contain at least one replacement".into());
     }
     let content = std::fs::read_to_string(target)
         .map_err(|error| format!("Could not read {} as UTF-8 text: {error}", args.path))?;
@@ -157,42 +157,12 @@ fn execute_locked(
         updated.push_str(&source[cursor..start]);
         let region = &source[start..end];
         let replacement = args.edits[index].new_text.replace("\r\n", "\n");
-        let ending = if region.contains('\n') { region } else { source };
-        let ending = if ending.find('\n').is_some_and(|at| at > 0 && ending.as_bytes()[at - 1] == b'\r') {
+        let ending = if region.contains("\r\n") || (!region.contains('\n') && source.contains("\r\n")) {
             "\r\n"
         } else {
             "\n"
         };
-        let normalized = region.replace("\r\n", "\n");
-        let original_lines: Vec<_> = region.split_inclusive('\n').collect();
-        let mut replaced_endings = std::collections::VecDeque::new();
-        // 匹配块里的未改上下文也保留原换行，混合换行文件不会因提供上下文而被改写。
-        for change in similar::TextDiff::from_lines(&normalized, &replacement).iter_all_changes() {
-            match change.tag() {
-                similar::ChangeTag::Equal => {
-                    replaced_endings.clear();
-                    updated.push_str(
-                        original_lines[change.old_index().expect("unchanged line has an original index")],
-                    );
-                }
-                similar::ChangeTag::Insert => {
-                    updated.push_str(
-                        &change.value().replace('\n', replaced_endings.pop_front().unwrap_or(ending)),
-                    );
-                }
-                similar::ChangeTag::Delete => {
-                    let line =
-                        original_lines[change.old_index().expect("deleted line has an original index")];
-                    replaced_endings.push_back(if line.ends_with("\r\n") {
-                        "\r\n"
-                    } else if line.ends_with('\n') {
-                        "\n"
-                    } else {
-                        ending
-                    });
-                }
-            }
-        }
+        updated.push_str(&replacement.replace('\n', ending));
         cursor = end;
     }
     updated.push_str(&source[cursor..]);
@@ -202,12 +172,8 @@ fn execute_locked(
     if signal.is_cancelled() {
         return Err(ABORTED_MESSAGE.into());
     }
-    let result = super::edit_diff::result(&args.path, &content, &updated);
-    if signal.is_cancelled() {
-        return Err(ABORTED_MESSAGE.into());
-    }
     // 提交开始后报告真实写入结果，不能把已完成的修改改报为取消。
     singularity_core::write_bytes_atomic(target, updated.as_bytes())
         .map_err(|error| format!("Could not write {}: {error}", args.path))?;
-    Ok(result)
+    Ok(super::edit_diff::result(&args.path, &content, &updated))
 }

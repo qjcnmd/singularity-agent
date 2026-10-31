@@ -74,10 +74,10 @@ function SidebarView() {
           {([{ page: 'instructions', label: '自定义指令' }, { page: 'skills', label: 'Skills' }, { page: 'mcp', label: 'MCP' }] as const).map(({ page, label }) =>
             <button key={page} type="button" className={`nav-item${state.page === page ? ' is-active' : ''}`} onClick={() => appStore.setPage(page)}>{label}</button>)}
         </nav>
-        <section className="sidebar-section workspace-section">
+        <section className="sidebar-section">
           <div className="section-heading">
             <span>项目</span>
-            <button type="button" className="icon-button section-action" onClick={() => appStore.openDirectoryPicker()} aria-label="添加项目"><Plus size={16} strokeWidth={1.6} /></button>
+            <button type="button" className="icon-button" onClick={() => appStore.openDirectoryPicker()} aria-label="添加项目"><Plus size={16} strokeWidth={1.6} /></button>
           </div>
           <div className="workspace-list">
             {state.bootstrap?.workspaces.map((item) => {
@@ -152,7 +152,7 @@ function WorkspaceButton({ workspace, selected, expanded, onToggle, onRemove }: 
         <span className="workspace-name"><strong>{name}</strong></span>
         <ExpandChevron expanded={expanded} size={13} className="workspace-chevron" />
       </button>
-      <button type="button" className="icon-button workspace-new" onClick={() => void appStore.newTask(workspaceKey(workspace.root))} aria-label={`在 ${name} 新建任务`}><Plus size={15} strokeWidth={1.7} aria-hidden="true" /></button>
+      <button type="button" className="icon-button workspace-new" onClick={() => appStore.newTask(workspaceKey(workspace.root))} aria-label={`在 ${name} 新建任务`}><Plus size={15} strokeWidth={1.7} aria-hidden="true" /></button>
       <button type="button" className="icon-button workspace-remove" onClick={onRemove} aria-label={`移除项目 ${name}`} aria-haspopup="dialog"><Minus size={16} strokeWidth={1.7} aria-hidden="true" /></button>
     </div>
   )

@@ -7,38 +7,39 @@
   --spring: ease;
   --message-font-size: 14.5px;
   /* 卡片头与卡片正文、元信息：跟随消息字号整体缩放，保留固定层级。 */
-  --block-font-size: max(11.5px, calc(var(--message-font-size) - 2px));
-  --meta-font-size: max(10.5px, calc(var(--message-font-size) - 3px));
+  --block-font-size: max(12px, calc(var(--message-font-size) - 1.5px));
+  --meta-font-size: max(11px, calc(var(--message-font-size) - 3px));
   --warning: #ff9500;
   color-scheme: light;
   --canvas: #ffffff;
-  --sidebar: #f9f9f9;
+  --sidebar: #fafafa;
   --surface: #ffffff;
-  --surface-muted: #f4f4f6;
+  --surface-muted: #f5f5f5;
   /* 内容里的卡片、代码块和输入框；弹窗和浮层；半透明玻璃的底色 */
   --card: #fff;
   --raised: #fff;
   --glass-base: #fff;
-  /* 浅灰填充：模型目录底、附件条、悬停、普通按钮悬停、关闭的开关 */
+  /* 浅灰填充：模型目录底、附件条、悬停、普通按钮悬停 */
   --fill-subtle: #fafafb;
   --fill: #f3f3f5;
   --fill-hover: #f0f0f2;
   --button-hover: #ececef;
-  --switch-off: #e1e1e5;
-  --nav-ink: #2f2f33;
+  --nav-ink: #212022;
   --surface-hover: rgb(0 0 0 / 4.5%);
-  --ink: #1d1d1f;
-  --ink-soft: #626268;
-  --ink-faint: #9e9ea4;
+  --ink: #141413;
+  --message-ink: #0d0d0d;
+  --ink-soft: #3d3d40;
+  --ink-faint: #686870;
   --ink-on-accent: #fff;
   --line: #ececee;
   --line-strong: #e0e0e3;
   /* 消息块（气泡、思考、工具）的轮廓：白底上细线要深一档才读得出边界，投影补足弱光下的层次。 */
-  --bubble-line: #dedee3;
-  --bubble-shadow: 0 1px 2px rgb(0 0 0 / 4.5%);
+  --bubble-line: #dcdce0;
+  --bubble-shadow: 0 1px 3px rgb(0 0 0 / 5%);
   --default-accent: #1783ff;
   --default-accent-soft: color-mix(in srgb, var(--default-accent) 10%, #fff);
   --accent: var(--default-accent);
+  --accent-ink: color-mix(in srgb, var(--accent) 76%, #000);
   --accent-soft: color-mix(in srgb, var(--accent) 10%, #fff);
   --danger: #ff3b30;
   --danger-soft: #fff0ef;
@@ -86,10 +87,10 @@ button { color: inherit; user-select: none; }
   --fill: #2f2f2f;
   --fill-hover: #333333;
   --button-hover: #3a3a3a;
-  --switch-off: #48484a;
   --nav-ink: #d6d6d6;
   --surface-hover: rgb(255 255 255 / 7%);
   --ink: #ededed;
+  --message-ink: #ffffff;
   --ink-soft: #a3a3a3;
   --ink-faint: #a0a0a0;
   --line: #333333;
@@ -100,6 +101,7 @@ button { color: inherit; user-select: none; }
   --default-accent: #f472b6;
   --default-accent-soft: #4a1d33;
   --accent: var(--default-accent);
+  --accent-ink: var(--accent);
   --accent-soft: var(--default-accent-soft);
   --danger: #ff453a;
   --danger-soft: #46201f;

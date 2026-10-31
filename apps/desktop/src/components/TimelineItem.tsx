@@ -4,7 +4,6 @@ import { AttachedImages, FileChips } from './Images'
 import { QuestionPanel } from './QuestionPanel'
 import { Disclosure } from './Disclosure'
 import { ToolGroupRow } from './ToolGroupRow'
-import { toolDisplay } from '../toolDisplay'
 import { memo, useEffect, useState, type ReactNode } from 'react'
 import { CommandOutput } from './CommandOutput'
 import { CircleAlert, CircleCheck, CircleX, LoaderCircle, FileText, SquareTerminal, Image, MessageCircleQuestion } from 'lucide-react'
@@ -14,8 +13,7 @@ import { useAppStore } from '../appStore'
 import { useBodyCollapse, useSelectionGuard } from '../interactions'
 import { MarkdownBody } from '../markdown'
 import { compactionText, factStatusText, formatTokenCount } from '../copy'
-import { readOutputLines } from '../readOutput'
-import { formatClock, compactionResultText, displayPath, firstLine, formatTurnDuration, pathFromArgs, toolSummary, toolArgument, type TimelineContent } from '../timeline'
+import { formatClock, compactionResultText, displayPath, firstLine, formatTurnDuration, pathFromArgs, readOutputLines, toolDisplay, toolSummary, toolArgument, type TimelineContent } from '../timeline'
 import type { HistoryItem, SessionModelUsage, ToolStatus } from '../protocol'
 
 const previewLineCount = 8
@@ -34,7 +32,7 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
   const userLines = item.type === 'message' && item.role === 'user' ? item.text.trimEnd().split('\n') : []
   const hiddenLines = Math.max(0, userLines.length - previewLineCount)
   const canCollapse = hiddenLines > 0
-  const [expanded, setExpanded] = useState(item.type !== 'tool')
+  const [expanded, setExpanded] = useState(false)
   const selectionGuard = useSelectionGuard(onDisclosureChange)
   const reduced = useReducedMotion()
 
@@ -46,10 +44,10 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
     className="timeline-item message-item timeline-assistant timeline-question" data-item-id={itemKey}>
     <QuestionPanel key={item.request.itemId} request={item.request} />
   </motion.article>
-  if (item.type === 'typing') return <motion.article {...enter} transition={reduced ? { duration: 0 } : pop} style={{ originX: 0, originY: 1 }}
+  if (item.type === 'typing') return <article
     className="timeline-item message-item timeline-assistant" data-item-id={itemKey} aria-label="正在输入">
-    <div className="message-bubble typing-bubble"><i /><i /><i /></div>
-  </motion.article>
+    <div className="message-bubble typing-bubble"><LoaderCircle size={13} className="spinner" aria-hidden="true" /></div>
+  </article>
 
   if (item.type === 'terminal') {
     return <div className={`timeline-item message-item timeline-assistant${item.status === 'interrupted' ? ' terminal-interruption' : ''}`} data-item-id={itemKey}>
@@ -112,7 +110,7 @@ function ToolCard({ item, itemKey, cwd, userHome, sessionId, onDisclosureChange 
         <span className="step-summary">{summary}</span>
         {status === 'interrupted' && <span className="item-status">{factStatusText.interrupted}</span>}
         {status === 'pending' && <span className="item-status">{factStatusText.pending}</span>}
-        <ExpandChevron expanded={expanded} className="step-chevron" />
+        <ExpandChevron expanded={expanded} />
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
         {shown.result?.durationMs !== undefined && <div className="tool-duration">耗时 {formatTurnDuration(shown.result.durationMs)}</div>}
@@ -173,14 +171,35 @@ function CompactionRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemK
   const collapseBody = useBodyCollapse(expanded ? () => setExpanded(false) : undefined, onDisclosureChange)
   const status = item.type === 'compaction' ? 'completed' : item.status
   return <motion.article {...enter} transition={reduced ? { duration: 0 } : pop} className={`timeline-item activity-step timeline-compaction status-${status}`} data-item-id={itemKey}>
-    <button type="button" className="activity-toggle compaction-toggle" aria-expanded={canExpand ? expanded : undefined} aria-disabled={!canExpand}
+    <button type="button" className="activity-toggle" aria-expanded={canExpand ? expanded : undefined} aria-disabled={!canExpand}
       {...guard(canExpand ? () => setExpanded(value => !value) : undefined)}>
       <StepIcon name="compaction" status={status} />
-      <span className="compaction-label" role="status">{title}</span>
+      <span role="status">{title}</span>
       {canExpand && <ExpandChevron expanded={expanded} size={14} />}
     </button>
     <Disclosure open={expanded}><div className="activity-expanded compaction-summary" {...collapseBody}><MarkdownBody text={summary} /></div></Disclosure>
   </motion.article>
+}
+
+function QuestionAnswers({ questions, output }: { questions: unknown; output: string }) {
+  const asked = Array.isArray(questions) ? questions as { id?: unknown; question?: unknown }[] : []
+  let answers: { id?: unknown; selected?: unknown; text?: unknown; skipped?: unknown }[]
+  try {
+    const parsed = JSON.parse(output) as { answers?: unknown }
+    answers = Array.isArray(parsed.answers) ? parsed.answers : []
+  } catch { answers = [] }
+  return <div>
+    {answers.map((answer, index) => {
+      const question = asked.find(value => value.id === answer.id)
+      const text = typeof answer.text === 'string' ? answer.text.trim() : ''
+      const selected = Array.isArray(answer.selected) ? answer.selected.filter((value): value is string => typeof value === 'string') : []
+      const reply = answer.skipped === true ? '跳过' : [...selected, ...(text ? [text] : [])].join('、')
+      return <div key={index} className="question-answer-result">
+        {typeof question?.question === 'string' && question.question.trim() && <p className="question-result-title">{question.question}</p>}
+        <p>{reply || '未回答'}</p>
+      </div>
+    })}
+  </div>
 }
 
 function ToolOutput({ item: fact, filePath }: { item: Extract<HistoryItem, { type: 'tool' }>; filePath: string | null }) {
@@ -189,6 +208,7 @@ function ToolOutput({ item: fact, filePath }: { item: Extract<HistoryItem, { typ
   // 内部关联字段不展示；命令输出原样保留，不按工具参数过滤业务数据。
   const displayJson = (key: string, value: unknown) => background && (key === 'taskId' || key === 'task_id') ? undefined : value
   const parameters = JSON.stringify(input, (key, value: unknown) => fact.name === 'task_output' && key === 'cursor' ? undefined : displayJson(key, value), 2)
+  if (fact.name === 'ask_user_question' && fact.status === 'completed') return <QuestionAnswers questions={typeof input === 'object' && input !== null ? (input as { questions?: unknown }).questions : undefined} output={fact.result?.output ?? ''} />
   let output = fact.result?.output ?? ''
   if (background && fact.name !== 'bash' && output !== '') {
     try { output = JSON.stringify(JSON.parse(output), displayJson, 2) }

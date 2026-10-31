@@ -17,7 +17,7 @@ impl AppServer {
             params.text,
             params.images,
             params.files,
-            std::path::Path::new(&conversation.thread().cwd),
+            std::path::Path::new(&conversation.cwd),
             &self.home,
         )
         .map_err(invalid_request)?;

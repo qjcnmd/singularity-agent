@@ -20,4 +20,4 @@
 .question-panel-body { border: 0; margin: -4px; padding: 4px; min-width: 0; min-height: 0; max-height: min(420px, 50vh); overflow-y: auto; }
 .question-panel footer { display: flex; align-items: center; gap: 10px; }
 .question-panel textarea { min-height: 24px; }
-.question-custom-answer { cursor: text; align-items: center; display: flex; }
+.question-custom-answer { cursor: text; align-items: center; }

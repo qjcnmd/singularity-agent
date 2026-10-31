@@ -12,7 +12,7 @@ pub(crate) fn assemble_developer_instructions(cwd: &str, tool_guidelines: &[&str
              writing new files.\n\n\
              Guidelines:\n\
              {tool_guidelines}\
-             - Use bash with rg for content searches and rg --files for file discovery; use Python or other commands for text edits, file writes, byte ranges, and structured processing.\n\
+             - Use bash with rg for content searches and rg --files for file discovery; use Python or other commands for file writes, byte ranges, and structured processing.\n\
              - Be concise in your responses\n\
              - Show file paths clearly when working with files\n\n\
              Environment:\n- Platform: {}\n\

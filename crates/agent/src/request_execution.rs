@@ -125,7 +125,7 @@ pub(crate) async fn execute_request(
                 }));
             }
         };
-        on_event(TurnEvent::ProviderAttempt { observation: observation.clone() });
+        on_event(TurnEvent::ProviderAttempt { observation });
         let Some(error) = error else {
             return Ok((response, id, saved_at));
         };

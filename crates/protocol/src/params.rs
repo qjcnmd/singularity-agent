@@ -184,15 +184,6 @@ pub struct ThreadTurn {
     pub items: Vec<HistoryItem>,
 }
 
-/// 任务的 ID、工作目录、当前模型选择和创建时关闭的上下文模块。
-#[derive(Debug, Clone, PartialEq)]
-pub struct Thread {
-    pub thread_id: String,
-    pub model: crate::ModelSelection,
-    pub cwd: String,
-    pub disabled_modules: Vec<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

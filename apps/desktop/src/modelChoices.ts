@@ -1,9 +1,5 @@
 import type { ModelSelection, RedactedModelCatalog } from './protocol'
 
-export function effectiveSelection(selection: ModelSelection | null | undefined, catalog: RedactedModelCatalog | undefined): ModelSelection | null {
-  return selection ?? catalog?.defaultSelection ?? null
-}
-
 /** 编辑器的常用档位与选择器的展示顺序共用；目录提供的特殊档位另行保留。 */
 export const reasoningGrades = [
   'minimal', 'low', 'medium', 'high', 'xhigh', 'max',

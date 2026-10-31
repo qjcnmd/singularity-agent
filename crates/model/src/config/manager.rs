@@ -180,19 +180,11 @@ fn model_definition(
 
 // 已指定的模型或显式档位被移除后清空默认选择，由用户重新选择。
 fn clear_invalid_default_selection(config: &mut UserConfigFile) {
-    let valid = config.default_model.as_ref().is_none_or(|selected| {
-        let Some(model) = config
-            .providers
-            .get(&selected.provider)
-            .and_then(|provider| provider.models.get(&selected.model))
-        else {
-            return false;
-        };
-        selected.reasoning.as_ref().is_none_or(|variant| {
-            model.reasoning_variants.as_ref().is_some_and(|variants| variants.contains(variant))
-        })
-    });
-    if !valid {
+    if config
+        .default_model
+        .as_ref()
+        .is_some_and(|selected| resolve_model_selection(config, selected).is_err())
+    {
         config.default_model = None;
     }
 }

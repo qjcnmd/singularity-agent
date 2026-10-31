@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use singularity_agent::agent::SteeringInboxHandle;
-use singularity_protocol::{SessionPhase, Thread};
+use singularity_protocol::{ModelSelection, SessionPhase};
 use tokio_util::sync::CancellationToken;
 
 use super::ConversationError;
@@ -68,7 +68,7 @@ impl TurnControls {
 }
 
 pub(super) struct ConversationState {
-    pub(super) thread: Thread,
+    pub(super) model: ModelSelection,
     pub(super) turn: TurnLifecycle,
     /// 首条和后续消息共用的输入队列，跨回合保留。
     pub(super) steering_inbox: SteeringInboxHandle,

@@ -81,7 +81,7 @@ impl Collector<'_> {
     }
 }
 
-fn tools_tokens(tools: &[ModelToolSchema]) -> u64 {
+pub(super) fn tools_tokens(tools: &[ModelToolSchema]) -> u64 {
     if tools.is_empty() {
         return 0;
     }

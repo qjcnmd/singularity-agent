@@ -41,13 +41,15 @@ export class RpcClient {
   start(): void {
     if (!this.stopped) return
     this.stopped = false
-    this.unsubscribe = window.singularity.onFrame(frame => this.accept(frame))
+    this.unsubscribe = window.singularity.onFrame(frame => {
+      if (!this.stopped) this.onFrame(frame)
+    })
     this.unsubscribeFailure = window.singularity.onFailure(() => this.setStatus('recovering'))
     this.setStatus('connecting')
     void window.singularity.connect().then(frame => {
       if (this.stopped || this.status === 'recovering') return
       this.setStatus('ready')
-      this.accept(frame)
+      this.onFrame(frame)
     })
       .catch(() => { if (!this.stopped) this.setStatus('recovering') })
   }
@@ -76,12 +78,8 @@ export class RpcClient {
   }
 
   private setStatus(status: ConnectionStatus): void {
+    if (this.status === status) return
     this.status = status
     this.onStatus(status)
-  }
-
-  private accept(frame: StreamEnvelope): void {
-    if (this.stopped) return
-    this.onFrame(frame)
   }
 }

@@ -140,5 +140,5 @@ function CodeBlock({ children }: { children?: ReactNode }) {
 
 const HighlightedCode = memo(function HighlightedCode({ code, language }: { code: string; language: string }) {
   const tokens = useCodeTokens(code, language)
-  return <pre className="highlighted-code"><code>{tokens === null ? <StreamText>{code}</StreamText> : tokens.map((line, row) => <span key={row}><CodeTokens tokens={line} renderText={text => <StreamText>{text}</StreamText>} />{row < tokens.length - 1 ? '\n' : ''}</span>)}</code></pre>
+  return <pre><code>{tokens === null ? <StreamText>{code}</StreamText> : tokens.map((line, row) => <span key={row}><CodeTokens tokens={line} renderText={text => <StreamText>{text}</StreamText>} />{row < tokens.length - 1 ? '\n' : ''}</span>)}</code></pre>
 })

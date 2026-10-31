@@ -80,7 +80,7 @@ impl Conversation {
         view.activity = Default::default();
         self.lock_state().turn = TurnLifecycle::Idle;
         view.last_event_revision = (self.publish)(StreamEvent::SessionSettled {
-            session_id: self.thread().thread_id,
+            session_id: self.thread_id.clone(),
             payload: self.runtime(&view),
             summary: self.summary(),
         });

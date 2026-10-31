@@ -2,8 +2,25 @@ import { reduceUnread, initialSyncState, acceptSessionStart, acceptSessionRead, 
 import { loadPersisted, persistView, type PersistedView } from './viewPersistence'
 import { RpcFailure, RpcClient } from './rpcClient'
 import type { ConnectionStatus, StreamEnvelope, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
-import { actionOrigin, pendingKey } from './storeActions'
 import { DraftStore, type DraftSnapshot } from './drafts'
+
+/** 操作来源的键：发起操作的控件和显示错误的位置用同一个键对应起来。 */
+export const actionOrigin = {
+  session: (id: string | null) => `session:${id}`,
+  control: (sessionId: string | null, controlId: string) => `control:${sessionId}:${controlId}`,
+  inline: (method: string, id: string | null) => `inline:${method}:${id}`,
+  directoryPicker: 'directory:picker',
+}
+
+/** 这些动作在对应控件显示错误；目录选择器的错误仍显示在工作台。 */
+export function hasInlineActionError(origin: string): boolean {
+  return origin.startsWith('control:') || origin.startsWith('inline:')
+}
+
+/** 进行中操作的键：方法名加来源。组件用它在已订阅的 pendingActions 里判断自己的操作是否进行中。 */
+export function pendingKey(method: string, origin: string): string {
+  return `${method}:${origin}`
+}
 
 
 export interface ActionError {
@@ -113,12 +130,12 @@ export class SessionStore {
       .find(([, sessions]) => sessions.some(session => session.threadId === sessionId))?.[0]
     if (workspaceRoot === undefined) return
     this.selectionRequest += 1
-    this.patch({ page: 'chat' })
     if (sessionId === this.state.selectedSessionId) {
+      this.patch({ page: 'chat' })
       if (this.state.session === null) await this.readSession(sessionId)
       return
     }
-    this.patch({ selectedWorkspaceRoot: workspaceRoot, selectedSessionId: sessionId, session: null,
+    this.patch({ page: 'chat', selectedWorkspaceRoot: workspaceRoot, selectedSessionId: sessionId, session: null,
       sessionLoad: { status: 'loading', error: null } })
     this.saveSelection()
     await this.readSession(sessionId)
@@ -126,16 +143,23 @@ export class SessionStore {
 
   /** 空白页共用一份待发送草稿；第一条消息发送时才建立会话。 */
   newTask(workspaceRoot = this.state.selectedWorkspaceRoot): void {
-    this.patch({ page: 'chat' })
-    if (workspaceRoot === null) return
+    if (workspaceRoot === null) {
+      this.patch({ page: 'chat' })
+      return
+    }
     this.selectionRequest += 1
     this.latestRead = null
-    this.patch({ selectedWorkspaceRoot: workspaceRoot, selectedSessionId: null, session: null,
-      sessionLoad: { status: 'idle', error: null } })
-    if (this.state.sidebarView.collapsed.includes(workspaceRoot)) {
-      this.saveView({ sidebarView: { ...this.state.sidebarView,
-        collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceRoot) } })
-    }
+    const collapsed = this.state.sidebarView.collapsed
+    this.patch({
+      page: 'chat',
+      selectedWorkspaceRoot: workspaceRoot,
+      selectedSessionId: null,
+      session: null,
+      sessionLoad: { status: 'idle', error: null },
+      ...(collapsed.includes(workspaceRoot)
+        ? { sidebarView: { ...this.state.sidebarView, collapsed: collapsed.filter(id => id !== workspaceRoot) } }
+        : {}),
+    })
     this.saveSelection()
     if (this.resyncing === null) this.flushFrames()
   }
@@ -213,6 +237,7 @@ export class SessionStore {
         frame.payload.method === 'item/textDelta'
         || frame.payload.method === 'tool/output')))
     if ((frame.type === 'session_changed' || frame.type === 'session_settled')
+      && this.state.session?.summary.threadId !== frame.sessionId
       && state.liveSessions[frame.sessionId]?.revision === frame.revision) {
       this.retainQuestionDraft(frame.sessionId, frame.payload.pendingQuestion?.itemId)
     }
@@ -225,20 +250,17 @@ export class SessionStore {
       try {
         const bootstrap = await this.transport.rpc('app.bootstrap', {})
         this.applySync(resetBaseline(this.state, bootstrap))
-        const workspaceRoot = this.state.selectedWorkspaceRoot
-        if (workspaceRoot !== null && this.state.selectedSessionId === null) {
-          void this.newTask(workspaceRoot)
-        }
         const { selectedSessionId } = this.state
         if (selectedSessionId !== null) {
           await this.readSession(selectedSessionId)
+          this.patch({ bootstrapLoad: { status: 'idle', error: null } })
         } else {
           this.patch({
             session: null,
             sessionLoad: { status: 'idle', error: null },
+            bootstrapLoad: { status: 'idle', error: null },
           })
         }
-        this.patch({ bootstrapLoad: { status: 'idle', error: null } })
       } catch (error) {
         this.patch({ bootstrapLoad: { status: 'error', error: this.toActionError(error) } })
       } finally {
@@ -304,11 +326,13 @@ export class SessionStore {
     if (state === this.state) return
     const { revision, modelCatalogRevision, bootstrap, session, liveSessions } = state
     const patch: Partial<AppState> = { revision, modelCatalogRevision, bootstrap, session, liveSessions }
+    let selectionDropped = false
     if (bootstrap !== null && bootstrap !== this.state.bootstrap) {
       const pruned = pruneStaleSelection(bootstrap, { ...this.state, session, liveSessions })
       patch.liveSessions = pruned.liveSessions
       patch.session = pruned.session
-      if (pruned.selectionDropped) {
+      selectionDropped = pruned.selectionDropped
+      if (selectionDropped) {
         this.latestRead = null
         this.selectionRequest += 1
         patch.selectedWorkspaceRoot = pruned.selectedWorkspaceRoot
@@ -317,10 +341,9 @@ export class SessionStore {
       }
     }
     this.patch(patch, progress)
-    if (patch.selectedWorkspaceRoot !== undefined || patch.selectedSessionId !== undefined) this.saveSelection()
-    // 当前任务已移出目录、项目仍在：沿用新建入口，继续在同一项目中工作。
-    if (patch.selectedSessionId === null && patch.selectedWorkspaceRoot != null) {
-      void this.newTask(patch.selectedWorkspaceRoot)
+    if (selectionDropped) {
+      this.saveSelection()
+      if (this.resyncing === null) this.flushFrames()
     }
   }
 

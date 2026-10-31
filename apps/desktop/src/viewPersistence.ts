@@ -16,7 +16,7 @@ const storageKey = 'singularity.app.view.v1'
 export interface PersistedView {
   theme: 'light' | 'dark'
   messageFontSize: number
-  /** 会话气泡配色，取调色盘颜色的 id（palette.ts）。 */
+  /** 会话气泡配色，取调色盘颜色的 id（bubbleColors.ts）。 */
   assistantBubble: string
   userBubble: string
   selectedWorkspaceRoot: string | null

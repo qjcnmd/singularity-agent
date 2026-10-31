@@ -12,16 +12,16 @@ pub fn load_agent_instructions(cwd: &Path, home: &Path) -> Result<Vec<Instructio
     let root = crate::workspace::project_root(cwd)?;
     let canonical_home = std::fs::canonicalize(home)
         .map_err(|error| format!("project_instruction_directory_read_failed:{}:{error}", home.display()))?;
-    let home_identity = crate::CanonicalWorkspacePath::from_saved(canonical_home)?;
-    let mut directories = vec![home.to_path_buf()];
-    for directory in instruction_directories(&root, cwd) {
-        // 该目录就是数据根，已在列表中，跳过。
-        if crate::CanonicalWorkspacePath::from_saved(&directory)? != home_identity {
-            directories.push(directory);
-        }
-    }
+    let home_key = crate::workspace_key(&canonical_home);
+    // 项目目录等于数据根时已在首项作为全局指令加载，跳过重复项。
+    let directories = std::iter::once((home.to_path_buf(), true)).chain(
+        instruction_directories(&root, cwd)
+            .into_iter()
+            .filter(|directory| crate::workspace_key(directory) != home_key)
+            .map(|directory| (directory, false)),
+    );
     let mut files = Vec::new();
-    for directory in directories {
+    for (directory, global) in directories {
         let path = directory.join(PROJECT_INSTRUCTIONS_FILE_NAME);
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
@@ -31,7 +31,7 @@ pub fn load_agent_instructions(cwd: &Path, home: &Path) -> Result<Vec<Instructio
             }
         };
         if !content.trim().is_empty() {
-            files.push(InstructionFile { path, content, global: directory == home });
+            files.push(InstructionFile { path, content, global });
         }
     }
     Ok(files)

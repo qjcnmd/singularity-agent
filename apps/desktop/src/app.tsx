@@ -106,7 +106,7 @@ function ResizeSeparator({ label, value, onChange, reversed = false }: { label: 
   const start = useRef<{ x: number; value: number } | null>(null)
   return (
     <div
-      className="resize-separator separator-sidebar"
+      className="resize-separator"
       role="separator"
       aria-label={label}
       aria-orientation="vertical"

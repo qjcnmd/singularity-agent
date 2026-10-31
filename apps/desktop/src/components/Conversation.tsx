@@ -40,7 +40,6 @@ export function Conversation({ state, items }: Props) {
     let scrollPosition = node.scrollTop
     const follow = (now: number) => {
       const distance = Math.max(0, node.scrollHeight - node.clientHeight) - scrollPosition
-      const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
       scrollPosition += reduced || Math.abs(distance) < .5 ? distance : distance * (1 - Math.exp(-(now - previous) / 90))
       node.scrollTop = scrollPosition
       observedTop.current = node.scrollTop

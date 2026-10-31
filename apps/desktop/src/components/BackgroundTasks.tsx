@@ -22,7 +22,7 @@ export const BackgroundTasks = memo(function BackgroundTasks() {
   const tasks = selectedTasks(state).filter(task => task.state.status === 'running')
   const sessionId = state.selectedSessionId
   if (sessionId === null || tasks.length === 0) return null
-  return <section className="background-tasks" aria-label="后台命令">
+  return <section aria-label="后台命令">
     {tasks.map(task => {
       const origin = actionOrigin.control(sessionId, task.taskId)
       return <BackgroundTaskRow key={`${sessionId}:${task.taskId}`} task={task} sessionId={sessionId}

@@ -18,7 +18,7 @@ use super::spec::BashArgs;
 use crate::tools::output::CaptureState;
 
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
-const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
+pub(super) const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
     "[output truncated: a descendant process was still writing when the command exited]";
 
 pub(super) enum ProcessEvent {

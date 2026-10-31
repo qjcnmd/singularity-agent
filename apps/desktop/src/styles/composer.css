@@ -1,5 +1,5 @@
 /* 输入区：卡片、加号菜单、模型选择、水球、输入建议、问答卡片、用量数据 */
-.composer-region { position: relative; z-index: 4; width: 100%; max-width: 780px; margin: 0 auto; padding: 0 28px 16px; }
+.composer-region { position: relative; z-index: 4; width: 100%; max-width: 840px; margin: 0 auto; padding: 0 24px 16px; }
 /* 输入区始终固定在底部，浮在消息上方，消息从玻璃后面滚过 */
 .app-main .composer-region { position: absolute; width: auto; left: 0; right: var(--panel-space); bottom: 0; padding-top: 18px; transition: right var(--smooth-dur) var(--smooth); }
 .composer-region:has(.context-capsules) { display: flex; flex-direction: column; max-height: calc(100% - 54px); }
@@ -40,7 +40,6 @@
 
 .composer-candidate-anchor { position: relative; }
 .composer-candidate-anchor > .picker-disclosure { position: absolute; bottom: 6px; left: 0; right: 0; z-index: 8; }
-.composer-candidates button strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .composer-card textarea:focus-visible { outline: none; }
 
 /* 新任务页：项目选择和上下文胶囊。外观复用工具消息块，开关时勾画出来。 */

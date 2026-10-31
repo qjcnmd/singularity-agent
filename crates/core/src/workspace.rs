@@ -25,7 +25,7 @@ impl CanonicalWorkspacePath {
 
     fn from_native(native: PathBuf) -> Self {
         let display = display_path(&native);
-        let comparison_key = display.to_lowercase();
+        let comparison_key = saved_path_key(&display);
         Self { native, display, comparison_key }
     }
 
@@ -53,10 +53,20 @@ impl PartialEq for CanonicalWorkspacePath {
 
 impl Eq for CanonicalWorkspacePath {}
 
+/// 已保存展示路径的忽略大小写比较键。
+pub fn saved_path_key(path: &str) -> String {
+    path.to_lowercase()
+}
+
+/// 原生路径转换为忽略大小写的展示路径比较键（去掉 Windows 长路径前缀）。
+pub fn workspace_key(path: &Path) -> String {
+    display_path(path).to_lowercase()
+}
+
 /// 已保存路径的等价比较：两边都是显示形式（正斜杠绝对路径），忽略大小写。
 /// 项目登记的查找、登记和移除判断共用；输入是保存的字符串，不访问文件系统。
 pub fn same_saved_path(left: &str, right: &str) -> bool {
-    left.to_lowercase() == right.to_lowercase()
+    saved_path_key(left) == saved_path_key(right)
 }
 
 /// 检查并规范化已存在的本地目录为工作区路径。

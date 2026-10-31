@@ -1,6 +1,6 @@
 import { compactionText } from './copy'
 import { hasErrorItem } from './execution'
-import type { HistoryItem, PendingQuestion, SessionRuntime, ThreadTurn } from './protocol'
+import type { BackgroundTask, HistoryItem, PendingQuestion, ReadSource, SessionRuntime, ThreadTurn, ToolStatus } from './protocol'
 
 export type ToolItem = Extract<HistoryItem, { type: 'tool' }>
 export type ToolGroup = { type: 'tool_group'; name: string; rows: Array<{ key: string; item: ToolItem }> }
@@ -18,9 +18,19 @@ export interface TimelineRow {
   item: TimelineContent
 }
 
+const turnRowCache = new WeakMap<ThreadTurn, TimelineRow[]>()
+
 /** 只有事实或上一回合的保存失败状态变化时，才重新排列历史。 */
 export function buildHistoryRows(turns: ThreadTurn[] | undefined, failureFromRuntime: boolean): TimelineRow[] {
-  return turns?.flatMap(turn => turnRows(turn, failureFromRuntime && turn === turns.at(-1))) ?? []
+  return turns?.flatMap(turn => {
+    if (failureFromRuntime && turn === turns.at(-1)) return turnRows(turn, true)
+    let cached = turnRowCache.get(turn)
+    if (!cached) {
+      cached = turnRows(turn, false)
+      turnRowCache.set(turn, cached)
+    }
+    return cached
+  }) ?? []
 }
 
 export function buildTimeline(rows: TimelineRow[], turns: ThreadTurn[] | undefined, runtime: Pick<SessionRuntime, 'failure' | 'pendingQuestion' | 'pendingMessages'> | undefined): TimelineRow[] {
@@ -53,11 +63,14 @@ export function buildTimeline(rows: TimelineRow[], turns: ThreadTurn[] | undefin
 
 function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): TimelineRow[] {
   const items = mergeAdjacentThinking(turn.items)
-  const result: TimelineRow[] = items.map(item => ({
+  const lastStepIndex = items.findLastIndex(item => item.type !== 'compaction' && item.type !== 'compaction_result')
+  const result: TimelineRow[] = items.map((item, index) => ({
     key: item.type === 'compaction' || item.type === 'compaction_result'
       ? `compaction:${item.id}` : `content:${turn.turnId}:${item.id}`,
     stable: !('status' in item) || item.status !== 'running' || item.type === 'tool',
-    item,
+    // 同一回合中间的过渡回复（后面还跟着工具或后续步骤）不重复显示累计统计行。
+    item: item.type === 'message' && item.role === 'assistant' && index < lastStepIndex && (item.stats !== undefined || item.at !== undefined)
+      ? { ...item, stats: undefined, at: undefined } : item,
   }))
   // 准备新回合或独立压缩不会重新启动上一轮的计时；进行中的回合收到首个 token 后才显示时间行。
   if (turn.finishedAt || (turn.status === 'running' && turn.firstTokenAt)) {
@@ -119,15 +132,10 @@ export function toolArgument(name: string, args: unknown): string | null {
   return typeof value === 'string' ? value : null
 }
 
-function backgroundToolSummary(name: string): string | null {
-  if (name === 'task_list') return '列出后台命令'
-  if (name !== 'task_output' && name !== 'task_stop') return null
-  return name === 'task_output' ? '查看后台命令输出' : '停止后台命令'
-}
-
 export function toolSummary(name: string, args: unknown): string {
-  const background = backgroundToolSummary(name)
-  if (background !== null) return background
+  if (name === 'task_list') return '列出后台命令'
+  if (name === 'task_output') return '查看后台命令输出'
+  if (name === 'task_stop') return '停止后台命令'
   if (name === 'ask_user_question') {
     const questions = record(args).questions
     const question = Array.isArray(questions) ? record(questions[0]).question : undefined
@@ -181,4 +189,27 @@ export function formatClock(value: string, includeDate = false): string {
 
 export function backgroundTaskId(item: Extract<HistoryItem, { type: 'tool' }>): string | null {
   return item.name === 'bash' ? item.result?.backgroundTaskId ?? null : null
+}
+
+/** 为 `read` 工具输出的前 `source.lineCount` 行标注源文件行号；超出部分的截断或分页提示不标行号。 */
+export function readOutputLines(text: string, source: ReadSource): Array<{ text: string; number?: number }> {
+  const lines = text.replace(/\r\n/g, '\n').split('\n')
+  return lines.map((line, index) => index < source.lineCount
+    ? { text: line, number: source.startLine + index }
+    : { text: line })
+}
+
+/** 单条详情与分组计数共用后台任务终态，避免命令转后台后仍显示成功。 */
+export function toolDisplay(item: ToolItem, tasks: BackgroundTask[] = []) {
+  const id = backgroundTaskId(item)
+  const task = id ? tasks.find(task => task.taskId === id) : undefined
+  const status: ToolStatus = task ? task.state.status === 'running' ? 'running'
+    : task.state.status === 'stopped' || task.state.status === 'interrupted' ? 'interrupted'
+    : task.state.status === 'failed' || (task.state.status === 'exited' && task.state.exitCode !== 0) ? 'failed' : 'completed' : item.status
+  const shown = task ? { ...item, result: {
+    output: task.state.status === 'failed' ? [task.output, task.state.message].filter(Boolean).join('\n') : task.output,
+    isError: status === 'failed',
+    durationMs: 'durationMs' in task.state ? task.state.durationMs : undefined,
+  } } : item
+  return { status, shown }
 }

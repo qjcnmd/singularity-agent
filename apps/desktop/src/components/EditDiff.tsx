@@ -1,8 +1,41 @@
 import { useMemo } from 'react'
-import { parseEditDiff, type DiffHunk } from '../editDiff'
 import { CodeTokens, useCodeTokens } from '../highlight'
 import { CopyButton } from './CopyButton'
 import '../styles/edit-diff.css'
+
+type DiffLine = { kind: 'context' | 'added' | 'deleted'; number: number; text: string }
+type DiffHunk = { lines: DiffLine[] }
+
+/** 解析后端保存的增删统计和 unified diff；行号来自补丁头，不从工具参数推测。 */
+function parseEditDiff(output: string) {
+  const [summary, ...lines] = output.split('\n')
+  const counts = /^\+(\d+) -(\d+)$/.exec(summary)
+  if (!counts) return null
+  let oldLine = 0
+  let newLine = 0
+  let truncated = false
+  const hunks: DiffHunk[] = []
+  for (const line of lines) {
+    const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line)
+    if (header) {
+      oldLine = Number(header[1])
+      newLine = Number(header[2])
+      hunks.push({ lines: [] })
+      continue
+    }
+    if (line === '[Diff truncated]') { truncated = true; continue }
+    if (line === '' || line.startsWith('\\')) continue
+    const hunk = hunks.at(-1)
+    if (!hunk) return null
+    if (line[0] === '+') hunk.lines.push({ kind: 'added', number: newLine++, text: line.slice(1) })
+    else if (line[0] === '-') hunk.lines.push({ kind: 'deleted', number: oldLine++, text: line.slice(1) })
+    else if (line[0] === ' ') {
+      hunk.lines.push({ kind: 'context', number: newLine++, text: line.slice(1) })
+      oldLine++
+    } else return null
+  }
+  return { added: Number(counts[1]), deleted: Number(counts[2]), hunks, truncated }
+}
 
 export function EditDiff({ path, output }: { path: string; output: string }) {
   const diff = useMemo(() => parseEditDiff(output), [output])
@@ -22,18 +55,16 @@ export function EditDiff({ path, output }: { path: string; output: string }) {
 }
 
 function Hunk({ hunk, language }: { hunk: DiffHunk; language: string }) {
-  const before = hunk.lines.filter(line => line.kind !== 'added')
-  const after = hunk.lines.filter(line => line.kind !== 'deleted')
-  const oldTokens = useCodeTokens(before.map(line => line.text).join('\n'), language)
-  const newTokens = useCodeTokens(after.map(line => line.text).join('\n'), language)
-  const highlighted = new Map([
-    ...before.map((line, index) => [line, oldTokens?.[index]] as const),
-    ...after.map((line, index) => [line, newTokens?.[index]] as const),
-  ])
+  const oldTokens = useCodeTokens(hunk.lines.filter(line => line.kind !== 'added').map(line => line.text).join('\n'), language)
+  const newTokens = useCodeTokens(hunk.lines.filter(line => line.kind !== 'deleted').map(line => line.text).join('\n'), language)
+  let oldIndex = 0
+  let newIndex = 0
   return <div className="edit-hunk">{hunk.lines.map((line, index) => {
-    const tokens = highlighted.get(line)
+    if (line.kind === 'context') oldIndex++
+    const tokens = line.kind === 'deleted' ? oldTokens?.[oldIndex++] : newTokens?.[newIndex++]
     return <div key={index} className={`edit-line edit-line-${line.kind}`}>
-    <span className="edit-line-number" aria-label={`${line.kind === 'deleted' ? '删除的原' : line.kind === 'added' ? '新增的' : ''}行 ${line.number}`}>{line.number}</span>
-    <code>{tokens ? <CodeTokens tokens={tokens} /> : line.text || '\u00a0'}</code>
-  </div>})}</div>
+      <span className="edit-line-number" aria-label={`${line.kind === 'deleted' ? '删除的原' : line.kind === 'added' ? '新增的' : ''}行 ${line.number}`}>{line.number}</span>
+      <code>{tokens ? <CodeTokens tokens={tokens} /> : line.text || '\u00a0'}</code>
+    </div>
+  })}</div>
 }

@@ -69,16 +69,6 @@ pub struct McpServerDiscovery {
     pub error: Option<String>,
 }
 
-struct ServerTools {
-    tools: Vec<McpTool>,
-    prompt: Option<String>,
-    tokens: u64,
-}
-
-fn unavailable_prompt(id: &str, error: &str) -> String {
-    format!("Unavailable MCP server {id}:\n{error}")
-}
-
 /// 工具定义按发给模型的字段名序列化后估算，与请求里的工具定义同一种写法。
 fn definition_tokens(tools: &[McpTool]) -> u64 {
     if tools.is_empty() {
@@ -205,69 +195,75 @@ impl McpManager {
     }
 
     async fn tools(
-        id: &str,
+        id: String,
         cwd: &Path,
         config: ServerConfig,
         cell: &ConnectionCell,
-    ) -> Result<ServerTools, String> {
+    ) -> McpServerDiscovery {
         // 同一项目的并发准备共用连接；失败的工具调用不会走这里重放。
         let mut state = cell.lock().await;
         let connection = match state.connection.as_ref().filter(|connection| !connection.is_closed()) {
-            Some(connection) => Arc::clone(connection),
+            Some(connection) => Ok(Arc::clone(connection)),
             None => {
                 state.connection = None;
-                match Connection::connect(cwd, config).await {
-                    Ok(connection) => Arc::new(connection),
-                    Err(error) => {
-                        state.tokens = singularity_core::estimate_tokens_of(&unavailable_prompt(id, &error));
-                        state.catalog = Err(error.clone());
-                        return Err(error);
-                    }
-                }
+                Connection::connect(cwd, config).await.map(Arc::new)
             }
         };
-        let listed = connection.tools().await.map(|mut tools| {
-            tools.sort_by(|a, b| a.name.cmp(&b.name));
-            tools
-        });
-        state.connection = Some(Arc::clone(&connection));
-        state.catalog = listed
-            .as_ref()
-            .map(|tools| {
-                tools
-                    .iter()
-                    .map(|tool| McpToolInfo {
-                        name: tool.name.to_string(),
-                        description: tool.description.as_deref().unwrap_or_default().into(),
-                    })
-                    .collect()
-            })
-            .map_err(Clone::clone);
-        let discovered = listed.map(|listed| {
-            let tools: Vec<_> = listed
-                .into_iter()
-                .map(|tool| McpTool {
-                    name: client::tool_alias(id, &tool.name),
-                    description: format!(
-                        "MCP server {id}, tool {}. {}",
-                        tool.name,
-                        tool.description.as_deref().unwrap_or("")
-                    ),
-                    original_name: tool.name.into_owned(),
-                    input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
-                    connection: Arc::clone(&connection),
+        let discovered = match connection {
+            Ok(connection) => {
+                let listed = connection.tools().await;
+                state.connection = Some(Arc::clone(&connection));
+                listed.map(|mut listed| {
+                    listed.sort_by(|a, b| a.name.cmp(&b.name));
+                    state.catalog = Ok(listed
+                        .iter()
+                        .map(|tool| McpToolInfo {
+                            name: tool.name.to_string(),
+                            description: tool.description.as_deref().unwrap_or_default().into(),
+                        })
+                        .collect());
+                    let tools: Vec<_> = listed
+                        .into_iter()
+                        .map(|tool| McpTool {
+                            name: client::tool_alias(&id, &tool.name),
+                            description: format!(
+                                "MCP server {id}, tool {}. {}",
+                                tool.name,
+                                tool.description.as_deref().unwrap_or("")
+                            ),
+                            original_name: tool.name.into_owned(),
+                            input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
+                            connection: Arc::clone(&connection),
+                        })
+                        .collect();
+                    let prompt = connection.instructions().map(|text| format!("MCP server {id}:\n{text}"));
+                    let tokens = definition_tokens(&tools)
+                        + prompt.as_deref().map_or(0, singularity_core::estimate_tokens_of);
+                    state.tokens = tokens;
+                    McpServerDiscovery {
+                        id: id.clone(),
+                        tools,
+                        prompt,
+                        tokens,
+                        error: None,
+                    }
                 })
-                .collect();
-            let prompt = connection.instructions().map(|text| format!("MCP server {id}:\n{text}"));
-            let tokens =
-                definition_tokens(&tools) + prompt.as_deref().map_or(0, singularity_core::estimate_tokens_of);
-            ServerTools { tools, prompt, tokens }
-        });
-        state.tokens = match &discovered {
-            Ok(found) => found.tokens,
-            Err(error) => singularity_core::estimate_tokens_of(&unavailable_prompt(id, error)),
+            }
+            Err(error) => Err(error),
         };
-        discovered
+        discovered.unwrap_or_else(|error| {
+            let prompt = format!("Unavailable MCP server {id}:\n{error}");
+            let tokens = singularity_core::estimate_tokens_of(&prompt);
+            state.tokens = tokens;
+            state.catalog = Err(error.clone());
+            McpServerDiscovery {
+                id,
+                tools: Vec::new(),
+                prompt: Some(prompt),
+                tokens,
+                error: Some(error),
+            }
+        })
     }
 
     /// 每轮获取全部服务器的工具（`skip` 里的服务器不连接）；复用健康连接，重新读取目录。
@@ -284,10 +280,7 @@ impl McpManager {
         let mut pending = tokio::task::JoinSet::new();
         for (id, config, cell) in entries {
             let cwd = cwd.to_path_buf();
-            pending.spawn(async move {
-                let found = Self::tools(&id, &cwd, config, &cell).await;
-                (id, found)
-            });
+            pending.spawn(async move { Self::tools(id, &cwd, config, &cell).await });
         }
         let mut discovered = BTreeMap::new();
         while !pending.is_empty() {
@@ -297,39 +290,20 @@ impl McpManager {
                     break;
                 }
                 entry = pending.join_next() => {
-                    let (id, result) = entry.expect("pending discovery task").expect("MCP discovery worker completes");
-                    discovered.insert(id, result);
+                    let server = entry.expect("pending discovery task").expect("MCP discovery worker completes");
+                    discovered.insert(server.id.clone(), server);
                 }
             }
         }
-        let servers = discovered
-            .into_iter()
-            .map(|(id, found)| match found {
-                Ok(found) => McpServerDiscovery {
-                    id,
-                    tools: found.tools,
-                    prompt: found.prompt,
-                    tokens: found.tokens,
-                    error: None,
-                },
-                Err(error) => {
-                    let prompt = unavailable_prompt(&id, &error);
-                    McpServerDiscovery {
-                        id,
-                        tools: Vec::new(),
-                        tokens: singularity_core::estimate_tokens_of(&prompt),
-                        prompt: Some(prompt),
-                        error: Some(error),
-                    }
-                }
-            })
-            .collect();
-        McpDiscovery { servers, error: None }
+        McpDiscovery {
+            servers: discovered.into_values().collect(),
+            error: None,
+        }
     }
 
     /// 用户明确重试时重建该项目的连接并发现工具，连接失败随服务器状态返回。
     pub async fn reconnect(&self, id: &str, cwd: &Path) -> Result<McpServerState, String> {
-        if let Some((_, config, cell)) = self.entries(cwd, Some(id), true)?.pop() {
+        if let Some((id, config, cell)) = self.entries(cwd, Some(id), true)?.pop() {
             // 连接失败保存在状态中，与执行准备失败使用同一份原因。
             let _ = Self::tools(id, cwd, config, &cell).await;
         }
@@ -408,5 +382,5 @@ async fn close_connections(cells: Vec<ConnectionCell>) {
 
 // 原生路径带有 Windows 长路径前缀，界面路径没有；两者按同一目录复用和关闭连接。
 fn directory_key(cwd: &Path) -> String {
-    singularity_core::display_path(cwd).to_lowercase()
+    singularity_core::workspace_key(cwd)
 }

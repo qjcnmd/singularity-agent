@@ -46,4 +46,5 @@
 - **Windows 自动化环境**：Playwright / Electron 自动化从普通 PowerShell 启动 Node 验证脚本，让 Electron 和 Rust 继承完整的 Windows 环境，不要沿用 `node_repl` 这类工具裁剪过的环境。装了 Git Bash 却报找不到时，先查验证进程的 `ProgramFiles`、`PATH` 和实际 `bash.exe` 路径，改好启动方式再重跑。
 - **模型调用**：只用真实的提供方和模型，不写模拟提供方。对验证有帮助就直接调用，不用问。用户没指定时用 Codex/GPT-6-luna max
 - **临时文件**：验证脚本、调查脚本和临时数据用完就删，不留在仓库。
-- **试用包**：每次功能做完、检查通过后，按[开发指南](docs/development.md#5-打包构建与发布)打包，退出正在运行的 Singularity，用 `apps/desktop/release/win-unpacked/` 的内容整体替换 `Desktop/Singularity`。桌面只保留这一份，不另建“新版”、日期或版本号目录；用户数据在 `~/.singularity`，不受影响。
+- **试用包**：每次功能做完、检查通过后，按[开发指南](docs/development.md#5-打包构建与发布)更新 `Desktop/Singularity`。日常只替换改动涉及的应用归档和 Rust 后端；首次交付、Electron 或运行依赖、打包配置变化时才完整打包。替换前退出 Singularity，更新后从桌面目录验证。只保留这一份成品，临时打包文件用完删除；用户数据在 `~/.singularity`。
+- **构建缓存**：本机 Rust 构建目录放在 D 盘，沿用 `cargo metadata` 返回的位置。功能交付后检查大小，超过 10 GiB 就运行 `cargo clean`；构建期间可以临时超过阈值，清理后下次构建需要重新编译。

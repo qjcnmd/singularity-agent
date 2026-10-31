@@ -5,8 +5,7 @@ import { PickerSurface } from './PickerSurface'
 import { ContextCapsules } from './ContextCapsules'
 import { WaterOrb } from './orb/WaterOrb'
 import { motion, useReducedMotion } from 'motion/react'
-import { inputTrigger } from '../inputTrigger'
-import { useSkillCandidates } from '../inputCandidates'
+import { inputTrigger, useSkillCandidates } from '../inputCandidates'
 import { smooth } from '../motion'
 import { DraftImages, FileChips, useAttachmentInput } from './Images'
 import { selectedSessionPhase } from '../sessionState'
@@ -127,11 +126,11 @@ function ComposerView({ accent }: { accent: string }) {
               </button>
             ))}
             </div>
-            {skills.status === 'loading' && <p className="candidate-message" role="status">正在读取 Skills…</p>}
-            {skills.status === 'ready' && suggestions.length === 0 && <p className="candidate-message">{skills.result.skills.length === 0 ? '没有可用的 Skills' : '没有匹配的 Skills'}</p>}
-            {skills.status === 'ready' && skills.result.diagnostics.map(message => <p className="candidate-message candidate-error" role="alert" key={message}>{message}</p>)}
+            {skills.status === 'loading' && <p role="status">正在读取 Skills…</p>}
+            {skills.status === 'ready' && suggestions.length === 0 && <p>{skills.result.skills.length === 0 ? '没有可用的 Skills' : '没有匹配的 Skills'}</p>}
+            {skills.status === 'ready' && skills.result.diagnostics.map(message => <p role="alert" key={message}>{message}</p>)}
             {skills.status === 'error' && (
-              <div className="candidate-message candidate-error" role="alert">
+              <div role="alert">
                 <strong>{skills.error.message}</strong>
                 <button ref={candidateRetry} type="button" className="secondary-button" onClick={() => {
                   skills.retry()
@@ -142,7 +141,7 @@ function ComposerView({ accent }: { accent: string }) {
           </div>
         </PickerSurface>
       </div>
-      <div {...attachmentInput.handlers} className={`composer-card${inputDisabled ? ' is-unavailable' : ''}`}>
+      <div {...attachmentInput.handlers} className="composer-card">
         <DraftImages images={imageDraft} remove={index => { if (draftKey !== null) appStore.setImages(draftKey, imageDraft.filter((_, at) => at !== index)) }} />
         <FileChips files={fileDraft} remove={index => { if (draftKey !== null) appStore.setFiles(draftKey, fileDraft.filter((_, at) => at !== index)) }} />
         <textarea

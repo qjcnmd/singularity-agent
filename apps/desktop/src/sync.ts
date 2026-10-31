@@ -87,19 +87,22 @@ function acceptSummary(state: SyncState, summary: ThreadSummary, revision: numbe
 
 /** 首次发送只更新这个任务，不改变整个目录的事件序号。 */
 export function acceptSessionStart(state: SyncState, started: SessionStartResult): SyncState {
-  if (state.bootstrap!.revision >= started.revision) return state
+  if (state.bootstrap && state.bootstrap.revision >= started.revision) return state
   const next = acceptLiveSession(state, started.summary.threadId, started.status, started.revision)
   return acceptSummary(next, started.summary, started.revision)
 }
 
-/** 根据最新目录剔除已删除项目的选中态与已删除任务的内存状态，并在未选中项目时默认选中第一个项目。 */
+/** 根据最新目录剔除已删除项目的选中态与已删除任务的内存状态。 */
 export function pruneStaleSelection(
   bootstrap: AppBootstrap,
   state: Pick<SyncState, 'liveSessions' | 'session'> & { selectedWorkspaceRoot: string | null; selectedSessionId: string | null },
 ) {
   const workspaces = new Set(bootstrap.workspaces.map(workspace => workspaceKey(workspace.root)))
   const sessions = new Set(Object.values(bootstrap.sessionsByWorkspace).flat().map(session => session.threadId))
-  const liveSessions = Object.fromEntries(Object.entries(state.liveSessions).filter(([id]) => sessions.has(id)))
+  const liveEntries = Object.entries(state.liveSessions)
+  const liveSessions = liveEntries.every(([id]) => sessions.has(id))
+    ? state.liveSessions
+    : Object.fromEntries(liveEntries.filter(([id]) => sessions.has(id)))
   const session = state.session !== null && !sessions.has(state.session.summary.threadId) ? null : state.session
   const workspaceRemoved = state.selectedWorkspaceRoot !== null && !workspaces.has(state.selectedWorkspaceRoot)
   const sessionRemoved = state.selectedSessionId !== null && !sessions.has(state.selectedSessionId)
@@ -124,12 +127,8 @@ export function resetBaseline(state: SyncState, bootstrap: AppBootstrap): SyncSt
   for (const [id, live] of Object.entries(state.liveSessions)) {
     if (live.revision > bootstrap.revision || (live.summaryRevision ?? 0) > bootstrap.revision) liveSessions[id] = live
   }
-  if (session) liveSessions[session.summary.threadId] = {
-    ...state.liveSessions[session.summary.threadId], phase: session.runtime.phase, failure: session.runtime.failure,
-    revision: state.liveSessions[session.summary.threadId]?.revision ?? 0,
-  }
   return {
-    revision: bootstrap.revision, modelCatalogRevision: Math.max(state.modelCatalogRevision, bootstrap.revision), bootstrap,
+    revision: Math.max(state.revision, bootstrap.revision), modelCatalogRevision: Math.max(state.modelCatalogRevision, bootstrap.revision), bootstrap,
     session, liveSessions,
   }
 }

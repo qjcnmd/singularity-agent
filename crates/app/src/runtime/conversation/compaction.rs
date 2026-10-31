@@ -18,10 +18,9 @@ impl Conversation {
             };
         };
         let conversation = Arc::clone(self);
-        let prepared =
-            tokio::task::spawn_blocking(move || conversation.prepare_request_context(&conversation.thread()))
-                .await
-                .expect("compaction preparation completes while the runtime is running");
+        let prepared = tokio::task::spawn_blocking(move || conversation.prepare_request_context())
+            .await
+            .expect("compaction preparation completes while the runtime is running");
         let mut requests = match prepared {
             Ok(requests) => requests,
             Err(error) => {

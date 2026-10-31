@@ -272,12 +272,12 @@ pub(crate) fn openai_responses_input(
                 }
             }
             ModelRole::Developer | ModelRole::User => {
-                let role = match message.role() {
-                    // 开头的 developer 已折叠进 instructions；历史之后的 developer
-                    // 使用 Responses 输入 schema 接受的 system 角色。
-                    ModelRole::Developer => "system",
-                    ModelRole::User => "user",
-                    ModelRole::Assistant | ModelRole::Tool => unreachable!(),
+                // 开头的 developer 已折叠进 instructions；历史之后的 developer
+                // 使用 Responses 输入 schema 接受的 system 角色。
+                let role = if message.role() == ModelRole::Developer {
+                    "system"
+                } else {
+                    "user"
                 };
                 items.push(json!({
                     "type": "message",

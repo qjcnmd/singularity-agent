@@ -24,13 +24,7 @@ impl RequestDefinitions {
             .iter()
             .map(|message| singularity_core::estimate_tokens_of(&message.content_text()) + 4)
             .sum::<u64>();
-        let tool_tokens = if tools.is_empty() {
-            0
-        } else {
-            singularity_core::estimate_tokens_of(
-                &serde_json::to_string(&tools).expect("tool schemas are serializable"),
-            ) + 4
-        };
+        let tool_tokens = modules::tools_tokens(&tools);
         Self {
             messages,
             tools,

@@ -1,6 +1,6 @@
 import { useRef, type KeyboardEvent } from 'react'
 import { motion, useReducedMotion } from 'motion/react'
-import { palette, type PaletteColor } from '../palette'
+import { palette, type PaletteColor } from '../bubbleColors'
 import { pop } from '../motion'
 
 const size = 84

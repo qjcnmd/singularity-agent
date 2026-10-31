@@ -1,6 +1,5 @@
-import { useId, useRef, useState } from 'react'
+import { useId, useLayoutEffect, useRef, useState } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
-import { useContextModules } from '../contextModules'
 import { formatTokenCount, workspaceName } from '../copy'
 import { navigateList, useDismissOnOutside } from '../interactions'
 import type { ContextGroup, ContextModule } from '../protocol'
@@ -8,6 +7,32 @@ import { workspaceKey } from '../workspace'
 import { Plus } from 'lucide-react'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
+
+type ModuleQuery =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'ready'; modules: ContextModule[] }
+  | { status: 'error'; error: Error }
+
+/** 新任务页读取当前项目的上下文胶囊；切换项目作废上一次读取，失败可重试。 */
+function useContextModules(workspaceRoot: string | null, connection: string) {
+  const [query, setQuery] = useState<ModuleQuery>({ status: 'idle' })
+  const [reload, setReload] = useState(0)
+  useLayoutEffect(() => {
+    if (workspaceRoot === null || connection !== 'ready') {
+      setQuery({ status: 'idle' })
+      return
+    }
+    setQuery({ status: 'loading' })
+    let active = true
+    void appStore.transport.rpc('context.preview', { workspaceRoot }).then(
+      modules => { if (active) setQuery({ status: 'ready', modules }) },
+      error => { if (active) setQuery({ status: 'error', error: error instanceof Error ? error : new Error(String(error)) }) },
+    )
+    return () => { active = false }
+  }, [workspaceRoot, connection, reload])
+  return { query, retry: () => setReload(value => value + 1) }
+}
 
 const groupTitles: Record<ContextGroup, string> = { instructions: '指令', tools: '工具', skills: '技能', mcp: 'MCP' }
 const groupOrder: ContextGroup[] = ['instructions', 'tools', 'skills', 'mcp']

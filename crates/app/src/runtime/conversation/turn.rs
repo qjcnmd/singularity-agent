@@ -8,7 +8,7 @@ use singularity_agent::agent::{Agent, AgentConfig, AgentError, RequestContext, T
 use singularity_agent::session::{LedgerRecord, lock_writer, with_writer_async};
 use singularity_model::OpenAiProvider;
 
-use singularity_protocol::{Thread, Turn, TurnErrorDetail, TurnFailureCause, TurnStatus};
+use singularity_protocol::{Turn, TurnErrorDetail, TurnFailureCause, TurnStatus};
 
 use super::Conversation;
 
@@ -144,7 +144,7 @@ impl Conversation {
     ) -> Result<(Agent, String, u64), TurnErrorDetail> {
         let writer = Arc::clone(&self.writer);
         let inbox = Arc::clone(&self.lock_state().steering_inbox);
-        let context = self.prepare_request_context(&self.thread())?;
+        let context = self.prepare_request_context()?;
         let context_window = context.context_window();
         let agent = Agent::new(context, inbox, Arc::clone(&controls.questions), Arc::clone(&self.bash_tasks));
         // 开始记录的 ID 就是回合 ID；输入消息由 Agent 之后单独保存，两次写入不是一个事务。
@@ -177,12 +177,10 @@ impl Conversation {
         }
         let conversation = Arc::clone(self);
         let result = async {
-            let requests = tokio::task::spawn_blocking(move || {
-                conversation.prepare_request_context(&conversation.thread())
-            })
-            .await
-            .expect("context preparation completes while the runtime is running")
-            .map_err(|error| error.message)?;
+            let requests = tokio::task::spawn_blocking(move || conversation.prepare_request_context())
+                .await
+                .expect("context preparation completes while the runtime is running")
+                .map_err(|error| error.message)?;
             requests.inspect_context(&signal).await.map_err(|error| error.to_string())
         }
         .await;
@@ -197,16 +195,16 @@ impl Conversation {
         result
     }
 
-    pub(super) fn prepare_request_context(&self, thread: &Thread) -> Result<RequestContext, TurnErrorDetail> {
-        let provider = OpenAiProvider::new(&self.models, &thread.model).map_err(preparation_error)?;
+    pub(super) fn prepare_request_context(&self) -> Result<RequestContext, TurnErrorDetail> {
+        let provider = OpenAiProvider::new(&self.models, &self.model()).map_err(preparation_error)?;
         let instruction_home = self.home.clone();
         let initial_instructions =
-            singularity_core::load_agent_instructions(std::path::Path::new(&thread.cwd), &instruction_home)
+            singularity_core::load_agent_instructions(std::path::Path::new(&self.cwd), &instruction_home)
                 .map_err(preparation_error)?;
         let config = AgentConfig {
             instruction_home,
             initial_instructions,
-            disabled_modules: thread.disabled_modules.clone(),
+            disabled_modules: self.disabled_modules.clone(),
         };
         Ok(RequestContext::new(provider, config, Arc::clone(&self.writer), Arc::clone(&self.mcp)))
     }

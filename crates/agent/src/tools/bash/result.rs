@@ -34,8 +34,8 @@ pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> Result
         result.push_str(&format!("\n[Output bytes {cursor}–{start} omitted.]"));
     }
     if output.incomplete {
-        result
-            .push_str("\n[output truncated: a descendant process was still writing when the command exited]");
+        result.push('\n');
+        result.push_str(super::exec::OUTPUT_TRUNCATED_BACKGROUND_NOTE);
     }
     if let Some(error) = &output.file_error {
         result.push_str(&format!("\nFull output could not be saved: {error}"));

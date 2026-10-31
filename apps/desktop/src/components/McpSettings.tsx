@@ -91,7 +91,7 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
     } finally { setBusy(false) }
   }
 
-  return <section className="mcp-settings" aria-label="MCP" aria-busy={loading}>
+  return <section aria-label="MCP" aria-busy={loading}>
     {error && editor === null && removing === null && <p role="alert" className="form-error">{error} <button type="button" className="quiet-button" disabled={busy || loading} onClick={() => void retryLoad()}>重新读取</button></p>}
     <div className="sg-provider-list">
       {servers.map(result => {
@@ -118,7 +118,7 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
       })}
       {!loading && !error && servers.length === 0 && <p className="sg-provider-empty">尚未配置 MCP 服务器。</p>}
     </div>
-    <div className="sg-add-actions"><button type="button" className="sg-add-card-btn" disabled={busy || loading} onClick={() => { setError(null); setEditor('new') }}>＋ 添加 MCP</button></div>
+    <button type="button" className="sg-add-card-btn" disabled={busy || loading} onClick={() => { setError(null); setEditor('new') }}>＋ 添加 MCP</button>
     <Dialog open={editor !== null} onClose={() => { if (!busy) setEditor(null) }} labelledBy="mcp-editor-title" className="mcp-editor-modal">
       <header className="modal-header"><h2 id="mcp-editor-title">{editor === 'new' ? '添加 MCP' : '编辑 MCP'}</h2><button type="button" className="icon-button" aria-label="关闭" disabled={busy} onClick={() => setEditor(null)}><X size={18} /></button></header>
       {editor !== null && <McpEditor key={editor === 'new' ? 'new' : editor.serverId} server={editor === 'new' ? undefined : editor} onCancel={() => setEditor(null)} busy={busy} error={error} onSave={async server => {

@@ -2,15 +2,14 @@ import { useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, useReducedMotion } from 'motion/react'
 import { appStore, useAppStore } from '../appStore'
-import { defaultBubbleColors } from '../bubbleColors'
+import { defaultBubbleColors, type PaletteColor } from '../bubbleColors'
 import { enter, pop } from '../motion'
-import type { PaletteColor } from '../palette'
 import { ColorWheel, type BallLook } from './ColorWheel'
 
 export type BubbleKind = 'assistantBubble' | 'userBubble'
 
-/** 助手气泡选“灰黑”时是默认的白底细边框，调色盘上画成和其他球同风格的珍珠白球。 */
-const assistantLooks: Partial<Record<string, BallLook>> = { neutral: { label: '白色（默认）', ball: '#d5dbe6', rim: '#9aa4b5' } }
+/** “灰黑”对应的是默认的白底细边框，调色盘上画成和其他球同风格的珍珠白球；用户气泡和助手气泡共用同一颗。 */
+const neutralLooks: Partial<Record<string, BallLook>> = { neutral: { label: '白色（默认）', ball: '#d5dbe6', rim: '#9aa4b5' } }
 
 type Drop = { color: PaletteColor; fill: string; rim: string; from: { x: number; y: number }; landed: boolean }
 
@@ -34,7 +33,7 @@ export function BubbleColorPicker({ kind, x, y, onClose }: { kind: BubbleKind; x
   const choose = (color: PaletteColor, ball: HTMLElement) => {
     if (reduced) { appStore.setBubbleColor(kind, color.id); root.current!.hidePopover(); return }
     const rect = ball.getBoundingClientRect()
-    const look = kind === 'assistantBubble' ? assistantLooks[color.id] : undefined
+    const look = neutralLooks[color.id]
     setDrop({ color, fill: look?.ball ?? color.solid, rim: look?.rim ?? color.solid, from: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }, landed: false })
   }
   const land = () => {
@@ -45,7 +44,7 @@ export function BubbleColorPicker({ kind, x, y, onClose }: { kind: BubbleKind; x
   return createPortal(<div ref={root} popover="auto" className="color-popover" onToggle={event => { if (event.newState === 'closed') onClose() }}>
     <motion.div className="color-popover-surface" {...enter} animate={drop ? { opacity: 0, scale: .96 } : enter.animate} transition={reduced ? { duration: 0 } : drop ? { duration: .18 } : pop} style={{ originX: 0, originY: 0 }}>
       <ColorWheel label={kind === 'userBubble' ? '我的消息颜色' : '助手消息颜色'} value={state[kind] ?? defaultBubbleColors[kind]}
-        chosen={drop?.color.id ?? null} looks={kind === 'assistantBubble' ? assistantLooks : undefined} onSelect={choose} />
+        chosen={drop?.color.id ?? null} looks={neutralLooks} onSelect={choose} />
     </motion.div>
     {drop && !drop.landed && <motion.i className="color-drop" style={{ '--ball': drop.fill, '--ball-rim': drop.rim, left: drop.from.x, top: drop.from.y } as React.CSSProperties}
       // 先微微上提，再加速落下；下落时拉长成水滴，落地前压扁。

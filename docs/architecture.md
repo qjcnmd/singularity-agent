@@ -72,7 +72,7 @@ Agent 通过 `TurnEvent` 通知后端，后端再发布显示内容或运行快�
 | MCP 配置与连接 | `mcp::McpManager` | MCP 管理页和执行共用一个实例，连接按项目目录复用；配置文件和设置接口共用 `protocol::McpTransportConfig`，省略的参数、环境变量和请求头按空值处理 |
 | 草稿、视图偏好、界面显示 | React 草稿存储、`AppStore`、`SessionStore` | 空白页共用一份草稿，已发送的任务按任务 ID 存草稿；历史读取和实时事件更新同一份回合列表 |
 
-Tokio 运行时由 `main` 持有。`Conversation` 长期持有会话写者和输入队列，所有保存都经过这个写者；它只保留当前操作的临时显示条目，读取时与已保存历史合并，操作结束后清除。
+Tokio 运行时由 `main` 持有。`Conversation` 直接持有不可变的任务身份、工作目录、已关闭模块（`thread_id`、`cwd`、`disabled_modules`）、会话写者和输入队列，可变模型选择（`model`）与运行阶段、关闭标记及单次预览控制放在 `ConversationState` 中；所有保存都经过同一个写者，`ConversationView` 只保留当前操作的临时显示条目，读取时与已保存历史合并，操作结束后清除。
 
 普通提交、独立压缩和后台续跑在 `lifecycle.rs` 检查各自的启动条件，然后共用一次建立停止控制、占用任务和发布运行状态的步骤。`view.rs` 负责历史读取、临时显示内容和事件发布；后台命令完成通知在 `background.rs` 中触发后续回合。
 
@@ -265,7 +265,7 @@ MCP 图片直接把 Base64 内容交给图片入口解码，按实际字节识�
 | 桌面 RPC 与同步 | [后端 rpc.rs](../crates/app/src/desktop/rpc.rs)、[rpcClient.ts](../apps/desktop/src/rpcClient.ts)、[sync.ts](../apps/desktop/src/sync.ts) |
 | 开始执行、停止与追加输入 | [conversation.rs](../crates/app/src/runtime/conversation.rs)、[turn.rs](../crates/app/src/runtime/conversation/turn.rs)、[inbox.rs](../crates/agent/src/agent/inbox.rs) |
 | 工具名称与参数检查、并发调度 | [registry.rs](../crates/agent/src/tools/registry.rs)、[dispatch.rs](../crates/agent/src/agent/dispatch.rs) |
-| 文件读取、命令执行与提问 | [read.rs](../crates/agent/src/tools/read.rs)、[bash/mod.rs](../crates/agent/src/tools/bash/mod.rs)、[questions.rs](../crates/agent/src/agent/questions.rs) |
+| 文件读写、看图、命令执行与提问 | [read.rs](../crates/agent/src/tools/read.rs)、[edit.rs](../crates/agent/src/tools/edit.rs)、[view_image.rs](../crates/agent/src/tools/view_image.rs)、[bash/mod.rs](../crates/agent/src/tools/bash/mod.rs)、[questions.rs](../crates/agent/src/agent/questions.rs) |
 | 后台进程、保存与自动继续 | [bash/tasks.rs](../crates/agent/src/tools/bash/tasks.rs)、[conversation/background.rs](../crates/app/src/runtime/conversation/background.rs)、[BackgroundTasks.tsx](../apps/desktop/src/components/BackgroundTasks.tsx) |
 | 模型请求、错误分类与重试 | [request_execution.rs](../crates/agent/src/request_execution.rs)、[openai/provider.rs](../crates/model/src/openai/provider.rs) |
 | 上下文与压缩 | [session/context.rs](../crates/agent/src/session/context.rs)、[agent/compaction.rs](../crates/agent/src/agent/compaction.rs)、[conversation/compaction.rs](../crates/app/src/runtime/conversation/compaction.rs) |

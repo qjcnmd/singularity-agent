@@ -1,7 +1,7 @@
 /* 模型选择 */
 .sg-trigger:hover { background: var(--surface-hover); }
 .sg-trigger:active { transform: scale(.96); transition-duration: 80ms; }
-.sg-triggerLabel { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent); font-weight: 400; }
+.sg-triggerLabel { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent-ink); font-weight: 400; }
 .sg-triggerEffort { flex: none; color: var(--ink-soft); }
 .sg-groups { max-height: 240px; overflow-y: auto; }
 .sg-groupTitle { margin: 0; padding: 7px 9px 3px; color: var(--ink-faint); font-size: 12px; font-weight: 400; }
@@ -31,3 +31,4 @@
 /* 固定宽度，打开时由 ModelPicker 按按钮中心定位；打开期间换模型、按钮变宽变窄，浮层也不移动。 */
 .sg-root > .model-popover { position: fixed; inset: auto; width: 240px; margin: 0; padding: 0; border: 0; overflow: visible; background: transparent; color: inherit; }
 .sg-menu { padding: 5px; }
+.sg-menu .candidate-message { margin: 0; padding: 8px 10px; color: var(--ink-faint); font-size: 12px; }

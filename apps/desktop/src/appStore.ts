@@ -1,9 +1,8 @@
 import { workspaceKey } from './workspace'
-import { SessionStore, type AppState, type QuestionDraft } from './sessionStore'
-import { actionOrigin } from './storeActions'
-export { actionOrigin, hasInlineActionError, pendingKey } from './storeActions'
+import { SessionStore, actionOrigin, type AppState, type QuestionDraft } from './sessionStore'
+export { actionOrigin, hasInlineActionError, pendingKey } from './sessionStore'
 export type { AppState, ActionError, FileTab } from './sessionStore'
-import { effectiveSelection, selectedModel } from './modelChoices'
+import { selectedModel } from './modelChoices'
 import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, clampFilePanelWidth, type PersistedView } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { emptyDraft, imageUpload, type Draft } from './drafts'
@@ -55,7 +54,7 @@ class AppStore extends SessionStore {
 
   modelSelection(): ModelSelection | null {
     if (this.state.selectedSessionId !== null) return this.state.session?.runtime.selection ?? null
-    return effectiveSelection(this.inputDraft().selection, this.state.bootstrap?.modelCatalog)
+    return this.inputDraft().selection ?? this.state.bootstrap?.modelCatalog.defaultSelection ?? null
   }
 
   modelAvailable(): boolean {
@@ -74,14 +73,13 @@ class AppStore extends SessionStore {
     if (state.selectedWorkspaceRoot === null) blockedReason = '请先选择项目'
     else if (state.connection !== 'ready') blockedReason = '连接未就绪'
     else if (state.bootstrapLoad.status !== 'idle') blockedReason = state.bootstrapLoad.status === 'error' ? '项目读取失败' : '正在读取项目'
-    else if (state.sessionLoad.status === 'loading') blockedReason = '正在读取任务'
-    else if (state.selectedSessionId !== null && state.session === null) blockedReason = state.sessionLoad.status === 'error'
-      ? '任务读取失败' : '正在读取任务'
+    else if (state.sessionLoad.status === 'loading' || (state.selectedSessionId !== null && state.session === null && state.sessionLoad.status !== 'error')) blockedReason = '正在读取任务'
+    else if (state.selectedSessionId !== null && state.session === null) blockedReason = '任务读取失败'
     else if (phase === 'stopping') blockedReason = '正在停止'
     else if (state.session?.runtime.pendingQuestion) blockedReason = '请先回答问题'
     else if (submitPending) blockedReason = '正在发送…'
     else if (!active && !this.modelAvailable()) blockedReason = '请选择模型'
-    return { canSubmit: state.drafts !== null && state.selectedWorkspaceRoot !== null && blockedReason === null && (draft.text.trim() !== '' || draft.images.length > 0 || draft.files.length > 0), blockedReason } as const
+    return { canSubmit: state.drafts !== null && blockedReason === null && (draft.text.trim() !== '' || draft.images.length > 0 || draft.files.length > 0), blockedReason } as const
   }
 
   async submitDraft(): Promise<boolean> {
