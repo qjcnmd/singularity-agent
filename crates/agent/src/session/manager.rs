@@ -109,6 +109,14 @@ impl SessionData {
         super::session_images_directory(parent, &self.session_id)
     }
 
+    /// 超长工具输出随会话保留，压缩和重新打开任务不删除文件。
+    pub(crate) fn output_directory(&self) -> PathBuf {
+        super::session_outputs_directory(
+            self.file.parent().expect("session has a parent directory"),
+            &self.session_id,
+        )
+    }
+
     /// 只允许读取这份历史实际引用的图片，不接受任意文件路径。
     pub fn image_data(&self, image_id: &str) -> Result<String> {
         let attachment = self

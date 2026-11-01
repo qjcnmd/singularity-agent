@@ -6,7 +6,7 @@
 
 | 行为 | 适用条件与影响 | 源码入口 |
 | --- | --- | --- |
-| 压缩依靠模型遵守摘要指令，不单独拒绝工具调用 | 摘要请求保留工具定义。回复未截断且正文非空时，保存正文，不执行其中的工具调用。正文替换此前的模型上下文，完整历史仍在日志中。 | [compaction.rs](../crates/agent/src/compaction.rs) |
+| 压缩依靠模型遵守摘要指令，不单独拒绝工具调用 | 摘要请求保留工具定义。回复未截断且正文非空时，保存正文，不执行其中的工具调用。正文替换此前的模型上下文，完整历史仍在日志中。 | [compaction.rs](../crates/agent/src/agent/compaction.rs) |
 | 流解码失败时不保留已收到的 Token 用量 | 解码失败的请求保留错误和计时，但不记录解码器已收到的用量，累计统计可能低于实际消耗。未上报的用量保持未知。 | [provider.rs](../crates/model/src/openai/provider.rs)、[Chat 解码器](../crates/model/src/openai/chat/stream.rs)、[Responses 解码器](../crates/model/src/openai/responses/stream.rs) |
 | 创建日志时被强制终止可能留下不完整文件 | 新会话独占新建日志并直接写入；创建过程中被强制终止时需要手动删除该日志，不增加创建事务或恢复流程。 | [manager.rs](../crates/agent/src/session/manager.rs) |
 | 草稿存储错误不打断操作 | 首次读取失败时从空白继续，不提示、不禁用输入；新输入照常保存，允许覆盖当前任务的旧草稿。自动保存失败时保留当前输入，清理失败不影响已完成的任务删除或项目移除。 | [drafts.ts](../apps/desktop/src/drafts.ts) |

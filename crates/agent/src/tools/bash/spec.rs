@@ -73,8 +73,8 @@ impl TaskOutputArgs {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TaskListArgs {}
 
-pub(crate) fn spec() -> singularity_model::ModelToolSchema {
-    singularity_model::ModelToolSchema {
+pub(crate) fn spec() -> singularity_core::ToolDefinition {
+    singularity_core::ToolDefinition {
         name: "bash".to_string(),
         description: DESCRIPTION.clone(),
         parameters_schema: json!({
@@ -91,16 +91,16 @@ pub(crate) fn spec() -> singularity_model::ModelToolSchema {
     }
 }
 
-pub(crate) fn task_list_spec() -> singularity_model::ModelToolSchema {
-    singularity_model::ModelToolSchema {
+pub(crate) fn task_list_spec() -> singularity_core::ToolDefinition {
+    singularity_core::ToolDefinition {
         name: "task_list".to_string(),
         description: "List this session's background commands, including saved commands from earlier runs. Commands left running in saved history are interrupted; they are not restarted. Completion notifies you automatically; do not repeatedly poll.".to_string(),
         parameters_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
     }
 }
 
-pub(crate) fn task_output_spec() -> singularity_model::ModelToolSchema {
-    singularity_model::ModelToolSchema {
+pub(crate) fn task_output_spec() -> singularity_core::ToolDefinition {
+    singularity_core::ToolDefinition {
         name: "task_output".to_string(),
         description: "Read a background command's output after cursor and its current state, including saved output after reopening the session. Pass the previous next_cursor to read only new output; omit cursor or use 0 to reread. Cursors count UTF-8 bytes of plain output, excluding status and notices. Long output returns a bounded tail with omitted ranges and a full-output file when available. Reads never consume output. wait_ms waits for a live command for at most 30000 ms; cancelling the wait does not stop the command. Completion notifies you automatically, so avoid short polling loops.".to_string(),
         parameters_schema: json!({
@@ -115,8 +115,8 @@ pub(crate) fn task_output_spec() -> singularity_model::ModelToolSchema {
     }
 }
 
-pub(crate) fn task_stop_spec() -> singularity_model::ModelToolSchema {
-    singularity_model::ModelToolSchema {
+pub(crate) fn task_stop_spec() -> singularity_core::ToolDefinition {
+    singularity_core::ToolDefinition {
         name: "task_stop".to_string(),
         description: "Stop this background command and all descendants, then wait for cleanup. Stopping an already finished command returns its existing result.".to_string(),
         parameters_schema: json!({

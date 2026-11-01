@@ -144,7 +144,7 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
   const stdio = server?.transport.type === 'stdio' ? server.transport : null
   const http = server?.transport.type === 'http' ? server.transport : null
   const [command, setCommand] = useState(stdio?.command ?? '')
-  const [args, setArgs] = useState(stdio?.args.join('\n') ?? '')
+  const [args, setArgs] = useState(JSON.stringify(stdio?.args ?? [], null, 2))
   const [cwd, setCwd] = useState(stdio?.cwd ?? '')
   const [env, setEnv] = useState(JSON.stringify(stdio?.env ?? {}, null, 2))
   const [url, setUrl] = useState(http?.url ?? '')
@@ -158,8 +158,10 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
     if (busy) return
     setFailure(null)
     try {
+      const parsedArgs: unknown = type === 'stdio' ? JSON.parse(args) : []
+      if (!Array.isArray(parsedArgs) || !parsedArgs.every((value): value is string => typeof value === 'string')) throw new Error('参数必须是字符串组成的 JSON 数组。')
       await onSave({ serverId: id.trim(), startupTimeoutSec: startup, toolTimeoutSec: timeout,
-        transport: type === 'stdio' ? { type, command: command.trim(), args: args.split('\n').filter(line => line.trim() !== ''), cwd: cwd.trim() || null, env: stringMap(env, '环境变量') }
+        transport: type === 'stdio' ? { type, command: command.trim(), args: parsedArgs, cwd: cwd.trim() || null, env: stringMap(env, '环境变量') }
           : { type, url: url.trim(), headers: stringMap(headers, '请求头') },
       })
     } catch (error) { setFailure(error instanceof Error ? error.message : '配置格式无效。') }
@@ -171,7 +173,7 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
       <label className="sg-field"><span>连接方式</span><select className="sg-input" aria-label="MCP 连接方式" value={type} onChange={event => setType(event.target.value as typeof type)}><option value="stdio">本地进程（stdio）</option><option value="http">远程服务（Streamable HTTP）</option></select></label>
       {type === 'stdio' ? <>
         <label className="sg-field"><span>命令</span><input className="sg-input" aria-label="MCP 命令" required value={command} onChange={event => setCommand(event.target.value)} /></label>
-        <label className="sg-field"><span>参数（每行一个）</span><textarea className="sg-input" aria-label="MCP 参数" rows={3} value={args} onChange={event => setArgs(event.target.value)} /></label>
+        <label className="sg-field"><span>参数（JSON 数组）</span><textarea className="sg-input" aria-label="MCP 参数" rows={3} value={args} onChange={event => setArgs(event.target.value)} /></label>
         <label className="sg-field"><span>工作目录（留空使用任务的项目目录）</span><input className="sg-input" aria-label="MCP 工作目录" value={cwd} onChange={event => setCwd(event.target.value)} /></label>
         <label className="sg-field"><span>环境变量（JSON 对象）</span><textarea className="sg-input" aria-label="MCP 环境变量" rows={3} spellCheck={false} value={env} onChange={event => setEnv(event.target.value)} /></label>
       </> : <>

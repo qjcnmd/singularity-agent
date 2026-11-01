@@ -15,8 +15,8 @@ pub(crate) struct ViewImageArgs {
     pub(crate) path: String,
 }
 
-pub(crate) fn spec() -> singularity_model::ModelToolSchema {
-    singularity_model::ModelToolSchema {
+pub(crate) fn spec() -> singularity_core::ToolDefinition {
+    singularity_core::ToolDefinition {
         name: "view_image".to_string(),
         description: "View an image file (PNG, JPEG, WebP, GIF first frame, BMP). The image is returned as visual input, not text.".to_string(),
         parameters_schema: json!({

@@ -153,7 +153,6 @@ pub(crate) fn read(home: &Path) -> Result<Configuration, String> {
 }
 
 pub(crate) fn write(home: &Path, config: &Configuration) -> Result<(), String> {
-    singularity_core::create_data_dir(home)?;
     singularity_core::write_json_atomic(&home.join("mcp.json"), config)
         .map_err(|error| format!("无法保存 mcp.json：{error}"))
 }

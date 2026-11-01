@@ -1,13 +1,40 @@
 //! 手动和自动压缩共用：总结早期历史、保留近期原文，成功后保存摘要和保留位置。
 
 use super::{AgentError, RequestContext, Result, TurnEvent};
-use crate::compaction::{CompactionPrefix, PreparedCompaction, validate_summary};
-use crate::request_execution::execute_request;
-use crate::session::{CompactionEntry, with_writer_async};
+use crate::request_execution::{execute_request, output_budget_tokens};
+use crate::session::{CompactionEntry, CompactionPrefix, context, with_writer_async};
+use singularity_model::{Message, ModelTurnRequest, ModelTurnResponse};
 use singularity_protocol::{HistoryItem, TurnStatus};
 use tokio_util::sync::CancellationToken;
 
 const AUTO_COMPACTION_TRIGGER_RATIO: f64 = 0.9;
+
+/// 摘要请求的目标输出上限；实际值还受模型上限与本次请求的窗口余量约束。
+const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
+
+const INITIAL_SUMMARY_INSTRUCTION: &str =
+    "Summarize the earlier conversation so another coding assistant can continue the user's current task.";
+const UPDATE_SUMMARY_INSTRUCTION: &str = "Update the previous summary with the new conversation above. Preserve still-current goals, constraints, completed work, and decisions. Move finished work to Done, remove resolved blockers, and revise Next Steps.";
+const SUMMARY_FORMAT: &str = r#"Output only a concise summary with these Markdown sections, in order:
+## Goal
+[The user's current objective]
+## Constraints & Preferences
+- [Current user requirements and preferences]
+## Progress
+### Done
+- [x] [Completed work]
+### In Progress
+- [ ] [Current work]
+### Blocked
+- [Current blockers]
+## Key Decisions
+- **[Decision]**: [Reason]
+## Next Steps
+1. [Next concrete action]
+## Critical Context
+- [Facts needed to continue]
+
+Use "(none)" for an empty section. Preserve exact paths, identifiers, commands, errors, and user wording when needed to continue. Distinguish verified results from plans. Project files remain authoritative; Harness and project instructions are loaded separately. Do not call tools or continue the conversation."#;
 
 impl RequestContext {
     pub(super) async fn reduce_context_if_needed(
@@ -93,14 +120,35 @@ impl RequestContext {
         self.ensure_definitions(on_event, cancellation).await?;
         let definitions = self.request_definitions().clone();
         let model = self.provider.model_configuration();
-        let prepared =
-            tokio::task::spawn_blocking(move || PreparedCompaction::new(prefix, definitions, &model))
-                .await
-                .expect("summary preparation completes while the runtime is running")?;
+        let first_kept_entry_id = prefix.first_kept_entry_id;
+        let request = tokio::task::spawn_blocking(move || {
+            let mut messages = definitions.messages;
+            messages.extend(prefix.messages);
+            let images = context::load_images(&mut messages, &prefix.image_directory)?;
+            let task = if prefix.updating {
+                UPDATE_SUMMARY_INSTRUCTION
+            } else {
+                INITIAL_SUMMARY_INSTRUCTION
+            };
+            let instruction = Message::user(format!("{task}\n\n{SUMMARY_FORMAT}"));
+            let input_tokens = definitions
+                .estimated_tokens
+                .saturating_add(prefix.estimated_tokens)
+                .saturating_add(context::message_token_estimate(&instruction));
+            messages.push(instruction);
+            Ok::<_, std::io::Error>(ModelTurnRequest {
+                messages,
+                images,
+                tools: definitions.tools,
+                max_output_tokens: output_budget_tokens(&model, input_tokens, DEFAULT_SUMMARY_MAX_TOKENS),
+            })
+        })
+        .await
+        .expect("summary preparation completes while the runtime is running")?;
         let (response, _, _) = execute_request(
             &self.provider,
             &self.session,
-            &prepared.request,
+            &request,
             on_event,
             cancellation,
             singularity_protocol::RequestPurpose::Compaction,
@@ -112,7 +160,7 @@ impl RequestContext {
         }
         let entry = CompactionEntry {
             summary: summary.clone(),
-            first_kept_entry_id: prepared.first_kept_entry_id,
+            first_kept_entry_id,
         };
         // 摘要和保留位置写在同一行；写入失败时旧上下文仍然有效。
         let id = item_id.to_owned();
@@ -143,4 +191,18 @@ pub fn compaction_unneeded(
     } else {
         Ok(false)
     }
+}
+
+/// 检查摘要：没有被截断且正文非空才能使用。
+fn validate_summary(response: ModelTurnResponse) -> Result<String> {
+    if response.is_length_truncated() {
+        return Err(AgentError::InvalidSummary(
+            "summary reached the output limit (incomplete checkpoint)".into(),
+        ));
+    }
+    let text = response.assistant_message.content_text();
+    if text.trim().is_empty() {
+        return Err(AgentError::InvalidSummary("summary contains no text".into()));
+    }
+    Ok(text)
 }

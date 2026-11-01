@@ -38,7 +38,6 @@ pub struct WorkspaceStore {
 impl WorkspaceStore {
     /// 打开已有登记文件；文件不存在时从空登记开始，其他读取错误直接返回。
     pub fn open(home: &Path) -> Result<Self, String> {
-        singularity_core::create_data_dir(home)?;
         let path = home.join(WORKSPACE_REGISTRY_FILE_NAME);
         let state = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)

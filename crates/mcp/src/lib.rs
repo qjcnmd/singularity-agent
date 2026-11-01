@@ -39,9 +39,7 @@ pub struct McpManager {
 /// 本轮发现的一个 MCP 工具；调用时使用发现时的连接，本轮内不变。
 #[derive(Clone)]
 pub struct McpTool {
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
+    pub definition: singularity_core::ToolDefinition,
     original_name: String,
     connection: Arc<Connection>,
 }
@@ -67,24 +65,6 @@ pub struct McpServerDiscovery {
     /// 这台服务器的工具定义和 `prompt` 在请求里的估算 Token 数。
     pub tokens: u64,
     pub error: Option<String>,
-}
-
-/// 工具定义按发给模型的字段名序列化后估算，与请求里的工具定义同一种写法。
-fn definition_tokens(tools: &[McpTool]) -> u64 {
-    if tools.is_empty() {
-        return 0;
-    }
-    let schemas: Vec<_> = tools
-        .iter()
-        .map(|tool| {
-            serde_json::json!({
-                "name": tool.name,
-                "description": tool.description,
-                "parametersSchema": tool.input_schema,
-            })
-        })
-        .collect();
-    singularity_core::estimate_tokens_of(&serde_json::Value::Array(schemas).to_string()) + 4
 }
 
 /// 一次工具发现的结果；`error` 是 mcp.json 读不出来的原因，此时没有服务器。
@@ -225,20 +205,23 @@ impl McpManager {
                     let tools: Vec<_> = listed
                         .into_iter()
                         .map(|tool| McpTool {
-                            name: client::tool_alias(&id, &tool.name),
-                            description: format!(
-                                "MCP server {id}, tool {}. {}",
-                                tool.name,
-                                tool.description.as_deref().unwrap_or("")
-                            ),
+                            definition: singularity_core::ToolDefinition {
+                                name: client::tool_alias(&id, &tool.name),
+                                description: format!(
+                                    "MCP server {id}, tool {}. {}",
+                                    tool.name,
+                                    tool.description.as_deref().unwrap_or("")
+                                ),
+                                parameters_schema: serde_json::Value::Object((*tool.input_schema).clone()),
+                            },
                             original_name: tool.name.into_owned(),
-                            input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
                             connection: Arc::clone(&connection),
                         })
                         .collect();
                     let prompt = connection.instructions().map(|text| format!("MCP server {id}:\n{text}"));
-                    let tokens = definition_tokens(&tools)
-                        + prompt.as_deref().map_or(0, singularity_core::estimate_tokens_of);
+                    let tokens =
+                        singularity_core::estimate_tool_tokens(tools.iter().map(|tool| &tool.definition))
+                            + prompt.as_deref().map_or(0, singularity_core::estimate_tokens_of);
                     state.tokens = tokens;
                     McpServerDiscovery {
                         id: id.clone(),

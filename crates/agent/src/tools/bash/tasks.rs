@@ -185,13 +185,14 @@ impl BashTasks {
         self: &Arc<Self>,
         args: BashArgs,
         cwd: PathBuf,
+        output_directory: PathBuf,
         signal: CancellationToken,
         mut on_update: impl FnMut(String) -> F + Send,
     ) -> ToolExecution {
         if signal.is_cancelled() {
             return error_result(ABORTED_MESSAGE);
         }
-        let mut process = match Process::spawn(&args, &cwd) {
+        let mut process = match Process::spawn(&args, &cwd, &output_directory) {
             Ok(process) => process,
             Err(error) => return error_result(error),
         };

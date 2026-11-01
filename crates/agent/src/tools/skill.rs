@@ -12,8 +12,8 @@ pub(crate) struct SkillArgs {
     pub(crate) name: String,
 }
 
-pub(crate) fn spec() -> singularity_model::ModelToolSchema {
-    singularity_model::ModelToolSchema {
+pub(crate) fn spec() -> singularity_core::ToolDefinition {
+    singularity_core::ToolDefinition {
         name: "skill".to_string(),
         description: "Load the complete instructions of an available skill by name. The result includes the skill's base directory, from which its relative resources are resolved.".to_string(),
         parameters_schema: json!({

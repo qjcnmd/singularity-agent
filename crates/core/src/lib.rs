@@ -4,10 +4,12 @@
 
 mod project_instructions;
 pub mod skills;
+mod tool;
 mod user_home;
 pub mod workspace;
 
 pub use project_instructions::{InstructionFile, load_agent_instructions};
+pub use tool::{ToolDefinition, estimate_tool_tokens};
 pub use user_home::resolve_home;
 pub use workspace::{
     CanonicalWorkspacePath, canonicalize_workspace, same_saved_path, saved_path_key, workspace_key,

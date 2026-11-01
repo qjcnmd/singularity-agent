@@ -1,4 +1,4 @@
-//! 工具输出的捕获：只在内存保留末尾部分，统计行数和字节数，超出显示上限时把完整输出写到临时文件。
+//! 工具输出的捕获：只在内存保留末尾部分，统计行数和字节数，超出显示上限时把完整输出写到会话目录。
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -11,8 +11,7 @@ use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, 
 /// 末尾缓冲的上限（100KB），输出再长也不会占满内存。
 const INTERNAL_TAIL_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;
 
-/// 输出超过显示上限时保存完整输出的临时文件，位于
-/// <TEMP>/singularity-tool-output/<uuid>.log，调用结束后保留，供模型和用户查看。
+/// 输出超过显示上限时保存完整输出，文件随所属会话保留和删除。
 struct SpillWriter {
     path: PathBuf,
     file: std::fs::File,
@@ -29,10 +28,10 @@ impl SpillWriter {
 }
 
 /// 累计输出的状态：内存里保留末尾部分（最多 100KB），并统计总行数和总字节数。
-/// 输出首次超过显示上限（2000 行或 50KB）时创建临时文件写入已有缓冲，之后每段输出都追加进去；
+/// 输出首次超过显示上限（2000 行或 50KB）时在会话目录创建文件写入已有缓冲，之后每段输出都追加进去；
 /// 写入失败时记下原因，结果里改为说明完整输出没能保存。
-#[derive(Default)]
 pub(super) struct CaptureState {
+    directory: PathBuf,
     tail: String,
     total_bytes: usize,
     completed_lines: usize,
@@ -41,6 +40,17 @@ pub(super) struct CaptureState {
 }
 
 impl CaptureState {
+    pub(super) fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            tail: String::new(),
+            total_bytes: 0,
+            completed_lines: 0,
+            spill: None,
+            last_progress: None,
+        }
+    }
+
     /// 总行数：已结束的行数，加上末尾还没换行的一行（如果有）。尾部缓冲裁掉的是开头，
     /// 所以看缓冲是否以换行结尾就能判断；这一行被裁过的完整长度无法得知，截断说明里不报。
     fn total_lines(&self) -> usize {
@@ -84,8 +94,7 @@ impl CaptureState {
         }
         self.tail.push_str(text);
         if self.spill.is_none() && self.is_truncated() {
-            let root = std::env::temp_dir().join("singularity-tool-output");
-            self.spill = Some(SpillWriter::create(&root, &self.tail));
+            self.spill = Some(SpillWriter::create(&self.directory, &self.tail));
         }
         if self.tail.len() > INTERNAL_TAIL_MAX_BYTES {
             self.tail = crate::tools::truncate::truncate_string_to_bytes_from_end(

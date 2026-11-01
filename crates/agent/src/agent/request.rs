@@ -13,18 +13,18 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone)]
 pub(crate) struct RequestDefinitions {
     pub(crate) messages: Vec<Message>,
-    pub(crate) tools: Vec<singularity_model::ModelToolSchema>,
+    pub(crate) tools: Vec<singularity_core::ToolDefinition>,
     pub(crate) estimated_tokens: u64,
 }
 
 impl RequestDefinitions {
     /// 定义在本轮内不变，加载时一次计算预算，普通请求和摘要请求直接复用。
-    fn new(messages: Vec<Message>, tools: Vec<singularity_model::ModelToolSchema>) -> Self {
+    fn new(messages: Vec<Message>, tools: Vec<singularity_core::ToolDefinition>) -> Self {
         let instructions = messages
             .iter()
             .map(|message| singularity_core::estimate_tokens_of(&message.content_text()) + 4)
             .sum::<u64>();
-        let tool_tokens = modules::tools_tokens(&tools);
+        let tool_tokens = singularity_core::estimate_tool_tokens(&tools);
         Self {
             messages,
             tools,

@@ -76,7 +76,6 @@ pub(crate) fn read_user_config_file(directory: &Path) -> Result<Option<UserConfi
 /// 序列化后原子替换整个配置：被删掉的提供方、模型和推理档位随保存消失。
 /// 键按 `BTreeMap` 排序，与文件原先的书写顺序无关。
 pub(crate) fn write_user_config_file(directory: &Path, config: &UserConfigFile) -> Result<(), ProviderError> {
-    singularity_core::create_data_dir(directory).map_err(configuration_error)?;
     let path = directory.join(USER_CONFIG_FILE_NAME);
     singularity_core::write_json_atomic(&path, config)
         .map_err(|error| configuration_error(format!("无法保存模型配置 {}：{error}", path.display())))

@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use singularity_core::ToolDefinition;
 use singularity_core::skills::SkillCatalog;
-use singularity_model::ModelToolSchema;
 use tokio_util::sync::CancellationToken;
 
 use super::bash;
@@ -55,9 +55,10 @@ impl ToolExecution {
     }
 }
 
-/// 工具执行时需要的工作目录、停止信号和后台命令管理器。
+/// 工具执行时需要的工作目录、会话输出目录、停止信号和后台命令管理器。
 pub(crate) struct ToolContext {
     pub cwd: std::path::PathBuf,
+    pub output_directory: std::path::PathBuf,
     pub signal: CancellationToken,
     pub bash_tasks: Arc<bash::BashTasks>,
 }
@@ -83,11 +84,16 @@ impl PreparedTool {
         context: ToolContext,
         on_update: impl FnMut(String) -> F + Send,
     ) -> ToolExecution {
-        let ToolContext { cwd, signal, bash_tasks } = context;
+        let ToolContext {
+            cwd,
+            output_directory,
+            signal,
+            bash_tasks,
+        } = context;
         match self {
             Self::Edit(args) => edit::execute(args, cwd, signal).await,
-            Self::Mcp(tool, args) => super::mcp::execute(tool, args, &signal).await,
-            Self::Bash(args) => bash_tasks.execute(args, cwd, signal, on_update).await,
+            Self::Mcp(tool, args) => super::mcp::execute(tool, args, output_directory, &signal).await,
+            Self::Bash(args) => bash_tasks.execute(args, cwd, output_directory, signal, on_update).await,
             Self::TaskList(_) => bash_tasks.tool_list(),
             Self::TaskOutput(args) => {
                 bash_tasks.output(&args.task_id, args.cursor, args.wait_ms, &signal).await
@@ -117,7 +123,7 @@ pub(crate) const ABORTED_MESSAGE: &str = "Operation aborted";
 type ToolParser = fn(&Value) -> Result<PreparedTool, ToolExecution>;
 
 /// 一个内置工具：发给模型的定义和参数检查。
-pub(crate) type BuiltinTool = (ModelToolSchema, ToolParser);
+pub(crate) type BuiltinTool = (ToolDefinition, ToolParser);
 
 pub(crate) fn bash_tool() -> BuiltinTool {
     (bash::spec(), |args| {
@@ -182,19 +188,19 @@ impl ToolRegistrySnapshot {
     }
 
     /// 发给模型的完整工具定义：内置工具在前，MCP 工具在后；`skill` 工具随 Skills 模块。
-    pub fn provider_schemas(&self) -> Vec<ModelToolSchema> {
+    pub fn provider_schemas(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
             .map(|(schema, _)| schema.clone())
             .chain(self.skills.iter().map(|_| skill::spec()))
-            .chain(self.mcp.iter().map(mcp_schema))
+            .chain(self.mcp.iter().map(|tool| tool.definition.clone()))
             .collect()
     }
 
     /// 查找工具并解析参数，不执行。Agent 在执行前按模型给出的顺序逐个调用；
     /// 未知工具和参数错误都返回给模型看的错误结果。
     pub(crate) fn preflight(&self, name: &str, args: &Value) -> Result<PreparedTool, ToolExecution> {
-        if let Some(tool) = self.mcp.iter().find(|tool| tool.name == name) {
+        if let Some(tool) = self.mcp.iter().find(|tool| tool.definition.name == name) {
             let args =
                 args.as_object().ok_or_else(|| error_result("MCP tool arguments must be a JSON object"))?;
             return Ok(PreparedTool::Mcp(tool.clone(), args.clone()));
@@ -211,14 +217,6 @@ impl ToolRegistrySnapshot {
             .find(|(spec, _)| spec.name == name)
             .ok_or_else(|| error_result(format!("tool execution failed: unknown tool: {name}")))?;
         parse(args)
-    }
-}
-
-fn mcp_schema(tool: &singularity_mcp::McpTool) -> ModelToolSchema {
-    ModelToolSchema {
-        name: tool.name.clone(),
-        description: tool.description.clone(),
-        parameters_schema: tool.input_schema.clone(),
     }
 }
 

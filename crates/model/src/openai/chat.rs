@@ -1,6 +1,7 @@
 //! OpenAI Chat Completions 协议：请求编码、SSE 解码与响应解析。
 
 use super::parse::*;
+use singularity_core::ToolDefinition;
 mod stream;
 pub(crate) use self::stream::read_chat_sse_stream;
 
@@ -14,7 +15,7 @@ use crate::provider::ProviderStreamEvent;
 use crate::provider::contract::{provider_content_filter_error, provider_finish_network_error};
 use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
 use crate::types::{
-    Message, ModelRole, ModelStopReason, ModelToolCall, ModelToolSchema, ModelTurnRequest, ModelTurnResponse,
+    Message, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
     ProviderMessageMetadata,
 };
 use tokio_util::sync::CancellationToken;
@@ -206,7 +207,7 @@ fn openai_tool_call_payload(tool_call: &ModelToolCall) -> Value {
     })
 }
 
-fn openai_tool_payload(tool: &ModelToolSchema) -> Value {
+fn openai_tool_payload(tool: &ToolDefinition) -> Value {
     json!({
         "type": "function",
         "function": {

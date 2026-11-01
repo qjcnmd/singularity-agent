@@ -39,7 +39,6 @@ pub fn prepare_desktop(
     String,
 > {
     let sessions_dir = home.join(SESSIONS_DIR_NAME);
-    singularity_core::create_data_dir(&sessions_dir)?;
     let models = Arc::new(ModelConfigManager::open(home.to_path_buf()));
     let mcp = Arc::new(singularity_mcp::McpManager::open(home.to_path_buf()));
     let catalog = ThreadCatalog::new(sessions_dir);

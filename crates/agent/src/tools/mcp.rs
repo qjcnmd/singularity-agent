@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 pub(super) async fn execute(
     tool: McpTool,
     args: Map<String, Value>,
+    output_directory: std::path::PathBuf,
     signal: &CancellationToken,
 ) -> ToolExecution {
     if signal.is_cancelled() {
@@ -21,7 +22,7 @@ pub(super) async fn execute(
                 let mut execution = ToolExecution::text(result.content);
                 execution.is_error = result.is_error;
                 for data in result.images {
-                    match InputImage::from_base64(format!("{}.image", tool.name), &data) {
+                    match InputImage::from_base64(format!("{}.image", tool.definition.name), &data) {
                         Ok(image) => execution.images.push(image),
                         Err(error) => {
                             execution.content.push_str(&format!("\n\nMCP 图片无效：{error}"));
@@ -33,7 +34,7 @@ pub(super) async fn execute(
             }
             Err(error) => error_result(error),
         };
-        let mut output = super::output::CaptureState::default();
+        let mut output = super::output::CaptureState::new(output_directory);
         output.ingest(&execution.content);
         let (content, note) = output.finish();
         execution.content = content;

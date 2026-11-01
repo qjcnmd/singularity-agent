@@ -11,6 +11,7 @@ mod manager;
 
 use format::Result;
 
+pub use context::CompactionPrefix;
 pub use format::{
     CompactionEntry, LedgerRecord, SessionEntry, SessionError, SessionMetadata, text_item_id,
     thinking_item_id, tool_item_id,
@@ -25,6 +26,11 @@ pub fn session_file_name(session_id: &str) -> String {
 /// 会话图片的保存、读取和删除共用的目录。
 pub fn session_images_directory(sessions_dir: &std::path::Path, session_id: &str) -> std::path::PathBuf {
     sessions_dir.join("images").join(session_id)
+}
+
+/// 会话完整工具输出的保存和删除共用的目录。
+pub fn session_outputs_directory(sessions_dir: &std::path::Path, session_id: &str) -> std::path::PathBuf {
+    sessions_dir.join("outputs").join(session_id)
 }
 
 pub(crate) fn new_entry_id() -> String {

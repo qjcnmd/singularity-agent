@@ -14,7 +14,7 @@ import { useBodyCollapse, useSelectionGuard } from '../interactions'
 import { MarkdownBody } from '../markdown'
 import { compactionText, factStatusText, formatTokenCount } from '../copy'
 import { formatClock, compactionResultText, displayPath, firstLine, formatTurnDuration, pathFromArgs, readOutputLines, toolDisplay, toolSummary, toolArgument, type TimelineContent } from '../timeline'
-import type { HistoryItem, SessionModelUsage, ToolStatus } from '../protocol'
+import type { HistoryItem, SessionModelUsage, ToolStatus, UserQuestion, UserQuestionAnswer } from '../protocol'
 
 const previewLineCount = 8
 
@@ -181,22 +181,17 @@ function CompactionRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemK
   </motion.article>
 }
 
-function QuestionAnswers({ questions, output }: { questions: unknown; output: string }) {
-  const asked = Array.isArray(questions) ? questions as { id?: unknown; question?: unknown }[] : []
-  let answers: { id?: unknown; selected?: unknown; text?: unknown; skipped?: unknown }[]
-  try {
-    const parsed = JSON.parse(output) as { answers?: unknown }
-    answers = Array.isArray(parsed.answers) ? parsed.answers : []
-  } catch { answers = [] }
+function QuestionAnswers({ questions, output }: { questions: UserQuestion[]; output: string }) {
+  // 仅展示成功调用：问题和答案已由后端校验，output 由 UserQuestions::ask 序列化。
+  const { answers } = JSON.parse(output) as { answers: UserQuestionAnswer[] }
   return <div>
     {answers.map((answer, index) => {
-      const question = asked.find(value => value.id === answer.id)
-      const text = typeof answer.text === 'string' ? answer.text.trim() : ''
-      const selected = Array.isArray(answer.selected) ? answer.selected.filter((value): value is string => typeof value === 'string') : []
-      const reply = answer.skipped === true ? '跳过' : [...selected, ...(text ? [text] : [])].join('、')
+      const question = questions.find(value => value.id === answer.id)!
+      const text = answer.text.trim()
+      const reply = answer.skipped ? '跳过' : [...answer.selected, ...(text ? [text] : [])].join('、')
       return <div key={index} className="question-answer-result">
-        {typeof question?.question === 'string' && question.question.trim() && <p className="question-result-title">{question.question}</p>}
-        <p>{reply || '未回答'}</p>
+        <p className="question-result-title">{question.question}</p>
+        <p>{reply}</p>
       </div>
     })}
   </div>
@@ -208,7 +203,7 @@ function ToolOutput({ item: fact, filePath }: { item: Extract<HistoryItem, { typ
   // 内部关联字段不展示；命令输出原样保留，不按工具参数过滤业务数据。
   const displayJson = (key: string, value: unknown) => background && (key === 'taskId' || key === 'task_id') ? undefined : value
   const parameters = JSON.stringify(input, (key, value: unknown) => fact.name === 'task_output' && key === 'cursor' ? undefined : displayJson(key, value), 2)
-  if (fact.name === 'ask_user_question' && fact.status === 'completed') return <QuestionAnswers questions={typeof input === 'object' && input !== null ? (input as { questions?: unknown }).questions : undefined} output={fact.result?.output ?? ''} />
+  if (fact.name === 'ask_user_question' && fact.status === 'completed') return <QuestionAnswers questions={(input as { questions: UserQuestion[] }).questions} output={fact.result!.output} />
   let output = fact.result?.output ?? ''
   if (background && fact.name !== 'bash' && output !== '') {
     try { output = JSON.stringify(JSON.parse(output), displayJson, 2) }

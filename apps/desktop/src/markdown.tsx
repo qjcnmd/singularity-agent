@@ -81,9 +81,9 @@ function MarkdownLink({ href, children }: { href?: string; children?: ReactNode 
 /** 行内代码里的相对路径按这个目录解析；为空时用当前任务的工作目录。文件栏里的 Markdown 用文件自己所在的目录。 */
 export const PathBase = createContext<string | null>(null)
 
-// 带目录分隔符的“xx/yy.ext”，或常见扩展名的单个文件名；可带 :行号:列号。`state.session` 这种属性访问不算。
-const pathLike = /^(?:~[\\/]|[A-Za-z]:[\\/]|\.{0,2}[\\/])?(?:[\w.@+-]+[\\/])+[\w.@+-]+\.[A-Za-z0-9]{1,10}(?::\d+){0,2}$/
-const fileNameLike = /^[\w.@+-]+\.(?:md|markdown|txt|json|jsonc|toml|ya?ml|ts|tsx|js|jsx|mjs|cjs|rs|py|go|java|c|h|cpp|css|html|sh|ps1|lock|env)(?::\d+){0,2}$/i
+// 带目录的文件、常见扩展名或隐藏文件；支持中文和空格，可带 :行号:列号。属性访问如 state.session 不算。
+const pathLike = /^(?:(?:~|[A-Za-z]:|\.{1,2})[\\/]|[\\/]|[\p{L}\p{M}\p{N}_.@+() -]+[\\/])(?:[\p{L}\p{M}\p{N}_.@+() -]+[\\/])*(?:\.[\p{L}\p{M}\p{N}_.@+() -]+|[\p{L}\p{M}\p{N}_.@+() -]+\.[A-Za-z0-9]{1,10})(?::\d+){0,2}$/u
+const fileNameLike = /^(?:\.[\p{L}\p{M}\p{N}_.@+() -]+|[\p{L}\p{M}\p{N}_.@+() -]+\.(?:md|markdown|txt|json|jsonc|toml|ya?ml|ts|tsx|js|jsx|mjs|cjs|rs|py|go|java|c|h|cpp|css|html|sh|ps1|lock|env))(?::\d+){0,2}$/iu
 
 function InlineCode({ children, className }: { children?: ReactNode; className?: string }) {
   const base = useContext(PathBase)

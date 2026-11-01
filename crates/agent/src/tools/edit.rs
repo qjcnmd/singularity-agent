@@ -27,8 +27,8 @@ struct Replacement {
     new_text: String,
 }
 
-pub(crate) fn spec() -> singularity_model::ModelToolSchema {
-    singularity_model::ModelToolSchema {
+pub(crate) fn spec() -> singularity_core::ToolDefinition {
+    singularity_core::ToolDefinition {
         name: "edit".into(),
         description: "Edit an existing UTF-8 text file using one or more exact replacements. Each old_text must be nonempty and unique in the original file; edits must not overlap. All replacements are checked before writing once. Read the relevant content first. LF and CRLF match equivalently; other whitespace and characters must match exactly. Use an empty new_text to delete text. Keep enough context to identify each location. Combine independent changes to one file in a single call; do not issue dependent edits concurrently.".into(),
         parameters_schema: json!({

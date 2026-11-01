@@ -7,9 +7,9 @@
 use std::sync::Arc;
 
 use singularity_core::skills::SkillCatalog;
-use singularity_core::{InstructionFile, estimate_tokens_of};
+use singularity_core::{InstructionFile, ToolDefinition, estimate_tokens_of, estimate_tool_tokens};
 use singularity_mcp::McpDiscovery;
-use singularity_model::{Message, ModelToolSchema};
+use singularity_model::Message;
 use singularity_protocol::{ContextGroup, ContextModule};
 
 use crate::tools::{self, ToolRegistrySnapshot};
@@ -81,14 +81,7 @@ impl Collector<'_> {
     }
 }
 
-pub(super) fn tools_tokens(tools: &[ModelToolSchema]) -> u64 {
-    if tools.is_empty() {
-        return 0;
-    }
-    estimate_tokens_of(&serde_json::to_string(tools).expect("tool schemas are serializable")) + 4
-}
-
-fn names(tools: &[ModelToolSchema]) -> String {
+fn names(tools: &[ToolDefinition]) -> String {
     tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join("、")
 }
 
@@ -149,7 +142,7 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         ContextGroup::Tools,
         "bash",
         "在工作目录执行命令".into(),
-        tools_tokens(&bash_schemas),
+        estimate_tool_tokens(&bash_schemas),
         true,
     );
     registry.add_builtin([bash]);
@@ -159,7 +152,7 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         ContextGroup::Tools,
         "task_*",
         format!("{}：查看、读取输出和停止后台命令", names(&task_schemas)),
-        tools_tokens(&task_schemas),
+        estimate_tool_tokens(&task_schemas),
         true,
     );
     registry.add_builtin(task_tools);
@@ -186,7 +179,14 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
     ];
     for (id, label, detail, tool, guideline) in optional_tools {
         let schemas = [tool.0.clone()];
-        if collector.push(id, ContextGroup::Tools, label, detail.into(), tools_tokens(&schemas), false) {
+        if collector.push(
+            id,
+            ContextGroup::Tools,
+            label,
+            detail.into(),
+            estimate_tool_tokens(&schemas),
+            false,
+        ) {
             registry.add_builtin([tool]);
             tool_guidelines.extend(guideline);
         }
@@ -195,7 +195,7 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
     // Skills：目录提示加 skill 工具，不依赖 read 和 bash。
     let skill_prompt = skills.prompt();
     let skill_schemas = [tools::skill_schema()];
-    let skill_tokens = estimate_tokens_of(&skill_prompt) + tools_tokens(&skill_schemas);
+    let skill_tokens = estimate_tokens_of(&skill_prompt) + estimate_tool_tokens(&skill_schemas);
     let skill_detail = if skill_prompt.is_empty() {
         "没有可公布给模型的技能".to_string()
     } else {
@@ -221,7 +221,12 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
     for server in mcp.servers {
         let detail = match &server.error {
             Some(error) => format!("连接失败：{error}"),
-            None => server.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join("、"),
+            None => server
+                .tools
+                .iter()
+                .map(|tool| tool.definition.name.as_str())
+                .collect::<Vec<_>>()
+                .join("、"),
         };
         if collector.push(
             &mcp_module_id(&server.id),

@@ -29,8 +29,8 @@ pub(crate) struct ReadArgs {
     pub(crate) limit: Option<u64>,
 }
 
-pub(crate) fn spec() -> singularity_model::ModelToolSchema {
-    singularity_model::ModelToolSchema {
+pub(crate) fn spec() -> singularity_core::ToolDefinition {
+    singularity_core::ToolDefinition {
         name: NAME.to_string(),
         description: DESCRIPTION.clone(),
         parameters_schema: json!({

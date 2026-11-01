@@ -4,7 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
-use singularity_agent::session::{SessionData, SessionError, SessionManager, session_images_directory};
+use singularity_agent::session::{
+    SessionData, SessionError, SessionManager, session_images_directory, session_outputs_directory,
+};
 use singularity_protocol::{ThreadHistory, ThreadSummary};
 use uuid::Uuid;
 
@@ -97,11 +99,15 @@ impl ThreadCatalog {
             self.session_error(thread_id, SessionError::InvalidSession(error.to_string()))
         })?;
         let path = thread_session_path(&self.sessions_dir, thread_id);
-        let images = session_images_directory(&self.sessions_dir, thread_id);
-        match std::fs::remove_dir_all(&images) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(CatalogError::Io { path: images, source }),
+        for directory in [
+            session_images_directory(&self.sessions_dir, thread_id),
+            session_outputs_directory(&self.sessions_dir, thread_id),
+        ] {
+            match std::fs::remove_dir_all(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(CatalogError::Io { path: directory, source }),
+            }
         }
         std::fs::remove_file(&path).map_err(|error| CatalogError::session(thread_id, &path, error.into()))
     }

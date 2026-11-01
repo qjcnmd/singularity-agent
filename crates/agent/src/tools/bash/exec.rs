@@ -60,7 +60,7 @@ pub(super) struct Process {
 }
 
 impl Process {
-    pub(super) fn spawn(args: &BashArgs, cwd: &Path) -> Result<Self, String> {
+    pub(super) fn spawn(args: &BashArgs, cwd: &Path, output_directory: &Path) -> Result<Self, String> {
         let shell = bash_path()?;
         let started = Instant::now();
         let mut command = Command::new(&shell);
@@ -86,8 +86,8 @@ impl Process {
         Ok(Self {
             child,
             output,
-            capture: CaptureState::default(),
-            model_capture: CaptureState::default(),
+            capture: CaptureState::new(output_directory.to_path_buf()),
+            model_capture: CaptureState::new(output_directory.to_path_buf()),
             progress,
             started,
             deadline: timeout_ms.map(|ms| started + Duration::from_millis(ms)),

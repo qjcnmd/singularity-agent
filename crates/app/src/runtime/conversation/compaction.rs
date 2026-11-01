@@ -1,6 +1,6 @@
 use super::*;
 use singularity_agent::agent::{AgentError, compaction_unneeded};
-use singularity_agent::compaction::CompactionPrefix;
+use singularity_agent::session::CompactionPrefix;
 use singularity_protocol::{TurnErrorDetail, TurnStatus};
 
 impl Conversation {

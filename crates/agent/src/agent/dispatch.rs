@@ -20,7 +20,10 @@ impl Agent {
         cancellation: &CancellationToken,
         on_event: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<()> {
-        let cwd = lock_writer(&self.requests.session).cwd().to_path_buf();
+        let (cwd, output_directory) = {
+            let writer = lock_writer(&self.requests.session);
+            (writer.cwd().to_path_buf(), writer.output_directory())
+        };
         let mut pending = tool_calls
             .into_iter()
             .enumerate()
@@ -84,6 +87,7 @@ impl Agent {
                 }
                 let context = crate::tools::ToolContext {
                     cwd: cwd.clone(),
+                    output_directory: output_directory.clone(),
                     signal: signal.clone(),
                     bash_tasks: Arc::clone(&self.bash_tasks),
                 };
