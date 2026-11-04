@@ -1,4 +1,4 @@
-//! 当前操作中还没保存的正文、工具进度和压缩状态；读取任务时叠加到已保存的历史上，
+//! 当前操作中还没保存的正文、工具进度和轮换状态；读取任务时叠加到已保存的历史上，
 //! 对应内容保存后就从这里移除。
 use singularity_protocol::{
     HistoryItem, HistoryMessageRole, ThreadHistory, ToolStatus, TurnEvent, TurnStatus,
@@ -43,11 +43,13 @@ impl Activity {
                 }
             }
             TurnEvent::ItemUpdated {
-                item: item @ (HistoryItem::Tool { .. } | HistoryItem::CompactionResult { .. }),
+                item: item @ (HistoryItem::Tool { .. } | HistoryItem::ContextRotationResult { .. }),
             } => {
                 upsert(&mut self.items, item.clone());
             }
-            TurnEvent::ItemUpdated { item: HistoryItem::Compaction { id, .. } }
+            TurnEvent::ItemUpdated {
+                item: HistoryItem::ContextRotation { id, .. },
+            }
             | TurnEvent::ToolFinished { item_id: id, .. } => self.items.retain(|item| item.id() != id),
             TurnEvent::MessageFinished { message_id, .. } | TurnEvent::MessageDiscarded { message_id } => {
                 let text = singularity_agent::session::text_item_id(message_id, 0);

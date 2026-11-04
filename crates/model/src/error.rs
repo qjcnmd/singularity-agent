@@ -52,7 +52,7 @@ impl ProviderError {
         Self::new(kind, message)
     }
 
-    /// 提供方是否明确拒绝了这次请求的上下文规模（会触发强制压缩）。
+    /// 提供方是否明确拒绝了这次请求的上下文规模（会触发强制轮换）。
     pub fn is_context_overflow(&self) -> bool {
         self.kind == ModelErrorKind::ContextLengthExceeded
     }
@@ -198,7 +198,7 @@ pub(crate) fn bounded_wire_detail(fields: &ProviderErrorBodyFields) -> Option<St
         .filter(|text| !text.is_empty())
 }
 
-/// 构造流内事件或 200 响应体中的提供方错误：已知错误码映射到对应分类（上下文超限触发压缩、限流可重试、配额耗尽归入认证错误），
+/// 构造流内事件或 200 响应体中的提供方错误：已知错误码映射到对应分类（上下文超限触发轮换、限流可重试、配额耗尽归入认证错误），
 /// 未知错误码归为 `UnknownProviderError`（不自动重试），并附上提供方原文和错误码。
 pub(crate) fn provider_embedded_error(
     fields: &ProviderErrorBodyFields,

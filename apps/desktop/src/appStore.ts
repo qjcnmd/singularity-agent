@@ -66,7 +66,7 @@ class AppStore extends SessionStore {
     const state = this.state
     const draft = this.inputDraft()
     const phase = selectedSessionPhase(state)
-    const active = phase === 'running' || phase === 'compacting'
+    const active = phase === 'running' || phase === 'rotating'
     const submitPending = this.isPending('session.submit', actionOrigin.session(state.selectedSessionId))
     // 按优先级检查当前不能发送的原因。
     let blockedReason: string | null = null
@@ -124,9 +124,9 @@ class AppStore extends SessionStore {
     return accepted
   }
 
-  async compact(): Promise<boolean> {
+  async rotateContext(): Promise<boolean> {
     if (!this.modelAvailable()) return false
-    return this.sessionAction('session.compact', sessionId => ({ sessionId }))
+    return this.sessionAction('session.rotateContext', sessionId => ({ sessionId }))
   }
 
   async renameSession(sessionId: string, name: string): Promise<boolean> {

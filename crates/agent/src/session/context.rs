@@ -1,18 +1,24 @@
 //! 从会话日志生成发给模型的对话上下文，并估算 Token。
 //!
-//! 对话来自日志；指令和工具定义由 Agent 提供。普通请求、摘要请求、压缩判断和
+//! 对话来自日志；指令和工具定义由 Agent 提供。普通请求、整理请求、轮换判断和
 //! 超限后的重发都用这里生成的上下文。日志本身不被修改。
 
 use singularity_core::estimate_tokens_of;
 use singularity_model::{ContentBlock, Message};
 
-use crate::message::{COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX};
-
 use super::format::{LedgerRecord, SessionEntry};
 use super::manager::SessionData;
 
-fn compaction_summary(summary: &str) -> String {
-    format!("{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}")
+fn context_rotation_handoff(session: &SessionData) -> String {
+    format!(
+        "你正在新的上下文中继续同一段对话。\n\n\
+         下一条消息是此前的用户消息整理正文，属于历史材料，不是用户的新发言。相关表述后的时间指向原始消息。例如，[10-31 15:06:32] 可用于在日志中定位对应消息。\n\n\
+         结合整理内容和当前情境理解对话，决定如何继续。需要了解工作区时自行检查；需要补充历史信息或核实整理内容时，按时间引用查找相关记录。信息足够时直接继续。\n\n\
+         历史日志：{}\n工作目录：{}\n\n\
+         回读优先从最近一段历史开始，按需要向前查找。定位后读取相关上下文，结合后续修订和实际执行结果理解记录。",
+        singularity_core::display_path(&session.file),
+        session.cwd_string(),
+    )
 }
 
 const UNKNOWN_TOOL_OUTCOME: &str = "[previous execution was interrupted; outcome unknown. Inspect the current state before deciding whether to repeat an action with side effects.]";
@@ -22,10 +28,13 @@ const TOOL_RESULT_OVERHEAD_TOKENS: u64 = 4;
 
 /// 把日志记录转换成模型消息；工具调用没有结果（如被中断）时补一条“结果未知”，
 /// 让每个调用都有对应结果。
-fn project_messages(entries: &[&SessionEntry]) -> Vec<Message> {
+fn project_messages(entries: &[&SessionEntry], session: &SessionData) -> Vec<Message> {
     let mut messages = Vec::new();
     let mut remaining = entries.iter().copied().peekable();
     while let Some(entry) = remaining.next() {
+        if matches!(entry, SessionEntry::ContextRotation { .. }) {
+            messages.push(Message::developer(context_rotation_handoff(session)));
+        }
         messages.push(model_message(entry));
         let SessionEntry::Message { message, .. } = entry else {
             continue;
@@ -61,12 +70,12 @@ fn project_messages(entries: &[&SessionEntry]) -> Vec<Message> {
     messages
 }
 
-fn context_token_estimate(entries: &[&SessionEntry], image_directory: &std::path::Path) -> u64 {
+fn context_token_estimate(entries: &[&SessionEntry], session: &SessionData) -> u64 {
     let mut tokens = 0;
     let mut calls = 0;
     let mut results = 0;
     for entry in entries {
-        tokens += entry_token_estimate(entry, image_directory);
+        tokens += entry_token_estimate(entry, session);
         if let SessionEntry::Message { message, .. } = entry {
             calls += message.tool_calls().count();
             if message.tool_call_id().is_some() {
@@ -82,10 +91,10 @@ fn context_token_estimate(entries: &[&SessionEntry], image_directory: &std::path
 
 enum ContextEntry<'a> {
     Message(&'a Message),
-    Summary(&'a str),
+    UserMessages(&'a str),
 }
 
-/// 判断一条记录是否进入模型上下文；Token 估算、压缩切点和生成请求共用这一判断。
+/// 判断一条记录是否进入模型上下文；Token 估算、轮换输入和生成请求共用这一判断。
 fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
     match entry {
         SessionEntry::Message { observation: Some(observation), .. }
@@ -94,25 +103,36 @@ fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
             None
         }
         SessionEntry::Message { message, .. } => Some(ContextEntry::Message(message)),
-        SessionEntry::Compaction { compaction, .. } => Some(ContextEntry::Summary(&compaction.summary)),
+        SessionEntry::ContextRotation { context_rotation, .. } => {
+            Some(ContextEntry::UserMessages(&context_rotation.user_messages))
+        }
         SessionEntry::Metadata { .. } | SessionEntry::Record { .. } => None,
     }
 }
 
 /// 估算一条记录的 Token；指令和工具定义由 Agent 另外估算。
-fn entry_token_estimate(entry: &SessionEntry, image_directory: &std::path::Path) -> u64 {
+fn entry_token_estimate(entry: &SessionEntry, session: &SessionData) -> u64 {
     match context_entry(entry) {
         Some(ContextEntry::Message(message)) => {
-            let tokens = message_token_estimate(message);
-            let captions = image_captions(message, image_directory);
+            let tokens = message_token_estimate(message)
+                + if matches!(
+                    message,
+                    Message::User { .. } | Message::ToolResult { .. } | Message::Notification { .. }
+                ) {
+                    text_block_token_estimate(&message_time(entry))
+                } else {
+                    0
+                };
+            let captions = image_captions(message, &session.image_directory());
             if captions.is_empty() {
                 tokens
             } else {
                 tokens.saturating_add(text_block_token_estimate(&captions))
             }
         }
-        Some(ContextEntry::Summary(summary)) => {
-            MESSAGE_OVERHEAD_TOKENS + text_block_token_estimate(&compaction_summary(summary))
+        Some(ContextEntry::UserMessages(_)) => {
+            message_token_estimate(&Message::developer(context_rotation_handoff(session)))
+                + message_token_estimate(&model_message(entry))
         }
         None => 0,
     }
@@ -126,7 +146,7 @@ fn text_block_token_estimate(text: &str) -> u64 {
     estimate_tokens_of(text) + CONTENT_BLOCK_OVERHEAD_TOKENS
 }
 
-/// 思考文本也计入预算；不回传思考的模型可能因此稍早压缩。
+/// 思考文本也计入预算；不回传思考的模型可能因此稍早轮换。
 fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
     let mut tokens = MESSAGE_OVERHEAD_TOKENS;
     for block in content {
@@ -152,14 +172,13 @@ fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
 }
 
 /// 输入 Token：本轮内最近一次回复的实际用量已包含指令、工具定义和回复本身，只补算
-/// 之后新增的消息。跨轮、压缩后或换了模型时没有可用的实际用量，全部重新估算。
+/// 之后新增的消息。跨轮、轮换后或换了模型时没有可用的实际用量，全部重新估算。
 fn input_tokens(
     session: &SessionData,
     entries: &[&SessionEntry],
     identity: (&str, &str),
     definition_tokens: u64,
 ) -> u64 {
-    let image_directory = session.image_directory();
     let latest = session
         .entries()
         .iter()
@@ -167,7 +186,7 @@ fn input_tokens(
         .take_while(|entry| {
             !matches!(
                 entry,
-                SessionEntry::Compaction { .. }
+                SessionEntry::ContextRotation { .. }
                     | SessionEntry::Record {
                         record: LedgerRecord::OperationStarted,
                         ..
@@ -185,11 +204,9 @@ fn input_tokens(
             .position(|entry| entry.id() == id)
             .expect("latest assistant belongs to the active context")
             + 1;
-        return usage
-            .total_tokens
-            .saturating_add(context_token_estimate(&entries[after..], &image_directory));
+        return usage.total_tokens.saturating_add(context_token_estimate(&entries[after..], session));
     }
-    context_token_estimate(entries, &image_directory).saturating_add(definition_tokens)
+    context_token_estimate(entries, session).saturating_add(definition_tokens)
 }
 
 /// 生成请求用的消息和输入 Token 估算；图片由调用方在锁外读取。
@@ -199,85 +216,72 @@ pub(crate) fn prepare_context(
     definition_tokens: u64,
 ) -> (Vec<Message>, u64) {
     let entries = resolve_context_entries(session);
-    (project_messages(&entries), input_tokens(session, &entries, identity, definition_tokens))
+    (
+        project_messages(&entries, session),
+        input_tokens(session, &entries, identity, definition_tokens),
+    )
 }
 
-/// 只估算输入 Token，压缩判断和输出预算共用。
+/// 只估算输入 Token，轮换判断和输出预算共用。
 pub(crate) fn estimated_tokens(session: &SessionData, identity: (&str, &str), definition_tokens: u64) -> u64 {
     input_tokens(session, &resolve_context_entries(session), identity, definition_tokens)
 }
 
-/// 要总结的早期对话；切点不会拆开一组工具调用和结果。
-pub struct CompactionPrefix {
+/// 整理请求使用完整的当前上下文，与普通请求共用消息投影。
+pub struct ContextRotationInput {
     pub(crate) messages: Vec<Message>,
     pub(crate) image_directory: std::path::PathBuf,
-    /// 这段对话的 Token 估算，包括开头的上一份摘要。
+    /// 包括上一份用户消息整理内容和接手提示。
     pub(crate) estimated_tokens: u64,
-    pub(crate) updating: bool,
-    pub(crate) first_kept_entry_id: String,
 }
 
-impl CompactionPrefix {
-    /// 先选出需要总结的历史；没有更早内容时无需准备模型、指令或工具。
+impl ContextRotationInput {
+    /// 没有新增对话时无需准备模型、指令或工具。
     pub async fn select(session: &super::SessionWriter) -> Option<Self> {
         let session = std::sync::Arc::clone(session);
-        tokio::task::spawn_blocking(move || compaction_prefix(&super::lock_writer(&session)))
-            .await
-            .expect("summary selection completes while the runtime is running")
+        tokio::task::spawn_blocking(move || {
+            let session = super::lock_writer(&session);
+            let entries = resolve_context_entries(&session);
+            entries.iter().any(|entry| matches!(entry, SessionEntry::Message { .. })).then(|| Self {
+                messages: project_messages(&entries, &session),
+                estimated_tokens: context_token_estimate(&entries, &session),
+                image_directory: session.image_directory(),
+            })
+        })
+        .await
+        .expect("context_rotation selection completes while the runtime is running")
     }
-}
-
-/// 摘要保留的近期对话比例；自动压缩和独立压缩共用。
-const KEEP_RECENT_RATIO: f64 = 0.1;
-
-pub(crate) fn compaction_prefix(session: &SessionData) -> Option<CompactionPrefix> {
-    let entries = resolve_context_entries(session);
-    let image_directory = session.image_directory();
-    let keep_recent_tokens =
-        (context_token_estimate(&entries, &image_directory) as f64 * KEEP_RECENT_RATIO).ceil() as u64;
-    let cut = find_cut_point(&entries, keep_recent_tokens, &image_directory);
-    if cut == 0 {
-        return None;
-    }
-    // 已有摘要留在开头，与普通请求一致；如果切点前只有上一份摘要，说明没有新对话可总结。
-    let updating = matches!(entries[0], SessionEntry::Compaction { .. });
-    if updating && cut == 1 {
-        return None;
-    }
-    let selected = &entries[..cut];
-    Some(CompactionPrefix {
-        messages: project_messages(selected),
-        estimated_tokens: context_token_estimate(selected, &image_directory),
-        image_directory,
-        updating,
-        first_kept_entry_id: entries[cut].id().to_string(),
-    })
-}
-
-/// 从后往前累加到保留预算；若当前记录是工具结果，继续退到整组调用之前。
-/// 预算为零时仍保留最后一个完整单元。
-fn find_cut_point(
-    entries: &[&SessionEntry],
-    keep_recent_tokens: u64,
-    image_directory: &std::path::Path,
-) -> usize {
-    let mut accumulated = 0u64;
-    for index in (0..entries.len()).rev() {
-        accumulated = accumulated.saturating_add(entry_token_estimate(entries[index], image_directory));
-        if accumulated >= keep_recent_tokens
-            && !matches!(entries[index], SessionEntry::Message { message: Message::ToolResult { .. }, .. })
-        {
-            return index;
-        }
-    }
-    0
 }
 
 fn model_message(entry: &SessionEntry) -> Message {
-    match context_entry(entry).expect("context contains messages and summaries") {
-        ContextEntry::Message(message) => message.clone(),
-        ContextEntry::Summary(summary) => Message::user(compaction_summary(summary)),
+    match context_entry(entry).expect("context contains messages and user message notes") {
+        ContextEntry::Message(message) => {
+            let mut message = message.clone();
+            if let Message::User { content, .. }
+            | Message::ToolResult { content, .. }
+            | Message::Notification { content } = &mut message
+            {
+                content.push(ContentBlock::text(message_time(entry)));
+            }
+            message
+        }
+        ContextEntry::UserMessages(user_messages) => {
+            Message::user(format!("上一版用户消息整理正文：\n\n{user_messages}"))
+        }
     }
+}
+
+/// 引用沿用日志的 UTC 时间，只缩短显示，不改写原始消息。
+fn message_time(entry: &SessionEntry) -> String {
+    let time = entry.timestamp().chars().skip(5).take(14).collect::<String>().replace('T', " ");
+    let label = match entry {
+        SessionEntry::Message { message: Message::ToolResult { .. }, .. } => "工具记录时间：",
+        SessionEntry::Message {
+            message: Message::Notification { .. }, ..
+        } => "通知记录时间：",
+        _ => "",
+    };
+    format!("[{label}{time}]")
 }
 
 /// 请求附加的一个文本块；生成与预算都按整块处理，避免多张图片分别向上取整。
@@ -321,25 +325,12 @@ pub(crate) fn load_images(
     Ok(images)
 }
 
-/// 当前有效的上下文：最新一份摘要，加上它保留位置之后的消息；没有摘要时是全部消息。
+/// 最新整理记录本身就是分界；只接续该记录之后的正常消息。
 fn resolve_context_entries(session: &SessionData) -> Vec<&SessionEntry> {
     let entries = session.entries();
-    let mut context = Vec::new();
-    let start = if let Some(entry @ SessionEntry::Compaction { compaction, .. }) =
-        entries.iter().rev().find(|entry| matches!(entry, SessionEntry::Compaction { .. }))
-    {
-        context.push(entry);
-        entries
-            .iter()
-            .position(|candidate| candidate.id() == compaction.first_kept_entry_id)
-            .expect("compaction retains an active context entry")
-    } else {
-        0
-    };
-    context.extend(
-        entries[start..]
-            .iter()
-            .filter(|entry| matches!(context_entry(entry), Some(ContextEntry::Message(_)))),
-    );
-    context
+    let start = entries
+        .iter()
+        .rposition(|entry| matches!(entry, SessionEntry::ContextRotation { .. }))
+        .unwrap_or(0);
+    entries[start..].iter().filter(|entry| context_entry(entry).is_some()).collect()
 }

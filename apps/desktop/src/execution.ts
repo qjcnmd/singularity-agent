@@ -33,7 +33,7 @@ function replaceMessage(turn: ThreadTurn, messageId: string, completed: HistoryI
 export function acceptExecutionEvent(facts: ThreadTurn[], event: TurnEventEnvelope): ThreadTurn[] {
   if (event.method === 'context/loaded') return facts
   const id = event.turnId ?? facts.at(-1)?.turnId
-  // 还没有任何回合时，手动压缩事件挂不到具体回合上，直接跳过。
+  // 还没有任何回合时，手动轮换事件挂不到具体回合上，直接跳过。
   if (id === undefined) return facts
   const index = facts.findIndex(turn => turn.turnId === id)
   if (event.method === 'turn/started' && index < 0) {

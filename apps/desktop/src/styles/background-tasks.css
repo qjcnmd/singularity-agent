@@ -10,22 +10,22 @@
 .float-note { color: var(--ink-faint); font-size: 12px; }
 .float-usage { display: grid; justify-items: start; gap: 8px; margin: 0 0 8px; }
 /* 右侧胶囊固定右缘，左缘收向圆形；占位与文字不随外框缩放。 */
-.compact-slot { display: inline-flex; justify-content: flex-end; font-size: 12px; }
-.status-chip.compact-capsule { width: 100%; padding: 0; gap: 0; overflow: hidden; white-space: nowrap; transition: width 240ms var(--smooth), background 120ms; }
-.compact-capsule.is-circle { width: 28px; }
-.compact-icon { display: grid; place-items: center; flex: none; width: 26px; height: 26px; margin-left: 4px; transition: margin-left 240ms var(--smooth); }
-.is-circle > .compact-icon { margin-left: 0; }
-.compact-icon .spinner { animation-delay: 240ms; }
-.compact-percent { margin-left: auto; margin-right: 7px; opacity: 1; transition: opacity 160ms var(--smooth); }
-.is-circle > .compact-percent { opacity: 0; }
-.status-chip.compact-capsule:active { transform: none; }
-.status-chip.compact-capsule:disabled { opacity: 1; cursor: default; }
-.compact-tick { width: 16px; height: 16px; fill: none; stroke: var(--positive); stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 14; stroke-dashoffset: 14; animation: compact-tick-draw 200ms var(--smooth) forwards; }
-@keyframes compact-tick-draw { to { stroke-dashoffset: 0; } }
+.rotation-slot { display: inline-flex; justify-content: flex-end; font-size: 12px; }
+.status-chip.rotation-capsule { width: 100%; padding: 0; gap: 0; overflow: hidden; white-space: nowrap; transition: width 240ms var(--smooth), background 120ms; }
+.rotation-capsule.is-circle { width: 28px; }
+.rotation-icon { display: grid; place-items: center; flex: none; width: 26px; height: 26px; margin-left: 4px; transition: margin-left 240ms var(--smooth); }
+.is-circle > .rotation-icon { margin-left: 0; }
+.rotation-icon .spinner { animation-delay: 240ms; }
+.rotation-percent { margin-left: auto; margin-right: 7px; opacity: 1; transition: opacity 160ms var(--smooth); }
+.is-circle > .rotation-percent { opacity: 0; }
+.status-chip.rotation-capsule:active { transform: none; }
+.status-chip.rotation-capsule:disabled { opacity: 1; cursor: default; }
+.rotation-tick { width: 16px; height: 16px; fill: none; stroke: var(--positive); stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 14; stroke-dashoffset: 14; animation: rotation-tick-draw 200ms var(--smooth) forwards; }
+@keyframes rotation-tick-draw { to { stroke-dashoffset: 0; } }
 @media (prefers-reduced-motion: reduce) {
-  .compact-capsule, .compact-icon, .compact-percent, .float-panel { transition: none; }
-  .compact-tick { animation: none; stroke-dashoffset: 0; }
-  .compact-icon .spinner { animation-delay: 0ms; }
+  .rotation-capsule, .rotation-icon, .rotation-percent, .float-panel { transition: none; }
+  .rotation-tick { animation: none; stroke-dashoffset: 0; }
+  .rotation-icon .spinner { animation-delay: 0ms; }
 }
 /* 运行状态面板只列本任务开着的模块，用和新建任务页一样的胶囊，尺寸小一号；这里只展示，点不动。 */
 .context-panel .capsules { display: flex; flex-wrap: wrap; gap: 5px; }
@@ -34,7 +34,7 @@
 .context-panel .capsule-icon { width: 12px; height: 12px; }
 .context-panel .capsule-tokens { font-size: 10.5px; }
 
-.background-task { width: 100%; max-width: 100%; margin: 0 0 8px; }
+.background-task { grid-template-columns: minmax(0, 1fr); width: 100%; max-width: 100%; margin: 0 0 8px; }
 .background-task:last-child { margin-bottom: 0; }
 .background-task-head { display: flex; align-items: center; min-width: 0; padding-left: 10px; }
 .background-task-head:has(.activity-toggle:hover) { background: color-mix(in srgb, var(--assistant-bubble-bg) 93%, var(--ink)); }

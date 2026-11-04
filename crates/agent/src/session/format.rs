@@ -1,7 +1,7 @@
 //! 会话日志的格式定义和文件头检查。
 //!
 //! 回合结束记录（`operation_finished`）保存最终状态、错误和是否由用户停止。产出可见内容的普通回复
-//! 随消息保存请求耗时与用量，其余请求（重试、无输出的失败请求和摘要请求）单独记为 `model_request`；指令和工具定义不写日志，每轮重新读取。
+//! 随消息保存请求耗时与用量，其余请求（重试、无输出的失败请求和整理请求）单独记为 `model_request`；指令和工具定义不写日志，每轮重新读取。
 
 use serde::{Deserialize, Serialize};
 use singularity_protocol::TurnStatus;
@@ -26,13 +26,12 @@ pub enum SessionError {
 }
 
 pub type Result<T> = std::result::Result<T, SessionError>;
-/// 摘要和它之后保留的第一条记录；被总结的原始记录仍在日志中。
+/// 完整新版用户消息整理内容；记录所在位置就是上下文切换分界。
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CompactionEntry {
-    pub summary: String,
-    #[serde(rename = "firstKeptEntryId")]
-    pub first_kept_entry_id: String,
+pub struct ContextRotationEntry {
+    #[serde(rename = "userMessages")]
+    pub user_messages: String,
 }
 /// 任务设置：模型选择、创建时关闭的上下文模块或任务名称。
 #[derive(Serialize, Deserialize)]
@@ -58,7 +57,7 @@ pub enum LedgerRecord {
     BackgroundTaskUpdated {
         task: singularity_protocol::BackgroundTask,
     },
-    /// 一次没有产生可见回复消息的模型请求（重试、无输出的失败/取消或摘要请求）。
+    /// 一次没有产生可见回复消息的模型请求（重试、无输出的失败/取消或整理请求）。
     ModelRequest {
         observation: singularity_protocol::RequestObservation,
     },
@@ -87,10 +86,10 @@ pub enum SessionEntry {
         #[serde(skip_serializing_if = "Option::is_none")]
         observation: Option<singularity_protocol::RequestObservation>,
     },
-    Compaction {
+    ContextRotation {
         id: String,
         timestamp: String,
-        compaction: CompactionEntry,
+        context_rotation: ContextRotationEntry,
     },
     Metadata {
         id: String,
@@ -120,7 +119,7 @@ impl SessionEntry {
     pub fn timestamp(&self) -> &str {
         match self {
             Self::Message { timestamp, .. }
-            | Self::Compaction { timestamp, .. }
+            | Self::ContextRotation { timestamp, .. }
             | Self::Metadata { timestamp, .. }
             | Self::Record { timestamp, .. } => timestamp,
         }
@@ -129,7 +128,7 @@ impl SessionEntry {
     pub fn id(&self) -> &str {
         match self {
             Self::Message { id, .. }
-            | Self::Compaction { id, .. }
+            | Self::ContextRotation { id, .. }
             | Self::Metadata { id, .. }
             | Self::Record { id, .. } => id,
         }

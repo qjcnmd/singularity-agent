@@ -42,7 +42,7 @@ pub struct ThreadHistory {
 pub enum SessionPhase {
     Idle,
     Running,
-    Compacting,
+    Rotating,
     Stopping,
 }
 
@@ -57,13 +57,13 @@ pub struct TurnEventEnvelope {
     pub phase: SessionPhase,
 }
 
-/// 未保存错误来自普通回合或独立压缩；压缩失败不改变任务的回合状态。
+/// 未保存错误来自普通回合或独立轮换；轮换失败不改变任务的回合状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionOperation {
     Turn,
-    Compaction,
+    ContextRotation,
 }
 
 /// 启动失败或未能写入日志的操作错误；已写入日志的回合失败直接从历史读取。

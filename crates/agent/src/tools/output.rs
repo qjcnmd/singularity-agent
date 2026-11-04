@@ -40,6 +40,12 @@ pub(super) struct CaptureState {
 }
 
 impl CaptureState {
+    /// 转入后台后保留完整正文，主动回读不依赖模型的增量读取位置。
+    pub(super) fn persist(&mut self) {
+        if self.spill.is_none() {
+            self.spill = Some(SpillWriter::create(&self.directory, &self.tail));
+        }
+    }
     pub(super) fn new(directory: PathBuf) -> Self {
         Self {
             directory,

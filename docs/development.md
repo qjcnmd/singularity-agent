@@ -101,6 +101,8 @@ cargo run -p singularity_protocol --features typescript --example export_types
 
 ### 本地打包免安装产物
 
+Windows 包通过 `electronLanguages` 只保留简体中文（`zh-CN`）和英文（`en-US`）的 Electron 语言资源。
+
 ```powershell
 # 构建 Release 版本后端与前端
 npm --prefix apps/desktop run build

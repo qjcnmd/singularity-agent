@@ -60,6 +60,9 @@ pub(super) struct Process {
 }
 
 impl Process {
+    pub(super) fn persist_output(&mut self) {
+        tokio::task::block_in_place(|| self.model_capture.persist());
+    }
     pub(super) fn spawn(args: &BashArgs, cwd: &Path, output_directory: &Path) -> Result<Self, String> {
         let shell = bash_path()?;
         let started = Instant::now();

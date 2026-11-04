@@ -20,32 +20,32 @@ export function RunPanel() {
   const running = tasks.filter(task => task.state.status === 'running').length
   const phase = selectedSessionPhase(state)
   const sessionId = state.selectedSessionId
-  const compaction = state.session?.facts.flatMap(turn => turn.items)
-    .findLast(item => item.type === 'compaction' || item.type === 'compaction_result')
+  const contextRotation = state.session?.facts.flatMap(turn => turn.items)
+    .findLast(item => item.type === 'context_rotation' || item.type === 'context_rotation_result')
   const failure = state.session?.runtime.failure
   const attempt = useRef<string | null>(null)
-  const [compactDone, setCompactDone] = useState(false)
+  const [rotationDone, setRotationDone] = useState(false)
   // 结果条目先于空闲状态到达；按本次条目的终态反馈，不猜测事件间隔。
   useEffect(() => {
     if (attempt.current === null) return
-    if (failure?.source === 'compaction') attempt.current = null
-    else if (compaction && compaction.id !== attempt.current
-      && (compaction.type === 'compaction' || compaction.status !== 'running')) {
+    if (failure?.source === 'context_rotation') attempt.current = null
+    else if (contextRotation && contextRotation.id !== attempt.current
+      && (contextRotation.type === 'context_rotation' || contextRotation.status !== 'running')) {
       attempt.current = null
-      setCompactDone(compaction.type === 'compaction')
+      setRotationDone(contextRotation.type === 'context_rotation')
     }
-  }, [compaction, failure])
+  }, [contextRotation, failure])
   useEffect(() => {
-    if (!compactDone) return
-    const timer = window.setTimeout(() => setCompactDone(false), 1200)
+    if (!rotationDone) return
+    const timer = window.setTimeout(() => setRotationDone(false), 1200)
     return () => window.clearTimeout(timer)
-  }, [compactDone])
-  const compacting = phase === 'compacting' || state.pendingActions.has(pendingKey('session.compact', actionOrigin.session(sessionId)))
-  const compactDisabled = !appStore.modelAvailable() || !state.session?.facts.length || state.connection !== 'ready'
-    || phase !== 'idle' || compactDone || compacting
-  const startCompact = () => {
-    attempt.current = compaction?.id ?? ''
-    void appStore.compact().then(accepted => { if (!accepted) attempt.current = null })
+  }, [rotationDone])
+  const rotating = phase === 'rotating' || state.pendingActions.has(pendingKey('session.rotateContext', actionOrigin.session(sessionId)))
+  const rotationDisabled = !appStore.modelAvailable() || !state.session?.facts.length || state.connection !== 'ready'
+    || phase !== 'idle' || rotationDone || rotating
+  const startRotation = () => {
+    attempt.current = contextRotation?.id ?? ''
+    void appStore.rotateContext().then(accepted => { if (!accepted) attempt.current = null })
   }
   useEffect(() => {
     const close = (event: KeyboardEvent) => {
@@ -63,15 +63,15 @@ export function RunPanel() {
       onClick={() => appStore.setBackgroundOpen(!state.backgroundOpen)}><Ellipsis size={18} /></button>
     <AnimatePresence>{state.backgroundOpen && <motion.aside id="run-panel" className="float-panel" aria-label="运行状态"
       initial={{ opacity: 0, scale: .94, y: -6 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: .96, y: -4 }} transition={reduced ? { duration: 0 } : pop}>
-      <Card title="上下文" summary={<span className="compact-slot" style={{ width: `calc(${String(percent).length + 1}ch + 37px)` }}>
-        <button type="button" className={`status-chip compact-capsule${compacting || compactDone ? ' is-circle' : ''}`} disabled={compactDisabled} onClick={startCompact}
-          aria-label={`压缩上下文，当前 ${percent}%`} aria-busy={compacting} title="压缩上下文">
-          <span className="compact-icon" aria-hidden="true">
-            {compacting ? <LoaderCircle size={16} className="spinner" />
-              : compactDone ? <svg className="compact-tick" viewBox="0 0 16 16"><path d="M3.4 8.4l3.1 3.1 6.2-6.9" /></svg>
+      <Card title="上下文" summary={<span className="rotation-slot" style={{ width: `calc(${String(percent).length + 1}ch + 37px)` }}>
+        <button type="button" className={`status-chip rotation-capsule${rotating || rotationDone ? ' is-circle' : ''}`} disabled={rotationDisabled} onClick={startRotation}
+          aria-label={`轮换上下文，当前 ${percent}%`} aria-busy={rotating} title="轮换上下文">
+          <span className="rotation-icon" aria-hidden="true">
+            {rotating ? <LoaderCircle size={16} className="spinner" />
+              : rotationDone ? <svg className="rotation-tick" viewBox="0 0 16 16"><path d="M3.4 8.4l3.1 3.1 6.2-6.9" /></svg>
               : <ContextRing percent={percent} />}
           </span>
-          <span className="compact-percent">{percent}%</span>
+          <span className="rotation-percent">{percent}%</span>
         </button>
       </span>}>
         {usage && <div className="float-usage"><span className="float-note">已用 {formatTokenCount(usage.used).toLowerCase()} / {formatTokenCount(usage.capacity).toLowerCase()} token</span></div>}

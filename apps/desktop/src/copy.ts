@@ -17,7 +17,7 @@ export const factStatusText: Record<ToolStatus | TurnStatus | 'recorded', string
 export const phaseText: Record<SessionPhase, string> = {
   idle: '就绪',
   running: '正在运行',
-  compacting: '正在压缩上下文',
+  rotating: '正在轮换上下文',
   stopping: '正在停止',
 }
 
@@ -33,12 +33,12 @@ export function interruptionText(manuallyStopped: boolean): string {
   return manuallyStopped ? factStatusText.interrupted : '任务异常中断'
 }
 
-export const compactionText = {
-  running: '正在压缩上下文…',
-  completed: '上下文已压缩',
-  failed: '上下文压缩失败',
-  unfinished: '压缩未完成',
-  unchanged: '没有可压缩的内容',
+export const contextRotationText = {
+  running: '正在轮换上下文…',
+  completed: '上下文已轮换',
+  failed: '上下文轮换失败',
+  unfinished: '轮换未完成',
+  unchanged: '没有新增对话，无需轮换',
 } as const
 
 export function formatTokenCount(value: number): string {

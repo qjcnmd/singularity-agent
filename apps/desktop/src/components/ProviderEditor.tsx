@@ -140,15 +140,15 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
               <span>提供方 ID</span>
               <input className="sg-input" autoFocus value={providerId} onChange={event => setProviderId(event.target.value)} />
             </label>}
-          <label className="sg-field">
-            <span>API 密钥</span>
-            <input className="sg-input" type="password" autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} />
-          </label>
+          <label className="sg-field"><span>API 地址</span><input className="sg-input" value={baseUrl} onChange={event => setBaseUrl(event.target.value)} /></label>
           <div className="field-row">
             <label className="sg-field"><span>显示名称</span><input className="sg-input" value={name} onChange={event => setName(event.target.value)} /></label>
             <div className="sg-field"><span>API 协议</span><ProtocolPicker value={protocol} onChange={setProtocol} /></div>
           </div>
-          <label className="sg-field"><span>API 地址</span><input className="sg-input" value={baseUrl} onChange={event => setBaseUrl(event.target.value)} /></label>
+          <label className="sg-field">
+            <span>API 密钥</span>
+            <input className="sg-input" type="password" autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} />
+          </label>
             <section className="sg-model-catalog" aria-label="模型目录">
               <div className="sg-model-catalog-head">
                 <strong>模型目录</strong>

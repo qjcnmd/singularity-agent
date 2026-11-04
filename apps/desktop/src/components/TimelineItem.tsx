@@ -12,8 +12,8 @@ import { enter, pop } from '../motion'
 import { useAppStore } from '../appStore'
 import { useBodyCollapse, useSelectionGuard } from '../interactions'
 import { MarkdownBody } from '../markdown'
-import { compactionText, factStatusText, formatTokenCount } from '../copy'
-import { formatClock, compactionResultText, displayPath, firstLine, formatTurnDuration, pathFromArgs, readOutputLines, toolDisplay, toolSummary, toolArgument, type TimelineContent } from '../timeline'
+import { contextRotationText, factStatusText, formatTokenCount } from '../copy'
+import { formatClock, contextRotationResultText, displayPath, firstLine, formatTurnDuration, pathFromArgs, readOutputLines, toolDisplay, toolSummary, toolArgument, type TimelineContent } from '../timeline'
 import type { HistoryItem, SessionModelUsage, ToolStatus, UserQuestion, UserQuestionAnswer } from '../protocol'
 
 const previewLineCount = 8
@@ -87,7 +87,7 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
   }
 
   if (item.type === 'thinking') return <ReasoningRow item={item} itemKey={itemKey} onDisclosureChange={onDisclosureChange} />
-  if (item.type === 'compaction' || item.type === 'compaction_result') return <CompactionRow item={item} itemKey={itemKey} onDisclosureChange={onDisclosureChange} />
+  if (item.type === 'context_rotation' || item.type === 'context_rotation_result') return <ContextRotationRow item={item} itemKey={itemKey} onDisclosureChange={onDisclosureChange} />
 
   return <ToolCard item={item} itemKey={itemKey} cwd={cwd} userHome={userHome} sessionId={sessionId} onDisclosureChange={onDisclosureChange} />
 })
@@ -161,23 +161,23 @@ function ReasoningRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemKe
   </motion.article>
 }
 
-function CompactionRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemKey' | 'onDisclosureChange'> & { item: Extract<HistoryItem, { type: 'compaction' | 'compaction_result' }> }) {
+function ContextRotationRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemKey' | 'onDisclosureChange'> & { item: Extract<HistoryItem, { type: 'context_rotation' | 'context_rotation_result' }> }) {
   const reduced = useReducedMotion()
   const [expanded, setExpanded] = useState(false)
-  const summary = item.type === 'compaction' ? item.summary : compactionResultText(item)
-  const title = item.type === 'compaction' ? compactionText.completed : item.status === 'failed' ? compactionText.failed : summary
-  const canExpand = summary !== '' && summary !== title
+  const content = item.type === 'context_rotation' ? item.userMessages : contextRotationResultText(item)
+  const title = item.type === 'context_rotation' ? contextRotationText.completed : item.status === 'failed' ? contextRotationText.failed : content
+  const canExpand = content !== '' && content !== title
   const guard = useSelectionGuard(onDisclosureChange)
   const collapseBody = useBodyCollapse(expanded ? () => setExpanded(false) : undefined, onDisclosureChange)
-  const status = item.type === 'compaction' ? 'completed' : item.status
-  return <motion.article {...enter} transition={reduced ? { duration: 0 } : pop} className={`timeline-item activity-step timeline-compaction status-${status}`} data-item-id={itemKey}>
+  const status = item.type === 'context_rotation' ? 'completed' : item.status
+  return <motion.article {...enter} transition={reduced ? { duration: 0 } : pop} className={`timeline-item activity-step timeline-context-rotation status-${status}`} data-item-id={itemKey}>
     <button type="button" className="activity-toggle" aria-expanded={canExpand ? expanded : undefined} aria-disabled={!canExpand}
       {...guard(canExpand ? () => setExpanded(value => !value) : undefined)}>
-      <StepIcon name="compaction" status={status} />
+      <StepIcon name="context_rotation" status={status} />
       <span role="status">{title}</span>
       {canExpand && <ExpandChevron expanded={expanded} size={14} />}
     </button>
-    <Disclosure open={expanded}><div className="activity-expanded compaction-summary" {...collapseBody}><MarkdownBody text={summary} /></div></Disclosure>
+    <Disclosure open={expanded}><div className="activity-expanded context-rotation-content" {...collapseBody}><MarkdownBody text={content} /></div></Disclosure>
   </motion.article>
 }
 

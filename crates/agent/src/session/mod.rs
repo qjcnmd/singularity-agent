@@ -11,9 +11,9 @@ mod manager;
 
 use format::Result;
 
-pub use context::CompactionPrefix;
+pub use context::ContextRotationInput;
 pub use format::{
-    CompactionEntry, LedgerRecord, SessionEntry, SessionError, SessionMetadata, text_item_id,
+    ContextRotationEntry, LedgerRecord, SessionEntry, SessionError, SessionMetadata, text_item_id,
     thinking_item_id, tool_item_id,
 };
 pub use manager::{SessionData, SessionManager};

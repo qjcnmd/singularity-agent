@@ -1,5 +1,5 @@
 //! 组装模型请求：本轮的指令和工具定义，加上从会话日志生成的对话上下文。
-//! 发送、重试和保存请求记录在 crate::request_execution，普通请求和摘要请求共用。
+//! 发送、重试和保存请求记录在 crate::request_execution，普通请求和整理请求共用。
 
 use super::{Agent, AgentError, RequestContext, Result, modules};
 use crate::request_execution::{execute_request, output_budget_tokens};
@@ -18,7 +18,7 @@ pub(crate) struct RequestDefinitions {
 }
 
 impl RequestDefinitions {
-    /// 定义在本轮内不变，加载时一次计算预算，普通请求和摘要请求直接复用。
+    /// 定义在本轮内不变，加载时一次计算预算，普通请求和整理请求直接复用。
     fn new(messages: Vec<Message>, tools: Vec<singularity_core::ToolDefinition>) -> Self {
         let instructions = messages
             .iter()
@@ -90,7 +90,7 @@ impl RequestContext {
         self.definitions.as_ref().expect("definitions are loaded before model requests")
     }
 
-    /// 估算下一次请求的输入 Token 数（最近一次实际用量加上新增消息，或全量估算），供自动压缩判断使用。
+    /// 估算下一次请求的输入 Token 数（最近一次实际用量加上新增消息，或全量估算），供自动轮换判断使用。
     pub(super) fn context_pressure_tokens(&self) -> u64 {
         let writer = lock_writer(&self.session);
         context::estimated_tokens(
@@ -100,7 +100,7 @@ impl RequestContext {
         )
     }
 
-    /// 组装并发送一次普通请求；输入 Token 估算与压缩判断用同一规则。
+    /// 组装并发送一次普通请求；输入 Token 估算与轮换判断用同一规则。
     async fn request_response(
         &mut self,
         on_event: &mut (dyn FnMut(TurnEvent) + Send),
@@ -145,26 +145,26 @@ impl RequestContext {
 }
 
 impl Agent {
-    /// 生成一次模型回复：需要时先压缩，再组装并发送请求。
-    /// 提供方明确返回上下文超限时，压缩后重新组装并重发，最多一次。
+    /// 生成一次模型回复：需要时先轮换，再组装并发送请求。
+    /// 提供方明确返回上下文超限时，轮换后重新组装并重发，最多一次。
     pub(super) async fn generate_response(
         &mut self,
         on_event: &mut (dyn FnMut(TurnEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<(ModelTurnResponse, String, String)> {
-        self.requests.reduce_context_if_needed(on_event, cancellation).await?;
+        self.requests.rotate_context_if_needed(on_event, cancellation).await?;
         self.drain_inputs(on_event, cancellation).await?;
         let overflow = match self.requests.request_response(on_event, cancellation).await {
             Err(AgentError::Provider(error)) if error.is_context_overflow() => error,
             result => return result,
         };
-        if !self.requests.compact_now(on_event, cancellation).await? {
+        if !self.requests.rotate_now(on_event, cancellation).await? {
             return Err(AgentError::Provider(overflow));
         }
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        // 压缩后只重发一次，仍然超限时直接把错误返回给调用方。
+        // 轮换后只重发一次，仍然超限时直接把错误返回给调用方。
         self.drain_inputs(on_event, cancellation).await?;
         self.requests.request_response(on_event, cancellation).await
     }

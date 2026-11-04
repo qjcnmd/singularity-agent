@@ -101,7 +101,7 @@ pub struct QueuedInput {
 #[derive(Debug, Clone)]
 pub enum QueuedInputKind {
     User(UserInput),
-    Background { task_id: String, status: String },
+    Background { task_id: String },
 }
 
 impl QueuedInput {
@@ -113,10 +113,10 @@ impl QueuedInput {
         }
     }
 
-    /// 完成通知只带命令 ID 和最终状态，输出由模型按需用 task_output 读取。
-    pub fn background(task_id: String, status: String) -> Self {
+    /// 队列只保存命令 ID；交给模型时从后台管理器取未读输出与终态。
+    pub fn background(task_id: String) -> Self {
         Self {
-            input: QueuedInputKind::Background { task_id, status },
+            input: QueuedInputKind::Background { task_id },
             message_id: crate::session::new_entry_id(),
         }
     }

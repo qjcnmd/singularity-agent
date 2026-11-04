@@ -8,11 +8,11 @@ use super::ConversationError;
 
 struct CancelState {
     accepting: bool,
-    compacting: bool,
+    rotating: bool,
     user_stopped: bool,
 }
 
-/// 一次操作（回合或独立压缩）的提问和停止控制；输入队列和写者由任务持有。
+/// 一次操作（回合或独立轮换）的提问和停止控制；输入队列和写者由任务持有。
 pub(crate) struct TurnControls {
     pub(crate) turn_id: String,
     cancellation: CancellationToken,
@@ -27,19 +27,19 @@ impl TurnControls {
             cancellation: CancellationToken::new(),
             cancel_state: Mutex::new(CancelState {
                 accepting: true,
-                compacting: false,
+                rotating: false,
                 user_stopped: false,
             }),
             questions: Arc::new(singularity_agent::agent::UserQuestions::default()),
         }
     }
 
-    pub(crate) fn set_compacting(&self, active: bool) {
-        self.cancel_state.lock().expect("cancel window lock poisoned").compacting = active;
+    pub(crate) fn set_rotating(&self, active: bool) {
+        self.cancel_state.lock().expect("cancel window lock poisoned").rotating = active;
     }
 
-    pub(crate) fn is_compacting(&self) -> bool {
-        self.cancel_state.lock().expect("cancel window lock poisoned").compacting
+    pub(crate) fn is_rotating(&self) -> bool {
+        self.cancel_state.lock().expect("cancel window lock poisoned").rotating
     }
 
     pub(crate) fn cancellation(&self) -> &CancellationToken {
@@ -89,7 +89,7 @@ impl ConversationState {
     }
 }
 
-/// 回合与独立压缩共用同一种控制；压缩标记区分两者的显示阶段。
+/// 回合与独立轮换共用同一种控制；轮换标记区分两者的显示阶段。
 pub(super) enum TurnLifecycle {
     Idle,
     Running(Arc<TurnControls>),
@@ -100,12 +100,12 @@ impl TurnLifecycle {
         !matches!(self, Self::Idle)
     }
 
-    /// 运行阶段由当前操作的停止和压缩标记决定，前端直接显示。
+    /// 运行阶段由当前操作的停止和轮换标记决定，前端直接显示。
     pub(super) fn phase(&self) -> SessionPhase {
         match self {
             Self::Idle => SessionPhase::Idle,
             Self::Running(controls) if controls.cancellation().is_cancelled() => SessionPhase::Stopping,
-            Self::Running(controls) if controls.is_compacting() => SessionPhase::Compacting,
+            Self::Running(controls) if controls.is_rotating() => SessionPhase::Rotating,
             Self::Running(_) => SessionPhase::Running,
         }
     }

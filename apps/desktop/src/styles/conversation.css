@@ -52,7 +52,7 @@
 .activity-expanded { padding: 0 14px 11px; min-width: 0; }
 .activity-shimmer { background: linear-gradient(90deg, var(--ink-faint) 0%, var(--ink) 40%, var(--ink-faint) 80%) 0 0 / 200% 100%; background-clip: text; -webkit-background-clip: text; color: transparent; animation: shimmer 1.6s linear infinite; }
 .return-to-latest { position: absolute; left: calc(50% - var(--panel-space) / 2); bottom: calc(var(--composer-height, 150px) + 8px); z-index: 3; width: 36px; height: 36px; margin-left: -18px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 50%; background: color-mix(in srgb, var(--glass-base) 92%, transparent); box-shadow: var(--shadow-soft); color: var(--ink-soft); cursor: pointer; backdrop-filter: blur(10px); }
-.stream-char { animation: stream-in 420ms ease-out both; }
+.stream-char { animation: stream-in ease-out both; }
 @keyframes stream-in { from { opacity: 0; } }
 .typing-bubble { display: flex; gap: 5px; padding: 13px 16px; }
 @media (prefers-reduced-motion: reduce) { .stream-char, .activity-shimmer { animation: none; } }
@@ -159,7 +159,7 @@
 .tool-duration { margin: 0 0 6px 2px; color: var(--ink-faint); line-height: 1.6; font-variant-numeric: tabular-nums; font-size: var(--meta-font-size); }
 .activity-output:has(.command-output) { background: var(--surface-muted); border: 0; }
 .command-output-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 10px 0 14px; color: var(--ink-faint); font: var(--block-font-size) var(--font-sans); }
-.command-output pre { white-space: pre; }
+.command-output pre { white-space: pre; overflow: visible; }
 .timeline-body.activity-output :is(code, pre) { font: inherit; }
-.compaction-summary { color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.6; }
-.expand-button { border-radius: 6px; color: inherit; background: none; font-size: var(--block-font-size); padding: 0; margin-top: 4px; opacity: .8; }
+.context-rotation-content { color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.6; }
+.expand-button { border: 0; border-radius: 6px; color: inherit; background: none; font-size: var(--block-font-size); padding: 0; margin-top: 4px; opacity: .8; cursor: pointer; }

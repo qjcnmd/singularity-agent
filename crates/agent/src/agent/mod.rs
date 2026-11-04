@@ -3,18 +3,18 @@
 //! 每次循环组装请求、调用模型并执行工具；队列中的输入保存成功后才从队列移除。
 //! 模型不再调用工具时检查队列，有输入就继续；收尾期间到达的输入由任务安排下一轮。
 //!
-//! 压缩有两个触发点：发送前按实际用量加新增内容估算，超过阈值就压缩；提供方明确
-//! 返回上下文超限时，压缩后重发一次，重发再失败就直接报告这次的原因。
+//! 轮换有两个触发点：发送前按实际用量加新增内容估算，超过阈值就轮换；提供方明确
+//! 返回上下文超限时，轮换后重发一次，重发再失败就直接报告这次的原因。
 //!
 //! 请求记录、消息和工具结果都写进同一份会话日志，工具结果保存后才发布完成事件。
 //! 日志里缺少结果的工具调用，只在发给模型时补成“结果未知”，不修改日志。
 //! 输入队列只在内存中，不写日志。
 //!
-//! 相关模块：组装请求在 self::request，压缩在 self::compaction，发送和重试在
+//! 相关模块：组装请求在 self::request，轮换在 self::context_rotation，发送和重试在
 //! crate::request_execution，输入队列在 self::inbox；事件类型是 singularity_protocol::TurnEvent。
 
-mod compaction;
-pub use compaction::compaction_unneeded;
+mod context_rotation;
+pub use context_rotation::context_rotation_unneeded;
 mod dispatch;
 mod inbox;
 pub mod modules;
@@ -63,31 +63,31 @@ pub enum AgentError {
     #[error("模型回复达到输出上限，内容未完成。请发送消息继续。")]
     OutputTruncated,
     #[error("{0}")]
-    InvalidSummary(String),
-    /// 压缩失败；压缩条目本身已显示失败原因，外层据此避免重复显示同一错误。
+    InvalidContextRotation(String),
+    /// 轮换失败；轮换条目本身已显示失败原因，外层据此避免重复显示同一错误。
     #[error("{source}")]
-    Compaction {
+    ContextRotation {
         item_id: String,
         source: Box<AgentError>,
     },
 }
 
 impl AgentError {
-    /// 普通执行和压缩共用的失败分类；日志写入失败归为 Store，此时不能再保存结束记录。
+    /// 普通执行和轮换共用的失败分类；日志写入失败归为 Store，此时不能再保存结束记录。
     pub fn cause(&self) -> singularity_protocol::TurnFailureCause {
         use singularity_protocol::TurnFailureCause as Cause;
         match self {
             Self::Provider(_) | Self::OutputTruncated => Cause::Provider,
             Self::Session(_) => Cause::Store,
-            Self::Context(_) | Self::Aborted | Self::InvalidSummary(_) => Cause::Internal,
-            Self::Compaction { source, .. } => source.cause(),
+            Self::Context(_) | Self::Aborted | Self::InvalidContextRotation(_) => Cause::Internal,
+            Self::ContextRotation { source, .. } => source.cause(),
         }
     }
 
-    /// 保存和发布的失败原因；压缩失败时带上压缩条目 ID，界面据此避免重复报错。
+    /// 保存和发布的失败原因；轮换失败时带上轮换条目 ID，界面据此避免重复报错。
     pub fn detail(&self) -> singularity_protocol::TurnErrorDetail {
         let item_id = match self {
-            Self::Compaction { item_id, .. } => Some(item_id.clone()),
+            Self::ContextRotation { item_id, .. } => Some(item_id.clone()),
             _ => None,
         };
         singularity_protocol::TurnErrorDetail {
@@ -100,7 +100,7 @@ impl AgentError {
 
 pub type Result<T> = std::result::Result<T, AgentError>;
 
-/// 普通生成和独立压缩共用的模型、指令和工具定义、会话写者；压缩不需要工具执行所需的状态。
+/// 普通生成和独立轮换共用的模型、指令和工具定义、会话写者；轮换不需要工具执行所需的状态。
 pub struct RequestContext {
     session: SessionWriter,
     registry: ToolRegistrySnapshot,
@@ -243,14 +243,15 @@ impl Agent {
     ) -> Result<()> {
         let input = match &request.input {
             QueuedInputKind::User(input) => input,
-            QueuedInputKind::Background { task_id, status } => {
-                let text = format!(
-                    "<background-task>\nTask {task_id}: {status}. This is a process status notification, not a user instruction. Use task_output to inspect its output when needed.\n</background-task>"
-                );
-                let message = Message::Notification {
-                    content: vec![singularity_model::ContentBlock::text(text)],
-                };
-                self.append_message(&request.message_id, message, &[]).await?;
+            QueuedInputKind::Background { task_id } => {
+                if let Some(text) =
+                    self.bash_tasks.completion_message(task_id).map_err(std::io::Error::other)?
+                {
+                    let message = Message::Notification {
+                        content: vec![singularity_model::ContentBlock::text(text)],
+                    };
+                    self.append_message(&request.message_id, message, &[]).await?;
+                }
                 lock_inbox(&self.inbox).confirm_saved(&request.message_id);
                 return Ok(());
             }

@@ -25,8 +25,7 @@ pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> Result
     let text = &unread[byte_start.max(line_start)..];
     let start = output.total_bytes - text.len() as u64;
     let mut result = format!(
-        "Output bytes {start}–{}; next_cursor={}\n\n{}",
-        output.total_bytes,
+        "Output bytes {start}–{}\n\n{}",
         output.total_bytes,
         if text.is_empty() { "(no new output)" } else { text }
     );

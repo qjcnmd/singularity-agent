@@ -72,7 +72,7 @@ pub(crate) enum PreparedTool {
     Question(super::question::QuestionArgs),
     Bash(bash::BashArgs),
     TaskList(bash::TaskListArgs),
-    TaskOutput(bash::TaskOutputArgs),
+    TaskOutput(bash::TaskIdArgs),
     TaskStop(bash::TaskIdArgs),
     Mcp(singularity_mcp::McpTool, serde_json::Map<String, Value>),
 }
@@ -95,9 +95,7 @@ impl PreparedTool {
             Self::Mcp(tool, args) => super::mcp::execute(tool, args, output_directory, &signal).await,
             Self::Bash(args) => bash_tasks.execute(args, cwd, output_directory, signal, on_update).await,
             Self::TaskList(_) => bash_tasks.tool_list(),
-            Self::TaskOutput(args) => {
-                bash_tasks.output(&args.task_id, args.cursor, args.wait_ms, &signal).await
-            }
+            Self::TaskOutput(args) => bash_tasks.output(&args.task_id, &signal),
             Self::TaskStop(args) => bash_tasks.stop(&args.task_id).await.unwrap_or_else(error_result),
             Self::Read(args) => tokio::task::spawn_blocking(move || read::execute(&args, &cwd, &signal))
                 .await
@@ -136,9 +134,7 @@ pub(crate) fn task_tools() -> Vec<BuiltinTool> {
     vec![
         (bash::task_list_spec(), |args| deserialize_args_or_error(args).map(PreparedTool::TaskList)),
         (bash::task_output_spec(), |args| {
-            deserialize_args_or_error::<bash::TaskOutputArgs>(args)?
-                .validate()
-                .map(PreparedTool::TaskOutput)
+            deserialize_args_or_error(args).map(PreparedTool::TaskOutput)
         }),
         (bash::task_stop_spec(), |args| deserialize_args_or_error(args).map(PreparedTool::TaskStop)),
     ]

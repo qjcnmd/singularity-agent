@@ -3,13 +3,13 @@ import { Fluid } from './fluid'
 import { Bubbles } from './bubbles'
 
 /* 水球发送键（来自用户提供的 singularity-water-orb 原型）：
- * 平时是解析出来的起伏海面；压缩时球壁转动，水改由 LiquidFun 粒子重建并翻滚；结束后平息再回落到新水位。
+ * 平时是解析出来的起伏海面；轮换时球壁转动，水改由 LiquidFun 粒子重建并翻滚；结束后平息再回落到新水位。
  * 球上不画箭头，点击即发送，运行中点击即停止。 */
 
 export type WaterOrbProps = {
   /** 上下文占用，按高度映射，0–100。 */
   percent: number
-  compacting: boolean
+  rotating: boolean
   enabled: boolean
   size: number
   label: string
@@ -22,11 +22,12 @@ const resolution = 200
 const clamp = (value: number) => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0))
 const hexToRgb = (hex: string): [number, number, number] => { const n = parseInt(hex.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255] }
 
-export function WaterOrb({ percent, compacting, enabled, size, label, color, onPress }: WaterOrbProps) {
+export function WaterOrb({ percent, rotating, enabled, size, label, color, onPress }: WaterOrbProps) {
   const canvas = useRef<HTMLCanvasElement>(null)
+  const repaintStill = useRef<(() => void) | null>(null)
   // 每帧读最新属性，不触发 React 重渲染
-  const latest = useRef({ occupancy: clamp(percent / 100), compacting, color: hexToRgb(color) })
-  latest.current = { occupancy: clamp(percent / 100), compacting, color: hexToRgb(color) }
+  const latest = useRef({ occupancy: clamp(percent / 100), rotating, color: hexToRgb(color) })
+  latest.current = { occupancy: clamp(percent / 100), rotating, color: hexToRgb(color) }
 
   useEffect(() => {
     const element = canvas.current!
@@ -46,6 +47,7 @@ export function WaterOrb({ percent, compacting, enabled, size, label, color, onP
     const field = new Float32Array(resolution * resolution)
     const physicalField = new Float32Array(resolution * resolution)
     const blurred = new Float32Array(resolution * resolution)
+    const surfaceHeights = new Float64Array(resolution)
     const splatRadius = 6.8
 
     const splat = (x0: number, y0: number, destination: Float32Array) => {
@@ -67,22 +69,22 @@ export function WaterOrb({ percent, compacting, enabled, size, label, color, onP
       const still = reduced.matches
       if (still) { level = target.occupancy; requestedLevel = level; agitation = 0 }
       t += still ? 0 : dt
-      if (!target.compacting) requestedLevel = target.occupancy
+      if (!target.rotating) requestedLevel = target.occupancy
       // 翻滚平息后才回落水位，不跳到新水位
-      if (!target.compacting && agitation < .18) {
+      if (!target.rotating && agitation < .18) {
         level += (requestedLevel - level) * (1 - Math.exp(-dt * 3))
         if (Math.abs(requestedLevel - level) < .003) {
           level = requestedLevel
           if (Math.abs(lastFill - level) > .002) { fluid.fill(level); lastFill = level }
         }
       }
-      agitation = still ? 0 : agitation + ((target.compacting ? 1 : 0) - agitation) * (1 - Math.exp(-dt * (target.compacting ? 3 : 1.8)))
+      agitation = still ? 0 : agitation + ((target.rotating ? 1 : 0) - agitation) * (1 - Math.exp(-dt * (target.rotating ? 3 : 1.8)))
       const fluidBlend = Math.min(1, agitation * 2)
-      // 只在压缩翻滚时跑物理；平时水面是解析波浪，省掉这部分开销
-      if (!still && (target.compacting || agitation > .01)) {
+      // 只在轮换翻滚时跑物理；平时水面是解析波浪，省掉这部分开销
+      if (!still && (target.rotating || agitation > .01)) {
         accumulator += dt
         let steps = 0
-        while (accumulator >= 1 / 120 && steps < 6) { fluid.step(1 / 120, target.compacting); accumulator -= 1 / 120; steps++ }
+        while (accumulator >= 1 / 120 && steps < 6) { fluid.step(1 / 120, target.rotating); accumulator -= 1 / 120; steps++ }
       } else accumulator = 0
 
       c.setTransform(dpr, 0, 0, dpr, 0, 0)
@@ -123,10 +125,12 @@ export function WaterOrb({ percent, compacting, enabled, size, label, color, onP
       const data = pixels.data
       const [red, green, blue] = target.color
       const threshold = .7 - agitation * .2
+      // 同一列的水面高度相同，一帧只计算一次；保留双精度以保持原来的像素结果。
+      for (let x = 0; x < resolution; x++) surfaceHeights[x] = surface(x / resolution * 2 - 1)
       for (let y = 0; y < resolution; y++) for (let x = 0; x < resolution; x++) {
         const index = y * resolution + x, k = index * 4
-        const nx = x / resolution * 2 - 1, ny = y / resolution * 2 - 1
-        const sea = Math.max(0, Math.min(4, (ny - surface(nx)) / .016 + 1))
+        const ny = y / resolution * 2 - 1
+        const sea = Math.max(0, Math.min(4, (ny - surfaceHeights[x]) / .016 + 1))
         const value = sea * (1 - fluidBlend) + field[index] * fluidBlend
         data[k] = red; data[k + 1] = green; data[k + 2] = blue
         data[k + 3] = Math.round(Math.max(0, Math.min(1, (value - threshold) * 7)) * 216)
@@ -158,7 +162,7 @@ export function WaterOrb({ percent, compacting, enabled, size, label, color, onP
         c.lineTo(1.1, 1.1); c.closePath(); c.clip()
       }
       // 水位回落期间不画气泡
-      const showBubbles = target.compacting || level <= requestedLevel + .003
+      const showBubbles = target.rotating || level <= requestedLevel + .003
       for (const bubble of showBubbles ? bubbles.items : []) {
         const alpha = bubble.state === 'popping' ? Math.max(0, 1 - bubble.pop / .22) : Math.min(1, bubble.age / .18)
         c.globalAlpha = alpha
@@ -191,7 +195,7 @@ export function WaterOrb({ percent, compacting, enabled, size, label, color, onP
       c.restore()
       c.beginPath(); c.arc(0, 0, .99, 0, TAU)
       c.strokeStyle = 'rgba(159,210,255,.30)'; c.lineWidth = .013; c.stroke()
-      frame = requestAnimationFrame(draw)
+      if (!still) frame = requestAnimationFrame(draw)
     }
     // 窗口隐藏时停下，回来后接着画
     const resume = () => {
@@ -200,9 +204,19 @@ export function WaterOrb({ percent, compacting, enabled, size, label, color, onP
       if (!document.hidden) frame = requestAnimationFrame(draw)
     }
     resume()
+    repaintStill.current = () => { if (reduced.matches) resume() }
     document.addEventListener('visibilitychange', resume)
-    return () => { cancelAnimationFrame(frame); document.removeEventListener('visibilitychange', resume); fluid.dispose() }
+    reduced.addEventListener('change', resume)
+    return () => {
+      cancelAnimationFrame(frame)
+      document.removeEventListener('visibilitychange', resume)
+      reduced.removeEventListener('change', resume)
+      repaintStill.current = null
+      fluid.dispose()
+    }
   }, [size])
+
+  useEffect(() => { repaintStill.current?.() }, [percent, color])
 
   return <button type="button" className="water-orb" style={{ width: size, height: size }} aria-label={label} aria-disabled={!enabled}
     onClick={() => { if (enabled) onPress?.() }}>

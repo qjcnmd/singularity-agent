@@ -94,7 +94,9 @@ async fn dispatch(
             blocking(move || app.answer_question(&params.session_id, &params.item_id, params.answers)).await
         }
         RpcRequest::SessionAbort(params) => blocking(move || app.abort(&params.session_id)).await,
-        RpcRequest::SessionCompact(params) => blocking(move || app.compact(&params.session_id)).await,
+        RpcRequest::SessionRotateContext(params) => {
+            blocking(move || app.rotate_context(&params.session_id)).await
+        }
         RpcRequest::SessionUpdateSettings(params) => {
             blocking(move || app.update_settings(&params.session_id, &params.selection)).await
         }

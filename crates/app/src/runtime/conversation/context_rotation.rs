@@ -1,18 +1,18 @@
 use super::*;
-use singularity_agent::agent::{AgentError, compaction_unneeded};
-use singularity_agent::session::CompactionPrefix;
+use singularity_agent::agent::{AgentError, context_rotation_unneeded};
+use singularity_agent::session::ContextRotationInput;
 use singularity_protocol::{TurnErrorDetail, TurnStatus};
 
 impl Conversation {
-    /// 独立压缩复用会话写者和本次操作的停止控制。
-    pub(crate) async fn compact_thread(
+    /// 独立轮换复用会话写者和本次操作的停止控制。
+    pub(crate) async fn rotate_context_thread(
         self: &Arc<Self>,
         controls: &TurnControls,
         sink: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<TurnStatus, TurnErrorDetail> {
-        let Some(prefix) = CompactionPrefix::select(&self.writer).await else {
+        let Some(input) = ContextRotationInput::select(&self.writer).await else {
             controls.finish_cancel();
-            return match compaction_unneeded(sink, controls.cancellation()) {
+            return match context_rotation_unneeded(sink, controls.cancellation()) {
                 Ok(_) => Ok(TurnStatus::Completed),
                 Err(_) => Ok(TurnStatus::Interrupted),
             };
@@ -20,7 +20,7 @@ impl Conversation {
         let conversation = Arc::clone(self);
         let prepared = tokio::task::spawn_blocking(move || conversation.prepare_request_context())
             .await
-            .expect("compaction preparation completes while the runtime is running");
+            .expect("context_rotation preparation completes while the runtime is running");
         let mut requests = match prepared {
             Ok(requests) => requests,
             Err(error) => {
@@ -32,7 +32,7 @@ impl Conversation {
             }
         };
         let result = requests
-            .compact_selected(prefix, sink, controls.cancellation(), || !controls.finish_cancel())
+            .rotate_selected(input, sink, controls.cancellation(), || !controls.finish_cancel())
             .await;
         controls.finish_cancel();
         match result {

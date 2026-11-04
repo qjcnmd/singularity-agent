@@ -12,7 +12,7 @@ export function selectedSessionPhase(state: Pick<SyncState, 'session' | 'liveSes
 /**
  * 侧栏显示的任务状态：运行中时显示当前阶段，空闲时只看最近一个**回合**的结果。
  *
- * 独立压缩的结果只显示在对话区的那一行，不改变任务状态；压缩失败或中断不会把
+ * 独立轮换的结果只显示在对话区的那一行，不改变任务状态；轮换失败或中断不会把
  * 已完成的任务标成失败。
  */
 export function sessionState(session: ThreadSummary, live: LiveSessionState | undefined) {

@@ -70,9 +70,9 @@ impl AppServer {
         conversation.inspect_context(shutdown.child_token()).await.map_err(internal_error)
     }
 
-    pub fn compact(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {
+    pub fn rotate_context(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {
         let _lifecycle = self.lock_lifecycle();
-        self.open_action_conversation(session_id)?.compact().map_err(conversation_error)
+        self.open_action_conversation(session_id)?.rotate_context().map_err(conversation_error)
     }
 
     /// 保存任务展示名称；活动执行继续使用当前写者。

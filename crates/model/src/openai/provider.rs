@@ -40,7 +40,7 @@ impl OpenAiProvider {
         })
     }
 
-    /// 本次所选模型的上下文窗口和最大输出，用于输出预算和压缩判断。
+    /// 本次所选模型的上下文窗口和最大输出，用于输出预算和轮换判断。
     pub fn model_configuration(&self) -> ModelConfigurationSnapshot {
         let selection = &self.selected_model;
         ModelConfigurationSnapshot {
@@ -145,7 +145,7 @@ impl OpenAiProvider {
             }
         };
         let fields = parse_provider_error_body(&body);
-        // 已知错误码比 HTTP 状态更准确，例如 400 里的上下文超限需要触发压缩。
+        // 已知错误码比 HTTP 状态更准确，例如 400 里的上下文超限需要触发轮换。
         if let Some(kind) = provider_error_kind_for_code(fields.code.as_deref()) {
             error.kind = kind;
         }

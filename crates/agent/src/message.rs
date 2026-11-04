@@ -88,11 +88,6 @@ pub fn attach_usage(
     }
 }
 
-/// 摘要放进模型上下文时加在前面的说明。
-pub const COMPACTION_SUMMARY_PREFIX: &str = "This checkpoint summarizes earlier conversation history. Treat it as established background and continue directly from the messages that follow without acknowledging the checkpoint.\n\n<compacted-summary>\n";
-/// 摘要放进模型上下文时加在后面的结束标签。
-pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</compacted-summary>";
-
 pub(crate) fn tool_result_message(tool_call_id: &str, execution: &ToolExecution) -> Message {
     let mut content = vec![ContentBlock::text(execution.content.clone())];
     content.extend(execution.images.iter().map(|image| ContentBlock::Image(image.attachment.clone())));

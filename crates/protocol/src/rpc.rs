@@ -184,7 +184,7 @@ rpc_methods! {
     SessionSubmit => "session.submit" (SessionTextParams) -> (),
     SessionAnswerQuestion => "session.answerQuestion" (crate::QuestionAnswerParams) -> (),
     SessionAbort => "session.abort" (SessionParams) -> (),
-    SessionCompact => "session.compact" (SessionParams) -> (),
+    SessionRotateContext => "session.rotateContext" (SessionParams) -> (),
     SessionContext => "session.context" (SessionParams) -> (),
     BackgroundTaskStop => "session.stopBackgroundTask" (BackgroundTaskParams) -> (),
     SessionUpdateSettings => "session.updateSettings" (UpdateSettingsParams) -> (),

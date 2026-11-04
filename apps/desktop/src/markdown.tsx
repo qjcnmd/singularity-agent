@@ -2,7 +2,7 @@
  * 正文渲染：Markdown（GFM、数学公式）、流式文本平滑揭示与代码块高亮。
  */
 
-import { createContext, useContext, Children, isValidElement, memo, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { createContext, useContext, Children, isValidElement, memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { useReducedMotion } from 'motion/react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -101,12 +101,33 @@ function InlineCode({ children, className }: { children?: ReactNode; className?:
 }
 
 const Streaming = createContext(false)
+const streamFadeMs = 420
+const streamCharacterStyle = { animationDuration: `${streamFadeMs}ms` }
+
+function StreamingText({ text }: { text: string }) {
+  const latest = useRef(text)
+  latest.current = text
+  const [settled, setSettled] = useState('')
+  const prefix = text.startsWith(settled) ? settled : ''
+  const pending = prefix.length < text.length
+  useEffect(() => {
+    if (!pending) return
+    // 每批至少显示完整的渐显时长；后续文字到达不会重置这一批的计时。
+    const batch = latest.current
+    const timer = setTimeout(() => setSettled(batch), streamFadeMs)
+    return () => clearTimeout(timer)
+  }, [settled, pending])
+  const offset = Array.from(prefix).length
+  return <>{prefix}{Array.from(text.slice(prefix.length)).map((character, index) =>
+    <span className="stream-char" style={streamCharacterStyle} key={offset + index}>{character}</span>)}</>
+}
+
 function StreamText({ children }: { children?: ReactNode }) {
   const streaming = useContext(Streaming)
   const reduced = useReducedMotion()
   if (!streaming || reduced) return children
   return Children.map(children, child => typeof child === 'string'
-    ? Array.from(child).map((character, index) => <span className="stream-char" key={index}>{character}</span>)
+    ? <StreamingText text={child} />
     : child)
 }
 const markdownComponents: Components = {

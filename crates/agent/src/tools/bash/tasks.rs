@@ -30,6 +30,12 @@ struct Entry {
     done: watch::Sender<Option<Result<(), CompletionError>>>,
 }
 
+#[derive(Default)]
+struct OutputDelivery {
+    end: u64,
+    terminal: bool,
+}
+
 enum CompletionError {
     Cleanup(String),
     Store(String),
@@ -46,6 +52,7 @@ impl CompletionError {
 /// 一个会话的后台命令查询与进程所有权；成功收尾后释放内存条目，不接管历史 PID。
 pub struct BashTasks {
     entries: Mutex<BTreeMap<String, Arc<Entry>>>,
+    delivered: Mutex<BTreeMap<String, OutputDelivery>>,
     on_update: Arc<dyn Fn(BashTaskUpdate) + Send + Sync>,
     writer: crate::session::SessionWriter,
     inbox: crate::agent::SteeringInboxHandle,
@@ -60,6 +67,7 @@ impl BashTasks {
     ) -> Arc<Self> {
         Arc::new(Self {
             entries: Mutex::new(BTreeMap::new()),
+            delivered: Mutex::new(BTreeMap::new()),
             on_update,
             writer,
             inbox,
@@ -113,34 +121,43 @@ impl BashTasks {
         result
     }
 
-    /// 从显式游标读取模型正文；等待与读取不消费输出，也不取消后台命令。
-    pub(crate) async fn output(
-        &self,
-        task_id: &str,
-        cursor: u64,
-        wait_ms: u64,
-        signal: &CancellationToken,
-    ) -> ToolExecution {
-        if let Some(entry) = self.entry(task_id) {
-            let mut done = entry.done.subscribe();
-            if wait_ms > 0 && done.borrow().is_none() {
-                tokio::select! {
-                    biased;
-                    _ = signal.cancelled() => return error_result(ABORTED_MESSAGE),
-                    _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {},
-                    _ = wait_done(&mut done) => {},
-                }
-            }
-            if let Some(Err(error)) = &*done.borrow() {
-                return error_result(error.message());
-            }
-        }
+    /// 主动查看立即返回新增输出；完成通知共用读取位置，界面查询不消费它。
+    pub(crate) fn output(&self, task_id: &str, signal: &CancellationToken) -> ToolExecution {
         if signal.is_cancelled() {
             return error_result(ABORTED_MESSAGE);
         }
-        self.task(task_id)
-            .map(|task| task_result(&task, Some(cursor), true))
+        if let Some(entry) = self.entry(task_id)
+            && let Some(Err(error)) = &*entry.done.borrow()
+        {
+            return error_result(error.message());
+        }
+        self.take_output(task_id, false)
+            .map(|result| result.expect("explicit reads always return status"))
             .unwrap_or_else(error_result)
+    }
+
+    /// 到交付时才取输出，避免已排队的通知与后续主动读取重复携带正文。
+    pub(crate) fn completion_message(&self, task_id: &str) -> Result<Option<String>, String> {
+        self.take_output(task_id, true).map(|result| result.map(|result| result.content))
+    }
+
+    fn take_output(&self, task_id: &str, notification: bool) -> Result<Option<ToolExecution>, String> {
+        let mut delivered = self.delivered.lock().expect("bash output delivery lock");
+        let task = self.task(task_id)?;
+        let position = delivered.entry(task_id.to_owned()).or_default();
+        if notification && position.terminal {
+            return Ok(None);
+        }
+        let mut result = task_result(&task, Some(position.end), true);
+        if notification {
+            result.content = format!(
+                "<background-task>\nCommand: {}\n{}\n</background-task>",
+                task.command, result.content
+            );
+        }
+        position.end = task.model_output.total_bytes;
+        position.terminal = !task.state.is_running();
+        Ok(Some(result))
     }
 
     /// 取消后台命令并等待回收、保存终态；操作成功后返回命令结果。
@@ -214,6 +231,7 @@ impl BashTasks {
         if signal.is_cancelled() {
             return process.finish(Outcome::Stopped).await.0;
         }
+        process.persist_output();
         let task = BackgroundTask {
             task_id: Uuid::now_v7().to_string(),
             command: args.command,
@@ -247,19 +265,23 @@ impl BashTasks {
         if let Err(error) = started {
             return process.finish(Outcome::Failed(error.to_string())).await.0;
         }
-        let result = task_result(&task, Some(0), false);
         (self.on_update)(BashTaskUpdate::Updated(task));
         // 保存开始记录期间可能已经收到停止；这时等进程回收、最终状态保存后再返回。
         if signal.is_cancelled() || entry.cancel.is_cancelled() {
             entry.cancel.cancel();
             self.clone().run_background(entry.clone(), process).await;
             let mut result = self
-                .task(&task_id)
-                .map(|task| task_result(&task, Some(0), false))
+                .take_output(&task_id, false)
+                .map(|result| result.expect("cancelled command returns its output"))
                 .unwrap_or_else(error_result);
             result.is_error = true;
             return result;
         }
+        let mut result = self
+            .take_output(&task_id, false)
+            .expect("background command was registered")
+            .expect("initial output is returned");
+        result.content.push_str("\n\nThe command continues in the background. Completion will deliver its status and new output automatically. Continue independent work; if nothing can proceed, give a brief status message and finish this response; you will resume when it finishes. Do not poll, sleep, or repeatedly read its log to wait. Use task_output only when current output helps you act now.");
         let manager = self.clone();
         tokio::spawn(async move {
             manager.run_background(entry, process).await;
@@ -317,19 +339,15 @@ impl BashTasks {
         };
         match saved {
             Ok(_) => {
-                let status = match &task.state {
-                    BackgroundTaskState::Exited { exit_code, .. } => {
-                        Some(format!("exited with code {exit_code}"))
-                    }
-                    BackgroundTaskState::Failed { message, .. } => Some(format!("failed: {message}")),
-                    _ => None,
-                };
                 // 先把完成通知放进输入队列，再标记命令结束，避免 `has_work` 在两者之间误判为空闲。
-                if let Some(status) = status {
+                if matches!(
+                    task.state,
+                    BackgroundTaskState::Exited { .. } | BackgroundTaskState::Failed { .. }
+                ) {
                     self.inbox
                         .lock()
                         .expect("turn inbox lock poisoned")
-                        .enqueue(crate::agent::QueuedInput::background(task.task_id.clone(), status));
+                        .enqueue(crate::agent::QueuedInput::background(task.task_id.clone()));
                 }
                 *entry.task.lock().expect("bash task lock") = task.clone();
                 (self.on_update)(BashTaskUpdate::Updated(task));

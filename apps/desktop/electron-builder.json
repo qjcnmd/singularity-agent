@@ -18,6 +18,7 @@
     }
   ],
   "win": {
+    "electronLanguages": ["zh-CN", "en-US"],
     "target": [
       "dir"
     ],

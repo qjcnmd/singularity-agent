@@ -23,7 +23,7 @@ function ComposerView({ accent }: { accent: string }) {
   const attachmentInput = useAttachmentInput(images => { if (draftKey !== null) appStore.setImages(draftKey, images, true) },
     paths => { if (draftKey !== null) appStore.setFiles(draftKey, paths, true) }, inputDisabled || !!pendingQuestion)
   const phase = selectedSessionPhase(state)
-  const busy = phase === 'running' || phase === 'compacting' || phase === 'stopping'
+  const busy = phase === 'running' || phase === 'rotating' || phase === 'stopping'
   const [caret, setCaret] = useState(draft.length)
   const trigger = pendingQuestion ? null : inputTrigger(draft, caret)
   const skills = useSkillCandidates(trigger !== null, state)
@@ -92,7 +92,7 @@ function ComposerView({ accent }: { accent: string }) {
     return () => observer.disconnect()
   }, [])
   const showsStop = busy && (pendingQuestion || (draft.trim() === '' && imageDraft.length === 0 && fileDraft.length === 0))
-  const orb = <WaterOrb size={40} color={accent} percent={occupancy?.percent ?? 0} compacting={phase === 'compacting'}
+  const orb = <WaterOrb size={40} color={accent} percent={occupancy?.percent ?? 0} rotating={phase === 'rotating'}
     enabled={showsStop ? phase !== 'stopping' && !state.pendingActions.has(pendingKey('session.abort', sessionOrigin)) : canSubmit}
     label={showsStop ? phase === 'stopping' ? '正在停止当前回合' : '停止当前回合' : blockedReason ?? '发送消息'}
     onPress={() => { if (showsStop) void appStore.stopActive(); else void appStore.submitDraft() }} />

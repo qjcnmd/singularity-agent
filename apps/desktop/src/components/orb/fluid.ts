@@ -3,7 +3,7 @@ import factory from 'liquidfun-wasm/dist/es/Box2D.js'
 import wasmUrl from 'liquidfun-wasm/dist/es/Box2D.wasm?url&inline'
 
 /* 水球里的水：用未修改的 LiquidFun（Box2D 流体分支）WASM 做粒子水，这里只是适配层。
- * 压缩时转动球壁带动水翻滚；重力固定向下，不旋转重力场。 */
+ * 轮换时转动球壁带动水翻滚；重力固定向下，不旋转重力场。 */
 
 let engine: typeof Box2D & EmscriptenModule
 

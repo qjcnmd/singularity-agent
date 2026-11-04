@@ -1,4 +1,4 @@
-//! 用户输入、独立压缩和后台续跑共用的启动、收尾与关闭流程。
+//! 用户输入、独立轮换和后台续跑共用的启动、收尾与关闭流程。
 use super::*;
 use singularity_protocol::{SessionFailure, SessionOperation, StreamEvent, TurnStatus};
 
@@ -13,7 +13,7 @@ impl Conversation {
         }
         let start = match state.turn.phase() {
             SessionPhase::Idle => true,
-            SessionPhase::Running | SessionPhase::Compacting => false,
+            SessionPhase::Running | SessionPhase::Rotating => false,
             SessionPhase::Stopping => return Err(ConversationError::Busy),
         };
         let mut inbox = state.steering_inbox.lock().expect("turn inbox lock poisoned");
@@ -28,14 +28,14 @@ impl Conversation {
         Ok(Some(self.begin_operation(&mut view, state, SessionOperation::Turn)))
     }
 
-    /// 空闲时占用任务执行独立压缩；压缩标记让运行阶段显示为“压缩中”。
-    fn reserve_compaction(self: &Arc<Self>) -> Result<Operation, ConversationError> {
+    /// 空闲时占用任务执行独立轮换；轮换标记让运行阶段显示为“轮换中”。
+    fn reserve_context_rotation(self: &Arc<Self>) -> Result<Operation, ConversationError> {
         let mut view = self.lock_view();
         let state = self.lock_state();
         if state.closing || state.turn.is_busy() {
             return Err(ConversationError::Busy);
         }
-        Ok(self.begin_operation(&mut view, state, SessionOperation::Compaction))
+        Ok(self.begin_operation(&mut view, state, SessionOperation::ContextRotation))
     }
 
     // 三个入口都已在状态锁内检查允许启动；占用任务、清理上次显示状态和发布由这里一起完成。
@@ -46,7 +46,7 @@ impl Conversation {
         source: SessionOperation,
     ) -> Operation {
         let controls = Arc::new(TurnControls::new(uuid::Uuid::new_v4().to_string()));
-        controls.set_compacting(source == SessionOperation::Compaction);
+        controls.set_rotating(source == SessionOperation::ContextRotation);
         if let Some(preview) = &state.context_preview {
             preview.cancel();
         }
@@ -61,7 +61,9 @@ impl Conversation {
         let mut emit = |event| self.on_event(event);
         let result = match operation.source {
             SessionOperation::Turn => self.run_single_turn(&operation.controls, &mut emit).await,
-            SessionOperation::Compaction => self.compact_thread(&operation.controls, &mut emit).await,
+            SessionOperation::ContextRotation => {
+                self.rotate_context_thread(&operation.controls, &mut emit).await
+            }
         };
         self.settle(operation.source, result);
     }
@@ -93,9 +95,9 @@ impl Conversation {
         }
         Ok(())
     }
-    /// 开始独立压缩。
-    pub fn compact(self: &Arc<Self>) -> Result<(), ConversationError> {
-        self.spawn_operation(self.reserve_compaction()?);
+    /// 开始独立轮换。
+    pub fn rotate_context(self: &Arc<Self>) -> Result<(), ConversationError> {
+        self.spawn_operation(self.reserve_context_rotation()?);
         Ok(())
     }
     pub(super) fn spawn_operation(self: &Arc<Self>, mut operation: Operation) {
@@ -128,7 +130,7 @@ impl Conversation {
             match self.phase() {
                 SessionPhase::Idle if self.lock_state().context_preview.is_none() => break,
                 SessionPhase::Idle => {}
-                SessionPhase::Running | SessionPhase::Compacting => {
+                SessionPhase::Running | SessionPhase::Rotating => {
                     let _ = self.abort();
                 }
                 SessionPhase::Stopping => {}

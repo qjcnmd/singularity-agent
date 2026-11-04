@@ -64,18 +64,18 @@ impl Conversation {
                 TurnEvent::ItemUpdated { ref item }
                     if matches!(
                         item,
-                        singularity_protocol::HistoryItem::Compaction { .. }
-                            | singularity_protocol::HistoryItem::CompactionResult { .. }
+                        singularity_protocol::HistoryItem::ContextRotation { .. }
+                            | singularity_protocol::HistoryItem::ContextRotationResult { .. }
                     ) =>
                 {
                     let active = matches!(
                         item,
-                        singularity_protocol::HistoryItem::CompactionResult {
+                        singularity_protocol::HistoryItem::ContextRotationResult {
                             status: TurnStatus::Running,
                             ..
                         }
                     );
-                    controls.set_compacting(active);
+                    controls.set_rotating(active);
                     sink(event);
                     sink(TurnEvent::SessionStateChanged {});
                 }
@@ -155,7 +155,7 @@ impl Conversation {
         Ok((agent, started_at, context_window))
     }
 
-    /// 普通回合与独立压缩共用的准备步骤；每次都重新读取模型配置和项目指令。
+    /// 普通回合与独立轮换共用的准备步骤；每次都重新读取模型配置和项目指令。
     /// 回合开始前查看上下文：本次启动已加载过就沿用，否则按回合开始时的规则加载一次，
     /// 结果和回合加载时一样通过 context/loaded 发布。
     pub async fn inspect_context(

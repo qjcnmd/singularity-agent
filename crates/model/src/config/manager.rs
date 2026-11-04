@@ -11,7 +11,7 @@ use singularity_protocol::{
 
 use super::*;
 
-/// 本轮模型的上下文窗口和最大输出，每轮开始时确定，用于压缩判断和输出预算。
+/// 本轮模型的上下文窗口和最大输出，每轮开始时确定，用于轮换判断和输出预算。
 /// 修改设置只影响之后的回合。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelConfigurationSnapshot {
