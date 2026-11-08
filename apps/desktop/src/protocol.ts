@@ -1,7 +1,6 @@
 import type * as Wire from './protocol.generated'
 export type * from './protocol.generated'
 
-/** 渲染进程与后端管道的连接状态。 */
 export type ConnectionStatus = 'connecting' | 'ready' | 'recovering'
 
 export type RpcMethod = keyof Wire.RpcContract

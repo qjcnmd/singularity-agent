@@ -150,7 +150,6 @@ pub enum HistoryItem {
 }
 
 impl HistoryItem {
-    /// 返回条目的唯一标识。
     pub fn id(&self) -> &str {
         match self {
             Self::Message { id, .. }

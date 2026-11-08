@@ -11,7 +11,7 @@
 
 @keyframes fade-in { from { opacity: 0; } }
 
-.context-menu { z-index: 100; min-width: 160px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow: auto; padding: 5px; border: 1px solid var(--line-strong); border-radius: 12px; animation: menu-enter var(--spring-dur) var(--spring); }
+.context-menu { z-index: 100; min-width: 160px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow: auto; padding: 5px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--raised); box-shadow: var(--shadow-floating); animation: menu-enter var(--spring-dur) var(--spring); }
 .context-menu button { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; text-align: left; background: transparent; color: var(--ink); border-radius: 7px; font-size: 13.5px; cursor: pointer; }
 .context-menu button:hover, .context-menu button:focus-visible { background: var(--selected); }
 /* 原生 Popover 的触发按钮就是定位锚点；8px 外边距保留窗口边缘空间。 */
@@ -34,7 +34,6 @@
 .expand-chevron.is-open { transform: rotate(90deg); }
 .sg-trigger .expand-chevron, .protocol-trigger .expand-chevron { transform: rotate(90deg); }
 .sg-trigger .expand-chevron.is-open, .protocol-trigger .expand-chevron.is-open { transform: rotate(270deg); }
-/* 下拉浮层显隐动画 */
 .picker-disclosure {
   display: none;
   opacity: 0;
@@ -59,14 +58,10 @@
 @keyframes menu-enter { from { opacity: 0; transform: translateY(-4px) scale(.96); } to { opacity: 1; transform: none; } }
 
 @media (prefers-reduced-motion: reduce) {
-  /* 响应系统的减少动态效果偏好 */
   .activity-step, .reasoning-summary, .content-disclosure, .content-disclosure > div, .picker-disclosure, .expand-chevron, .protocol-dropdown { transition: none !important; }
   .context-menu, .context-menu > button { animation: none; }
 }
 
-/* 浮动面板毛玻璃效果 */
-.context-menu { background: var(--raised); box-shadow: var(--shadow-floating); }
-/* 代码高亮配色（引用 Shiki 生成的 CSS 变量） */
 .code-token { color: var(--shiki-light); }
 [data-theme=dark] .code-token { color: var(--shiki-dark); }
 

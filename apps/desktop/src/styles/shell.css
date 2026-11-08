@@ -1,5 +1,3 @@
-/* 工作台：侧栏、会话与顶栏运行状态小面板。 */
-
 .resize-separator { position: relative; z-index: 4; flex: none; width: 0; cursor: col-resize; outline: none; }
 .resize-separator::before { content: ""; position: absolute; inset: 0 -4px; }
 .resize-separator::after { content: ""; position: absolute; top: 0; bottom: 0; left: -1px; width: 2px; background: transparent; transition: background 150ms; }
@@ -19,7 +17,6 @@
 
 @keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
 
-/* ---------- 按钮 ---------- */
 :is(.secondary-button, .primary-button, .danger-button) { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 34px; padding: 0 14px; border: 0; border-radius: 10px; background: var(--surface-muted); font-weight: 400; font-size: 13.5px; cursor: pointer; white-space: nowrap; transition: background 120ms, transform var(--spring-dur) var(--spring), opacity 120ms; }
 :is(.secondary-button, .primary-button, .danger-button):hover:not(:disabled) { background: var(--button-hover); }
 :is(.secondary-button, .primary-button, .danger-button):active:not(:disabled) { transform: scale(.96); transition-duration: 80ms; }
@@ -127,7 +124,6 @@
 }
 /* 圆环调色盘：弹出层本身透明，外观和动画在里面的 surface 上 */
 .color-popover { position: fixed; inset: auto; margin: 0; padding: 0; border: 0; background: transparent; box-shadow: none; backdrop-filter: none; overflow: visible; }
-/* 只有一圈球，没有底板 */
 .color-popover-surface { padding: 4px; }
 .color-wheel { position: relative; }
 /* 柔和淡彩玻璃球：浅色的水装满，同色细边是球壳，左上一点高光 */

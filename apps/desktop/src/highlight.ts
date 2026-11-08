@@ -22,7 +22,6 @@ const LANGUAGE_ALIASES: Record<string, LanguageId> = {
   js: 'javascript', jsx: 'javascript', ts: 'typescript', rs: 'rust', md: 'markdown', sh: 'bash',
 }
 
-/** 将代码块标记或扩展名映射为支持的语言 ID，不支持的语言返回 `'text'`。 */
 function languageIdFor(language: string): LanguageId | 'text' {
   const name = language.trim().split(/\s+/)[0].toLowerCase()
   if (Object.hasOwn(LANGUAGE_LOADERS, name)) return name as LanguageId
@@ -94,7 +93,7 @@ export function useCodeTokens(code: string, language: string) {
   return useMemo(() => {
     if (loaded === null || loaded.language !== lang) return null
     try { return tokenize(loaded.highlighter, code, lang) }
-    catch { return null } // 分词失败时回退为纯文本展示。
+    catch { return null }
   }, [loaded, code, lang])
 }
 

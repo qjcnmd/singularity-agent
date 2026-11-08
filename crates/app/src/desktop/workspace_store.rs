@@ -50,12 +50,10 @@ impl WorkspaceStore {
         Ok(Self { path, state: Mutex::new(state) })
     }
 
-    /// 返回当前登记的独立快照。
     pub fn list(&self) -> Vec<Workspace> {
         self.lock().workspaces.clone()
     }
 
-    /// 按目录查找已登记的项目。
     pub fn find(&self, workspace_root: &str) -> Option<Workspace> {
         self.lock()
             .workspaces
@@ -112,6 +110,6 @@ impl WorkspaceStore {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RegistryFile> {
-        self.state.lock().expect("workspace registry lock poisoned (fail-stop)")
+        self.state.lock().expect("workspace registry lock poisoned")
     }
 }

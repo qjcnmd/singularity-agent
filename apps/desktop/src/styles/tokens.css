@@ -1,4 +1,3 @@
-/* 全局颜色、圆角、阴影、字体与动效 CSS 变量 */
 :root {
   interpolate-size: allow-keywords;
   --smooth-dur: 320ms;

@@ -20,7 +20,6 @@ pub struct ModelConfigurationSnapshot {
 }
 
 impl ModelConfigurationSnapshot {
-    /// 转为 `u64` 的上下文窗口容量，供 Token 预算计算使用。
     pub fn context_window(&self) -> u64 {
         u64::from(self.max_context_tokens)
     }
@@ -84,7 +83,6 @@ impl ModelConfigManager {
         Self { directory, access: Mutex::new(()) }
     }
 
-    /// 读取配置并生成不含密钥的目录。
     pub fn redacted_catalog(&self) -> RedactedModelCatalog {
         let _access = self.lock();
         match read_user_config_file(&self.directory) {

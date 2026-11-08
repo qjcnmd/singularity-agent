@@ -12,7 +12,6 @@ use uuid::Uuid;
 
 use crate::runtime::history::{index_turn_history, session_usage, summarize_thread};
 
-/// 数据目录内保存会话文件的子目录名。
 pub const SESSIONS_DIR_NAME: &str = "sessions";
 
 /// `sessions/` 目录下的会话文件；不持有写者，写入由打开它的 Conversation 负责。
@@ -117,7 +116,6 @@ impl ThreadCatalog {
     }
 }
 
-/// 任务对应的会话文件路径。
 pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
     sessions_dir.join(singularity_agent::session::session_file_name(thread_id))
 }
@@ -131,7 +129,6 @@ fn open_thread_read_only(sessions_dir: &Path, thread_id: &str) -> Result<Session
     Ok(session)
 }
 
-/// 查找、打开或删除会话文件时的错误。
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     #[error("thread {0} was not found")]

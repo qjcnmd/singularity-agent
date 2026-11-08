@@ -49,7 +49,6 @@ pub(crate) fn openai_chat_stream_request_payload(
     payload
 }
 
-/// 按模型配置的 ThinkingWireFormat 写入思考开关字段。
 fn apply_thinking_wire(payload: &mut Value, enabled: bool, wire_format: ThinkingWireFormat) {
     match wire_format {
         ThinkingWireFormat::ThinkingType => {

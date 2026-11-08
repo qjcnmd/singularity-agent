@@ -37,7 +37,6 @@ pub fn load_agent_instructions(cwd: &Path, home: &Path) -> Result<Vec<Instructio
     Ok(files)
 }
 
-/// 一份实际加载的指令文件。
 #[derive(Debug, Clone)]
 pub struct InstructionFile {
     pub path: PathBuf,
@@ -47,7 +46,6 @@ pub struct InstructionFile {
 
 /// 返回 workspace root 到 cwd 之间需要检查指令的目录，两端都包含。
 fn instruction_directories(workspace_root: &Path, cwd: &Path) -> Vec<PathBuf> {
-    // workspace root 是 cwd 的祖先，strip_prefix 会成功。
     let depth = cwd
         .strip_prefix(workspace_root)
         .expect("cwd 必在 workspace root 之下")

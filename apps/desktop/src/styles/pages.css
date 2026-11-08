@@ -7,7 +7,6 @@ textarea.input { resize: vertical; line-height: 1.5; font-family: var(--font-san
 
 
 
-/* 侧栏入口打开的管理页：自定义指令、Skills、MCP */
 /* 入场位移和异步内容会短暂改变溢出状态，固定滚动条占位以免居中页面横跳。 */
 .manage-scroll { flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; width: 100%; }
 .manage-page { width: 100%; max-width: 860px; margin: 0 auto; padding: 72px 36px 40px; }

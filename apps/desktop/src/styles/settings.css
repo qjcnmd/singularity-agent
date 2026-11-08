@@ -4,7 +4,7 @@
 .confirm-modal { width: 420px; }
 
 
-/* 设置弹窗：单页滚动，外观和模型各一组；组是白底细边框的圆角块，组内一行一项 */
+/* 设置弹窗：单页滚动，外观和模型各一组 */
 dialog.sg-settings-modal { width: min(640px, calc(100vw - 48px)); max-height: min(720px, calc(100vh - 48px)); display: flex; flex-direction: column; }
 dialog.sg-settings-modal[open] { display: flex; }
 .sg-settings-content { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 24px 24px; }
@@ -22,7 +22,7 @@ dialog.sg-settings-modal[open] { display: flex; }
 .stepper { display: flex; align-items: center; gap: 6px; color: var(--ink-faint); }
 .stepper .input { width: 64px; text-align: center; }
 
-/* MCP 页的服务器卡片和添加按钮 */
+/* 模型提供方与 MCP 服务器共用的卡片和编辑列表 */
 .sg-provider-list { display: grid; gap: 8px; }
 .sg-add-card-btn { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; height: 44px; margin-top: 10px; border: 1px solid var(--line); border-radius: 12px; background: transparent; color: var(--ink-soft); font-weight: 400; cursor: pointer; transition: border-color 120ms, color 120ms, background 120ms; }
 .sg-add-card-btn:hover:not(:disabled) { background: var(--fill-subtle); color: var(--ink); }

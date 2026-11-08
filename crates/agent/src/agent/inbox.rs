@@ -105,7 +105,6 @@ pub enum QueuedInputKind {
 }
 
 impl QueuedInput {
-    /// 接受输入时分配消息 ID。
     pub fn new(input: UserInput) -> Self {
         Self {
             input: QueuedInputKind::User(input),
@@ -152,7 +151,6 @@ impl SteeringInbox {
         self.entries.push_back(request);
     }
 
-    /// 还没保存的输入，按接受顺序排列。
     pub fn pending(&self) -> &VecDeque<QueuedInput> {
         &self.entries
     }

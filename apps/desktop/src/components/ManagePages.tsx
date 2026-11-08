@@ -129,7 +129,6 @@ function SkillsList({ root }: { root: string | null }) {
   </PageFrame>
 }
 
-/** 点开在右侧文件栏查看 SKILL.md，篇幅再长也不用滚回顶部收起。 */
 function SkillCard({ skill, workspaceRoot }: { skill: SkillMetadata; workspaceRoot: string }) {
   return <button type="button" className="skill-card" onClick={() => appStore.openFile(skill.path, workspaceRoot, skill.name)}>
     <strong>{skill.name}</strong><span>{skill.description}</span>

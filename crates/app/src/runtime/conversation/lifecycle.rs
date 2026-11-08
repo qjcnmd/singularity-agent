@@ -95,7 +95,6 @@ impl Conversation {
         }
         Ok(())
     }
-    /// 开始独立轮换。
     pub fn rotate_context(self: &Arc<Self>) -> Result<(), ConversationError> {
         self.spawn_operation(self.reserve_context_rotation()?);
         Ok(())
@@ -152,7 +151,6 @@ impl Conversation {
         state.closing = true;
         Ok(DeleteGuard { conversation: Some(Arc::clone(self)) })
     }
-    /// 是否已关闭新操作入口。
     pub fn is_deleting(&self) -> bool {
         self.lock_state().closing
     }

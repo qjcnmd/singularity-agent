@@ -22,7 +22,6 @@ pub(crate) fn parse_tool_arguments(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
-/// 解析上游返回的 Token 用量（输入、输出、总数与缓存命中）。
 pub(crate) fn parse_usage(
     usage: Option<&Value>,
     input_field: &str,

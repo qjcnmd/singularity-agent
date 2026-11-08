@@ -37,7 +37,6 @@ pub struct ToolDisplay {
 }
 
 impl ToolExecution {
-    /// 构造成功的纯文本结果。
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
@@ -216,7 +215,6 @@ impl ToolRegistrySnapshot {
     }
 }
 
-/// 构造工具失败结果。
 pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
     let mut execution = ToolExecution::text(message);
     execution.is_error = true;

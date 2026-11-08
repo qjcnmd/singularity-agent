@@ -1,7 +1,6 @@
 import Anser from 'anser'
 import { CopyButton } from './CopyButton'
 
-/** Bash 调用与后台命令共用命令和 ANSI 输出显示。 */
 export function CommandOutput({ command, output }: { command: string; output: string }) {
   return <div className="command-output">
     <div className="command-output-header"><span>Bash</span><CopyButton text={output ? `${command}\n\n${output}` : command} label="复制命令与输出" /></div>

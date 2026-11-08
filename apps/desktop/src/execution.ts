@@ -29,7 +29,6 @@ function replaceMessage(turn: ThreadTurn, messageId: string, completed: HistoryI
   items.splice(position < 0 ? items.length : position, 0, ...completed)
   return { ...turn, items }
 }
-/** 把回合事件增量合并到已有的回合列表中。 */
 export function acceptExecutionEvent(facts: ThreadTurn[], event: TurnEventEnvelope): ThreadTurn[] {
   if (event.method === 'context/loaded') return facts
   const id = event.turnId ?? facts.at(-1)?.turnId

@@ -46,7 +46,6 @@ export function useBodyCollapse(collapse: (() => void) | undefined, beforeCollap
   }
 }
 
-/** 原生按钮打开 Popover 后，设置各选择器的首次焦点。 */
 export function usePopoverFocus(
   open: boolean,
   container: RefObject<HTMLElement | null>,
@@ -57,7 +56,6 @@ export function usePopoverFocus(
   }, [open, container, initialFocus])
 }
 
-/** 筛选容器内当前可见、未禁用且未被 `inert`/`aria-hidden` 隐藏的可聚焦元素。 */
 export function focusableElements(root: HTMLElement): HTMLElement[] {
   return [...root.querySelectorAll<HTMLElement>('button, input, select, textarea, summary, a[href], [tabindex]')]
     .filter(node => !node.matches(':disabled, [tabindex="-1"]') && !node.closest('[inert], [aria-hidden="true"]') && node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden')

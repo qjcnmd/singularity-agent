@@ -23,7 +23,6 @@ pub fn estimate_tokens_of(text: &str) -> u64 {
     (text.encode_utf16().count() as u64).div_ceil(4)
 }
 
-/// 将 Duration 转换为毫秒数，溢出时封顶 u64::MAX。
 pub fn duration_millis(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -59,7 +58,6 @@ pub fn display_path(path: &std::path::Path) -> String {
     }
 }
 
-/// 递归创建目录，失败时在错误中附带目录路径。
 pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(path).map_err(|error| format!("failed to create {}: {error}", path.display()))
 }

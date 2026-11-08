@@ -155,7 +155,6 @@ impl Conversation {
         Ok((agent, started_at, context_window))
     }
 
-    /// 普通回合与独立轮换共用的准备步骤；每次都重新读取模型配置和项目指令。
     /// 回合开始前查看上下文：本次启动已加载过就沿用，否则按回合开始时的规则加载一次，
     /// 结果和回合加载时一样通过 context/loaded 发布。
     pub async fn inspect_context(
@@ -194,7 +193,7 @@ impl Conversation {
         self.changed.notify_waiters();
         result
     }
-
+    /// 普通回合与独立轮换共用的准备步骤；每次都重新读取模型配置和项目指令。
     pub(super) fn prepare_request_context(&self) -> Result<RequestContext, TurnErrorDetail> {
         let provider = OpenAiProvider::new(&self.models, &self.model()).map_err(preparation_error)?;
         let instruction_home = self.home.clone();

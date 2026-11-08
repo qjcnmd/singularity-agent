@@ -23,13 +23,13 @@
 | 模块 | 职责 | 源码入口 |
 | --- | --- | --- |
 | Electron 主进程与 preload | 窗口、托盘、原生对话框；隔离渲染进程与后端通信 | [main.ts](../apps/desktop/desktop/main.ts)、[preload.cts](../apps/desktop/desktop/preload.cts)、[backend.ts](../apps/desktop/desktop/backend.ts) |
-| React 工作台 | 用户输入、草稿、任务显示和界面状态 | [app.tsx](../apps/desktop/src/app.tsx)、[sessionStore.ts](../apps/desktop/src/sessionStore.ts) |
+| React 工作台 | 用户输入、草稿、任务显示和界面状态 | [app.tsx](../apps/desktop/src/app.tsx)、[appStore.ts](../apps/desktop/src/appStore.ts)、[sessionStore.ts](../apps/desktop/src/sessionStore.ts) |
 | `app` | 组装后端、stdio RPC、项目与任务目录、发布事件 | [app_server.rs](../crates/app/src/desktop/app_server.rs)、[transport.rs](../crates/app/src/desktop/transport.rs) |
 | `app::runtime` | 任务的执行、停止、排队输入和历史读取 | [conversation.rs](../crates/app/src/runtime/conversation.rs)、[turn.rs](../crates/app/src/runtime/conversation/turn.rs)、[lifecycle.rs](../crates/app/src/runtime/conversation/lifecycle.rs)、[view.rs](../crates/app/src/runtime/conversation/view.rs)、[thread_catalog.rs](../crates/app/src/runtime/thread_catalog.rs) |
 | `agent` | 模型与工具循环、组装上下文、轮换、写会话日志 | [agent/mod.rs](../crates/agent/src/agent/mod.rs)、[session/mod.rs](../crates/agent/src/session/mod.rs) |
 | `model` | 模型配置、Chat / Responses 编解码、HTTP / SSE 传输 | [config/manager.rs](../crates/model/src/config/manager.rs)、[openai/provider.rs](../crates/model/src/openai/provider.rs)、[transport/http.rs](../crates/model/src/transport/http.rs) |
 | `mcp` | MCP 配置、按项目目录复用连接、发现和调用工具 | [lib.rs](../crates/mcp/src/lib.rs)、[client.rs](../crates/mcp/src/client.rs) |
-| `core` | 数据目录、原子写文件、项目指令、技能发现及全文加载 | [user_home.rs](../crates/core/src/user_home.rs)、[project_instructions.rs](../crates/core/src/project_instructions.rs)、[skills.rs](../crates/core/src/skills.rs) |
+| `core` | 数据目录、工作目录规范化、原子写文件、工具定义与 Token 估算、项目指令、技能发现及全文加载 | [lib.rs](../crates/core/src/lib.rs)、[user_home.rs](../crates/core/src/user_home.rs)、[workspace.rs](../crates/core/src/workspace.rs)、[tool.rs](../crates/core/src/tool.rs)、[project_instructions.rs](../crates/core/src/project_instructions.rs)、[skills.rs](../crates/core/src/skills.rs) |
 | `protocol` | RPC 参数、结果、事件和 TypeScript 类型导出 | [rpc.rs](../crates/protocol/src/rpc.rs)、[params.rs](../crates/protocol/src/params.rs) |
 
 工作台通过 `app` 内的会话模块调用 `agent`。`model::Message` 同时用于模型回复、日志里保存的消息和下一次请求；Chat 和 Responses 在发送时才各自编码，公开历史只取可显示的部分。
@@ -44,12 +44,12 @@ Agent 通过 `TurnEvent` 通知后端，后端再发布显示内容或运行快�
 | `instructions.read` | workspaceRoot 为 null 时读取全局 AGENTS.md，否则读取项目根目录 AGENTS.md；返回 path 和 content，文件不存在时正文为空 |
 | `instructions.save` | 同目录唯一临时文件写入后原子替换目标；失败清理本次临时文件并返回原错误，成功直接返回目标路径和本次写入的原文；下一轮开始时生效 |
 | `file.read` | 文件栏读取一个文本文件：路径可为绝对、`~/` 开头或相对任务工作目录；超过 2 MB、二进制或非 UTF-8 时返回原因 |
-| `SkillMetadata.path` | 技能列表中展示实际入口路径 |
+| `SkillMetadata.path` | 点击技能项时在右侧文件栏打开对应的 `SKILL.md` 并展示路径 |
 | `HistoryItem.message.at` | 消息保存时间，显示用户发送时间及助手完成时间 |
 | `HistoryItem.message.stats` | 截至这条回复的会话累计用量（`SessionModelUsage`），只附在助手消息最后一段正文。读取历史时按日志顺序累计到这条消息；实时事件在 ProviderAttempt 累计后、发布 message/finished 时附上当时的累计，两者结果相同 |
 | `ThreadTurn.firstTokenAt` | 历史首 token 时间；实时界面在收到第一个非空增量时记录本地时间 |
 
-管理页由 `ManagePages.tsx` 调用现有 RPC 客户端；`SessionStore.page` 维护当前页面。打开管理页会更新选择序号，仍在提交的消息完成后不会把用户拉回会话。MCP 配置组件移到管理页，连接状态查询、编辑和操作忙碌状态由 `McpSettings.tsx` 自己维护；离页卸载时作废旧请求并停止轮询。
+管理页由 `ManagePages.tsx` 调用现有 RPC 客户端；`SessionStore` 维护当前页面 `page`，由 `AppStore.setPage` 切换。打开管理页会更新选择序号，仍在提交的消息完成后不会把用户拉回会话。MCP 配置组件移到管理页，连接状态查询、编辑和操作忙碌状态由 `McpSettings.tsx` 自己维护；离页卸载时作废旧请求并停止轮询。
 
 `TimelineItem.tsx` 用每条消息的 stats 计算平均 TTFT、平均速度、总 token 和缓存比例。后台 bash 的工具结果包含 taskId，卡片据此查对应后台任务，随命令从运行变为结束、停止或失败。阅读位置继续由 `viewportAnchors` 保存，贴底动画和展开暂停由 `Conversation.tsx` 管理。
 
@@ -220,11 +220,11 @@ RPC 在一张方法匹配表中分发；文件读写进入阻塞工作线程，�
 
 未提交的问答按任务和问题保存在 `SessionStore` 内存中，切换任务时保留，提交成功或后端确认问题结束后清除；刷新页面后需要重新填写。
 
-文件标签统一目录末尾斜杠，以规范化的绝对路径为键，同一文件的相对路径、绝对路径和不同斜杠写法共用一个标签。
+文件标签统一目录末尾斜杠，解析为规范化的小写 `file:///` URL 作为键，同一文件的相对路径、绝对路径和不同斜杠写法共用一个标签。
 
 导航、输入候选、模型与项目选择、发送和复制等纯控件禁止选字，点击直接执行；正文内的链接、图表和可折叠内容检查拖选，防止复制文字时触发展开、收起或跳转。Skill 候选使用技能目录条目，输入前缀筛选本次目录；切换任务、项目、关闭技能输入或进入等待回答时作废未完成的读取结果；候选请求、显隐、键盘处理和 ARIA 共用同一启用条件。
 
-任务菜单、模型、协议和气泡调色盘浮层共用原生 Popover 的显隐、层叠和关闭行为。CSS 根据触发按钮定位，随滚动和尺寸变化更新；组件只处理选择、焦点和方向键操作。调色盘的弹出和选中动画用 motion，和消息出现共用同一套弹簧。具体位置和间距见[工作台交互](desktop-ui.md#弹窗与浮层)。
+任务菜单、模型、协议和气泡调色盘浮层共用原生 Popover 的显隐、层叠和关闭行为：任务菜单和协议下拉通过 CSS 锚点跟随触发按钮定位；模型浮层在展开时按触发按钮计算固定位置，打开期间切换模型导致按钮宽度变化时不移动；气泡调色盘按右键指针坐标定位。项目选择菜单使用 CSS 锚点定位与 `Disclosure` 展开过渡。组件只处理选择、焦点和方向键操作。调色盘的弹出和选中动画用 motion，和消息出现共用同一套弹簧。具体位置和间距见[工作台交互](desktop-ui.md#弹窗与浮层)。
 
 ## MCP
 
@@ -234,7 +234,7 @@ RPC 在一张方法匹配表中分发；文件读写进入阻塞工作线程，�
 
 MCP 图片直接把 Base64 内容交给图片入口解码，按实际字节识别格式，与上传和文件读取共用图片检查与保存；不先拼成 data URL 再拆开。图片损坏时保留工具返回的文字，并将该工具结果标为错误。
 
-列表读取、保存、开关和删除都一次返回完整配置、当前项目的已有连接状态和最近发现的工具，界面不逐个查询服务器。读取不会启动服务或查询远端；页面挂载时每次读取结束后等一秒再批量刷新，任务新建立的连接也会更新到页面；组件自己的忙碌状态暂停轮询并禁用保存、取消等操作，离页卸载时作废旧请求并停止计时。读取失败停止自动刷新并显示原因，可点击“重新读取”恢复；保存失败保留表单。只有失败状态显示“重试连接”，通过独立的 `mcp.reconnect` 重建当前项目的连接并发现工具，连接失败随服务器状态返回。
+列表读取、保存和删除都一次返回完整配置、当前项目的已有连接状态和最近发现的工具，界面不逐个查询服务器。读取不会启动服务或查询远端；页面挂载时每次读取结束后等一秒再批量刷新，任务新建立的连接也会更新到页面；组件自己的忙碌状态暂停轮询并禁用保存、取消等操作，离页卸载时作废旧请求并停止计时。读取失败停止自动刷新并显示原因，可点击“重新读取”恢复；保存失败保留表单。只有失败状态显示“重试连接”，通过独立的 `mcp.reconnect` 重建当前项目的连接并发现工具，连接失败随服务器状态返回。
 
 本地服务器放在 Windows Job Object 里，关闭句柄时终止整棵进程树，后端异常退出也会回收。
 
@@ -285,7 +285,7 @@ MCP 图片直接把 Base64 内容交给图片入口解码，按实际字节识�
 | 会话格式、追加写入与末尾修复 | [format.rs](../crates/agent/src/session/format.rs)、[manager.rs](../crates/agent/src/session/manager.rs)、[file.rs](../crates/agent/src/session/file.rs) |
 | 历史、时间线与用量显示 | [history.rs](../crates/app/src/runtime/history.rs)、[activity.rs](../crates/app/src/runtime/conversation/activity.rs)、[timeline.ts](../apps/desktop/src/timeline.ts)、[TimelineItem.tsx](../apps/desktop/src/components/TimelineItem.tsx) |
 | 水球发送与停止 | [WaterOrb.tsx](../apps/desktop/src/components/orb/WaterOrb.tsx)、[fluid.ts](../apps/desktop/src/components/orb/fluid.ts)、[bubbles.ts](../apps/desktop/src/components/orb/bubbles.ts)；LiquidFun WASM 内联字节加载 |
-| 管理页与运行状态 | [ManagePages.tsx](../apps/desktop/src/components/ManagePages.tsx) 读写指令和技能；[RunPanel.tsx](../apps/desktop/src/components/RunPanel.tsx) 显示上下文和后台命令 |
+| 管理页与运行状态 | [ManagePages.tsx](../apps/desktop/src/components/ManagePages.tsx) 读写指令和技能，[McpSettings.tsx](../apps/desktop/src/components/McpSettings.tsx) 管理 MCP；[RunPanel.tsx](../apps/desktop/src/components/RunPanel.tsx) 与 [ContextPanel.tsx](../apps/desktop/src/components/ContextPanel.tsx) 显示上下文和后台命令 |
 
 运行流程变化时更新 `architecture.html`；职责、状态维护者或源码入口变化时更新本文。
 

@@ -1,7 +1,3 @@
-/**
- * 正文渲染：Markdown（GFM、数学公式）、流式文本平滑揭示与代码块高亮。
- */
-
 import { createContext, useContext, Children, isValidElement, memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { useReducedMotion } from 'motion/react'
 import ReactMarkdown, { type Components } from 'react-markdown'

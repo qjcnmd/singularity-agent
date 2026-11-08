@@ -4,7 +4,6 @@ import { palette, type PaletteColor } from '../bubbleColors'
 import { pop } from '../motion'
 
 const size = 84
-/** 球心所在圆的半径。 */
 const ring = 30
 const ball = 18
 

@@ -7,7 +7,6 @@ const hasDraft = (draft: Draft | undefined) => draft !== undefined && (draft.tex
 
 export type DraftSnapshot = Readonly<Record<string, Draft>>
 
-/** 管理各任务的输入草稿（文字、图片、附件和未启动任务的模型选择），同步到 IndexedDB。 */
 export class DraftStore {
   private snapshot: DraftSnapshot | null = null
   private loading: Promise<DraftSnapshot> | null = null
@@ -99,7 +98,6 @@ async function loadDrafts(): Promise<Record<string, Draft>> {
   request.onsuccess = () => {
     const cursor = request.result
     if (!cursor) return
-    // 加入附件之前保存的草稿没有 files 字段。
     result[String(cursor.key)] = { ...cursor.value as Draft, files: (cursor.value as Partial<Draft>).files ?? [] }
     cursor.continue()
   }

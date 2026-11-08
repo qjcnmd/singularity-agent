@@ -29,7 +29,6 @@ impl CanonicalWorkspacePath {
         Self { native, display, comparison_key }
     }
 
-    /// 文件系统调用使用的原生路径。
     pub fn as_path(&self) -> &Path {
         &self.native
     }
@@ -53,7 +52,6 @@ impl PartialEq for CanonicalWorkspacePath {
 
 impl Eq for CanonicalWorkspacePath {}
 
-/// 已保存展示路径的忽略大小写比较键。
 pub fn saved_path_key(path: &str) -> String {
     path.to_lowercase()
 }

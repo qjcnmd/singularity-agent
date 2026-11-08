@@ -9,7 +9,7 @@ let engine: typeof Box2D & EmscriptenModule
 
 /** 应用启动时调用一次，加载完成后才能创建 Fluid。 */
 export async function initFluid() {
-  // 内联字节使 Electron 的 file:// 页面无需发出 fetch，也无需放宽 connect-src。
+  // 内联 WASM 字节，避免在 CSP connect-src 'none' 下发起 fetch。
   const wasmBinary = Uint8Array.from(atob(wasmUrl.slice(wasmUrl.indexOf(',') + 1)), character => character.charCodeAt(0))
   engine = await factory({ wasmBinary: wasmBinary.buffer })
 }

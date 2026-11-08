@@ -2,7 +2,6 @@ use super::*;
 use crate::provider::contract::finalize_provider_response;
 use crate::types::ModelUsage;
 
-/// 读取并解码一次 Chat 流式响应。
 pub(crate) async fn read_chat_sse_stream(
     cancellation: &CancellationToken,
     response: reqwest::Response,

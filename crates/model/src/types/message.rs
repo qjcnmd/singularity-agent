@@ -76,7 +76,6 @@ pub enum Message {
 }
 
 impl Message {
-    /// 按保存顺序读取消息内容。
     pub fn content(&self) -> &[ContentBlock] {
         match self {
             Self::Developer { content }
@@ -95,7 +94,6 @@ impl Message {
         }
     }
 
-    /// 用户消息附上的文件路径；其他角色为空。
     pub fn files(&self) -> &[String] {
         match self {
             Self::User { files, .. } => files,
@@ -103,7 +101,6 @@ impl Message {
         }
     }
 
-    /// 消息的正文，不含思考内容。
     pub fn content_text(&self) -> String {
         content_text(self.content())
     }
@@ -116,7 +113,6 @@ impl Message {
         })
     }
 
-    /// 按消息中的顺序遍历所有工具调用。
     pub fn tool_calls(&self) -> impl Iterator<Item = &ModelToolCall> {
         self.content().iter().filter_map(|block| match block {
             ContentBlock::ToolCall(call) => Some(call),
@@ -124,7 +120,6 @@ impl Message {
         })
     }
 
-    /// 工具结果对应的调用 ID；其他角色为 None。
     pub fn tool_call_id(&self) -> Option<&str> {
         match self {
             Self::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
@@ -132,7 +127,6 @@ impl Message {
         }
     }
 
-    /// 助手消息携带的提供方续接信息；其他角色返回 `None`。
     pub fn provider_metadata(&self) -> Option<&ProviderMessageMetadata> {
         match self {
             Self::Assistant { provider_metadata, .. } => provider_metadata.as_ref(),
@@ -182,7 +176,6 @@ impl Message {
     }
 }
 
-/// 拼接模型可见的文本块。
 fn content_text(content: &[ContentBlock]) -> String {
     let mut text = String::new();
     for block in content {
@@ -197,7 +190,6 @@ fn content_text(content: &[ContentBlock]) -> String {
 }
 
 impl ContentBlock {
-    /// 构造不含提供方续接字段的文本块。
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text { text: text.into(), metadata: None }
     }

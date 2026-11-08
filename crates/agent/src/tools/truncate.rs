@@ -33,7 +33,6 @@ pub struct Truncation {
     pub last_line_partial: bool,
 }
 
-/// 把字节数格式化成人类可读的容量字符串（如 45.2KB、1.5MB）。
 pub fn format_size(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes}B")

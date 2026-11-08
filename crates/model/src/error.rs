@@ -33,7 +33,6 @@ impl std::fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 impl ProviderError {
-    /// 创建不带重试延迟的提供方错误。
     pub fn new(kind: ModelErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -57,12 +56,10 @@ impl ProviderError {
         self.kind == ModelErrorKind::ContextLengthExceeded
     }
 
-    /// 判断这个错误是否允许自动重发同一请求。
     pub fn is_retryable(&self) -> bool {
         self.kind == ModelErrorKind::Temporary
     }
 
-    /// 保留提供方要求的延迟，交给所属的重试策略使用。
     pub fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
         self.retry_after = retry_after;
         self

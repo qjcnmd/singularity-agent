@@ -1,4 +1,3 @@
-/* 运行状态：右上角弹出的浮动小面板 */
 .float-panel { position: absolute; top: 56px; right: 24px; z-index: 6; display: grid; gap: 10px; align-content: start; width: 264px; max-height: calc(100vh - 70px); overflow-y: auto; scrollbar-gutter: stable; padding: 2px; transform-origin: top right; }
 .float-card { min-width: 0; border: 1px solid color-mix(in srgb, var(--glass-base) 75%, transparent); border-radius: 16px; background: color-mix(in srgb, var(--glass-base) 80%, transparent); backdrop-filter: blur(22px) saturate(180%);
   box-shadow: 0 0 0 .5px rgb(0 0 0 / 9%), 0 10px 28px -14px rgb(0 0 0 / 22%); }

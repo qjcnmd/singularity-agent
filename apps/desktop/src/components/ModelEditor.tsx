@@ -19,7 +19,6 @@ type ModelEditorProps = {
   onClose: () => void
 }
 
-/** 单个模型的添加与编辑弹窗。 */
 export function ModelEditor({ index, initial, protocol, onConfirm, onClose }: ModelEditorProps) {
   const [draft, setDraft] = useState(() => toDraft(initial))
   const [error, setError] = useState<string | null>(null)
@@ -39,7 +38,6 @@ export function ModelEditor({ index, initial, protocol, onConfirm, onClose }: Mo
     if (capacityError !== null) return capacityError
     const reasoningError = reasoningConfigurationError(draft, protocol)
     if (reasoningError !== null) return reasoningError
-    // 将容量输入解析为数值后再传给上层保存。
     const { contextText, outputText, ...model } = draft
     const next: ModelInput = { ...model, maxContextTokens: context, maxOutputTokens: output }
     return onConfirm(next)

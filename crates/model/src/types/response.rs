@@ -39,7 +39,6 @@ impl ModelTurnResponse {
         }
     }
 
-    /// 提供方是否因为输出额度用尽而停下。
     pub fn is_length_truncated(&self) -> bool {
         self.stop_reason == ModelStopReason::Length
     }

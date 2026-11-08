@@ -23,7 +23,6 @@ use singularity_protocol::SessionPhase;
 
 use singularity_protocol::TurnEvent;
 
-/// 一个已打开的任务。
 pub struct Conversation {
     pub(crate) thread_id: String,
     pub(crate) cwd: String,
@@ -120,7 +119,6 @@ impl Conversation {
         })
     }
 
-    /// 当前模型选择的副本。
     pub(crate) fn model(&self) -> singularity_protocol::ModelSelection {
         self.lock_state().model.clone()
     }

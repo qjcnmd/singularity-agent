@@ -28,7 +28,6 @@ export const turnStatusText: Record<TurnStatus, string> = {
   interrupted: '任务已停止',
 }
 
-/** 根据是否由用户主动停止返回对应的中断提示文案。 */
 export function interruptionText(manuallyStopped: boolean): string {
   return manuallyStopped ? factStatusText.interrupted : '任务异常中断'
 }

@@ -3,7 +3,6 @@ import { createInterface } from 'node:readline'
 import { EventEmitter } from 'node:events'
 import type { RpcResponse, StreamEnvelope } from '../src/protocol.generated.js'
 
-/** 启动并管理后端 Rust 子进程，通过 stdio 收发协议帧。 */
 export class Backend extends EventEmitter {
   readonly child
   readonly ready: Promise<StreamEnvelope>

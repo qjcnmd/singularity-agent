@@ -1,4 +1,3 @@
-// 持久保存在 localStorage 中的界面偏好（侧栏宽度、主题、字号、阅读锚点等）及默认值。
 import type { ViewportAnchor } from './protocol'
 
 export const defaultAnchor = (): ViewportAnchor => ({

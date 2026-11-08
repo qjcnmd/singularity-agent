@@ -12,7 +12,7 @@
 
 ## crates/ 结构
 
-单向依赖 `app → agent → {model, mcp, core, protocol}`。
+单向依赖 `app → agent → {model, mcp} → {core, protocol}`。
 
 ```
 crates/
@@ -28,7 +28,8 @@ crates/
 │
 ├── core/                        # 基础设施：数据目录与项目资源
 │   └── src/
-│       ├── lib.rs                          # write_json_atomic 原子写
+│       ├── lib.rs                          # 原子写文件与通用工具函数
+│       ├── tool.rs                         # ToolDefinition 与 Token 估算
 │       ├── user_home.rs                    # ~/.singularity 定位
 │       ├── project_instructions.rs         # AGENTS.md 加载
 │       ├── skills.rs                       # SKILL.md 发现与全文读取
@@ -59,11 +60,11 @@ crates/
 │       ├── agent/
 │       │   ├── mod.rs                      # 主循环（模型↔工具）
 │       │   ├── request.rs                  # RequestContext：每轮指令+工具定义
+│       │   ├── modules.rs                  # 上下文模块组装与预览
 │       │   ├── dispatch.rs                 # 工具并发调度（≤8）
 │       │   ├── inbox.rs                    # SteeringInbox 输入队列
 │       │   ├── questions.rs                # 提问工具
-│       │   └── compaction.rs               # PreparedCompaction 组装
-│       ├── compaction.rs                   # 压缩请求
+│       │   └── context_rotation.rs         # 上下文轮换
 │       ├── request_execution.rs            # 模型请求执行、重试、保存
 │       ├── message.rs  image.rs  prompts.rs
 │       ├── session/
@@ -71,12 +72,13 @@ crates/
 │       │   ├── format.rs  file.rs          # 日志格式、末尾修复
 │       │   └── context.rs                  # 从日志生成模型上下文、Token 估算
 │       └── tools/
-│           ├── registry.rs                 # 工具注册表、参数校验
-│           ├── read.rs  truncate.rs  output.rs  question.rs  mcp.rs
+│           ├── mod.rs  registry.rs         # 工具注册表、参数校验
+│           ├── read.rs  edit.rs  edit_diff.rs  view_image.rs
+│           ├── truncate.rs  output.rs  question.rs  skill.rs  mcp.rs
 │           └── bash/
 │               ├── mod.rs  spec.rs         # 参数与定义
 │               ├── exec.rs  pump.rs        # 前台执行、stdout/stderr 异步泵
-│               ├── shell.rs                # Job Object 进程树管理
+│               ├── shell.rs  result.rs     # Job Object 进程树、结果构造
 │               └── tasks.rs                # BashTasks：后台任务状态
 │
 └── app/                         # 桌面后端组装层（main.rs 为 Singularity.exe 入口）
@@ -99,7 +101,7 @@ crates/
                 ├── lifecycle.rs            # 启动条件检查与执行编排
                 ├── view.rs                 # 历史读取与事件发布
                 ├── state.rs  activity.rs
-                ├── compaction.rs           # 独立压缩
+                ├── context_rotation.rs     # 独立轮换
                 └── background.rs           # 后台命令完成→唤醒回合
 ```
 

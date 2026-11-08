@@ -233,7 +233,6 @@ pub struct RpcError {
 }
 
 impl RpcError {
-    /// 创建带错误码和实际原因的 RPC 错误。
     pub fn new(code: RpcErrorCode, message: impl Into<String>) -> Self {
         Self { code, message: message.into() }
     }

@@ -17,7 +17,6 @@ export function SelectionSlider({ container, activeKey }: { container: RefObject
       wasVisible.current = true
     }
     measure()
-    // 列表里有行插入、删除或展开时跟着移动
     const observer = new ResizeObserver(measure)
     observer.observe(root)
     const rows = new MutationObserver(measure)

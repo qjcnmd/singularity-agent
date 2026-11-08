@@ -215,12 +215,10 @@ impl SessionManager {
 }
 
 impl SessionData {
-    /// 会话日志路径，用于错误信息。
     pub fn path(&self) -> &Path {
         &self.file
     }
 
-    /// 文件头里的会话 ID。
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -237,12 +235,10 @@ impl SessionData {
         }
     }
 
-    /// 文件头里的创建时间。
     pub fn created_at(&self) -> &str {
         &self.header_timestamp
     }
 
-    /// 任务的工作目录（规范化后的绝对路径）。
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
@@ -252,7 +248,6 @@ impl SessionData {
         singularity_core::display_path(&self.cwd)
     }
 
-    /// 解析出的记录，按写入顺序排列。
     pub fn entries(&self) -> &[SessionEntry] {
         &self.entries
     }

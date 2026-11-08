@@ -59,7 +59,6 @@ export interface AppState extends PersistedView, SyncState {
 }
 
 
-/** 管理任务切换、会话读取和流式事件同步。 */
 export class SessionStore {
   protected state: AppState = {
     ...loadPersisted(),
@@ -81,7 +80,6 @@ export class SessionStore {
   private readonly listeners = new Set<() => void>()
   private notification: number | null = null
   private viewSave: ReturnType<typeof setTimeout> | null = null
-  /** 与后端通信的 RPC 客户端；设置和候选搜索也通过它发起请求。 */
   readonly transport = new RpcClient(frame => this.onFrame(frame), connection => this.patch({ connection }))
   protected readonly drafts = new DraftStore(drafts => this.patch({ drafts }))
   private started = false
@@ -203,7 +201,6 @@ export class SessionStore {
     }
   }
 
-  /** 判断读取返回时是否仍对应当前选中的任务，避免过期响应覆盖新选择。 */
   private readIsCurrent(request: symbol, sessionId: string): boolean {
     return request === this.latestRead && this.state.selectedSessionId === sessionId
   }

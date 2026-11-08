@@ -46,7 +46,6 @@ pub(crate) struct UserConfigModel {
     pub(crate) thinking_wire_format: Option<String>,
 }
 
-/// 读取完整配置；文件不存在时返回 None。
 pub(crate) fn read_user_config_file(directory: &Path) -> Result<Option<UserConfigFile>, ProviderError> {
     let path = directory.join(USER_CONFIG_FILE_NAME);
     let config_text = match std::fs::read_to_string(&path) {

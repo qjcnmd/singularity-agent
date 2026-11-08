@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react'
 import { Fluid } from './fluid'
 import { Bubbles } from './bubbles'
 
-/* 水球发送键（来自用户提供的 singularity-water-orb 原型）：
+/* 水球发送键：
  * 平时是解析出来的起伏海面；轮换时球壁转动，水改由 LiquidFun 粒子重建并翻滚；结束后平息再回落到新水位。
  * 球上不画箭头，点击即发送，运行中点击即停止。 */
 
@@ -197,7 +197,6 @@ export function WaterOrb({ percent, rotating, enabled, size, label, color, onPre
       c.strokeStyle = 'rgba(159,210,255,.30)'; c.lineWidth = .013; c.stroke()
       if (!still) frame = requestAnimationFrame(draw)
     }
-    // 窗口隐藏时停下，回来后接着画
     const resume = () => {
       cancelAnimationFrame(frame)
       previous = 0

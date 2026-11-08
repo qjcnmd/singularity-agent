@@ -132,7 +132,6 @@ impl Utf8Decoder {
                 Err(error) => {
                     let valid = error.valid_up_to();
                     if valid > 0 {
-                        // valid_up_to 之前的前缀是合法 UTF-8。
                         let text = std::str::from_utf8(&self.pending[consumed..consumed + valid])
                             .expect("valid_up_to must describe valid UTF-8");
                         output.push_str(text);

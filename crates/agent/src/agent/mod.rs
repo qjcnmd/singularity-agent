@@ -37,7 +37,6 @@ use crate::session::{SessionError, SessionWriter, lock_writer};
 use crate::tools::ToolRegistrySnapshot;
 use singularity_model::Message;
 
-/// 每轮加载指令使用的目录。
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// 文件指令（AGENTS.md 等）的用户数据根目录。
@@ -48,7 +47,6 @@ pub struct AgentConfig {
     pub disabled_modules: Vec<String>,
 }
 
-/// Agent 循环可能返回的错误。
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("session error: {0}")]
@@ -135,7 +133,7 @@ impl RequestContext {
             config,
         }
     }
-    /// 当前模型的上下文窗口。
+
     pub fn context_window(&self) -> u64 {
         self.provider.model_configuration().context_window()
     }

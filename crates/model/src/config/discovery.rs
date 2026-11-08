@@ -22,7 +22,6 @@ pub async fn discover(base_url: &str, api_key: &str) -> Result<Vec<String>, Prov
             configuration_error(format!("模型查询客户端无法启动（{}）。", transport_error_source(error)))
         })?;
     let request = client.get(crate::openai::models_endpoint(base_url));
-    // 有密钥时附带 Bearer 认证头，空密钥直接发匿名请求。
     let request = if api_key.is_empty() {
         request
     } else {

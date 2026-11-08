@@ -72,7 +72,7 @@ pub(super) struct ConversationState {
     pub(super) turn: TurnLifecycle,
     /// 首条和后续消息共用的输入队列，跨回合保留。
     pub(super) steering_inbox: SteeringInboxHandle,
-    /// 最近一轮所用模型的上下文窗口，用于显示占用比例；重启后为空。
+    /// 当前任务模型的上下文窗口，打开任务时从配置读取，每轮开始时按实际解析结果更新。
     pub(super) last_context_window: Option<u64>,
     pub(super) auto_resume: bool,
     pub(super) closing: bool,

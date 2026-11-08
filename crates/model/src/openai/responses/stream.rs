@@ -1,6 +1,5 @@
 use super::*;
 
-/// 读取并解码一次 Responses 流式响应。
 pub(crate) async fn read_responses_sse_stream(
     cancellation: &CancellationToken,
     response: reqwest::Response,

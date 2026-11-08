@@ -33,7 +33,6 @@ export function FilePanel() {
     return () => { current = false }
   }, [active?.id, active?.opened, attempt])
 
-  // 关掉的标签不再占着内容。
   useEffect(() => {
     setDocuments(all => Object.fromEntries(Object.entries(all).filter(([id]) => state.fileTabs.some(tab => tab.id === id))))
   }, [state.fileTabs])

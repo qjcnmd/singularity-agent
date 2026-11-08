@@ -215,7 +215,6 @@ function ToolOutput({ item: fact, filePath }: { item: Extract<HistoryItem, { typ
   const hasReadLines = fact.result?.readSource !== undefined && fact.result?.readSource.lineCount > 0
   if (filePath !== null && (output !== '' || hasReadLines) && fact.status !== 'failed') return <div>
     <div className="tool-output-header">{filePath}</div>
-    {/* 后端提供 readSource 时为读取的正文行标上源文件行号。 */}
     {fact.result?.readSource
       ? <div className="tool-lines">{readOutputLines(output, fact.result.readSource).map((line, index) => (
         <div key={index} className="tool-line">{line.number !== undefined && <span className="tool-line-number">{line.number}</span>}<span>{line.text}</span></div>
@@ -259,6 +258,5 @@ function MessageStatsLine({ stats, at }: { stats?: SessionModelUsage; at?: strin
   // 向下取整：只有全部命中时才显示 100%。
   if (stats?.usagePresent && stats.cacheUsageComplete && stats.inputTokens > 0) parts.push(`${Math.floor(stats.cachedInputTokens / stats.inputTokens * 100)}%`)
   if (at) parts.push(formatClock(at))
-  // 文字只留数值，悬停时说明各项含义。
   return parts.length ? <p className="turn-stats" title="平均首 token 时间 · 平均输出速度 · 会话总用量 · 缓存命中率 · 时间">{parts.join(' · ')}</p> : null
 }

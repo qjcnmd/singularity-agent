@@ -36,7 +36,7 @@ pub(crate) struct ModuleInputs<'a> {
     pub instructions: Vec<InstructionFile>,
     pub skills: SkillCatalog,
     pub mcp: McpDiscovery,
-    /// 创建任务时关闭的模块 ID。
+
     pub disabled: &'a [String],
 }
 
@@ -57,7 +57,6 @@ struct Collector<'a> {
 }
 
 impl Collector<'_> {
-    /// 登记一个模块，返回它是否开着。
     fn push(
         &mut self,
         id: &str,

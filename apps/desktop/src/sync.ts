@@ -18,7 +18,6 @@ export const initialSyncState = (): SyncState => ({
   revision: 0, modelCatalogRevision: 0, bootstrap: null, session: null, liveSessions: {},
 })
 
-/** 更新指定会话的实时运行状态，按全局事件位置丢弃过时更新 */
 function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionUpdate, revision: number, event?: TurnEventEnvelope): SyncState {
   const previous = state.liveSessions[sessionId]
   if (previous && revision <= previous.revision) return state
@@ -39,7 +38,6 @@ function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSe
   }
 }
 
-/** 合并 `app.bootstrap` 快照，同时保留读取期间已收到更新的事件修订版本。 */
 function acceptBootstrap(state: SyncState, bootstrap: AppBootstrap): SyncState {
   if (state.bootstrap !== null && bootstrap.revision < state.bootstrap.revision) return state
   const sessionsByWorkspace = { ...bootstrap.sessionsByWorkspace }
@@ -92,7 +90,6 @@ export function acceptSessionStart(state: SyncState, started: SessionStartResult
   return acceptSummary(next, started.summary, started.revision)
 }
 
-/** 根据最新目录剔除已删除项目的选中态与已删除任务的内存状态。 */
 export function pruneStaleSelection(
   bootstrap: AppBootstrap,
   state: Pick<SyncState, 'liveSessions' | 'session'> & { selectedWorkspaceRoot: string | null; selectedSessionId: string | null },
@@ -192,7 +189,6 @@ export function reduceStream(state: SyncState, frame: Exclude<StreamEnvelope, { 
   }
 }
 
-/** 计算会话未读状态：非当前选中任务执行完毕时标记未读，用户切换进入时清除 */
 export function reduceUnread(
   unread: ReadonlySet<string>,
   previous: SyncState['liveSessions'],

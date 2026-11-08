@@ -1,4 +1,4 @@
-//! 用户上传、`read` 工具和 MCP 工具返回图片的格式识别、解码校验与文件读写。
+//! 用户上传、`view_image` 工具和 MCP 工具返回图片的格式识别、解码校验与文件读写。
 
 use std::io::{Cursor, Read};
 use std::path::Path;

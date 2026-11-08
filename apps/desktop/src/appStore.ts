@@ -68,7 +68,6 @@ class AppStore extends SessionStore {
     const phase = selectedSessionPhase(state)
     const active = phase === 'running' || phase === 'rotating'
     const submitPending = this.isPending('session.submit', actionOrigin.session(state.selectedSessionId))
-    // 按优先级检查当前不能发送的原因。
     let blockedReason: string | null = null
     if (state.selectedWorkspaceRoot === null) blockedReason = '请先选择项目'
     else if (state.connection !== 'ready') blockedReason = '连接未就绪'
@@ -237,7 +236,6 @@ class AppStore extends SessionStore {
     })
   }
 
-  /** 删除任务或移除项目成功后清理相应阅读锚点。 */
   private clearSessionAnchors(ids: string[]): void {
     const viewportAnchors = { ...this.state.viewportAnchors }
     for (const id of ids) {

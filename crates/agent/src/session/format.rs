@@ -177,7 +177,6 @@ impl SessionHeader {
         }
     }
 
-    /// 检查文件头的类型、版本、UUID 和时间戳。
     pub(super) fn validate(self) -> Result<Self> {
         let header = self;
         if header.kind != SESSION_HEADER_TYPE {

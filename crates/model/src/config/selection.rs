@@ -2,14 +2,12 @@
 
 use super::*;
 
-/// 解析好的提供方连接设置。
 pub(crate) struct OpenAiProviderConfig {
     pub(crate) provider_name: String,
     pub(crate) base_url: String,
     pub(crate) api_key: String,
 }
 
-/// 一次从配置解析完成的模型选择。
 pub(crate) struct SelectedModel {
     pub(crate) model_name: String,
     pub(crate) api_protocol: ProviderApiProtocol,

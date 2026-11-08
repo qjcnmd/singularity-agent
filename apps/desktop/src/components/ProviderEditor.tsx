@@ -40,7 +40,6 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
     return () => { discoveryRevision.current += 1 }
   }, [providerId, baseUrl, apiKey, active])
   const saveError = state.actionErrors[origin]
-  /** 校验并提交模型草稿。返回错误提示字符串表示校验失败，null 表示已成功加入列表。 */
   const commitModel = (index: number | null, draft: ModelInput): string | null => {
     if (invalidModelId(models, index, draft.modelId)) return '请输入有效且不重复的模型 ID。'
     setModels(rows => index === null ? [...rows, draft] : rows.map((row, at) => at === index ? draft : row))
@@ -61,7 +60,6 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
     setFailure(null)
     setFetching(true)
     try {
-      // 通过后端查询提供方的可用模型列表
       const found = await appStore.transport.rpc('model.discover', {
         providerId: providerId.trim(), baseUrl, apiKey: apiKey.trim() || null,
       })
