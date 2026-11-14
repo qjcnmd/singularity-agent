@@ -6,39 +6,11 @@ export type AppBootstrap = {
  */
 userHome: string | null, sessionStates: { [key in string]: SessionStatus }, revision: number, workspaces: Array<Workspace>, sessionsByWorkspace: { [key in string]: Array<ThreadSummary> }, modelCatalog: RedactedModelCatalog, };
 
-export type BackgroundTask = { taskId: string, command: string, description: string,
-/**
- * 输出的末尾部分；超长时附带完整输出文件的位置，与 bash 工具的结果相同。
- */
-output: string, modelOutput: CommandOutputSnapshot, state: BackgroundTaskState, };
-
 export type BackgroundTaskParams = { sessionId: string, taskId: string, };
 
 export type BackgroundTaskState = { "status": "running" } | { "status": "exited", exitCode: number, durationMs: number, } | { "status": "stopped", durationMs: number, } | { "status": "failed", message: string, durationMs: number, } | { "status": "interrupted" };
 
-export type BackgroundTaskUpdate = { phase: SessionPhase, task: BackgroundTask, };
-
-export type CommandOutputSnapshot = {
-/**
- * 最多 100 KiB 的纯文本尾部。
- */
-text: string,
-/**
- * 从命令输出起点累计的纯文本字节数。
- */
-totalBytes: number,
-/**
- * 完整纯文本输出文件的路径。
- */
-fullOutput?: string,
-/**
- * 保存完整输出时的错误。
- */
-fileError?: string,
-/**
- * 管道排空超时，输出尚未全部收齐。
- */
-incomplete?: boolean, };
+export type BackgroundTaskUpdate = { phase: SessionPhase, task: VisibleBackgroundTask, };
 
 export type ContextGroup = "instructions" | "tools" | "skills" | "mcp";
 
@@ -168,9 +140,7 @@ error: string | null, defaultSelection: ModelSelection | null, providers: Array<
 
 export type RedactedProvider = { apiProtocol: ProviderApiProtocol, providerId: string, displayName: string | null, baseUrl: string, credentialConfigured: boolean, models: Array<ModelConfigurationInput>, };
 
-export type RpcError = { code: RpcErrorCode, message: string, };
-
-export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "configuration_invalid" | "provider_unavailable" | "internal";
+export type RpcError = { message: string, };
 
 export type RpcResponse = { "type": "success", result: JsonValue, } | { "type": "error", error: RpcError, };
 
@@ -190,7 +160,7 @@ inputTokens: number,
 /**
  * 已知的缓存输入合计；仅 cache_usage_complete 为真时可计算命中率。
  */
-cachedInputTokens: number, outputTokens: number, totalTokens: number,
+cachedInputTokens: number, totalTokens: number,
 /**
  * 同时有生成耗时和输出 Token 数的请求的合计，用于计算每秒输出 Token 数。
  */
@@ -199,10 +169,6 @@ decodeTokens: number, decodeMs: number,
  * 计入合计的请求是否都明确报告了缓存输入用量。
  */
 cacheUsageComplete: boolean,
-/**
- * 计入统计的请求耗时合计（毫秒），含等待首个 token。
- */
-generationMs: number,
 /**
  * 是否有请求上报了用量；为 false 时 Token 数都是 0，不代表没有消耗。
  */
@@ -222,7 +188,7 @@ revision: number, history: ThreadHistory, runtime: SessionRuntime,
 /**
  * 首次读取后台命令，后续变化由独立事件更新。
  */
-backgroundTasks: Array<BackgroundTask>, context: InjectedContext | null, };
+backgroundTasks: Array<VisibleBackgroundTask>, context: InjectedContext | null, };
 
 export type SessionRenameParams = { sessionId: string, name: string, };
 
@@ -288,15 +254,13 @@ export type ToolStatus = "pending" | "running" | "completed" | "failed" | "inter
 
 export type Turn = { turnId: string, status: TurnStatus, };
 
-export type TurnErrorDetail = { cause: TurnFailureCause, message: string,
+export type TurnErrorDetail = { message: string,
 /**
  * 已经显示了这次失败的条目 ID（如轮换条目），界面据此避免重复报错。
  */
 itemId?: string, };
 
 export type TurnEventEnvelope = { turnId: string | null, phase: SessionPhase, } & ({ "method": "context/loaded", "params": { context: InjectedContext, } } | { "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "item/updated", "params": { item: HistoryItem, } } | { "method": "item/textDelta", "params": { itemId: string, thinking: boolean, delta: string, } } | { "method": "message/finished", "params": { messageId: string, items: Array<HistoryItem>, } } | { "method": "message/discarded", "params": { messageId: string, } } | { "method": "tool/output", "params": { itemId: string, output: string, } } | { "method": "tool/finished", "params": { itemId: string, result: ToolResult, } } | { "method": "turn/completed", "params": { turn: Turn, manuallyStopped: boolean, finishedAt: string, } } | { "method": "turn/error", "params": { error: TurnErrorDetail, finishedAt: string, } });
-
-export type TurnFailureCause = "store" | "provider" | "internal";
 
 export type TurnStatus = "running" | "completed" | "failed" | "interrupted";
 
@@ -307,6 +271,12 @@ export type UserQuestion = { id: string, question: string, options: Array<UserQu
 export type UserQuestionAnswer = { id: string, selected: Array<string>, text: string, skipped: boolean, };
 
 export type UserQuestionOption = { label: string, description: string | null, };
+
+export type VisibleBackgroundTask = { taskId: string, command: string, description: string,
+/**
+ * 输出的末尾部分；超长时附带完整输出文件的位置，与 bash 工具的结果相同。
+ */
+output: string, state: BackgroundTaskState, };
 
 export type Workspace = { root: string, };
 

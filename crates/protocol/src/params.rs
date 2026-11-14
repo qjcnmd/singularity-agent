@@ -208,15 +208,12 @@ pub struct SessionModelUsage {
     pub input_tokens: u64,
     /// 已知的缓存输入合计；仅 cache_usage_complete 为真时可计算命中率。
     pub cached_input_tokens: u64,
-    pub output_tokens: u64,
     pub total_tokens: u64,
     /// 同时有生成耗时和输出 Token 数的请求的合计，用于计算每秒输出 Token 数。
     pub decode_tokens: u64,
     pub decode_ms: u64,
     /// 计入合计的请求是否都明确报告了缓存输入用量。
     pub cache_usage_complete: bool,
-    /// 计入统计的请求耗时合计（毫秒），含等待首个 token。
-    pub generation_ms: u64,
     /// 是否有请求上报了用量；为 false 时 Token 数都是 0，不代表没有消耗。
     pub usage_present: bool,
 }

@@ -1,6 +1,6 @@
 import { contextRotationText } from './copy'
 import { hasErrorItem } from './execution'
-import type { BackgroundTask, HistoryItem, PendingQuestion, ReadSource, SessionRuntime, ThreadTurn, ToolStatus } from './protocol'
+import type { HistoryItem, PendingQuestion, ReadSource, SessionRuntime, ThreadTurn, ToolStatus, VisibleBackgroundTask } from './protocol'
 
 export type ToolItem = Extract<HistoryItem, { type: 'tool' }>
 export type ToolGroup = { type: 'tool_group'; name: string; rows: Array<{ key: string; item: ToolItem }> }
@@ -200,7 +200,7 @@ export function readOutputLines(text: string, source: ReadSource): Array<{ text:
 }
 
 /** 单条详情与分组计数共用后台任务终态，避免命令转后台后仍显示成功。 */
-export function toolDisplay(item: ToolItem, tasks: BackgroundTask[] = []) {
+export function toolDisplay(item: ToolItem, tasks: VisibleBackgroundTask[] = []) {
   const id = backgroundTaskId(item)
   const task = id ? tasks.find(task => task.taskId === id) : undefined
   const status: ToolStatus = task ? task.state.status === 'running' ? 'running'

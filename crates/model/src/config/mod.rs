@@ -18,7 +18,7 @@ use selection::{OpenAiProviderConfig, SelectedModel, resolve_model_definition, r
 use singularity_protocol::ModelSelection;
 
 pub(crate) fn configuration_error(message: impl Into<String>) -> ProviderError {
-    ProviderError::new(ModelErrorKind::InvalidRequest, message)
+    ProviderError::new(ModelErrorKind::Other, message)
 }
 
 pub(crate) fn missing_provider_config_error(name: &str) -> ProviderError {

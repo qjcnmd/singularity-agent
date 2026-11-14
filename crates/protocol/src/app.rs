@@ -206,35 +206,20 @@ pub struct SessionReadResult {
     pub history: ThreadHistory,
     pub runtime: SessionRuntime,
     /// 首次读取后台命令，后续变化由独立事件更新。
-    pub background_tasks: Vec<crate::BackgroundTask>,
+    pub background_tasks: Vec<crate::VisibleBackgroundTask>,
     pub context: Option<crate::InjectedContext>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum RpcErrorCode {
-    InvalidRequest,
-    WorkspaceNotFound,
-    WorkspaceBusy,
-    SessionNotFound,
-    SessionBusy,
-    ConfigurationInvalid,
-    ProviderUnavailable,
-    Internal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct RpcError {
-    pub code: RpcErrorCode,
     pub message: String,
 }
 
 impl RpcError {
-    pub fn new(code: RpcErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+    pub fn new(message: impl std::fmt::Display) -> Self {
+        Self { message: message.to_string() }
     }
 }
 

@@ -122,7 +122,7 @@ function ComposerView({ accent }: { accent: string }) {
                 onMouseDown={event => event.preventDefault()}
                 onClick={() => insertCandidate(candidate)}
               >
-                <strong>/{candidate.name}</strong><span>{candidate.description}</span>
+                <strong>{candidate.name}</strong><span>{candidate.description}</span>
               </button>
             ))}
             </div>

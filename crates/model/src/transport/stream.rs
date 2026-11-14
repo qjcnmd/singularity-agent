@@ -127,5 +127,5 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
 }
 
 pub(crate) fn provider_stream_malformed_error(message: &'static str, reason: &'static str) -> ProviderError {
-    ProviderError::diagnostic(ModelErrorKind::JsonSchemaViolation, message, vec![reason.to_string()])
+    ProviderError::diagnostic(ModelErrorKind::Other, message, vec![reason.to_string()])
 }

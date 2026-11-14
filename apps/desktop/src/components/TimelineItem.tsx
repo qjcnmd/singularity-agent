@@ -52,7 +52,7 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
   if (item.type === 'terminal') {
     return <div className={`timeline-item message-item timeline-assistant${item.status === 'interrupted' ? ' terminal-interruption' : ''}`} data-item-id={itemKey}>
       {item.status === 'failed'
-        ? <div className="message-bubble error-bubble" role="alert">{item.text}</div>
+        ? <div className="message-bubble error-bubble" role="alert"><CircleAlert size={15} className="error-icon" aria-hidden="true" /><span>{item.text}</span></div>
         : <article className="activity-step"><div className="activity-toggle"><CircleX size={13} className="bad" /><span className="step-title">{item.text}</span></div></article>}
       {item.at && <time className="turn-stats" dateTime={item.at} title="结束时间">{formatClock(item.at, true)}</time>}
     </div>
@@ -72,6 +72,7 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
       >
         {item.role === 'user' && item.at && <time className="msg-time" dateTime={item.at}>{formatClock(item.at, true)}</time>}
         <div className={`message-bubble${item.status === 'failed' ? ' error-bubble' : ''}`}>
+        {item.status === 'failed' && <CircleAlert size={15} className="error-icon" aria-hidden="true" />}
         {item.role === 'user' && attachments}
         <div className="timeline-body message-body">{item.role === 'user' ? <div className="user-text">{body}</div> : <MarkdownBody text={body} streaming={item.status === 'running'} />}</div>
         {item.role === 'assistant' && attachments}

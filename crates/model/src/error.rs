@@ -7,12 +7,9 @@ pub enum ModelErrorKind {
     Cancelled,
     /// 可自动重试的网络故障、超时、限流和服务端故障。
     Temporary,
-    AuthError,
-    InvalidRequest,
     ContextLengthExceeded,
-    JsonSchemaViolation,
-    ContentFilter,
-    UnknownProviderError,
+    /// 不重试、直接显示的失败；具体原因在错误文字里。
+    Other,
 }
 
 /// 提供方失败，含错误分类、可显示的诊断信息和重试等待时间。
@@ -70,7 +67,7 @@ impl ProviderError {
 const PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
 /// 提供方明确返回的限流错误码，允许自动重试。
 const PROVIDER_RATE_LIMIT_EXCEEDED_CODE: &str = "rate_limit_exceeded";
-/// 配额耗尽的错误码：重试没有意义，归入不可重试的认证/账务错误。
+/// 提供方返回的配额耗尽错误码，不自动重试。
 const PROVIDER_INSUFFICIENT_QUOTA_CODE: &str = "insufficient_quota";
 /// 附在非 2xx 错误上的提供方诊断文本长度上限（字符数）。
 pub(crate) const MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS: usize = 256;
@@ -140,7 +137,7 @@ pub(crate) fn provider_error_kind_for_code(code: Option<&str>) -> Option<ModelEr
     match code {
         Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE) => Some(ModelErrorKind::ContextLengthExceeded),
         Some(PROVIDER_RATE_LIMIT_EXCEEDED_CODE) => Some(ModelErrorKind::Temporary),
-        Some(PROVIDER_INSUFFICIENT_QUOTA_CODE) => Some(ModelErrorKind::AuthError),
+        Some(PROVIDER_INSUFFICIENT_QUOTA_CODE) => Some(ModelErrorKind::Other),
         _ => None,
     }
 }
@@ -148,13 +145,11 @@ pub(crate) fn provider_error_kind_for_code(code: Option<&str>) -> Option<ModelEr
 /// 超时、限流和服务端故障共用重试策略，具体状态码保留在错误文字里。
 pub(crate) fn provider_error_kind_for_http_status(status: u16) -> ModelErrorKind {
     match status {
-        crate::HTTP_STATUS_UNAUTHORIZED | crate::HTTP_STATUS_FORBIDDEN => ModelErrorKind::AuthError,
         crate::HTTP_STATUS_REQUEST_TIMEOUT
         | crate::HTTP_STATUS_CONFLICT
         | crate::HTTP_STATUS_RATE_LIMITED => ModelErrorKind::Temporary,
-        status if (400..=499).contains(&status) => ModelErrorKind::InvalidRequest,
         status if (500..=599).contains(&status) => ModelErrorKind::Temporary,
-        _ => ModelErrorKind::UnknownProviderError,
+        _ => ModelErrorKind::Other,
     }
 }
 
@@ -195,14 +190,13 @@ pub(crate) fn bounded_wire_detail(fields: &ProviderErrorBodyFields) -> Option<St
         .filter(|text| !text.is_empty())
 }
 
-/// 构造流内事件或 200 响应体中的提供方错误：已知错误码映射到对应分类（上下文超限触发轮换、限流可重试、配额耗尽归入认证错误），
-/// 未知错误码归为 `UnknownProviderError`（不自动重试），并附上提供方原文和错误码。
+/// 构造流内事件或 200 响应体中的提供方错误：已知错误码映射到对应分类（上下文超限触发轮换、限流可重试、配额耗尽不重试），
+/// 未知错误码归为 `Other`（不自动重试），并附上提供方原文和错误码。
 pub(crate) fn provider_embedded_error(
     fields: &ProviderErrorBodyFields,
     fallback_message: &str,
 ) -> ProviderError {
-    let kind =
-        provider_error_kind_for_code(fields.code.as_deref()).unwrap_or(ModelErrorKind::UnknownProviderError);
+    let kind = provider_error_kind_for_code(fields.code.as_deref()).unwrap_or(ModelErrorKind::Other);
     let message = bounded_wire_detail(fields).unwrap_or_else(|| fallback_message.to_string());
     let details = provider_wire_facts(fields);
     ProviderError::diagnostic(kind, message, details)

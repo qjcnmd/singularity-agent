@@ -1,15 +1,15 @@
 import { LoaderCircle } from 'lucide-react'
 import { memo, useId, useState } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type ActionError, type AppState } from '../appStore'
-import type { BackgroundTask } from '../protocol'
+import type { VisibleBackgroundTask } from '../protocol'
 import { CommandOutput } from './CommandOutput'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 
 const fields = ['selectedSessionId', 'liveSessions', 'pendingActions', 'actionErrors', 'connection'] as const
 type BackgroundState = Pick<AppState, typeof fields[number]>
-const emptyTasks: BackgroundTask[] = []
-function selectedTasks(state: BackgroundState): BackgroundTask[] {
+const emptyTasks: VisibleBackgroundTask[] = []
+function selectedTasks(state: BackgroundState): VisibleBackgroundTask[] {
   const id = state.selectedSessionId
   if (id === null) return emptyTasks
   return state.liveSessions[id]?.backgroundTasks ?? emptyTasks
@@ -33,7 +33,7 @@ export const BackgroundTasks = memo(function BackgroundTasks() {
 })
 
 const BackgroundTaskRow = memo(function BackgroundTaskRow({ task, sessionId, pending, error, connected }: {
-  task: BackgroundTask; sessionId: string; pending: boolean; error: ActionError | undefined; connected: boolean
+  task: VisibleBackgroundTask; sessionId: string; pending: boolean; error: ActionError | undefined; connected: boolean
 }) {
   const [expanded, setExpanded] = useState(false)
   const outputId = useId()

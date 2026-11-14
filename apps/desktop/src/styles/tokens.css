@@ -11,7 +11,7 @@
   --warning: #ff9500;
   color-scheme: light;
   --canvas: #ffffff;
-  --sidebar: #fafafa;
+  --sidebar: #f6f6f8;
   --surface: #ffffff;
   --surface-muted: #f5f5f5;
   /* 内容里的卡片、代码块和输入框；弹窗和浮层；半透明玻璃的底色 */
@@ -32,9 +32,15 @@
   --ink-on-accent: #fff;
   --line: #ececee;
   --line-strong: #e0e0e3;
-  /* 消息块（气泡、思考、工具）的轮廓：白底上细线要深一档才读得出边界，投影补足弱光下的层次。 */
-  --bubble-line: #dcdce0;
-  --bubble-shadow: 0 1px 3px rgb(0 0 0 / 5%);
+  /* 界面靠填充分层、不描边：气泡用浅灰底；胶囊和悬停用更浅的半透明底；灰底里的代码块和工具输出用半透明白提亮。 */
+  --bubble-fill: #f2f2f5;
+  --soft-fill: rgb(0 0 0 / 4%);
+  --soft-fill-hover: rgb(0 0 0 / 7%);
+  --inset: rgb(255 255 255 / 72%);
+  /* 玻璃卡片（输入框、运行面板）的边缘：半像素环加一层落影，代替描边。 */
+  --glass-ring: rgb(0 0 0 / 10%);
+  --glass-ring-focus: rgb(0 0 0 / 20%);
+  --glass-drop: 0 10px 30px -12px rgb(0 0 0 / 18%);
   --default-accent: #1783ff;
   --default-accent-soft: color-mix(in srgb, var(--default-accent) 10%, #fff);
   --accent: var(--default-accent);
@@ -94,9 +100,13 @@ button { color: inherit; user-select: none; }
   --ink-faint: #a0a0a0;
   --line: #333333;
   --line-strong: #4d4d4d;
-  /* 深色下同样的可读度要用比 --line 亮一档的线；投影压得更重才看得出厚度。 */
-  --bubble-line: #3f3f43;
-  --bubble-shadow: 0 1px 2px rgb(0 0 0 / 35%);
+  --bubble-fill: #2c2c2e;
+  --soft-fill: rgb(255 255 255 / 6%);
+  --soft-fill-hover: rgb(255 255 255 / 10%);
+  --inset: rgb(0 0 0 / 22%);
+  --glass-ring: rgb(255 255 255 / 12%);
+  --glass-ring-focus: rgb(255 255 255 / 24%);
+  --glass-drop: 0 10px 30px -10px rgb(0 0 0 / 60%);
   --default-accent: #f472b6;
   --default-accent-soft: #4a1d33;
   --accent: var(--default-accent);

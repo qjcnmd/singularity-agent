@@ -76,7 +76,7 @@ fn read_listing(body: &Value) -> Result<Vec<String>, ProviderError> {
 }
 
 fn discovery_response_error(message: impl Into<String>) -> ProviderError {
-    ProviderError::new(ModelErrorKind::JsonSchemaViolation, message)
+    ProviderError::new(ModelErrorKind::Other, message)
 }
 
 async fn discovery_http_error(response: reqwest::Response) -> ProviderError {

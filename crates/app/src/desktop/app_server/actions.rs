@@ -20,7 +20,7 @@ impl AppServer {
             std::path::Path::new(&conversation.cwd),
             &self.home,
         )
-        .map_err(invalid_request)?;
+        .map_err(RpcError::new)?;
         conversation.start(input).map_err(conversation_error)?;
         Ok(())
     }
@@ -32,7 +32,7 @@ impl AppServer {
         answers: Vec<singularity_protocol::UserQuestionAnswer>,
     ) -> Result<(), RpcError> {
         self.apply_control(session_id, |conversation| {
-            conversation.answer_question(item_id, answers).map_err(invalid_request)
+            conversation.answer_question(item_id, answers).map_err(RpcError::new)
         })
     }
 
@@ -67,7 +67,7 @@ impl AppServer {
         })
         .await
         .expect("conversation lookup completes while the backend is running")?;
-        conversation.inspect_context(shutdown.child_token()).await.map_err(internal_error)
+        conversation.inspect_context(shutdown.child_token()).await.map_err(RpcError::new)
     }
 
     pub fn rotate_context(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {
@@ -105,7 +105,7 @@ impl AppServer {
         .await
         .expect("delete preparation completes while the backend is running")?;
         if let Some((conversation, _)) = &pending {
-            conversation.stop().await.map_err(invalid_request)?;
+            conversation.stop().await.map_err(RpcError::new)?;
         }
         let app = Arc::clone(self);
         let id = session_id.to_string();
@@ -141,6 +141,6 @@ impl AppServer {
             let _lifecycle = self.lock_lifecycle();
             Arc::clone(self.open_action_conversation(session_id)?.bash_tasks())
         };
-        tasks.stop(task_id).await.map(|_| ()).map_err(invalid_request)
+        tasks.stop(task_id).await.map(|_| ()).map_err(RpcError::new)
     }
 }

@@ -4,31 +4,34 @@
 .conversation-document { container-type: inline-size; max-width: 800px; width: 100%; min-height: 100%; margin: 0 auto; padding: 70px 30px calc(var(--composer-height, 150px) + 12px); display: flex; flex-direction: column; }
 .timeline-item { min-width: 0; }
 .message-item { display: grid; justify-items: start; align-self: flex-start; max-width: min(88%, 680px); margin-top: 10px; }
-.message-bubble { min-width: 0; max-width: 100%; padding: 10px 16px; border-radius: 16px; border: 1px solid var(--assistant-bubble-border); background: var(--assistant-bubble-bg); color: var(--assistant-bubble-ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; font-size: var(--message-font-size); font-weight: 430; line-height: 1.65; overflow-wrap: anywhere; transition: background-color 350ms, border-color 350ms, color 350ms; }
-.timeline-assistant .message-bubble { box-shadow: var(--bubble-shadow); }
+.message-bubble { min-width: 0; max-width: 100%; padding: 10px 16px; border-radius: 18px; background: var(--assistant-bubble-bg); color: var(--assistant-bubble-ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; font-size: var(--message-font-size); font-weight: 430; line-height: 1.65; overflow-wrap: anywhere; transition: background-color 350ms, color 350ms; }
 .terminal-interruption { margin-top: 0; }
 .timeline-user { align-self: flex-end; justify-items: end; max-width: min(72%, 540px); }
-/* 用户气泡选白色时与助手一样用白底细边框，选实色时用实色底配同色边，共用轻投影。 */
-.timeline-user .message-bubble { color: var(--user-bubble-ink); border-color: var(--user-bubble-border); background: var(--user-bubble-bg); box-shadow: var(--bubble-shadow); }
+.timeline-user .message-bubble { color: var(--user-bubble-ink); background: var(--user-bubble-bg); }
 .message-body { font-size: var(--message-font-size); line-height: 1.65; color: inherit; }
 .timeline-user .message-body { color: inherit; }
-.message-bubble.error-bubble { border-color: transparent; background: var(--danger-soft); color: #b3261e; }
+/* 出错的气泡沿用默认浅灰底和正文色，只靠左侧红色图标提示，不整块染红。 */
+.message-bubble.error-bubble { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; background: var(--bubble-fill); color: var(--message-ink); }
+.error-bubble > :not(.error-icon) { grid-column: 2; }
+.error-icon { margin-top: .32em; color: var(--danger); }
 .msg-time { color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
 .timeline-user .msg-time { margin: 0 6px 3px 0; }
 .turn-duration { display: inline-flex; gap: 10px; margin: 10px 0 0; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
 .turn-stats { margin: 4px 0 0; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
-/* 思考与工具块在助手气泡底色上混入 4% 字色，与正文气泡区分层次。 */
-.activity-step, .reasoning-row { display: grid; width: fit-content; max-width: min(640px, 100%); margin: 10px 0 0; border-radius: 12px; border: 1px solid var(--assistant-bubble-border); background: color-mix(in srgb, var(--assistant-bubble-bg) 96%, var(--ink)); overflow: hidden; transition: background 120ms, border-color 120ms, width var(--disclosure-duration) var(--smooth); }
+/* 思考与工具行平时没有底色，左移 8px 让图标对齐气泡左缘；展开后整块用助手气泡底色。连续几行之间只留 2px。 */
+.activity-step, .reasoning-row { display: grid; width: fit-content; max-width: min(640px, 100%); margin: 10px 0 0 -8px; border-radius: 12px; overflow: hidden; transition: background var(--disclosure-duration) var(--smooth), width var(--disclosure-duration) var(--smooth); }
+.activity-step:has(> .activity-toggle[aria-expanded=true]) { background: var(--assistant-bubble-bg); }
+.timeline-item:is(.activity-step, .tool-group) + .timeline-item:is(.activity-step, .tool-group), .tool-group-items > .activity-step:first-child { margin-top: 2px; }
+.message-item > .activity-step { margin-left: 0; }
 /* 正文按展开后的宽度排版，避免宽度过渡中换行导致高度反复改变。 */
 .activity-step:has(> .activity-toggle[aria-expanded=true]) { width: 640px; }
 .activity-step > .content-disclosure { contain: inline-size; }
 .activity-step > .content-disclosure > div > .activity-expanded { width: min(640px, calc(100cqw - 4px)); }
-.activity-step:has(> .activity-toggle:hover), .reasoning-row:has(> .activity-toggle:hover) { background: color-mix(in srgb, var(--assistant-bubble-bg) 93%, var(--ink)); }
-.activity-toggle { display: flex; align-items: center; gap: 7px; min-width: 0; width: 100%; min-height: 30px; padding: 0 14px; border: 0; background: none; color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.6; text-align: left; cursor: pointer; }
+.activity-toggle { display: flex; align-items: center; gap: 7px; min-width: 0; width: 100%; min-height: 28px; padding: 0 8px; border: 0; border-radius: 8px; background: none; transition: background 120ms; color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.6; text-align: left; cursor: pointer; }
+button.activity-toggle:not([aria-disabled=true]):hover { background: var(--soft-fill); }
 .activity-toggle[aria-disabled=true] { cursor: default; }
-.tool-group { margin: 10px 0 0; min-width: 0; max-width: 100%; }
-.tool-group-toggle { width: fit-content; max-width: calc(100% - 24px); flex-wrap: wrap; height: auto; min-height: 30px; box-sizing: content-box; border: 1px solid var(--assistant-bubble-border); border-radius: 12px; background: color-mix(in srgb, var(--assistant-bubble-bg) 96%, var(--ink)); }
-.tool-group-toggle:hover { background: color-mix(in srgb, var(--assistant-bubble-bg) 93%, var(--ink)); }
+.tool-group { margin: 10px 0 0 -8px; min-width: 0; max-width: 100%; }
+.tool-group-toggle { width: fit-content; max-width: calc(100% - 24px); flex-wrap: wrap; height: auto; }
 .tool-group-items { display: grid; padding-left: 12px; }
 .step-label { display: inline-flex; align-items: center; flex: none; gap: 7px; }
 .step-title { flex: none; font-weight: 500; color: var(--ink); }
@@ -44,11 +47,11 @@
 .reasoning-summary.is-ticker { display: flex; justify-content: flex-end; text-overflow: clip; mask-image: linear-gradient(to right, transparent, #000 56px); }
 .reasoning-summary.is-ticker > span { flex: none; white-space: nowrap; }
 .reasoning-body { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.6; }
-.ok { color: var(--positive); }
+/* 成功是常态，对勾用灰色；只有失败和中断上色。 */
+.ok { color: var(--ink-faint); }
 .bad { color: var(--danger); }
-.activity-step.status-failed { border-color: transparent; background: var(--danger-soft); }
 .item-status { flex: none; color: var(--ink-faint); }
-.activity-expanded { padding: 0 14px 11px; min-width: 0; }
+.activity-expanded { padding: 2px 8px 8px; min-width: 0; }
 .activity-shimmer { background: linear-gradient(90deg, var(--ink-faint) 0%, var(--ink) 40%, var(--ink-faint) 80%) 0 0 / 200% 100%; background-clip: text; -webkit-background-clip: text; color: transparent; animation: shimmer 1.6s linear infinite; }
 .return-to-latest { position: absolute; left: calc(50% - var(--panel-space) / 2); bottom: calc(var(--composer-height, 150px) + 8px); z-index: 3; width: 36px; height: 36px; margin-left: -18px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 50%; background: color-mix(in srgb, var(--glass-base) 92%, transparent); box-shadow: var(--shadow-soft); color: var(--ink-soft); cursor: pointer; backdrop-filter: blur(10px); }
 .stream-char { animation: stream-in ease-out both; }
@@ -93,8 +96,8 @@
   overflow-x: auto;
   padding: 10px 12px;
   border: 0;
-  border-radius: 12px;
-  background: var(--surface-muted);
+  border-radius: 10px;
+  background: var(--inset);
   color: var(--ink);
 }
 
@@ -114,7 +117,7 @@
 .tool-line-number { min-width: 3.5em; padding-right: 1em; text-align: right; color: var(--ink-soft); user-select: none; flex-shrink: 0; }
 
 /* 行内代码沿用正文字体并采用极浅底色，避免句子中间频繁切等宽字体与深灰框造成割裂。 */
-.timeline-body :not(pre) > code { color: inherit; font-family: inherit; font-size: .95em; background: color-mix(in srgb, currentColor 5%, transparent); padding: 1px 5px; border: 0; border-radius: 4px; }
+.timeline-body :not(pre) > code { color: inherit; font-family: inherit; font-size: .95em; background: color-mix(in srgb, currentColor 7%, transparent); padding: 1px 5px; border: 0; border-radius: 4px; }
 
 .empty-state {
   max-width: 480px;
@@ -137,7 +140,7 @@
 }
 .empty-state .secondary-button { margin-top: 14px; }
 
-.code-block { margin: 10px 0; border-radius: 12px; overflow: hidden; background: var(--surface-muted); border: 0; }
+.code-block { margin: 10px 0; border-radius: 10px; overflow: hidden; background: var(--inset); border: 0; }
 .code-block-header { display: flex; align-items: center; justify-content: space-between; padding: 6px 6px 0 12px; color: var(--ink-faint); font-size: var(--meta-font-size); }
 /* Mermaid 图：居中显示，图比气泡宽时在图内横向滚动；右上角是菜单和放大按钮 */
 .mermaid-block { position: relative; margin: 8px -6px 2px; border-radius: 14px; background: var(--card); }
@@ -154,9 +157,8 @@
 .mermaid-diagram svg { display: block; height: auto; min-width: var(--diagram-min-width); margin: 0 auto; }
 .code-block pre { margin: 0; padding: 4px 12px 11px; overflow-x: auto; font: var(--block-font-size)/1.6 var(--font-mono); background: transparent; }
 .code-block code { background: none; padding: 0; font-size: inherit; }
-.activity-output { overflow: auto; font-family: var(--font-sans); font-size: var(--block-font-size); line-height: 1.65; overscroll-behavior: contain; max-height: 260px; border-radius: 10px; background: var(--surface-muted); border: 0; }
+.activity-output { overflow: auto; font-family: var(--font-sans); font-size: var(--block-font-size); line-height: 1.65; overscroll-behavior: contain; max-height: 260px; border-radius: 8px; background: var(--inset); border: 0; }
 .tool-duration { margin: 0 0 6px 2px; color: var(--ink-faint); line-height: 1.6; font-variant-numeric: tabular-nums; font-size: var(--meta-font-size); }
-.activity-output:has(.command-output) { background: var(--surface-muted); border: 0; }
 .command-output-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 10px 0 14px; color: var(--ink-faint); font: var(--block-font-size) var(--font-sans); }
 .command-output pre { white-space: pre; overflow: visible; }
 .timeline-body.activity-output :is(code, pre) { font: inherit; }

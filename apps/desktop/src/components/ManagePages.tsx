@@ -60,7 +60,7 @@ export function InstructionsPage() {
     } catch (error) { setError(error instanceof Error ? error.message : String(error)) }
     finally { setSaving(false) }
   }
-  return <PageFrame>
+  return <PageFrame title="自定义指令">
     <div className="instructions-layout">
       <nav className="instruction-targets" aria-label="指令范围" role="tablist">
         <button type="button" role="tab" disabled={saving} aria-selected={target === null} onClick={() => setTarget(null)}>全局</button>
@@ -131,7 +131,7 @@ function SkillsList({ root }: { root: string | null }) {
 
 function SkillCard({ skill, workspaceRoot }: { skill: SkillMetadata; workspaceRoot: string }) {
   return <button type="button" className="skill-card" onClick={() => appStore.openFile(skill.path, workspaceRoot, skill.name)}>
-    <strong>{skill.name}</strong><span>{skill.description}</span>
+    <strong>{skill.name}</strong><span className="skill-description">{skill.description}</span>
   </button>
 }
 

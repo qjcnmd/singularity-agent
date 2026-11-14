@@ -264,7 +264,6 @@ pub fn accumulate_request_usage(
     };
     usage.input_tokens += request_usage.input_tokens;
     usage.cached_input_tokens += request_usage.cached_input_tokens.unwrap_or(0);
-    usage.output_tokens += request_usage.output_tokens;
     usage.total_tokens += request_usage.total_tokens;
     usage.cache_usage_complete &= request_usage.cached_input_tokens.is_some();
     if let Some(ms) = observation.decode_ms
@@ -273,7 +272,6 @@ pub fn accumulate_request_usage(
         usage.decode_ms += ms;
         usage.decode_tokens += request_usage.output_tokens;
     }
-    usage.generation_ms += observation.duration_ms;
     usage.usage_present = true;
 }
 

@@ -9,7 +9,7 @@ textarea.input { resize: vertical; line-height: 1.5; font-family: var(--font-san
 
 /* 入场位移和异步内容会短暂改变溢出状态，固定滚动条占位以免居中页面横跳。 */
 .manage-scroll { flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; width: 100%; }
-.manage-page { width: 100%; max-width: 860px; margin: 0 auto; padding: 72px 36px 40px; }
+.manage-page { width: 100%; max-width: 760px; margin: 0 auto; padding: 72px 36px 40px; }
 .manage-page > header { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
 .skills-count { color: var(--ink-faint); font-size: 13px; font-variant-numeric: tabular-nums; }
 .skills-refresh { display: grid; place-items: center; flex: none; width: 32px; height: 32px; margin-left: auto; padding: 0; border: 0; border-radius: 8px; background: transparent; color: var(--ink-soft); cursor: pointer; transition: background 120ms, color 120ms; }
@@ -24,28 +24,27 @@ textarea.input { resize: vertical; line-height: 1.5; font-family: var(--font-san
 
 .manage-page:has(.instructions-layout) { min-height: 100%; display: flex; flex-direction: column; }
 .instructions-layout { flex: 1; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
-/* 范围选择为顶部横向页签：选中项底部一条深色指示线，其余浅灰；超出时才允许横向滚动 */
-.instruction-targets { display: flex; gap: 4px; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; }
+/* 范围选择是一排胶囊页签：选中项浅灰底，其余只有文字；超出时才允许横向滚动 */
+.instruction-targets { display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; }
 .instruction-targets::-webkit-scrollbar { display: none; }
-.instruction-targets button { flex: none; padding: 8px 12px; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; background: transparent; color: var(--ink-soft); font-size: 13.5px; font-weight: 400; cursor: pointer; transition: color 120ms, border-color 120ms; white-space: nowrap; }
-.instruction-targets button:hover:not(:disabled) { color: var(--ink); }
-.instruction-targets button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); font-weight: 500; }
+.instruction-targets button { flex: none; height: 30px; padding: 0 12px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-soft); font-size: 13.5px; font-weight: 400; cursor: pointer; transition: color 120ms, background 120ms; white-space: nowrap; }
+.instruction-targets button:hover:not(:disabled) { color: var(--ink); background: var(--soft-fill); }
+.instruction-targets button[aria-selected="true"] { color: var(--ink); background: var(--soft-fill-hover); }
 .instruction-targets button:disabled { cursor: default; opacity: .5; }
-.instruction-editor { flex: 1; display: flex; flex-direction: column; align-self: stretch; gap: 14px; min-width: 0; }
-.editor-path { color: var(--ink-faint); font: 12px var(--font-sans); overflow-wrap: anywhere; }
-.instruction-editor textarea { flex: 1; min-height: 320px; padding: 20px; border-color: var(--line); border-radius: 12px; font: 15.5px/1.85 var(--font-sans); }
+.instruction-editor { flex: 1; display: flex; flex-direction: column; align-self: stretch; gap: 10px; min-width: 0; }
+.editor-path { padding-left: 4px; color: var(--ink-faint); font: 12px var(--font-sans); overflow-wrap: anywhere; }
+/* 编辑区是一块浅灰底的纸，不描边；聚焦时只加一圈细环。 */
+.instruction-editor textarea { flex: 1; min-height: 320px; padding: 18px 20px; border: 0; border-radius: 14px; background: var(--sidebar); font: 14.5px/1.75 var(--font-sans); }
+.instruction-editor textarea:focus { box-shadow: 0 0 0 1px var(--glass-ring-focus); }
+.instruction-editor textarea:disabled { background: var(--sidebar); }
 .instruction-editor footer { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .instruction-save-notice { position: fixed; top: 24px; left: 0; right: 0; z-index: 30; display: flex; justify-content: center; pointer-events: none; }
 .instruction-save-notice > div { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--raised); box-shadow: var(--shadow-floating); color: var(--ink); font-size: 13.5px; }
 .instruction-save-notice svg { color: var(--positive); }
 
-/* 一整块细边列表，行间细线分隔 */
-.skill-list { display: grid; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
-.skill-list:empty { display: none; }
-.skill-card { display: grid; grid-template-rows: 20px 20px; gap: 2px; width: 100%; min-width: 0; height: 62px; padding: 11px 16px; border: 0; background: var(--canvas); color: var(--ink); font-size: 13.5px; line-height: 20px; text-align: left; cursor: pointer; transition: background 120ms; }
-.skill-card + .skill-card { box-shadow: inset 0 1px 0 var(--line); }
-.skill-card > :is(strong, span) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.skill-card strong { font-weight: 500; }
-.skill-card > span { color: var(--ink-faint); font-size: 13px; }
-.skill-card:hover { background: var(--fill-subtle); }
-.skill-card:focus-visible { outline-offset: -2px; }
+/* 技能是没有外框和分隔线的格子，够宽时排两列；每格名称一行、说明最多两行，悬停才有底色。左右外扩 12px，让文字和页面标题左对齐。 */
+.skill-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 2px 12px; margin: 0 -12px; }
+.skill-card { display: grid; grid-template-rows: 20px 36px; row-gap: 2px; min-width: 0; padding: 10px 12px; border: 0; border-radius: 12px; background: transparent; color: var(--ink); font-size: 13.5px; line-height: 20px; text-align: left; cursor: pointer; transition: background 120ms; }
+.skill-card strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.skill-description { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; color: var(--ink-faint); font-size: 12.5px; line-height: 18px; }
+.skill-card:hover { background: var(--soft-fill); }

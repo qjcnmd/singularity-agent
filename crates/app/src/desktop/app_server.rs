@@ -7,7 +7,6 @@ mod errors;
 mod shutdown;
 mod workspace;
 
-pub(super) use self::errors::invalid_request;
 use self::errors::*;
 
 use std::collections::HashMap;
@@ -17,12 +16,11 @@ use crate::runtime::{CatalogError, Conversation, ConversationError, ThreadCatalo
 use singularity_agent::agent::UserInput;
 use singularity_model::{ModelConfigManager, ProviderError};
 use singularity_protocol::{
-    AppBootstrap, ProviderConfigurationInput, RpcError, RpcErrorCode, SessionReadResult, StreamEnvelope,
-    StreamEvent,
+    AppBootstrap, ProviderConfigurationInput, RpcError, SessionReadResult, StreamEnvelope, StreamEvent,
 };
 use tokio::sync::mpsc;
 
-use super::workspace_store::{WorkspaceError, WorkspaceStore};
+use super::workspace_store::WorkspaceStore;
 
 /// 提交 RPC 在消息入队后返回；后续准备、保存和执行状态通过会话事件发布。
 pub struct AppServer {
@@ -107,7 +105,7 @@ impl AppServer {
         ) -> Result<singularity_protocol::RedactedModelCatalog, ProviderError>,
     ) -> Result<singularity_protocol::ModelCatalogResult, RpcError> {
         let _publication = self.lock_app_publication();
-        let catalog = update(&self.models).map_err(model_error)?;
+        let catalog = update(&self.models).map_err(RpcError::new)?;
         Ok(self.model_catalog_result(catalog))
     }
 
@@ -128,11 +126,8 @@ impl AppServer {
         api_key: Option<&str>,
     ) -> Result<Vec<String>, RpcError> {
         // 先取出本次查询用的密钥，网络请求期间不持有配置锁。
-        let api_key =
-            self.models.discovery_credential(provider_id, api_key).map_err(model_discovery_error)?;
-        singularity_model::discover_models(base_url, &api_key)
-            .await
-            .map_err(model_discovery_error)
+        let api_key = self.models.discovery_credential(provider_id, api_key).map_err(RpcError::new)?;
+        singularity_model::discover_models(base_url, &api_key).await.map_err(RpcError::new)
     }
 
     /// 收到第一条消息才创建任务；空白页在后端没有任务和日志文件。
@@ -149,7 +144,7 @@ impl AppServer {
             std::path::Path::new(&workspace.root),
             &self.home,
         )
-        .map_err(invalid_request)?;
+        .map_err(RpcError::new)?;
         let thread = self
             .catalog
             .create_thread(&workspace.root, params.selection, params.disabled_modules)

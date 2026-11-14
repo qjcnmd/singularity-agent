@@ -110,9 +110,9 @@ export function Settings() {
                         <span className={`credential${provider.credentialConfigured ? ' on' : ''}`}>{provider.credentialConfigured ? '已配置密钥' : '无密钥'}</span>
                         <ExpandChevron expanded={expanded} size={16} />
                       </button>
-                      <span className="sg-row-actions">
+                      {expanded && <span className="sg-row-actions">
                         <button type="button" className="quiet-button danger" disabled={busy} aria-label={`删除提供方 ${provider.displayName || provider.providerId}`} onClick={() => requestRemoval(provider)}>删除</button>
-                      </span>
+                      </span>}
                     </div>
                     <Disclosure open={expanded}>
                       <div id={`provider-editor-${provider.providerId}`}>

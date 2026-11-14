@@ -24,7 +24,6 @@ export function pendingKey(method: string, origin: string): string {
 
 
 export interface ActionError {
-  code: string
   message: string
 }
 
@@ -300,23 +299,15 @@ export class SessionStore {
   }
 
   protected reportError(error: unknown, origin: string): void {
-    const actionError = this.toActionError(error)
-    if (actionError.code !== 'unavailable') {
-      this.patch({
-        actionErrors: { ...this.state.actionErrors, [origin]: actionError },
-        actionErrorOrigin: origin,
-      })
-    }
+    if (error instanceof RpcFailure && error.unavailable) return
+    this.patch({
+      actionErrors: { ...this.state.actionErrors, [origin]: this.toActionError(error) },
+      actionErrorOrigin: origin,
+    })
   }
 
   private toActionError(error: unknown): ActionError {
-    if (error instanceof RpcFailure) {
-      return { code: error.code, message: error.message }
-    }
-    return {
-      code: 'internal',
-      message: error instanceof Error ? error.message : '发生了未知错误。',
-    }
+    return { message: error instanceof Error ? error.message : '发生了未知错误。' }
   }
 
   protected applySync(state: SyncState, progress = false): void {

@@ -11,8 +11,6 @@ pub(crate) const USER_CONFIG_FILE_NAME: &str = "config.json";
 /// 读取提供方响应时的空闲超时（秒）：每读到数据就重新计时，不限制长回复的总时长。
 /// 留出足够时间给模型在第一个增量之前思考，慢的推理模型不会被误判为网络故障。
 pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 300;
-pub(crate) const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
-pub(crate) const HTTP_STATUS_FORBIDDEN: u16 = 403;
 pub(crate) const HTTP_STATUS_REQUEST_TIMEOUT: u16 = 408;
 pub(crate) const HTTP_STATUS_CONFLICT: u16 = 409;
 pub(crate) const HTTP_STATUS_RATE_LIMITED: u16 = 429;

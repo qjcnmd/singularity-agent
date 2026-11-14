@@ -39,6 +39,31 @@ pub struct BackgroundTask {
     pub state: BackgroundTaskState,
 }
 
+/// 发给工作台的后台命令视图；含模型输出快照的完整数据按原样保存在会话日志。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct VisibleBackgroundTask {
+    pub task_id: String,
+    pub command: String,
+    pub description: String,
+    /// 输出的末尾部分；超长时附带完整输出文件的位置，与 bash 工具的结果相同。
+    pub output: String,
+    pub state: BackgroundTaskState,
+}
+
+impl From<BackgroundTask> for VisibleBackgroundTask {
+    fn from(task: BackgroundTask) -> Self {
+        Self {
+            task_id: task.task_id,
+            command: task.command,
+            description: task.description,
+            output: task.output,
+            state: task.state,
+        }
+    }
+}
+
 /// 命令的运行或结束状态；重启后历史中仍为运行中的命令显示为中断，不根据 PID 判断进程是否还在。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -64,5 +89,5 @@ impl BackgroundTaskState {
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundTaskUpdate {
     pub phase: crate::SessionPhase,
-    pub task: BackgroundTask,
+    pub task: VisibleBackgroundTask,
 }

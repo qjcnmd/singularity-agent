@@ -1,6 +1,6 @@
 .float-panel { position: absolute; top: 56px; right: 24px; z-index: 6; display: grid; gap: 10px; align-content: start; width: 264px; max-height: calc(100vh - 70px); overflow-y: auto; scrollbar-gutter: stable; padding: 2px; transform-origin: top right; }
-.float-card { min-width: 0; border: 1px solid color-mix(in srgb, var(--glass-base) 75%, transparent); border-radius: 16px; background: color-mix(in srgb, var(--glass-base) 80%, transparent); backdrop-filter: blur(22px) saturate(180%);
-  box-shadow: 0 0 0 .5px rgb(0 0 0 / 9%), 0 10px 28px -14px rgb(0 0 0 / 22%); }
+.float-card { min-width: 0; border-radius: 16px; background: color-mix(in srgb, var(--glass-base) 82%, transparent); backdrop-filter: blur(22px) saturate(180%);
+  box-shadow: 0 0 0 .5px var(--glass-ring), var(--glass-drop); }
 .float-card-head { display: flex; align-items: center; gap: 4px; width: 100%; height: 40px; padding: 0 12px; }
 .float-card-toggle { display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; background: none; text-align: left; cursor: pointer; }
 .float-card-head strong { font-weight: 500; }
@@ -29,14 +29,16 @@
 /* 运行状态面板只列本任务开着的模块，用和新建任务页一样的胶囊，尺寸小一号；这里只展示，点不动。 */
 .context-panel .capsules { display: flex; flex-wrap: wrap; gap: 5px; }
 .context-panel .capsule.capsule-static { height: 24px; padding: 0 8px; gap: 5px; border-radius: 12px; font-size: 11.5px; cursor: default; }
-.context-panel .capsule.capsule-static:hover, .context-panel .capsule.capsule-static:active { background: var(--assistant-bubble-bg); transform: none; }
+.context-panel .capsule.capsule-static:hover, .context-panel .capsule.capsule-static:active { background: var(--soft-fill); transform: none; }
 .context-panel .capsule-icon { width: 12px; height: 12px; }
 .context-panel .capsule-tokens { font-size: 10.5px; }
 
 .background-task { grid-template-columns: minmax(0, 1fr); width: 100%; max-width: 100%; margin: 0 0 8px; }
 .background-task:last-child { margin-bottom: 0; }
 .background-task-head { display: flex; align-items: center; min-width: 0; padding-left: 10px; }
-.background-task-head:has(.activity-toggle:hover) { background: color-mix(in srgb, var(--assistant-bubble-bg) 93%, var(--ink)); }
+.background-task-head { border-radius: 8px; transition: background 120ms; }
+.background-task-head:has(.activity-toggle:hover) { background: var(--soft-fill); }
+.background-task-head .activity-toggle:hover { background: none; }
 .background-task-head .activity-toggle { flex: 1; padding: 0 10px 0 3px; }
 .task-stop { display: grid; place-items: center; flex: none; width: 24px; height: 30px; padding: 0; border: 0; background: none; color: var(--ink-soft); cursor: pointer; }
 .task-stop:hover:not(:disabled) { color: var(--danger); }

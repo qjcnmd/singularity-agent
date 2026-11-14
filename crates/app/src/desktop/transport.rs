@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use singularity_protocol::{RpcRequest, RpcResponse, StreamEvent};
+use singularity_protocol::{RpcError, RpcRequest, RpcResponse, StreamEvent};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -35,7 +35,10 @@ pub async fn run(
     let result = async {
         write(
             &mut output,
-            &singularity_protocol::StreamEnvelope { revision: app.revision(), event: StreamEvent::Ready },
+            &singularity_protocol::StreamEnvelope {
+                revision: app.revision(),
+                event: StreamEvent::Ready,
+            },
         )
         .await?;
         loop {
@@ -49,7 +52,7 @@ pub async fn run(
                     requests.spawn(async move {
                         let response = match serde_json::from_str::<RpcRequest>(call.request.get()) {
                             Ok(request) => rpc::handle(&app, request, &shutdown).await,
-                            Err(error) => RpcResponse::Error { error: super::app_server::invalid_request(error.to_string()) },
+                            Err(error) => RpcResponse::Error { error: RpcError::new(error) },
                         };
                         Response { id: call.id, response }
                     });
@@ -66,7 +69,8 @@ pub async fn run(
             }
         }
         Ok(())
-    }.await;
+    }
+    .await;
     // EOF 或管道故障都结束接收；先取消目录查询、收齐已接受的修改，再停止会话。
     shutdown.cancel();
     while let Some(joined) = requests.join_next().await {

@@ -8,7 +8,7 @@ use singularity_agent::agent::{Agent, AgentConfig, AgentError, RequestContext, T
 use singularity_agent::session::{LedgerRecord, lock_writer, with_writer_async};
 use singularity_model::OpenAiProvider;
 
-use singularity_protocol::{Turn, TurnErrorDetail, TurnFailureCause, TurnStatus};
+use singularity_protocol::{Turn, TurnErrorDetail, TurnStatus};
 
 use super::Conversation;
 
@@ -91,11 +91,10 @@ impl Conversation {
             Err(AgentError::Aborted) => (TurnStatus::Interrupted, None),
             // 写日志失败时不再尝试写结束记录；读取历史时，没有结束记录的回合显示为中断。
             Err(error) => {
-                let detail = error.detail();
-                if detail.cause == TurnFailureCause::Store {
-                    return Err(detail);
+                if error.is_session_failure() {
+                    return Err(error.detail());
                 }
-                (TurnStatus::Failed, Some(detail))
+                (TurnStatus::Failed, Some(error.detail()))
             }
         };
         // 所有结果按同一顺序处理：关闭停止入口、保存结束记录、发布结束事件。
@@ -111,14 +110,10 @@ impl Conversation {
             Ok(timestamp) => timestamp,
             Err(storage_error) => {
                 let message = match error {
-                    Some(error) => format!("{error}; 保存执行结果失败：{storage_error}"),
+                    Some(error) => format!("{}; 保存执行结果失败：{storage_error}", error.message),
                     None => format!("保存执行结果失败：{storage_error}"),
                 };
-                return Err(TurnErrorDetail {
-                    cause: TurnFailureCause::Store,
-                    message,
-                    item_id: None,
-                });
+                return Err(TurnErrorDetail { message, item_id: None });
             }
         };
         let manually_stopped = crate::runtime::history::is_manually_stopped(turn_status, cancel_accepted);
@@ -211,7 +206,6 @@ impl Conversation {
 
 fn preparation_error(error: impl std::fmt::Display) -> TurnErrorDetail {
     TurnErrorDetail {
-        cause: TurnFailureCause::Internal,
         message: error.to_string(),
         item_id: None,
     }

@@ -1,6 +1,6 @@
 import { SelectionSlider } from './SelectionSlider'
 import { workspaceKey } from '../workspace'
-import { X, Minus, Plus, Folder, FolderOpen } from 'lucide-react'
+import { X, Minus, Plus, Folder, FolderOpen, SquarePen, FileText, Sparkles, Plug, Settings } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useId, useRef, useState } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
@@ -70,9 +70,9 @@ function SidebarView() {
         </header>
 
         <nav className="side-nav">
-          <button className={`nav-item${state.page === 'chat' && state.selectedSessionId === null ? ' is-active' : ''}`} type="button" onClick={() => appStore.newTask()}>新建任务</button>
-          {([{ page: 'instructions', label: '自定义指令' }, { page: 'skills', label: 'Skills' }, { page: 'mcp', label: 'MCP' }] as const).map(({ page, label }) =>
-            <button key={page} type="button" className={`nav-item${state.page === page ? ' is-active' : ''}`} onClick={() => appStore.setPage(page)}>{label}</button>)}
+          <button className={`nav-item${state.page === 'chat' && state.selectedSessionId === null ? ' is-active' : ''}`} type="button" onClick={() => appStore.newTask()}><SquarePen size={16} strokeWidth={1.5} aria-hidden="true" />新建任务</button>
+          {([{ page: 'instructions', label: '自定义指令', Icon: FileText }, { page: 'skills', label: 'Skills', Icon: Sparkles }, { page: 'mcp', label: 'MCP', Icon: Plug }] as const).map(({ page, label, Icon }) =>
+            <button key={page} type="button" className={`nav-item${state.page === page ? ' is-active' : ''}`} onClick={() => appStore.setPage(page)}><Icon size={16} strokeWidth={1.5} aria-hidden="true" />{label}</button>)}
         </nav>
         <section className="sidebar-section">
           <div className="section-heading">
@@ -130,7 +130,7 @@ function SidebarView() {
           </div>
         </section>
         <footer className="sidebar-footer">
-          <button type="button" className="nav-item" onClick={() => appStore.setSettingsOpen(true)}>设置</button>
+          <button type="button" className="nav-item" onClick={() => appStore.setSettingsOpen(true)}><Settings size={16} strokeWidth={1.5} aria-hidden="true" />设置</button>
         </footer>
       </div></aside>
       <SidebarDialog state={dialog} onClose={() => setDialog(current => current === dialog ? { kind: 'none' } : current)} />

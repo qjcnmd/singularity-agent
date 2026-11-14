@@ -7,11 +7,11 @@ use crate::error::{ModelErrorKind, ProviderError};
 use crate::types::ModelTurnResponse;
 
 pub(crate) fn provider_response_validation_error(message: &str, errors: Vec<String>) -> ProviderError {
-    ProviderError::diagnostic(ModelErrorKind::JsonSchemaViolation, message, errors)
+    ProviderError::diagnostic(ModelErrorKind::Other, message, errors)
 }
 
 pub(crate) fn provider_content_filter_error(message: &str) -> ProviderError {
-    ProviderError::new(ModelErrorKind::ContentFilter, message)
+    ProviderError::new(ModelErrorKind::Other, message)
 }
 
 /// 构造流式生成过程中的网络错误（对应 finish_reason 为 "network_error"）。

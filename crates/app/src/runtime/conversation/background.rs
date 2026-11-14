@@ -7,8 +7,8 @@ impl Conversation {
         &self.bash_tasks
     }
 
-    pub fn background_tasks(&self) -> Vec<singularity_protocol::BackgroundTask> {
-        self.bash_tasks.list()
+    pub fn background_tasks(&self) -> Vec<singularity_protocol::VisibleBackgroundTask> {
+        self.bash_tasks.list().into_iter().map(Into::into).collect()
     }
 
     pub(super) fn on_background_update(self: &Arc<Self>, update: singularity_agent::tools::BashTaskUpdate) {
@@ -21,7 +21,7 @@ impl Conversation {
                         session_id: self.thread_id.clone(),
                         payload: Box::new(singularity_protocol::BackgroundTaskUpdate {
                             phase: self.phase(),
-                            task,
+                            task: task.into(),
                         }),
                     });
                 }
@@ -36,7 +36,7 @@ impl Conversation {
                     session_id: self.thread_id.clone(),
                     payload: Box::new(singularity_protocol::BackgroundTaskUpdate {
                         phase: self.phase(),
-                        task,
+                        task: task.into(),
                     }),
                 });
                 self.publish_changed(&mut view);
@@ -53,11 +53,7 @@ impl Conversation {
         self.pause_background_resume();
         view.failure = Some(SessionFailure {
             source: SessionOperation::Turn,
-            error: singularity_protocol::TurnErrorDetail {
-                cause: singularity_protocol::TurnFailureCause::Store,
-                message,
-                item_id: None,
-            },
+            error: singularity_protocol::TurnErrorDetail { message, item_id: None },
         });
     }
     /// 保存失败后保留待处理的输入，停止当前操作并暂停自动继续；用户下一条消息恢复。

@@ -37,7 +37,7 @@ pub(crate) async fn execute_request(
 ) -> Result<(ModelTurnResponse, String, String), AgentError> {
     if request.max_output_tokens == 0 {
         return Err(AgentError::Provider(singularity_model::ProviderError::new(
-            ModelErrorKind::InvalidRequest,
+            ModelErrorKind::Other,
             "当前输入已占满模型上下文，无法生成回复。请缩短指令、工具定义或消息，或选择上下文更大的模型。",
         )));
     }

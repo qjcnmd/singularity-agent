@@ -1,9 +1,9 @@
 //! 工作台 RPC 的适配层：每个方法只分发一次，阻塞操作进入工作线程。
-use super::app_server::{AppServer, invalid_request};
+use super::app_server::AppServer;
 use super::file_view::read_text_file;
 use serde::Serialize;
 use serde_json::Value;
-use singularity_protocol::{RpcError, RpcErrorCode, RpcRequest, RpcResponse};
+use singularity_protocol::{RpcError, RpcRequest, RpcResponse};
 use std::sync::Arc;
 
 pub async fn handle(
@@ -25,7 +25,7 @@ async fn dispatch(
     match request {
         RpcRequest::McpReconnect(params) => {
             let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
-            let inspect = async { app.mcp.reconnect(&params.server_id, &cwd).await.map_err(invalid_request) };
+            let inspect = async { app.mcp.reconnect(&params.server_id, &cwd).await.map_err(RpcError::new) };
             value(unless_shutdown(shutdown, inspect).await?)
         }
         RpcRequest::ModelDiscover(params) => {
@@ -39,7 +39,7 @@ async fn dispatch(
         RpcRequest::WorkspaceRemove(params) => value(app.remove_workspace(&params.workspace_root).await?),
         RpcRequest::SessionDelete(params) => value(app.delete_session(&params.session_id).await?),
         RpcRequest::SessionContext(params) => value(app.inspect_context(&params.session_id, shutdown).await?),
-        RpcRequest::DirectoryPick(_) => Err(invalid_request("目录选择由 Electron 处理。")),
+        RpcRequest::DirectoryPick(_) => Err(RpcError::new("目录选择由 Electron 处理。")),
         RpcRequest::AppBootstrap(_) => blocking(move || app.bootstrap()).await,
         RpcRequest::SkillsList(params) => blocking(move || app.skills(&params.workspace_root)).await,
         RpcRequest::InstructionsRead(params) => {
@@ -60,21 +60,21 @@ async fn dispatch(
         RpcRequest::McpList(params) => {
             blocking(move || {
                 let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
-                app.mcp.list(&cwd).map_err(invalid_request)
+                app.mcp.list(&cwd).map_err(RpcError::new)
             })
             .await
         }
         RpcRequest::McpSave(params) => {
             blocking(move || {
                 let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
-                app.mcp.save(params.server, &cwd).map_err(invalid_request)
+                app.mcp.save(params.server, &cwd).map_err(RpcError::new)
             })
             .await
         }
         RpcRequest::McpRemove(params) => {
             blocking(move || {
                 let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
-                app.mcp.remove(&params.server_id, &cwd).map_err(invalid_request)
+                app.mcp.remove(&params.server_id, &cwd).map_err(RpcError::new)
             })
             .await
         }
@@ -118,7 +118,7 @@ async fn unless_shutdown<T>(
 ) -> Result<T, RpcError> {
     tokio::select! {
         result = work => result,
-        () = shutdown.cancelled() => Err(RpcError::new(RpcErrorCode::Internal, "工作台正在退出。")),
+        () = shutdown.cancelled() => Err(RpcError::new("工作台正在退出。")),
     }
 }
 

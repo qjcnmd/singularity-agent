@@ -91,7 +91,7 @@ fn chat_reasoning_detail_text_field(detail: &serde_json::Map<String, Value>) -> 
 /// 未识别的 finish_reason：保留截断后的原始词形，不猜它的含义。
 fn provider_chat_finish_reason_unsupported(reason: &str) -> ProviderError {
     ProviderError::diagnostic(
-        ModelErrorKind::JsonSchemaViolation,
+        ModelErrorKind::Other,
         "provider Chat response reported an unsupported finish reason",
         vec![format!(
             "finish_reason={}",

@@ -14,12 +14,12 @@ struct RegistryFile {
     workspaces: Vec<Workspace>,
 }
 
-/// 输入无效、项目不存在、保存失败三类错误；RPC 入口据此返回错误码和原因。
+/// 输入无效、项目不存在、保存失败三类错误；RPC 入口直接返回原因。
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
     #[error("{0}")]
     InvalidInput(String),
-    #[error("项目不存在。")]
+    #[error("项目不存在或已移除。")]
     NotFound,
     #[error("failed to update workspace registry {}: {source}", path.display())]
     Storage {

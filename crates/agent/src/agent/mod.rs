@@ -71,14 +71,12 @@ pub enum AgentError {
 }
 
 impl AgentError {
-    /// 普通执行和轮换共用的失败分类；日志写入失败归为 Store，此时不能再保存结束记录。
-    pub fn cause(&self) -> singularity_protocol::TurnFailureCause {
-        use singularity_protocol::TurnFailureCause as Cause;
+    /// 日志写入失败时不能再保存结束记录；轮换内部的写入失败同样算。
+    pub fn is_session_failure(&self) -> bool {
         match self {
-            Self::Provider(_) | Self::OutputTruncated => Cause::Provider,
-            Self::Session(_) => Cause::Store,
-            Self::Context(_) | Self::Aborted | Self::InvalidContextRotation(_) => Cause::Internal,
-            Self::ContextRotation { source, .. } => source.cause(),
+            Self::Session(_) => true,
+            Self::ContextRotation { source, .. } => source.is_session_failure(),
+            _ => false,
         }
     }
 
@@ -88,11 +86,7 @@ impl AgentError {
             Self::ContextRotation { item_id, .. } => Some(item_id.clone()),
             _ => None,
         };
-        singularity_protocol::TurnErrorDetail {
-            cause: self.cause(),
-            message: self.to_string(),
-            item_id,
-        }
+        singularity_protocol::TurnErrorDetail { message: self.to_string(), item_id }
     }
 }
 

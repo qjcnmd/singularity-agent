@@ -6,12 +6,12 @@ import type {
 } from './protocol'
 
 export class RpcFailure extends Error {
-  readonly code: string
+  readonly unavailable: boolean
 
-  constructor(code: string, message: string) {
+  constructor(message: string, unavailable = false) {
     super(message)
     this.name = 'RpcFailure'
-    this.code = code
+    this.unavailable = unavailable
   }
 }
 
@@ -68,11 +68,11 @@ export class RpcClient {
       envelope = await window.singularity.rpc({ method, params })
     } catch {
       this.setStatus('recovering')
-      throw new RpcFailure('unavailable', '工作台后端不可用。')
+      throw new RpcFailure('工作台后端不可用。', true)
     }
     if (envelope.type === 'error') {
       const error = envelope.error
-      throw new RpcFailure(error.code, error.message)
+      throw new RpcFailure(error.message)
     }
     return envelope.result
   }

@@ -1,4 +1,4 @@
-import { X } from 'lucide-react'
+import { Pencil, Plus, Trash2, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { appStore } from '../appStore'
 import { formatTokenCount } from '../copy'
@@ -104,8 +104,8 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
               <ExpandChevron expanded={open} size={16} />
             </button>
             <span className="sg-row-actions">
-              <button type="button" className="quiet-button" disabled={busy || loading} aria-label={`编辑 MCP ${server.serverId}`} onClick={() => { setError(null); setEditor(server) }}>编辑</button>
-              <button type="button" className="quiet-button danger" disabled={busy || loading} aria-label={`删除 MCP ${server.serverId}`} onClick={() => { setError(null); setRemoving(server) }}>删除</button>
+              <button type="button" className="icon-button small" disabled={busy || loading} aria-label={`编辑 MCP ${server.serverId}`} title="编辑" onClick={() => { setError(null); setEditor(server) }}><Pencil size={14} strokeWidth={1.6} aria-hidden="true" /></button>
+              <button type="button" className="icon-button small danger" disabled={busy || loading} aria-label={`删除 MCP ${server.serverId}`} title="删除" onClick={() => { setError(null); setRemoving(server) }}><Trash2 size={14} strokeWidth={1.6} aria-hidden="true" /></button>
             </span>
           </div>
           <Disclosure open={open}><div id={`mcp-tools-${server.serverId}`} className="mcp-tools">
@@ -118,7 +118,7 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
       })}
       {!loading && !error && servers.length === 0 && <p className="sg-provider-empty">尚未配置 MCP 服务器。</p>}
     </div>
-    <button type="button" className="sg-add-card-btn" disabled={busy || loading} onClick={() => { setError(null); setEditor('new') }}>＋ 添加 MCP</button>
+    <button type="button" className="sg-add-card-btn" disabled={busy || loading} onClick={() => { setError(null); setEditor('new') }}><Plus size={15} strokeWidth={1.7} aria-hidden="true" />添加 MCP</button>
     <Dialog open={editor !== null} onClose={() => { if (!busy) setEditor(null) }} labelledBy="mcp-editor-title" className="mcp-editor-modal">
       <header className="modal-header"><h2 id="mcp-editor-title">{editor === 'new' ? '添加 MCP' : '编辑 MCP'}</h2><button type="button" className="icon-button" aria-label="关闭" disabled={busy} onClick={() => setEditor(null)}><X size={18} /></button></header>
       {editor !== null && <McpEditor key={editor === 'new' ? 'new' : editor.serverId} server={editor === 'new' ? undefined : editor} onCancel={() => setEditor(null)} busy={busy} error={error} onSave={async server => {

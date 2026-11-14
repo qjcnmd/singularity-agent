@@ -143,7 +143,7 @@ fn provider_responses_stream_malformed_error(reason: &'static str) -> ProviderEr
 
 fn provider_responses_stream_terminal_missing_error() -> ProviderError {
     ProviderError::new(
-        ModelErrorKind::JsonSchemaViolation,
+        ModelErrorKind::Other,
         "provider Responses stream did not contain a completed terminal",
     )
 }

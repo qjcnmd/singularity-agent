@@ -5,22 +5,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::params::Turn;
 
-/// 失败的分类和原因；message 不含密钥等认证信息。
+/// 失败原因；message 不含密钥等认证信息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TurnErrorDetail {
-    pub cause: TurnFailureCause,
     pub message: String,
     /// 已经显示了这次失败的条目 ID（如轮换条目），界面据此避免重复报错。
     #[serde(rename = "itemId", default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub item_id: Option<String>,
-}
-
-impl std::fmt::Display for TurnErrorDetail {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{} ({})", self.message, self.cause)
-    }
 }
 
 /// Agent 发出、工作台接收的执行事件；回合 ID 在外层 TurnEventEnvelope 上。
@@ -80,24 +73,4 @@ pub enum ProviderAttemptStatus {
     Ok,
     Error,
     Cancelled,
-}
-
-/// 失败来源：写日志失败、提供方错误或内部错误。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum TurnFailureCause {
-    Store,
-    Provider,
-    Internal,
-}
-
-impl std::fmt::Display for TurnFailureCause {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Store => "store",
-            Self::Provider => "provider",
-            Self::Internal => "internal",
-        })
-    }
 }

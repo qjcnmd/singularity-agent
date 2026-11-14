@@ -91,6 +91,8 @@ cargo run -p singularity_protocol --features typescript --example export_types
 
 ## 4. 现场验证
 
+从自动化进程（Devin 等 Electron 宿主）启动打包产物前，先清掉环境变量 `ELECTRON_RUN_AS_NODE`：宿主把它注入子进程环境，会让 exe 以 Node 模式运行、不带脚本时立即静默退出（退出码 0），表现为"启动不了"。真实用户从资源管理器双击不受影响。
+
 功能完成后，在构建后的 Electron 工作台中实际操作本次改动涉及的功能。按影响检查结果、出错、停止、重复操作和重读历史后的表现，只检查受影响部分。数据目录、模型调用等约定见[仓库指令](../AGENTS.md#验证环境与交付)。
 
 公式渲染和样式共用 `apps/desktop/package.json` 中指定的 KaTeX 版本；Mermaid 图同样固定版本，更新时检查流程图、时序图、语法错误的图和横向很宽的图；同时在系统“减少动态效果”开启时检查一次（Playwright 默认按未开启模拟，需设 `reducedMotion: 'reduce'`），这时全局过渡样式会让刚改的尺寸读回旧值。`overrides` 同时约束 Markdown 插件的传递依赖。更新时检查行内公式、独立公式、矩阵和错误公式。

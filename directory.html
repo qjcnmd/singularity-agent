@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>crates/ 结构</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 32px 24px 56px;
+  background: #ffffff;
+  color: #1f2328;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+}
+.markdown-body {
+  max-width: 1120px;
+  margin: 0 auto;
+}
+h2 {
+  margin: 0 0 16px;
+  padding-bottom: 0.3em;
+  font-size: 1.5em;
+  font-weight: 600;
+  border-bottom: 1px solid #d1d9e0;
+}
+pre {
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
+  font-size: 13px;
+  line-height: 1.45;
+  color: #1f2328;
+  background-color: #f6f8fa;
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, "Microsoft YaHei", monospace;
+}
+.c {
+  color: #59636e;
+}
+</style>
+</head>
+<body>
+<article class="markdown-body">
+  <h2>crates/ 结构</h2>
+  <pre>crates/
+├── protocol/                                             <span class="c"># RPC 契约：前后端共享的类型定义（12 .rs）</span>
+│   ├── examples/                                         <span class="c"># 命令行导出前端 TypeScript 契约</span>
+│   │   └── export_types.rs                               <span class="c"># 运行导出 protocol.generated.ts 到 apps/desktop/src/</span>
+│   │       └── main() (L3)                               <span class="c"># 调用 singularity_protocol::export_rpc_types()</span>
+│   └── src/                                              <span class="c"># 共享契约定义（11 文件）</span>
+│       ├── lib.rs                                        <span class="c"># re-export 全部 DTO 模块及 RpcRequest / rpc_contract</span>
+│       ├── rpc.rs                                        <span class="c"># 前后端 JSON-RPC 方法总表与 17 个请求参数体</span>
+│       │   ├── RpcRequest (L146)                         <span class="c"># Workspace/Session/Model/Mcp/Skill 全方法分发</span>
+│       │   ├── EmptyParams (L9)                          <span class="c"># 无参 RPC 请求</span>
+│       │   ├── WorkspaceAddParams (L22)                  <span class="c"># 新增工作区路径参数</span>
+│       │   ├── SessionStartParams (L95)                  <span class="c"># 新任务初始化与禁用上下文模块参数</span>
+│       │   ├── SessionTextParams (L109)                  <span class="c"># 已有任务继续发送文本与附件参数</span>
+│       │   ├── ProviderSaveParams (L60)                  <span class="c"># 保存模型提供方与变体配置参数</span>
+│       │   └── DiscoverModelsParams (L77)                <span class="c"># 在线拉取提供方 /models 请求参数</span>
+│       ├── typescript.rs                                 <span class="c"># Rust → TypeScript 类型声明编译器</span>
+│       │   ├── Bindings (L9)                             <span class="c"># collect &amp; visit 收集 RpcRequest 及关联 DTO</span>
+│       │   └── client_types() (L41)                      <span class="c"># 生成 RpcMethod / RpcParams / RpcResult</span>
+│       ├── app.rs                                        <span class="c"># 工作台引导、会话列表、运行时状态与流信封 DTO</span>
+│       │   ├── AppBootstrap (L190)                       <span class="c"># 启动首包：工作区、摘要、脱敏目录与 revision</span>
+│       │   ├── SessionReadResult (L203)                  <span class="c"># 单任务完整历史与运行时状态结果</span>
+│       │   ├── Workspace (L13)                           <span class="c"># 已注册工作区路径与规范 key</span>
+│       │   ├── ThreadSummary (L20)                       <span class="c"># 左侧任务列表条目摘要与运行阶段</span>
+│       │   ├── SessionPhase (L42)                        <span class="c"># Idle / Running / ContextRotating / Stopping</span>
+│       │   ├── TurnEventEnvelope (L53)                   <span class="c"># 带严格递增序号的流式事件信封</span>
+│       │   ├── SessionRuntime (L112)                     <span class="c"># 活跃回合、后台任务与挂起提问快照</span>
+│       │   ├── ContextUsage (L127)                       <span class="c"># 当前上下文 token 占用与容量比例</span>
+│       │   ├── RedactedModelCatalog (L161)               <span class="c"># 隐藏真实 api_key 后的下发模型目录</span>
+│       │   └── RpcError (L216)                           <span class="c"># JSON-RPC 结构化错误码与诊断信息</span>
+│       ├── params.rs                                     <span class="c"># 公开历史条目、回合与累计用量口径</span>
+│       │   ├── HistoryItem (L102)                        <span class="c"># 正文 / 思考 / 工具 / 轮换 / 错误投影项</span>
+│       │   ├── id() (L153)                               <span class="c"># HistoryItem 与实时流严格同源的条目 ID</span>
+│       │   ├── ThreadTurn (L168)                         <span class="c"># 按 operation_started 切分的公开用户回合</span>
+│       │   ├── TurnStatus (L225)                         <span class="c"># Completed / Interrupted / Failed 回合终态</span>
+│       │   ├── ModelUsage (L19)                          <span class="c"># 单次模型请求 token / TTFT / 缓存命中统计</span>
+│       │   ├── SessionModelUsage (L203)                  <span class="c"># 整条会话累计输入/输出/缓存用量</span>
+│       │   ├── ToolResult (L66)                          <span class="c"># 工具输出、图片附件与 unified diff 结果</span>
+│       │   └── ReadSource (L55)                          <span class="c"># Read 工具读取的文件起止行号范围</span>
+│       ├── event.rs                                      <span class="c"># 单回合运行期推送给前端的事件</span>
+│       │   ├── TurnEvent (L23)                           <span class="c"># 文本/思考增量、尝试状态、工具与提问流事件</span>
+│       │   ├── ProviderAttemptStatus (L72)               <span class="c"># 模型请求重试与回退进度通知</span>
+│       │   └── TurnErrorDetail (L11)                     <span class="c"># 回合失败错误分类与诊断详情</span>
+│       ├── background.rs                                 <span class="c"># 后台命令可见状态与增量更新 DTO</span>
+│       │   ├── CommandOutputSnapshot (L9)                <span class="c"># 命令输出尾部字节快照与溢写路径</span>
+│       │   ├── BackgroundTask (L32)                      <span class="c"># 后端内部后台命令完整状态（含内部游标）</span>
+│       │   ├── VisibleBackgroundTask (L46)               <span class="c"># 剥离内部字段后下发前端的安全任务视图</span>
+│       │   └── BackgroundTaskState (L71)                 <span class="c"># Running / Stopping / Exited / Interrupted</span>
+│       ├── question.rs                                   <span class="c"># ask_user_question 工具与前端提问 DTO</span>
+│       │   ├── PendingQuestion (L28)                     <span class="c"># 当前挂起等待用户回答的题组快照</span>
+│       │   ├── UserQuestion (L16)                        <span class="c"># 单个问题与可选项定义</span>
+│       │   └── QuestionAnswerParams (L48)                <span class="c"># 前端回传的答案提交参数</span>
+│       ├── image.rs                                      <span class="c"># 图片上传与已落盘附件索引 DTO</span>
+│       │   ├── ImageAttachment (L7)                      <span class="c"># 已落盘附件 id 与 MIME 元数据</span>
+│       │   └── ImageUpload (L19)                         <span class="c"># 前端上传的 data URL 图片载体</span>
+│       ├── mcp.rs                                        <span class="c"># MCP 传输配置、工具列表与连接状态 DTO</span>
+│       │   ├── McpTransportConfig (L10)                  <span class="c"># Stdio 子进程 / HTTP 远程传输配置</span>
+│       │   ├── McpServerInput (L30)                      <span class="c"># 前端提交与脱敏回显的 MCP 服务配置</span>
+│       │   ├── McpConnectionStatus (L73)                 <span class="c"># Connected / Failed / AuthRequired 状态</span>
+│       │   └── McpServerState (L84)                      <span class="c"># 单个 MCP 服务状态、工具列表与错误详情</span>
+│       └── inspection.rs                                 <span class="c"># 技能目录、文档读写与上下文预览胶囊 DTO</span>
+│           ├── InjectedContext (L42)                     <span class="c"># 本轮实际或预览注入的上下文总览</span>
+│           ├── ContextModule (L50)                       <span class="c"># 单个上下文模块开关状态与 token 估算</span>
+│           ├── ContextGroup (L67)                        <span class="c"># Core / Instructions / Skills / Mcp 分组</span>
+│           ├── SkillMetadata (L9)                        <span class="c"># 技能名称、路径、作用域与简介元数据</span>
+│           └── SkillCatalog (L27)                        <span class="c"># 工作区下发现的技能清单</span>
+│
+├── core/                                                 <span class="c"># 基础设施：数据目录与项目资源（6 .rs）</span>
+│   └── src/                                              <span class="c"># 底层公共工具集（6 文件）</span>
+│       ├── lib.rs                                        <span class="c"># 原子写文件、Token 估算与时间路径工具</span>
+│       │   ├── write_bytes_atomic() (L77)                <span class="c"># 同目录临时文件 + flush/sync 原子替换</span>
+│       │   ├── write_json_atomic() (L67)                 <span class="c"># 先序列化再调用 write_bytes_atomic 写盘</span>
+│       │   ├── estimate_tokens_of() (L22)                <span class="c"># UTF-16 字符数 / 4 向上取整（全仓统一）</span>
+│       │   ├── now_iso() (L31)                           <span class="c"># 生成 UTC ISO8601 时间戳</span>
+│       │   └── display_path() (L50)                      <span class="c"># 去掉 Windows \?\ 长路径前缀用于展示</span>
+│       ├── tool.rs                                       <span class="c"># ToolDefinition 与 Token 估算</span>
+│       │   ├── ToolDefinition (L8)                       <span class="c"># 内置与 MCP 工具共用 Schema 定义</span>
+│       │   └── estimate_tool_tokens() (L15)              <span class="c"># 工具名、描述与参数 Schema 预估 token</span>
+│       ├── user_home.rs                                  <span class="c"># ~/.singularity 或 SINGULARITY_HOME 定位</span>
+│       │   ├── resolve_home() (L15)                      <span class="c"># 优先 SINGULARITY_HOME，回退 ~/.singularity</span>
+│       │   └── validated_root() (L40)                    <span class="c"># 拒绝空白或相对路径数据根目录</span>
+│       ├── workspace.rs                                  <span class="c"># 项目目录规范化与 Git 根查找</span>
+│       │   ├── CanonicalWorkspacePath (L10)              <span class="c"># 维护显示路径与小写规范键 key() (L37)</span>
+│       │   ├── canonicalize_workspace() (L71)            <span class="c"># 规范化项目路径</span>
+│       │   └── project_root() (L85)                      <span class="c"># 沿父目录向上查找 .git 根目录</span>
+│       ├── project_instructions.rs                       <span class="c"># AGENTS.md 分层收集加载</span>
+│       │   ├── load_agent_instructions() (L9)            <span class="c"># 按 全局-&gt;project_root-&gt;cwd 读 AGENTS.md</span>
+│       │   ├── InstructionFile (L41)                     <span class="c"># 指令文件路径、作用域来源与正文</span>
+│       │   └── instruction_directories() (L48)           <span class="c"># 列出按优先级排序的指令搜索目录</span>
+│       └── skills.rs                                     <span class="c"># SKILL.md 发现与全文按需读取</span>
+│           ├── SkillCatalog (L38)                        <span class="c"># discover(L103) 去重；model_skills(L181) 滤禁用</span>
+│           ├── Skill (L13)                               <span class="c"># load_instructions() (L23) 仅调用时读正文</span>
+│           └── discover_skill() (L58)                    <span class="c"># 解析 SKILL.md YAML frontmatter 元数据</span>
+│
+├── model/                                                <span class="c"># 模型配置、内部消息类型与协议编解码（27 .rs）</span>
+│   └── src/                                              <span class="c"># 模型层源码</span>
+│       ├── lib.rs                                        <span class="c"># 端点路径、默认超时与 HTTP 状态常量（L7-L16）</span>
+│       ├── error.rs                                      <span class="c"># 4 类错误分类；bounded_provider_error_diagnostic() (L157)</span>
+│       │   ├── ModelErrorKind (L6)                       <span class="c"># Cancelled / Temporary / ContextLengthExceeded</span>
+│       │   ├── ProviderError (L17)                       <span class="c"># is_context_overflow(L52) / is_retryable(L56)</span>
+│       │   ├── provider_error_kind_for_code() (L136)     <span class="c"># 按错误码识别上下文超限与可重试错误</span>
+│       │   ├── for_http_status() (L146)                  <span class="c"># 408 / 409 / 429 / 5xx 判 Temporary</span>
+│       │   └── append_provider_http_diagnostic() (L117)  <span class="c"># 从响应体抽取可读 HTTP 错误片段</span>
+│       ├── config/                                       <span class="c"># config.json 读写、选择解析与模型探测（6 文件）</span>
+│       │   ├── mod.rs                                    <span class="c"># validate_base_url(L37) / validate_provider_value(L28)</span>
+│       │   ├── manager.rs                                <span class="c"># ModelConfigManager：config.json 单一读写管理器</span>
+│       │   │   ├── ModelConfigManager (L29)              <span class="c"># open / resolve / validate / redacted_catalog</span>
+│       │   │   ├── save_provider() (L97)                 <span class="c"># 锁内原子替换；空 key 留旧值并清失效选中</span>
+│       │   │   ├── remove_provider() (L51)               <span class="c"># 移除提供方并回退无效默认选择</span>
+│       │   │   ├── model_definitions() (L139)            <span class="c"># Responses 模式自动清理 Chat 专属字段</span>
+│       │   │   └── discovery_credential() (L64)          <span class="c"># 提取在线 /models 探测凭据</span>
+│       │   ├── schema.rs                                 <span class="c"># 配置结构、思考 wire 格式与档位校验</span>
+│       │   │   ├── validate_identifier() (L7)            <span class="c"># 校验 provider_id 与 model_id 合法字符</span>
+│       │   │   ├── parse_thinking_wire_format() (L15)    <span class="c"># 解析各协议思考字段 wire 格式</span>
+│       │   │   └── validate_reasoning_variants() (L49)   <span class="c"># 校验可用推理档位，拒绝空档位列表</span>
+│       │   ├── selection.rs                              <span class="c"># 选中 ID → 完整 OpenAiProviderConfig + SelectedModel</span>
+│       │   │   ├── OpenAiProviderConfig (L5)             <span class="c"># 解码后的提供方 URL、密钥与协议参数</span>
+│       │   │   ├── SelectedModel (L11)                   <span class="c"># 当前选中模型实例及有效变体参数</span>
+│       │   │   └── resolve_model_selection() (L21)       <span class="c"># 缺失配置或无有效变体直接报错</span>
+│       │   ├── discovery.rs                              <span class="c"># 向提供方 /models 查询可用模型列表</span>
+│       │   │   ├── discover() (L13)                      <span class="c"># 用表单凭据在线查 /models，不读盘不改配置</span>
+│       │   │   ├── discovery_transport_error() (L47)     <span class="c"># 统一处理探测超时、取消与连接失败</span>
+│       │   │   └── discovery_http_error() (L82)          <span class="c"># 先收错误体再剥离敏感 URL 查询参数</span>
+│       │   └── user/                                     <span class="c"># 用户级 config.json JSON 文件读写</span>
+│       │       └── mod.rs                                <span class="c"># BTreeMap 有序反序列化；UserConfigProvider (L23)</span>
+│       │           ├── UserConfigFile (L14)              <span class="c"># 用户级 config.json 根序列化结构</span>
+│       │           └── UserConfigModel (L36)             <span class="c"># 单模型配置（上下文/输出/思考 wire 字段）</span>
+│       ├── types/                                        <span class="c"># 提供方无关的统一消息、工具与思考元数据（6 文件）</span>
+│       │   ├── mod.rs                                    <span class="c"># re-export Message / Request / Response / Tool / Reasoning</span>
+│       │   ├── message.rs                                <span class="c"># 全仓统一对话消息模型（请求/日志/历史同源）</span>
+│       │   │   ├── Message (L35)                         <span class="c"># User / Developer / Assistant / ToolResult</span>
+│       │   │   ├── ContentBlock (L15)                    <span class="c"># Text / Image / Reasoning 内容块枚举</span>
+│       │   │   └── text_for_display() (L90)              <span class="c"># UI 显首段原文，模型端附技能与文件路径</span>
+│       │   ├── request.rs                                <span class="c"># ModelTurnRequest (L6)：单轮请求 messages / tools</span>
+│       │   ├── response.rs                               <span class="c"># ModelStopReason (L7) / ModelTurnResponse (L17)</span>
+│       │   ├── tool.rs                                   <span class="c"># ModelToolCall (L10)：工具 call id + 名称 + 参数 JSON</span>
+│       │   └── reasoning.rs                              <span class="c"># 提供方私有思考内容同源续接校验</span>
+│       │       └── is_for_model() (L49)                  <span class="c"># 仅同源 provider/model/url 才回传思考块</span>
+│       ├── provider/                                     <span class="c"># Provider 流事件与响应终检（2 文件）</span>
+│       │   ├── mod.rs                                    <span class="c"># enum ProviderStreamEvent (L7)：底层增量事件抽象</span>
+│       │   └── contract.rs                               <span class="c"># finalize_provider_response() (L23)：终态与 ID 校验</span>
+│       ├── transport/                                    <span class="c"># HTTP 连接池单例与 SSE 切帧器（3 文件）</span>
+│       │   ├── mod.rs                                    <span class="c"># re-export http 与 stream 模块</span>
+│       │   ├── http.rs                                   <span class="c"># 全局复用 reqwest 客户端、Retry-After 与取消竞速</span>
+│       │   │   ├── provider_client() (L45)               <span class="c"># rustls-ring 全局 reqwest 客户端单例</span>
+│       │   │   ├── retry_after_delay() (L13)             <span class="c"># 解析秒数或 HTTP 日期格式 Retry-After</span>
+│       │   │   └── provider_future() (L79)               <span class="c"># 与 CancellationToken select! 即时中止</span>
+│       │   └── stream.rs                                 <span class="c"># 跨 chunk SSE 帧解码与异步读取循环</span>
+│       │       ├── SseFrameDecoder (L12)                 <span class="c"># 剥 BOM、折叠 CRLF、拼跨块 UTF-8 与 data</span>
+│       │       ├── SseStreamDecoder (L88)                <span class="c"># 各协议 SSE 事件解码 trait</span>
+│       │       └── read_sse_stream() (L100)              <span class="c"># 逐帧读取流并驱动解码器与取消检查</span>
+│       └── openai/                                       <span class="c"># Chat Completions 与 Responses 双协议编解码（8 文件）</span>
+│           ├── provider.rs                               <span class="c"># OpenAiProvider：协议分发与 HTTP 错误映射</span>
+│           │   └── OpenAiProvider (L23)                  <span class="c"># complete_stream() (L58) 发起流</span>
+│           ├── mod.rs                                    <span class="c"># message_metadata_for (L21) / reasoning_wire_decision (L37)</span>
+│           ├── wire.rs                                   <span class="c"># ThinkingWireFormat (L5) 与 chat/responses/models 端点拼接</span>
+│           ├── parse.rs                                  <span class="c"># parse_tool_arguments() (L21) / parse_usage() (L25)</span>
+│           ├── chat.rs                                   <span class="c"># openai_chat_stream_request_payload(L23) / openai_messages</span>
+│           │   └── apply_thinking_wire() (L52)           <span class="c"># 写入思考开关与 max_output_tokens 字段</span>
+│           ├── chat/                                     <span class="c"># Chat SSE 流解码器</span>
+│           │   └── stream.rs                             <span class="c"># ChatSseDecoder：严格校验 [DONE]、finish_reason 与思考来源</span>
+│           │       ├── ChatSseDecoder (L32)              <span class="c"># 锁定首个非空思考来源（TopLevel 优先）</span>
+│           │       ├── dispatch_event() (L54)            <span class="c"># 拒多 choice 或 index!=0 事件</span>
+│           │       └── finish() (L157)                   <span class="c"># 仅 usage 帧后仍须有明确终止标志</span>
+│           ├── responses.rs                              <span class="c"># Responses API：parse_openai_responses_response (L74)</span>
+│           │   └── openai_responses_input() (L220)       <span class="c"># 转 Responses input item（含加密思考项）</span>
+│           └── responses/                                <span class="c"># Responses SSE 流解码器</span>
+│               └── stream.rs                             <span class="c"># ResponsesSseDecoder：转发增量并校验终态事件</span>
+│                   └── ResponsesSseDecoder (L17)         <span class="c"># dispatch_event() (L29) 发射增量</span>
+│
+├── mcp/                                                  <span class="c"># MCP 客户端连接池（4 .rs）</span>
+│   └── src/                                              <span class="c"># MCP 连接管理（4 文件）</span>
+│       ├── lib.rs                                        <span class="c"># McpManager：按项目目录复用长连接（锁外建连、锁外关停）</span>
+│       │   ├── McpManager (L34)                          <span class="c"># 按目录复用连接：tools(L177) / discover(L254)</span>
+│       │   ├── disconnect_directory() (L341)             <span class="c"># 锁内取句柄、锁外等子进程关闭</span>
+│       │   ├── shutdown() (L352)                         <span class="c"># 停机时并发关闭所有目录 MCP 连接</span>
+│       │   └── McpTool (L41)                             <span class="c"># 单工具 call() (L49) 调用入口</span>
+│       ├── config.rs                                     <span class="c"># mcp.json 校验、敏感 env/header 脱敏与原子读写</span>
+│       │   ├── Configuration (L9)                        <span class="c"># mcp.json 解析；validate(L50) 校验传输配置</span>
+│       │   └── ServerConfig (L16)                        <span class="c"># redact() (L93) 屏蔽 env/headers 密钥字段</span>
+│       ├── client.rs                                     <span class="c"># rmcp SDK 连接、超时取消与稳定工具别名</span>
+│       │   ├── Connection (L23)                          <span class="c"># connect(L55) / call(L176 不重放) / close(L225)</span>
+│       │   └── tool_alias() (L235)                       <span class="c"># 工具名超长或重名时生成稳定摘要别名</span>
+│       └── result.rs                                     <span class="c"># MCP CallToolResult → 文本/图片附件转换</span>
+│           ├── McpToolResult (L6)                        <span class="c"># MCP 工具转换后的文本与图片附件结果</span>
+│           └── convert() (L12)                           <span class="c"># 将 MCP CallToolResult 转为内部结果</span>
+│
+├── agent/                                                <span class="c"># Agent 主循环、上下文、工具、会话日志（35 .rs）</span>
+│   └── src/                                              <span class="c"># 顶层辅助、agent/ 循环、session/ 日志与 tools/ 工具</span>
+│       ├── lib.rs                                        <span class="c"># 导出 agent / session / tools / image / prompts 等模块</span>
+│       ├── request_execution.rs                          <span class="c"># 模型请求重试与输出预算裁剪</span>
+│       │   ├── execute_request() (L30)                   <span class="c"># Temporary 错误最多试 3 次，即时响应取消</span>
+│       │   └── output_budget_tokens() (L19)              <span class="c"># 按剩余上下文窗口裁剪 max_output_tokens</span>
+│       ├── image.rs                                      <span class="c"># InputImage (L13-L104)：魔数识图、校验、转 DataURL 与落盘</span>
+│       ├── message.rs                                    <span class="c"># Message 投影为公开 HistoryItem / ToolResult (L9-L126)</span>
+│       ├── prompts.rs                                    <span class="c"># assemble_developer_instructions() (L5)：组装开发者指令</span>
+│       ├── agent/                                        <span class="c"># 主循环、模块拼装、并发调度、队列与轮换（7 文件）</span>
+│       │   ├── mod.rs                                    <span class="c"># Agent &amp; RequestContext：模型↔工具主循环</span>
+│       │   │   ├── AgentError (L51)                      <span class="c"># is_session_failure() (L75) 区分持久化故障</span>
+│       │   │   ├── RequestContext (L96)                  <span class="c"># inspect_context() (L106) 共用模块拼装</span>
+│       │   │   └── Agent (L137)                          <span class="c"># run(L158) 主循环；append_message(L280) 写盘发事件</span>
+│       │   ├── request.rs                                <span class="c"># RequestDefinitions 懒加载与单轮生成入口</span>
+│       │   │   ├── RequestDefinitions (L14)              <span class="c"># ensure/load_definitions (L38/L52) 懒取 MCP</span>
+│       │   │   ├── context_pressure_tokens() (L94)       <span class="c"># 计算当前上下文压力 token 阈值</span>
+│       │   │   └── generate_response() (L150)            <span class="c"># 准备上下文、调用重试执行并写盘回复</span>
+│       │   ├── modules.rs                                <span class="c"># 模块化 Context 拼装与未开会话预览入口</span>
+│       │   │   ├── SYSTEM_PROMPT / BASH (L17-L21)        <span class="c"># 锁定系统提示词/Bash/Tasks 底座，其余可选</span>
+│       │   │   ├── assemble() (L87)                      <span class="c"># 组装启用模块并同步裁剪禁用工具 Schema</span>
+│       │   │   └── preview() (L260)                      <span class="c"># 新任务预览上下文分布，不连 MCP 服务器</span>
+│       │   ├── dispatch.rs                               <span class="c"># 并发工具调度（最多 8 个）与提问屏障</span>
+│       │   │   ├── dispatch_tools() (L15)                <span class="c"># JoinSet 至多 8 并发；遇提问等先行工具全完</span>
+│       │   │   └── finish_tool() (L145)                  <span class="c"># 收口单工具结果、补写盘与发射完成事件</span>
+│       │   ├── inbox.rs                                  <span class="c"># SteeringInbox 双通道队列（用户输入 vs 后台通知）</span>
+│       │   │   ├── UserInput (L14)                       <span class="c"># from_uploads() (L25) 入队前先校验解码图片</span>
+│       │   │   └── SteeringInbox (L139)                  <span class="c"># cancel() (L145) 只清用户排队，保留后台通知</span>
+│       │   ├── questions.rs                              <span class="c"># UserQuestions 内存挂起提问池</span>
+│       │   │   └── UserQuestions (L19)                   <span class="c"># ask(L69) 挂起；answer(L34) 非法保留原题</span>
+│       │   └── context_rotation.rs                       <span class="c"># 上下文自动/手动轮换</span>
+│       │       ├── rotate_context_if_needed() (L30)      <span class="c"># 自动阈值/rotate_now(L47)/selected(L60)</span>
+│       │       └── validate_user_messages() (L181)       <span class="c"># 禁止截断或空摘要覆盖有效历史上下文</span>
+│       ├── session/                                      <span class="c"># JSONL v1 会话日志、尾行修复与上下文投影（5 文件）</span>
+│       │   ├── mod.rs                                    <span class="c"># 文件/附件目录命名与 with_writer_async() (L46) 卸载阻塞 IO</span>
+│       │   ├── format.rs                                 <span class="c"># 日志格式 v1 与流式/历史同源条目 ID</span>
+│       │   │   ├── CURRENT_SESSION_VERSION (L13)         <span class="c"># 固定格式版本 v1；SessionHeader (L158)</span>
+│       │   │   ├── LedgerRecord (L55)                    <span class="c"># Operation 4 种状态 + ContextRotation 分界</span>
+│       │   │   └── text_item_id() (L141)                 <span class="c"># 与 thinking/tool_item_id 保实时回放同 ID</span>
+│       │   ├── file.rs                                   <span class="c"># parse_session_file(L9) / repair_tail(L85) 修复半截尾行</span>
+│       │   ├── manager.rs                                <span class="c"># SessionManager（唯一写者）与 SessionData（只读扫描）</span>
+│       │   │   ├── SessionManager (L20)                  <span class="c"># 唯一写者：create / open_existing / append</span>
+│       │   │   └── SessionData (L27)                     <span class="c"># open(L138) 只读；image_data(L121) 限已引用图</span>
+│       │   └── context.rs                                <span class="c"># 从日志投影模型上下文与 Token 估算</span>
+│       │       ├── project_messages() (L31)              <span class="c"># 按最新轮换点硬分界并补未知工具配对</span>
+│       │       └── prepare_context() (L213)              <span class="c"># 锁外读图；最近实际 input_tokens 复用+补算</span>
+│       └── tools/                                        <span class="c"># 内置工具集与 Bash 进程树（11 文件 + bash/ 7 文件）</span>
+│           ├── mod.rs                                    <span class="c"># 导出全部内置工具模块</span>
+│           ├── registry.rs                               <span class="c"># ToolRegistrySnapshot：Schema 冻结与 preflight 校验</span>
+│           │   ├── PreparedTool (L66)                    <span class="c"># Builtin / Skill / Mcp 已准备工具变体</span>
+│           │   └── ToolRegistrySnapshot (L165)           <span class="c"># Schema 冻结，preflight() (L197) 调用前校验</span>
+│           ├── read.rs                                   <span class="c"># ReadArgs (L26) / execute() (L49)：按行分页读文本</span>
+│           ├── edit.rs                                   <span class="c"># 按路径进程内串行锁的原子批量替换</span>
+│           │   ├── FILE_EDITS (L13)                      <span class="c"># 同文件串行、不同文件并发</span>
+│           │   └── execute_locked() (L99)                <span class="c"># 校验 OldText 唯一且不重叠、保留 BOM 与换行符后原子写盘</span>
+│           ├── edit_diff.rs                              <span class="c"># result() (L8)：生成带行号与统计的 unified diff</span>
+│           ├── view_image.rs                             <span class="c"># execute() (L33)：校验图像并返回多模态视觉输入</span>
+│           ├── skill.rs                                  <span class="c"># execute() (L30)：查当前启用 model_skills() 读取 SKILL.md</span>
+│           ├── question.rs                               <span class="c"># QuestionArgs::validate() (L16)：参数校验</span>
+│           ├── mcp.rs                                    <span class="c"># execute() (L9)：转发 MCP 调用、超长截尾与转换图片</span>
+│           ├── output.rs                                 <span class="c"># CaptureState(L33) / SpillWriter(L15)：100KB 内存+溢写</span>
+│           ├── truncate.rs                               <span class="c"># truncate_tail() (L49)：2000 行 / 50KB 按 UTF-8 截尾</span>
+│           └── bash/                                     <span class="c"># Windows Job Object 进程树、双流解码与后台游标（7 文件）</span>
+│               ├── mod.rs                                <span class="c"># 导出 BashTool / BashTasks</span>
+│               ├── spec.rs                               <span class="c"># BashArgs::validate() (L32)：yield 默认 10s 上限 30s</span>
+│               ├── shell.rs                              <span class="c"># find_bash_on_windows() (L45)：定位 Git Bash 并避 WSL 存根</span>
+│               ├── exec.rs                               <span class="c"># Job Object 进程树与前台直转后台移交</span>
+│               │   ├── Outcome (L32)                     <span class="c"># Completed / Backgrounded 执行分支枚举</span>
+│               │   └── Process (L51)                     <span class="c"># Job Object 进程树：spawn / next / finish</span>
+│               ├── pump.rs                               <span class="c"># OutputStreams(L29)/OutputReader(L61)/Utf8Decoder(L114)</span>
+│               ├── tasks.rs                              <span class="c"># BashTasks：后台任务控制器</span>
+│               │   ├── BashTasks (L53)                   <span class="c"># execute / run_background(L309) / stop(L164)</span>
+│               │   └── output() (L125)                   <span class="c"># 与 completion_message(L140) 维护双游标</span>
+│               └── result.rs                             <span class="c"># output_text() (L8) / task_result() (L47)：16 KiB 增量切片</span>
+│
+└── app/                                                  <span class="c"># 桌面后端组装层（Singularity.exe 入口，23 .rs）</span>
+    └── src/                                              <span class="c"># 主入口、desktop 网关与 runtime 状态机</span>
+        ├── main.rs                                       <span class="c"># main() (L9) / run() (L16)：Singularity.exe 入口</span>
+        ├── session_options.rs                            <span class="c"># lock_data_directory() (L13) OS 单实例锁</span>
+        ├── desktop.rs                                    <span class="c"># 串联 app_server / rpc / transport / file_view / store</span>
+        ├── desktop/                                      <span class="c"># stdio JSON-RPC、AppServer 与工作区存储（9 文件）</span>
+        │   ├── transport.rs                              <span class="c"># run() (L27) / write() (L83)：按行 JSON 读写与流推送</span>
+        │   ├── rpc.rs                                    <span class="c"># handle(L9) / dispatch(L20)：同步 IO 进 spawn_blocking</span>
+        │   ├── app_server.rs                             <span class="c"># AppServer：核心容器、单向四级锁序与 revision 递增</span>
+        │   │   ├── AppServer (L26)                       <span class="c"># 持有 models / mcp / workspaces / catalog / rev</span>
+        │   │   ├── start_session() (L134)                <span class="c"># 创建新会话并启动首次操作</span>
+        │   │   ├── read_session() (L157)                 <span class="c"># 读取单任务历史并叠加瞬态 Activity</span>
+        │   │   └── publish_app_snapshot() (L202)         <span class="c"># 严守 lifecycle-&gt;publication-&gt;sessions 锁序</span>
+        │   ├── app_server/                               <span class="c"># AppServer 拆分子模块（4 文件）</span>
+        │   │   ├── actions.rs                            <span class="c"># 会话控制动作与删除两段锁</span>
+        │   │   │   ├── submit() (L13)                    <span class="c"># 继续发送文本或图片输入并唤醒回合</span>
+        │   │   │   ├── answer_question() (L28)           <span class="c"># 投递挂起提问答案</span>
+        │   │   │   ├── abort() (L39)                     <span class="c"># 触发当前回合停止竞态控制</span>
+        │   │   │   ├── inspect_context() (L57)           <span class="c"># 按需触发当前上下文明细检查</span>
+        │   │   │   └── delete_session() (L87)            <span class="c"># DeleteGuard -&gt; 锁外 stop+删盘 -&gt; 失败回滚</span>
+        │   │   ├── workspace.rs                          <span class="c"># bootstrap(L12)/remove_workspace(L48)/preview(L110)</span>
+        │   │   ├── shutdown.rs                           <span class="c"># AppServer::shutdown() (L4)：JoinSet 并发关停全部会话</span>
+        │   │   └── errors.rs                             <span class="c"># conversation_error / catalog_error (L3-L17) 转 RpcError</span>
+        │   ├── workspace_store.rs                        <span class="c"># WorkspaceStore (L33)：workspaces.json 写盘成功才提交内存</span>
+        │   └── file_view.rs                              <span class="c"># read_text_file() (L11)：右侧文件栏只读读取</span>
+        └── runtime/                                      <span class="c"># 历史索引、目录管理与 Conversation 状态机（11 文件）</span>
+            ├── mod.rs                                    <span class="c"># 导出 history / thread_catalog / conversation</span>
+            ├── thread_catalog.rs                         <span class="c"># ThreadCatalog：会话建删与单次历史读取</span>
+            │   └── ThreadCatalog (L18)                   <span class="c"># create(L28)/list(L52)/delete(L96)/read(L162)</span>
+            ├── history.rs                                <span class="c"># 历史投影、中断补标、用量统计与上下文占有率</span>
+            │   ├── index_turn_history() (L131)           <span class="c"># 无终态标中断；单次遍历同源产历史与统计</span>
+            │   ├── context_usage() (L177)                <span class="c"># 计算最新模型请求上下文占用率</span>
+            │   └── summarize_thread() (L279)             <span class="c"># 提取列表显示用标题、预览与摘要状态</span>
+            ├── conversation.rs                           <span class="c"># Conversation：单个会话运行实体与原子忙闲判定</span>
+            │   └── Conversation (L26)                    <span class="c"># has_work(L127 单锁判忙) / abort(L177) / rename</span>
+            └── conversation/                             <span class="c"># Conversation 细分状态、排他调度与实时叠加（7 文件）</span>
+                ├── state.rs                              <span class="c"># TurnControls 停止竞态锁与会话状态</span>
+                │   ├── TurnControls (L16)                <span class="c"># accept_cancel(L50) / finish_cancel(L63) 停止锁</span>
+                │   ├── ConversationState (L70)           <span class="c"># has_pending_resume(L85) 决定闲置续跑队列</span>
+                │   └── TurnLifecycle (L93)               <span class="c"># Idle / Turn / ContextRotation 状态机</span>
+                ├── lifecycle.rs                          <span class="c"># 排他调度、收尾结算与 DeleteGuard</span>
+                │   ├── submit() (L8)                     <span class="c"># 入队并调度回合，冲突时取消预览</span>
+                │   ├── reserve_context_rotation() (L32)  <span class="c"># 预留独占上下文轮换槽位</span>
+                │   ├── begin_operation() (L42)           <span class="c"># 互斥启动回合或轮换</span>
+                │   ├── settle() (L70)                    <span class="c"># 回合结算；异常失败时暂停后台 auto_resume</span>
+                │   ├── stop() (L123)                     <span class="c"># 等待运行中的操作或轮换优雅退出</span>
+                │   └── DeleteGuard (L159)                <span class="c"># Drop 时未确认删除则自动回滚 closing 标记</span>
+                ├── turn.rs                               <span class="c"># 单回合预处理与上下文检查去重</span>
+                │   ├── run_single_turn() (L33)           <span class="c"># 预处理通过才写 started；终态先落盘再发事件</span>
+                │   ├── prepare_turn() (L136)             <span class="c"># 解析模型配置并准备上下文</span>
+                │   └── inspect_context() (L155)          <span class="c"># 锁内判重，完成复核未取消才发 ContextLoaded</span>
+                ├── context_rotation.rs                   <span class="c"># rotate_context_thread() (L8)：独立轮换入口</span>
+                ├── background.rs                         <span class="c"># on_background_update(L14) / pause_background_resume(L60)</span>
+                ├── view.rs                               <span class="c"># ConversationView：历史+瞬态叠加与事件发射</span>
+                │   ├── runtime() (L54)                   <span class="c"># 生成合并瞬态 Activity 后的运行时快照</span>
+                │   ├── read() (L88)                      <span class="c"># 单锁合并已落盘历史与瞬态 Activity</span>
+                │   ├── publish_changed() (L104)          <span class="c"># 通知列表或快照变更通知</span>
+                │   └── publish_event() (L122)            <span class="c"># 发射带单调序号 TurnEventEnvelope</span>
+                └── activity.rs                           <span class="c"># Activity(L8) / apply(L16) / merge(L76)：暂存瞬态增量</span></pre>
+</article>
+</body>
+</html>

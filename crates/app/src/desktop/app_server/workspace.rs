@@ -5,7 +5,7 @@ use std::path::Path;
 
 use singularity_protocol::{AppBootstrap, RedactedModelCatalog, RpcError, ThreadSummary, Workspace};
 
-use super::{AppServer, catalog_error, internal_error, workspace_error};
+use super::{AppServer, catalog_error};
 use crate::desktop::workspace_store::WorkspaceError;
 
 impl AppServer {
@@ -40,7 +40,7 @@ impl AppServer {
     }
 
     pub fn add_workspace(&self, root: &str) -> Result<Workspace, RpcError> {
-        let workspace = self.workspaces.add(Path::new(root)).map_err(workspace_error)?;
+        let workspace = self.workspaces.add(Path::new(root)).map_err(RpcError::new)?;
         self.publish_app_snapshot();
         Ok(workspace)
     }
@@ -56,12 +56,12 @@ impl AppServer {
                 singularity_core::same_saved_path(&conversation.cwd, &workspace.root)
             };
             if sessions.values().any(|conversation| belongs(conversation) && conversation.has_work()) {
-                return Err(RpcError::new(
-                    singularity_protocol::RpcErrorCode::WorkspaceBusy,
-                    format!("项目 {} 仍有运行中的任务、后台命令或待处理输入。", workspace.root),
-                ));
+                return Err(RpcError::new(format!(
+                    "项目 {} 仍有运行中的任务、后台命令或待处理输入。",
+                    workspace.root
+                )));
             }
-            app.workspaces.remove(&workspace_root).map_err(workspace_error)?;
+            app.workspaces.remove(&workspace_root).map_err(RpcError::new)?;
             sessions.retain(|_, conversation| {
                 if belongs(conversation) {
                     conversation.set_closing(true);
@@ -85,7 +85,7 @@ impl AppServer {
     pub fn workspace(&self, workspace_root: &str) -> Result<Workspace, RpcError> {
         self.workspaces
             .find(workspace_root)
-            .ok_or_else(|| workspace_error(WorkspaceError::NotFound))
+            .ok_or_else(|| RpcError::new(WorkspaceError::NotFound))
     }
 
     pub fn skills(&self, workspace_root: &str) -> Result<singularity_protocol::SkillCatalog, RpcError> {
@@ -114,9 +114,9 @@ impl AppServer {
         let root = self.workspace(workspace_root)?.root;
         let cwd = Path::new(&root);
         let instructions =
-            singularity_core::load_agent_instructions(cwd, &self.home).map_err(internal_error)?;
+            singularity_core::load_agent_instructions(cwd, &self.home).map_err(RpcError::new)?;
         let skills = singularity_core::skills::SkillCatalog::discover(cwd, &self.home);
-        let servers = self.mcp.list(cwd).map_err(internal_error)?;
+        let servers = self.mcp.list(cwd).map_err(RpcError::new)?;
         Ok(singularity_agent::agent::modules::preview(&root, instructions, skills, servers))
     }
 
@@ -129,7 +129,7 @@ impl AppServer {
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(internal_error(format!("{}: {error}", path.display()))),
+            Err(error) => return Err(RpcError::new(format!("{}: {error}", path.display()))),
         };
         Ok(singularity_protocol::TextDocument {
             path: singularity_core::display_path(&path),
@@ -145,7 +145,7 @@ impl AppServer {
     ) -> Result<singularity_protocol::TextDocument, RpcError> {
         let path = self.instructions_path(workspace_root)?;
         singularity_core::write_bytes_atomic(&path, content.as_bytes())
-            .map_err(|error| internal_error(format!("{}: {error}", path.display())))?;
+            .map_err(|error| RpcError::new(format!("{}: {error}", path.display())))?;
         Ok(singularity_protocol::TextDocument {
             path: singularity_core::display_path(&path),
             content: content.to_owned(),
