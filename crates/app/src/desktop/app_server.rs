@@ -3,11 +3,7 @@
 //! 由 runtime::Conversation 负责。本模块负责组装依赖、查找已打开的任务、处理 RPC 和发布全局事件。
 
 mod actions;
-mod errors;
-mod shutdown;
 mod workspace;
-
-use self::errors::*;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -71,7 +67,7 @@ impl AppServer {
         *self.revision.lock().expect("stream revision lock poisoned")
     }
 
-    pub(super) fn mcp_directory(&self, workspace: Option<&str>) -> Result<std::path::PathBuf, RpcError> {
+    pub(super) fn scope_directory(&self, workspace: Option<&str>) -> Result<std::path::PathBuf, RpcError> {
         workspace
             .map(|id| self.workspace(id).map(|workspace| workspace.root.into()))
             .unwrap_or_else(|| Ok(self.home.clone()))
@@ -241,4 +237,37 @@ impl AppServer {
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Conversation>>> {
         self.sessions.lock().expect("app_server session map lock poisoned")
     }
+
+    /// 管道关闭时等待已接受的操作和子进程结束。
+    pub async fn shutdown(&self) {
+        let sessions: Vec<_> = self.lock_sessions().values().cloned().collect();
+        let mut stops = tokio::task::JoinSet::new();
+        for session in sessions {
+            stops.spawn(async move { session.stop().await });
+        }
+        while let Some(result) = stops.join_next().await {
+            if let Err(error) = result.expect("session shutdown completes while the runtime is running") {
+                eprintln!("{error}");
+            }
+        }
+        self.mcp.shutdown().await;
+    }
+}
+
+pub(super) fn conversation_error(error: ConversationError) -> RpcError {
+    match error {
+        ConversationError::Busy => session_busy(),
+        other => RpcError::new(other),
+    }
+}
+
+pub(super) fn catalog_error(error: CatalogError) -> RpcError {
+    match error {
+        CatalogError::NotFound(_) => RpcError::new("任务不存在或已删除。"),
+        other => RpcError::new(other),
+    }
+}
+
+pub(super) fn session_busy() -> RpcError {
+    RpcError::new("当前任务正在处理另一项操作。")
 }

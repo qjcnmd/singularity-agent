@@ -10,7 +10,6 @@ function toTransition({ damping, response }: { damping: number; response: number
 
 export const smooth = toTransition(smoothPreset)
 export const pop = toTransition(popPreset)
-export const actionToastTransition = pop
 /** 消息、卡片和弹出的调色盘共用的出现动画：从下方略缩小处弹出。 */
 export const enter = { initial: { opacity: 0, y: 10, scale: .9 }, animate: { opacity: 1, y: 0, scale: 1 } }
 

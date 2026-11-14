@@ -40,7 +40,8 @@ pub async fn discover(base_url: &str, api_key: &str) -> Result<Vec<String>, Prov
 /// 两者分不开。
 async fn read_response_body(response: reqwest::Response) -> Result<Value, ProviderError> {
     let bytes = response.bytes().await.map_err(discovery_transport_error)?;
-    serde_json::from_slice(&bytes).map_err(|_| discovery_response_error("提供方未返回有效的模型目录。"))
+    serde_json::from_slice(&bytes)
+        .map_err(|_| ProviderError::new(ModelErrorKind::Other, "提供方未返回有效的模型目录。"))
 }
 
 /// 发现失败保留去掉 URL、截断后的原因；目录查询由用户手动重试。
@@ -70,13 +71,9 @@ fn read_listing(body: &Value) -> Result<Vec<String>, ProviderError> {
             add_model(id, entry);
         }
     } else {
-        return Err(discovery_response_error("提供方未返回 data 模型列表或 models 目录。"));
+        return Err(ProviderError::new(ModelErrorKind::Other, "提供方未返回 data 模型列表或 models 目录。"));
     }
     Ok(models.into_iter().collect())
-}
-
-fn discovery_response_error(message: impl Into<String>) -> ProviderError {
-    ProviderError::new(ModelErrorKind::Other, message)
 }
 
 async fn discovery_http_error(response: reqwest::Response) -> ProviderError {

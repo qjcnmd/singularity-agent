@@ -11,18 +11,14 @@ pub use manager::{ModelConfigManager, ModelConfigurationSnapshot};
 pub(crate) use schema::*;
 pub(crate) use user::*;
 
-use super::{ModelErrorKind, ProviderApiProtocol, ProviderError};
+use super::{ModelErrorKind, ProviderError};
 use crate::openai::wire::ThinkingWireFormat;
 
 use selection::{OpenAiProviderConfig, SelectedModel, resolve_model_definition, resolve_model_selection};
-use singularity_protocol::ModelSelection;
+use singularity_protocol::{ModelSelection, ProviderApiProtocol};
 
 pub(crate) fn configuration_error(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ModelErrorKind::Other, message)
-}
-
-pub(crate) fn missing_provider_config_error(name: &str) -> ProviderError {
-    configuration_error(format!("缺少提供方配置：{name}"))
 }
 
 pub(crate) fn validate_provider_value(value: &str, name: &str) -> Result<(), ProviderError> {

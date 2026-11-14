@@ -1,5 +1,5 @@
 use super::*;
-use crate::provider::contract::finalize_provider_response;
+use crate::provider::finalize_provider_response;
 use crate::types::ModelUsage;
 
 pub(crate) async fn read_chat_sse_stream(
@@ -162,12 +162,14 @@ impl<'a> ChatSseDecoder<'a> {
             match self.finish_reason.as_deref() {
                 Some("length") => Ok(ModelStopReason::Length),
                 Some("stop" | "tool_calls" | "function_call") => Ok(ModelStopReason::Stop),
-                Some("content_filter") => {
-                    Err(provider_content_filter_error("provider Chat response was stopped by content filter"))
-                }
-                Some("network_error") => {
-                    Err(provider_finish_network_error("provider Chat response reported a network error"))
-                }
+                Some("content_filter") => Err(ProviderError::new(
+                    ModelErrorKind::Other,
+                    "provider Chat response was stopped by content filter",
+                )),
+                Some("network_error") => Err(ProviderError::new(
+                    ModelErrorKind::Temporary,
+                    "provider Chat response reported a network error",
+                )),
                 Some(unknown) => Err(provider_chat_finish_reason_unsupported(unknown)),
                 None => Err(provider_chat_stream_malformed_error("finish_reason_missing")),
             }

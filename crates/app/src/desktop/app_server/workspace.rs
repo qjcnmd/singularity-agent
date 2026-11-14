@@ -125,7 +125,7 @@ impl AppServer {
         &self,
         workspace_root: Option<&str>,
     ) -> Result<singularity_protocol::TextDocument, RpcError> {
-        let path = self.instructions_path(workspace_root)?;
+        let path = self.scope_directory(workspace_root)?.join("AGENTS.md");
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -143,21 +143,13 @@ impl AppServer {
         workspace_root: Option<&str>,
         content: &str,
     ) -> Result<singularity_protocol::TextDocument, RpcError> {
-        let path = self.instructions_path(workspace_root)?;
+        let path = self.scope_directory(workspace_root)?.join("AGENTS.md");
         singularity_core::write_bytes_atomic(&path, content.as_bytes())
             .map_err(|error| RpcError::new(format!("{}: {error}", path.display())))?;
         Ok(singularity_protocol::TextDocument {
             path: singularity_core::display_path(&path),
             content: content.to_owned(),
         })
-    }
-
-    fn instructions_path(&self, workspace_root: Option<&str>) -> Result<std::path::PathBuf, RpcError> {
-        let directory = match workspace_root {
-            Some(root) => std::path::PathBuf::from(self.workspace(root)?.root),
-            None => self.home.clone(),
-        };
-        Ok(directory.join("AGENTS.md"))
     }
 }
 

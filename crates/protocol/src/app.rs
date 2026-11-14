@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
+use crate::{ThreadTurn, TurnEvent, TurnStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -105,7 +105,7 @@ pub struct ModelSelection {
     pub reasoning: Option<String>,
 }
 
-/// 会话当前运行阶段、待处理输入与用量。
+/// 会话当前运行阶段、待处理输入与上下文用量。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -116,8 +116,6 @@ pub struct SessionRuntime {
     pub pending_question: Option<crate::PendingQuestion>,
     pub pending_messages: Vec<PendingUserMessage>,
     pub failure: Option<SessionFailure>,
-    /// 整份会话的累计模型用量。
-    pub usage: SessionModelUsage,
 }
 
 /// 最近一次生成请求的实际输入用量，以及执行时采用的窗口大小。

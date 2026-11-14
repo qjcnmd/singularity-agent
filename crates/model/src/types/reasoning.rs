@@ -1,6 +1,6 @@
-use crate::ProviderApiProtocol;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use singularity_protocol::ProviderApiProtocol;
 use std::fmt;
 
 pub(crate) const DEFAULT_CHAT_REASONING_FIELD: &str = "reasoning_content";

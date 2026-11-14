@@ -169,22 +169,22 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
 
   return <form className="sg-editor mcp-editor" onSubmit={event => void save(event)}>
     <fieldset className="mcp-editor-scroll" disabled={busy}>
-      <label className="sg-field"><span>名称</span><input className="sg-input" aria-label="MCP 名称" required pattern="[A-Za-z0-9_-]+" disabled={!!server} value={id} onChange={event => setId(event.target.value)} /></label>
-      <label className="sg-field"><span>连接方式</span><select className="sg-input" aria-label="MCP 连接方式" value={type} onChange={event => setType(event.target.value as typeof type)}><option value="stdio">本地进程（stdio）</option><option value="http">远程服务（Streamable HTTP）</option></select></label>
+      <label className="sg-field"><span>名称</span><input className="input" aria-label="MCP 名称" required pattern="[A-Za-z0-9_-]+" disabled={!!server} value={id} onChange={event => setId(event.target.value)} /></label>
+      <label className="sg-field"><span>连接方式</span><select className="input" aria-label="MCP 连接方式" value={type} onChange={event => setType(event.target.value as typeof type)}><option value="stdio">本地进程（stdio）</option><option value="http">远程服务（Streamable HTTP）</option></select></label>
       {type === 'stdio' ? <>
-        <label className="sg-field"><span>命令</span><input className="sg-input" aria-label="MCP 命令" required value={command} onChange={event => setCommand(event.target.value)} /></label>
-        <label className="sg-field"><span>参数（JSON 数组）</span><textarea className="sg-input" aria-label="MCP 参数" rows={3} value={args} onChange={event => setArgs(event.target.value)} /></label>
-        <label className="sg-field"><span>工作目录（留空使用任务的项目目录）</span><input className="sg-input" aria-label="MCP 工作目录" value={cwd} onChange={event => setCwd(event.target.value)} /></label>
-        <label className="sg-field"><span>环境变量（JSON 对象）</span><textarea className="sg-input" aria-label="MCP 环境变量" rows={3} spellCheck={false} value={env} onChange={event => setEnv(event.target.value)} /></label>
+        <label className="sg-field"><span>命令</span><input className="input" aria-label="MCP 命令" required value={command} onChange={event => setCommand(event.target.value)} /></label>
+        <label className="sg-field"><span>参数（JSON 数组）</span><textarea className="input" aria-label="MCP 参数" rows={3} value={args} onChange={event => setArgs(event.target.value)} /></label>
+        <label className="sg-field"><span>工作目录（留空使用任务的项目目录）</span><input className="input" aria-label="MCP 工作目录" value={cwd} onChange={event => setCwd(event.target.value)} /></label>
+        <label className="sg-field"><span>环境变量（JSON 对象）</span><textarea className="input" aria-label="MCP 环境变量" rows={3} spellCheck={false} value={env} onChange={event => setEnv(event.target.value)} /></label>
       </> : <>
-        <label className="sg-field"><span>服务地址</span><input className="sg-input" aria-label="MCP 服务地址" type="url" required value={url} onChange={event => setUrl(event.target.value)} /></label>
-        <label className="sg-field"><span>请求头（JSON 对象）</span><textarea className="sg-input" aria-label="MCP 请求头" rows={3} spellCheck={false} value={headers} onChange={event => setHeaders(event.target.value)} /></label>
+        <label className="sg-field"><span>服务地址</span><input className="input" aria-label="MCP 服务地址" type="url" required value={url} onChange={event => setUrl(event.target.value)} /></label>
+        <label className="sg-field"><span>请求头（JSON 对象）</span><textarea className="input" aria-label="MCP 请求头" rows={3} spellCheck={false} value={headers} onChange={event => setHeaders(event.target.value)} /></label>
       </>}
       <div className="mcp-timeouts">
         <label className="sg-field">
           <span>连接超时（秒）</span>
           <input
-            className="sg-input"
+            className="input"
             aria-label="MCP 连接超时"
             type="number"
             min={1}
@@ -197,7 +197,7 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
         <label className="sg-field">
           <span>调用超时（秒）</span>
           <input
-            className="sg-input"
+            className="input"
             aria-label="MCP 调用超时"
             type="number"
             min={1}

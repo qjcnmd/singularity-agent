@@ -76,18 +76,7 @@ dialog.mcp-editor-modal .mcp-editor-scroll { max-height: calc(100vh - 220px); }
 .sg-editor { padding: 4px 18px 18px; }
 .sg-field { display: grid; gap: 6px; min-width: 0; }
 .sg-field > span { font-size: 12.5px; font-weight: 400; color: var(--ink-soft); }
-.sg-input { width: 100%; min-height: 36px; padding: 7px 11px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--card); color: inherit; outline: none; font-size: 13.5px; transition: border-color 140ms, box-shadow 140ms; }
-.sg-input:hover:not(:disabled) { border-color: #c9c9ce; }
-.sg-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3.5px color-mix(in srgb, var(--accent) 16%, transparent); }
-.sg-input:disabled { background: var(--surface-muted); color: var(--ink-faint); }
-textarea.sg-input { resize: vertical; line-height: 1.5; font: 12.5px var(--font-sans); }
-.sg-primary-btn, .sg-secondary-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 34px; padding: 0 14px; border: 0; border-radius: 10px; font-weight: 400; font-size: 13.5px; cursor: pointer; white-space: nowrap; transition: background 120ms, transform var(--spring-dur) var(--spring); }
-.sg-primary-btn { background: var(--accent); color: #fff; }
-.sg-secondary-btn { background: var(--surface-muted); }
-.sg-primary-btn:active:not(:disabled), .sg-secondary-btn:active:not(:disabled) { transform: scale(.96); transition-duration: 80ms; }
 button:disabled { opacity: .45; cursor: default; }
-.sg-icon-btn { display: grid; place-items: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); cursor: pointer; }
-.sg-icon-btn:hover { background: var(--surface-hover); }
 .model-editor-form { display: flex; flex-direction: column; min-height: 0; }
 .model-editor-scroll { padding: 10px 24px 4px; display: grid; gap: 14px; min-height: 0; overflow-y: auto; }
 .model-editor-form > footer, .model-discovery-modal > footer { padding: 16px 20px 20px; }

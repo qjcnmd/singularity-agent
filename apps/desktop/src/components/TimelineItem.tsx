@@ -203,7 +203,7 @@ function ToolOutput({ item: fact, filePath }: { item: Extract<HistoryItem, { typ
   const background = ['bash', 'task_list', 'task_output', 'task_stop'].includes(fact.name)
   // 内部关联字段不展示；命令输出原样保留，不按工具参数过滤业务数据。
   const displayJson = (key: string, value: unknown) => background && (key === 'taskId' || key === 'task_id') ? undefined : value
-  const parameters = JSON.stringify(input, (key, value: unknown) => fact.name === 'task_output' && key === 'cursor' ? undefined : displayJson(key, value), 2)
+  const parameters = JSON.stringify(input, displayJson, 2)
   if (fact.name === 'ask_user_question' && fact.status === 'completed') return <QuestionAnswers questions={(input as { questions: UserQuestion[] }).questions} output={fact.result!.output} />
   let output = fact.result?.output ?? ''
   if (background && fact.name !== 'bash' && output !== '') {
@@ -213,11 +213,11 @@ function ToolOutput({ item: fact, filePath }: { item: Extract<HistoryItem, { typ
   const command = fact.name === 'bash' ? toolArgument(fact.name, input) : null
   if (command !== null) return <CommandOutput command={command} output={output} />
   if (fact.name === 'edit' && filePath !== null && fact.status === 'completed') return <EditDiff path={filePath} output={output} />
-  const hasReadLines = fact.result?.readSource !== undefined && fact.result?.readSource.lineCount > 0
-  if (filePath !== null && (output !== '' || hasReadLines) && fact.status !== 'failed') return <div>
+  const readSource = fact.result?.readSource
+  if (filePath !== null && (output !== '' || (readSource !== undefined && readSource.lineCount > 0)) && fact.status !== 'failed') return <div>
     <div className="tool-output-header">{filePath}</div>
-    {fact.result?.readSource
-      ? <div className="tool-lines">{readOutputLines(output, fact.result.readSource).map((line, index) => (
+    {readSource
+      ? <div className="tool-lines">{readOutputLines(output, readSource).map((line, index) => (
         <div key={index} className="tool-line">{line.number !== undefined && <span className="tool-line-number">{line.number}</span>}<span>{line.text}</span></div>
       ))}</div>
       : <pre><code>{output}</code></pre>}

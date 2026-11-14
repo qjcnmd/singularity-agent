@@ -12,7 +12,6 @@ use crate::config::selection::{OpenAiProviderConfig, SelectedModel};
 use crate::error::{ModelErrorKind, ProviderError};
 use crate::openai::wire::ThinkingWireFormat;
 use crate::provider::ProviderStreamEvent;
-use crate::provider::contract::{provider_content_filter_error, provider_finish_network_error};
 use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
 use crate::types::{
     Message, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,

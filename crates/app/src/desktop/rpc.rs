@@ -24,7 +24,7 @@ async fn dispatch(
 ) -> Result<Value, RpcError> {
     match request {
         RpcRequest::McpReconnect(params) => {
-            let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
+            let cwd = app.scope_directory(params.workspace_root.as_deref())?;
             let inspect = async { app.mcp.reconnect(&params.server_id, &cwd).await.map_err(RpcError::new) };
             value(unless_shutdown(shutdown, inspect).await?)
         }
@@ -59,21 +59,21 @@ async fn dispatch(
         }
         RpcRequest::McpList(params) => {
             blocking(move || {
-                let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
+                let cwd = app.scope_directory(params.workspace_root.as_deref())?;
                 app.mcp.list(&cwd).map_err(RpcError::new)
             })
             .await
         }
         RpcRequest::McpSave(params) => {
             blocking(move || {
-                let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
+                let cwd = app.scope_directory(params.workspace_root.as_deref())?;
                 app.mcp.save(params.server, &cwd).map_err(RpcError::new)
             })
             .await
         }
         RpcRequest::McpRemove(params) => {
             blocking(move || {
-                let cwd = app.mcp_directory(params.workspace_root.as_deref())?;
+                let cwd = app.scope_directory(params.workspace_root.as_deref())?;
                 app.mcp.remove(&params.server_id, &cwd).map_err(RpcError::new)
             })
             .await

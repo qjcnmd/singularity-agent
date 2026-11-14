@@ -2,8 +2,9 @@
 
 use singularity_protocol::{BackgroundTask, BackgroundTaskState, CommandOutputSnapshot};
 
-use crate::tools::registry::{ToolDisplay, ToolExecution, error_result};
-use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+use crate::tools::registry::{
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, ToolDisplay, ToolExecution, error_result,
+};
 
 pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> Result<String, String> {
     if cursor > output.total_bytes {
@@ -44,7 +45,11 @@ pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> Result
     Ok(result)
 }
 
-pub(super) fn task_result(task: &BackgroundTask, cursor: Option<u64>, display_output: bool) -> ToolExecution {
+pub(super) fn task_result(
+    task: &BackgroundTask,
+    cursor: Option<u64>,
+    display_output: Option<bool>,
+) -> ToolExecution {
     let mut content = format!("Task {}: {}", task.task_id, state_text(&task.state));
     if let Some(cursor) = cursor {
         match output_text(&task.model_output, cursor) {
@@ -55,15 +60,17 @@ pub(super) fn task_result(task: &BackgroundTask, cursor: Option<u64>, display_ou
             Err(error) => return error_result(error),
         }
     }
-    let mut summary = task_summary(task, &task.state);
-    if display_output {
-        summary["output"] = serde_json::json!(task.output);
-    }
     let mut result = ToolExecution::text(content);
-    result.display = Some(Box::new(ToolDisplay {
-        output: serde_json::to_string(&summary).expect("task result serializes"),
-        background_task_id: Some(task.task_id.clone()),
-    }));
+    if let Some(include_output) = display_output {
+        let mut summary = task_summary(task, &task.state);
+        if include_output {
+            summary["output"] = serde_json::json!(task.output);
+        }
+        result.display = Some(Box::new(ToolDisplay {
+            output: serde_json::to_string(&summary).expect("task result serializes"),
+            background_task_id: Some(task.task_id.clone()),
+        }));
+    }
     result.is_error = matches!(task.state,
         BackgroundTaskState::Exited { exit_code, .. } if exit_code != 0)
         || matches!(task.state, BackgroundTaskState::Failed { .. } | BackgroundTaskState::Interrupted);

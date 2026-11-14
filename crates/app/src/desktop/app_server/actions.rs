@@ -10,19 +10,18 @@ impl AppServer {
     }
 
     /// 输入直接进入会话队列；启动和收尾期间同样接受，按顺序执行。
-    pub fn submit(self: &Arc<Self>, params: singularity_protocol::SessionTextParams) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
-        let conversation = self.open_action_conversation(&params.session_id)?;
-        let input = UserInput::from_uploads(
-            params.text,
-            params.images,
-            params.files,
-            std::path::Path::new(&conversation.cwd),
-            &self.home,
-        )
-        .map_err(RpcError::new)?;
-        conversation.start(input).map_err(conversation_error)?;
-        Ok(())
+    pub fn submit(&self, params: singularity_protocol::SessionTextParams) -> Result<(), RpcError> {
+        self.apply_control(&params.session_id, |conversation| {
+            let input = UserInput::from_uploads(
+                params.text,
+                params.images,
+                params.files,
+                std::path::Path::new(&conversation.cwd),
+                &self.home,
+            )
+            .map_err(RpcError::new)?;
+            conversation.start(input).map_err(conversation_error)
+        })
     }
 
     pub fn answer_question(
@@ -45,12 +44,11 @@ impl AppServer {
     fn apply_control(
         &self,
         session_id: &str,
-        apply: impl FnOnce(&Conversation) -> Result<(), RpcError>,
+        apply: impl FnOnce(&Arc<Conversation>) -> Result<(), RpcError>,
     ) -> Result<(), RpcError> {
         let _lifecycle = self.lock_lifecycle();
         let conversation = self.open_action_conversation(session_id)?;
-        apply(&conversation)?;
-        Ok(())
+        apply(&conversation)
     }
 
     /// 打开任务时查看下一轮会加载的指令和工具；结果通过 context/loaded 事件送达。
@@ -70,17 +68,15 @@ impl AppServer {
         conversation.inspect_context(shutdown.child_token()).await.map_err(RpcError::new)
     }
 
-    pub fn rotate_context(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
-        self.open_action_conversation(session_id)?.rotate_context().map_err(conversation_error)
+    pub fn rotate_context(&self, session_id: &str) -> Result<(), RpcError> {
+        self.apply_control(session_id, |conversation| {
+            conversation.rotate_context().map_err(conversation_error)
+        })
     }
 
     /// 保存任务展示名称；活动执行继续使用当前写者。
     pub fn rename_session(&self, session_id: &str, name: &str) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
-        let conversation = self.open_action_conversation(session_id)?;
-        conversation.rename(name).map_err(conversation_error)?;
-        Ok(())
+        self.apply_control(session_id, |conversation| conversation.rename(name).map_err(conversation_error))
     }
 
     /// 停止目标任务并等它结束，再删除日志和附件；等待期间只拒绝该任务的新操作。
@@ -128,10 +124,9 @@ impl AppServer {
         session_id: &str,
         selection: &singularity_protocol::ModelSelection,
     ) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
-        let conversation = self.open_action_conversation(session_id)?;
-        conversation.update_settings(selection).map_err(conversation_error)?;
-        Ok(())
+        self.apply_control(session_id, |conversation| {
+            conversation.update_settings(selection).map_err(conversation_error)
+        })
     }
 }
 
@@ -141,6 +136,6 @@ impl AppServer {
             let _lifecycle = self.lock_lifecycle();
             Arc::clone(self.open_action_conversation(session_id)?.bash_tasks())
         };
-        tasks.stop(task_id).await.map(|_| ()).map_err(RpcError::new)
+        tasks.stop(task_id).await.map_err(RpcError::new)
     }
 }

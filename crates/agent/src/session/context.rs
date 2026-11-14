@@ -138,18 +138,10 @@ fn entry_token_estimate(entry: &SessionEntry, session: &SessionData) -> u64 {
     }
 }
 
-pub(crate) fn message_token_estimate(message: &Message) -> u64 {
-    content_token_estimate(message.content(), matches!(message, Message::ToolResult { .. }))
-}
-
-fn text_block_token_estimate(text: &str) -> u64 {
-    estimate_tokens_of(text) + CONTENT_BLOCK_OVERHEAD_TOKENS
-}
-
 /// 思考文本也计入预算；不回传思考的模型可能因此稍早轮换。
-fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
+pub(crate) fn message_token_estimate(message: &Message) -> u64 {
     let mut tokens = MESSAGE_OVERHEAD_TOKENS;
-    for block in content {
+    for block in message.content() {
         tokens = tokens.saturating_add(match block {
             ContentBlock::Text { text, .. } | ContentBlock::Thinking { thinking: text, .. } => {
                 text_block_token_estimate(text)
@@ -165,10 +157,14 @@ fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
             }
         });
     }
-    if tool_result {
+    if matches!(message, Message::ToolResult { .. }) {
         tokens += TOOL_RESULT_OVERHEAD_TOKENS;
     }
     tokens
+}
+
+fn text_block_token_estimate(text: &str) -> u64 {
+    estimate_tokens_of(text) + CONTENT_BLOCK_OVERHEAD_TOKENS
 }
 
 /// 输入 Token：本轮内最近一次回复的实际用量已包含指令、工具定义和回复本身，只补算

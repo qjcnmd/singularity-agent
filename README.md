@@ -47,7 +47,7 @@ crates/
 │       │   ├── chat.rs + chat/stream.rs    # Chat Completions 编解码
 │       │   ├── responses.rs + responses/stream.rs  # Responses 编解码
 │       │   ├── provider.rs  parse.rs  wire.rs      # 端点、错误分类、续接
-│       ├── provider/contract.rs            # Provider 抽象
+│       ├── provider.rs                     # Provider 抽象
 │       └── transport/                      # HTTP 客户端 + SSE 切帧器
 │
 ├── mcp/                         # MCP 客户端
@@ -66,15 +66,15 @@ crates/
 │       │   ├── questions.rs                # 提问工具
 │       │   └── context_rotation.rs         # 上下文轮换
 │       ├── request_execution.rs            # 模型请求执行、重试、保存
-│       ├── message.rs  image.rs  prompts.rs
+│       ├── message.rs  image.rs
 │       ├── session/
 │       │   ├── manager.rs                  # SessionManager：日志追加写
 │       │   ├── format.rs  file.rs          # 日志格式、末尾修复
 │       │   └── context.rs                  # 从日志生成模型上下文、Token 估算
 │       └── tools/
 │           ├── mod.rs  registry.rs         # 工具注册表、参数校验
-│           ├── read.rs  edit.rs  edit_diff.rs  view_image.rs
-│           ├── truncate.rs  output.rs  question.rs  skill.rs  mcp.rs
+│           ├── read.rs  edit.rs  view_image.rs
+│           ├── output.rs  question.rs  skill.rs  mcp.rs
 │           └── bash/
 │               ├── mod.rs  spec.rs         # 参数与定义
 │               ├── exec.rs  pump.rs        # 前台执行、stdout/stderr 异步泵
@@ -86,12 +86,11 @@ crates/
         ├── desktop.rs
         ├── desktop/
         │   ├── app_server.rs               # AppServer：会话生命周期
-        │   ├── app_server/{actions,errors,shutdown,workspace}.rs
+        │   ├── app_server/{actions,workspace}.rs
         │   ├── rpc.rs                      # 方法匹配表分发
         │   ├── transport.rs                # stdio 帧读写
         │   ├── workspace_store.rs          # 项目路径存储
         │   └── file_view.rs                # 文件栏读取
-        ├── session_options.rs
         └── runtime/
             ├── mod.rs  history.rs          # 历史投影、用量累计
             ├── thread_catalog.rs           # 任务列表/摘要

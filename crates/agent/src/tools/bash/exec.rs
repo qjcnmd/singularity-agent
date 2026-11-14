@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tools::registry::{ABORTED_MESSAGE, ToolDisplay, ToolExecution};
 
-use super::pump::OutputStreams;
+use super::pump::{OutputChunk, OutputStreams};
 use super::shell::bash_path;
 use super::spec::BashArgs;
 use crate::tools::output::CaptureState;
@@ -55,14 +55,21 @@ pub(super) struct Process {
     model_capture: CaptureState,
     progress: Interval,
     started: Instant,
-    deadline: Option<Instant>,
-    timeout_ms: Option<u64>,
+    timeout: Option<(Instant, u64)>,
 }
 
 impl Process {
     pub(super) fn persist_output(&mut self) {
         tokio::task::block_in_place(|| self.model_capture.persist());
     }
+
+    fn ingest(&mut self, chunk: OutputChunk) {
+        tokio::task::block_in_place(|| {
+            self.capture.ingest(&chunk.display);
+            self.model_capture.ingest(&chunk.model);
+        });
+    }
+
     pub(super) fn spawn(args: &BashArgs, cwd: &Path, output_directory: &Path) -> Result<Self, String> {
         let shell = bash_path()?;
         let started = Instant::now();
@@ -85,7 +92,10 @@ impl Process {
         );
         let mut progress = tokio::time::interval(Duration::from_millis(100));
         progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let timeout_ms = args.timeout_ms.map(std::num::NonZeroU64::get);
+        let timeout = args.timeout_ms.map(|ms| {
+            let ms = ms.get();
+            (started + Duration::from_millis(ms), ms)
+        });
         Ok(Self {
             child,
             output,
@@ -93,8 +103,7 @@ impl Process {
             model_capture: CaptureState::new(output_directory.to_path_buf()),
             progress,
             started,
-            deadline: timeout_ms.map(|ms| started + Duration::from_millis(ms)),
-            timeout_ms,
+            timeout,
         })
     }
 
@@ -103,8 +112,8 @@ impl Process {
             tokio::select! {
                 biased;
                 _ = signal.cancelled() => return ProcessEvent::Finished(Outcome::Stopped),
-                _ = wait_deadline(self.deadline) => return ProcessEvent::Finished(Outcome::Failed(format!(
-                    "Command timed out after {} ms and was terminated", self.timeout_ms.expect("deadline has timeout")
+                ms = wait_deadline(self.timeout) => return ProcessEvent::Finished(Outcome::Failed(format!(
+                    "Command timed out after {ms} ms and was terminated"
                 ))),
                 // 先等主进程；finish 再终止并等待整棵进程树。
                 status = self.child.inner_mut().wait() => return ProcessEvent::Finished(match status {
@@ -116,10 +125,7 @@ impl Process {
                 }),
                 _ = self.progress.tick() => {},
                 chunk = self.output.next(), if self.output.is_open() => match chunk {
-                    Some(Ok(chunk)) => tokio::task::block_in_place(|| {
-                        self.capture.ingest(&chunk.display);
-                        self.model_capture.ingest(&chunk.model);
-                    }),
+                    Some(Ok(chunk)) => self.ingest(chunk),
                     Some(Err(error)) => return ProcessEvent::Finished(Outcome::Failed(error.to_string())),
                     None => {},
                 }
@@ -160,10 +166,7 @@ impl Process {
                 biased;
                 _ = &mut drain => { truncated = true; break; }
                 chunk = self.output.next() => match chunk {
-                    Some(Ok(chunk)) => tokio::task::block_in_place(|| {
-                        self.capture.ingest(&chunk.display);
-                        self.model_capture.ingest(&chunk.model);
-                    }),
+                    Some(Ok(chunk)) => self.ingest(chunk),
                     Some(Err(error)) => failures.push(error.to_string()),
                     None => {},
                 }
@@ -213,9 +216,12 @@ fn finished_output(capture: CaptureState, outcome: &Outcome, truncated: bool) ->
     content
 }
 
-async fn wait_deadline(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
+async fn wait_deadline(timeout: Option<(Instant, u64)>) -> u64 {
+    match timeout {
+        Some((deadline, ms)) => {
+            tokio::time::sleep_until(deadline).await;
+            ms
+        }
         None => std::future::pending().await,
     }
 }

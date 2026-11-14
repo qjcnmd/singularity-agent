@@ -172,7 +172,8 @@ export class SessionStore {
     if (selection === this.selectionRequest) void this.selectSession(started.summary.threadId)
   }
 
-  sessions(workspaceRoot = this.state.selectedWorkspaceRoot): ThreadSummary[] {
+  sessions(): ThreadSummary[] {
+    const workspaceRoot = this.state.selectedWorkspaceRoot
     return workspaceRoot === null ? [] : this.state.bootstrap?.sessionsByWorkspace[workspaceRoot] ?? []
   }
 

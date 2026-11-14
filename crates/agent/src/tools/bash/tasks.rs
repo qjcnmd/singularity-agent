@@ -148,7 +148,7 @@ impl BashTasks {
         if notification && position.terminal {
             return Ok(None);
         }
-        let mut result = task_result(&task, Some(position.end), true);
+        let mut result = task_result(&task, Some(position.end), (!notification).then_some(true));
         if notification {
             result.content = format!(
                 "<background-task>\nCommand: {}\n{}\n</background-task>",
@@ -160,8 +160,20 @@ impl BashTasks {
         Ok(Some(result))
     }
 
-    /// 取消后台命令并等待回收、保存终态；操作成功后返回命令结果。
-    pub async fn stop(&self, task_id: &str) -> Result<ToolExecution, String> {
+    /// 取消后台命令并等待回收、保存终态。
+    pub async fn stop(&self, task_id: &str) -> Result<(), String> {
+        self.stop_task(task_id).await.map(|_| ())
+    }
+
+    /// 取消后台命令并等待回收、保存终态；操作成功后返回模型可查看的命令结果。
+    pub(crate) async fn tool_stop(&self, task_id: &str) -> ToolExecution {
+        match self.stop_task(task_id).await {
+            Ok(task) => task_result(&task, None, Some(false)),
+            Err(error) => error_result(error),
+        }
+    }
+
+    async fn stop_task(&self, task_id: &str) -> Result<BackgroundTask, String> {
         if let Some(entry) = self.entry(task_id) {
             let mut done = entry.done.subscribe();
             if done.borrow().is_none() {
@@ -172,7 +184,7 @@ impl BashTasks {
                 return Err(error.message().to_owned());
             }
         }
-        self.task(task_id).map(|task| task_result(&task, None, false))
+        self.task(task_id)
     }
 
     /// 停止并等待全部活进程；只返回回收错误，已结束命令的保存失败不阻止关闭或删除。

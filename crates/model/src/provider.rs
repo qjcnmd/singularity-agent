@@ -1,22 +1,23 @@
-//! 检查提供方返回的回复，以及几类提供方错误的构造。
+//! 模型调用的结果、流事件与协议校验。
 
-pub use singularity_protocol::ProviderApiProtocol;
 use std::collections::HashSet;
 
 use crate::error::{ModelErrorKind, ProviderError};
 use crate::types::ModelTurnResponse;
 
+/// 流式解码过程中发给调用方的增量事件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderStreamEvent {
+    /// 工具调用名称或参数的生成增量，仅用于记录生成开始时间。
+    ToolCallDelta,
+    /// 模型响应里对外可见的正文增量。
+    OutputTextDelta { delta: String },
+    /// 模型公开的思考文本增量（Chat 的 reasoning 增量或 Responses 的 reasoning summary 增量），不含加密推理等提供方私有字段。
+    ReasoningTextDelta { delta: String },
+}
+
 pub(crate) fn provider_response_validation_error(message: &str, errors: Vec<String>) -> ProviderError {
     ProviderError::diagnostic(ModelErrorKind::Other, message, errors)
-}
-
-pub(crate) fn provider_content_filter_error(message: &str) -> ProviderError {
-    ProviderError::new(ModelErrorKind::Other, message)
-}
-
-/// 构造流式生成过程中的网络错误（对应 finish_reason 为 "network_error"）。
-pub(crate) fn provider_finish_network_error(message: &str) -> ProviderError {
-    ProviderError::new(ModelErrorKind::Temporary, message)
 }
 
 /// 校验模型响应：非截断响应须有正文或工具调用，工具调用 ID 非空且不重复、工具名非空。

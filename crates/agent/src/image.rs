@@ -22,7 +22,7 @@ impl InputImage {
     }
 
     /// 接收工作台 data URL，声明的 MIME 不作为格式依据。
-    pub fn upload(upload: ImageUpload) -> Result<Self, String> {
+    pub(crate) fn upload(upload: ImageUpload) -> Result<Self, String> {
         let (header, data) = upload.data_url.split_once(',').ok_or("图片数据无效。")?;
         if !header.starts_with("data:") || !header.ends_with(";base64") {
             return Err("图片必须使用 Base64 data URL。".into());

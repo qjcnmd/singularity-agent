@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
-use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, format_size, truncate_tail};
+use crate::tools::registry::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
 /// 末尾缓冲的上限（100KB），输出再长也不会占满内存。
 const INTERNAL_TAIL_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;
@@ -103,10 +103,7 @@ impl CaptureState {
             self.spill = Some(SpillWriter::create(&self.directory, &self.tail));
         }
         if self.tail.len() > INTERNAL_TAIL_MAX_BYTES {
-            self.tail = crate::tools::truncate::truncate_string_to_bytes_from_end(
-                &self.tail,
-                INTERNAL_TAIL_MAX_BYTES,
-            );
+            self.tail = truncate_string_to_bytes_from_end(&self.tail, INTERNAL_TAIL_MAX_BYTES);
         }
     }
 
@@ -170,4 +167,82 @@ impl CaptureState {
         };
         format!("{}\n\n{note}", tail_result.content)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TruncatedBy {
+    Lines,
+    Bytes,
+}
+
+/// 尾部截断结果：保留后的文本、触发截断的维度与实际保留行数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Truncation {
+    content: String,
+    truncated_by: TruncatedBy,
+    /// 截断后实际保留下来的行数。
+    output_lines: usize,
+    /// 末尾那行本身超过字节上限时，是否只保留了该行尾部。
+    last_line_partial: bool,
+}
+
+fn format_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// 为已超出展示预算的 Bash 或 MCP 输出选择尾部，保留最后 `DEFAULT_MAX_LINES` 行且不超过 `DEFAULT_MAX_BYTES`。
+/// 调用方先判定超限；捕获缓冲裁过开头时仍大于展示预算。
+/// 末尾单行超过字节上限时，只保留该行尾部的完整 UTF-8 字符（`last_line_partial = true`）。
+fn truncate_tail(content: &str) -> Truncation {
+    let lines = content.split_terminator('\n');
+    let mut output: Vec<&str> = Vec::new();
+    let mut output_bytes = 0usize;
+    // 截断类别由真正触发的那个边界决定：行数上限先命中就按行报告，否则按字节报告。
+    // 去掉末尾换行后正文可能恰好放得下，这种情况下超限原因仍然是字节。
+    let mut truncated_by = TruncatedBy::Bytes;
+    for line in lines.rev() {
+        if output.len() >= DEFAULT_MAX_LINES {
+            truncated_by = TruncatedBy::Lines;
+            break;
+        }
+        let line_bytes = line.len() + usize::from(!output.is_empty()); // 行间的换行 +1
+        if output_bytes + line_bytes > DEFAULT_MAX_BYTES {
+            if output.is_empty() {
+                return Truncation {
+                    content: truncate_string_to_bytes_from_end(line, DEFAULT_MAX_BYTES),
+                    truncated_by: TruncatedBy::Bytes,
+                    output_lines: 1,
+                    last_line_partial: true,
+                };
+            }
+            break;
+        }
+        output.push(line);
+        output_bytes += line_bytes;
+    }
+    let content = {
+        output.reverse();
+        output.join("\n")
+    };
+    Truncation {
+        content,
+        truncated_by,
+        output_lines: output.len(),
+        last_line_partial: false,
+    }
+}
+
+/// 从行尾往前截到 max_bytes 字节以内，按 UTF-8 字符边界对齐。
+fn truncate_string_to_bytes_from_end(line: &str, max_bytes: usize) -> String {
+    if line.len() <= max_bytes {
+        return line.to_string();
+    }
+    let start = line.ceil_char_boundary(line.len() - max_bytes);
+    line[start..].to_string()
 }

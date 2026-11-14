@@ -26,5 +26,4 @@ pub use config::{ModelConfigManager, ModelConfigurationSnapshot, discover_models
 pub use error::*;
 pub use openai::OpenAiProvider;
 pub use provider::ProviderStreamEvent;
-pub use provider::contract::ProviderApiProtocol;
 pub use types::*;

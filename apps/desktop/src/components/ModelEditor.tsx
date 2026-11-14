@@ -58,22 +58,22 @@ export function ModelEditor({ index, initial, protocol, onConfirm, onClose }: Mo
         <div className="model-editor-scroll">
           <label className="sg-field">
             <span>模型 ID</span>
-            <input className="sg-input" data-autofocus value={draft.modelId} onChange={event => patch({ modelId: event.target.value })} />
+            <input className="input" data-autofocus value={draft.modelId} onChange={event => patch({ modelId: event.target.value })} />
           </label>
           <div className="model-capacity-row"><label className="sg-field">
             <span>上下文窗口</span>
-            <input aria-label="上下文窗口" className="sg-input" aria-required="true" value={draft.contextText} onChange={event => patch({ contextText: event.target.value })} />
+            <input aria-label="上下文窗口" className="input" aria-required="true" value={draft.contextText} onChange={event => patch({ contextText: event.target.value })} />
           </label>
           <label className="sg-field">
             <span>最大输出 Token</span>
-            <input aria-label="最大输出 Token" className="sg-input" aria-required="true" value={draft.outputText} onChange={event => patch({ outputText: event.target.value })} />
+            <input aria-label="最大输出 Token" className="input" aria-required="true" value={draft.outputText} onChange={event => patch({ outputText: event.target.value })} />
           </label></div>
           <ReasoningOptions options={options} selected={variants} onChange={reasoningVariants => patch({ reasoningVariants })} />
         </div>
         {error && <p className="form-error model-editor-error" role="alert">{error}</p>}
         <footer className="sg-editor-actions">
-          <button type="button" className="sg-secondary-btn" onClick={onClose}>取消</button>
-          <button type="submit" disabled={!canSave} className="sg-primary-btn">确定</button>
+          <button type="button" className="secondary-button" onClick={onClose}>取消</button>
+          <button type="submit" disabled={!canSave} className="primary-button">确定</button>
         </footer>
       </form>
     </Dialog>

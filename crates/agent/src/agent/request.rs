@@ -20,10 +20,7 @@ pub(crate) struct RequestDefinitions {
 impl RequestDefinitions {
     /// 定义在本轮内不变，加载时一次计算预算，普通请求和整理请求直接复用。
     fn new(messages: Vec<Message>, tools: Vec<singularity_core::ToolDefinition>) -> Self {
-        let instructions = messages
-            .iter()
-            .map(|message| singularity_core::estimate_tokens_of(&message.content_text()) + 4)
-            .sum::<u64>();
+        let instructions = messages.iter().map(context::message_token_estimate).sum::<u64>();
         let tool_tokens = singularity_core::estimate_tool_tokens(&tools);
         Self {
             messages,
@@ -127,7 +124,7 @@ impl RequestContext {
                 messages,
                 images,
                 tools,
-                max_output_tokens: output_budget_tokens(&model, input_tokens, model.max_output_tokens),
+                max_output_tokens: output_budget_tokens(&model, input_tokens),
             })
         })
         .await
@@ -160,9 +157,6 @@ impl Agent {
         };
         if !self.requests.rotate_now(on_event, cancellation).await? {
             return Err(AgentError::Provider(overflow));
-        }
-        if cancellation.is_cancelled() {
-            return Err(AgentError::Aborted);
         }
         // 轮换后只重发一次，仍然超限时直接把错误返回给调用方。
         self.drain_inputs(on_event, cancellation).await?;

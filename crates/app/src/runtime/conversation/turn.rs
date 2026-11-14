@@ -13,17 +13,6 @@ use singularity_protocol::{Turn, TurnErrorDetail, TurnStatus};
 use super::Conversation;
 
 impl Conversation {
-    /// 检查模型选择能否用当前配置文件解析成可用的提供方和模型。
-    /// 用户修改任务模型时调用；执行准备时直接解析当轮配置。
-    pub(crate) fn validate_model_selection(
-        &self,
-        selection: &singularity_protocol::ModelSelection,
-    ) -> Result<(), String> {
-        self.models
-            .validate_selection(selection)
-            .map_err(|error| format!("invalid model selection: {error}"))
-    }
-
     /// 准备、执行并保存本轮结果，使用接受输入时创建的停止控制。
     ///
     /// 返回 Ok 时最终状态（完成、失败或中断）已经保存，结束事件也已发出，失败原因随
@@ -52,7 +41,6 @@ impl Conversation {
         };
         self.lock_state().last_context_window = Some(context_window);
         let turn_id = controls.turn_id.clone();
-        let writer = Arc::clone(&self.writer);
         let turn = Turn {
             turn_id: turn_id.clone(),
             status: TurnStatus::Running,
@@ -106,16 +94,17 @@ impl Conversation {
             error: error.clone(),
             user_stopped: cancel_accepted,
         };
-        let finished_at = match with_writer_async(&writer, move |writer| writer.append_record(record)).await {
-            Ok(timestamp) => timestamp,
-            Err(storage_error) => {
-                let message = match error {
-                    Some(error) => format!("{}; 保存执行结果失败：{storage_error}", error.message),
-                    None => format!("保存执行结果失败：{storage_error}"),
-                };
-                return Err(TurnErrorDetail { message, item_id: None });
-            }
-        };
+        let finished_at =
+            match with_writer_async(&self.writer, move |writer| writer.append_record(record)).await {
+                Ok(timestamp) => timestamp,
+                Err(storage_error) => {
+                    let message = match error {
+                        Some(error) => format!("{}; 保存执行结果失败：{storage_error}", error.message),
+                        None => format!("保存执行结果失败：{storage_error}"),
+                    };
+                    return Err(TurnErrorDetail { message, item_id: None });
+                }
+            };
         let manually_stopped = crate::runtime::history::is_manually_stopped(turn_status, cancel_accepted);
         if let Some(error) = &error {
             sink(TurnEvent::TurnFailed { error: error.clone(), finished_at });
@@ -137,13 +126,12 @@ impl Conversation {
         &self,
         controls: &crate::runtime::conversation::TurnControls,
     ) -> Result<(Agent, String, u64), TurnErrorDetail> {
-        let writer = Arc::clone(&self.writer);
         let inbox = Arc::clone(&self.lock_state().steering_inbox);
         let context = self.prepare_request_context()?;
         let context_window = context.context_window();
         let agent = Agent::new(context, inbox, Arc::clone(&controls.questions), Arc::clone(&self.bash_tasks));
         // 开始记录的 ID 就是回合 ID；输入消息由 Agent 之后单独保存，两次写入不是一个事务。
-        let mut writer = lock_writer(&writer);
+        let mut writer = lock_writer(&self.writer);
         let started_at = writer
             .append_record_with_id(controls.turn_id.clone(), LedgerRecord::OperationStarted)
             .map_err(preparation_error)?;

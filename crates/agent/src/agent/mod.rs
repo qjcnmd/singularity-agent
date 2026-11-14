@@ -27,11 +27,11 @@ use singularity_model::{OpenAiProvider, ProviderError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-pub use self::inbox::{QueuedInput, QueuedInputKind, SteeringInbox, SteeringInboxHandle, UserInput};
+pub use self::inbox::{QueuedInput, SteeringInbox, SteeringInboxHandle, UserInput};
 pub use self::questions::UserQuestions;
 pub use singularity_protocol::TurnEvent;
 
-use self::inbox::lock_inbox;
+use self::inbox::{QueuedInputKind, lock_inbox};
 use crate::message::public_items;
 use crate::session::{SessionError, SessionWriter, lock_writer};
 use crate::tools::ToolRegistrySnapshot;
@@ -161,16 +161,10 @@ impl Agent {
         cancellation: &CancellationToken,
     ) -> Result<()> {
         self.drain_inputs(on_event, cancellation).await?;
-        if cancellation.is_cancelled() {
-            return Err(AgentError::Aborted);
-        }
 
         self.requests.ensure_definitions(on_event, cancellation).await?;
 
         loop {
-            if cancellation.is_cancelled() {
-                return Err(AgentError::Aborted);
-            }
             self.drain_inputs(on_event, cancellation).await?;
             let (response, assistant_result_entry_id, saved_at) =
                 self.generate_response(on_event, cancellation).await?;
@@ -219,7 +213,7 @@ impl Agent {
     ) -> Result<()> {
         loop {
             if cancellation.is_cancelled() {
-                return Ok(());
+                return Err(AgentError::Aborted);
             }
             let next = lock_inbox(&self.inbox).next();
             let Some(request) = next else { break };

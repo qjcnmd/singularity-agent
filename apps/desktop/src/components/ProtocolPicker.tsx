@@ -22,7 +22,7 @@ export function ProtocolPicker({ value, onChange }: { value: ProviderApiProtocol
       anchor.current!.click()
     }
   }}>
-    <button ref={anchor} type="button" className="sg-input protocol-trigger" aria-label="API 协议" aria-haspopup="listbox" aria-controls={id} aria-expanded={open} popoverTarget={id}>
+    <button ref={anchor} type="button" className="input protocol-trigger" aria-label="API 协议" aria-haspopup="listbox" aria-controls={id} aria-expanded={open} popoverTarget={id}>
       <span>{protocols.find(([id]) => id === value)?.[1] ?? `无效协议：${value}`}</span><ExpandChevron expanded={open} size={14} />
     </button>
     <div ref={popup} id={id} popover="auto" className="protocol-dropdown" onToggle={event => setOpen(event.newState === 'open')}><Disclosure open={open}><div className="protocol-options" role="listbox" aria-label="API 协议">

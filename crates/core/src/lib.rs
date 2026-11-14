@@ -58,10 +58,6 @@ pub fn display_path(path: &std::path::Path) -> String {
     }
 }
 
-pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
-    std::fs::create_dir_all(path).map_err(|error| format!("failed to create {}: {error}", path.display()))
-}
-
 /// 将值写成缩进 JSON 并追加一个 LF，刷盘后原子替换目标文件。
 /// 调用方负责创建父目录；序列化或文件操作失败时保留原错误原因。
 pub fn write_json_atomic<T: serde::Serialize + ?Sized>(

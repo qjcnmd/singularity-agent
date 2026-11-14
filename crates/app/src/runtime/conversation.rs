@@ -204,7 +204,10 @@ impl Conversation {
         &self,
         selection: &singularity_protocol::ModelSelection,
     ) -> Result<(), ConversationError> {
-        self.validate_model_selection(selection).map_err(ConversationError::Configuration)?;
+        self.models
+            .validate_selection(selection)
+            .map_err(|error| format!("invalid model selection: {error}"))
+            .map_err(ConversationError::Configuration)?;
         let mut view = self.lock_view();
         let mut state = self.lock_state();
         if &state.model == selection {

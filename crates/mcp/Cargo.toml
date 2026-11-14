@@ -16,10 +16,9 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-rmcp = { version = "3.5.0", default-features = false, features = ["client", "transport-child-process", "which-command", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+rmcp = { version = "3.10.0", default-features = false, features = ["client", "transport-child-process", "which-command", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
 reqwest.workspace = true
 rustls.workspace = true
-url = "2.5"
 sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]

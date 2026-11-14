@@ -6,9 +6,12 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use serde::Deserialize;
 use serde_json::json;
+use similar::{ChangeTag, TextDiff};
 use tokio_util::sync::CancellationToken;
 
-use super::registry::{ABORTED_MESSAGE, ToolExecution, error_result};
+use super::registry::{
+    ABORTED_MESSAGE, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, ToolDisplay, ToolExecution, error_result,
+};
 
 static FILE_EDITS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -175,5 +178,31 @@ fn execute_locked(
     // 提交开始后报告真实写入结果，不能把已完成的修改改报为取消。
     singularity_core::write_bytes_atomic(target, updated.as_bytes())
         .map_err(|error| format!("Could not write {}: {error}", args.path))?;
-    Ok(super::edit_diff::result(&args.path, &content, &updated))
+    Ok(edit_result(&args.path, &view, &updated))
+}
+
+fn edit_result(path: &str, before: &str, after: &str) -> ToolExecution {
+    let after = after.strip_prefix('\u{feff}').unwrap_or(after).replace("\r\n", "\n");
+    let diff = TextDiff::from_lines(before, &after);
+    let (mut added, mut deleted) = (0, 0);
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Insert => added += 1,
+            ChangeTag::Delete => deleted += 1,
+            ChangeTag::Equal => {}
+        }
+    }
+    let patch = diff.unified_diff().context_radius(2).to_string();
+    let mut output = format!("+{added} -{deleted}\n");
+    for (index, line) in patch.lines().enumerate() {
+        if index >= DEFAULT_MAX_LINES || output.len() + line.len() + 1 > DEFAULT_MAX_BYTES {
+            output.push_str("[Diff truncated]\n");
+            break;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    let mut execution = ToolExecution::text(format!("Edited {path}.\n{output}"));
+    execution.display = Some(Box::new(ToolDisplay { output, background_task_id: None }));
+    execution
 }

@@ -93,13 +93,13 @@ fn load_selected_skills(text: &str, cwd: &std::path::Path, home: &std::path::Pat
 /// 队列中的一项输入；消息 ID 在入队时分配，保存失败后重试仍用同一个。
 #[derive(Debug, Clone)]
 pub struct QueuedInput {
-    pub input: QueuedInputKind,
+    pub(super) input: QueuedInputKind,
     pub(super) message_id: String,
 }
 
 /// 区分用户消息和后台命令完成通知；通知不会显示成用户输入。
 #[derive(Debug, Clone)]
-pub enum QueuedInputKind {
+pub(super) enum QueuedInputKind {
     User(UserInput),
     Background { task_id: String },
 }

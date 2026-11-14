@@ -126,7 +126,7 @@ impl RequestContext {
                 messages,
                 images,
                 tools: definitions.tools,
-                max_output_tokens: output_budget_tokens(&model, input_tokens, model.max_output_tokens),
+                max_output_tokens: output_budget_tokens(&model, input_tokens),
             })
         })
         .await

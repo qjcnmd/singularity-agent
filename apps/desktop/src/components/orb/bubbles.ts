@@ -1,8 +1,8 @@
 /* 水里的气泡：从球底陆续冒出 → 上升并变大 → 到水面破掉。 */
 
-export type Bubble = { x: number; y: number; vx: number; vy: number; age: number; base: number; radius: number; birthY: number; birthDepth: number; state: 'rising' | 'popping'; pop: number }
-export type WetQuery = (x: number, y: number) => boolean
-export type FlowQuery = (x: number, y: number) => [number, number]
+type Bubble = { x: number; y: number; vx: number; vy: number; age: number; base: number; radius: number; birthY: number; birthDepth: number; state: 'rising' | 'popping'; pop: number }
+type WetQuery = (x: number, y: number) => boolean
+type FlowQuery = (x: number, y: number) => [number, number]
 
 export class Bubbles {
   items: Bubble[] = []

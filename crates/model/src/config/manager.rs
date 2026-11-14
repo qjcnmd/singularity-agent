@@ -38,8 +38,9 @@ impl ModelConfigManager {
         selection: &ModelSelection,
     ) -> Result<(OpenAiProviderConfig, SelectedModel), ProviderError> {
         let _access = self.lock();
-        let config = read_user_config_file(&self.directory)?
-            .ok_or_else(|| missing_provider_config_error(crate::USER_CONFIG_FILE_NAME))?;
+        let config = read_user_config_file(&self.directory)?.ok_or_else(|| {
+            configuration_error(format!("缺少提供方配置：{}", crate::USER_CONFIG_FILE_NAME))
+        })?;
         resolve_model_selection(&config, selection)
     }
 

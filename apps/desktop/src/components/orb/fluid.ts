@@ -14,7 +14,7 @@ export async function initFluid() {
   engine = await factory({ wasmBinary: wasmBinary.buffer })
 }
 
-export type Particle = { x: number; y: number; vx: number; vy: number }
+type Particle = { x: number; y: number; vx: number; vy: number }
 
 export class Fluid {
   particles: Particle[] = []

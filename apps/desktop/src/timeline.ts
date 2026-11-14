@@ -2,7 +2,7 @@ import { contextRotationText } from './copy'
 import { hasErrorItem } from './execution'
 import type { HistoryItem, PendingQuestion, ReadSource, SessionRuntime, ThreadTurn, ToolStatus, VisibleBackgroundTask } from './protocol'
 
-export type ToolItem = Extract<HistoryItem, { type: 'tool' }>
+type ToolItem = Extract<HistoryItem, { type: 'tool' }>
 export type ToolGroup = { type: 'tool_group'; name: string; rows: Array<{ key: string; item: ToolItem }> }
 
 export type TimelineContent = HistoryItem | ToolGroup
@@ -187,10 +187,6 @@ export function formatClock(value: string, includeDate = false): string {
   return includeDate && date.toDateString() !== new Date().toDateString() ? `${date.getMonth() + 1}/${date.getDate()} ${clock}` : clock
 }
 
-export function backgroundTaskId(item: Extract<HistoryItem, { type: 'tool' }>): string | null {
-  return item.name === 'bash' ? item.result?.backgroundTaskId ?? null : null
-}
-
 /** 为 `read` 工具输出的前 `source.lineCount` 行标注源文件行号；超出部分的截断或分页提示不标行号。 */
 export function readOutputLines(text: string, source: ReadSource): Array<{ text: string; number?: number }> {
   const lines = text.replace(/\r\n/g, '\n').split('\n')
@@ -201,7 +197,7 @@ export function readOutputLines(text: string, source: ReadSource): Array<{ text:
 
 /** 单条详情与分组计数共用后台任务终态，避免命令转后台后仍显示成功。 */
 export function toolDisplay(item: ToolItem, tasks: VisibleBackgroundTask[] = []) {
-  const id = backgroundTaskId(item)
+  const id = item.name === 'bash' ? item.result?.backgroundTaskId ?? null : null
   const task = id ? tasks.find(task => task.taskId === id) : undefined
   const status: ToolStatus = task ? task.state.status === 'running' ? 'running'
     : task.state.status === 'stopped' || task.state.status === 'interrupted' ? 'interrupted'

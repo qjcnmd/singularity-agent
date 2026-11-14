@@ -81,17 +81,20 @@ impl Conversation {
                 })
                 .collect(),
             failure: view.failure.clone(),
-            usage: view.usage.clone(),
         }
     }
     /// 历史与活动内容在同一次会话读取内合并。
     pub fn read(&self) -> Result<SessionReadResult, crate::runtime::CatalogError> {
         let view = self.lock_view();
-        let mut runtime = self.runtime(&view);
-        let background_tasks = self.background_tasks();
+        let runtime = self.runtime(&view);
+        let background_tasks = self.bash_tasks.list().into_iter().map(Into::into).collect();
         let writer = lock_writer(&self.writer);
-        let (mut history, usage) = crate::runtime::thread_catalog::read_thread_history(&writer)?;
-        runtime.usage = usage;
+        let mut history = crate::runtime::history::read_thread_history(&writer).map_err(|source| {
+            crate::runtime::CatalogError::Session {
+                path: writer.path().to_path_buf(),
+                source,
+            }
+        })?;
         view.activity.merge(&mut history);
         Ok(SessionReadResult {
             revision: view.last_event_revision,
@@ -101,19 +104,26 @@ impl Conversation {
             context: view.context.clone(),
         })
     }
+    pub(super) fn publish(&self, view: &mut ConversationView, event: StreamEvent) {
+        view.last_event_revision = (self.publish)(event);
+    }
+
     pub(super) fn publish_changed(&self, view: &mut ConversationView) {
-        view.last_event_revision = (self.publish)(StreamEvent::SessionChanged {
-            session_id: self.thread_id.clone(),
-            payload: self.runtime(view),
-        });
+        let payload = self.runtime(view);
+        self.publish(
+            view,
+            StreamEvent::SessionChanged {
+                session_id: self.thread_id.clone(),
+                payload,
+            },
+        );
     }
     pub(super) fn summary(&self) -> singularity_protocol::ThreadSummary {
         let writer = lock_writer(&self.writer);
         crate::runtime::history::summarize_thread(&writer)
     }
     pub(super) fn publish_summary(&self, view: &mut ConversationView) {
-        view.last_event_revision =
-            (self.publish)(StreamEvent::SessionSummaryChanged { summary: self.summary() });
+        self.publish(view, StreamEvent::SessionSummaryChanged { summary: self.summary() });
     }
     /// 接收 Agent 的共同事件，更新运行状态后发布。
     pub(super) fn on_event(&self, event: TurnEvent) {
@@ -152,13 +162,16 @@ impl Conversation {
         if phase != SessionPhase::Idle {
             view.activity.apply(&event);
         }
-        view.last_event_revision = (self.publish)(StreamEvent::TurnEvent {
-            session_id: self.thread_id.clone(),
-            payload: Box::new(TurnEventEnvelope {
-                turn_id: view.activity.turn_id(),
-                event,
-                phase,
-            }),
-        });
+        self.publish(
+            view,
+            StreamEvent::TurnEvent {
+                session_id: self.thread_id.clone(),
+                payload: Box::new(TurnEventEnvelope {
+                    turn_id: view.activity.turn_id(),
+                    event,
+                    phase,
+                }),
+            },
+        );
     }
 }

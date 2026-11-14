@@ -1,6 +1,6 @@
 import { workspaceKey } from './workspace'
 import { workspaceName } from './copy'
-import { actionToastTransition } from './motion'
+import { pop } from './motion'
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { Composer } from './components/Composer'
 import { Conversation } from './components/Conversation'
@@ -43,7 +43,7 @@ export function App() {
 }
 
 const MainContent = memo(function MainContent({ accent }: { accent: string }) {
-  const state = useAppStore(['page', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'backgroundOpen', 'actionErrors', 'actionErrorOrigin'])
+  const state = useAppStore(['page', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'backgroundOpen', 'actionErrors', 'actionErrorOrigin'])
   const facts = state.session?.facts
   const runtime = state.session?.runtime
   const failure = runtime?.failure
@@ -94,7 +94,7 @@ const MainContent = memo(function MainContent({ accent }: { accent: string }) {
         <AnimatePresence>
           {visibleError !== null && <motion.div key="action-toast" className="action-toast" role="status"
             initial={{ opacity: reducedMotion ? 1 : 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            transition={reducedMotion ? { duration: 0 } : actionToastTransition}>
+            transition={reducedMotion ? { duration: 0 } : pop}>
             <strong>{visibleError.message}</strong>
           </motion.div>}
         </AnimatePresence>

@@ -1,6 +1,6 @@
 //! Chat 与 Responses 共用的工具参数和 Token 用量解析。
 use crate::error::ProviderError;
-use crate::provider::contract::provider_response_validation_error;
+use crate::provider::provider_response_validation_error;
 use crate::types::ModelUsage;
 use serde_json::Value;
 

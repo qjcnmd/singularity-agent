@@ -54,7 +54,7 @@ impl Connection {
 
     pub async fn connect(cwd: &Path, config: ServerConfig) -> Result<Self, String> {
         let logs = Arc::new(Mutex::new(Vec::new()));
-        let root = url::Url::from_directory_path(cwd)
+        let root = reqwest::Url::from_directory_path(cwd)
             .map_err(|_| "MCP 项目目录无法转换为文件 URI。")?
             .to_string();
         let handler = Handler { root };

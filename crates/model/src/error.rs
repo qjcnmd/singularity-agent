@@ -181,15 +181,6 @@ pub(crate) fn bounded_provider_error_diagnostic(text: &str) -> String {
     diagnostic
 }
 
-/// 提取截断后的非空错误说明；为空时由调用方提供默认说明。
-pub(crate) fn bounded_wire_detail(fields: &ProviderErrorBodyFields) -> Option<String> {
-    fields
-        .message
-        .as_deref()
-        .map(bounded_provider_error_diagnostic)
-        .filter(|text| !text.is_empty())
-}
-
 /// 构造流内事件或 200 响应体中的提供方错误：已知错误码映射到对应分类（上下文超限触发轮换、限流可重试、配额耗尽不重试），
 /// 未知错误码归为 `Other`（不自动重试），并附上提供方原文和错误码。
 pub(crate) fn provider_embedded_error(
@@ -197,7 +188,12 @@ pub(crate) fn provider_embedded_error(
     fallback_message: &str,
 ) -> ProviderError {
     let kind = provider_error_kind_for_code(fields.code.as_deref()).unwrap_or(ModelErrorKind::Other);
-    let message = bounded_wire_detail(fields).unwrap_or_else(|| fallback_message.to_string());
+    let message = fields
+        .message
+        .as_deref()
+        .map(bounded_provider_error_diagnostic)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| fallback_message.to_string());
     let details = provider_wire_facts(fields);
     ProviderError::diagnostic(kind, message, details)
 }

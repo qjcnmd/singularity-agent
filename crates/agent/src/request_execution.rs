@@ -15,14 +15,10 @@ use singularity_protocol::{
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-/// 输出上限取模型上限、请求用途与窗口剩余空间的最小值。
-pub(crate) fn output_budget_tokens(
-    model: &ModelConfigurationSnapshot,
-    input_tokens: u64,
-    requested_output_tokens: u32,
-) -> u32 {
+/// 输出上限取模型上限与窗口剩余空间的最小值。
+pub(crate) fn output_budget_tokens(model: &ModelConfigurationSnapshot, input_tokens: u64) -> u32 {
     let room = model.context_window().saturating_sub(input_tokens);
-    model.max_output_tokens.min(requested_output_tokens).min(room as u32)
+    model.max_output_tokens.min(room as u32)
 }
 
 /// 发送一次请求，可重试的错误最多尝试三次。每次尝试使用新的消息 ID，等待期间可停止。
@@ -82,7 +78,6 @@ pub(crate) async fn execute_request(
             provider: provider_name.to_string(),
             model: model_name.to_string(),
             status,
-            duration_ms: duration_millis(finished.duration_since(started)),
             ttft_ms: first_token.map(|first| duration_millis(first.duration_since(started))),
             decode_ms: first_token.map(|first| duration_millis(finished.duration_since(first))),
             usage: response.usage.clone(),

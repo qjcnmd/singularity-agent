@@ -15,9 +15,8 @@
 .mcp-dot { width: 9px; height: 9px; flex: none; margin: 0 4px; border-radius: 50%; background: #c7c7cc; }
 .mcp-dot.status-connected { background: var(--positive); }
 .mcp-dot.status-failed { background: var(--danger); }
-.mcp-dot.status-connecting { background: var(--warning); animation: breathe 1.2s ease-in-out infinite; }
+.mcp-dot.status-connecting { background: var(--warning); }
 .mcp-tools { display: grid; gap: 10px; justify-items: start; padding: 2px 16px 16px 52px; }
 .mcp-tool { overflow-wrap: anywhere; border: 0; padding: 0; }
-.mcp-editor-modal { width: 520px; }
 .mcp-editor-scroll { display: grid; gap: 14px; min-width: 0; margin: 0; border: 0; overflow-y: auto; padding: 10px 24px 4px; }
 .mcp-editor footer { flex: none; display: flex; justify-content: flex-end; gap: 8px; border: 0; padding: 16px 20px 20px; }

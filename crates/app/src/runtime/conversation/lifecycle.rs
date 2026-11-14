@@ -3,41 +3,6 @@ use super::*;
 use singularity_protocol::{SessionFailure, SessionOperation, StreamEvent, TurnStatus};
 
 impl Conversation {
-    /// 首条和后续消息都放进输入队列；空闲时占用任务并返回要启动的回合，
-    /// 运行中只排队，等当前回合消费或结束后接着处理。
-    fn submit(self: &Arc<Self>, input: UserInput) -> Result<Option<Operation>, ConversationError> {
-        let mut view = self.lock_view();
-        let mut state = self.lock_state();
-        if state.closing {
-            return Err(ConversationError::Busy);
-        }
-        let start = match state.turn.phase() {
-            SessionPhase::Idle => true,
-            SessionPhase::Running | SessionPhase::Rotating => false,
-            SessionPhase::Stopping => return Err(ConversationError::Busy),
-        };
-        let mut inbox = state.steering_inbox.lock().expect("turn inbox lock poisoned");
-        inbox.enqueue(QueuedInput::new(input));
-        drop(inbox);
-        state.auto_resume = true;
-        if !start {
-            drop(state);
-            self.publish_changed(&mut view);
-            return Ok(None);
-        }
-        Ok(Some(self.begin_operation(&mut view, state, SessionOperation::Turn)))
-    }
-
-    /// 空闲时占用任务执行独立轮换；轮换标记让运行阶段显示为“轮换中”。
-    fn reserve_context_rotation(self: &Arc<Self>) -> Result<Operation, ConversationError> {
-        let mut view = self.lock_view();
-        let state = self.lock_state();
-        if state.closing || state.turn.is_busy() {
-            return Err(ConversationError::Busy);
-        }
-        Ok(self.begin_operation(&mut view, state, SessionOperation::ContextRotation))
-    }
-
     // 三个入口都已在状态锁内检查允许启动；占用任务、清理上次显示状态和发布由这里一起完成。
     fn begin_operation(
         &self,
@@ -81,22 +46,55 @@ impl Conversation {
         view.failure = failure;
         view.activity = Default::default();
         self.lock_state().turn = TurnLifecycle::Idle;
-        view.last_event_revision = (self.publish)(StreamEvent::SessionSettled {
-            session_id: self.thread_id.clone(),
-            payload: self.runtime(&view),
-            summary: self.summary(),
-        });
+        let payload = self.runtime(&view);
+        self.publish(
+            &mut view,
+            StreamEvent::SessionSettled {
+                session_id: self.thread_id.clone(),
+                payload,
+                summary: self.summary(),
+            },
+        );
         self.changed.notify_waiters();
     }
+
     /// 接受用户输入并启动所需执行；后续回合由会话接续。
     pub fn start(self: &Arc<Self>, input: UserInput) -> Result<(), ConversationError> {
-        if let Some(operation) = self.submit(input)? {
-            self.spawn_operation(operation);
+        let mut view = self.lock_view();
+        let mut state = self.lock_state();
+        if state.closing {
+            return Err(ConversationError::Busy);
         }
+        let start = match state.turn.phase() {
+            SessionPhase::Idle => true,
+            SessionPhase::Running | SessionPhase::Rotating => false,
+            SessionPhase::Stopping => return Err(ConversationError::Busy),
+        };
+        let mut inbox = state.steering_inbox.lock().expect("turn inbox lock poisoned");
+        inbox.enqueue(QueuedInput::new(input));
+        drop(inbox);
+        state.auto_resume = true;
+        if !start {
+            drop(state);
+            self.publish_changed(&mut view);
+            return Ok(());
+        }
+        let operation = self.begin_operation(&mut view, state, SessionOperation::Turn);
+        drop(view);
+        self.spawn_operation(operation);
         Ok(())
     }
+
+    /// 空闲时占用任务执行独立轮换；轮换标记让运行阶段显示为“轮换中”。
     pub fn rotate_context(self: &Arc<Self>) -> Result<(), ConversationError> {
-        self.spawn_operation(self.reserve_context_rotation()?);
+        let mut view = self.lock_view();
+        let state = self.lock_state();
+        if state.closing || state.turn.is_busy() {
+            return Err(ConversationError::Busy);
+        }
+        let operation = self.begin_operation(&mut view, state, SessionOperation::ContextRotation);
+        drop(view);
+        self.spawn_operation(operation);
         Ok(())
     }
     pub(super) fn spawn_operation(self: &Arc<Self>, mut operation: Operation) {

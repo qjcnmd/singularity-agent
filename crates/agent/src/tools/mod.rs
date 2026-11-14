@@ -5,20 +5,16 @@
 
 mod bash;
 mod edit;
-mod edit_diff;
 mod mcp;
 mod output;
 mod question;
 mod read;
 mod registry;
 mod skill;
-mod truncate;
 mod view_image;
 
 pub use bash::{BashTaskUpdate, BashTasks};
-pub(crate) use registry::ToolContext;
-pub use registry::ToolExecution;
-pub(crate) use registry::{ABORTED_MESSAGE, error_result};
+pub(crate) use registry::{ABORTED_MESSAGE, ToolContext, ToolExecution, error_result};
 pub(crate) use registry::{
     PreparedTool, ToolRegistrySnapshot, bash_tool, edit_tool, question_tool, read_tool, task_tools,
     view_image_tool,

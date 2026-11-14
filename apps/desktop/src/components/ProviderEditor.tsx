@@ -136,16 +136,16 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
         <fieldset disabled={busy} className="provider-fields">
           {!provider && <label className="sg-field">
               <span>提供方 ID</span>
-              <input className="sg-input" autoFocus value={providerId} onChange={event => setProviderId(event.target.value)} />
+              <input className="input" autoFocus value={providerId} onChange={event => setProviderId(event.target.value)} />
             </label>}
-          <label className="sg-field"><span>API 地址</span><input className="sg-input" value={baseUrl} onChange={event => setBaseUrl(event.target.value)} /></label>
+          <label className="sg-field"><span>API 地址</span><input className="input" value={baseUrl} onChange={event => setBaseUrl(event.target.value)} /></label>
           <div className="field-row">
-            <label className="sg-field"><span>显示名称</span><input className="sg-input" value={name} onChange={event => setName(event.target.value)} /></label>
+            <label className="sg-field"><span>显示名称</span><input className="input" value={name} onChange={event => setName(event.target.value)} /></label>
             <div className="sg-field"><span>API 协议</span><ProtocolPicker value={protocol} onChange={setProtocol} /></div>
           </div>
           <label className="sg-field">
             <span>API 密钥</span>
-            <input className="sg-input" type="password" autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} />
+            <input className="input" type="password" autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} />
           </label>
             <section className="sg-model-catalog" aria-label="模型目录">
               <div className="sg-model-catalog-head">
@@ -164,7 +164,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
                       <span className="catalog-id">{model.modelId}</span>
                       <small>{model.maxContextTokens === null ? '' : `${formatTokenCount(model.maxContextTokens)} 上下文`}{model.reasoningVariants?.length ? ` · ${model.reasoningVariants.join(' / ')}` : ''}</small>
                       <button type="button" className="quiet-button" onClick={() => setModelEditor({ index, draft: applyProtocol(model, protocol) })}>编辑</button>
-                      <button type="button" className="sg-icon-btn danger" aria-label={`删除模型 ${model.modelId}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}><X size={14} /></button>
+                      <button type="button" className="icon-button small danger" aria-label={`删除模型 ${model.modelId}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}><X size={14} /></button>
                     </div>
                     {reasoningError && <p className="form-error" role="alert">{reasoningError}</p>}
                   </div>
@@ -176,8 +176,8 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
           {failure && <p className="form-error" role="alert">{failure}</p>}
           {saveError && <p className="form-error" role="alert">{saveError.message}</p>}
           <footer className="sg-editor-actions">
-            <button type="button" className="sg-secondary-btn" onClick={onDone}>取消</button>
-            <button type="submit" className="sg-primary-btn">{busy ? '保存中…' : '保存配置'}</button>
+            <button type="button" className="secondary-button" onClick={onDone}>取消</button>
+            <button type="submit" className="primary-button">{busy ? '保存中…' : '保存配置'}</button>
           </footer>
         </fieldset>
       </form>
@@ -202,8 +202,8 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
           ))}
         </div>
         <footer className="sg-editor-actions">
-          <button type="button" className="sg-secondary-btn" onClick={() => setCandidates(null)}>取消</button>
-          <button type="button" className="sg-primary-btn" disabled={picked.size === 0} onClick={adopt}>添加模型</button>
+          <button type="button" className="secondary-button" onClick={() => setCandidates(null)}>取消</button>
+          <button type="button" className="primary-button" disabled={picked.size === 0} onClick={adopt}>添加模型</button>
         </footer>
       </Dialog>
     </>

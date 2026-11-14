@@ -1,7 +1,6 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { actionOrigin, appStore, useAppStore, pendingKey } from '../appStore'
 import { ModelPicker } from './ModelPicker'
-import { PickerSurface } from './PickerSurface'
 import { ContextCapsules } from './ContextCapsules'
 import { WaterOrb } from './orb/WaterOrb'
 import { motion, useReducedMotion } from 'motion/react'
@@ -102,7 +101,7 @@ function ComposerView({ accent }: { accent: string }) {
       transition={{ layout: reducedMotion ? { duration: 0 } : smooth }}>
       {sessionId === null && <ContextCapsules />}
       <div ref={candidateAnchor} className="composer-candidate-anchor">
-        <PickerSurface open={showCandidateSurface}>
+        <div className={`picker-disclosure${showCandidateSurface ? ' is-open' : ''}`} inert={!showCandidateSurface} aria-hidden={!showCandidateSurface}><div>
           <div ref={candidateList} className="composer-candidates" onKeyDown={event => {
             if (event.key === 'Escape') {
               event.preventDefault()
@@ -139,7 +138,7 @@ function ComposerView({ accent }: { accent: string }) {
               </div>
             )}
           </div>
-        </PickerSurface>
+        </div></div>
       </div>
       <div {...attachmentInput.handlers} className="composer-card">
         <DraftImages images={imageDraft} remove={index => { if (draftKey !== null) appStore.setImages(draftKey, imageDraft.filter((_, at) => at !== index)) }} />

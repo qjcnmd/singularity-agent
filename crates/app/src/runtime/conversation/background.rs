@@ -7,23 +7,13 @@ impl Conversation {
         &self.bash_tasks
     }
 
-    pub fn background_tasks(&self) -> Vec<singularity_protocol::VisibleBackgroundTask> {
-        self.bash_tasks.list().into_iter().map(Into::into).collect()
-    }
-
     pub(super) fn on_background_update(self: &Arc<Self>, update: singularity_agent::tools::BashTaskUpdate) {
         match update {
             singularity_agent::tools::BashTaskUpdate::Updated(task) => {
                 let wake = !task.state.is_running();
                 {
                     let mut view = self.lock_view();
-                    view.last_event_revision = (self.publish)(StreamEvent::BackgroundTaskUpdated {
-                        session_id: self.thread_id.clone(),
-                        payload: Box::new(singularity_protocol::BackgroundTaskUpdate {
-                            phase: self.phase(),
-                            task: task.into(),
-                        }),
-                    });
+                    self.publish_background_task(&mut view, task.into());
                 }
                 if wake && let Some(operation) = self.pending_operation() {
                     self.spawn_operation(operation);
@@ -32,16 +22,24 @@ impl Conversation {
             singularity_agent::tools::BashTaskUpdate::Failed { task, error } => {
                 let mut view = self.lock_view();
                 self.set_background_failure(&mut view, error);
-                view.last_event_revision = (self.publish)(StreamEvent::BackgroundTaskUpdated {
-                    session_id: self.thread_id.clone(),
-                    payload: Box::new(singularity_protocol::BackgroundTaskUpdate {
-                        phase: self.phase(),
-                        task: task.into(),
-                    }),
-                });
+                self.publish_background_task(&mut view, task.into());
                 self.publish_changed(&mut view);
             }
         }
+    }
+
+    fn publish_background_task(
+        &self,
+        view: &mut view::ConversationView,
+        task: singularity_protocol::VisibleBackgroundTask,
+    ) {
+        self.publish(
+            view,
+            StreamEvent::BackgroundTaskUpdated {
+                session_id: self.thread_id.clone(),
+                payload: Box::new(singularity_protocol::BackgroundTaskUpdate { phase: self.phase(), task }),
+            },
+        );
     }
     pub(super) fn background_error(&self, message: String) {
         let mut view = self.lock_view();

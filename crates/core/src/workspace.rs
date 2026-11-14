@@ -1,16 +1,15 @@
-//! 项目目录的路径处理：文件系统调用用的原生路径、显示用的字符串和比较用的键在这里一起生成。
+//! 项目目录的路径处理：文件系统调用用的原生路径和显示用的字符串在这里一起生成。
 //! 项目登记、会话的工作目录和项目指令加载都用它；它只表示路径，不限制 Agent 的访问范围。
 
 use std::path::{Path, PathBuf};
 
 use crate::display_path;
 
-/// 已规范化的项目目录路径；相等比较忽略大小写和斜杠方向。
+/// 已规范化的项目目录路径。
 #[derive(Debug, Clone)]
 pub struct CanonicalWorkspacePath {
     native: PathBuf,
     display: String,
-    comparison_key: String,
 }
 
 impl CanonicalWorkspacePath {
@@ -25,17 +24,11 @@ impl CanonicalWorkspacePath {
 
     fn from_native(native: PathBuf) -> Self {
         let display = display_path(&native);
-        let comparison_key = saved_path_key(&display);
-        Self { native, display, comparison_key }
+        Self { native, display }
     }
 
     pub fn as_path(&self) -> &Path {
         &self.native
-    }
-
-    /// 忽略大小写的目录键，用于项目分组。
-    pub fn key(&self) -> &str {
-        &self.comparison_key
     }
 
     /// 界面显示和保存使用的正斜杠路径（去掉 Windows `\\?\` 前缀）。
@@ -43,14 +36,6 @@ impl CanonicalWorkspacePath {
         &self.display
     }
 }
-
-impl PartialEq for CanonicalWorkspacePath {
-    fn eq(&self, other: &Self) -> bool {
-        self.comparison_key == other.comparison_key
-    }
-}
-
-impl Eq for CanonicalWorkspacePath {}
 
 pub fn saved_path_key(path: &str) -> String {
     path.to_lowercase()

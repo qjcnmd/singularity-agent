@@ -6,7 +6,7 @@ import { Bubbles } from './bubbles'
  * 平时是解析出来的起伏海面；轮换时球壁转动，水改由 LiquidFun 粒子重建并翻滚；结束后平息再回落到新水位。
  * 球上不画箭头，点击即发送，运行中点击即停止。 */
 
-export type WaterOrbProps = {
+type WaterOrbProps = {
   /** 上下文占用，按高度映射，0–100。 */
   percent: number
   rotating: boolean

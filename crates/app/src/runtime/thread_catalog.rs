@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 use singularity_agent::session::{
     SessionData, SessionError, SessionManager, session_images_directory, session_outputs_directory,
 };
-use singularity_protocol::{ThreadHistory, ThreadSummary};
+use singularity_protocol::ThreadSummary;
 use uuid::Uuid;
 
-use crate::runtime::history::{index_turn_history, session_usage, summarize_thread};
+use crate::runtime::history::summarize_thread;
 
 pub const SESSIONS_DIR_NAME: &str = "sessions";
 
@@ -156,22 +156,4 @@ impl CatalogError {
             source => Self::Session { path: path.to_path_buf(), source },
         }
     }
-}
-
-/// 从同一份会话记录生成完整历史、任务摘要和最终累计用量。
-pub fn read_thread_history(
-    session: &SessionData,
-) -> Result<(ThreadHistory, singularity_protocol::SessionModelUsage), CatalogError> {
-    let summary = summarize_thread(session);
-    let indexed_turns = index_turn_history(session.entries());
-    let mut usage = session_usage(
-        &session.entries()
-            [..indexed_turns.first().map_or(session.entries().len(), |turn| turn.entries.start)],
-    );
-    let turns = indexed_turns
-        .iter()
-        .map(|turn| turn.project(session, &mut usage))
-        .collect::<Result<_, _>>()
-        .map_err(|error| CatalogError::session(&summary.thread_id, session.path(), error))?;
-    Ok((ThreadHistory { summary, turns }, usage))
 }

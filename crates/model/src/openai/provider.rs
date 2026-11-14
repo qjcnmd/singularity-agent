@@ -15,9 +15,9 @@ use crate::openai::{
     read_chat_sse_stream, read_responses_sse_stream, responses_endpoint,
 };
 use crate::provider::ProviderStreamEvent;
-use crate::provider::contract::ProviderApiProtocol;
 use crate::transport::{provider_client, provider_future, retry_after_delay};
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
+use singularity_protocol::ProviderApiProtocol;
 
 /// 按所选模型的协议发送 Chat Completions 或 Responses 流式请求。
 pub struct OpenAiProvider {

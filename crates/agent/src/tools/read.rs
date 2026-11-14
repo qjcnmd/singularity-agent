@@ -9,8 +9,10 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::registry::{ABORTED_MESSAGE, ToolExecution, error_result};
-use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, default_cap_summary, default_max_kb};
+use super::registry::{
+    ABORTED_MESSAGE, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, ToolExecution, default_cap_summary,
+    default_max_kb, error_result,
+};
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(

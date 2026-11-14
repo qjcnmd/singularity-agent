@@ -67,7 +67,6 @@ pub enum TurnEvent {
 
 /// 模型请求的实际结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAttemptStatus {
     Ok,

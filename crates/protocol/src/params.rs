@@ -5,7 +5,6 @@ use serde_json::Value;
 
 /// 请求的用途：普通生成或上下文轮换；两者的用量都计入会话合计。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RequestPurpose {
     Generation,
@@ -14,7 +13,6 @@ pub enum RequestPurpose {
 
 /// 提供方为一次请求上报的 Token 数和缓存命中数。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelUsage {
     pub input_tokens: u64,
@@ -28,21 +26,17 @@ pub struct ModelUsage {
 /// 一次请求尝试的结果、耗时和用量；保存到日志后由后端统计。
 /// 不含密钥或提供方私有数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestObservation {
     pub purpose: RequestPurpose,
     pub provider: String,
     pub model: String,
     pub status: crate::ProviderAttemptStatus,
-    pub duration_ms: u64,
     /// 请求开始到首个生成增量的实测耗时；没有生成增量时保持未知。
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
     pub ttft_ms: Option<u64>,
     /// 首个生成增量到请求完成的耗时；没有生成增量时保持未知。
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
     pub decode_ms: Option<u64>,
     /// 未上报时为 None；有用量时输入、输出和总数始终齐全。
     pub usage: Option<ModelUsage>,

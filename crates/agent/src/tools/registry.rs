@@ -15,9 +15,22 @@ use super::read;
 use super::skill;
 use super::view_image;
 
+pub(crate) const DEFAULT_MAX_LINES: usize = 2000;
+pub(crate) const DEFAULT_MAX_BYTES: usize = 50 * 1024;
+
+/// 展示上限的 KB 数值，工具描述与截断提示共用。
+pub(crate) const fn default_max_kb() -> usize {
+    DEFAULT_MAX_BYTES / 1024
+}
+
+/// `read` 与 `bash` 工具说明共用的上限描述。
+pub(crate) fn default_cap_summary() -> String {
+    format!("{DEFAULT_MAX_LINES} lines or {}KB", default_max_kb())
+}
+
 /// 工具执行的结果。若工具执行失败（如路径不存在或命令返回非零），通过 `is_error: true` 反馈给模型。
 #[derive(Debug)]
-pub struct ToolExecution {
+pub(crate) struct ToolExecution {
     pub content: String,
     /// 本地展示信息；未设置时显示 content，不编码到模型请求。
     pub display: Option<Box<ToolDisplay>>,
@@ -31,13 +44,13 @@ pub struct ToolExecution {
 
 /// 工具结果的本地展示正文及关联的后台命令。
 #[derive(Debug)]
-pub struct ToolDisplay {
+pub(crate) struct ToolDisplay {
     pub output: String,
     pub background_task_id: Option<String>,
 }
 
 impl ToolExecution {
-    pub fn text(content: impl Into<String>) -> Self {
+    pub(crate) fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             display: None,
@@ -48,7 +61,7 @@ impl ToolExecution {
         }
     }
 
-    pub fn with_read_source(mut self, source: singularity_protocol::ReadSource) -> Self {
+    pub(crate) fn with_read_source(mut self, source: singularity_protocol::ReadSource) -> Self {
         self.read_source = Some(source);
         self
     }
@@ -95,7 +108,7 @@ impl PreparedTool {
             Self::Bash(args) => bash_tasks.execute(args, cwd, output_directory, signal, on_update).await,
             Self::TaskList(_) => bash_tasks.tool_list(),
             Self::TaskOutput(args) => bash_tasks.output(&args.task_id, &signal),
-            Self::TaskStop(args) => bash_tasks.stop(&args.task_id).await.unwrap_or_else(error_result),
+            Self::TaskStop(args) => bash_tasks.tool_stop(&args.task_id).await,
             Self::Read(args) => tokio::task::spawn_blocking(move || read::execute(&args, &cwd, &signal))
                 .await
                 .expect("tool worker completes while the runtime is running"),
@@ -183,7 +196,7 @@ impl ToolRegistrySnapshot {
     }
 
     /// 发给模型的完整工具定义：内置工具在前，MCP 工具在后；`skill` 工具随 Skills 模块。
-    pub fn provider_schemas(&self) -> Vec<ToolDefinition> {
+    pub(crate) fn provider_schemas(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
             .map(|(schema, _)| schema.clone())

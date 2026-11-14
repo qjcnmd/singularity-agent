@@ -12,9 +12,10 @@ mod manager;
 use format::Result;
 
 pub use context::ContextRotationInput;
+pub(crate) use format::tool_item_id;
 pub use format::{
     ContextRotationEntry, LedgerRecord, SessionEntry, SessionError, SessionMetadata, text_item_id,
-    thinking_item_id, tool_item_id,
+    thinking_item_id,
 };
 pub use manager::{SessionData, SessionManager};
 

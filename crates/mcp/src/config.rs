@@ -75,7 +75,8 @@ impl ServerConfig {
                 }
             }
             McpTransportConfig::Http { url, headers } => {
-                let parsed = url::Url::parse(url).map_err(|_| "MCP 地址必须是有效的 HTTP 或 HTTPS URL。")?;
+                let parsed =
+                    reqwest::Url::parse(url).map_err(|_| "MCP 地址必须是有效的 HTTP 或 HTTPS URL。")?;
                 if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
                     return Err("MCP 地址必须是有效的 HTTP 或 HTTPS URL。".into());
                 }

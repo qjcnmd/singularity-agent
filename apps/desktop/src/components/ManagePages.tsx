@@ -5,7 +5,7 @@ import { appStore, useAppStore } from '../appStore'
 import type { SkillMetadata, TextDocument } from '../protocol'
 import { workspaceName } from '../copy'
 import { workspaceKey } from '../workspace'
-import { actionToastTransition, smooth } from '../motion'
+import { pop, smooth } from '../motion'
 import { McpSettings } from './McpSettings'
 import { CircleCheck, RefreshCw } from 'lucide-react'
 
@@ -83,7 +83,7 @@ export function InstructionsPage() {
       </motion.section>
     </div>
     {createPortal(<div className="instruction-save-notice" role="status" aria-live="polite" aria-atomic="true">
-      <AnimatePresence>{showSaved && <motion.div key="saved" initial={{ opacity: 0, y: -12, scale: .95 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: -8, scale: .95 }} transition={reduced ? { duration: 0 } : actionToastTransition}>
+      <AnimatePresence>{showSaved && <motion.div key="saved" initial={{ opacity: 0, y: -12, scale: .95 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: -8, scale: .95 }} transition={reduced ? { duration: 0 } : pop}>
         <CircleCheck size={16} aria-hidden="true" /><span>保存成功</span>
       </motion.div>}</AnimatePresence>
     </div>, document.body)}

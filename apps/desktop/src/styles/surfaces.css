@@ -58,8 +58,8 @@
 @keyframes menu-enter { from { opacity: 0; transform: translateY(-4px) scale(.96); } to { opacity: 1; transform: none; } }
 
 @media (prefers-reduced-motion: reduce) {
-  .activity-step, .reasoning-summary, .content-disclosure, .content-disclosure > div, .picker-disclosure, .expand-chevron, .protocol-dropdown { transition: none !important; }
-  .context-menu, .context-menu > button { animation: none; }
+  .activity-step, .reasoning-summary, .content-disclosure, .picker-disclosure, .expand-chevron { transition: none !important; }
+  .context-menu { animation: none; }
 }
 
 .code-token { color: var(--shiki-light); }

@@ -5,23 +5,23 @@
 use singularity_agent::session::{LedgerRecord, SessionData, SessionEntry, SessionError, SessionMetadata};
 use singularity_model::{ContentBlock, Message};
 use singularity_protocol::{
-    HistoryItem, SessionModelUsage, ThreadSummary, ThreadTurn, ToolStatus, TurnStatus,
+    HistoryItem, SessionModelUsage, ThreadHistory, ThreadSummary, ThreadTurn, ToolStatus, TurnStatus,
 };
 
 /// 一个回合在日志中的条目范围和最终状态；初始设置不构成回合。
-pub(crate) struct IndexedTurn {
-    pub turn_id: String,
-    pub status: TurnStatus,
-    pub error: Option<singularity_protocol::TurnErrorDetail>,
+struct IndexedTurn {
+    turn_id: String,
+    status: TurnStatus,
+    error: Option<singularity_protocol::TurnErrorDetail>,
     /// 用户主动停止导致的中断。
-    pub manually_stopped: bool,
-    pub entries: std::ops::Range<usize>,
+    manually_stopped: bool,
+    entries: std::ops::Range<usize>,
 }
 
 impl IndexedTurn {
     /// 生成这个回合的公开历史；工具结果合并到对应的调用条目里。
     /// usage 从本回合之前的累计值开始，随本回合条目推进。
-    pub fn project(
+    fn project(
         &self,
         session: &SessionData,
         usage: &mut SessionModelUsage,
@@ -128,7 +128,7 @@ pub(crate) fn is_manually_stopped(outcome: TurnStatus, user_stopped: bool) -> bo
 
 /// 按回合开始记录划分日志，只记下范围、最终状态、错误和是否手动停止；
 /// 读取完整历史时才生成具体内容。没有结束记录的回合视为中断。
-pub(crate) fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
+fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
     let mut turns: Vec<IndexedTurn> = Vec::new();
     for (position, entry) in entries.iter().enumerate() {
         if let SessionEntry::Record {
@@ -328,4 +328,19 @@ pub(crate) fn summarize_thread(session: &SessionData) -> ThreadSummary {
         status: last_turn.map(|(status, _)| status),
         manually_stopped: last_turn.is_some_and(|(_, manually_stopped)| manually_stopped),
     }
+}
+
+/// 从同一份会话记录生成完整历史与任务摘要。
+pub(crate) fn read_thread_history(session: &SessionData) -> Result<ThreadHistory, SessionError> {
+    let summary = summarize_thread(session);
+    let indexed_turns = index_turn_history(session.entries());
+    let mut usage = session_usage(
+        &session.entries()
+            [..indexed_turns.first().map_or(session.entries().len(), |turn| turn.entries.start)],
+    );
+    let turns = indexed_turns
+        .iter()
+        .map(|turn| turn.project(session, &mut usage))
+        .collect::<Result<_, _>>()?;
+    Ok(ThreadHistory { summary, turns })
 }

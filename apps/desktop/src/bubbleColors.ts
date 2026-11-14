@@ -24,7 +24,7 @@ export const palette: readonly PaletteColor[] = [
 ]
 
 /** 找不到时（比如旧版保存的值）返回 undefined，由调用方决定默认色。 */
-export function paletteColor(id: string): PaletteColor | undefined {
+function paletteColor(id: string): PaletteColor | undefined {
   return palette.find(color => color.id === id)
 }
 
@@ -40,7 +40,6 @@ export function bubbleVariables(view: Pick<PersistedView, 'assistantBubble' | 'u
     '--accent-soft': neutral ? 'var(--default-accent-soft)' : `color-mix(in srgb, ${assistant.solid} 10%, var(--canvas))`,
     '--ink-on-accent': neutral ? '#fff' : assistant.ink,
     '--assistant-bubble-bg': neutral ? 'var(--bubble-fill)' : `color-mix(in srgb, ${assistant.solid} 10%, var(--surface))`,
-    '--assistant-bubble-ink': 'var(--message-ink)',
     /* 用户泡选 neutral 时和助手一致：浅灰底。其它色用实色底。 */
     '--user-bubble-bg': userNeutral ? 'var(--bubble-fill)' : user.solid,
     '--user-bubble-ink': userNeutral ? 'var(--message-ink)' : user.ink,

@@ -5,8 +5,7 @@ export function workspaceName(workspace: Workspace): string {
   return workspace.root.slice(workspace.root.lastIndexOf('/') + 1) || workspace.root
 }
 
-export const factStatusText: Record<ToolStatus | TurnStatus | 'recorded', string> = {
-  recorded: '已记录',
+export const factStatusText: Record<ToolStatus | TurnStatus, string> = {
   pending: '等待执行',
   running: '进行中',
   completed: '已完成',

@@ -4,12 +4,11 @@
 .conversation-document { container-type: inline-size; max-width: 800px; width: 100%; min-height: 100%; margin: 0 auto; padding: 70px 30px calc(var(--composer-height, 150px) + 12px); display: flex; flex-direction: column; }
 .timeline-item { min-width: 0; }
 .message-item { display: grid; justify-items: start; align-self: flex-start; max-width: min(88%, 680px); margin-top: 10px; }
-.message-bubble { min-width: 0; max-width: 100%; padding: 10px 16px; border-radius: 18px; background: var(--assistant-bubble-bg); color: var(--assistant-bubble-ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; font-size: var(--message-font-size); font-weight: 430; line-height: 1.65; overflow-wrap: anywhere; transition: background-color 350ms, color 350ms; }
+.message-bubble { min-width: 0; max-width: 100%; padding: 10px 16px; border-radius: 18px; background: var(--assistant-bubble-bg); color: var(--message-ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; font-size: var(--message-font-size); font-weight: 430; line-height: 1.65; overflow-wrap: anywhere; transition: background-color 350ms, color 350ms; }
 .terminal-interruption { margin-top: 0; }
 .timeline-user { align-self: flex-end; justify-items: end; max-width: min(72%, 540px); }
 .timeline-user .message-bubble { color: var(--user-bubble-ink); background: var(--user-bubble-bg); }
 .message-body { font-size: var(--message-font-size); line-height: 1.65; color: inherit; }
-.timeline-user .message-body { color: inherit; }
 /* 出错的气泡沿用默认浅灰底和正文色，只靠左侧红色图标提示，不整块染红。 */
 .message-bubble.error-bubble { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; background: var(--bubble-fill); color: var(--message-ink); }
 .error-bubble > :not(.error-icon) { grid-column: 2; }
@@ -20,11 +19,10 @@
 .turn-stats { margin: 4px 0 0; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
 /* 思考与工具行平时没有底色，左移 8px 让图标对齐气泡左缘；展开后整块用助手气泡底色。连续几行之间只留 2px。 */
 .activity-step, .reasoning-row { display: grid; width: fit-content; max-width: min(640px, 100%); margin: 10px 0 0 -8px; border-radius: 12px; overflow: hidden; transition: background var(--disclosure-duration) var(--smooth), width var(--disclosure-duration) var(--smooth); }
-.activity-step:has(> .activity-toggle[aria-expanded=true]) { background: var(--assistant-bubble-bg); }
+.activity-step:has(> .activity-toggle[aria-expanded=true]) { background: var(--assistant-bubble-bg); width: 640px; }
 .timeline-item:is(.activity-step, .tool-group) + .timeline-item:is(.activity-step, .tool-group), .tool-group-items > .activity-step:first-child { margin-top: 2px; }
 .message-item > .activity-step { margin-left: 0; }
 /* 正文按展开后的宽度排版，避免宽度过渡中换行导致高度反复改变。 */
-.activity-step:has(> .activity-toggle[aria-expanded=true]) { width: 640px; }
 .activity-step > .content-disclosure { contain: inline-size; }
 .activity-step > .content-disclosure > div > .activity-expanded { width: min(640px, calc(100cqw - 4px)); }
 .activity-toggle { display: flex; align-items: center; gap: 7px; min-width: 0; width: 100%; min-height: 28px; padding: 0 8px; border: 0; border-radius: 8px; background: none; transition: background 120ms; color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.6; text-align: left; cursor: pointer; }

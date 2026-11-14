@@ -148,7 +148,7 @@ pub fn thinking_item_id(entry_id: &str, index: usize) -> String {
 }
 
 /// 助手消息中第 call_index 个工具调用的界面条目 ID。
-pub fn tool_item_id(assistant_entry_id: &str, call_index: usize) -> String {
+pub(crate) fn tool_item_id(assistant_entry_id: &str, call_index: usize) -> String {
     format!("{assistant_entry_id}:tool:{call_index}")
 }
 

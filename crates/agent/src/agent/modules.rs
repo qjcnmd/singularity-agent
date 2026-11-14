@@ -7,23 +7,23 @@
 use std::sync::Arc;
 
 use singularity_core::skills::SkillCatalog;
-use singularity_core::{InstructionFile, ToolDefinition, estimate_tokens_of, estimate_tool_tokens};
+use singularity_core::{InstructionFile, estimate_tokens_of, estimate_tool_tokens};
 use singularity_mcp::McpDiscovery;
 use singularity_model::Message;
 use singularity_protocol::{ContextGroup, ContextModule};
 
 use crate::tools::{self, ToolRegistrySnapshot};
 
-pub const SYSTEM_PROMPT: &str = "system";
-pub const GLOBAL_INSTRUCTIONS: &str = "global-instructions";
-pub const PROJECT_INSTRUCTIONS: &str = "project-instructions";
-pub const BASH: &str = "bash";
-pub const TASKS: &str = "tasks";
-pub const READ: &str = "read";
-pub const EDIT: &str = "edit";
-pub const VIEW_IMAGE: &str = "view-image";
-pub const QUESTION: &str = "ask-user-question";
-pub const SKILLS: &str = "skills";
+const SYSTEM_PROMPT: &str = "system";
+const GLOBAL_INSTRUCTIONS: &str = "global-instructions";
+const PROJECT_INSTRUCTIONS: &str = "project-instructions";
+const BASH: &str = "bash";
+const TASKS: &str = "tasks";
+const READ: &str = "read";
+const EDIT: &str = "edit";
+const VIEW_IMAGE: &str = "view-image";
+const QUESTION: &str = "ask-user-question";
+const SKILLS: &str = "skills";
 pub(super) const MCP_PREFIX: &str = "mcp:";
 
 fn mcp_module_id(server_id: &str) -> String {
@@ -80,10 +80,6 @@ impl Collector<'_> {
     }
 }
 
-fn names(tools: &[ToolDefinition]) -> String {
-    tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join("、")
-}
-
 pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
     let ModuleInputs { cwd, instructions, skills, mcp, disabled } = inputs;
     let mut collector = Collector {
@@ -135,23 +131,23 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
     // 工具：bash 和后台命令锁定；其他内置工具各自一个模块。
     let bash = tools::bash_tool();
     let task_tools = tools::task_tools();
-    let bash_schemas = [bash.0.clone()];
     collector.push(
         BASH,
         ContextGroup::Tools,
         "bash",
         "在工作目录执行命令".into(),
-        estimate_tool_tokens(&bash_schemas),
+        estimate_tool_tokens([&bash.0]),
         true,
     );
     registry.add_builtin([bash]);
-    let task_schemas: Vec<_> = task_tools.iter().map(|(schema, _)| schema.clone()).collect();
+    let task_names = task_tools.iter().map(|(schema, _)| schema.name.as_str()).collect::<Vec<_>>().join("、");
+    let task_tokens = estimate_tool_tokens(task_tools.iter().map(|(schema, _)| schema));
     collector.push(
         TASKS,
         ContextGroup::Tools,
         "task_*",
-        format!("{}：查看、读取输出和停止后台命令", names(&task_schemas)),
-        estimate_tool_tokens(&task_schemas),
+        format!("{task_names}：查看、读取输出和停止后台命令"),
+        task_tokens,
         true,
     );
     registry.add_builtin(task_tools);
@@ -177,15 +173,8 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         (QUESTION, "ask_user_question", "向用户提问", tools::question_tool(), None),
     ];
     for (id, label, detail, tool, guideline) in optional_tools {
-        let schemas = [tool.0.clone()];
-        if collector.push(
-            id,
-            ContextGroup::Tools,
-            label,
-            detail.into(),
-            estimate_tool_tokens(&schemas),
-            false,
-        ) {
+        let tokens = estimate_tool_tokens([&tool.0]);
+        if collector.push(id, ContextGroup::Tools, label, detail.into(), tokens, false) {
             registry.add_builtin([tool]);
             tool_guidelines.extend(guideline);
         }
@@ -193,8 +182,7 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
 
     // Skills：目录提示加 skill 工具，不依赖 read 和 bash。
     let skill_prompt = skills.prompt();
-    let skill_schemas = [tools::skill_schema()];
-    let skill_tokens = estimate_tokens_of(&skill_prompt) + estimate_tool_tokens(&skill_schemas);
+    let skill_tokens = estimate_tokens_of(&skill_prompt) + estimate_tool_tokens([&tools::skill_schema()]);
     let skill_detail = if skill_prompt.is_empty() {
         "没有可公布给模型的技能".to_string()
     } else {
@@ -240,7 +228,7 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         }
     }
 
-    let system = crate::prompts::assemble_developer_instructions(cwd, &tool_guidelines);
+    let system = assemble_developer_instructions(cwd, &tool_guidelines);
     collector.modules[system_index].tokens = estimate_tokens_of(&system);
     let mut messages = vec![Message::developer(
         [system].into_iter().chain(collector.developer).collect::<Vec<_>>().join("\n\n"),
@@ -292,6 +280,27 @@ pub fn preview(
         }
     }));
     modules
+}
+
+/// 生成 Developer 指令；`tool_guidelines` 是本任务开着的工具模块各自提供的一行用法，
+/// 文件指令和技能列表由请求组装代码另外添加。
+fn assemble_developer_instructions(cwd: &str, tool_guidelines: &[&str]) -> String {
+    let tool_guidelines: String = tool_guidelines.iter().map(|line| format!("- {line}\n")).collect();
+    // 写明平台和 shell，否则模型可能在 Git Bash 里写 cmd 语法（如 `cd /d`、`2>nul`），
+    // 输出被重定向丢掉。
+    format!(
+        "You are an expert coding assistant operating inside Singularity, a coding agent \
+             harness. You help users by reading files, executing commands, editing code, and \
+             writing new files.\n\n\
+             Guidelines:\n\
+             {tool_guidelines}\
+             - Use bash with rg for content searches and rg --files for file discovery; use Python or other commands for file writes, byte ranges, and structured processing.\n\
+             - Be concise in your responses\n\
+             - Show file paths clearly when working with files\n\n\
+             Environment:\n- Platform: windows\n\
+             - Command shell: bash (Git Bash on Windows).\n\n\
+             Current working directory: {cwd}"
+    )
 }
 
 fn file_instruction_message(instructions: &str) -> Message {

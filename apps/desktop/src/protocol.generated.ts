@@ -192,11 +192,7 @@ backgroundTasks: Array<VisibleBackgroundTask>, context: InjectedContext | null, 
 
 export type SessionRenameParams = { sessionId: string, name: string, };
 
-export type SessionRuntime = { phase: SessionPhase, selection: ModelSelection, contextUsage: ContextUsage | null, pendingQuestion: PendingQuestion | null, pendingMessages: Array<PendingUserMessage>, failure: SessionFailure | null,
-/**
- * 整份会话的累计模型用量。
- */
-usage: SessionModelUsage, };
+export type SessionRuntime = { phase: SessionPhase, selection: ModelSelection, contextUsage: ContextUsage | null, pendingQuestion: PendingQuestion | null, pendingMessages: Array<PendingUserMessage>, failure: SessionFailure | null, };
 
 export type SessionStartParams = { workspaceRoot: string, selection: ModelSelection, text: string, images: Array<ImageUpload>,
 /**
