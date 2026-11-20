@@ -26,6 +26,7 @@ impl ModelConfigurationSnapshot {
 }
 
 /// 数据目录里 `config.json` 的读写入口；读取和修改按顺序进行，不缓存文件内容。
+#[derive(Debug)]
 pub struct ModelConfigManager {
     directory: PathBuf,
     access: Mutex<()>,
@@ -36,7 +37,7 @@ impl ModelConfigManager {
     pub(crate) fn resolve(
         &self,
         selection: &ModelSelection,
-    ) -> Result<(OpenAiProviderConfig, SelectedModel), ProviderError> {
+    ) -> Result<(ProviderConfig, SelectedModel), ProviderError> {
         let _access = self.lock();
         let config = read_user_config_file(&self.directory)?.ok_or_else(|| {
             configuration_error(format!("缺少提供方配置：{}", crate::USER_CONFIG_FILE_NAME))
@@ -47,6 +48,13 @@ impl ModelConfigManager {
     /// 只检查模型选择能否解析，不创建 HTTP 客户端。
     pub fn validate_selection(&self, selection: &ModelSelection) -> Result<(), ProviderError> {
         self.resolve(selection).map(|_| ())
+    }
+
+    pub fn context_window(&self, selection: &ModelSelection) -> Option<u64> {
+        let _access = self.lock();
+        let config = read_user_config_file(&self.directory).ok()??;
+        let model = config.providers.get(&selection.provider)?.models.get(&selection.model)?;
+        Some(u64::from(model.max_context_tokens))
     }
     /// 移除提供方，返回保存后的目录（不含密钥）。正在运行的回合不受影响。
     pub fn remove_provider(&self, provider_id: &str) -> Result<RedactedModelCatalog, ProviderError> {
@@ -68,15 +76,14 @@ impl ModelConfigManager {
         api_key: Option<&str>,
     ) -> Result<String, ProviderError> {
         let _access = self.lock();
-        match api_key {
-            Some(key) => {
-                validate_provider_value(key, "api_key")?;
-                Ok(key.to_string())
-            }
-            None => Ok(read_user_config_file(&self.directory)?
+        let key = match api_key {
+            Some(key) => key.to_string(),
+            None => read_user_config_file(&self.directory)?
                 .and_then(|config| config.providers.get(provider_id).map(|provider| provider.api_key.clone()))
-                .unwrap_or_default()),
-        }
+                .unwrap_or_default(),
+        };
+        validate_provider_value(&key, "api_key")?;
+        Ok(key)
     }
 
     /// 绑定数据目录；构造时不读取或创建配置文件。
@@ -106,7 +113,7 @@ impl ModelConfigManager {
             validate_provider_value(key, "api_key")?;
         }
         // API 根只去掉首尾空白和结尾斜杠；保留完整路径，再追加各协议的端点。
-        let base_url = crate::openai::canonical_base_url(&input.base_url).to_string();
+        let base_url = crate::provider::canonical_base_url(&input.base_url).to_string();
         validate_base_url(&base_url)?;
         let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
         // 先检查全部模型，任何一项不通过都在写文件之前返回。
@@ -153,15 +160,11 @@ fn model_definitions(
     Ok(definitions)
 }
 
-/// 转换单个模型并检查配置是否完整可用；Responses 协议不使用的 Chat 字段会被清空。
+/// 转换单个模型并检查配置是否完整可用。
 fn model_definition(
-    mut model: ModelConfigurationInput,
+    model: ModelConfigurationInput,
     provider_protocol: ProviderApiProtocol,
 ) -> Result<(String, UserConfigModel), ProviderError> {
-    if provider_protocol == ProviderApiProtocol::Responses {
-        model.thinking_wire_format = None;
-        model.chat_output_tokens_field = None;
-    }
     let configured = UserConfigModel {
         max_context_tokens: model
             .max_context_tokens
@@ -170,8 +173,6 @@ fn model_definition(
             .max_output_tokens
             .ok_or_else(|| configuration_error("请填写最大输出 Token。"))?,
         reasoning_variants: model.reasoning_variants,
-        chat_output_tokens_field: model.chat_output_tokens_field.filter(|field| !field.is_empty()),
-        thinking_wire_format: model.thinking_wire_format,
     };
     resolve_model_definition(&configured, provider_protocol, &model.model_id, None)?;
     Ok((model.model_id, configured))
@@ -226,8 +227,6 @@ fn catalog_from_data(data: &UserConfigFile) -> RedactedModelCatalog {
                     max_context_tokens: Some(model.max_context_tokens),
                     max_output_tokens: Some(model.max_output_tokens),
                     reasoning_variants: model.reasoning_variants.clone(),
-                    thinking_wire_format: model.thinking_wire_format.clone(),
-                    chat_output_tokens_field: model.chat_output_tokens_field.clone(),
                 })
                 .collect(),
         })

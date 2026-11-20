@@ -1,5 +1,3 @@
-#![deny(unsafe_code)]
-
 //! 各 crate 共用的数据目录、项目路径、AGENTS.md 加载、技能发现与基础工具函数。
 
 mod project_instructions;
@@ -18,32 +16,29 @@ pub use workspace::{
 /// 向上查找项目根目录（AGENTS.md 与项目技能的查找上界）时识别的 `.git` 标记。
 pub(crate) const PROJECT_ROOT_MARKER: &str = ".git";
 
-/// 启发式 Token 估算：按 UTF-16 字符数除以 4 向上取整。上下文预算和胶囊上的估算共用这条规则。
+/// 启发式 Token 估算：ASCII 按 4 字符约 1 token，非 ASCII（汉字、Emoji 等）按 1 字符约 1 token，向上取整。
 pub fn estimate_tokens_of(text: &str) -> u64 {
-    (text.encode_utf16().count() as u64).div_ceil(4)
+    let quarters: u64 = text.chars().map(|ch| if ch.is_ascii() { 1 } else { 4 }).sum();
+    quarters.div_ceil(4)
 }
 
 pub fn duration_millis(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+const ISO_FORMAT: &[time::format_description::FormatItem<'static>] =
+    time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
+
 /// 获取当前 UTC 时间的 ISO 8601 字符串（毫秒精度，形如 `2026-10-11T08:00:00.000Z`）。
 pub fn now_iso() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::macros::format_description!(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
-        ))
-        .expect("utc timestamp always formats")
+    time::OffsetDateTime::now_utc().format(ISO_FORMAT).expect("utc timestamp always formats")
 }
 
 /// 把 `now_iso` 格式的时间往前推若干毫秒；无法解析时返回 None。
 pub fn iso_minus_millis(timestamp: &str, millis: u64) -> Option<String> {
-    let format = time::macros::format_description!(
-        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
-    );
-    let parsed = time::PrimitiveDateTime::parse(timestamp, &format).ok()?;
+    let parsed = time::PrimitiveDateTime::parse(timestamp, ISO_FORMAT).ok()?;
     let shifted = parsed.checked_sub(time::Duration::milliseconds(i64::try_from(millis).ok()?))?;
-    shifted.format(&format).ok()
+    shifted.format(ISO_FORMAT).ok()
 }
 
 /// 规范化路径显示：替换为正斜杠，并处理 Windows 的 UNC 与 verbatim 扩展前缀。

@@ -10,8 +10,10 @@ pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> Result
     if cursor > output.total_bytes {
         return Err(format!("cursor {cursor} exceeds output size {}", output.total_bytes));
     }
-    let retained_start = output.total_bytes - output.text.len() as u64;
-    let offset = cursor.saturating_sub(retained_start) as usize;
+    let retained_start = output.total_bytes.saturating_sub(output.text.len() as u64);
+    let Ok(offset) = usize::try_from(cursor.saturating_sub(retained_start)) else {
+        return Err("cursor is out of range".into());
+    };
     if !output.text.is_char_boundary(offset) {
         return Err("cursor must be at a UTF-8 character boundary".into());
     }
@@ -24,7 +26,7 @@ pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> Result
         .nth(DEFAULT_MAX_LINES - 1)
         .map_or(0, |(index, _)| index + 1);
     let text = &unread[byte_start.max(line_start)..];
-    let start = output.total_bytes - text.len() as u64;
+    let start = output.total_bytes.saturating_sub(text.len() as u64);
     let mut result = format!(
         "Output bytes {start}–{}\n\n{}",
         output.total_bytes,

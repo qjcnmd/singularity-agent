@@ -17,17 +17,27 @@ import { sessionTitles } from './sessionTitle'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
 export function App() {
-  const state = useAppStore(['theme', 'messageFontSize', 'assistantBubble', 'userBubble', 'sidebarCollapsed', 'sidebarWidth', 'fileTabs', 'filePanelWidth'])
+  const state = useAppStore(['theme', 'messageFontSize', 'accentColor', 'sidebarCollapsed', 'sidebarWidth', 'fileTabs', 'filePanelWidth'])
   const [accent, setAccent] = useState(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())
+  const [, setViewportWidth] = useState(() => window.innerWidth)
   const filePanelOpen = state.fileTabs.length > 0
-  useLayoutEffect(() => { document.documentElement.dataset.theme = state.theme }, [state.theme])
+  useLayoutEffect(() => {
+    document.documentElement.dataset.theme = state.theme
+    void window.singularity.setTheme(state.theme)
+  }, [state.theme])
   useLayoutEffect(() => { document.documentElement.style.setProperty('--message-font-size', `${state.messageFontSize}px`) }, [state.messageFontSize])
   useLayoutEffect(() => {
     for (const [name, value] of Object.entries(bubbleVariables(state))) document.documentElement.style.setProperty(name, value)
-    // CSS 是主题色的唯一来源；写入主题与气泡变量后再把解析值交给画布。
+    // CSS 是主题色的唯一来源；写入主题与强调色变量后再把解析值交给画布。
     setAccent(getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())
-  }, [state.theme, state.assistantBubble, state.userBubble])
+  }, [state.theme, state.accentColor])
   useEffect(() => { appStore.start(); return () => appStore.stop() }, [])
+  useEffect(() => {
+    if (!filePanelOpen) return
+    const onResize = () => setViewportWidth(window.innerWidth)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [filePanelOpen])
   const style = {
     gridTemplateColumns: `${state.sidebarCollapsed ? 0 : state.sidebarWidth}px 0 minmax(0, 1fr) 0 ${filePanelOpen ? clampFilePanelWidth(state.filePanelWidth) : 0}px`,
     '--sidebar-width': `${state.sidebarWidth}px`,

@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 //! 用户级 MCP 配置、按工作目录复用的连接，以及设置页查看的最近发现结果。
 
 mod client;
@@ -30,6 +28,11 @@ struct ConnectionState {
 
 type Connections = BTreeMap<(String, String), (ServerConfig, ConnectionCell)>;
 
+struct PreparedEntries {
+    active: Vec<(String, ServerConfig, ConnectionCell)>,
+    evicted: Vec<ConnectionCell>,
+}
+
 /// MCP 配置和连接的管理者；设置页和 Agent 共用同一个实例。
 pub struct McpManager {
     home: PathBuf,
@@ -39,19 +42,34 @@ pub struct McpManager {
 /// 本轮发现的一个 MCP 工具；调用时使用发现时的连接，本轮内不变。
 #[derive(Clone)]
 pub struct McpTool {
-    pub definition: singularity_core::ToolDefinition,
-    original_name: String,
+    pub name: String,
+    pub description: String,
+    pub parameters_schema: serde_json::Value,
     connection: Arc<Connection>,
 }
 
 impl McpTool {
+    /// 判断该工具是否无需传入任何参数，供延迟加载摘要标注 `(no args)`。
+    pub fn has_no_args(&self) -> bool {
+        let Some(object) = self.parameters_schema.as_object() else {
+            return false;
+        };
+        let required_empty =
+            object.get("required").and_then(serde_json::Value::as_array).is_none_or(Vec::is_empty);
+        let props_empty = object
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(serde_json::Map::is_empty);
+        required_empty && props_empty
+    }
+
     /// 调用服务器原始工具；连接负责总超时和有界取消通知，调用不会自动重试。
     pub async fn call(
         &self,
         arguments: serde_json::Map<String, serde_json::Value>,
         signal: &CancellationToken,
     ) -> Result<McpToolResult, String> {
-        let result = self.connection.call(&self.original_name, arguments, signal).await?;
+        let result = self.connection.call(&self.name, arguments, signal).await?;
         Ok(result::convert(result))
     }
 }
@@ -118,12 +136,29 @@ impl McpManager {
         cwd: &Path,
         change: impl FnOnce(&mut Configuration) -> Result<(), String>,
     ) -> Result<Vec<McpServerState>, String> {
-        let mut connections = self.lock();
-        let mut config = config::read(&self.home)?;
-        change(&mut config)?;
-        config::write(&self.home, &config)?;
-        connections.retain(|(_, server), _| server != id);
-        Ok(Self::states(config, cwd, &connections))
+        let (evicted, states) = {
+            let mut connections = self.lock();
+            let mut config = config::read(&self.home)?;
+            change(&mut config)?;
+            config::write(&self.home, &config)?;
+            let mut evicted = Vec::new();
+            connections.retain(|(_, server), (_, cell)| {
+                if server == id {
+                    evicted.push(Arc::clone(cell));
+                    false
+                } else {
+                    true
+                }
+            });
+            let states = Self::states(config, cwd, &connections);
+            (evicted, states)
+        };
+        if !evicted.is_empty()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(close_connections(evicted));
+        }
+        Ok(states)
     }
 
     fn states(config: Configuration, cwd: &Path, connections: &Connections) -> Vec<McpServerState> {
@@ -137,26 +172,35 @@ impl McpManager {
 
     fn entries(
         &self,
+        config: Configuration,
         cwd: &Path,
         only: Option<&str>,
+        skip: &[String],
         reconnect: bool,
-    ) -> Result<Vec<(String, ServerConfig, ConnectionCell)>, String> {
+    ) -> Result<PreparedEntries, String> {
         let mut connections = self.lock();
-        let config = config::read(&self.home)?;
         if only.is_some_and(|id| !config.servers.contains_key(id)) {
             return Err("MCP 服务器不存在。".into());
         }
-        // 以 mcp.json 为准：配置已改的连接从表里移除，正在运行的回合仍持有旧连接直到结束。
-        connections.retain(|(_, id), (previous, _)| config.servers.get(id) == Some(previous));
+        // 以 mcp.json 为准：配置已改的连接从表里移除，由调用方异步关闭旧连接。
+        let mut evicted = Vec::new();
+        connections.retain(|(_, id), (previous, cell)| {
+            if config.servers.get(id) == Some(previous) {
+                true
+            } else {
+                evicted.push(Arc::clone(cell));
+                false
+            }
+        });
         let mut entries = Vec::new();
         let directory = directory_key(cwd);
         for (id, config) in config.servers {
-            if only.is_some_and(|only| only != id) {
+            if only.is_some_and(|only| only != id) || skip.contains(&id) {
                 continue;
             }
             let key = (directory.clone(), id.clone());
-            if reconnect {
-                connections.remove(&key);
+            if reconnect && let Some((_, cell)) = connections.remove(&key) {
+                evicted.push(cell);
             }
             let (_, cell) = connections.entry(key).or_insert_with(|| {
                 (
@@ -171,7 +215,7 @@ impl McpManager {
             let cell = Arc::clone(cell);
             entries.push((id, config, cell));
         }
-        Ok(entries)
+        Ok(PreparedEntries { active: entries, evicted })
     }
 
     async fn tools(
@@ -205,23 +249,15 @@ impl McpManager {
                     let tools: Vec<_> = listed
                         .into_iter()
                         .map(|tool| McpTool {
-                            definition: singularity_core::ToolDefinition {
-                                name: client::tool_alias(&id, &tool.name),
-                                description: format!(
-                                    "MCP server {id}, tool {}. {}",
-                                    tool.name,
-                                    tool.description.as_deref().unwrap_or("")
-                                ),
-                                parameters_schema: serde_json::Value::Object((*tool.input_schema).clone()),
-                            },
-                            original_name: tool.name.into_owned(),
+                            name: tool.name.into_owned(),
+                            description: tool.description.as_deref().unwrap_or("").to_string(),
+                            parameters_schema: serde_json::Value::Object((*tool.input_schema).clone()),
                             connection: Arc::clone(&connection),
                         })
                         .collect();
                     let prompt = connection.instructions().map(|text| format!("MCP server {id}:\n{text}"));
-                    let tokens =
-                        singularity_core::estimate_tool_tokens(tools.iter().map(|tool| &tool.definition))
-                            + prompt.as_deref().map_or(0, singularity_core::estimate_tokens_of);
+                    // 仅估算服务器自身说明文本；统一延迟加载的工具摘要由 agent 模块按实际注入口径计算。
+                    let tokens = prompt.as_deref().map_or(0, singularity_core::estimate_tokens_of);
                     state.tokens = tokens;
                     McpServerDiscovery {
                         id: id.clone(),
@@ -235,6 +271,7 @@ impl McpManager {
             Err(error) => Err(error),
         };
         discovered.unwrap_or_else(|error| {
+            tracing::warn!(server_id = %id, error = %error, "MCP server discovery failed");
             let prompt = format!("Unavailable MCP server {id}:\n{error}");
             let tokens = singularity_core::estimate_tokens_of(&prompt);
             state.tokens = tokens;
@@ -255,11 +292,22 @@ impl McpManager {
         if signal.is_cancelled() {
             return McpDiscovery::default();
         }
-        let mut entries = match self.entries(cwd, None, false) {
-            Ok(entries) => entries,
+        let home = self.home.clone();
+        let config = match tokio::task::spawn_blocking(move || config::read(&home))
+            .await
+            .expect("MCP config read completes while the runtime is running")
+        {
+            Ok(config) => config,
             Err(error) => return McpDiscovery { servers: Vec::new(), error: Some(error) },
         };
-        entries.retain(|(id, ..)| !skip.contains(id));
+        let PreparedEntries { active: entries, evicted } = match self.entries(config, cwd, None, skip, false)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return McpDiscovery { servers: Vec::new(), error: Some(error) },
+        };
+        if !evicted.is_empty() {
+            tokio::spawn(close_connections(evicted));
+        }
         let mut pending = tokio::task::JoinSet::new();
         for (id, config, cell) in entries {
             let cwd = cwd.to_path_buf();
@@ -286,12 +334,24 @@ impl McpManager {
 
     /// 用户明确重试时重建该项目的连接并发现工具，连接失败随服务器状态返回。
     pub async fn reconnect(&self, id: &str, cwd: &Path) -> Result<McpServerState, String> {
-        if let Some((id, config, cell)) = self.entries(cwd, Some(id), true)?.pop() {
+        let home = self.home.clone();
+        let config = tokio::task::spawn_blocking(move || config::read(&home))
+            .await
+            .expect("MCP config read completes while the runtime is running")?;
+        let PreparedEntries { active: mut entries, evicted } =
+            self.entries(config, cwd, Some(id), &[], true)?;
+        if !evicted.is_empty() {
+            close_connections(evicted).await;
+        }
+        if let Some((id, config, cell)) = entries.pop() {
             // 连接失败保存在状态中，与执行准备失败使用同一份原因。
             let _ = Self::tools(id, cwd, config, &cell).await;
         }
         // 重连等待期间设置可能已修改，返回时读取当前配置和连接。
-        let mut config = config::read(&self.home)?;
+        let home = self.home.clone();
+        let mut config = tokio::task::spawn_blocking(move || config::read(&home))
+            .await
+            .expect("MCP config read completes while the runtime is running")?;
         let config = config.servers.remove(id).ok_or("MCP 服务器不存在。")?;
         Ok(Self::server_state(id.into(), config, &directory_key(cwd), &self.lock()))
     }
@@ -356,11 +416,16 @@ impl McpManager {
 }
 
 async fn close_connections(cells: Vec<ConnectionCell>) {
+    let mut closing = tokio::task::JoinSet::new();
     for cell in cells {
-        if let Some(connection) = &cell.lock().await.connection {
-            connection.close().await;
-        }
+        closing.spawn(async move {
+            let connection = cell.lock().await.connection.take();
+            if let Some(connection) = connection {
+                connection.close().await;
+            }
+        });
     }
+    while closing.join_next().await.is_some() {}
 }
 
 // 原生路径带有 Windows 长路径前缀，界面路径没有；两者按同一目录复用和关闭连接。

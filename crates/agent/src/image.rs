@@ -1,12 +1,16 @@
 //! 用户上传、`view_image` 工具和 MCP 工具返回图片的格式识别、解码校验与文件读写。
 
-use std::io::{Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use image::{ImageFormat, ImageReader};
+use image::{ImageFormat, ImageReader, Limits};
 use singularity_protocol::{ImageAttachment, ImageUpload};
+
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_DECODE_ALLOC_BYTES: u64 = 128 * 1024 * 1024;
 
 /// 已校验的图片附件和文件内容；克隆时通过 `Arc` 共享字节。
 #[derive(Debug, Clone, PartialEq)]
@@ -32,14 +36,29 @@ impl InputImage {
 
     /// 解码外部图片的 Base64 内容，按实际字节识别格式。
     pub(crate) fn from_base64(name: String, data: &str) -> Result<Self, String> {
+        if data.len() > MAX_IMAGE_BYTES * 4 / 3 + 4 {
+            return Err("图片大小超过 20 MB 上限。".into());
+        }
         let bytes = STANDARD.decode(data).map_err(|_| "图片 Base64 数据无效。")?;
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err("图片大小超过 20 MB 上限。".into());
+        }
         Self::prepare(name, bytes)
     }
 
     /// 读取图片文件并校验格式和尺寸。
-    pub(crate) fn read(path: &Path, mut reader: impl Read) -> Result<Self, String> {
+    pub(crate) fn read(path: &Path, reader: impl Read) -> Result<Self, String> {
+        let mut reader = BufReader::new(reader);
+        let head = reader.fill_buf().map_err(|error| format!("无法读取图片：{error}"))?;
+        image::guess_format(head).map_err(|_| "无法识别图片格式。")?;
         let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).map_err(|error| format!("无法读取图片：{error}"))?;
+        reader
+            .take((MAX_IMAGE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("无法读取图片：{error}"))?;
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err("图片文件大小超过 20 MB 上限。".into());
+        }
         Self::prepare(path.file_name().unwrap_or_default().to_string_lossy().into_owned(), bytes)
     }
 
@@ -52,9 +71,13 @@ impl InputImage {
             ImageFormat::Gif | ImageFormat::Bmp => "image/png",
             _ => return Err("支持 PNG、JPEG、WebP、GIF 和 BMP 图片。".into()),
         };
-        let decoded = ImageReader::with_format(Cursor::new(&bytes), format)
-            .decode()
-            .map_err(|error| format!("图片无法解码：{error}"))?;
+        let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
+        let mut limits = Limits::default();
+        limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+        limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+        limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+        reader.limits(limits);
+        let decoded = reader.decode().map_err(|error| format!("图片无法解码：{error}"))?;
         let (width, height) = (decoded.width(), decoded.height());
         let name = if format == ImageFormat::Gif {
             format!("{name}（首帧）")

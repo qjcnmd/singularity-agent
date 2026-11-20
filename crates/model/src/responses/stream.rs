@@ -4,7 +4,7 @@ pub(crate) async fn read_responses_sse_stream(
     cancellation: &CancellationToken,
     response: reqwest::Response,
     on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
-    config: &OpenAiProviderConfig,
+    config: &ProviderConfig,
     selection: &SelectedModel,
     endpoint: &str,
 ) -> ModelTurnResponse {
@@ -116,7 +116,7 @@ impl<'a> ResponsesSseDecoder<'a> {
     fn finish(
         mut self,
         result: Result<(), ProviderError>,
-        config: &OpenAiProviderConfig,
+        config: &ProviderConfig,
         model_name: &str,
         endpoint: &str,
     ) -> ModelTurnResponse {

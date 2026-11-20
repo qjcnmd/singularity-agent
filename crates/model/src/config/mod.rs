@@ -12,9 +12,8 @@ pub(crate) use schema::*;
 pub(crate) use user::*;
 
 use super::{ModelErrorKind, ProviderError};
-use crate::openai::wire::ThinkingWireFormat;
 
-use selection::{OpenAiProviderConfig, SelectedModel, resolve_model_definition, resolve_model_selection};
+use selection::{ProviderConfig, SelectedModel, resolve_model_definition, resolve_model_selection};
 use singularity_protocol::{ModelSelection, ProviderApiProtocol};
 
 pub(crate) fn configuration_error(message: impl Into<String>) -> ProviderError {

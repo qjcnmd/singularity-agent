@@ -138,6 +138,7 @@ class AppStore extends SessionStore {
     return this.action('session.delete', actionOrigin.session(sessionId), async () => {
       await this.transport.rpc('session.delete', { sessionId })
       this.clearSessionAnchors([sessionId])
+      this.clearQuestionDrafts([sessionId])
       await this.drafts.remove([sessionId])
     })
   }
@@ -156,6 +157,7 @@ class AppStore extends SessionStore {
     return this.action('workspace.remove', actionOrigin.inline('workspace.remove', workspaceRoot), async () => {
       await this.transport.rpc('workspace.remove', { workspaceRoot })
       this.clearSessionAnchors(removedDrafts)
+      this.clearQuestionDrafts(removedDrafts)
       this.saveView({ sidebarView: {
         collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceRoot),
       } })
@@ -236,6 +238,14 @@ class AppStore extends SessionStore {
     })
   }
 
+  private clearQuestionDrafts(ids: string[]): void {
+    const remove = new Set(ids)
+    const entries = Object.entries(this.state.questionDrafts).filter(([id]) => !remove.has(id))
+    if (entries.length !== Object.keys(this.state.questionDrafts).length) {
+      this.patch({ questionDrafts: Object.fromEntries(entries) })
+    }
+  }
+
   private clearSessionAnchors(ids: string[]): void {
     const viewportAnchors = { ...this.state.viewportAnchors }
     for (const id of ids) {
@@ -282,10 +292,15 @@ class AppStore extends SessionStore {
     const directory = cwd.replace(/\\/g, '/').replace(/\/+$/, '')
     // 文件 URL 统一相对路径和目录层级；文件名中的百分号、# 和 ? 保留原意。
     const encodePath = (value: string) => encodeURI(value).replace(/[?#]/g, encodeURIComponent)
-    const id = new URL(
-      encodePath(/^[a-z]:\//i.test(target) ? `file:///${target}` : target),
-      encodePath(directory.startsWith('//') ? `file:${directory}/` : `file:///${directory}/`),
-    ).href.toLowerCase()
+    let id: string
+    try {
+      id = new URL(
+        encodePath(/^[a-z]:\//i.test(target) ? `file:///${target}` : target),
+        encodePath(directory.startsWith('//') ? `file:${directory}/` : `file:///${directory}/`),
+      ).href.toLowerCase()
+    } catch {
+      return
+    }
     const fileTabs = this.state.fileTabs.some(tab => tab.id === id)
       ? this.state.fileTabs.map(tab => tab.id === id ? { ...tab, opened: tab.opened + 1 } : tab)
       : [...this.state.fileTabs, { id, path, cwd, title, opened: 0 }]
@@ -309,8 +324,8 @@ class AppStore extends SessionStore {
     this.saveView({ filePanelWidth: clampFilePanelWidth(value) }, true)
   }
 
-  setBubbleColor(kind: 'assistantBubble' | 'userBubble', id: string): void {
-    this.saveView({ [kind]: id })
+  setAccentColor(accentColor: string): void {
+    this.saveView({ accentColor })
   }
 }
 

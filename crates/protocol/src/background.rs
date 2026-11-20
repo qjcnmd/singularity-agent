@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// 给模型读取的命令纯文本输出快照，与界面展示正文分开保存。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CommandOutputSnapshot {
     /// 最多 100 KiB 的纯文本尾部。
@@ -22,7 +22,7 @@ pub struct CommandOutputSnapshot {
 }
 
 /// 任务中的一个后台命令。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BackgroundTask {
     pub task_id: String,
@@ -35,7 +35,7 @@ pub struct BackgroundTask {
 }
 
 /// 发给工作台的后台命令视图；含模型输出快照的完整数据按原样保存在会话日志。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct VisibleBackgroundTask {
@@ -60,7 +60,7 @@ impl From<BackgroundTask> for VisibleBackgroundTask {
 }
 
 /// 命令的运行或结束状态；重启后历史中仍为运行中的命令显示为中断，不根据 PID 判断进程是否还在。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "status", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum BackgroundTaskState {
@@ -79,7 +79,7 @@ impl BackgroundTaskState {
 }
 
 /// 后台命令的状态变化，附带当时的任务阶段；先后顺序由外层事件序号决定。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundTaskUpdate {

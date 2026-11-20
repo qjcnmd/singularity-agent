@@ -21,10 +21,56 @@ const BASH: &str = "bash";
 const TASKS: &str = "tasks";
 const READ: &str = "read";
 const EDIT: &str = "edit";
+const WRITE: &str = "write";
 const VIEW_IMAGE: &str = "view-image";
 const QUESTION: &str = "ask-user-question";
-const SKILLS: &str = "skills";
+pub const SKILLS_MODULE_ID: &str = "skills";
 pub(super) const MCP_PREFIX: &str = "mcp:";
+
+/// 所有 MCP 服务器统一采用按工具粒度的延迟加载：仅在 Developer 指令注入紧凑摘要，
+/// 通过固定的 `mcp_schema` / `mcp_call` 代理按需读取单个或多个目标工具的参数定义并调用。
+const MCP_SUMMARY_MAX_CHARS: usize = 120;
+
+fn mcp_proxy_tokens() -> u64 {
+    let schema = tools::mcp_schema_schema();
+    let call = tools::mcp_call_schema();
+    estimate_tool_tokens([&schema, &call])
+}
+
+fn format_mcp_prompt<'a>(
+    server_id: &str,
+    server_prompt: Option<&str>,
+    tools: impl IntoIterator<Item = (&'a str, &'a str, bool)>,
+) -> String {
+    let mut lines = Vec::new();
+    if let Some(prompt) = server_prompt {
+        lines.push(prompt.to_string());
+    }
+    lines.push(format!(
+        "MCP server {server_id} (lazy-loaded — call mcp_schema(server, tools) to inspect only the specific tools you need, then call mcp_call(server, tool, arguments); tools marked (no args) can be called directly):"
+    ));
+    for (name, description, no_args) in tools {
+        let brief = brief_summary(description);
+        let tag = if no_args { " (no args)" } else { "" };
+        if brief.is_empty() {
+            lines.push(format!("- {name}{tag}"));
+        } else {
+            lines.push(format!("- {name}{tag}: {brief}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn brief_summary(description: &str) -> String {
+    let line = description.lines().find(|line| !line.trim().is_empty()).unwrap_or("").trim();
+    let mut chars = line.chars();
+    let prefix: String = chars.by_ref().take(MCP_SUMMARY_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
 
 fn mcp_module_id(server_id: &str) -> String {
     format!("{MCP_PREFIX}{server_id}")
@@ -109,7 +155,13 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         let files: Vec<_> = instructions.iter().filter(|file| file.global == global).collect();
         let text = files
             .iter()
-            .map(|file| format!("# Instructions from {}\n\n{}", file.path.display(), file.content))
+            .map(|file| {
+                format!(
+                    "# Instructions from {}\n\n{}",
+                    singularity_core::display_path(&file.path),
+                    file.content
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n\n");
         let detail = if files.is_empty() {
@@ -162,6 +214,13 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
                 "Use edit for targeted changes to existing text files; combine independent changes to one file in a single call.",
             ),
         ),
+        (
+            WRITE,
+            "write",
+            "创建或覆盖写入文本文件",
+            tools::write_tool(),
+            Some("Use write to create new text files or replace an entire file."),
+        ),
         (READ, "read", "读取文本文件", tools::read_tool(), Some("Use read for text files.")),
         (
             VIEW_IMAGE,
@@ -189,7 +248,7 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         skills.model_skills().map(|skill| skill.name.as_str()).collect::<Vec<_>>().join("、")
     };
     if collector.push(
-        SKILLS,
+        SKILLS_MODULE_ID,
         ContextGroup::Skills,
         "Skills",
         skill_detail,
@@ -201,30 +260,49 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         registry.set_skills(Arc::new(skills));
     }
 
-    // MCP：每个服务器一个模块，工具、服务器说明和连接错误一起开关。本任务关掉的服务器不连接。
+    // MCP：每个服务器一个独立开关模块，本任务关掉的服务器不连接；
+    // 所有已连接 MCP 统一延迟加载，仅注入精简摘要，由固定的 `mcp_schema` / `mcp_call` 按工具粒度按需访问。
     if let Some(error) = mcp.error {
         collector.developer.push(format!("Unavailable MCP configuration:\n{error}"));
     }
+    let mut proxy_accounted = false;
     for server in mcp.servers {
+        let has_tools = server.error.is_none() && !server.tools.is_empty();
+        let prompt = if has_tools {
+            Some(format_mcp_prompt(
+                &server.id,
+                server.prompt.as_deref(),
+                server
+                    .tools
+                    .iter()
+                    .map(|tool| (tool.name.as_str(), tool.description.as_str(), tool.has_no_args())),
+            ))
+        } else {
+            server.prompt
+        };
+        let base_tokens = prompt.as_deref().map_or(0, estimate_tokens_of);
+        let module_id = mcp_module_id(&server.id);
+        let will_enable = !collector.disabled.iter().any(|disabled| disabled == &module_id);
+        let proxy = if has_tools && will_enable && !proxy_accounted {
+            proxy_accounted = true;
+            mcp_proxy_tokens()
+        } else {
+            0
+        };
+        let tokens = base_tokens + proxy;
         let detail = match &server.error {
             Some(error) => format!("连接失败：{error}"),
-            None => server
-                .tools
-                .iter()
-                .map(|tool| tool.definition.name.as_str())
-                .collect::<Vec<_>>()
-                .join("、"),
+            None if server.tools.is_empty() => "已连接（无可用工具）".to_string(),
+            None => {
+                let names = server.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join("、");
+                format!("按需加载（共 {} 个工具）：{names}", server.tools.len())
+            }
         };
-        if collector.push(
-            &mcp_module_id(&server.id),
-            ContextGroup::Mcp,
-            &server.id,
-            detail,
-            server.tokens,
-            false,
-        ) {
-            collector.developer.extend(server.prompt);
-            registry.add_mcp_tools(server.tools);
+        if collector.push(&module_id, ContextGroup::Mcp, &server.id, detail, tokens, false) {
+            collector.developer.extend(prompt);
+            if has_tools {
+                registry.add_mcp_server(server.id, server.tools);
+            }
         }
     }
 
@@ -260,21 +338,45 @@ pub fn preview(
         disabled: &[],
     })
     .modules;
+    let mut proxy_accounted = false;
     modules.extend(servers.into_iter().map(|server| {
         let id = server.server.server_id;
+        let has_tools = server.error.is_none()
+            && server.status == singularity_protocol::McpConnectionStatus::Connected
+            && !server.tools.is_empty();
+        let tokens = if has_tools {
+            let prompt = format_mcp_prompt(
+                &id,
+                None,
+                server.tools.iter().map(|tool| (tool.name.as_str(), tool.description.as_str(), false)),
+            );
+            let proxy = if !proxy_accounted {
+                proxy_accounted = true;
+                mcp_proxy_tokens()
+            } else {
+                0
+            };
+            estimate_tokens_of(&prompt) + server.tokens + proxy
+        } else {
+            server.tokens
+        };
         let detail = match (&server.status, server.error) {
             (singularity_protocol::McpConnectionStatus::NotConnected, _) => {
                 "尚未连接，创建任务时才会连接".to_string()
             }
             (_, Some(error)) => format!("连接失败：{error}"),
-            (_, None) => server.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join("、"),
+            (_, None) if server.tools.is_empty() => "已连接（无可用工具）".to_string(),
+            (_, None) => {
+                let names = server.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join("、");
+                format!("按需加载（共 {} 个工具）：{names}", server.tools.len())
+            }
         };
         ContextModule {
             id: mcp_module_id(&id),
             group: ContextGroup::Mcp,
             label: id,
             detail,
-            tokens: server.tokens,
+            tokens,
             locked: false,
             enabled: true,
         }
@@ -294,7 +396,7 @@ fn assemble_developer_instructions(cwd: &str, tool_guidelines: &[&str]) -> Strin
              writing new files.\n\n\
              Guidelines:\n\
              {tool_guidelines}\
-             - Use bash with rg for content searches and rg --files for file discovery; use Python or other commands for file writes, byte ranges, and structured processing.\n\
+             - Use bash with rg for content searches and rg --files for file discovery; use Python or other commands for byte ranges and structured processing.\n\
              - Be concise in your responses\n\
              - Show file paths clearly when working with files\n\n\
              Environment:\n- Platform: windows\n\

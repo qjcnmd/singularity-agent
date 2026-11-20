@@ -67,7 +67,43 @@ pub(crate) fn transport_error_source(error: reqwest::Error) -> String {
     crate::error::bounded_provider_error_diagnostic(&source.to_string())
 }
 
-fn provider_transport_error(error: reqwest::Error) -> ProviderError {
+pub(crate) const MAX_HTTP_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+pub(crate) enum BoundedBodyReadError {
+    Cancelled,
+    Transport(reqwest::Error),
+}
+
+/// 读取有大小上限的 HTTP 错误响应正文；超出上限后截断，避免大错误页占满内存。
+pub(crate) async fn read_bounded_error_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Vec<u8>, BoundedBodyReadError> {
+    let mut body = Vec::new();
+    while body.len() < max_bytes {
+        let chunk = match cancellation {
+            Some(token) => {
+                if token.is_cancelled() {
+                    return Err(BoundedBodyReadError::Cancelled);
+                }
+                tokio::select! {
+                    () = token.cancelled() => return Err(BoundedBodyReadError::Cancelled),
+                    result = response.chunk() => result.map_err(BoundedBodyReadError::Transport)?,
+                }
+            }
+            None => response.chunk().await.map_err(BoundedBodyReadError::Transport)?,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let remaining = max_bytes - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    Ok(body)
+}
+
+pub(crate) fn provider_transport_error(error: reqwest::Error) -> ProviderError {
     let message = format!("provider transport failed: {}", transport_error_source(error));
     ProviderError::new(ModelErrorKind::Temporary, message)
 }

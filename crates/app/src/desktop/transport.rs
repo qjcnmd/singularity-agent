@@ -24,17 +24,31 @@ struct Response {
     response: RpcResponse,
 }
 
+const STDOUT_WRITER_CAPACITY: usize = 512;
+
 pub async fn run(
     app: Arc<AppServer>,
-    mut events: mpsc::UnboundedReceiver<singularity_protocol::StreamEnvelope>,
+    mut events: mpsc::Receiver<singularity_protocol::StreamEnvelope>,
 ) -> Result<(), String> {
     let mut input = BufReader::new(tokio::io::stdin()).lines();
-    let mut output = tokio::io::stdout();
+    let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(STDOUT_WRITER_CAPACITY);
+    // 独立有界写任务隔离 stdout 背压，确保大输出期间 abort/RPC 仍可及时进入且内存有上界。
+    let writer = tokio::spawn(async move {
+        let mut output = tokio::io::stdout();
+        while let Some(bytes) = writer_rx.recv().await {
+            output.write_all(&bytes).await.map_err(|e| format!("write desktop pipe: {e}"))?;
+            while let Ok(more) = writer_rx.try_recv() {
+                output.write_all(&more).await.map_err(|e| format!("write desktop pipe: {e}"))?;
+            }
+            output.flush().await.map_err(|e| format!("flush desktop pipe: {e}"))?;
+        }
+        Ok::<(), String>(())
+    });
     let mut requests = JoinSet::new();
     let shutdown = CancellationToken::new();
     let result = async {
-        write(
-            &mut output,
+        send_line(
+            &writer_tx,
             &singularity_protocol::StreamEnvelope {
                 revision: app.revision(),
                 event: StreamEvent::Ready,
@@ -43,6 +57,7 @@ pub async fn run(
         .await?;
         loop {
             tokio::select! {
+                biased;
                 line = input.next_line() => {
                     let Some(line) = line.map_err(|e| format!("read desktop pipe: {e}"))? else { break };
                     let call: Request = serde_json::from_str(&line)
@@ -60,11 +75,11 @@ pub async fn run(
                 result = requests.join_next(), if !requests.is_empty() => {
                     let response = result.expect("nonempty RPC task set")
                         .expect("RPC task completes while the runtime is running");
-                    write(&mut output, &response).await?;
+                    send_line(&writer_tx, &response).await?;
                 }
                 event = events.recv() => {
                     let Some(frame) = event else { break };
-                    write(&mut output, &frame).await?;
+                    send_line(&writer_tx, &frame).await?;
                 }
             }
         }
@@ -77,12 +92,16 @@ pub async fn run(
         joined.expect("accepted RPC task completes before shutdown");
     }
     app.shutdown().await;
-    result
+    while let Ok(frame) = events.try_recv() {
+        let _ = send_line(&writer_tx, &frame).await;
+    }
+    drop(writer_tx);
+    let write_result = writer.await.expect("desktop pipe writer task completes");
+    result.and(write_result)
 }
 
-async fn write(output: &mut tokio::io::Stdout, value: &impl Serialize) -> Result<(), String> {
+async fn send_line(writer_tx: &mpsc::Sender<Vec<u8>>, value: &impl Serialize) -> Result<(), String> {
     let mut bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
-    output.write_all(&bytes).await.map_err(|e| format!("write desktop pipe: {e}"))?;
-    output.flush().await.map_err(|e| format!("flush desktop pipe: {e}"))
+    writer_tx.send(bytes).await.map_err(|_| "desktop pipe writer closed".to_string())
 }

@@ -11,7 +11,7 @@
 //! 输入队列只在内存中，不写日志。
 //!
 //! 相关模块：组装请求在 self::request，轮换在 self::context_rotation，发送和重试在
-//! crate::request_execution，输入队列在 self::inbox；事件类型是 singularity_protocol::TurnEvent。
+//! crate::request_execution，输入队列在 self::inbox；事件类型是 [`AgentEvent`]。
 
 mod context_rotation;
 pub use context_rotation::context_rotation_unneeded;
@@ -23,7 +23,7 @@ pub(crate) mod request;
 
 use std::sync::Arc;
 
-use singularity_model::{OpenAiProvider, ProviderError};
+use singularity_model::{ModelClient, ProviderError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -31,9 +31,19 @@ pub use self::inbox::{QueuedInput, SteeringInbox, SteeringInboxHandle, UserInput
 pub use self::questions::UserQuestions;
 pub use singularity_protocol::TurnEvent;
 
+/// Agent 发出的事件：可转发为前端 `TurnEvent`，或通知外层更新状态与累计用量。
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentEvent {
+    Turn(TurnEvent),
+    ProviderAttempt {
+        observation: singularity_protocol::RequestObservation,
+    },
+    SessionStateChanged,
+}
+
 use self::inbox::{QueuedInputKind, lock_inbox};
 use crate::message::public_items;
-use crate::session::{SessionError, SessionWriter, lock_writer};
+use crate::session::{MessageDisplay, SessionError, SessionWriter, lock_writer};
 use crate::tools::ToolRegistrySnapshot;
 use singularity_model::Message;
 
@@ -98,7 +108,7 @@ pub struct RequestContext {
     registry: ToolRegistrySnapshot,
     mcp: Arc<singularity_mcp::McpManager>,
     definitions: Option<request::RequestDefinitions>,
-    provider: OpenAiProvider,
+    provider: ModelClient,
     config: AgentConfig,
 }
 impl RequestContext {
@@ -113,7 +123,7 @@ impl RequestContext {
 
     /// 提供方和文件指令在创建时确定；技能和 MCP 工具在第一次请求前加载。
     pub fn new(
-        provider: OpenAiProvider,
+        provider: ModelClient,
         config: AgentConfig,
         session: SessionWriter,
         mcp: Arc<singularity_mcp::McpManager>,
@@ -157,7 +167,7 @@ impl Agent {
     /// 停止时返回 AgentError::Aborted，由会话记为中断；生成的内容已经保存并通过事件发布。
     pub async fn run(
         &mut self,
-        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<()> {
         self.drain_inputs(on_event, cancellation).await?;
@@ -176,15 +186,16 @@ impl Agent {
             // 按消息中的顺序发布所有内容；工具进度随后更新原来的条目。
             let public_items = public_items(
                 &assistant,
+                None,
                 &assistant_result_entry_id,
                 singularity_protocol::TurnStatus::Completed,
                 singularity_protocol::ToolStatus::Pending,
                 &saved_at,
             );
-            on_event(TurnEvent::MessageFinished {
+            on_event(AgentEvent::Turn(TurnEvent::MessageFinished {
                 message_id: assistant_result_entry_id.clone(),
                 items: public_items,
-            });
+            }));
             let has_tool_calls = !tool_calls.is_empty();
             if has_tool_calls {
                 self.dispatch_tools(
@@ -208,7 +219,7 @@ impl Agent {
 
     async fn drain_inputs(
         &mut self,
-        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<()> {
         loop {
@@ -225,7 +236,7 @@ impl Agent {
     async fn append_user_input(
         &mut self,
         request: &QueuedInput,
-        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
         let input = match &request.input {
             QueuedInputKind::User(input) => input,
@@ -236,7 +247,7 @@ impl Agent {
                     let message = Message::Notification {
                         content: vec![singularity_model::ContentBlock::text(text)],
                     };
-                    self.append_message(&request.message_id, message, &[]).await?;
+                    self.append_message(&request.message_id, message, None, &[]).await?;
                 }
                 lock_inbox(&self.inbox).confirm_saved(&request.message_id);
                 return Ok(());
@@ -245,16 +256,14 @@ impl Agent {
         let images: Vec<_> = input.images.iter().map(|image| image.attachment.clone()).collect();
         let model_text = input.text_with_files();
         let display_text = (model_text != input.text).then(|| input.text.clone());
+        let display = (display_text.is_some() || !input.files.is_empty())
+            .then(|| MessageDisplay::User { display_text, files: input.files.clone() });
         let mut content = vec![singularity_model::ContentBlock::text(model_text)];
         content.extend(images.iter().cloned().map(singularity_model::ContentBlock::Image));
-        let message = Message::User {
-            content,
-            display_text,
-            files: input.files.clone(),
-        };
-        let saved_at = self.append_message(&request.message_id, message, &input.images).await?;
+        let message = Message::User { content };
+        let saved_at = self.append_message(&request.message_id, message, display, &input.images).await?;
         lock_inbox(&self.inbox).confirm_saved(&request.message_id);
-        on_event(TurnEvent::ItemUpdated {
+        on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
             item: singularity_protocol::HistoryItem::Message {
                 id: request.item_id(),
                 text: input.text.clone(),
@@ -265,7 +274,7 @@ impl Agent {
                 role: singularity_protocol::HistoryMessageRole::User,
                 status: singularity_protocol::TurnStatus::Completed,
             },
-        });
+        }));
         Ok(())
     }
 
@@ -275,6 +284,7 @@ impl Agent {
         &self,
         id: &str,
         message: Message,
+        display: Option<MessageDisplay>,
         images: &[crate::image::InputImage],
     ) -> Result<String> {
         let session = Arc::clone(&self.requests.session);
@@ -288,7 +298,7 @@ impl Agent {
                 }
             }
             let mut writer = lock_writer(&session);
-            writer.append_message_with_id(&id, message, None)
+            writer.append_message_with_id(&id, message, None, display)
         })
         .await
         .expect("message writer completes while the runtime is running")?)

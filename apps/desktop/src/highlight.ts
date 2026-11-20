@@ -8,18 +8,50 @@ import { createElement, useEffect, useMemo, useState, type ReactNode, type CSSPr
  */
 const LANGUAGE_LOADERS = {
   javascript: () => import('@shikijs/langs/javascript'),
+  jsx: () => import('@shikijs/langs/jsx'),
   typescript: () => import('@shikijs/langs/typescript'),
   tsx: () => import('@shikijs/langs/tsx'),
   rust: () => import('@shikijs/langs/rust'),
+  python: () => import('@shikijs/langs/python'),
   json: () => import('@shikijs/langs/json'),
+  yaml: () => import('@shikijs/langs/yaml'),
+  toml: () => import('@shikijs/langs/toml'),
   markdown: () => import('@shikijs/langs/markdown'),
+  css: () => import('@shikijs/langs/css'),
+  html: () => import('@shikijs/langs/html'),
   bash: () => import('@shikijs/langs/bash'),
+  powershell: () => import('@shikijs/langs/powershell'),
+  go: () => import('@shikijs/langs/go'),
+  sql: () => import('@shikijs/langs/sql'),
+  c: () => import('@shikijs/langs/c'),
+  cpp: () => import('@shikijs/langs/cpp'),
+  java: () => import('@shikijs/langs/java'),
   diff: () => import('@shikijs/langs/diff'),
 } as const
 
 type LanguageId = keyof typeof LANGUAGE_LOADERS
 const LANGUAGE_ALIASES: Record<string, LanguageId> = {
-  js: 'javascript', jsx: 'javascript', ts: 'typescript', rs: 'rust', md: 'markdown', sh: 'bash',
+  js: 'javascript',
+  mjs: 'javascript',
+  cjs: 'javascript',
+  ts: 'typescript',
+  mts: 'typescript',
+  cts: 'typescript',
+  rs: 'rust',
+  py: 'python',
+  yml: 'yaml',
+  md: 'markdown',
+  htm: 'html',
+  sh: 'bash',
+  zsh: 'bash',
+  shell: 'bash',
+  ps1: 'powershell',
+  pwsh: 'powershell',
+  h: 'c',
+  hpp: 'cpp',
+  cc: 'cpp',
+  cxx: 'cpp',
+  'c++': 'cpp',
 }
 
 function languageIdFor(language: string): LanguageId | 'text' {
@@ -45,7 +77,10 @@ function loadHighlighter(): Promise<Highlighter> {
     themes: [theme.default, darkTheme.default],
     langs: [],
     engine: engine.createJavaScriptRegexEngine(),
-  }))
+  })).catch(error => {
+    highlighterPromise = null
+    throw error
+  })
   return highlighterPromise
 }
 
@@ -57,6 +92,9 @@ function loadLanguage(language: LanguageId): Promise<Highlighter> {
     pending = Promise.all([loadHighlighter(), LANGUAGE_LOADERS[language]()]).then(async ([highlighter, grammar]) => {
       await highlighter.loadLanguage(...grammar.default)
       return highlighter
+    }).catch(error => {
+      languagePromises.delete(language)
+      throw error
     })
     languagePromises.set(language, pending)
   }

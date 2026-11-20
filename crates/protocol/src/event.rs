@@ -47,21 +47,22 @@ pub enum TurnEvent {
         item_id: String,
         result: crate::ToolResult,
     },
-    #[cfg_attr(feature = "typescript", ts(skip))]
-    ProviderAttempt { observation: crate::RequestObservation },
     #[serde(rename = "turn/completed")]
     TurnCompleted {
         turn: Turn,
         manually_stopped: bool,
         finished_at: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(optional))]
+        stats: Option<crate::SessionModelUsage>,
     },
-    /// 提问或轮换状态变化，通知外层推送最新的 `SessionRuntime`。
-    #[cfg_attr(feature = "typescript", ts(skip))]
-    SessionStateChanged {},
     #[serde(rename = "turn/error")]
     TurnFailed {
         error: TurnErrorDetail,
         finished_at: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(optional))]
+        stats: Option<crate::SessionModelUsage>,
     },
 }
 

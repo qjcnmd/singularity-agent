@@ -3,25 +3,15 @@ use serde_json::Value;
 use singularity_protocol::ProviderApiProtocol;
 use std::fmt;
 
-pub(crate) const DEFAULT_CHAT_REASONING_FIELD: &str = "reasoning_content";
-
-pub(crate) const CHAT_REASONING_FIELDS: &[&str] =
-    &[DEFAULT_CHAT_REASONING_FIELD, "reasoning", "reasoning_text"];
-
-/// 随助手消息保存在会话日志中的提供方续接信息，用于后续请求向同一模型回传思考字段；转换前端历史条目时不展示。
+/// 随助手消息保存在会话日志中的提供方续接信息，用于后续请求向同一模型回传思考签名或加密内容；转换前端历史条目时不展示。
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "protocol", rename_all = "snake_case")]
 pub enum ProviderMessageMetadata {
-    Chat {
+    Messages {
         provider_name: String,
         model_name: String,
         /// 实际请求地址；地址变化后不复用这份私有数据。
         endpoint: String,
-        /// 保留提供方返回时用的字段名。
-        reasoning_field: String,
-        /// OpenAI 兼容端点返回的结构化签名或加密推理；不当作文本重建。
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        reasoning_details: Vec<Value>,
     },
     Responses {
         provider_name: String,
@@ -36,7 +26,7 @@ impl fmt::Debug for ProviderMessageMetadata {
         debug.field(
             "protocol",
             &match self {
-                Self::Chat { .. } => "chat",
+                Self::Messages { .. } => "messages",
                 Self::Responses { .. } => "responses",
             },
         );
@@ -59,15 +49,15 @@ impl ProviderMessageMetadata {
             && source_endpoint == endpoint
             && matches!(
                 (self, protocol),
-                (Self::Chat { .. }, ProviderApiProtocol::Chat)
+                (Self::Messages { .. }, ProviderApiProtocol::Messages)
                     | (Self::Responses { .. }, ProviderApiProtocol::Responses)
             )
     }
 
     fn model_identity(&self) -> (&str, &str, &str) {
         match self {
-            Self::Chat { provider_name, model_name, endpoint, .. }
-            | Self::Responses { provider_name, model_name, endpoint, .. } => {
+            Self::Messages { provider_name, model_name, endpoint }
+            | Self::Responses { provider_name, model_name, endpoint } => {
                 (provider_name, model_name, endpoint)
             }
         }

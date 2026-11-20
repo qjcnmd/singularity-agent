@@ -31,21 +31,17 @@
 `~/.singularity/config.json`：
 ```json
 {
-  "default_model": { "provider": "deepseek", "model": "deepseek-chat", "reasoning": null },
+  "default_model": { "provider": "deepseek", "model": "deepseek-flash", "reasoning": "high" },
   "providers": {
     "deepseek": {
       "api_key": "sk-your-api-key-here",
-      "base_url": "https://api.deepseek.com/v1",
-      "api_protocol": "chat",
+      "base_url": "https://api.deepseek.com/anthropic/v1",
+      "api_protocol": "messages",
       "models": {
-        "deepseek-chat": {
-          "max_context_tokens": 128000,
-          "max_output_tokens": 8192
-        },
-        "deepseek-reasoner": {
-          "max_context_tokens": 128000,
-          "max_output_tokens": 8192,
-          "reasoning_variants": ["high"]
+        "deepseek-flash": {
+          "max_context_tokens": 500000,
+          "max_output_tokens": 65536,
+          "reasoning_variants": ["off", "low", "high", "max"]
         }
       }
     }
@@ -53,30 +49,19 @@
 }
 ```
 
-`reasoning_variants` 直接填写提供方接受的档位名称，例如 `["off", "low", "high"]`。Chat 模型使用 `thinking_type` 或 `enable_thinking` 开关字段时，可填写 `["off", "on"]`；默认的 `reasoning_effort` 字段和 Responses 协议须填写具体档位或 `off`，不接受 `on`。
+`reasoning_variants` 直接填写提供方接受的档位名称，例如 `["off", "low", "high"]`。Messages 协议支持 `off`、`on` 以及具体档位（启用时发送 `thinking: {"type":"adaptive"}`，具体档位附带 `output_config.effort`）；Responses 协议须填写具体档位或 `off`，不接受 `on`。
 
 ### `base_url` 规范与常见厂商示例
 
-`api_protocol` 必须在提供方上设置为 `chat` 或 `responses`，该提供方的所有模型统一使用它。模型配置不包含协议字段。
+`api_protocol` 必须在提供方上设置为 `messages` 或 `responses`，该提供方的所有模型统一使用它。模型配置不包含协议字段。
 
-系统会在 `base_url` 后追加 `/chat/completions`、`/responses` 或 `/models`。请填写 API 根地址，按提供方要求保留版本号和自定义路径，不填写完整接口地址：
+系统会在 `base_url` 后追加 `/messages`、`/responses` 或 `/models`。请填写 API 根地址，按提供方要求保留版本号和自定义路径，不填写完整接口地址：
 
 | 提供方 | 推荐 `base_url` | 协议类型 (`api_protocol`) |
 | --- | --- | --- |
-| **OpenAI 官方** | `https://api.openai.com/v1` | `chat` 或 `responses` |
-| **DeepSeek 官方** | `https://api.deepseek.com/v1` | `chat` |
-| **B.AI 代理** | `https://api.b.ai/v1` | `chat` |
-| **Ollama (本地)** | `http://localhost:11434/v1` | `chat` |
-| **vLLM / LM Studio** | `http://localhost:8000/v1` | `chat` |
-
-### 模型请求格式
-
-不同 Chat 端点使用的思考和输出字段可在 `config.json` 的模型条目中指定：
-
-| 字段 | 默认值 | 作用说明 |
-| --- | --- | --- |
-| `thinking_wire_format` | `reasoning_effort` | 思考模式字段：`reasoning_effort`、`thinking_type` (Anthropic 风格) 或 `enable_thinking` (布尔值) |
-| `chat_output_tokens_field` | `max_tokens` | Chat 协议指定输出上限的字段名，可切换为 `max_completion_tokens` |
+| **Anthropic 官方** | `https://api.anthropic.com/v1` | `messages` |
+| **DeepSeek 官方** | `https://api.deepseek.com/anthropic/v1` | `messages` |
+| **OpenAI 官方** | `https://api.openai.com/v1` | `responses` |
 
 ## MCP 工具
 
@@ -108,6 +93,7 @@
 - **生效时机**：配置在下一轮任务开始时生效。工具清单与项目指令一起在每轮开始时加载，同一轮内不变。
 - **按任务关闭**：新建任务页的胶囊可以关掉某个服务器；关掉后这个任务不连接它，工具和服务器说明都不发给模型，其他任务不受影响。MCP 管理页只负责增删改和查看状态。
 - **连接状态**：打开设置只查看已有状态，不会主动连接。每轮开始时复用正常的连接并重新获取工具列表，服务器更新工具后下一轮生效。连接失败时可点击“重试连接”。工具在一轮中途被服务器移除时，调用会直接失败，不会自动重试。
+- **统一延迟加载**：所有启用的 MCP 服务器均采用按工具粒度的延迟加载——仅在指令中注入工具名、无参标记与精简简介，由固定的 `mcp_schema`（支持单次查一个或多个指定工具）与 `mcp_call` 代理按需读取参数定义并调用，降低上下文占用并保持工具列表前缀稳定。
 - **环境要求**：本地 stdio 服务需要在系统 PATH 中安装对应的运行环境（如 Node.js 或 Python）。
 
 ## 项目指令与技能
@@ -152,6 +138,7 @@ description: 审查代码改动并生成专业建议
 | `sessions/<id>.jsonl` | 每个任务的完整历史（当前格式为 v1），工具结果分别保存模型正文与必要的展示字段；后台命令保存纯文本输出尾部及字节范围 |
 | `sessions/images/<id>/` | 各任务中发送或读取的图片文件 |
 | `sessions/outputs/<id>/` | 各任务的完整超长工具输出 |
+| `logs/singularity.log` | 后端结构化诊断日志（单文件 5 MiB 自动滚动保留 3 份，可用 `SINGULARITY_LOG` / `RUST_LOG` 调整级别） |
 | `AGENTS.md` | 用户全局指令（可选） |
 | `skills/` | 用户级全局技能脚本与说明 |
 

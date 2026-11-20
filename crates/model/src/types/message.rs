@@ -29,49 +29,35 @@ pub enum ContentBlock {
     ToolCall(ModelToolCall),
 }
 
-/// 核心会话消息结构：以角色为标签的枚举，每个角色只携带自己合法的字段。
+/// 核心会话消息结构：以角色为标签的枚举，仅包含模型对话协议所需字段；
+/// 本地展示元数据由会话日志外层单独保存，不混入模型消息。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Message {
     /// Harness 和技能指令，包括请求前缀、轮换接手提示和末尾的整理要求。
-    Developer { content: Vec<ContentBlock> },
+    Developer {
+        content: Vec<ContentBlock>,
+    },
     /// 后台任务的状态通知，不显示为用户气泡。
-    Notification { content: Vec<ContentBlock> },
-    #[serde(rename_all = "camelCase")]
+    Notification {
+        content: Vec<ContentBlock>,
+    },
     User {
         content: Vec<ContentBlock>,
-        /// 附加技能正文和附件路径前的用户文字；模型消费 content，界面保持原始显示。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        display_text: Option<String>,
-        /// 用户附上的文件路径，界面显示为附件卡片；模型读取的路径已写进 content。
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        files: Vec<String>,
     },
     #[serde(rename_all = "camelCase")]
     Assistant {
         content: Vec<ContentBlock>,
-        /// 提供方专用的推理续接信息（Chat 的思考字段名与 `reasoning_details`、Responses 的来源标识），仅在后续请求发往同一提供方、模型、协议和地址时附带。
+        /// 提供方专用的推理续接信息（Messages / Responses 的来源标识），仅在后续请求发往同一提供方、模型、协议和地址时附带。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_metadata: Option<ProviderMessageMetadata>,
     },
     #[serde(rename_all = "camelCase")]
     ToolResult {
         content: Vec<ContentBlock>,
-        /// 本地界面正文；未设置时显示 content，提供方编码始终只使用 content。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        display_output: Option<String>,
-        /// bash 结果关联的后台命令；仅供本地展示，不编码到模型请求。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        background_task_id: Option<String>,
         /// 对应的工具调用 ID；名称和参数由原始 ToolCall 记录提供，这里不重复。
         tool_call_id: String,
         is_error: bool,
-        /// 工具实际执行的耗时（毫秒）；未执行或结果未知时为空。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        duration_ms: Option<u64>,
-        /// read 实际读取到的源文件范围；只有 read 的成功结果才带这个字段。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        read_source: Option<singularity_protocol::ReadSource>,
     },
 }
 
@@ -80,24 +66,9 @@ impl Message {
         match self {
             Self::Developer { content }
             | Self::Notification { content }
-            | Self::User { content, .. }
+            | Self::User { content }
             | Self::Assistant { content, .. }
             | Self::ToolResult { content, .. } => content,
-        }
-    }
-
-    /// 用户消息第一段文本（`index == 0`）若有原始输入（`display_text`），界面和标题显示原文，模型读取含技能正文和附件路径的 `content`。
-    pub fn text_for_display<'a>(&'a self, index: usize, text: &'a str) -> &'a str {
-        match self {
-            Self::User { display_text: Some(display), .. } if index == 0 => display,
-            _ => text,
-        }
-    }
-
-    pub fn files(&self) -> &[String] {
-        match self {
-            Self::User { files, .. } => files,
-            _ => &[],
         }
     }
 
@@ -138,11 +109,7 @@ impl Message {
 impl Message {
     /// 构造纯文本用户消息或总结要求。
     pub fn user(text: impl Into<String>) -> Self {
-        Self::User {
-            content: vec![ContentBlock::text(text)],
-            display_text: None,
-            files: Vec::new(),
-        }
+        Self::User { content: vec![ContentBlock::text(text)] }
     }
     /// 构造 Harness 或技能目录指令。
     pub fn developer(text: impl Into<String>) -> Self {

@@ -13,7 +13,10 @@ pub async fn handle(
 ) -> RpcResponse {
     match dispatch(Arc::clone(app), request, shutdown).await {
         Ok(result) => RpcResponse::Success { result },
-        Err(error) => RpcResponse::Error { error },
+        Err(error) => {
+            tracing::warn!(error = %error.message, "RPC request failed");
+            RpcResponse::Error { error }
+        }
     }
 }
 
@@ -26,19 +29,25 @@ async fn dispatch(
         RpcRequest::McpReconnect(params) => {
             let cwd = app.scope_directory(params.workspace_root.as_deref())?;
             let inspect = async { app.mcp.reconnect(&params.server_id, &cwd).await.map_err(RpcError::new) };
-            value(unless_shutdown(shutdown, inspect).await?)
+            Ok(value(unless_shutdown(shutdown, inspect).await?))
         }
         RpcRequest::ModelDiscover(params) => {
-            let discover =
-                app.discover_models(&params.provider_id, &params.base_url, params.api_key.as_deref());
-            value(unless_shutdown(shutdown, discover).await?)
+            let discover = app.discover_models(
+                &params.provider_id,
+                params.api_protocol,
+                &params.base_url,
+                params.api_key.as_deref(),
+            );
+            Ok(value(unless_shutdown(shutdown, discover).await?))
         }
         RpcRequest::BackgroundTaskStop(params) => {
-            value(app.stop_background_task(&params.session_id, &params.task_id).await?)
+            Ok(value(app.stop_background_task(&params.session_id, &params.task_id).await?))
         }
-        RpcRequest::WorkspaceRemove(params) => value(app.remove_workspace(&params.workspace_root).await?),
-        RpcRequest::SessionDelete(params) => value(app.delete_session(&params.session_id).await?),
-        RpcRequest::SessionContext(params) => value(app.inspect_context(&params.session_id, shutdown).await?),
+        RpcRequest::WorkspaceRemove(params) => Ok(value(app.remove_workspace(&params.workspace_root).await?)),
+        RpcRequest::SessionDelete(params) => Ok(value(app.delete_session(&params.session_id).await?)),
+        RpcRequest::SessionContext(params) => {
+            Ok(value(app.inspect_context(&params.session_id, shutdown).await?))
+        }
         RpcRequest::DirectoryPick(_) => Err(RpcError::new("目录选择由 Electron 处理。")),
         RpcRequest::AppBootstrap(_) => blocking(move || app.bootstrap()).await,
         RpcRequest::SkillsList(params) => blocking(move || app.skills(&params.workspace_root)).await,
@@ -83,6 +92,10 @@ async fn dispatch(
         }
         RpcRequest::SessionStart(params) => blocking(move || app.start_session(params)).await,
         RpcRequest::SessionRead(params) => blocking(move || app.read_session(&params.session_id)).await,
+        RpcRequest::SessionFocus(params) => {
+            app.set_focused_session(params.session_id);
+            Ok(value(()))
+        }
         RpcRequest::SessionImageRead(params) => {
             blocking(move || app.image_data(&params.session_id, &params.image_id)).await
         }
@@ -106,7 +119,7 @@ async fn dispatch(
 async fn blocking<T: Serialize>(
     operation: impl FnOnce() -> Result<T, RpcError> + Send + 'static,
 ) -> Result<Value, RpcError> {
-    tokio::task::spawn_blocking(move || value(operation()?))
+    tokio::task::spawn_blocking(move || Ok(value(operation()?)))
         .await
         .expect("RPC worker completes while the backend is running")
 }
@@ -122,6 +135,6 @@ async fn unless_shutdown<T>(
     }
 }
 
-fn value(output: impl Serialize) -> Result<Value, RpcError> {
-    Ok(serde_json::to_value(output).expect("RPC output contains JSON-compatible protocol values"))
+fn value(output: impl Serialize) -> Value {
+    serde_json::to_value(output).expect("RPC output contains JSON-compatible protocol values")
 }

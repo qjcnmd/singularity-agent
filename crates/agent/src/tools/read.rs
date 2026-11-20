@@ -40,7 +40,7 @@ pub(crate) fn spec() -> singularity_core::ToolDefinition {
             "properties": {
                 "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },
                 "offset": { "type": "integer", "description": "Line number to start reading from (1-indexed)" },
-                "limit": { "type": "integer", "description": format!("Maximum number of lines to read (omitted: default {DEFAULT_MAX_LINES} lines)") },
+                "limit": { "type": "integer", "minimum": 1, "description": format!("Maximum number of lines to read (omitted: default {DEFAULT_MAX_LINES} lines)") },
             },
             "required": ["path"],
             "additionalProperties": false,
@@ -62,6 +62,9 @@ pub(crate) fn execute(args: &ReadArgs, cwd: &Path, signal: &CancellationToken) -
         Ok(bytes) if image::guess_format(bytes).is_ok() => {
             return error_result(format!("{} is an image file, not text.", args.path));
         }
+        Ok(bytes) if bytes.contains(&0) => {
+            return error_result(format!("{} is a binary file, not text.", args.path));
+        }
         Ok(_) => {}
         Err(error) => return error_result(format!("Could not read file: {}. {error}", args.path)),
     }
@@ -75,10 +78,15 @@ fn execute_reader(
     reader: &mut impl BufRead,
     signal: &CancellationToken,
 ) -> ToolExecution {
-    let start_line = offset.map_or(0, |offset| (offset as usize).saturating_sub(1));
+    if limit == Some(0) {
+        return error_result("limit must be at least 1");
+    }
+    let start_line =
+        offset.map_or(0, |offset| usize::try_from(offset).unwrap_or(usize::MAX).saturating_sub(1));
     let start_line_display = start_line + 1;
-    let user_line_limit =
-        limit.map_or(DEFAULT_MAX_LINES, |limit| limit.min(DEFAULT_MAX_LINES as u64) as usize);
+    let user_line_limit = limit.map_or(DEFAULT_MAX_LINES, |limit| {
+        usize::try_from(limit).unwrap_or(DEFAULT_MAX_LINES).min(DEFAULT_MAX_LINES)
+    });
     let mut state = ReadState {
         selected: Vec::new(),
         selected_bytes: 0,

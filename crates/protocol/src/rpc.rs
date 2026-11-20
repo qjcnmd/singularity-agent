@@ -76,6 +76,7 @@ pub struct ProviderParams {
 #[serde(rename_all = "camelCase")]
 pub struct DiscoverModelsParams {
     pub provider_id: String,
+    pub api_protocol: crate::ProviderApiProtocol,
     pub base_url: String,
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub api_key: Option<String>,
@@ -86,6 +87,14 @@ pub struct DiscoverModelsParams {
 #[serde(rename_all = "camelCase")]
 pub struct SessionParams {
     pub session_id: String,
+}
+
+/// 告知后端当前前端正在展示的会话；非聚焦会话的高频流式进度不再跨管道推送。
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionFocusParams {
+    pub session_id: Option<String>,
 }
 
 /// 首次发送时创建会话，空白页只保存在工作台草稿中。
@@ -178,6 +187,7 @@ rpc_methods! {
     ContextPreview => "context.preview" (WorkspaceParams) -> Vec<ContextModule>,
     SessionStart => "session.start" (SessionStartParams) -> SessionStartResult,
     SessionRead => "session.read" (SessionParams) -> SessionReadResult,
+    SessionFocus => "session.focus" (SessionFocusParams) -> (),
     SessionImageRead => "session.imageRead" (SessionImageParams) -> String,
     SessionRename => "session.rename" (SessionRenameParams) -> (),
     SessionDelete => "session.delete" (SessionParams) -> (),

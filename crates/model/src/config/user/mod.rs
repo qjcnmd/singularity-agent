@@ -39,11 +39,6 @@ pub(crate) struct UserConfigModel {
     /// 可选的推理档位列表；省略或为空时不提供推理档位。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_variants: Option<Vec<String>>,
-    /// Chat 请求里表示最大输出 Token 的字段名，默认是 `max_tokens`，也可设为 `max_completion_tokens`；Responses 不使用。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) chat_output_tokens_field: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) thinking_wire_format: Option<String>,
 }
 
 pub(crate) fn read_user_config_file(directory: &Path) -> Result<Option<UserConfigFile>, ProviderError> {

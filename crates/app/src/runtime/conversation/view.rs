@@ -12,9 +12,9 @@ pub(super) struct ConversationView {
     pub(super) context: Option<singularity_protocol::InjectedContext>,
 }
 impl ConversationView {
-    pub(super) fn new(usage: singularity_protocol::SessionModelUsage) -> Self {
+    pub(super) fn new(usage: singularity_protocol::SessionModelUsage, initial_revision: u64) -> Self {
         Self {
-            last_event_revision: 0,
+            last_event_revision: initial_revision,
             activity: Default::default(),
             failure: None,
             usage,
@@ -126,24 +126,29 @@ impl Conversation {
         self.publish(view, StreamEvent::SessionSummaryChanged { summary: self.summary() });
     }
     /// 接收 Agent 的共同事件，更新运行状态后发布。
-    pub(super) fn on_event(&self, event: TurnEvent) {
-        self.publish_event(&mut self.lock_view(), event);
+    pub(super) fn on_event(&self, event: AgentEvent) {
+        let mut view = self.lock_view();
+        match event {
+            AgentEvent::SessionStateChanged => self.publish_changed(&mut view),
+            AgentEvent::ProviderAttempt { observation } => {
+                crate::runtime::history::accumulate_request_usage(&mut view.usage, &observation);
+                self.publish_changed(&mut view);
+            }
+            AgentEvent::Turn(event) => self.publish_event(&mut view, event),
+        }
     }
     pub(super) fn publish_event(&self, view: &mut ConversationView, mut event: TurnEvent) {
-        // 请求结束先发 ProviderAttempt 累计用量，再发完成的回复；回复带上此刻的会话累计。
-        if let TurnEvent::MessageFinished { items, .. } = &mut event {
-            singularity_agent::message::attach_usage(items, &view.usage);
+        // 请求结束先发 ProviderAttempt 累计用量，再发完成的回复或回合结束；均带上此刻的会话累计。
+        match &mut event {
+            TurnEvent::MessageFinished { items, .. } => {
+                singularity_agent::message::attach_usage(items, &view.usage);
+            }
+            TurnEvent::TurnCompleted { stats, .. } | TurnEvent::TurnFailed { stats, .. } => {
+                *stats = Some(view.usage.clone());
+            }
+            _ => {}
         }
         match &event {
-            TurnEvent::SessionStateChanged {} => {
-                self.publish_changed(view);
-                return;
-            }
-            TurnEvent::ProviderAttempt { observation } => {
-                crate::runtime::history::accumulate_request_usage(&mut view.usage, observation);
-                self.publish_changed(view);
-                return;
-            }
             TurnEvent::ContextLoaded { context } => {
                 view.context = Some(context.clone());
             }

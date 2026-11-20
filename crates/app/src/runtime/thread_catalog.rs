@@ -44,7 +44,7 @@ impl ThreadCatalog {
 
     /// 以写入方式打开日志并截掉未写完的末尾；返回的写者交给 Conversation 长期持有。
     pub fn open_session(&self, thread_id: &str) -> Result<SessionManager, CatalogError> {
-        let path = thread_session_path(&self.sessions_dir, thread_id);
+        let path = checked_session_path(&self.sessions_dir, thread_id)?;
         SessionManager::open_existing(&path, thread_id).map_err(|error| self.session_error(thread_id, error))
     }
 
@@ -94,10 +94,7 @@ impl ThreadCatalog {
 
     /// 停止任务后删除日志和附件；附件删除失败时保留日志，便于重试。
     pub fn delete(&self, thread_id: &str) -> Result<(), CatalogError> {
-        Uuid::parse_str(thread_id).map_err(|error| {
-            self.session_error(thread_id, SessionError::InvalidSession(error.to_string()))
-        })?;
-        let path = thread_session_path(&self.sessions_dir, thread_id);
+        let path = checked_session_path(&self.sessions_dir, thread_id)?;
         for directory in [
             session_images_directory(&self.sessions_dir, thread_id),
             session_outputs_directory(&self.sessions_dir, thread_id),
@@ -120,8 +117,16 @@ pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
     sessions_dir.join(singularity_agent::session::session_file_name(thread_id))
 }
 
-fn open_thread_read_only(sessions_dir: &Path, thread_id: &str) -> Result<SessionData, CatalogError> {
+fn checked_session_path(sessions_dir: &Path, thread_id: &str) -> Result<PathBuf, CatalogError> {
     let path = thread_session_path(sessions_dir, thread_id);
+    Uuid::parse_str(thread_id).map_err(|error| {
+        CatalogError::session(thread_id, &path, SessionError::InvalidSession(error.to_string()))
+    })?;
+    Ok(path)
+}
+
+fn open_thread_read_only(sessions_dir: &Path, thread_id: &str) -> Result<SessionData, CatalogError> {
+    let path = checked_session_path(sessions_dir, thread_id)?;
     let session = SessionData::open(&path).map_err(|error| CatalogError::session(thread_id, &path, error))?;
     session
         .verify_session_id(thread_id)

@@ -1,5 +1,3 @@
-// 不写 unsafe 代码；命令进程树交给 process-wrap 管理。
-#![deny(unsafe_code)]
 //! Singularity 的 Agent：模型与工具循环、会话日志和内置工具。
 //!
 //! - agent：一轮执行的入口；
@@ -8,6 +6,8 @@
 //! - tools：内置工具。
 
 pub mod agent;
+pub use agent::AgentEvent;
+pub(crate) mod compaction;
 mod image;
 pub mod message;
 mod request_execution;

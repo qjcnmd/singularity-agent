@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 //! 前后端与各 crate 共用的 RPC 请求、事件、历史和配置类型。
 
 mod app;

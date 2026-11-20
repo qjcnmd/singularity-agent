@@ -7,13 +7,20 @@ import { workspaceName } from '../copy'
 import { workspaceKey } from '../workspace'
 import { pop, smooth } from '../motion'
 import { McpSettings } from './McpSettings'
-import { CircleCheck, RefreshCw } from 'lucide-react'
+import { CircleCheck, ChevronRight, RefreshCw, Search } from 'lucide-react'
 
-function PageFrame({ title, actions, children }: { title?: string; actions?: ReactNode; children: ReactNode }) {
+function PageFrame({ title, subtitle, actions, children }: { title?: string; subtitle?: string; actions?: ReactNode; children: ReactNode }) {
   const reduced = useReducedMotion()
   return <div className="manage-scroll">
     <motion.div className="manage-page" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={reduced ? { duration: 0 } : smooth}>
-      {title && <header><h2>{title}</h2>{actions}</header>}{children}
+      {title && <header className="manage-header">
+        <div className="manage-heading">
+          <h2>{title}</h2>
+          {subtitle && <p className="manage-subtitle">{subtitle}</p>}
+        </div>
+        {actions && <div className="manage-actions">{actions}</div>}
+      </header>}
+      {children}
     </motion.div>
   </div>
 }
@@ -60,7 +67,7 @@ export function InstructionsPage() {
     } catch (error) { setError(error instanceof Error ? error.message : String(error)) }
     finally { setSaving(false) }
   }
-  return <PageFrame title="自定义指令">
+  return <PageFrame title="自定义指令" subtitle="为全局或指定项目配置默认规则（AGENTS.md）。">
     <div className="instructions-layout">
       <nav className="instruction-targets" aria-label="指令范围" role="tablist">
         <button type="button" role="tab" disabled={saving} aria-selected={target === null} onClick={() => setTarget(null)}>全局</button>
@@ -72,13 +79,16 @@ export function InstructionsPage() {
         })}
       </nav>
       <motion.section key={key} className="instruction-editor" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: reduced ? 0 : .18 }} aria-busy={loading || saving}>
-        {saved && <div className="editor-path">{saved.path}</div>}
-        {loading && <span role="status">读取中…</span>}
-        {error && <div className="form-error" role="alert">{error}{!saved && <button type="button" className="quiet-button" onClick={() => setReload(value => value + 1)}>重新读取</button>}</div>}
+        <div className="editor-card-bar">
+          <span>文件</span>
+          <span className="editor-path">{saved?.path ?? (loading ? '读取中…' : '—')}</span>
+        </div>
+        {error && <div className="form-error" role="alert" style={{ margin: '10px 14px 0' }}>{error}{!saved && <button type="button" className="quiet-button" onClick={() => setReload(value => value + 1)}>重新读取</button>}</div>}
         <textarea aria-label="自定义指令内容" className="input" value={text} spellCheck={false} disabled={loading || saving || !saved}
           onChange={event => setDrafts(current => ({ ...current, [key]: event.target.value }))} />
         <footer>
-          <button type="button" className="primary-button" disabled={!dirty || saving || loading} onClick={() => void save()}>{saving ? '保存中…' : '保存'}</button>
+          <span className="editor-status">{loading ? '读取中…' : dirty ? '有未保存修改' : saved ? '已同步磁盘' : ''}</span>
+          <button type="button" className="primary-button small" disabled={!dirty || saving || loading} onClick={() => void save()}>{saving ? '保存中…' : '保存'}</button>
         </footer>
       </motion.section>
     </div>
@@ -92,12 +102,14 @@ export function InstructionsPage() {
 
 export function SkillsPage() {
   const state = useAppStore(['bootstrap', 'selectedWorkspaceRoot'])
-  const root = state.selectedWorkspaceRoot ?? state.bootstrap?.workspaces[0]?.root ?? null
+  const firstWorkspace = state.bootstrap?.workspaces[0]
+  const root = state.selectedWorkspaceRoot ?? (firstWorkspace ? workspaceKey(firstWorkspace.root) : null)
   return <SkillsList key={root ?? 'none'} root={root} />
 }
 
 function SkillsList({ root }: { root: string | null }) {
   const [skills, setSkills] = useState<SkillMetadata[] | null>(root === null ? [] : null)
+  const [query, setQuery] = useState('')
   const [loading, setLoading] = useState(root !== null)
   const [error, setError] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
@@ -116,26 +128,41 @@ function SkillsList({ root }: { root: string | null }) {
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [root, reload])
-  return <PageFrame title="Skills" actions={<>
+  const trimmed = query.trim().toLowerCase()
+  const filtered = skills?.filter(skill => !trimmed || skill.name.toLowerCase().includes(trimmed) || skill.description.toLowerCase().includes(trimmed)) ?? null
+  return <PageFrame title="Skills" subtitle="输入 / 按需调用；点击列表项在右侧预览技能说明。" actions={<>
     <span className="skills-count" role="status" aria-label={skills !== null ? `共 ${skills.length} 个技能` : '技能数量尚未读取'}>{skills !== null ? `${skills.length} 个` : '—'}</span>
     <button type="button" className="skills-refresh" aria-label="刷新 Skills 列表" title="刷新 Skills 列表" aria-busy={loading} aria-disabled={loading || root === null} onClick={refresh}>
-      <RefreshCw size={18} aria-hidden="true" />
+      <RefreshCw size={15} aria-hidden="true" />
     </button>
   </>}>
+    {skills !== null && skills.length > 0 && (
+      <label className="skills-search">
+        <Search size={14} aria-hidden="true" />
+        <input type="search" aria-label="搜索 Skills" placeholder="搜索技能名称或说明…" value={query} onChange={event => setQuery(event.target.value)} />
+      </label>
+    )}
     {loading && skills === null && <p role="status">读取中…</p>}
     {error && <div className="form-error" role="alert">{error}</div>}
     {!loading && !error && skills?.length === 0 && <p className="detail-empty">没有可用的 Skills</p>}
-    <div className="skill-list">{root && skills?.map(skill => <SkillCard key={`${root}:${skill.name}`} skill={skill} workspaceRoot={root} />)}</div>
+    {!loading && !error && filtered !== null && skills !== null && skills.length > 0 && filtered.length === 0 && <p className="detail-empty">没有匹配的 Skills</p>}
+    {root && filtered && filtered.length > 0 && (
+      <div className="skill-list">{filtered.map(skill => <SkillCard key={`${root}:${skill.name}`} skill={skill} workspaceRoot={root} />)}</div>
+    )}
   </PageFrame>
 }
 
 function SkillCard({ skill, workspaceRoot }: { skill: SkillMetadata; workspaceRoot: string }) {
   return <button type="button" className="skill-card" onClick={() => appStore.openFile(skill.path, workspaceRoot, skill.name)}>
-    <strong>{skill.name}</strong><span className="skill-description">{skill.description}</span>
+    <span className="skill-card-main">
+      <strong>{skill.name}</strong>
+      <span className="skill-description">{skill.description}</span>
+    </span>
+    <ChevronRight size={14} className="skill-row-chev" aria-hidden="true" />
   </button>
 }
 
 export function McpPage() {
   const { selectedWorkspaceRoot } = useAppStore(['selectedWorkspaceRoot'])
-  return <PageFrame title="MCP"><McpSettings workspaceRoot={selectedWorkspaceRoot} /></PageFrame>
+  return <PageFrame title="MCP" subtitle="管理外部工具服务，点击卡片展开可用工具列表。"><McpSettings workspaceRoot={selectedWorkspaceRoot} /></PageFrame>
 }

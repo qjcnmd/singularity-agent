@@ -63,11 +63,16 @@ impl Process {
         tokio::task::block_in_place(|| self.model_capture.persist());
     }
 
-    fn ingest(&mut self, chunk: OutputChunk) {
-        tokio::task::block_in_place(|| {
+    fn ingest(&mut self, chunk: &OutputChunk) {
+        if self.capture.will_write_disk(&chunk.display) || self.model_capture.will_write_disk(&chunk.model) {
+            tokio::task::block_in_place(|| {
+                self.capture.ingest(&chunk.display);
+                self.model_capture.ingest(&chunk.model);
+            });
+        } else {
             self.capture.ingest(&chunk.display);
             self.model_capture.ingest(&chunk.model);
-        });
+        }
     }
 
     pub(super) fn spawn(args: &BashArgs, cwd: &Path, output_directory: &Path) -> Result<Self, String> {
@@ -85,7 +90,9 @@ impl Process {
             .wrap(CreationFlags(windows::Win32::System::Threading::CREATE_NO_WINDOW))
             .wrap(JobObject)
             .wrap(KillOnDrop);
-        let mut child = wrapped.spawn().map_err(|error| format!("failed to spawn shell {shell}: {error}"))?;
+        let mut child = wrapped
+            .spawn()
+            .map_err(|error| format!("failed to spawn shell {}: {error}", shell.display()))?;
         let output = OutputStreams::new(
             child.stdout().take().expect("bash stdout is piped"),
             child.stderr().take().expect("bash stderr is piped"),
@@ -125,7 +132,7 @@ impl Process {
                 }),
                 _ = self.progress.tick() => {},
                 chunk = self.output.next(), if self.output.is_open() => match chunk {
-                    Some(Ok(chunk)) => self.ingest(chunk),
+                    Some(Ok(chunk)) => self.ingest(&chunk),
                     Some(Err(error)) => return ProcessEvent::Finished(Outcome::Failed(error.to_string())),
                     None => {},
                 }
@@ -166,7 +173,7 @@ impl Process {
                 biased;
                 _ = &mut drain => { truncated = true; break; }
                 chunk = self.output.next() => match chunk {
-                    Some(Ok(chunk)) => self.ingest(chunk),
+                    Some(Ok(chunk)) => self.ingest(&chunk),
                     Some(Err(error)) => failures.push(error.to_string()),
                     None => {},
                 }

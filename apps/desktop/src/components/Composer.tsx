@@ -1,4 +1,5 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { Plus } from 'lucide-react'
 import { actionOrigin, appStore, useAppStore, pendingKey } from '../appStore'
 import { ModelPicker } from './ModelPicker'
 import { ContextCapsules } from './ContextCapsules'
@@ -14,7 +15,7 @@ export const Composer = memo(ComposerView)
 function ComposerView({ accent }: { accent: string }) {
   const reducedMotion = useReducedMotion()
   const state = useAppStore(['drafts', 'pendingActions', 'bootstrap', 'bootstrapLoad', 'connection', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'liveSessions', 'sessionLoad'])
-  const { text: draft, images: imageDraft, files: fileDraft } = appStore.inputDraft()
+  const { text: draft, images: imageDraft, files: fileDraft, disabledModules } = appStore.inputDraft()
   const sessionId = state.selectedSessionId
   const draftKey = appStore.draftKey()
   const pendingQuestion = state.session?.runtime.pendingQuestion
@@ -24,7 +25,9 @@ function ComposerView({ accent }: { accent: string }) {
   const phase = selectedSessionPhase(state)
   const busy = phase === 'running' || phase === 'rotating' || phase === 'stopping'
   const [caret, setCaret] = useState(draft.length)
-  const trigger = pendingQuestion ? null : inputTrigger(draft, caret)
+  const skillsModule = state.session?.context?.modules.find(module => module.id === 'skills')
+  const skillsEnabled = sessionId === null ? !(disabledModules ?? []).includes('skills') : (skillsModule?.enabled ?? true)
+  const trigger = pendingQuestion || !skillsEnabled ? null : inputTrigger(draft, caret)
   const skills = useSkillCandidates(trigger !== null, state)
   const suggestions = trigger !== null && skills.status === 'ready'
     ? skills.result.skills.filter(skill => skill.name.startsWith(trigger.query))
@@ -88,7 +91,7 @@ function ComposerView({ accent }: { accent: string }) {
     const main = node.closest<HTMLElement>('.app-main')!
     const observer = new ResizeObserver(() => main.style.setProperty('--composer-height', `${node.offsetHeight}px`))
     observer.observe(node)
-    return () => observer.disconnect()
+    return () => { observer.disconnect(); main.style.removeProperty('--composer-height') }
   }, [])
   const showsStop = busy && (pendingQuestion || (draft.trim() === '' && imageDraft.length === 0 && fileDraft.length === 0))
   const orb = <WaterOrb size={40} color={accent} percent={occupancy?.percent ?? 0} rotating={phase === 'rotating'}
@@ -121,7 +124,7 @@ function ComposerView({ accent }: { accent: string }) {
                 onMouseDown={event => event.preventDefault()}
                 onClick={() => insertCandidate(candidate)}
               >
-                <strong>{candidate.name}</strong><span>{candidate.description}</span>
+                <strong><span className="candidate-slash">/</span>{candidate.name}</strong><span>{candidate.description}</span>
               </button>
             ))}
             </div>
@@ -196,7 +199,7 @@ function ComposerView({ accent }: { accent: string }) {
           <div className="composer-context">
             {attachmentInput.picker}
             <button type="button" className="attach-button" aria-label="添加附件" title="添加附件" disabled={attachmentInput.disabled} onClick={attachmentInput.open}>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true"><path d="M5 12h14M12 5v14" /></svg>
+              <Plus size={16} strokeWidth={1.8} aria-hidden="true" />
             </button>
           </div>
           <div className="composer-actions"><ModelPicker state={state} />{orb}</div>

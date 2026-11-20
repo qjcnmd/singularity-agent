@@ -24,10 +24,10 @@ export function formatCapacityInput(value: number | null): string {
   return String(value)
 }
 
-type ReasoningConfiguration = Pick<ModelConfigurationInput, 'reasoningVariants' | 'thinkingWireFormat'>
+type ReasoningConfiguration = Pick<ModelConfigurationInput, 'reasoningVariants'>
 
-function supportsThinkingToggle(model: ReasoningConfiguration, protocol: ProviderApiProtocol): boolean {
-  return protocol === 'chat' && (model.thinkingWireFormat === 'thinking_type' || model.thinkingWireFormat === 'enable_thinking')
+function supportsThinkingToggle(protocol: ProviderApiProtocol): boolean {
+  return protocol === 'messages'
 }
 
 /** 模型弹窗和提供方保存共用思考选项规则，切换协议后也能直接指出不适用的档位。 */
@@ -36,7 +36,6 @@ export function reasoningConfigurationError(model: ReasoningConfiguration, proto
   if (declared.some(variant => !variant || /[\s\x00-\x1f\x7f]/.test(variant))) return '思考档位无效，请取消选择此档位。'
   if (new Set(declared).size !== declared.length) return '思考选项不能重名。'
   if (protocol === 'responses' && declared.includes('on')) return 'Responses 须选择具体思考档位，不支持 on 开关。'
-  if (declared.includes('on') && !supportsThinkingToggle(model, protocol)) return 'reasoning_effort 须选择具体思考档位，不支持 on 开关。'
   return null
 }
 
@@ -46,20 +45,12 @@ export function blankModel(): ModelConfigurationInput {
     maxContextTokens: null,
     maxOutputTokens: null,
     reasoningVariants: null,
-    thinkingWireFormat: null,
-    chatOutputTokensField: null,
   }
-}
-
-export function applyProtocol(model: ModelConfigurationInput, apiProtocol: ProviderApiProtocol): ModelConfigurationInput {
-  return { ...model,
-    thinkingWireFormat: apiProtocol === 'responses' ? null : model.thinkingWireFormat,
-    chatOutputTokensField: apiProtocol === 'responses' ? null : model.chatOutputTokensField }
 }
 
 /** 只提供能发送的开关；不适用的已选值仍显示，供用户取消并修正配置。 */
 export function reasoningOptionsFor(model: ReasoningConfiguration, protocol: ProviderApiProtocol): string[] {
-  const supportsToggle = supportsThinkingToggle(model, protocol)
+  const supportsToggle = supportsThinkingToggle(protocol)
   const variants = model.reasoningVariants ?? []
   const toggle = supportsToggle && variants.includes('on')
     && variants.every(variant => variant === 'off' || variant === 'on')

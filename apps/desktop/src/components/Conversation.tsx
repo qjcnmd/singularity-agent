@@ -1,11 +1,10 @@
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { ArrowDown } from 'lucide-react'
 import { appStore, type AppState } from '../appStore'
 import { type TimelineRow } from '../timeline'
 import { TimelineItem } from './TimelineItem'
 import { defaultAnchor } from '../viewPersistence'
-import { BubbleColorPicker, type BubbleKind } from './BubbleColorPicker'
 
 interface Props {
   state: Pick<AppState, 'selectedSessionId' | 'session' | 'sessionLoad' | 'bootstrap'>
@@ -22,14 +21,6 @@ export function Conversation({ state, items }: Props) {
   const frame = useRef(0)
   const restoredSession = useRef<string | null>(null)
   const reduced = useReducedMotion()
-  const [colorPicker, setColorPicker] = useState<{ kind: BubbleKind; x: number; y: number } | null>(null)
-  // 右键我的气泡改我的消息配色，右键助手气泡改助手配色；失败气泡保持红色，不响应。
-  const openColorPicker = (event: MouseEvent<HTMLElement>) => {
-    const bubble = (event.target as Element).closest('.message-bubble:not(.error-bubble)')
-    if (!bubble) return
-    event.preventDefault()
-    setColorPicker({ kind: bubble.closest('.timeline-user') ? 'userBubble' : 'assistantBubble', x: event.clientX, y: event.clientY })
-  }
   const disclosurePause = useRef(0)
   const disclosureTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const followLatest = () => {
@@ -90,7 +81,7 @@ export function Conversation({ state, items }: Props) {
   }, [itemIdentity, sessionId, state.session?.runtime.phase])
 
   const saveReadingPosition = (node: HTMLDivElement, element: HTMLElement) => {
-    const anchorElement = element.closest<HTMLElement>('.tool-group') ?? element
+    const anchorElement = element.closest<HTMLElement>('.activity-card, .tool-group') ?? element
     const items = currentItems.current
     const index = items.findIndex(item => item.key === anchorElement.dataset.itemId)
     // 重试会撤回流式片段；用它之前最近的已保存条目记录位置。
@@ -180,13 +171,12 @@ export function Conversation({ state, items }: Props) {
   return (
     <div className="conversation-surface"><div className="conversation-scroll" ref={viewport} tabIndex={0} aria-label="任务内容" onScroll={onScroll} onWheel={interruptFollow} onTouchStart={interruptFollow} onPointerDown={interruptFollow} onKeyDown={event => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) interruptFollow() }}>
       {/* 切换任务时整页淡入，消息不各自弹出；任务里新出现的消息才逐条弹出。 */}
-      <motion.div key={sessionId} className="conversation-document" onContextMenu={openColorPicker}
+      <motion.div key={sessionId} className="conversation-document"
         initial={reduced ? false : { opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: .2, ease: 'easeOut' }}>
         <AnimatePresence initial={false}>{items.map(item => <TimelineItem key={item.key} item={item.item} itemKey={item.key} onDisclosureChange={preserveDisclosurePosition} cwd={state.session!.summary.cwd} userHome={state.bootstrap?.userHome} sessionId={sessionId ?? undefined} />)}</AnimatePresence>
       </motion.div>
 
     </div>
-      {colorPicker && <BubbleColorPicker key={`${colorPicker.x},${colorPicker.y}`} {...colorPicker} onClose={() => setColorPicker(null)} />}
       {awayFromLatest && <button type="button" className="return-to-latest" aria-label="回到最新消息" onClick={returnToLatest}>
         <ArrowDown size={16} aria-hidden="true" />
       </button>}

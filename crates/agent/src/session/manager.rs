@@ -12,7 +12,8 @@ use singularity_model::Message;
 
 use super::file::{parse_session_file, repair_tail};
 use super::format::{
-    ContextRotationEntry, LedgerRecord, Result, SessionEntry, SessionError, SessionHeader, SessionMetadata,
+    ContextRotationEntry, LedgerRecord, MessageDisplay, Result, SessionEntry, SessionError, SessionHeader,
+    SessionMetadata,
 };
 
 /// 可写的会话日志。记录按写入顺序排列，这个顺序就是事情发生的顺序；
@@ -180,12 +181,14 @@ impl SessionManager {
         id: &str,
         message: Message,
         observation: Option<singularity_protocol::RequestObservation>,
+        display: Option<MessageDisplay>,
     ) -> Result<String> {
         self.append_entry(SessionEntry::Message {
             id: id.to_string(),
             timestamp: now_iso(),
             message,
             observation,
+            display,
         })
     }
 

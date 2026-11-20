@@ -41,7 +41,7 @@ impl WorkspaceStore {
         let path = home.join(WORKSPACE_REGISTRY_FILE_NAME);
         let state = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|error| format!("workspace registry is invalid: {error}"))?,
+                .map_err(|error| format!("workspace registry {} is invalid: {error}", path.display()))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => RegistryFile::default(),
             Err(error) => {
                 return Err(format!("failed to read workspace registry {}: {error}", path.display()));

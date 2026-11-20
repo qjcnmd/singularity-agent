@@ -75,15 +75,16 @@ impl ServerConfig {
                 }
             }
             McpTransportConfig::Http { url, headers } => {
-                let parsed =
-                    reqwest::Url::parse(url).map_err(|_| "MCP 地址必须是有效的 HTTP 或 HTTPS URL。")?;
+                let parsed = reqwest::Url::parse(url)
+                    .map_err(|error| format!("MCP 服务器 {id} 地址无效（{url}）：{error}"))?;
                 if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-                    return Err("MCP 地址必须是有效的 HTTP 或 HTTPS URL。".into());
+                    return Err(format!("MCP 服务器 {id} 地址必须是有效的 HTTP 或 HTTPS URL：{url}"));
                 }
                 for (key, value) in headers {
                     reqwest::header::HeaderName::from_bytes(key.as_bytes())
-                        .map_err(|_| "MCP 请求头名称无效。")?;
-                    reqwest::header::HeaderValue::from_str(value).map_err(|_| "MCP 请求头值无效。")?;
+                        .map_err(|error| format!("MCP 服务器 {id} 请求头名称无效（{key}）：{error}"))?;
+                    reqwest::header::HeaderValue::from_str(value)
+                        .map_err(|error| format!("MCP 服务器 {id} 请求头值无效（{key}）：{error}"))?;
                 }
             }
         }
@@ -92,23 +93,41 @@ impl ServerConfig {
 
     /// 网络错误、服务器 stderr 和服务端报错可能带有密钥，返回或打印前把配置中的敏感值替换掉。
     pub fn redact(&self, mut error: String) -> String {
-        let mut values: Vec<&str> = match &self.transport {
+        use std::borrow::Cow;
+
+        let mut values: Vec<Cow<'_, str>> = match &self.transport {
             McpTransportConfig::Stdio { env, .. } => env
                 .iter()
                 .filter(|(name, _)| is_secret_name(name))
-                .map(|(_, value)| value.as_str())
+                .map(|(_, value)| Cow::Borrowed(value.as_str()))
                 .collect(),
             McpTransportConfig::Http { url, headers } => {
-                let mut values = vec![url.as_str()];
+                let mut values: Vec<Cow<'_, str>> = Vec::new();
+                if let Ok(parsed) = reqwest::Url::parse(url) {
+                    if let Some(password) = parsed.password() {
+                        values.push(Cow::Owned(password.to_owned()));
+                        if !parsed.username().is_empty() {
+                            values.push(Cow::Owned(parsed.username().to_owned()));
+                        }
+                    }
+                    if let Some(query) = parsed.query() {
+                        values.push(Cow::Owned(query.to_owned()));
+                    }
+                } else {
+                    values.push(Cow::Borrowed(url.as_str()));
+                }
                 values.extend(
-                    headers.iter().filter(|(name, _)| is_secret_name(name)).map(|(_, value)| value.as_str()),
+                    headers
+                        .iter()
+                        .filter(|(name, _)| is_secret_name(name))
+                        .map(|(_, value)| Cow::Borrowed(value.as_str())),
                 );
                 for (name, value) in headers {
                     // 服务端错误可能只回显认证值，没有 Bearer / Basic 前缀。
                     if name.eq_ignore_ascii_case("authorization")
                         && let Some((_, credential)) = value.split_once(' ')
                     {
-                        values.push(credential.trim());
+                        values.push(Cow::Borrowed(credential.trim()));
                     }
                 }
                 values
@@ -118,7 +137,7 @@ impl ServerConfig {
         values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
         for value in values {
             if !value.is_empty() {
-                error = error.replace(value, "[redacted]");
+                error = error.replace(value.as_ref(), "[redacted]");
             }
         }
         error

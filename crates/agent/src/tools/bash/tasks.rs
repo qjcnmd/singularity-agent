@@ -362,12 +362,12 @@ impl BashTasks {
                         .enqueue(crate::agent::QueuedInput::background(task.task_id.clone()));
                 }
                 *entry.task.lock().expect("bash task lock") = task.clone();
-                (self.on_update)(BashTaskUpdate::Updated(task));
                 let finished = completion.is_ok();
                 entry.done.send_replace(Some(completion));
                 if finished {
                     self.entries.lock().expect("bash task entries lock").remove(&task_id);
                 }
+                (self.on_update)(BashTaskUpdate::Updated(task));
             }
             Err(error) => {
                 let error = error.to_string();

@@ -14,7 +14,7 @@ pub struct Workspace {
     pub root: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadSummary {
@@ -76,7 +76,7 @@ pub struct SessionFailure {
 }
 
 /// 项目列表恢复任务状态所需的当前阶段和未保存错误。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStatus {
@@ -85,7 +85,7 @@ pub struct SessionStatus {
 }
 
 /// 已接受、还没保存的用户消息；保存后条目 ID 不变。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PendingUserMessage {
@@ -106,7 +106,7 @@ pub struct ModelSelection {
 }
 
 /// 会话当前运行阶段、待处理输入与上下文用量。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntime {
@@ -119,7 +119,7 @@ pub struct SessionRuntime {
 }
 
 /// 最近一次生成请求的实际输入用量，以及执行时采用的窗口大小。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ContextUsage {
@@ -136,9 +136,6 @@ pub struct ModelConfigurationInput {
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning_variants: Option<Vec<String>>,
-    pub thinking_wire_format: Option<String>,
-    /// Chat 请求里表示最大输出 Token 的字段名；`None` 表示发送 `max_tokens`。
-    pub chat_output_tokens_field: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -167,7 +164,7 @@ pub struct RedactedModelCatalog {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApiProtocol {
-    Chat,
+    Messages,
     Responses,
 }
 
@@ -182,7 +179,7 @@ pub struct ProviderConfigurationInput {
     pub models: Vec<ModelConfigurationInput>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct AppBootstrap {
@@ -232,24 +229,21 @@ pub enum RpcResponse {
 /// 推送给工作台的事件；序列化时与外层的事件序号合并成一个对象。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum StreamEvent {
     Ready,
     AppChanged {
         payload: AppBootstrap,
     },
     SessionChanged {
-        #[serde(rename = "sessionId")]
         session_id: String,
         payload: SessionRuntime,
     },
     TurnEvent {
-        #[serde(rename = "sessionId")]
         session_id: String,
         payload: Box<TurnEventEnvelope>,
     },
     SessionSettled {
-        #[serde(rename = "sessionId")]
         session_id: String,
         payload: SessionRuntime,
         summary: ThreadSummary,
@@ -258,7 +252,6 @@ pub enum StreamEvent {
         summary: ThreadSummary,
     },
     BackgroundTaskUpdated {
-        #[serde(rename = "sessionId")]
         session_id: String,
         payload: Box<crate::BackgroundTaskUpdate>,
     },
@@ -277,7 +270,7 @@ pub struct StreamEnvelope {
 }
 
 /// 首次发送的结果：输入已接受，工作台按返回的任务 ID 打开任务。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStartResult {
@@ -287,7 +280,7 @@ pub struct SessionStartResult {
 }
 
 /// 保存或删除提供方后的模型目录及最新事件序号，前端据此忽略更早的旧列表。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCatalogResult {

@@ -22,7 +22,9 @@ pub(crate) fn convert(result: CallToolResult) -> McpToolResult {
             ContentBlock::Resource(content) => match content.resource {
                 ResourceContents::TextResourceContents { text: content, .. } => text.push(content),
                 ResourceContents::BlobResourceContents { uri, mime_type, blob, .. } => match mime_type {
-                    Some(mime) if mime.starts_with("image/") => {
+                    Some(mime)
+                        if mime.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/")) =>
+                    {
                         images.push(blob);
                     }
                     mime => {

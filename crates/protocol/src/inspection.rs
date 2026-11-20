@@ -3,7 +3,7 @@
 use serde::Serialize;
 
 /// 输入框里的技能候选；选中时只插入名称，路径由 Agent 消费输入时解析。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SkillMetadata {
@@ -14,7 +14,7 @@ pub struct SkillMetadata {
 }
 
 /// 一份文本文件的路径和内容：技能入口或 AGENTS.md。文件不存在时内容为空。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct TextDocument {
@@ -22,21 +22,21 @@ pub struct TextDocument {
     pub content: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SkillCatalog {
     pub skills: Vec<SkillMetadata>,
     pub diagnostics: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct DirectoryPickResult {
     pub path: Option<String>,
 }
 
 /// 本轮请求实际加载的各上下文模块，供工作台查看上下文。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct InjectedContext {
@@ -44,7 +44,7 @@ pub struct InjectedContext {
 }
 
 /// 新建任务页上的一个上下文胶囊：一类指令、一组工具、Skills 或一个 MCP 服务器。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ContextModule {
@@ -61,7 +61,7 @@ pub struct ContextModule {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ContextGroup {

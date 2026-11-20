@@ -38,6 +38,7 @@ export function acceptExecutionEvent(facts: ThreadTurn[], event: TurnEventEnvelo
   if (event.method === 'turn/started' && index < 0) {
     return [...facts, { turnId: id, status: 'running', startedAt: event.params.startedAt, manuallyStopped: false, items: [] }]
   }
+  if (index < 0) return facts
   let turn = facts[index]
   switch (event.method) {
     case 'turn/started': turn = { ...turn, status: 'running', startedAt: event.params.startedAt }; break
@@ -63,8 +64,8 @@ export function acceptExecutionEvent(facts: ThreadTurn[], event: TurnEventEnvelo
       turn = upsert(turn, { ...tool, result, status: event.method === 'tool/output' ? 'running' : result.isError ? 'failed' : 'completed' })
       break
     }
-    case 'turn/error': turn = { ...finishTurn(turn, 'failed'), error: event.params.error, finishedAt: event.params.finishedAt }; break
-    case 'turn/completed': turn = { ...finishTurn(turn, event.params.turn.status, event.params.manuallyStopped), finishedAt: event.params.finishedAt }; break
+    case 'turn/error': turn = { ...finishTurn(turn, 'failed'), error: event.params.error, finishedAt: event.params.finishedAt, stats: event.params.stats }; break
+    case 'turn/completed': turn = { ...finishTurn(turn, event.params.turn.status, event.params.manuallyStopped), finishedAt: event.params.finishedAt, stats: event.params.stats }; break
     default: event satisfies never
   }
   const next = [...facts]

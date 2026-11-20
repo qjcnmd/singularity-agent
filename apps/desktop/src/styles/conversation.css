@@ -4,25 +4,45 @@
 .conversation-document { container-type: inline-size; max-width: 800px; width: 100%; min-height: 100%; margin: 0 auto; padding: 70px 30px calc(var(--composer-height, 150px) + 12px); display: flex; flex-direction: column; }
 .timeline-item { min-width: 0; }
 .message-item { display: grid; justify-items: start; align-self: flex-start; max-width: min(88%, 680px); margin-top: 10px; }
-.message-bubble { min-width: 0; max-width: 100%; padding: 10px 16px; border-radius: 18px; background: var(--assistant-bubble-bg); color: var(--message-ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; font-size: var(--message-font-size); font-weight: 430; line-height: 1.65; overflow-wrap: anywhere; transition: background-color 350ms, color 350ms; }
+.timeline-assistant { max-width: 100%; width: 100%; }
+.message-bubble { min-width: 0; max-width: 100%; padding: 10px 16px; border-radius: 18px; background: var(--assistant-bubble-bg); color: var(--message-ink); font-family: var(--font-sans); font-size: var(--message-font-size); font-weight: 400; line-height: 1.65; overflow-wrap: anywhere; transition: background-color 350ms, color 350ms; }
+.timeline-assistant > .message-bubble:not(.error-bubble):not(.typing-bubble) { background: transparent; padding: 4px 2px; border-radius: 0; width: 100%; }
 .terminal-interruption { margin-top: 0; }
 .timeline-user { align-self: flex-end; justify-items: end; max-width: min(72%, 540px); }
 .timeline-user .message-bubble { color: var(--user-bubble-ink); background: var(--user-bubble-bg); }
 .message-body { font-size: var(--message-font-size); line-height: 1.65; color: inherit; }
-/* 出错的气泡沿用默认浅灰底和正文色，只靠左侧红色图标提示，不整块染红。 */
-.message-bubble.error-bubble { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; background: var(--bubble-fill); color: var(--message-ink); }
+.message-bubble.error-bubble { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; background: var(--danger-soft); color: var(--danger-ink); border: 1px solid color-mix(in srgb, var(--danger) 20%, transparent); }
 .error-bubble > :not(.error-icon) { grid-column: 2; }
 .error-icon { margin-top: .32em; color: var(--danger); }
 .msg-time { color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
 .timeline-user .msg-time { margin: 0 6px 3px 0; }
 .turn-duration { display: inline-flex; gap: 10px; margin: 10px 0 0; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
-.turn-stats { margin: 4px 0 0; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
-/* 思考与工具行平时没有底色，左移 8px 让图标对齐气泡左缘；展开后整块用助手气泡底色。连续几行之间只留 2px。 */
+.turn-stats { align-self: flex-start; margin: 4px 0 0; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
+/* 连续非文本步骤（思考、工具、轮换）统一收入一张可折叠白卡，新步骤向下平滑生长。 */
+.activity-card { width: min(680px, 100%); margin-top: 10px; border-radius: 16px; background: var(--card); border: 1px solid var(--line-strong); box-shadow: 0 1px 2px rgb(0 0 0 / 3.5%), 0 6px 20px -12px rgb(0 0 0 / 10%); overflow: hidden; }
+[data-theme=dark] .activity-card { border-color: var(--line); box-shadow: 0 2px 10px -3px rgb(0 0 0 / 45%); }
+.activity-card-header { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 36px; padding: 6px 12px; border: 0; background: color-mix(in srgb, var(--ink) 2.2%, transparent); color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.5; text-align: left; cursor: pointer; transition: background 120ms; }
+.activity-card-header:hover { background: color-mix(in srgb, var(--ink) 4.8%, transparent); }
+.activity-card-header.is-static { cursor: default; border-bottom: 1px solid var(--line); }
+.activity-card-header.is-static:hover { background: color-mix(in srgb, var(--ink) 2.2%, transparent); }
+.activity-card-header.is-header-only { border-bottom: 0; }
+.activity-card-header[aria-expanded=true] { border-bottom: 1px solid var(--line); }
+.activity-card-title { flex: 1; min-width: 0; font-weight: 500; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity-card-meta { flex: none; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
+.activity-card-body { display: grid; gap: 1px; padding: 4px; }
+.activity-card-row { overflow: clip; }
+.activity-status-row { display: flex; align-items: flex-start; gap: 8px; min-height: 32px; padding: 6px 9px; border-radius: 10px; font-size: var(--block-font-size); line-height: 1.55; color: var(--ink-soft); }
+.activity-status-row > svg { flex: none; margin-top: 3px; }
+.activity-status-row.is-error { background: color-mix(in srgb, var(--danger-soft) 72%, transparent); color: var(--danger-ink); }
+.activity-error-text { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.activity-row-time { flex: none; margin-left: auto; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
+.activity-card .content-disclosure > div { opacity: 0; transition: opacity 160ms ease; }
+.activity-card .content-disclosure.is-open > div { opacity: 1; transition: opacity 200ms ease 40ms; }
+/* 独立活动行（中断提示、后台面板）沿用无底色行样式；卡片内步骤满宽展开，避免宽度跳变。 */
 .activity-step, .reasoning-row { display: grid; width: fit-content; max-width: min(640px, 100%); margin: 10px 0 0 -8px; border-radius: 12px; overflow: hidden; transition: background var(--disclosure-duration) var(--smooth), width var(--disclosure-duration) var(--smooth); }
 .activity-step:has(> .activity-toggle[aria-expanded=true]) { background: var(--assistant-bubble-bg); width: 640px; }
 .timeline-item:is(.activity-step, .tool-group) + .timeline-item:is(.activity-step, .tool-group), .tool-group-items > .activity-step:first-child { margin-top: 2px; }
 .message-item > .activity-step { margin-left: 0; }
-/* 正文按展开后的宽度排版，避免宽度过渡中换行导致高度反复改变。 */
 .activity-step > .content-disclosure { contain: inline-size; }
 .activity-step > .content-disclosure > div > .activity-expanded { width: min(640px, calc(100cqw - 4px)); }
 .activity-toggle { display: flex; align-items: center; gap: 7px; min-width: 0; width: 100%; min-height: 28px; padding: 0 8px; border: 0; border-radius: 8px; background: none; transition: background 120ms; color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.6; text-align: left; cursor: pointer; }
@@ -31,13 +51,30 @@ button.activity-toggle:not([aria-disabled=true]):hover { background: var(--soft-
 .tool-group { margin: 10px 0 0 -8px; min-width: 0; max-width: 100%; }
 .tool-group-toggle { width: fit-content; max-width: calc(100% - 24px); flex-wrap: wrap; height: auto; }
 .tool-group-items { display: grid; padding-left: 12px; }
+.activity-card :is(.activity-step, .reasoning-row, .tool-group) { width: 100%; max-width: 100%; margin: 0; border-radius: 0; background: transparent; }
+.activity-card .activity-step:has(> .activity-toggle[aria-expanded=true]) { width: 100%; background: transparent; }
+.activity-card .activity-step > .content-disclosure { contain: none; }
+.activity-card .activity-step > .content-disclosure > div > .activity-expanded { width: 100%; }
+.activity-card .activity-toggle { min-height: 32px; padding: 5px 9px; border-radius: 10px; }
+.activity-card .tool-group-toggle { width: 100%; max-width: 100%; }
+.activity-card .tool-group-items { padding-left: 14px; gap: 1px; }
+.activity-card .activity-expanded { padding: 2px 9px 8px 30px; }
+.activity-card .activity-output { background: var(--fill-subtle); border: 1px solid var(--line); }
 .step-label { display: inline-flex; align-items: center; flex: none; gap: 7px; }
 .step-title { flex: none; font-weight: 500; color: var(--ink); }
 .step-icon { display: inline-flex; flex: none; }
 .step-summary { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.activity-toggle > svg { flex: none; }
+.activity-toggle > svg, .activity-card-header > svg { flex: none; }
 /* 转圈和中文并排时，圆的视觉中心比文字略高，往下挪 1px；translate 不影响旋转动画。 */
-.activity-toggle > .spinner { translate: 0 1px; }
+.activity-toggle > .spinner, .step-spinner { translate: 0 .5px; }
+.step-spinner { width: 14px; height: 14px; color: var(--accent); }
+.step-tick { flex: none; overflow: visible; }
+.step-tick-ring { fill: none; stroke: var(--positive); stroke-width: 1.45; transform-origin: 8px 8px; }
+.step-tick-check { fill: none; stroke: var(--positive); stroke-width: 1.65; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 10; stroke-dashoffset: 0; }
+.step-tick.is-fresh .step-tick-ring { animation: step-ring-pop var(--spring-dur) var(--spring) both; }
+.step-tick.is-fresh .step-tick-check { stroke-dashoffset: 10; animation: step-tick-draw 260ms cubic-bezier(.22, 1, .36, 1) 70ms forwards; }
+@keyframes step-ring-pop { 0% { transform: scale(.65); opacity: .35; } 100% { transform: scale(1); opacity: 1; } }
+@keyframes step-tick-draw { to { stroke-dashoffset: 0; } }
 .reasoning-row.is-streaming { width: 640px; }
 .reasoning-summary { transition: opacity var(--disclosure-duration) var(--smooth); }
 .activity-toggle[aria-expanded=true] > .reasoning-summary { opacity: 0; }
@@ -54,13 +91,17 @@ button.activity-toggle:not([aria-disabled=true]):hover { background: var(--soft-
 .return-to-latest { position: absolute; left: calc(50% - var(--panel-space) / 2); bottom: calc(var(--composer-height, 150px) + 8px); z-index: 3; width: 36px; height: 36px; margin-left: -18px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 50%; background: color-mix(in srgb, var(--glass-base) 92%, transparent); box-shadow: var(--shadow-soft); color: var(--ink-soft); cursor: pointer; backdrop-filter: blur(10px); }
 .stream-char { animation: stream-in ease-out both; }
 @keyframes stream-in { from { opacity: 0; } }
-.typing-bubble { display: flex; gap: 5px; padding: 13px 16px; }
-@media (prefers-reduced-motion: reduce) { .stream-char, .activity-shimmer { animation: none; } }
-.action-toast { position: absolute; bottom: calc(var(--composer-height, 150px) + 8px); left: 50%; transform: translateX(-50%); z-index: 25; max-width: min(480px, 90%); padding: 9px 15px; border-radius: 14px; background: rgb(196 41 31 / 94%); color: #fff; font-size: 13px; pointer-events: none; }
+.typing-bubble { display: flex; align-items: center; gap: 5px; background: transparent; padding: 6px 2px; border-radius: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .stream-char, .activity-shimmer { animation: none; }
+  .step-tick.is-fresh .step-tick-ring, .step-tick.is-fresh .step-tick-check { animation: none; stroke-dashoffset: 0; }
+  .activity-card .content-disclosure > div { transition: none; }
+}
+.action-toast { position: absolute; bottom: calc(var(--composer-height, 0px) + 54px); left: calc(50% - var(--panel-space, 0px) / 2); transform: translateX(-50%); z-index: 25; max-width: min(480px, 90%); padding: 9px 15px; border-radius: 14px; background: rgb(196 41 31 / 94%); color: #fff; font-size: 13px; pointer-events: none; }
 .timeline-body {
   min-width: 0;
   overflow-wrap: anywhere;
-  color: var(--ink);
+  color: inherit;
   user-select: text;
 }
 /* 用 :where() 归零默认外边距，让相邻块（段落、列表、代码块）的统一间距规则生效。 */
@@ -93,9 +134,9 @@ button.activity-toggle:not([aria-disabled=true]):hover { background: var(--soft-
   max-width: 100%;
   overflow-x: auto;
   padding: 10px 12px;
-  border: 0;
+  border: 1px solid var(--line);
   border-radius: 10px;
-  background: var(--inset);
+  background: var(--fill-subtle);
   color: var(--ink);
 }
 
@@ -138,13 +179,31 @@ button.activity-toggle:not([aria-disabled=true]):hover { background: var(--soft-
 }
 .empty-state .secondary-button { margin-top: 14px; }
 
-.code-block { margin: 10px 0; border-radius: 10px; overflow: hidden; background: var(--inset); border: 0; }
+.code-block { margin: 10px 0; border-radius: 10px; overflow: hidden; background: var(--fill-subtle); border: 1px solid var(--line); }
 .code-block-header { display: flex; align-items: center; justify-content: space-between; padding: 6px 6px 0 12px; color: var(--ink-faint); font-size: var(--meta-font-size); }
 /* Mermaid 图：居中显示，图比气泡宽时在图内横向滚动；右上角是菜单和放大按钮 */
-.mermaid-block { position: relative; margin: 8px -6px 2px; border-radius: 14px; background: var(--card); }
+.mermaid-block, .diagram-viewer {
+  --diagram-fill: var(--diagram-fill-light);
+  --diagram-border: var(--diagram-border-light);
+  --diagram-text: var(--diagram-text-light);
+  --mermaid-line: #8e8e93;
+  --mermaid-ink: var(--ink);
+  --mermaid-ink-soft: var(--ink-soft);
+  --mermaid-edge-bg: var(--card);
+  --mermaid-cluster-bg: var(--fill-subtle);
+  --mermaid-cluster-border: var(--line-strong);
+}
+[data-theme=dark] .mermaid-block, [data-theme=dark] .diagram-viewer {
+  --diagram-fill: var(--diagram-fill-dark);
+  --diagram-border: var(--diagram-border-dark);
+  --diagram-text: var(--diagram-text-dark);
+  --mermaid-line: #98989d;
+}
+.mermaid-block { position: relative; margin: 10px 0 4px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
 .mermaid-tools { position: absolute; top: 6px; right: 6px; z-index: 1; display: flex; gap: 2px; color: var(--ink-faint); }
 .mermaid-diagram { padding: 40px 16px 20px; overflow-x: auto; cursor: zoom-in; outline: none; border-radius: 14px; }
-.mermaid-diagram:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }.diagram-viewer { width: min(1100px, 80vw); }
+.mermaid-diagram:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+.diagram-viewer { width: min(1100px, 80vw); }
 .diagram-viewer-close { position: absolute; top: 12px; right: 12px; z-index: 1; }
 .diagram-viewer-stage { position: relative; flex: none; overflow: hidden; cursor: grab; touch-action: none; user-select: none; }
 .diagram-viewer-stage:active { cursor: grabbing; }
@@ -153,9 +212,9 @@ button.activity-toggle:not([aria-disabled=true]):hover { background: var(--soft-
 .mermaid-stage { position: fixed; left: 0; top: 0; visibility: hidden; pointer-events: none; }
 .message-item:has(.mermaid-diagram), .message-item:has(.mermaid-diagram) > .message-bubble { width: 100%; }
 .mermaid-diagram svg { display: block; height: auto; min-width: var(--diagram-min-width); margin: 0 auto; }
-.code-block pre { margin: 0; padding: 4px 12px 11px; overflow-x: auto; font: var(--block-font-size)/1.6 var(--font-mono); background: transparent; }
+.code-block pre { margin: 0; padding: 4px 12px 11px; overflow-x: auto; font: var(--block-font-size)/1.6 var(--font-mono); background: transparent; border: 0; border-radius: 0; }
 .code-block code { background: none; padding: 0; font-size: inherit; }
-.activity-output { overflow: auto; font-family: var(--font-sans); font-size: var(--block-font-size); line-height: 1.65; overscroll-behavior: contain; max-height: 260px; border-radius: 8px; background: var(--inset); border: 0; }
+.activity-output { overflow: auto; font-family: var(--font-sans); font-size: var(--block-font-size); line-height: 1.65; color: var(--ink); overscroll-behavior: contain; max-height: 260px; border-radius: 8px; background: var(--inset); border: 0; }
 .tool-duration { margin: 0 0 6px 2px; color: var(--ink-faint); line-height: 1.6; font-variant-numeric: tabular-nums; font-size: var(--meta-font-size); }
 .command-output-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 10px 0 14px; color: var(--ink-faint); font: var(--block-font-size) var(--font-sans); }
 .command-output pre { white-space: pre; overflow: visible; }

@@ -165,6 +165,6 @@ impl Utf8Decoder {
 fn push_visible(output: &mut String, text: &str) {
     output.extend(
         text.chars()
-            .filter(|character| matches!(character, '\t' | '\n' | '\u{1b}') || (*character as u32) > 0x1f),
+            .filter(|character| matches!(character, '\t' | '\n' | '\u{1b}') || !character.is_control()),
     );
 }

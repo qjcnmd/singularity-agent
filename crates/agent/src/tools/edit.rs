@@ -16,6 +16,70 @@ use super::registry::{
 static FILE_EDITS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// 规范化目标路径的锁键：文件已存在时直接规范化，否则规范化最近已存在的祖先目录再拼回后缀，
+/// 确保 `edit` 与 `write` 对同一目标（含新建文件）共用同一把进程级路径锁。
+pub(super) fn file_lock_key(path: &Path) -> std::io::Result<String> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Ok(singularity_core::workspace_key(&canonical));
+    }
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(canonical) = cursor.canonicalize() {
+            let mut full = canonical;
+            for component in missing.into_iter().rev() {
+                full.push(component);
+            }
+            return Ok(singularity_core::workspace_key(&full));
+        }
+        let Some(name) = cursor.file_name() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("cannot resolve parent directory for {}", path.display()),
+            ));
+        };
+        missing.push(name.to_os_string());
+        cursor = cursor.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("cannot resolve parent directory for {}", path.display()),
+            )
+        })?;
+    }
+}
+
+/// 在进程级单文件路径锁下执行阻塞文件修改；等待锁期间可响应取消，持锁写入期间必须等落盘完成。
+pub(super) async fn with_file_lock<F>(key: String, signal: CancellationToken, work: F) -> ToolExecution
+where
+    F: FnOnce(&CancellationToken) -> Result<ToolExecution, String> + Send + 'static,
+{
+    let lock = {
+        let mut files = FILE_EDITS.lock().expect("file edit registry lock poisoned");
+        let lock = files.get(&key).and_then(Weak::upgrade).unwrap_or_default();
+        files.insert(key, Arc::downgrade(&lock));
+        lock
+    };
+    let result = tokio::select! {
+        biased;
+        _ = signal.cancelled() => error_result(ABORTED_MESSAGE),
+        guard = Arc::clone(&lock).lock_owned() => {
+            // 工作线程持有锁直到写入结束，停止不能提前放行下一个编辑。
+            tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                work(&signal).unwrap_or_else(error_result)
+            })
+            .await
+            .expect("tool worker completes while the runtime is running")
+        }
+    };
+    drop(lock);
+    FILE_EDITS
+        .lock()
+        .expect("file edit registry lock poisoned")
+        .retain(|_, lock| lock.strong_count() > 0);
+    result
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EditArgs {
@@ -73,30 +137,7 @@ pub(crate) async fn execute(args: EditArgs, cwd: PathBuf, signal: CancellationTo
         Err(error) => return error_result(format!("Could not edit {}: {error}", args.path)),
     };
     let key = singularity_core::workspace_key(&target);
-    let lock = {
-        let mut files = FILE_EDITS.lock().expect("file edit registry lock poisoned");
-        let lock = files.get(&key).and_then(Weak::upgrade).unwrap_or_default();
-        files.insert(key, Arc::downgrade(&lock));
-        lock
-    };
-    let result = tokio::select! {
-        biased;
-        _ = signal.cancelled() => error_result(ABORTED_MESSAGE),
-        guard = Arc::clone(&lock).lock_owned() => {
-            // 工作线程持有锁直到写入结束，停止不能提前放行下一个编辑。
-            tokio::task::spawn_blocking(move || {
-                let _guard = guard;
-                execute_locked(&args, &target, &signal)
-                    .unwrap_or_else(error_result)
-            }).await.expect("tool worker completes while the runtime is running")
-        }
-    };
-    drop(lock);
-    FILE_EDITS
-        .lock()
-        .expect("file edit registry lock poisoned")
-        .retain(|_, lock| lock.strong_count() > 0);
-    result
+    with_file_lock(key, signal, move |signal| execute_locked(&args, &target, signal)).await
 }
 
 fn execute_locked(
@@ -178,12 +219,13 @@ fn execute_locked(
     // 提交开始后报告真实写入结果，不能把已完成的修改改报为取消。
     singularity_core::write_bytes_atomic(target, updated.as_bytes())
         .map_err(|error| format!("Could not write {}: {error}", args.path))?;
-    Ok(edit_result(&args.path, &view, &updated))
+    Ok(format_diff_result("Edited", &args.path, &view, &updated))
 }
 
-fn edit_result(path: &str, before: &str, after: &str) -> ToolExecution {
+pub(super) fn format_diff_result(verb: &str, path: &str, before: &str, after: &str) -> ToolExecution {
+    let before = before.strip_prefix('\u{feff}').unwrap_or(before).replace("\r\n", "\n");
     let after = after.strip_prefix('\u{feff}').unwrap_or(after).replace("\r\n", "\n");
-    let diff = TextDiff::from_lines(before, &after);
+    let diff = TextDiff::from_lines(&before, &after);
     let (mut added, mut deleted) = (0, 0);
     for change in diff.iter_all_changes() {
         match change.tag() {
@@ -202,7 +244,7 @@ fn edit_result(path: &str, before: &str, after: &str) -> ToolExecution {
         output.push_str(line);
         output.push('\n');
     }
-    let mut execution = ToolExecution::text(format!("Edited {path}.\n{output}"));
+    let mut execution = ToolExecution::text(format!("{verb} {path}.\n{output}"));
     execution.display = Some(Box::new(ToolDisplay { output, background_task_id: None }));
     execution
 }

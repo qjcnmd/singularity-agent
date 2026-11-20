@@ -1,8 +1,5 @@
 import { useEffect, useRef, useState, type RefObject } from 'react'
 
-/** “滑动”切换效果用的选中背景：一个垫在整列选项下面的色块，滑到带 data-selected 的那一项。
- * 色块在所有选项下层，滑过时不会盖住文字，也不会被单个选项裁切。
- * 列表里没有选中项时淡出；从无到有时直接出现在目标位置再淡入，不从别处滑过来。 */
 export function SelectionSlider({ container, activeKey }: { container: RefObject<HTMLElement | null>; activeKey: string | null }) {
   const [box, setBox] = useState<{ top: number; height: number; visible: boolean; animate: boolean }>({ top: 0, height: 0, visible: false, animate: false })
   const wasVisible = useRef(false)
@@ -11,16 +8,24 @@ export function SelectionSlider({ container, activeKey }: { container: RefObject
     if (!root) return
     const measure = () => {
       const target = root.querySelector<HTMLElement>(':scope > [data-selected="true"]')
-      if (!target) { wasVisible.current = false; setBox(current => ({ ...current, visible: false })); return }
+      if (!target) {
+        wasVisible.current = false
+        setBox(current => current.visible ? { ...current, visible: false } : current)
+        return
+      }
       const top = target.getBoundingClientRect().top - root.getBoundingClientRect().top
-      setBox({ top, height: target.offsetHeight, visible: true, animate: wasVisible.current })
+      const height = target.offsetHeight
+      const animate = wasVisible.current
       wasVisible.current = true
+      setBox(current => current.top === top && current.height === height && current.visible && current.animate === animate
+        ? current
+        : { top, height, visible: true, animate })
     }
     measure()
     const observer = new ResizeObserver(measure)
     observer.observe(root)
     const rows = new MutationObserver(measure)
-    rows.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-selected'] })
+    rows.observe(root, { childList: true, attributes: true, attributeFilter: ['data-selected'] })
     return () => { observer.disconnect(); rows.disconnect() }
   }, [container, activeKey])
   return <span className="selection-slider" aria-hidden="true" style={{

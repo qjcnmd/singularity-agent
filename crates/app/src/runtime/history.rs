@@ -2,7 +2,9 @@
 //! 历史只包含用户能看到的消息、思考、工具和轮换内容，不带原始日志行或
 //! 提供方私有字段；任务摘要直接读取最近回合的状态，完整历史才划分全部回合。
 
-use singularity_agent::session::{LedgerRecord, SessionData, SessionEntry, SessionError, SessionMetadata};
+use singularity_agent::session::{
+    LedgerRecord, MessageDisplay, SessionData, SessionEntry, SessionError, SessionMetadata,
+};
 use singularity_model::{ContentBlock, Message};
 use singularity_protocol::{
     HistoryItem, SessionModelUsage, ThreadHistory, ThreadSummary, ThreadTurn, ToolStatus, TurnStatus,
@@ -36,7 +38,14 @@ impl IndexedTurn {
                 accumulate_request_usage(usage, observation);
             }
             match entry {
-                SessionEntry::Message { message, id, observation, timestamp, .. } => match message {
+                SessionEntry::Message {
+                    message,
+                    id,
+                    observation,
+                    display,
+                    timestamp,
+                    ..
+                } => match message {
                     Message::Developer { .. } | Message::Notification { .. } => {}
                     Message::User { .. } | Message::Assistant { .. } => {
                         let mut calls = message.tool_calls();
@@ -57,6 +66,7 @@ impl IndexedTurn {
                         };
                         let mut public = singularity_agent::message::public_items(
                             message,
+                            display.as_ref(),
                             id,
                             status,
                             ToolStatus::Interrupted,
@@ -83,8 +93,9 @@ impl IndexedTurn {
                         let HistoryItem::Tool { result, status, .. } = &mut items[position] else {
                             unreachable!("tool positions contain calls");
                         };
-                        let displayed = singularity_agent::message::public_tool_result(message)
-                            .expect("matched a tool result message");
+                        let displayed =
+                            singularity_agent::message::public_tool_result(message, display.as_ref())
+                                .expect("matched a tool result message");
                         *status = if displayed.is_error {
                             ToolStatus::Failed
                         } else {
@@ -117,6 +128,7 @@ impl IndexedTurn {
             manually_stopped: self.manually_stopped,
             error: self.error.clone(),
             items,
+            stats: Some(usage.clone()),
         })
     }
 }
@@ -206,11 +218,13 @@ pub(crate) fn context_usage(
 
 /// 默认标题：把第一条用户消息里的连续空白合并成一个空格，取前 MAX_SESSION_TITLE_CHARS
 /// 个字符；没有文字时返回 None。
-fn default_title(message: &Message) -> Option<String> {
+fn default_title(message: &Message, display: Option<&MessageDisplay>) -> Option<String> {
     let mut title = String::new();
     let mut remaining = MAX_SESSION_TITLE_CHARS;
     let words = message.content().iter().enumerate().filter_map(|(index, block)| match block {
-        ContentBlock::Text { text, .. } => Some(message.text_for_display(index, text).split_whitespace()),
+        ContentBlock::Text { text, .. } => {
+            Some(singularity_agent::message::user_text_for_display(display, index, text).split_whitespace())
+        }
         ContentBlock::Thinking { .. } | ContentBlock::ToolCall(_) | ContentBlock::Image(_) => None,
     });
     for word in words.flatten() {
@@ -302,13 +316,13 @@ pub(crate) fn summarize_thread(session: &SessionData) -> ThreadSummary {
     }
     let title = title.or_else(|| {
         session.entries().iter().find_map(|entry| {
-            let SessionEntry::Message { message, .. } = entry else {
+            let SessionEntry::Message { message, display, .. } = entry else {
                 return None;
             };
             if !matches!(message, Message::User { .. }) {
                 return None;
             }
-            default_title(message)
+            default_title(message, display.as_ref())
         })
     });
     let created_at = session.created_at().to_string();

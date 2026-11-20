@@ -17,11 +17,9 @@ use self::state::{ConversationState, TurnLifecycle};
 
 use std::sync::{Arc, Mutex};
 
-use singularity_agent::agent::{QueuedInput, UserInput};
+use singularity_agent::agent::{AgentEvent, QueuedInput, UserInput};
 use singularity_agent::session::{SessionMetadata, SessionWriter, lock_writer};
-use singularity_protocol::SessionPhase;
-
-use singularity_protocol::TurnEvent;
+use singularity_protocol::{SessionPhase, TurnEvent};
 
 pub struct Conversation {
     pub(crate) thread_id: String,
@@ -62,6 +60,7 @@ impl Conversation {
         home: std::path::PathBuf,
         models: Arc<singularity_model::ModelConfigManager>,
         mcp: Arc<singularity_mcp::McpManager>,
+        initial_revision: u64,
         publish: Arc<dyn Fn(singularity_protocol::StreamEvent) -> u64 + Send + Sync>,
     ) -> Arc<Self> {
         let model = session
@@ -80,7 +79,7 @@ impl Conversation {
         let cwd = session.cwd_string();
         let disabled_modules = session.disabled_modules();
         let usage = crate::runtime::history::session_usage(session.entries());
-        let context_window = configured_context_window(&models, &model);
+        let context_window = models.context_window(&model);
         let writer = Arc::new(Mutex::new(session));
         let inbox = Arc::new(std::sync::Mutex::new(singularity_agent::agent::SteeringInbox::default()));
         Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
@@ -98,7 +97,7 @@ impl Conversation {
                 thread_id,
                 cwd,
                 disabled_modules,
-                view: Mutex::new(view::ConversationView::new(usage)),
+                view: Mutex::new(view::ConversationView::new(usage, initial_revision)),
                 publish,
                 changed: tokio::sync::Notify::new(),
                 home,
@@ -175,6 +174,7 @@ impl Conversation {
 
     /// 停止当前回合或轮换，清空尚未消费的输入。
     pub fn abort(&self) -> Result<(), ConversationError> {
+        let mut view = self.lock_view();
         let mut state = self.lock_state();
         let TurnLifecycle::Running(controls) = &state.turn else {
             return Err(ConversationError::Busy);
@@ -183,7 +183,7 @@ impl Conversation {
         state.steering_inbox.lock().expect("turn inbox lock poisoned").cancel();
         state.auto_resume = false;
         drop(state);
-        self.publish_changed(&mut self.lock_view());
+        self.publish_changed(&mut view);
         Ok(())
     }
 
@@ -228,22 +228,4 @@ impl Conversation {
     fn lock_state(&self) -> std::sync::MutexGuard<'_, ConversationState> {
         self.state.lock().expect("conversation state lock poisoned")
     }
-}
-
-/// 重新打开任务时还没有跑过回合，先用配置里的上下文窗口，让日志里已有的用量能直接显示；
-/// 之后每轮开始时改用该轮实际解析出的窗口。找不到模型时保持未知。
-fn configured_context_window(
-    models: &singularity_model::ModelConfigManager,
-    selection: &singularity_protocol::ModelSelection,
-) -> Option<u64> {
-    models
-        .redacted_catalog()
-        .providers
-        .into_iter()
-        .find(|provider| provider.provider_id == selection.provider)?
-        .models
-        .into_iter()
-        .find(|model| model.model_id == selection.model)?
-        .max_context_tokens
-        .map(u64::from)
 }

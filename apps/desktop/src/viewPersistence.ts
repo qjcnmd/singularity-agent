@@ -1,3 +1,4 @@
+import { defaultAccentColor, resolveAccentId } from './bubbleColors'
 import type { ViewportAnchor } from './protocol'
 
 export const defaultAnchor = (): ViewportAnchor => ({
@@ -15,9 +16,8 @@ const storageKey = 'singularity.app.view.v1'
 export interface PersistedView {
   theme: 'light' | 'dark'
   messageFontSize: number
-  /** 会话气泡配色，取调色盘颜色的 id（bubbleColors.ts）。 */
-  assistantBubble: string
-  userBubble: string
+  /** 全局强调色，取调色盘颜色 id（bubbleColors.ts）。 */
+  accentColor: string
   selectedWorkspaceRoot: string | null
   selectedSessionId: string | null
   sidebarWidth: number
@@ -32,8 +32,7 @@ export function loadPersisted(): PersistedView {
   const fallback: PersistedView = {
     theme: 'light',
     messageFontSize: messageFontSize.default,
-    assistantBubble: 'neutral',
-    userBubble: 'blue',
+    accentColor: defaultAccentColor,
     selectedWorkspaceRoot: null,
     selectedSessionId: null,
     sidebarWidth: 268,
@@ -44,17 +43,18 @@ export function loadPersisted(): PersistedView {
     viewportAnchors: {},
   }
   try {
-    const stored = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as PersistedView | null
-    // 新增的偏好在旧记录里没有，补上默认值。
-    return stored ? { ...fallback, ...stored } : fallback
+    const stored = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as (Partial<PersistedView> & { assistantBubble?: string }) | null
+    if (!stored) return fallback
+    const accentColor = resolveAccentId(stored.accentColor ?? stored.assistantBubble)
+    return { ...fallback, ...stored, accentColor }
   } catch {
     return fallback
   }
 }
 
 export function persistView(value: PersistedView): void {
-  const { theme, messageFontSize, assistantBubble, userBubble, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, viewportAnchors } = value
-  const view: PersistedView = { theme, messageFontSize, assistantBubble, userBubble, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, viewportAnchors }
+  const { theme, messageFontSize, accentColor, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, viewportAnchors } = value
+  const view: PersistedView = { theme, messageFontSize, accentColor, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, viewportAnchors }
   localStorage.setItem(storageKey, JSON.stringify(view))
 }
 

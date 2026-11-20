@@ -1,6 +1,6 @@
 //! 最多同时运行八个工具，完成一个就保存并补入下一个；提问等待其他工具结束。
 
-use super::{Agent, Result, TurnEvent};
+use super::{Agent, AgentEvent, Result, TurnEvent};
 use crate::message::tool_result_message;
 use crate::session::lock_writer;
 use crate::tools::{PreparedTool, ToolExecution, error_result};
@@ -18,7 +18,7 @@ impl Agent {
         assistant_result_entry_id: &str,
         length_truncated: bool,
         cancellation: &CancellationToken,
-        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
         let (cwd, output_directory) = {
             let writer = lock_writer(&self.requests.session);
@@ -49,7 +49,7 @@ impl Agent {
                     break;
                 }
                 let (item_id, call, tool) = pending.next().expect("pending tool exists");
-                on_event(TurnEvent::ItemUpdated {
+                on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
                     item: singularity_protocol::HistoryItem::Tool {
                         id: item_id.clone(),
                         name: call.tool_name,
@@ -57,7 +57,7 @@ impl Agent {
                         result: None,
                         status: singularity_protocol::ToolStatus::Running,
                     },
-                });
+                }));
                 let tool = if signal.is_cancelled() {
                     Err(error_result(crate::tools::ABORTED_MESSAGE))
                 } else {
@@ -120,14 +120,14 @@ impl Agent {
             }
             tokio::select! {
                 Some((item_id, partial_result)) = updates.recv() => {
-                    on_event(TurnEvent::ToolOutput { item_id, output: partial_result });
+                    on_event(AgentEvent::Turn(TurnEvent::ToolOutput { item_id, output: partial_result }));
                 }
                 completed = workers.join_next() => {
                     let (item_id, call_id, execution) = completed.expect("workers are running")
                         .expect("tool worker completes while the runtime is running");
                     // 完成前发出的进度先交付，防止旧进度覆盖已完成结果。
                     while let Ok((item_id, partial_result)) = updates.try_recv() {
-                        on_event(TurnEvent::ToolOutput { item_id, output: partial_result });
+                        on_event(AgentEvent::Turn(TurnEvent::ToolOutput { item_id, output: partial_result }));
                     }
                     if save_error.is_none()
                         && let Err(error) = self.finish_tool(item_id, call_id, execution, on_event).await
@@ -147,13 +147,13 @@ impl Agent {
         item_id: String,
         call_id: String,
         execution: ToolExecution,
-        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        let message = tool_result_message(&call_id, &execution);
-        let result =
-            crate::message::public_tool_result(&message).expect("tool execution produces a tool result");
-        self.append_message(&item_id, message, &execution.images).await?;
-        on_event(TurnEvent::ToolFinished { item_id, result });
+        let (message, display) = tool_result_message(&call_id, &execution);
+        let result = crate::message::public_tool_result(&message, display.as_ref())
+            .expect("tool execution produces a tool result");
+        self.append_message(&item_id, message, display, &execution.images).await?;
+        on_event(AgentEvent::Turn(TurnEvent::ToolFinished { item_id, result }));
         Ok(())
     }
 }

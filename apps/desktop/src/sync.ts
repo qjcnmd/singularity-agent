@@ -118,11 +118,17 @@ export function resetBaseline(state: SyncState, bootstrap: AppBootstrap): SyncSt
   bootstrap = accepted.bootstrap!
   const session = accepted.session
   const liveSessions: SyncState['liveSessions'] = Object.fromEntries(Object.entries(bootstrap.sessionStates)
-    .map(([id, status]) => [id, { revision: 0, ...status,
-      summaryRevision: state.liveSessions[id]?.summaryRevision,
-      backgroundTasks: state.liveSessions[id]?.backgroundTasks ?? [] }]))
+    .map(([id, status]) => {
+      const previous = state.liveSessions[id]
+      const keepLive = previous !== undefined && previous.revision > bootstrap.revision
+      return [id, {
+        ...(keepLive ? previous : { revision: 0, ...status }),
+        summaryRevision: (previous?.summaryRevision ?? 0) > bootstrap.revision ? previous?.summaryRevision : undefined,
+        backgroundTasks: previous?.backgroundTasks ?? [],
+      }]
+    }))
   for (const [id, live] of Object.entries(state.liveSessions)) {
-    if (live.revision > bootstrap.revision || (live.summaryRevision ?? 0) > bootstrap.revision) liveSessions[id] = live
+    if (live.revision > bootstrap.revision && !(id in liveSessions)) liveSessions[id] = live
   }
   return {
     revision: Math.max(state.revision, bootstrap.revision), modelCatalogRevision: Math.max(state.modelCatalogRevision, bootstrap.revision), bootstrap,
@@ -133,7 +139,7 @@ export function resetBaseline(state: SyncState, bootstrap: AppBootstrap): SyncSt
 export function acceptSessionRead(state: SyncState, source: SessionReadResult): SyncState {
   const id = source.history.summary.threadId
   const previous = state.liveSessions[id]
-  if (source.revision < Math.max(previous?.revision ?? 0, previous?.summaryRevision ?? 0)) return state
+  if (state.session !== null && source.revision < Math.max(previous?.revision ?? 0, previous?.summaryRevision ?? 0)) return state
   state = acceptSummary(state, source.history.summary, source.revision)
   const session = readExecution(source)
   return { ...state, session, liveSessions: { ...state.liveSessions, [id]: {

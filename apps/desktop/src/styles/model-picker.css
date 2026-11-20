@@ -2,32 +2,102 @@
 .sg-trigger:active { transform: scale(.96); transition-duration: 80ms; }
 .sg-triggerLabel { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent-ink); font-weight: 400; }
 .sg-triggerEffort { flex: none; color: var(--ink-soft); }
-.sg-groups { max-height: 240px; overflow-y: auto; }
-.sg-groupTitle { margin: 0; padding: 7px 9px 3px; color: var(--ink-faint); font-size: 12px; font-weight: 400; }
-.sg-option { display: flex; align-items: center; justify-content: space-between; width: 100%; min-height: 32px; padding: 5px 9px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; text-align: left; font-size: 14px; font-weight: 400; }
+.sg-groups { max-height: 244px; overflow-y: auto; }
+.sg-groupTitle { margin: 0; padding: 7px 10px 3px; color: var(--ink-faint); font-size: 11.5px; font-weight: 500; }
+.sg-option { display: flex; align-items: center; justify-content: space-between; width: 100%; min-height: 32px; padding: 5px 10px; border: 0; border-radius: 9px; background: transparent; cursor: pointer; text-align: left; font-size: 13.5px; font-weight: 400; transition: background 120ms; }
 .sg-option:hover, .sg-option:focus-visible { background: var(--surface-hover); outline: none; }
+.sg-option[aria-pressed="true"] { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .sg-option svg { color: var(--accent); }
-.effort { padding: 6px 8px 8px; }
-.effort-head { margin-bottom: 6px; text-align: center; font-size: 13px; font-weight: 400; transition: color 200ms; }
-.track { position: relative; height: 24px; margin: 4px 0; border-radius: 12px; background: var(--surface-muted); cursor: grab; touch-action: none; user-select: none; }
+
+.effort { padding: 8px 10px 10px; }
+.effort-head { margin-bottom: 8px; text-align: center; font-size: 13.5px; font-weight: 500; color: var(--ink); }
+.track { position: relative; height: 28px; margin: 2px 0; border-radius: 999px; background: var(--surface-muted); box-shadow: inset 0 0 0 1px rgb(0 0 0 / 5%); cursor: grab; touch-action: none; user-select: none; }
+[data-theme=dark] .track { box-shadow: inset 0 0 0 1px rgb(255 255 255 / 7%); }
 .track:active { cursor: grabbing; }
-/* 已选部分按档位着色，里面的闪点向左飘，像往右冲刺的尾气；位置和闪点都由 EffortSlider 逐帧驱动 */
-.track-fill { position: absolute; left: 0; top: 0; bottom: 0; overflow: hidden; border-radius: 12px; }
-.track-fill .spark { position: absolute; left: 0; top: 0; width: 3px; height: 3px; margin: -1.5px 0 0 -1.5px; border-radius: 50%; background: #fff; opacity: 0; pointer-events: none; }
-.track-thumb { position: absolute; top: 3px; width: 18px; height: 18px; margin-left: -9px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 .5px rgb(0 0 0 / 10%), 0 1px 2px rgb(0 0 0 / 16%); pointer-events: none; transition: box-shadow 160ms; }
-.track-thumb[data-pressed="true"] { box-shadow: 0 0 0 .5px rgb(0 0 0 / 12%), 0 1px 4px rgb(0 0 0 / 24%); }
+
+.track-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  overflow: hidden;
+  border-radius: 999px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 82%, #fff), var(--accent));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 26%), inset 0 -1px 0 rgb(0 0 0 / 8%);
+}
+
+.track-fill::before,
+.track-fill::after {
+  content: "";
+  position: absolute;
+  inset: -4px 0;
+  width: 200%;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.track-fill::before {
+  background: linear-gradient(
+    105deg,
+    transparent 0%,
+    rgb(255 255 255 / 12%) 18%,
+    rgb(255 255 255 / 28%) 34%,
+    transparent 52%,
+    rgb(255 255 255 / 14%) 74%,
+    transparent 100%
+  );
+  background-size: 50% 100%;
+  background-repeat: repeat-x;
+  animation: effort-water-flow 7.5s linear infinite;
+}
+
+.track-fill::after {
+  background: radial-gradient(60% 85% at 50% 20%, rgb(255 255 255 / 22%), transparent 72%);
+  background-size: 50% 100%;
+  background-repeat: repeat-x;
+  opacity: .75;
+  animation: effort-water-drift 11.5s linear infinite;
+}
+
+.model-popover:not(:popover-open) .track-fill::before,
+.model-popover:not(:popover-open) .track-fill::after {
+  animation-play-state: paused;
+}
+
+@keyframes effort-water-flow {
+  from { transform: translate3d(-50%, 0, 0); }
+  to { transform: translate3d(0%, 0, 0); }
+}
+
+@keyframes effort-water-drift {
+  from { transform: translate3d(0%, 2px, 0); }
+  to { transform: translate3d(-50%, -2px, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .track-fill::before,
+  .track-fill::after {
+    animation: none;
+  }
+}
+
+.track-stops { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+.track-stop { position: absolute; top: 50%; width: 5px; height: 5px; margin: -2.5px 0 0 -2.5px; border-radius: 50%; background: color-mix(in srgb, var(--ink) 26%, transparent); transition: background 140ms; }
+.track-stop[data-covered="true"] { background: rgb(255 255 255 / 56%); }
+
+.track-thumb { position: absolute; top: 2px; z-index: 3; width: 24px; height: 24px; margin-left: -12px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 .5px rgb(0 0 0 / 10%), 0 1px 3px rgb(0 0 0 / 20%); pointer-events: none; transition: box-shadow 160ms; }
+.track-thumb[data-pressed="true"] { box-shadow: 0 0 0 .5px rgb(0 0 0 / 14%), 0 2px 6px rgb(0 0 0 / 26%); }
 .track input { position: absolute; width: 1px; height: 1px; margin: 0; opacity: 0; pointer-events: none; }
 .track:has(input:focus-visible) .track-thumb { outline: 2px solid var(--accent); outline-offset: 2px; }
-
 
 .sg-root { min-width: 0; position: relative; max-width: 240px; width: max-content; }
 .sg-trigger { display: flex; align-items: center; gap: 4px; max-width: 240px; height: 34px; padding: 0 8px 0 11px; border: 0; border-radius: 999px; background: transparent; color: var(--ink-faint); font-weight: 400; cursor: pointer; transition: transform var(--spring-dur) var(--spring); width: 100%; min-width: 0; }
 .sg-modelName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sg-check { color: var(--accent); }
-.sg-divider { height: 1px; margin: 4px 6px; background: var(--line); }
+.sg-check { flex: none; display: inline-flex; color: var(--accent); }
+.sg-divider { height: 1px; margin: 5px 8px; background: var(--line); }
 .effort-field { padding: 0; margin: 0; border: 0; min-width: 0; }
 .effort-field:disabled { opacity: .45; }
 /* 固定宽度，打开时由 ModelPicker 按按钮中心定位；打开期间换模型、按钮变宽变窄，浮层也不移动。 */
-.sg-root > .model-popover { position: fixed; inset: auto; width: 240px; margin: 0; padding: 0; border: 0; overflow: visible; background: transparent; color: inherit; }
-.sg-menu { padding: 5px; }
+.sg-root > .model-popover { position: fixed; inset: auto; width: 256px; margin: 0; padding: 0; border: 0; overflow: visible; background: transparent; color: inherit; }
+.sg-menu { padding: 6px; }
 .sg-menu .candidate-message { margin: 0; padding: 8px 10px; color: var(--ink-faint); font-size: 12px; }

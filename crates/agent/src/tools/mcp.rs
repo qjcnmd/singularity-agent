@@ -1,10 +1,120 @@
-//! 调用 MCP 工具，校验返回的图片并截断超长文本输出。
+//! 统一延迟加载的 MCP 代理工具：`mcp_schema` 按需查询指定工具的完整参数定义，
+//! `mcp_call` 调用单个 MCP 工具并校验返回图片、截断超长文本输出。
+
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+use singularity_mcp::McpTool;
+use tokio_util::sync::CancellationToken;
 
 use super::{ToolExecution, error_result};
 use crate::image::InputImage;
-use serde_json::{Map, Value};
-use singularity_mcp::McpTool;
-use tokio_util::sync::CancellationToken;
+
+pub(crate) const MCP_SCHEMA_TOOL_NAME: &str = "mcp_schema";
+pub(crate) const MCP_CALL_TOOL_NAME: &str = "mcp_call";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct McpSchemaArgs {
+    pub(crate) server: String,
+    pub(crate) tools: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct McpCallArgs {
+    pub(crate) server: String,
+    pub(crate) tool: String,
+    #[serde(default)]
+    pub(crate) arguments: Map<String, Value>,
+}
+
+pub(crate) fn schema_spec() -> singularity_core::ToolDefinition {
+    singularity_core::ToolDefinition {
+        name: MCP_SCHEMA_TOOL_NAME.into(),
+        description: "Inspect the full description and JSON input schema of one or more specific MCP tools on a server before invoking them via mcp_call. Only request the tools you need.".into(),
+        parameters_schema: json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "description": "MCP server ID from the developer instructions" },
+                "tools": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string" },
+                    "description": "One or more specific tool names exposed by that MCP server"
+                }
+            },
+            "required": ["server", "tools"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(crate) fn call_spec() -> singularity_core::ToolDefinition {
+    singularity_core::ToolDefinition {
+        name: MCP_CALL_TOOL_NAME.into(),
+        description: "Invoke an MCP tool by server ID and tool name. Call mcp_schema first if the tool takes arguments whose schema you have not yet inspected; tools marked (no args) can be called directly.".into(),
+        parameters_schema: json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "description": "MCP server ID" },
+                "tool": { "type": "string", "description": "Tool name exposed by that MCP server" },
+                "arguments": { "type": "object", "description": "JSON object arguments matching the tool input schema (omit or pass {} if the tool takes no arguments)" }
+            },
+            "required": ["server", "tool"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(crate) fn lookup_tool<'a>(
+    servers: &'a BTreeMap<String, Vec<McpTool>>,
+    server: &str,
+    tool: &str,
+) -> Result<&'a McpTool, ToolExecution> {
+    let tools = servers.get(server).ok_or_else(|| error_result(format!("Unknown MCP server: {server}")))?;
+    tools
+        .iter()
+        .find(|candidate| candidate.name == tool)
+        .ok_or_else(|| error_result(format!("Unknown tool '{tool}' on MCP server '{server}'")))
+}
+
+pub(crate) fn lookup_tools(
+    servers: &BTreeMap<String, Vec<McpTool>>,
+    server: &str,
+    names: &[String],
+) -> Result<Vec<McpTool>, ToolExecution> {
+    if names.is_empty() {
+        return Err(error_result("tools must contain at least one tool name"));
+    }
+    let mut resolved = Vec::with_capacity(names.len());
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name.as_str()) {
+            continue;
+        }
+        resolved.push(lookup_tool(servers, server, name)?.clone());
+    }
+    Ok(resolved)
+}
+
+pub(crate) fn execute_schema(tools: &[McpTool]) -> ToolExecution {
+    let sections: Vec<String> = tools
+        .iter()
+        .map(|tool| {
+            let schema = serde_json::to_string_pretty(&tool.parameters_schema)
+                .unwrap_or_else(|_| tool.parameters_schema.to_string());
+            let description = if tool.description.trim().is_empty() {
+                "(no description)"
+            } else {
+                tool.description.trim()
+            };
+            format!("Tool: {}\nDescription: {description}\nInput schema:\n{schema}", tool.name)
+        })
+        .collect();
+    ToolExecution::text(sections.join("\n\n---\n\n"))
+}
 
 pub(super) async fn execute(
     tool: McpTool,
@@ -22,7 +132,7 @@ pub(super) async fn execute(
                 let mut execution = ToolExecution::text(result.content);
                 execution.is_error = result.is_error;
                 for data in result.images {
-                    match InputImage::from_base64(format!("{}.image", tool.definition.name), &data) {
+                    match InputImage::from_base64(format!("{}.image", tool.name), &data) {
                         Ok(image) => execution.images.push(image),
                         Err(error) => {
                             execution.content.push_str(&format!("\n\nMCP 图片无效：{error}"));

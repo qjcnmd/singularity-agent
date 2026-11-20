@@ -10,8 +10,13 @@ export type DraftSnapshot = Readonly<Record<string, Draft>>
 export class DraftStore {
   private snapshot: DraftSnapshot | null = null
   private loading: Promise<DraftSnapshot> | null = null
+  private pendingSaves = new Map<string, { timer: ReturnType<typeof setTimeout>; draft: Draft }>()
 
-  constructor(private readonly onChange: (drafts: DraftSnapshot) => void) {}
+  constructor(private readonly onChange: (drafts: DraftSnapshot) => void) {
+    if (typeof window !== 'undefined') {
+      window.addEventListener('pagehide', () => this.flushAll())
+    }
+  }
 
   load(): Promise<DraftSnapshot> {
     if (this.snapshot !== null) return Promise.resolve(this.snapshot)
@@ -25,30 +30,62 @@ export class DraftStore {
     return this.snapshot?.[sessionId] ?? emptyDraft
   }
 
-  /** 编辑立即生效；自动保存失败不影响当前输入和发送。 */
+  /** 编辑立即生效；自动保存按 key 防抖并在退出或清理时立即落盘。 */
   async set(sessionId: string, draft: Draft): Promise<boolean> {
     if (this.snapshot === null) return false
     const drafts = { ...this.snapshot }
     if (hasDraft(draft)) drafts[sessionId] = draft
     else delete drafts[sessionId]
     this.publish(drafts)
-    await persistDraft(sessionId, draft).catch(() => {})
+    const previous = this.pendingSaves.get(sessionId)
+    if (previous) clearTimeout(previous.timer)
+    const timer = setTimeout(() => {
+      this.pendingSaves.delete(sessionId)
+      void persistDraft(sessionId, draft).catch(() => {})
+    }, 250)
+    this.pendingSaves.set(sessionId, { timer, draft })
     return true
   }
 
   /** 发送期间继续编辑的内容仍保留。 */
   async clearIfUnchanged(sessionId: string, submitted: Draft): Promise<void> {
-    if (this.snapshot?.[sessionId] === submitted) await this.set(sessionId, emptyDraft)
+    if (this.snapshot?.[sessionId] === submitted) {
+      this.cancelPending([sessionId])
+      if (this.snapshot !== null) {
+        const drafts = { ...this.snapshot }
+        delete drafts[sessionId]
+        this.publish(drafts)
+      }
+      await persistDraft(sessionId, emptyDraft).catch(() => {})
+    }
   }
 
   /** 清理失败不影响已完成的任务删除或项目移除。 */
   async remove(sessionIds: string[]): Promise<void> {
+    this.cancelPending(sessionIds)
     await removeDrafts(sessionIds).catch(() => {})
     if (this.snapshot !== null) {
       const drafts = { ...this.snapshot }
       for (const id of sessionIds) delete drafts[id]
       this.publish(drafts)
     }
+  }
+
+  private cancelPending(sessionIds: string[]): void {
+    for (const id of sessionIds) {
+      const pending = this.pendingSaves.get(id)
+      if (!pending) continue
+      clearTimeout(pending.timer)
+      this.pendingSaves.delete(id)
+    }
+  }
+
+  private flushAll(): void {
+    for (const [id, pending] of this.pendingSaves) {
+      clearTimeout(pending.timer)
+      void persistDraft(id, pending.draft).catch(() => {})
+    }
+    this.pendingSaves.clear()
   }
 
   private publish(drafts: DraftSnapshot): void {

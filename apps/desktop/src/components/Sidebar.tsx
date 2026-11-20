@@ -1,6 +1,6 @@
 import { SelectionSlider } from './SelectionSlider'
 import { workspaceKey } from '../workspace'
-import { X, Minus, Plus, Folder, FolderOpen, SquarePen, FileText, Sparkles, Plug, Settings } from 'lucide-react'
+import { X, Minus, Plus } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useId, useRef, useState } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
@@ -16,6 +16,7 @@ import { ExpandChevron } from './ExpandChevron'
 type PendingDialog =
   | { kind: 'none' }
   | { kind: 'rename'; session: ThreadSummary }
+  | { kind: 'delete'; session: ThreadSummary; title: string }
   | { kind: 'remove'; workspace: Workspace }
 
 export const Sidebar = memo(SidebarView)
@@ -55,6 +56,11 @@ function SidebarView() {
     return () => cancelAnimationFrame(frame)
   }, [state.sidebarCollapsed])
   const [dialog, setDialog] = useState<PendingDialog>({ kind: 'none' })
+  const [, setTimeTick] = useState(0)
+  useEffect(() => {
+    const id = window.setInterval(() => setTimeTick(tick => tick + 1), 60_000)
+    return () => window.clearInterval(id)
+  }, [])
   const collapsed = new Set(state.sidebarView.collapsed)
   const [showAll, setShowAll] = useState<Set<string>>(new Set())
   return (
@@ -66,18 +72,24 @@ function SidebarView() {
       </div>
       <div id="left-sidebar" className="sidebar sidebar-expanded" inert={state.sidebarCollapsed} aria-hidden={state.sidebarCollapsed}>
         <header className="sidebar-brand">
+          <span className="sidebar-wordmark">Singularity</span>
           <SidebarToggle expanded={!state.sidebarCollapsed} controls="left-sidebar" onClick={toggleSidebar} />
         </header>
 
+        <button className={`sidebar-new-task${state.page === 'chat' && state.selectedSessionId === null ? ' is-active' : ''}`} type="button" onClick={() => appStore.newTask()}>
+          <span className="sidebar-new-plus" aria-hidden="true">+</span>
+          <span>新建任务</span>
+        </button>
+
         <nav className="side-nav">
-          <button className={`nav-item${state.page === 'chat' && state.selectedSessionId === null ? ' is-active' : ''}`} type="button" onClick={() => appStore.newTask()}><SquarePen size={16} strokeWidth={1.5} aria-hidden="true" />新建任务</button>
-          {([{ page: 'instructions', label: '自定义指令', Icon: FileText }, { page: 'skills', label: 'Skills', Icon: Sparkles }, { page: 'mcp', label: 'MCP', Icon: Plug }] as const).map(({ page, label, Icon }) =>
-            <button key={page} type="button" className={`nav-item${state.page === page ? ' is-active' : ''}`} onClick={() => appStore.setPage(page)}><Icon size={16} strokeWidth={1.5} aria-hidden="true" />{label}</button>)}
+          {([{ page: 'skills', label: 'Skills' }, { page: 'instructions', label: '自定义指令' }, { page: 'mcp', label: 'MCP' }] as const).map(({ page, label }) =>
+            <button key={page} type="button" className={`nav-item${state.page === page ? ' is-active' : ''}`} onClick={() => appStore.setPage(page)}>{label}</button>)}
         </nav>
+        <div className="sidebar-sep" aria-hidden="true" />
         <section className="sidebar-section">
           <div className="section-heading">
             <span>项目</span>
-            <button type="button" className="icon-button" onClick={() => appStore.openDirectoryPicker()} aria-label="添加项目"><Plus size={16} strokeWidth={1.6} /></button>
+            <button type="button" className="icon-button small" onClick={() => appStore.openDirectoryPicker()} aria-label="添加项目"><Plus size={14} strokeWidth={1.7} /></button>
           </div>
           <div className="workspace-list">
             {state.bootstrap?.workspaces.map((item) => {
@@ -109,7 +121,7 @@ function SidebarView() {
                   {visible.map(session => <SessionButton key={session.threadId} session={session} title={titleOf(session)}
                     selected={state.page === 'chat' && session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
                     unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })}
-                    onDelete={() => { void appStore.deleteSession(session.threadId) }} />)}
+                    onDelete={() => setDialog({ kind: 'delete', session, title: titleOf(session) })} />)}
                   {sessions.length > 5 && (
                     <button
                       type="button"
@@ -130,7 +142,7 @@ function SidebarView() {
           </div>
         </section>
         <footer className="sidebar-footer">
-          <button type="button" className="nav-item" onClick={() => appStore.setSettingsOpen(true)}><Settings size={16} strokeWidth={1.5} aria-hidden="true" />设置</button>
+          <button type="button" className="nav-item" onClick={() => appStore.setSettingsOpen(true)}>设置</button>
         </footer>
       </div></aside>
       <SidebarDialog state={dialog} onClose={() => setDialog(current => current === dialog ? { kind: 'none' } : current)} />
@@ -148,12 +160,11 @@ function WorkspaceButton({ workspace, selected, expanded, onToggle, onRemove }: 
         onClick={onToggle}
         aria-expanded={expanded}
       >
-        {expanded ? <FolderOpen size={16} strokeWidth={1.5} className="workspace-folder" aria-hidden="true" /> : <Folder size={16} strokeWidth={1.5} className="workspace-folder" aria-hidden="true" />}
-        <span className="workspace-name"><strong>{name}</strong></span>
         <ExpandChevron expanded={expanded} size={13} className="workspace-chevron" />
+        <span className="workspace-name"><strong>{name}</strong></span>
       </button>
-      <button type="button" className="icon-button workspace-new" onClick={() => appStore.newTask(workspaceKey(workspace.root))} aria-label={`在 ${name} 新建任务`}><Plus size={15} strokeWidth={1.7} aria-hidden="true" /></button>
-      <button type="button" className="icon-button workspace-remove" onClick={onRemove} aria-label={`移除项目 ${name}`} aria-haspopup="dialog"><Minus size={16} strokeWidth={1.7} aria-hidden="true" /></button>
+      <button type="button" className="icon-button workspace-new" onClick={() => appStore.newTask(workspaceKey(workspace.root))} aria-label={`在 ${name} 新建任务`}><Plus size={14} strokeWidth={1.7} aria-hidden="true" /></button>
+      <button type="button" className="icon-button workspace-remove" onClick={onRemove} aria-label={`移除项目 ${name}`} aria-haspopup="dialog"><Minus size={15} strokeWidth={1.7} aria-hidden="true" /></button>
     </div>
   )
 }
@@ -178,6 +189,7 @@ function SessionButton({
   const [menuOpen, setMenuOpen] = useState(false)
   const anchor = useRef<HTMLButtonElement>(null)
   const status = sessionState(session, live)
+  const statusClass = live && live.phase !== 'idle' ? 'running' : unread && !selected ? status.className : 'idle'
   return (
     <div data-selected={selected} className={`session-row${selected ? ' is-selected' : ''}`} onContextMenu={event => { event.preventDefault(); setMenuOpen(true) }}>
       <button ref={anchor} type="button" className="session-main" aria-haspopup="menu" aria-expanded={menuOpen}
@@ -185,11 +197,11 @@ function SessionButton({
         appStore.selectSession(session.threadId)
         if (window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
       }}>
+        <span className={`session-status status-${statusClass}`} aria-hidden="true" />
         <span className="session-label">
           <strong className={live && live.phase !== 'idle' ? 'activity-shimmer' : undefined}>{title}</strong>
           {session.status !== null && <time dateTime={session.updatedAt}>{relativeTime(session.updatedAt)}</time>}
         </span>
-        <span className={`session-status status-${live && live.phase !== 'idle' ? 'running' : unread && !selected ? status.className : 'idle'}`} aria-hidden="true" />
         <span className="sr-only">{status.label}</span>
       </button>
       {menuOpen && <Menu anchor={anchor} label="任务菜单" onClose={() => setMenuOpen(false)} entries={[{ id: 'rename', label: '重命名', onSelect: onRename }, { id: 'delete', label: '删除任务', onSelect: onDelete }]} />}
@@ -200,8 +212,14 @@ function SessionButton({
 function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () => void }) {
   const [name, setName] = useState('')
   const { actionErrors, pendingActions } = useAppStore(['actionErrors', 'pendingActions'])
-  const method = state.kind === 'rename' ? 'session.rename' : 'workspace.remove'
-  const origin = state.kind === 'none' ? null : actionOrigin.inline(method, state.kind === 'rename' ? state.session.threadId : workspaceKey(state.workspace.root))
+  const method = state.kind === 'rename' ? 'session.rename' : state.kind === 'delete' ? 'session.delete' : 'workspace.remove'
+  const origin = state.kind === 'none'
+    ? null
+    : state.kind === 'rename'
+      ? actionOrigin.inline(method, state.session.threadId)
+      : state.kind === 'delete'
+        ? actionOrigin.session(state.session.threadId)
+        : actionOrigin.inline(method, workspaceKey(state.workspace.root))
   const busy = origin !== null && pendingActions.has(pendingKey(method, origin))
   const close = () => { if (!busy) onClose() }
   const initialName = state.kind === 'rename' ? state.session.title ?? '' : ''
@@ -228,16 +246,23 @@ function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () =
       </Dialog>
     )
   }
-  const title = '移除项目'
-  const targetName = workspaceName(state.workspace)
-  const confirm = async () => { if (await appStore.removeWorkspace(workspaceKey(state.workspace.root))) onClose() }
+  const deleting = state.kind === 'delete'
+  const title = deleting ? '删除任务' : '移除项目'
+  const message = deleting ? `删除“${state.title}”？已保存的任务记录将一并删除。` : `移除“${workspaceName(state.workspace)}”？已保存的任务历史会保留。`
+  const confirmLabel = deleting ? '删除' : '移除项目'
+  const confirm = async () => {
+    const ok = deleting
+      ? await appStore.deleteSession(state.session.threadId)
+      : await appStore.removeWorkspace(workspaceKey(state.workspace.root))
+    if (ok) onClose()
+  }
   return (
     <Dialog open onClose={close} labelledBy="confirm-title" className="confirm-modal">
       <header className="modal-header"><h2 id="confirm-title">{title}</h2><button type="button" className="icon-button" data-autofocus disabled={busy} onClick={close} aria-label="关闭"><X size={18} /></button></header>
       <div className="confirm-body">
-        <p>{`移除“${targetName}”？已保存的任务历史会保留。`}</p>
+        <p>{message}</p>
         {failure && <p className="form-error" role="alert">{failure.message}</p>}
-        <footer><button type="button" className="secondary-button" disabled={busy} onClick={close}>取消</button><button type="button" className="danger-button" disabled={busy} onClick={() => void confirm()}>{title}</button></footer>
+        <footer><button type="button" className="secondary-button" disabled={busy} onClick={close}>取消</button><button type="button" className="danger-button" disabled={busy} onClick={() => void confirm()}>{confirmLabel}</button></footer>
       </div>
     </Dialog>
   )

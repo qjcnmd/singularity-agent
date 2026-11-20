@@ -36,7 +36,7 @@ export type ContextUsage = { used: number, capacity: number, };
 
 export type DirectoryPickResult = { path: string | null, };
 
-export type DiscoverModelsParams = { providerId: string, baseUrl: string, apiKey?: string | null, };
+export type DiscoverModelsParams = { providerId: string, apiProtocol: ProviderApiProtocol, baseUrl: string, apiKey?: string | null, };
 
 export type EmptyParams = Record<string, never>;
 
@@ -92,11 +92,7 @@ export type McpTransportConfig = { "type": "stdio", command: string, args: Array
 
 export type ModelCatalogResult = { catalog: RedactedModelCatalog, revision: number, };
 
-export type ModelConfigurationInput = { modelId: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<string> | null, thinkingWireFormat: string | null,
-/**
- * Chat 请求里表示最大输出 Token 的字段名；`None` 表示发送 `max_tokens`。
- */
-chatOutputTokensField: string | null, };
+export type ModelConfigurationInput = { modelId: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<string> | null, };
 
 export type ModelSelection = { provider: string, model: string, reasoning: string | null, };
 
@@ -108,7 +104,7 @@ itemId: string, questions: Array<UserQuestion>, };
 
 export type PendingUserMessage = { itemId: string, text: string, images: Array<ImageAttachment>, files: Array<string>, };
 
-export type ProviderApiProtocol = "chat" | "responses";
+export type ProviderApiProtocol = "messages" | "responses";
 
 export type ProviderConfigurationInput = { apiProtocol: ProviderApiProtocol, providerId: string, displayName: string | null, baseUrl: string, models: Array<ModelConfigurationInput>, };
 
@@ -145,6 +141,8 @@ export type RpcError = { message: string, };
 export type RpcResponse = { "type": "success", result: JsonValue, } | { "type": "error", error: RpcError, };
 
 export type SessionFailure = { source: SessionOperation, error: TurnErrorDetail, };
+
+export type SessionFocusParams = { sessionId: string | null, };
 
 export type SessionImageParams = { sessionId: string, imageId: string, };
 
@@ -238,7 +236,11 @@ firstTokenAt?: string, turnId: string, status: TurnStatus,
 /**
  * 中断是否由用户停止；没有结束记录的回合为 false。
  */
-manuallyStopped: boolean, error?: TurnErrorDetail, items: Array<HistoryItem>, };
+manuallyStopped: boolean, error?: TurnErrorDetail, items: Array<HistoryItem>,
+/**
+ * 截至本轮结束时整个会话的累计用量；运行中的回合为空。
+ */
+stats?: SessionModelUsage, };
 
 export type ToolResult = { output: string,
 /**
@@ -256,7 +258,7 @@ export type TurnErrorDetail = { message: string,
  */
 itemId?: string, };
 
-export type TurnEventEnvelope = { turnId: string | null, phase: SessionPhase, } & ({ "method": "context/loaded", "params": { context: InjectedContext, } } | { "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "item/updated", "params": { item: HistoryItem, } } | { "method": "item/textDelta", "params": { itemId: string, thinking: boolean, delta: string, } } | { "method": "message/finished", "params": { messageId: string, items: Array<HistoryItem>, } } | { "method": "message/discarded", "params": { messageId: string, } } | { "method": "tool/output", "params": { itemId: string, output: string, } } | { "method": "tool/finished", "params": { itemId: string, result: ToolResult, } } | { "method": "turn/completed", "params": { turn: Turn, manuallyStopped: boolean, finishedAt: string, } } | { "method": "turn/error", "params": { error: TurnErrorDetail, finishedAt: string, } });
+export type TurnEventEnvelope = { turnId: string | null, phase: SessionPhase, } & ({ "method": "context/loaded", "params": { context: InjectedContext, } } | { "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "item/updated", "params": { item: HistoryItem, } } | { "method": "item/textDelta", "params": { itemId: string, thinking: boolean, delta: string, } } | { "method": "message/finished", "params": { messageId: string, items: Array<HistoryItem>, } } | { "method": "message/discarded", "params": { messageId: string, } } | { "method": "tool/output", "params": { itemId: string, output: string, } } | { "method": "tool/finished", "params": { itemId: string, result: ToolResult, } } | { "method": "turn/completed", "params": { turn: Turn, manuallyStopped: boolean, finishedAt: string, stats?: SessionModelUsage, } } | { "method": "turn/error", "params": { error: TurnErrorDetail, finishedAt: string, stats?: SessionModelUsage, } });
 
 export type TurnStatus = "running" | "completed" | "failed" | "interrupted";
 
@@ -300,6 +302,7 @@ export interface RpcContract {
   "context.preview": { params: WorkspaceParams; result: Array<ContextModule> }
   "session.start": { params: SessionStartParams; result: SessionStartResult }
   "session.read": { params: SessionParams; result: SessionReadResult }
+  "session.focus": { params: SessionFocusParams; result: null }
   "session.imageRead": { params: SessionImageParams; result: string }
   "session.rename": { params: SessionRenameParams; result: null }
   "session.delete": { params: SessionParams; result: null }

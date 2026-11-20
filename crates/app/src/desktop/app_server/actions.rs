@@ -2,7 +2,7 @@ use super::*;
 
 impl AppServer {
     pub fn image_data(&self, session_id: &str, image_id: &str) -> Result<String, RpcError> {
-        let conversation = self.lock_sessions().get(session_id).cloned();
+        let conversation = self.lock_sessions().get(session_id);
         if let Some(conversation) = conversation {
             return conversation.image_data(image_id).map_err(catalog_error);
         }
@@ -11,15 +11,25 @@ impl AppServer {
 
     /// 输入直接进入会话队列；启动和收尾期间同样接受，按顺序执行。
     pub fn submit(&self, params: singularity_protocol::SessionTextParams) -> Result<(), RpcError> {
+        let (cwd, skills_enabled) = {
+            let _lifecycle = self.lock_lifecycle();
+            let conversation = self.open_action_conversation(&params.session_id)?;
+            let skills_enabled = !conversation
+                .disabled_modules
+                .iter()
+                .any(|id| id == singularity_agent::agent::modules::SKILLS_MODULE_ID);
+            (conversation.cwd.clone(), skills_enabled)
+        };
+        let input = UserInput::from_uploads(
+            params.text,
+            params.images,
+            params.files,
+            std::path::Path::new(&cwd),
+            &self.home,
+            skills_enabled,
+        )
+        .map_err(RpcError::new)?;
         self.apply_control(&params.session_id, |conversation| {
-            let input = UserInput::from_uploads(
-                params.text,
-                params.images,
-                params.files,
-                std::path::Path::new(&conversation.cwd),
-                &self.home,
-            )
-            .map_err(RpcError::new)?;
             conversation.start(input).map_err(conversation_error)
         })
     }
@@ -84,8 +94,8 @@ impl AppServer {
         let app = Arc::clone(self);
         let id = session_id.to_string();
         let pending = tokio::task::spawn_blocking(move || {
-            let _lifecycle = app.lock_lifecycle();
-            let conversation = app.lock_sessions().get(&id).cloned();
+            let lifecycle = app.lock_lifecycle();
+            let conversation = app.lock_sessions().get(&id);
             match conversation {
                 Some(conversation) => {
                     let deletion = conversation.begin_delete().map_err(conversation_error)?;
@@ -94,19 +104,22 @@ impl AppServer {
                 None => {
                     // 未加载的任务直接删除；删除前保持生命周期锁，阻止新建 conversation。
                     app.catalog.delete(&id).map_err(catalog_error)?;
+                    drop(lifecycle);
+                    app.publish_app_snapshot();
                     Ok(None)
                 }
             }
         })
         .await
         .expect("delete preparation completes while the backend is running")?;
-        if let Some((conversation, _)) = &pending {
-            conversation.stop().await.map_err(RpcError::new)?;
-        }
+        let Some((conversation, deletion)) = pending else {
+            return Ok(());
+        };
+        conversation.stop().await.map_err(RpcError::new)?;
         let app = Arc::clone(self);
         let id = session_id.to_string();
         tokio::task::spawn_blocking(move || {
-            if let Some((_conversation, deletion)) = pending {
+            {
                 let _lifecycle = app.lock_lifecycle();
                 app.catalog.delete(&id).map_err(catalog_error)?;
                 app.lock_sessions().remove(&id);
@@ -131,11 +144,19 @@ impl AppServer {
 }
 
 impl AppServer {
-    pub async fn stop_background_task(&self, session_id: &str, task_id: &str) -> Result<(), RpcError> {
-        let tasks = {
-            let _lifecycle = self.lock_lifecycle();
-            Arc::clone(self.open_action_conversation(session_id)?.bash_tasks())
-        };
+    pub async fn stop_background_task(
+        self: &Arc<Self>,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<(), RpcError> {
+        let app = Arc::clone(self);
+        let id = session_id.to_owned();
+        let tasks = tokio::task::spawn_blocking(move || {
+            let _lifecycle = app.lock_lifecycle();
+            Ok::<_, RpcError>(Arc::clone(app.open_action_conversation(&id)?.bash_tasks()))
+        })
+        .await
+        .expect("background task lookup completes while the backend is running")?;
         tasks.stop(task_id).await.map_err(RpcError::new)
     }
 }

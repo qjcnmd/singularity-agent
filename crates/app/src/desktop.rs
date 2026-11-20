@@ -3,6 +3,7 @@
 mod app_server;
 mod file_view;
 mod rpc;
+mod stream_hub;
 mod transport;
 pub(crate) mod workspace_store;
 

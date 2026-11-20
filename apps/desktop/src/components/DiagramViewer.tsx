@@ -25,6 +25,11 @@ export function DiagramViewer({ svg, width, height, style, onClose }: { svg: str
   useLayoutEffect(() => {
     // 宽度由样式定，高度跟着图走：扁的图不在上下留大片空白，最高不超过 maxStageHeight。
     const { clientWidth } = stage.current!
+    if (width <= 0 || height <= 0) {
+      setStageHeight(minStageHeight)
+      setView({ x: 0, y: 0, scale: 1 })
+      return
+    }
     const maxStageHeight = Math.min(760, innerHeight * .8)
     const scale = Math.min((clientWidth - fitMargin * 2) / width, (maxStageHeight - fitMargin * 2) / height, maxFitScale)
     const fittedHeight = Math.max(minStageHeight, height * scale + fitMargin * 2)

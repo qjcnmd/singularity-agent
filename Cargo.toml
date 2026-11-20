@@ -17,6 +17,7 @@ license = "MIT"
 repository = "https://github.com/qjcnmd/singularity-agent"
 
 [workspace.lints.rust]
+unsafe_code = "forbid"
 unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
@@ -45,6 +46,8 @@ tokio = { version = "1.48", features = [
     "time",
 ] }
 tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
 uuid = { version = "1.11", features = ["v4"] }
 
 # 内部程序异常直接终止；普通操作失败仍通过 Result 返回。

@@ -39,7 +39,7 @@ impl ProviderError {
     }
 
     /// 构造带分类的诊断错误，把具体原因并进各入口实际显示的错误文本里。
-    pub(crate) fn diagnostic(kind: ModelErrorKind, message: impl Into<String>, details: Vec<String>) -> Self {
+    pub(crate) fn diagnostic(kind: ModelErrorKind, message: impl Into<String>, details: &[String]) -> Self {
         let mut message = message.into();
         if !details.is_empty() {
             message.push_str(": ");
@@ -132,12 +132,21 @@ pub(crate) fn append_provider_http_diagnostic(
     }
 }
 
-/// 提供方错误码到 `ModelErrorKind` 的精确映射（全等匹配，不按错误文本猜测）；未命中时返回 `None`，由调用方决定分类。
-pub(crate) fn provider_error_kind_for_code(code: Option<&str>) -> Option<ModelErrorKind> {
-    match code {
-        Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE) => Some(ModelErrorKind::ContextLengthExceeded),
-        Some(PROVIDER_RATE_LIMIT_EXCEEDED_CODE) => Some(ModelErrorKind::Temporary),
-        Some(PROVIDER_INSUFFICIENT_QUOTA_CODE) => Some(ModelErrorKind::Other),
+/// 提供方错误码或类型到 `ModelErrorKind` 的映射；未命中时返回 `None`，由调用方决定分类。
+pub(crate) fn provider_error_kind_for_fields(fields: &ProviderErrorBodyFields) -> Option<ModelErrorKind> {
+    match fields.code.as_deref() {
+        Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE) => return Some(ModelErrorKind::ContextLengthExceeded),
+        Some(PROVIDER_RATE_LIMIT_EXCEEDED_CODE) => return Some(ModelErrorKind::Temporary),
+        Some(PROVIDER_INSUFFICIENT_QUOTA_CODE) => return Some(ModelErrorKind::Other),
+        _ => {}
+    }
+    match fields.wire_type.as_deref() {
+        Some("rate_limit_error" | "overloaded_error") => Some(ModelErrorKind::Temporary),
+        Some("invalid_request_error") => fields.message.as_deref().and_then(|message| {
+            let lower = message.to_ascii_lowercase();
+            (lower.contains("prompt is too long") || lower.contains("maximum context length"))
+                .then_some(ModelErrorKind::ContextLengthExceeded)
+        }),
         _ => None,
     }
 }
@@ -187,7 +196,7 @@ pub(crate) fn provider_embedded_error(
     fields: &ProviderErrorBodyFields,
     fallback_message: &str,
 ) -> ProviderError {
-    let kind = provider_error_kind_for_code(fields.code.as_deref()).unwrap_or(ModelErrorKind::Other);
+    let kind = provider_error_kind_for_fields(fields).unwrap_or(ModelErrorKind::Other);
     let message = fields
         .message
         .as_deref()
@@ -195,5 +204,5 @@ pub(crate) fn provider_embedded_error(
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| fallback_message.to_string());
     let details = provider_wire_facts(fields);
-    ProviderError::diagnostic(kind, message, details)
+    ProviderError::diagnostic(kind, message, &details)
 }

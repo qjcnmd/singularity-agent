@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { appStore, actionOrigin, pendingKey, useAppStore } from '../appStore'
+import { appStore, actionOrigin, pendingKey, useAppStore, type AppState } from '../appStore'
 import { selectedSessionPhase } from '../sessionState'
 import { formatTokenCount } from '../copy'
 import { pop } from '../motion'
@@ -10,18 +10,52 @@ import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 import { Ellipsis, LoaderCircle } from 'lucide-react'
 
+function latestContextRotation(facts: NonNullable<AppState['session']>['facts'] | undefined) {
+  if (!facts) return undefined
+  for (let turnIndex = facts.length - 1; turnIndex >= 0; turnIndex--) {
+    const items = facts[turnIndex].items
+    for (let itemIndex = items.length - 1; itemIndex >= 0; itemIndex--) {
+      const item = items[itemIndex]
+      if (item.type === 'context_rotation' || item.type === 'context_rotation_result') return item
+    }
+  }
+  return undefined
+}
+
 export function RunPanel() {
-  const state = useAppStore(['session', 'selectedSessionId', 'backgroundOpen', 'liveSessions', 'connection', 'pendingActions'])
+  const { backgroundOpen } = useAppStore(['backgroundOpen'])
   const opener = useRef<HTMLButtonElement>(null)
   const reduced = useReducedMotion()
+  useEffect(() => {
+    const close = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || !appStore.getSnapshot().backgroundOpen) return
+      if (document.querySelector(':modal, :popover-open')) return
+      appStore.setBackgroundOpen(false)
+      opener.current?.focus()
+    }
+    window.addEventListener('keydown', close)
+    return () => window.removeEventListener('keydown', close)
+  }, [])
+  return <div className="topbar-actions">
+    <button ref={opener} type="button" className="status-chip" aria-label="运行状态面板"
+      aria-expanded={backgroundOpen} aria-controls="run-panel"
+      onClick={() => appStore.setBackgroundOpen(!backgroundOpen)}><Ellipsis size={18} /></button>
+    <AnimatePresence>{backgroundOpen && <motion.aside id="run-panel" className="float-panel" aria-label="运行状态"
+      initial={{ opacity: 0, scale: .94, y: -6 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: .96, y: -4 }} transition={reduced ? { duration: 0 } : pop}>
+      <RunPanelBody />
+    </motion.aside>}</AnimatePresence>
+  </div>
+}
+
+function RunPanelBody() {
+  const state = useAppStore(['session', 'selectedSessionId', 'liveSessions', 'connection', 'pendingActions'])
   const usage = state.session?.runtime.contextUsage
   const percent = usage ? Math.min(100, Math.round(usage.used / usage.capacity * 100)) : 0
   const tasks = state.selectedSessionId ? state.liveSessions[state.selectedSessionId]?.backgroundTasks ?? [] : []
   const running = tasks.filter(task => task.state.status === 'running').length
   const phase = selectedSessionPhase(state)
   const sessionId = state.selectedSessionId
-  const contextRotation = state.session?.facts.flatMap(turn => turn.items)
-    .findLast(item => item.type === 'context_rotation' || item.type === 'context_rotation_result')
+  const contextRotation = latestContextRotation(state.session?.facts)
   const failure = state.session?.runtime.failure
   const attempt = useRef<string | null>(null)
   const [rotationDone, setRotationDone] = useState(false)
@@ -47,22 +81,7 @@ export function RunPanel() {
     attempt.current = contextRotation?.id ?? ''
     void appStore.rotateContext().then(accepted => { if (!accepted) attempt.current = null })
   }
-  useEffect(() => {
-    const close = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape' || event.defaultPrevented || !appStore.getSnapshot().backgroundOpen) return
-      if (document.querySelector(':modal, :popover-open')) return
-      appStore.setBackgroundOpen(false)
-      opener.current?.focus()
-    }
-    window.addEventListener('keydown', close)
-    return () => window.removeEventListener('keydown', close)
-  }, [])
-  return <div className="topbar-actions">
-    <button ref={opener} type="button" className="status-chip" aria-label="运行状态面板"
-      aria-expanded={state.backgroundOpen} aria-controls="run-panel"
-      onClick={() => appStore.setBackgroundOpen(!state.backgroundOpen)}><Ellipsis size={18} /></button>
-    <AnimatePresence>{state.backgroundOpen && <motion.aside id="run-panel" className="float-panel" aria-label="运行状态"
-      initial={{ opacity: 0, scale: .94, y: -6 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: .96, y: -4 }} transition={reduced ? { duration: 0 } : pop}>
+  return <>
       <Card title="上下文" summary={<span className="rotation-slot" style={{ width: `calc(${String(percent).length + 1}ch + 37px)` }}>
         <button type="button" className={`status-chip rotation-capsule${rotating || rotationDone ? ' is-circle' : ''}`} disabled={rotationDisabled} onClick={startRotation}
           aria-label={`轮换上下文，当前 ${percent}%`} aria-busy={rotating} title="轮换上下文">
@@ -78,8 +97,7 @@ export function RunPanel() {
         <ContextPanel />
       </Card>
       {running > 0 && <Card title="后台命令" initiallyOpen summary={running}><BackgroundTasks /></Card>}
-    </motion.aside>}</AnimatePresence>
-  </div>
+  </>
 }
 
 function ContextRing({ percent }: { percent: number }) {

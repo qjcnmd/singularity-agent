@@ -9,7 +9,7 @@ use std::{
 };
 
 /// 一个被发现出来的技能；在被调用之前只保留元数据。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
     pub name: String,
     pub description: String,
@@ -21,9 +21,12 @@ pub struct Skill {
 impl Skill {
     /// 用户选择或模型调用 skill 工具时完整读取入口；辅助资源仍由模型按需读取，不受工具输出截断限制。
     pub fn load_instructions(&self) -> Result<String, String> {
+        let directory = self
+            .path
+            .parent()
+            .ok_or_else(|| format!("无法加载技能 /{}（{}）：缺少父目录", self.name, self.path.display()))?;
         let content = fs::read_to_string(&self.path)
             .map_err(|error| format!("无法加载技能 /{}（{}）：{error}", self.name, self.path.display()))?;
-        let directory = self.path.parent().expect("discovered skills have a parent directory");
         Ok(format!(
             "<skill>\nName: {}\nPath: {}\nBase directory: {}\nSkill instructions follow. Already loaded; do not read SKILL.md again to activate it. Resolve relative resources from the base directory using absolute tool paths.\n\n{content}\n</skill>",
             self.name,
@@ -34,7 +37,7 @@ impl Skill {
 }
 
 /// 无效文件如实记进 diagnostics，只在工作台展示，不进入模型提示词。
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SkillCatalog {
     pub skills: Vec<Skill>,
     pub diagnostics: Vec<String>,
@@ -109,12 +112,19 @@ impl SkillCatalog {
         };
         let mut roots = vec![
             root.join(crate::user_home::SINGULARITY_DIR_NAME).join("skills"),
-            root.join(".agents/skills"),
+            root.join(".agents").join("skills"),
             home.join("skills"),
         ];
         if let Some(os_home) = std::env::home_dir() {
-            roots.push(os_home.join(".agents/skills"));
+            roots.push(os_home.join(".agents").join("skills"));
         }
+        let mut seen = std::collections::HashSet::new();
+        roots.retain(|root| {
+            let key = std::fs::canonicalize(root)
+                .map(|path| crate::workspace_key(&path))
+                .unwrap_or_else(|_| crate::workspace_key(root));
+            seen.insert(key)
+        });
         let mut catalog = Self::from_roots(&roots);
         if let Some(error) = root_error {
             catalog.diagnostics.push(error);

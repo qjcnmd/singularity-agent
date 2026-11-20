@@ -37,17 +37,16 @@ crates/
 │
 ├── model/                       # 模型配置与请求
 │   └── src/
+│       ├── client.rs                       # ModelClient 协议分发与 HTTP 鉴权
 │       ├── config/
 │       │   ├── manager.rs                  # config.json 读改写（隐藏密钥）
 │       │   ├── schema.rs  selection.rs     # 配置结构、ModelSelection
 │       │   ├── discovery.rs                # 模型列表查询
 │       │   └── user/mod.rs                 # 文件读写入口
 │       ├── types/                          # Message/Tool/Request/Response/reasoning
-│       ├── openai/
-│       │   ├── chat.rs + chat/stream.rs    # Chat Completions 编解码
-│       │   ├── responses.rs + responses/stream.rs  # Responses 编解码
-│       │   ├── provider.rs  parse.rs  wire.rs      # 端点、错误分类、续接
-│       ├── provider.rs                     # Provider 抽象
+│       ├── messages.rs + messages/stream.rs        # Messages（Anthropic 兼容 / DeepSeek）编解码
+│       ├── responses.rs + responses/stream.rs      # OpenAI Responses 编解码
+│       ├── provider.rs                     # 端点拼接、续接判断、参数解析与响应校验
 │       └── transport/                      # HTTP 客户端 + SSE 切帧器
 │
 ├── mcp/                         # MCP 客户端
@@ -112,7 +111,6 @@ crates/
 | [开发指南](docs/development.md) | 源码构建、调试、检查和打包 |
 | [架构说明](docs/architecture.md) | 运行边界、模块职责、状态由谁维护、源码导航 |
 | [架构图](architecture.html) | 完整运行流程、执行顺序与分支 |
-| [工作台交互](docs/desktop-ui.md) | 各控件的操作方式 |
 | [已确认的取舍](docs/decisions.md) | 讨论后决定保留的设计和接受的限制 |
 
 ## 许可证

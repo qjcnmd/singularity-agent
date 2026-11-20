@@ -19,3 +19,4 @@ singularity_core = { path = "../core" }
 singularity_protocol = { path = "../protocol" }
 time.workspace = true
 tokio.workspace = true
+tracing.workspace = true

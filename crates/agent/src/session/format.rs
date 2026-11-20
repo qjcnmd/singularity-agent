@@ -49,7 +49,37 @@ pub enum SessionMetadata {
     },
 }
 
-/// 执行记录：回合开始与结束、未生成消息的模型请求和后台命令状态。不进入模型上下文。
+/// 仅用于本地界面展示的消息元数据，与发给模型的 `Message` 协议结构解耦。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MessageDisplay {
+    #[serde(rename_all = "camelCase")]
+    User {
+        /// 附加技能正文和附件路径前的原始用户输入；界面和标题显示原文。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_text: Option<String>,
+        /// 用户随消息附上的文件路径，界面展示为附件卡片。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Tool {
+        /// 本地界面正文（如含 ANSI 颜色或 unified diff）；为空时显示模型正文。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        /// bash 结果关联的后台命令 ID，供界面跟随最新状态。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_task_id: Option<String>,
+        /// 工具实际执行耗时（毫秒）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        /// `read` 实际读取到的源文件行范围。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read_source: Option<singularity_protocol::ReadSource>,
+    },
+}
+
+/// 执行记录：回合开始与结束、未生成消息的模型请求、旧工具输出微压缩水位线和后台命令状态。不进入模型上下文。
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "recordType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LedgerRecord {
@@ -60,6 +90,12 @@ pub enum LedgerRecord {
     /// 一次没有产生可见回复消息的模型请求（重试、无输出的失败/取消或整理请求）。
     ModelRequest {
         observation: singularity_protocol::RequestObservation,
+    },
+    /// 零模型调用的旧工具输出微压缩水位线：`before_entry_id` 及之前的超长工具结果在投影给模型时折叠为摘要，
+    /// 保持后续前缀稳定以维持前缀缓存，同时不改动原始日志。
+    ToolOutputsPruned {
+        #[serde(rename = "beforeEntryId")]
+        before_entry_id: String,
     },
     /// 回合开始，记录 ID 就是回合 ID。
     OperationStarted,
@@ -85,6 +121,8 @@ pub enum SessionEntry {
         message: Message,
         #[serde(skip_serializing_if = "Option::is_none")]
         observation: Option<singularity_protocol::RequestObservation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<MessageDisplay>,
     },
     ContextRotation {
         id: String,

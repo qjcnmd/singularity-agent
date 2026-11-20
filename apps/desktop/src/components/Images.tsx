@@ -33,8 +33,19 @@ export function useAttachmentInput(addImages: (images: File[]) => void, addFiles
   return { handlers, picker, open: () => input.current?.click(), disabled }
 }
 
+const fileKeys = new WeakMap<File, string>()
+let nextFileKey = 0
+function fileKey(file: File): string {
+  let key = fileKeys.get(file)
+  if (!key) {
+    key = `file-${++nextFileKey}`
+    fileKeys.set(file, key)
+  }
+  return key
+}
+
 export function DraftImages({ images, remove }: { images: File[]; remove: (index: number) => void }) {
-  return <div className="image-list">{images.map((image, index) => <ImageTile key={index} name={image.name} file={image} remove={() => remove(index)} />)}</div>
+  return <div className="image-list">{images.map((image, index) => <ImageTile key={fileKey(image)} name={image.name} file={image} remove={() => remove(index)} />)}</div>
 }
 
 export function FileChips({ files, remove }: { files: string[]; remove?: (index: number) => void }) {

@@ -1,33 +1,36 @@
 //! 普通请求和整理请求共用的发送、重试、计时与日志写入。普通生成请求在成功、或失败/取消前已产出可见内容时
 //! 保存为助手消息（附带请求耗时和用量）；重试尝试、无输出的失败请求和整理请求只保存 `ModelRequest` 记录。失败和取消的消息不进入后续模型上下文。
 
-use crate::agent::AgentError;
+use crate::agent::{AgentError, AgentEvent};
 use crate::message::public_items;
 use crate::session::{LedgerRecord, SessionError, SessionWriter, with_writer_async};
 use singularity_core::duration_millis;
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, OpenAiProvider,
+    ModelClient, ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse,
     ProviderStreamEvent,
 };
 use singularity_protocol::{
     ProviderAttemptStatus, RequestObservation, RequestPurpose, TurnEvent, TurnStatus,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// 服务端要求的等待超过此上限时直接报错，不静默挂起回合。
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// 输出上限取模型上限与窗口剩余空间的最小值。
 pub(crate) fn output_budget_tokens(model: &ModelConfigurationSnapshot, input_tokens: u64) -> u32 {
     let room = model.context_window().saturating_sub(input_tokens);
-    model.max_output_tokens.min(room as u32)
+    model.max_output_tokens.min(u32::try_from(room).unwrap_or(u32::MAX))
 }
 
 /// 发送一次请求，可重试的错误最多尝试三次。每次尝试使用新的消息 ID，等待期间可停止。
 /// 成功返回回复、记录 ID 和日志保存时间。
 pub(crate) async fn execute_request(
-    provider: &OpenAiProvider,
+    provider: &ModelClient,
     session: &SessionWriter,
     request: &ModelTurnRequest,
-    on_event: &mut (dyn FnMut(TurnEvent) + Send),
+    on_event: &mut (dyn FnMut(AgentEvent) + Send),
     cancellation: &CancellationToken,
     purpose: RequestPurpose,
 ) -> Result<(ModelTurnResponse, String, String), AgentError> {
@@ -49,16 +52,20 @@ pub(crate) async fn execute_request(
                 first_token.get_or_insert_with(Instant::now);
                 if purpose == RequestPurpose::Generation {
                     match event {
-                        ProviderStreamEvent::OutputTextDelta { delta } => on_event(TurnEvent::TextDelta {
-                            item_id: crate::session::text_item_id(&id, 0),
-                            thinking: false,
-                            delta,
-                        }),
-                        ProviderStreamEvent::ReasoningTextDelta { delta } => on_event(TurnEvent::TextDelta {
-                            item_id: crate::session::thinking_item_id(&id, 0),
-                            thinking: true,
-                            delta,
-                        }),
+                        ProviderStreamEvent::OutputTextDelta { delta } => {
+                            on_event(AgentEvent::Turn(TurnEvent::TextDelta {
+                                item_id: crate::session::text_item_id(&id, 0),
+                                thinking: false,
+                                delta,
+                            }));
+                        }
+                        ProviderStreamEvent::ReasoningTextDelta { delta } => {
+                            on_event(AgentEvent::Turn(TurnEvent::TextDelta {
+                                item_id: crate::session::thinking_item_id(&id, 0),
+                                thinking: true,
+                                delta,
+                            }));
+                        }
                         ProviderStreamEvent::ToolCallDelta => {}
                     }
                 }
@@ -66,7 +73,10 @@ pub(crate) async fn execute_request(
             .await;
         let finished = Instant::now();
         let error = response.error().cloned();
-        let retry = attempt < 3 && error.as_ref().is_some_and(singularity_model::ProviderError::is_retryable);
+        let retry = attempt < 3
+            && error
+                .as_ref()
+                .is_some_and(|e| e.is_retryable() && e.retry_after.is_none_or(|d| d <= MAX_RETRY_AFTER));
         let status = match &error {
             None => ProviderAttemptStatus::Ok,
             Some(error) if error.kind == ModelErrorKind::Cancelled => ProviderAttemptStatus::Cancelled,
@@ -91,6 +101,7 @@ pub(crate) async fn execute_request(
         let mut items = if purpose == RequestPurpose::Generation && error.is_some() && !retry {
             public_items(
                 &response.assistant_message,
+                None,
                 &id,
                 item_status,
                 singularity_protocol::ToolStatus::Interrupted,
@@ -105,7 +116,7 @@ pub(crate) async fn execute_request(
         let persisted = observation.clone();
         let entry_id = id.clone();
         let saved = with_writer_async(session, move |writer| match message {
-            Some(message) => writer.append_message_with_id(&entry_id, message, Some(persisted)),
+            Some(message) => writer.append_message_with_id(&entry_id, message, Some(persisted), None),
             None => {
                 writer.append_record_with_id(entry_id, LedgerRecord::ModelRequest { observation: persisted })
             }
@@ -120,20 +131,39 @@ pub(crate) async fn execute_request(
                 }));
             }
         };
-        on_event(TurnEvent::ProviderAttempt { observation });
+        on_event(AgentEvent::ProviderAttempt { observation });
         let Some(error) = error else {
             return Ok((response, id, saved_at));
         };
         if retry {
-            on_event(TurnEvent::MessageDiscarded { message_id: id });
             let delay = error
                 .retry_after
                 .unwrap_or_else(|| std::time::Duration::from_millis(2_000 * 2u64.pow(attempt - 1)));
+            tracing::warn!(
+                provider = provider_name,
+                model = model_name,
+                attempt,
+                delay_ms = delay.as_millis() as u64,
+                error = %error,
+                "provider attempt failed; retrying"
+            );
+            if purpose == RequestPurpose::Generation {
+                on_event(AgentEvent::Turn(TurnEvent::MessageDiscarded { message_id: id }));
+            }
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {},
                 _ = cancellation.cancelled() => return Err(AgentError::Aborted),
             }
             continue;
+        }
+        if error.kind != ModelErrorKind::Cancelled {
+            tracing::warn!(
+                provider = provider_name,
+                model = model_name,
+                attempt,
+                error = %error,
+                "provider request failed"
+            );
         }
         if purpose == RequestPurpose::Generation {
             for item in &mut items {
@@ -141,7 +171,7 @@ pub(crate) async fn execute_request(
                     *at = Some(saved_at.clone());
                 }
             }
-            on_event(TurnEvent::MessageFinished { message_id: id, items });
+            on_event(AgentEvent::Turn(TurnEvent::MessageFinished { message_id: id, items }));
         }
         return Err(if error.kind == ModelErrorKind::Cancelled {
             AgentError::Aborted

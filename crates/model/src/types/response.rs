@@ -2,7 +2,7 @@ use super::ModelUsage;
 use super::message::Message;
 use crate::ProviderError;
 
-/// 把 Chat Completions 与 Responses 两种协议统一后的停止原因。
+/// 把 Messages 与 Responses 两种协议统一后的停止原因。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelStopReason {
     Stop,

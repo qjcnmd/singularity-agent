@@ -1,5 +1,6 @@
 //! 工具清单、工具定义、参数检查和执行分发。
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -11,9 +12,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::bash;
 use super::edit;
+use super::mcp;
 use super::read;
 use super::skill;
 use super::view_image;
+use super::write;
 
 pub(crate) const DEFAULT_MAX_LINES: usize = 2000;
 pub(crate) const DEFAULT_MAX_BYTES: usize = 50 * 1024;
@@ -78,6 +81,7 @@ pub(crate) struct ToolContext {
 /// 参数已检查并解析好的工具调用。
 pub(crate) enum PreparedTool {
     Edit(edit::EditArgs),
+    Write(write::WriteArgs),
     Read(read::ReadArgs),
     ViewImage(view_image::ViewImageArgs),
     Skill(skill::SkillArgs, Arc<SkillCatalog>),
@@ -86,6 +90,7 @@ pub(crate) enum PreparedTool {
     TaskList(bash::TaskListArgs),
     TaskOutput(bash::TaskIdArgs),
     TaskStop(bash::TaskIdArgs),
+    McpSchema(Vec<singularity_mcp::McpTool>),
     Mcp(singularity_mcp::McpTool, serde_json::Map<String, Value>),
 }
 
@@ -103,12 +108,16 @@ impl PreparedTool {
             bash_tasks,
         } = context;
         match self {
-            Self::Edit(args) => edit::execute(args, cwd, signal).await,
-            Self::Mcp(tool, args) => super::mcp::execute(tool, args, output_directory, &signal).await,
-            Self::Bash(args) => bash_tasks.execute(args, cwd, output_directory, signal, on_update).await,
+            Self::Edit(args) => Box::pin(edit::execute(args, cwd, signal)).await,
+            Self::Write(args) => Box::pin(write::execute(args, cwd, signal)).await,
+            Self::McpSchema(tools) => mcp::execute_schema(&tools),
+            Self::Mcp(tool, args) => Box::pin(mcp::execute(tool, args, output_directory, &signal)).await,
+            Self::Bash(args) => {
+                Box::pin(bash_tasks.execute(args, cwd, output_directory, signal, on_update)).await
+            }
             Self::TaskList(_) => bash_tasks.tool_list(),
             Self::TaskOutput(args) => bash_tasks.output(&args.task_id, &signal),
-            Self::TaskStop(args) => bash_tasks.tool_stop(&args.task_id).await,
+            Self::TaskStop(args) => Box::pin(bash_tasks.tool_stop(&args.task_id)).await,
             Self::Read(args) => tokio::task::spawn_blocking(move || read::execute(&args, &cwd, &signal))
                 .await
                 .expect("tool worker completes while the runtime is running"),
@@ -160,6 +169,10 @@ pub(crate) fn edit_tool() -> BuiltinTool {
     (edit::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Edit))
 }
 
+pub(crate) fn write_tool() -> BuiltinTool {
+    (write::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Write))
+}
+
 pub(crate) fn view_image_tool() -> BuiltinTool {
     (view_image::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::ViewImage))
 }
@@ -172,12 +185,13 @@ pub(crate) fn question_tool() -> BuiltinTool {
     })
 }
 
-/// 本轮可用的工具：本任务开着的内置工具，加上本轮发现的 MCP 工具。发给模型的工具定义、
-/// 参数检查和执行分发都在这里。
+/// 本轮可用的工具：本任务开着的内置工具，以及按服务器归类、统一按工具粒度延迟加载的 MCP 工具。
+/// 发给模型的工具定义、参数检查和执行分发都在这里。
 #[derive(Default)]
 pub(crate) struct ToolRegistrySnapshot {
     tools: Vec<BuiltinTool>,
-    mcp: Vec<singularity_mcp::McpTool>,
+    /// 本轮已连接且有可用工具的 MCP 服务器，统一通过 `mcp_schema` / `mcp_call` 按需访问。
+    mcp_servers: BTreeMap<String, Vec<singularity_mcp::McpTool>>,
     /// Skills 模块开着时持有本轮的技能目录，`skill` 工具按它加载。
     skills: Option<Arc<SkillCatalog>>,
 }
@@ -191,27 +205,40 @@ impl ToolRegistrySnapshot {
         self.skills = Some(catalog);
     }
 
-    pub(crate) fn add_mcp_tools(&mut self, tools: Vec<singularity_mcp::McpTool>) {
-        self.mcp.extend(tools);
+    pub(crate) fn add_mcp_server(&mut self, server_id: String, tools: Vec<singularity_mcp::McpTool>) {
+        if !tools.is_empty() {
+            self.mcp_servers.insert(server_id, tools);
+        }
     }
 
-    /// 发给模型的完整工具定义：内置工具在前，MCP 工具在后；`skill` 工具随 Skills 模块。
+    /// 发给模型的完整工具定义：内置工具在前；存在可用 MCP 服务器时固定附带 `mcp_schema` / `mcp_call` 代理工具。
     pub(crate) fn provider_schemas(&self) -> Vec<ToolDefinition> {
+        let mcp_proxies = (!self.mcp_servers.is_empty())
+            .then(|| [mcp::schema_spec(), mcp::call_spec()])
+            .into_iter()
+            .flatten();
         self.tools
             .iter()
             .map(|(schema, _)| schema.clone())
             .chain(self.skills.iter().map(|_| skill::spec()))
-            .chain(self.mcp.iter().map(|tool| tool.definition.clone()))
+            .chain(mcp_proxies)
             .collect()
     }
 
     /// 查找工具并解析参数，不执行。Agent 在执行前按模型给出的顺序逐个调用；
     /// 未知工具和参数错误都返回给模型看的错误结果。
     pub(crate) fn preflight(&self, name: &str, args: &Value) -> Result<PreparedTool, ToolExecution> {
-        if let Some(tool) = self.mcp.iter().find(|tool| tool.definition.name == name) {
-            let args =
-                args.as_object().ok_or_else(|| error_result("MCP tool arguments must be a JSON object"))?;
-            return Ok(PreparedTool::Mcp(tool.clone(), args.clone()));
+        if !self.mcp_servers.is_empty() {
+            if name == mcp::MCP_SCHEMA_TOOL_NAME {
+                let args: mcp::McpSchemaArgs = deserialize_args_or_error(args)?;
+                let tools = mcp::lookup_tools(&self.mcp_servers, &args.server, &args.tools)?;
+                return Ok(PreparedTool::McpSchema(tools));
+            }
+            if name == mcp::MCP_CALL_TOOL_NAME {
+                let args: mcp::McpCallArgs = deserialize_args_or_error(args)?;
+                let tool = mcp::lookup_tool(&self.mcp_servers, &args.server, &args.tool)?;
+                return Ok(PreparedTool::Mcp(tool.clone(), args.arguments));
+            }
         }
         if name == "skill"
             && let Some(catalog) = &self.skills

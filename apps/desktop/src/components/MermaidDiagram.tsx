@@ -13,32 +13,46 @@ function loadMermaid(): Promise<Mermaid> {
       startOnLoad: false, securityLevel: 'strict', theme: 'base', look: 'classic', fontFamily: 'inherit',
       // mermaid 12 默认节点文字超过 120px 就换行，节点又窄又容易把单词断开；放宽并加大内边距。
       flowchart: { wrappingWidth: 280, padding: 22, nodeSpacing: 56, rankSpacing: 56 },
-      themeVariables: { fontSize: '15px', primaryColor: '#f4f4f6', primaryBorderColor: '#dcdce0', primaryTextColor: '#1d1d1f', lineColor: '#9a9aa0', edgeLabelBackground: '#ffffff' },
+      themeVariables: { fontSize: '15px' },
       // 写进图自带的样式表：mermaid 量节点尺寸时也按加粗字排版，不会量完再变宽溢出。
-      // 颜色取自容器上的 --diagram-*，每张图一组；代码里 style/classDef 写的颜色是行内样式，优先于这里。
+      // 颜色取自容器上的 CSS 变量，明暗主题切换时自动更新；代码里 style/classDef 写的行内样式优先于这里。
       themeCSS: `.node rect, .node polygon, .node circle { fill: var(--diagram-fill); stroke: var(--diagram-border); }
         .node rect { rx: 16px; ry: 16px; }
         .nodeLabel, .node .label, .node text { color: var(--diagram-text); fill: var(--diagram-text); font-weight: 600; }
-        .edgeLabel, .edgeLabel p { color: #6e6e73; }`,
+        .edgePath .path, .flowchart-link { stroke: var(--mermaid-line); }
+        .marker { fill: var(--mermaid-line); stroke: var(--mermaid-line); }
+        .edgeLabel, .edgeLabel p, .edgeLabel span { color: var(--mermaid-ink-soft); background: var(--mermaid-edge-bg); }
+        .edgeLabel rect, .labelBkg { fill: var(--mermaid-edge-bg); background-color: var(--mermaid-edge-bg); }
+        .cluster rect { fill: var(--mermaid-cluster-bg); stroke: var(--mermaid-cluster-border); }
+        .cluster-label .nodeLabel, .cluster-label span { color: var(--mermaid-ink); }`,
     })
     return mermaid
+  }).catch(error => {
+    loading = null
+    throw error
   })
 }
 
-/** 没被代码自己上色的节点用的浅色组：底色、边框、文字。 */
 const palettes = [
-  ['#fde8f1', '#f3c6da', '#9b2f5e'],
-  ['#e7f0ff', '#c4d8fb', '#1f4f9c'],
-  ['#e5f6ec', '#bfe5cd', '#1f6b40'],
-  ['#fdf1dc', '#f1d5a3', '#8a5a12'],
-  ['#efe9fd', '#d4c8f6', '#5b3aa6'],
+  { light: ['#fde8f1', '#f3c6da', '#9b2f5e'], dark: ['#3b1f2d', '#733855', '#f9bdd6'] },
+  { light: ['#e7f0ff', '#c4d8fb', '#1f4f9c'], dark: ['#1d2b44', '#375587', '#b4d0ff'] },
+  { light: ['#e5f6ec', '#bfe5cd', '#1f6b40'], dark: ['#1b3326', '#33664b', '#a8e3bf'] },
+  { light: ['#fdf1dc', '#f1d5a3', '#8a5a12'], dark: ['#362916', '#6b5228', '#f5d293'] },
+  { light: ['#efe9fd', '#d4c8f6', '#5b3aa6'], dark: ['#2a223f', '#52407c', '#cfc1fb'] },
 ]
 
 /** 按内容固定挑一组颜色，同一张图每次打开颜色不变。 */
 function paletteStyle(code: string): CSSProperties {
   const hash = [...code].reduce((sum, character) => (sum * 31 + character.charCodeAt(0)) >>> 0, 7)
-  const [fill, border, text] = palettes[hash % palettes.length]
-  return { '--diagram-fill': fill, '--diagram-border': border, '--diagram-text': text } as CSSProperties
+  const chosen = palettes[hash % palettes.length]
+  return {
+    '--diagram-fill-light': chosen.light[0],
+    '--diagram-border-light': chosen.light[1],
+    '--diagram-text-light': chosen.light[2],
+    '--diagram-fill-dark': chosen.dark[0],
+    '--diagram-border-dark': chosen.dark[1],
+    '--diagram-text-dark': chosen.dark[2],
+  } as CSSProperties
 }
 
 /** 宽图缩到气泡宽度时最多缩到原尺寸的这个比例，再宽就在图内横向滚动，避免字小得看不清。 */

@@ -2,7 +2,7 @@
 
 use super::*;
 
-pub(crate) struct OpenAiProviderConfig {
+pub(crate) struct ProviderConfig {
     pub(crate) provider_name: String,
     pub(crate) base_url: String,
     pub(crate) api_key: String,
@@ -10,18 +10,16 @@ pub(crate) struct OpenAiProviderConfig {
 
 pub(crate) struct SelectedModel {
     pub(crate) model_name: String,
-    pub(crate) api_protocol: ProviderApiProtocol,
+    pub(crate) protocol: ProviderApiProtocol,
     pub(crate) max_context_tokens: u32,
     pub(crate) max_output_tokens: u32,
     pub(crate) reasoning_variant: Option<String>,
-    pub(crate) thinking_wire_format: ThinkingWireFormat,
-    pub(crate) chat_output_tokens_field: &'static str,
 }
 
 pub(super) fn resolve_model_selection(
     data: &UserConfigFile,
     selected: &ModelSelection,
-) -> Result<(OpenAiProviderConfig, SelectedModel), ProviderError> {
+) -> Result<(ProviderConfig, SelectedModel), ProviderError> {
     let provider = data
         .providers
         .get(&selected.provider)
@@ -40,7 +38,7 @@ pub(super) fn resolve_model_selection(
         selected.reasoning.as_deref(),
     )?;
     Ok((
-        OpenAiProviderConfig {
+        ProviderConfig {
             provider_name: selected.provider.clone(),
             base_url: provider.base_url.clone(),
             api_key: key.to_string(),
@@ -58,25 +56,18 @@ pub(super) fn resolve_model_definition(
     let max_context_tokens = model_file.max_context_tokens;
     let max_output_tokens = model_file.max_output_tokens;
     let reasoning_variants = model_file.reasoning_variants.as_deref().unwrap_or_default();
-    let thinking_wire_format =
-        parse_thinking_wire_format(model_file.thinking_wire_format.as_deref(), protocol)?;
-    validate_reasoning_variants(protocol, thinking_wire_format, reasoning_variants)?;
-    let chat_output_tokens_field =
-        parse_chat_output_tokens_field(model_file.chat_output_tokens_field.as_deref(), protocol)?;
+    validate_reasoning_variants(protocol, reasoning_variants)?;
     if max_context_tokens == 0 || max_output_tokens == 0 {
         return Err(configuration_error("模型上下文窗口和最大输出 Token 须大于 0"));
     }
     if requested_variant.is_some_and(|value| !reasoning_variants.iter().any(|variant| variant == value)) {
         return Err(configuration_error("模型选择器指定的推理档位未在模型配置中声明"));
     }
-    let reasoning_variant = requested_variant.map(str::to_string);
     Ok(SelectedModel {
         model_name: model_name.to_string(),
-        api_protocol: protocol,
+        protocol,
         max_context_tokens,
         max_output_tokens,
-        thinking_wire_format,
-        chat_output_tokens_field,
-        reasoning_variant,
+        reasoning_variant: requested_variant.map(str::to_string),
     })
 }

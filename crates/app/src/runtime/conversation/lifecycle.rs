@@ -43,7 +43,9 @@ impl Conversation {
         if failed {
             self.pause_background_resume();
         }
-        view.failure = failure;
+        if failure.is_some() {
+            view.failure = failure;
+        }
         view.activity = Default::default();
         self.lock_state().turn = TurnLifecycle::Idle;
         let payload = self.runtime(&view);

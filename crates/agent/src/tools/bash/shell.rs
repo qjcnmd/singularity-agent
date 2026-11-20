@@ -1,10 +1,10 @@
 //! bash 工具所用 shell 的发现与选择。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 可用的 Bash 路径；找不到就给出安装与 PATH 的指引。查找顺序和排除规则见
 /// [`find_bash_on_windows`]。
-pub(super) fn bash_path() -> Result<String, String> {
+pub(super) fn bash_path() -> Result<PathBuf, String> {
     find_bash_on_windows().ok_or_else(|| {
         "Git Bash is required but bash.exe was not found. Install Git for Windows from https://git-scm.com/install/windows, or add the Git bin directory containing bash.exe to PATH."
             .to_string()
@@ -42,11 +42,15 @@ fn starts_with_ignore_ascii_case(path: &Path, prefix: &Path) -> bool {
     })
 }
 
-fn find_bash_on_windows() -> Option<String> {
+fn find_bash_on_windows() -> Option<PathBuf> {
+    static BASH_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    if let Some(cached) = BASH_PATH.get() {
+        return Some(cached.clone());
+    }
     let mut candidates = Vec::new();
     for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
-        if let Ok(program_files) = std::env::var(var) {
-            candidates.push(format!("{program_files}\\Git\\bin\\bash.exe"));
+        if let Some(program_files) = std::env::var_os(var) {
+            candidates.push(PathBuf::from(program_files).join("Git\\bin\\bash.exe"));
         }
     }
     // SystemRoot 只读一次：所有 PATH 候选共用同一个排除基准。
@@ -60,8 +64,10 @@ fn find_bash_on_windows() -> Option<String> {
             if is_system32_bash_launcher(&candidate, &system_root) {
                 continue;
             }
-            candidates.push(candidate.display().to_string());
+            candidates.push(candidate);
         }
     }
-    candidates.into_iter().find(|candidate| Path::new(candidate).is_file())
+    let found = candidates.into_iter().find(|candidate| candidate.is_file())?;
+    let _ = BASH_PATH.set(found.clone());
+    Some(found)
 }

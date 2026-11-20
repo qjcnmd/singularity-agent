@@ -19,6 +19,7 @@ declare global {
   interface Window {
     singularity: {
       rpc<M extends RpcMethod>(request: { method: M; params: RpcParams<M> }): Promise<RpcResponse<M>>
+      setTheme(theme: 'light' | 'dark'): Promise<void>
       connect(): Promise<StreamEnvelope>
       onFrame(listener: (frame: StreamEnvelope) => void): () => void
       onFailure(listener: () => void): () => void

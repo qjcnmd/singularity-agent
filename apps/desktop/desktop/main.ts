@@ -3,6 +3,7 @@ import { join, resolve, relative, isAbsolute } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { homedir } from 'node:os'
 import { createHash } from 'node:crypto'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { Backend } from './backend.js'
 import type { DirectoryPickResult, RpcResponse } from '../src/protocol.generated.js'
 
@@ -10,7 +11,17 @@ const entry = 'singularity://app/'
 const configuredHome = process.env.SINGULARITY_HOME
 const home = resolve(configuredHome?.trim() ? configuredHome : join(homedir(), '.singularity'))
 // 数据目录决定 Chromium profile：不同目录各用各的锁和视图状态。
-app.setPath('userData', join(app.getPath('appData'), 'Singularity', createHash('sha256').update(home.toLowerCase()).digest('hex').slice(0, 16)))
+const userDataDir = join(app.getPath('appData'), 'Singularity', createHash('sha256').update(home.toLowerCase()).digest('hex').slice(0, 16))
+app.setPath('userData', userDataDir)
+const themeFile = join(userDataDir, 'theme')
+
+function readSavedTheme(): 'light' | 'dark' {
+  try {
+    return readFileSync(themeFile, 'utf8').trim() === 'dark' ? 'dark' : 'light'
+  } catch {
+    return 'light'
+  }
+}
 protocol.registerSchemesAsPrivileged([{ scheme: 'singularity', privileges: { standard: true, secure: true, supportFetchAPI: true } }])
 let window: BrowserWindow
 let tray: Tray
@@ -53,7 +64,7 @@ async function start(): Promise<void> {
   await backend.ready
   window = new BrowserWindow({
     title: 'Singularity', width: 1440, height: 960, minWidth: 720, minHeight: 480,
-    show: false, backgroundColor: '#f2f2f7', icon,
+    show: false, backgroundColor: readSavedTheme() === 'dark' ? '#202020' : '#ffffff', icon,
     webPreferences: { preload: join(fileURLToPath(new URL('.', import.meta.url)), 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
   })
   Menu.setApplicationMenu(Menu.buildFromTemplate([{ label: 'Singularity', submenu: [
@@ -76,6 +87,15 @@ async function start(): Promise<void> {
     const frame = await backend.connect()
     subscribed = true
     return frame
+  })
+  ipcMain.handle('singularity:theme', (event, theme) => {
+    trusted(event)
+    const next = theme === 'dark' ? 'dark' : 'light'
+    try {
+      mkdirSync(userDataDir, { recursive: true })
+      writeFileSync(themeFile, next, 'utf8')
+    } catch {}
+    window.setBackgroundColor(next === 'dark' ? '#202020' : '#ffffff')
   })
   ipcMain.handle('singularity:rpc', async (event, request): Promise<RpcResponse> => {
     trusted(event)

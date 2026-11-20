@@ -4,26 +4,29 @@ mod stream;
 pub(crate) use self::stream::read_responses_sse_stream;
 
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
-use crate::config::selection::{OpenAiProviderConfig, SelectedModel};
+use crate::config::selection::{ProviderConfig, SelectedModel};
 use crate::error::{ModelErrorKind, ProviderError, provider_embedded_error, provider_error_fields};
-use crate::openai::parse::{parse_tool_call_arguments, parse_usage};
-use crate::provider::{ProviderStreamEvent, finalize_provider_response, provider_response_validation_error};
+use crate::provider::{
+    ProviderStreamEvent, finalize_provider_response, image_data_url, message_metadata_for,
+    parse_tool_call_arguments, parse_usage, provider_response_validation_error, reasoning_wire_decision,
+    serialize_tool_call_arguments,
+};
 use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
 use crate::types::{
     ContentBlock, Message, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
     ProviderBlockMetadata, ProviderMessageMetadata,
 };
-use tokio_util::sync::CancellationToken;
 
 pub(crate) fn openai_responses_stream_request_payload(
     request: &ModelTurnRequest,
     selection: &SelectedModel,
     provider_name: &str,
     endpoint: &str,
-) -> Value {
+) -> Result<Value, ProviderError> {
     let (instructions, input) =
-        openai_responses_input(&request.messages, &request.images, selection, provider_name, endpoint);
+        openai_responses_input(&request.messages, &request.images, selection, provider_name, endpoint)?;
     let mut payload = json!({
         "model": selection.model_name,
         "input": input,
@@ -31,7 +34,7 @@ pub(crate) fn openai_responses_stream_request_payload(
         "store": false,
         "include": ["reasoning.encrypted_content"],
     });
-    let reasoning = super::reasoning_wire_decision(selection);
+    let reasoning = reasoning_wire_decision(selection);
     if let Some(instructions) = instructions {
         payload["instructions"] = json!(instructions);
     }
@@ -65,11 +68,11 @@ pub(crate) fn openai_responses_stream_request_payload(
         }
         None => {}
     }
-    payload
+    Ok(payload)
 }
 
 pub(crate) fn parse_openai_responses_response(
-    config: &OpenAiProviderConfig,
+    config: &ProviderConfig,
     mut payload: Value,
     model_name: &str,
     endpoint: &str,
@@ -99,7 +102,7 @@ pub(crate) fn parse_openai_responses_response(
                 "provider Responses payload was not completed (reason: {})",
                 incomplete_reason.unwrap_or("unknown")
             ),
-            vec!["responses_status_not_completed".to_string()],
+            &["responses_status_not_completed".to_string()],
         ));
     }
     // 内容按提供方输出的顺序保存；续接字段跟随各块，正文和参数不重复保存。
@@ -108,7 +111,7 @@ pub(crate) fn parse_openai_responses_response(
         _ => {
             return Err(provider_response_validation_error(
                 "provider Responses payload missing output items",
-                vec!["responses_output_missing".to_string()],
+                &["responses_output_missing".to_string()],
             ));
         }
     };
@@ -117,7 +120,7 @@ pub(crate) fn parse_openai_responses_response(
         let Some(item_type) = item.get("type").and_then(Value::as_str) else {
             return Err(provider_response_validation_error(
                 "provider Responses output item type was missing",
-                vec!["responses_output_item_type_missing".into()],
+                &["responses_output_item_type_missing".into()],
             ));
         };
         let block = match item_type {
@@ -125,7 +128,7 @@ pub(crate) fn parse_openai_responses_response(
                 let text = parse_responses_message_content(item.get("content")).map_err(|evidence| {
                     provider_response_validation_error(
                         "provider Responses message content was invalid",
-                        vec![evidence.into()],
+                        &[evidence.into()],
                     )
                 })?;
                 ContentBlock::Text {
@@ -146,7 +149,7 @@ pub(crate) fn parse_openai_responses_response(
                 if item.get("id").and_then(Value::as_str).is_none_or(str::is_empty) {
                     return Err(provider_response_validation_error(
                         "provider Responses reasoning item id was missing",
-                        vec!["responses_reasoning_item_id_missing".into()],
+                        &["responses_reasoning_item_id_missing".into()],
                     ));
                 }
                 let thinking = item
@@ -165,7 +168,7 @@ pub(crate) fn parse_openai_responses_response(
             _ => {
                 return Err(provider_response_validation_error(
                     "provider Responses payload contained an unsupported output item",
-                    vec!["responses_output_item_unsupported".into()],
+                    &["responses_output_item_unsupported".into()],
                 ));
             }
         };
@@ -214,14 +217,14 @@ fn parse_responses_message_content(content: Option<&Value>) -> Result<String, &'
     }
 }
 
-/// 把消息编码成 Responses 的 input；是否附带提供方私有数据见 super::message_metadata_for。
+/// 把消息编码成 Responses 的 input；是否附带提供方私有数据见 `message_metadata_for`。
 pub(crate) fn openai_responses_input(
     messages: &[Message],
     images: &std::collections::HashMap<String, String>,
     selection: &SelectedModel,
     provider_name: &str,
     endpoint: &str,
-) -> (Option<String>, Vec<Value>) {
+) -> Result<(Option<String>, Vec<Value>), ProviderError> {
     let instruction_count =
         messages.iter().take_while(|message| message.role() == ModelRole::Developer).count();
     let instructions = messages[..instruction_count]
@@ -237,12 +240,12 @@ pub(crate) fn openai_responses_input(
                 items.push(json!({
                     "type": "function_call_output",
                     "call_id": message.tool_call_id(),
-                    "output": responses_content(message, images),
+                    "output": responses_content(message, images)?,
                 }));
             }
             ModelRole::Assistant => {
                 let same_provider =
-                    super::message_metadata_for(message, selection, provider_name, endpoint).is_some();
+                    message_metadata_for(message, selection, provider_name, endpoint).is_some();
                 for block in message.content() {
                     let (mut item, metadata) = match block {
                         ContentBlock::Text { text, metadata } => (
@@ -258,7 +261,7 @@ pub(crate) fn openai_responses_input(
                             )
                         }
                         ContentBlock::ToolCall(call) => (
-                            json!({"type":"function_call", "call_id":call.tool_call_id, "name":call.tool_name, "arguments":call.arguments.to_string()}),
+                            json!({"type":"function_call", "call_id":call.tool_call_id, "name":call.tool_name, "arguments":serialize_tool_call_arguments(&call.arguments)}),
                             call.metadata.as_ref(),
                         ),
                         _ => continue,
@@ -280,25 +283,27 @@ pub(crate) fn openai_responses_input(
                 items.push(json!({
                     "type": "message",
                     "role": role,
-                    "content": responses_content(message, images),
+                    "content": responses_content(message, images)?,
                 }));
             }
         }
     }
-    ((!instructions.is_empty()).then_some(instructions), items)
+    Ok(((!instructions.is_empty()).then_some(instructions), items))
 }
 
-fn responses_content(message: &Message, images: &std::collections::HashMap<String, String>) -> Value {
+fn responses_content(
+    message: &Message,
+    images: &std::collections::HashMap<String, String>,
+) -> Result<Value, ProviderError> {
     if message.images().next().is_none() {
-        return json!(message.content_text());
+        return Ok(json!(message.content_text()));
     }
     let mut parts = vec![json!({"type": "input_text", "text": message.content_text()})];
-    parts.extend(
-        message
-            .images()
-            .map(|image| json!({"type": "input_image", "image_url": images[&image.id]})),
-    );
-    json!(parts)
+    for image in message.images() {
+        let url = image_data_url(images, &image.id)?;
+        parts.push(json!({"type": "input_image", "image_url": url}));
+    }
+    Ok(json!(parts))
 }
 
 fn block_metadata(item: Value, content_fields: &[&str]) -> ProviderBlockMetadata {

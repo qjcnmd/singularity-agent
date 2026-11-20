@@ -68,6 +68,17 @@ impl CaptureState {
         self.total_lines() > DEFAULT_MAX_LINES || self.total_bytes > DEFAULT_MAX_BYTES
     }
 
+    pub(super) fn will_write_disk(&self, text: &str) -> bool {
+        if self.spill.is_some() {
+            return true;
+        }
+        if self.total_bytes.saturating_add(text.len()) > DEFAULT_MAX_BYTES {
+            return true;
+        }
+        let incoming_lines = text.bytes().filter(|byte| *byte == b'\n').count();
+        self.completed_lines + incoming_lines + 1 > DEFAULT_MAX_LINES
+    }
+
     /// 运行中显示的输出：第一次有输出立即返回，之后有新输出时最多每 100ms 返回一次；
     /// 超出上限时附上完整输出文件的位置。
     pub(super) fn current_output(&mut self) -> Option<String> {

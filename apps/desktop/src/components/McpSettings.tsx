@@ -13,6 +13,7 @@ const connectionLabels: Record<McpConnectionStatus, string> = {
 
 export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null }) {
   const [busy, setBusy] = useState(false)
+  const [reconnecting, setReconnecting] = useState(0)
   const [servers, setServers] = useState<McpServerState[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -41,16 +42,17 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
   }, [load])
 
   useEffect(() => {
-    if (busy || loading || error) return
+    if (busy || loading || error || reconnecting > 0) return
     // 页面可见时持续读取后端状态；上次读取结束后再计时，不启动服务器。
     const timer = window.setTimeout(() => {
       void load()
     }, 1000)
     return () => window.clearTimeout(timer)
-  }, [busy, loading, error, servers, load])
+  }, [busy, loading, error, reconnecting, servers, load])
 
   async function reconnect(serverId: string) {
     const version = ++revision.current
+    setReconnecting(count => count + 1)
     setServers(current => current.map(state => state.server.serverId === serverId
       ? { ...state, status: 'connecting', error: null, tools: [] } : state))
     try {
@@ -59,6 +61,8 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
     } catch (error) {
       if (revision.current === version) setServers(current => current.map(state => state.server.serverId === serverId
         ? { ...state, status: 'failed', error: error instanceof Error ? error.message : '连接 MCP 失败。', tools: [] } : state))
+    } finally {
+      setReconnecting(count => Math.max(0, count - 1))
     }
   }
 
@@ -100,8 +104,17 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
         return <div className="sg-row-card" key={server.serverId}>
           <div className="sg-row-head mcp-row-head">
             <button type="button" className="sg-provider-toggle" aria-expanded={open} aria-controls={`mcp-tools-${server.serverId}`} onClick={() => setExpanded(open ? null : server.serverId)}>
-              <span className={`mcp-dot status-${result.status}`} /><span className="sg-row-identity"><strong>{server.serverId}</strong><span className="mcp-status">{result.status === 'connected' ? `${result.tools.length} 个工具 · ≈ ${formatTokenCount(result.tokens).toLowerCase()} tokens` : connectionLabels[result.status]}</span></span>
-              <ExpandChevron expanded={open} size={16} />
+              <span className="row-card-title">
+                <span className="row-card-head-line">
+                  <strong>{server.serverId}</strong>
+                  <span className="proto-tag">{server.transport.type === 'stdio' ? 'stdio' : 'HTTP'}</span>
+                </span>
+                <small className="mcp-endpoint-inline">{server.transport.type === 'stdio' ? `${server.transport.command} ${server.transport.args.join(' ')}`.trim() : server.transport.url}</small>
+              </span>
+              <span className={`mcp-status-pill status-${result.status}`}>
+                {result.status === 'connected' ? `${result.tools.length} 个工具 · ≈ ${formatTokenCount(result.tokens).toLowerCase()} tokens` : connectionLabels[result.status]}
+              </span>
+              <ExpandChevron expanded={open} size={15} />
             </button>
             <span className="sg-row-actions">
               <button type="button" className="icon-button small" disabled={busy || loading} aria-label={`编辑 MCP ${server.serverId}`} title="编辑" onClick={() => { setError(null); setEditor(server) }}><Pencil size={14} strokeWidth={1.6} aria-hidden="true" /></button>
@@ -109,10 +122,11 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
             </span>
           </div>
           <Disclosure open={open}><div id={`mcp-tools-${server.serverId}`} className="mcp-tools">
-            <p className="mcp-endpoint">{server.transport.type === 'stdio' ? `${server.transport.command} ${server.transport.args.join(' ')}` : server.transport.url}</p>
             {result.error && <p role="alert" className="form-error">{result.error}</p>}
-            {result.status === 'failed' && <button type="button" className="secondary-button" disabled={busy || loading} onClick={() => void reconnect(server.serverId)}>重试连接</button>}
-            {result.tools.map(tool => <div key={tool.name} className="mcp-tool"><strong>{tool.name}</strong><p>{tool.description}</p></div>)}
+            {result.status === 'failed' && <button type="button" className="secondary-button small" disabled={busy || loading} onClick={() => void reconnect(server.serverId)}>重试连接</button>}
+            {result.tools.length > 0 && <div className="mcp-tool-list">
+              {result.tools.map(tool => <div key={tool.name} className="mcp-tool"><strong>{tool.name}</strong>{tool.description && <p>{tool.description}</p>}</div>)}
+            </div>}
           </div></Disclosure>
         </div>
       })}
@@ -149,8 +163,8 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
   const [env, setEnv] = useState(JSON.stringify(stdio?.env ?? {}, null, 2))
   const [url, setUrl] = useState(http?.url ?? '')
   const [headers, setHeaders] = useState(JSON.stringify(http?.headers ?? {}, null, 2))
-  const [startup, setStartup] = useState(server?.startupTimeoutSec ?? 30)
-  const [timeout, setTimeout] = useState(server?.toolTimeoutSec ?? 120)
+  const [startup, setStartup] = useState(String(server?.startupTimeoutSec ?? 30))
+  const [timeout, setTimeout] = useState(String(server?.toolTimeoutSec ?? 120))
   const [failure, setFailure] = useState<string | null>(null)
 
   async function save(event: FormEvent) {
@@ -160,7 +174,9 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
     try {
       const parsedArgs: unknown = type === 'stdio' ? JSON.parse(args) : []
       if (!Array.isArray(parsedArgs) || !parsedArgs.every((value): value is string => typeof value === 'string')) throw new Error('参数必须是字符串组成的 JSON 数组。')
-      await onSave({ serverId: id.trim(), startupTimeoutSec: startup, toolTimeoutSec: timeout,
+      const startupTimeoutSec = positiveInteger(startup, '连接超时')
+      const toolTimeoutSec = positiveInteger(timeout, '调用超时')
+      await onSave({ serverId: id.trim(), startupTimeoutSec, toolTimeoutSec,
         transport: type === 'stdio' ? { type, command: command.trim(), args: parsedArgs, cwd: cwd.trim() || null, env: stringMap(env, '环境变量') }
           : { type, url: url.trim(), headers: stringMap(headers, '请求头') },
       })
@@ -191,7 +207,7 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
             step={1}
             required
             value={startup}
-            onChange={event => setStartup(Number(event.target.value))}
+            onChange={event => setStartup(event.target.value)}
           />
         </label>
         <label className="sg-field">
@@ -204,7 +220,7 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
             step={1}
             required
             value={timeout}
-            onChange={event => setTimeout(Number(event.target.value))}
+            onChange={event => setTimeout(event.target.value)}
           />
         </label>
       </div>
@@ -212,6 +228,12 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
     </fieldset>
     <footer><button type="button" className="secondary-button" disabled={busy} onClick={onCancel}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? '保存中…' : '保存 MCP'}</button></footer>
   </form>
+}
+
+function positiveInteger(raw: string, label: string): number {
+  const value = Number(raw.trim())
+  if (!Number.isInteger(value) || value < 1) throw new Error(`${label}必须是大于 0 的整数。`)
+  return value
 }
 
 function stringMap(text: string, label: string): Record<string, string> {

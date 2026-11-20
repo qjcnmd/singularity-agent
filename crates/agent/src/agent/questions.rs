@@ -6,7 +6,7 @@ use singularity_protocol::{PendingQuestion, UserQuestionAnswer};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use super::TurnEvent;
+use super::AgentEvent;
 use crate::tools::{ABORTED_MESSAGE, ToolExecution, error_result};
 
 struct WaitingQuestion {
@@ -70,11 +70,11 @@ impl UserQuestions {
         &self,
         request: PendingQuestion,
         cancellation: &CancellationToken,
-        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> ToolExecution {
         let (reply, receive) = oneshot::channel();
         *self.waiting.lock().expect("question lock poisoned") = Some(WaitingQuestion { request, reply });
-        on_event(TurnEvent::SessionStateChanged {});
+        on_event(AgentEvent::SessionStateChanged);
         let result = tokio::select! {
             biased;
             () = cancellation.cancelled() => error_result(ABORTED_MESSAGE),
@@ -83,7 +83,7 @@ impl UserQuestions {
             }).to_string()),
         };
         self.waiting.lock().expect("question lock poisoned").take();
-        on_event(TurnEvent::SessionStateChanged {});
+        on_event(AgentEvent::SessionStateChanged);
         result
     }
 }

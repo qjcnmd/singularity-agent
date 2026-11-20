@@ -1,22 +1,28 @@
-.timeline-question { justify-items: stretch; width: min(88%, 560px); }
-.question-panel { display: grid; gap: 10px; padding: 14px 16px 12px; overflow: hidden; }
-.question-body { display: grid; gap: 8px; }
-.question-title { font-size: 1em; }
-.question-hint { margin-top: -4px; color: var(--ink-faint); font-size: var(--meta-font-size); }
-.question-options, .question-panel-body { display: grid; gap: 6px; }
-.question-answer-row { display: flex; align-items: flex-start; gap: 10px; width: 100%; padding: 9px 12px; border: 1px solid var(--line); border-radius: 16px; background: var(--card); cursor: pointer; text-align: left; transition: border-color 120ms, background 120ms, transform var(--spring-dur) var(--spring); }
-.question-answer-row:hover { background: var(--surface-muted); }
-.question-answer-row:active { transform: scale(.985); transition-duration: 80ms; }
-.question-answer-row[aria-checked="true"], .question-custom-answer[data-selected="true"] { border-color: var(--accent); background: var(--accent-soft); }
-.question-answer-row small { display: block; color: var(--ink-faint); font-size: var(--meta-font-size); }
-.question-option-mark { display: grid; place-items: center; width: 22px; height: 22px; flex: none; border-radius: 7px; background: var(--surface-muted); color: var(--ink-soft); font-size: var(--meta-font-size); font-weight: 400; }
-.question-answer-row[aria-checked="true"] .question-option-mark { background: var(--accent); color: #fff; }
-.question-custom-answer textarea { flex: 1; border: 0; outline: 0; resize: none; background: transparent; font: inherit; field-sizing: content; }
-.question-pager { display: flex; align-items: center; gap: 4px; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
-.question-actions { margin-left: auto; display: flex; gap: 6px; }
-
-/* 留出 4px 给选项的焦点框，免得被滚动区裁掉 */
-.question-panel-body { border: 0; margin: -4px; padding: 4px; min-width: 0; min-height: 0; max-height: min(420px, 50vh); overflow-y: auto; }
-.question-panel footer { display: flex; align-items: center; gap: 10px; }
-.question-panel textarea { min-height: 24px; }
-.question-custom-answer { cursor: text; align-items: center; }
+.question-waiting-dot { width: 8px; height: 8px; margin: 3px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); flex: none; }
+.question-badge { flex: none; padding: 1px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 500; }
+.question-panel { display: grid; gap: 8px; padding: 10px 12px 10px; overflow: hidden; font-size: var(--block-font-size); }
+.question-body { display: grid; gap: 7px; min-width: 0; }
+.question-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.question-title { font-size: 13.5px; font-weight: 500; color: var(--ink); line-height: 1.45; }
+.question-hint { flex: none; color: var(--ink-faint); font-size: var(--meta-font-size); }
+/* 留出 2px 给焦点描边，免得被滚动区裁掉。 */
+.question-panel-body { border: 0; margin: -2px; padding: 2px; min-width: 0; min-height: 0; max-height: min(320px, 44vh); overflow-y: auto; }
+.question-list { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--fill-subtle); }
+.question-options { display: grid; }
+.question-answer-row { display: flex; align-items: baseline; gap: 9px; width: 100%; padding: 7px 10px; border: 0; border-top: 1px solid var(--line); background: transparent; color: var(--ink); font: inherit; line-height: 1.45; cursor: pointer; text-align: left; transition: background 120ms; }
+.question-options > .question-answer-row:first-child,
+.question-list > .question-custom-answer:first-child { border-top: 0; }
+.question-answer-row:hover { background: var(--soft-fill); }
+.question-answer-row[aria-checked="true"], .question-custom-answer[data-selected="true"] { background: var(--accent-soft); }
+.question-option-mark { display: inline-grid; place-items: center; width: 18px; height: 18px; flex: none; border-radius: 5px; background: var(--soft-fill-hover); color: var(--ink-soft); font-size: 11px; font-weight: 500; transform: translateY(-0.5px); }
+.question-answer-row[aria-checked="true"] .question-option-mark { background: var(--accent); color: var(--ink-on-accent); }
+.question-option-text { flex: 1; min-width: 0; }
+.question-option-label { font-weight: 500; color: var(--ink); }
+.question-option-desc { display: inline; margin-left: 6px; color: var(--ink-faint); font-size: var(--meta-font-size); }
+.question-custom-answer { cursor: text; align-items: center; padding: 6px 10px; background: var(--card); }
+.question-custom-mark { background: transparent; color: var(--ink-faint); transform: none; }
+.question-custom-answer textarea { flex: 1; min-height: 20px; border: 0; outline: 0; resize: none; background: transparent; font: inherit; font-size: 12.5px; line-height: 1.45; color: var(--ink); field-sizing: content; }
+.question-custom-answer textarea::placeholder { color: var(--ink-faint); }
+.question-panel footer { display: flex; align-items: center; gap: 8px; }
+.question-pager { display: flex; align-items: center; gap: 3px; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
+.question-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }

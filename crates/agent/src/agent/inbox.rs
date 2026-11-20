@@ -28,18 +28,34 @@ impl UserInput {
         files: Vec<String>,
         cwd: &std::path::Path,
         home: &std::path::Path,
+        skills_enabled: bool,
     ) -> Result<Self, String> {
         if text.trim().is_empty() && images.is_empty() && files.is_empty() {
             return Err("输入不能为空。".into());
         }
-        if let Some(missing) = files.iter().find(|path| !std::path::Path::new(path).is_file()) {
-            return Err(format!("找不到附件：{missing}"));
+        let mut seen_files = std::collections::HashSet::new();
+        let mut unique_files = Vec::with_capacity(files.len());
+        for path in files {
+            let file = std::path::Path::new(&path);
+            if !file.is_absolute() {
+                return Err(format!("附件路径必须是绝对路径：{path}"));
+            }
+            if !file.is_file() {
+                return Err(format!("找不到附件：{path}"));
+            }
+            if seen_files.insert(path.clone()) {
+                unique_files.push(path);
+            }
         }
         Ok(Self {
-            skill_instructions: load_selected_skills(&text, cwd, home)?,
+            skill_instructions: if skills_enabled {
+                load_selected_skills(&text, cwd, home)?
+            } else {
+                String::new()
+            },
             text,
             images: images.into_iter().map(crate::image::InputImage::upload).collect::<Result<_, _>>()?,
-            files,
+            files: unique_files,
         })
     }
 

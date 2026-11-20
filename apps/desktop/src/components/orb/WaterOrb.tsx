@@ -1,10 +1,4 @@
 import { useEffect, useRef } from 'react'
-import { Fluid } from './fluid'
-import { Bubbles } from './bubbles'
-
-/* 水球发送键：
- * 平时是解析出来的起伏海面；轮换时球壁转动，水改由 LiquidFun 粒子重建并翻滚；结束后平息再回落到新水位。
- * 球上不画箭头，点击即发送，运行中点击即停止。 */
 
 type WaterOrbProps = {
   /** 上下文占用，按高度映射，0–100。 */
@@ -18,207 +12,263 @@ type WaterOrbProps = {
 }
 
 const TAU = Math.PI * 2
-const resolution = 200
-const clamp = (value: number) => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0))
-const hexToRgb = (hex: string): [number, number, number] => { const n = parseInt(hex.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255] }
+const CALM_INTERVAL_MS = 1000 / 24
+const clamp01 = (value: number) => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0))
+
+function parseRgb(color: string): [number, number, number] {
+  const trimmed = color.trim()
+  if (trimmed.startsWith('#')) {
+    const hex = trimmed.slice(1)
+    if (hex.length === 3 || hex.length === 4) {
+      return [parseInt(hex[0] + hex[0], 16), parseInt(hex[1] + hex[1], 16), parseInt(hex[2] + hex[2], 16)]
+    }
+    if (hex.length >= 6) {
+      const value = parseInt(hex.slice(0, 6), 16)
+      if (!Number.isNaN(value)) return [(value >> 16) & 255, (value >> 8) & 255, value & 255]
+    }
+  }
+  const match = trimmed.match(/rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)/i)
+  if (match) {
+    return [Number(match[1]) || 0, Number(match[2]) || 0, Number(match[3]) || 0]
+  }
+  return [23, 131, 255]
+}
+
+function buildGlassShell(pixelSize: number): HTMLCanvasElement {
+  const shell = document.createElement('canvas')
+  shell.width = pixelSize
+  shell.height = pixelSize
+  const ctx = shell.getContext('2d')!
+  const half = pixelSize / 2
+  ctx.setTransform(half, 0, 0, half, half, half)
+
+  ctx.save()
+  ctx.beginPath()
+  ctx.arc(0, 0, 0.99, 0, TAU)
+  ctx.clip()
+
+  const volume = ctx.createRadialGradient(-0.28, -0.38, 0.08, 0.08, 0.12, 1.28)
+  volume.addColorStop(0, 'rgba(255,255,255,.25)')
+  volume.addColorStop(0.42, 'rgba(255,255,255,.06)')
+  volume.addColorStop(0.66, 'rgba(178,218,255,.02)')
+  volume.addColorStop(0.86, 'rgba(167,213,255,.05)')
+  volume.addColorStop(1, 'rgba(155,207,255,.08)')
+  ctx.fillStyle = volume
+  ctx.fillRect(-1, -1, 2, 2)
+
+  const rim = ctx.createRadialGradient(0, 0, 0.73, 0, 0, 1.01)
+  rim.addColorStop(0, 'rgba(255,255,255,0)')
+  rim.addColorStop(0.53, 'rgba(194,227,255,.03)')
+  rim.addColorStop(0.76, 'rgba(183,223,255,.06)')
+  rim.addColorStop(0.89, 'rgba(245,252,255,.78)')
+  rim.addColorStop(1, 'rgba(172,218,255,.20)')
+  ctx.fillStyle = rim
+  ctx.fillRect(-1, -1, 2, 2)
+
+  const transmitted = ctx.createRadialGradient(0.18, 0.84, 0, 0.18, 0.84, 0.48)
+  transmitted.addColorStop(0, 'rgba(236,250,255,.30)')
+  transmitted.addColorStop(1, 'rgba(236,250,255,0)')
+  ctx.fillStyle = transmitted
+  ctx.fillRect(-1, -1, 2, 2)
+
+  ctx.beginPath()
+  ctx.arc(-0.23, -0.84, 0.035, 0, TAU)
+  ctx.fillStyle = '#fff'
+  ctx.fill()
+  ctx.restore()
+
+  ctx.beginPath()
+  ctx.arc(0, 0, 0.99, 0, TAU)
+  ctx.strokeStyle = 'rgba(159,210,255,.30)'
+  ctx.lineWidth = 0.013
+  ctx.stroke()
+
+  return shell
+}
+
+interface OrbBubble {
+  x: number
+  y: number
+  radius: number
+  speed: number
+  phase: number
+}
+
+function createBubbles(): OrbBubble[] {
+  return Array.from({ length: 8 }, (_, index) => ({
+    x: -0.58 + (index * 0.165),
+    y: 0.9 - (index % 4) * 0.32,
+    radius: 0.018 + (index % 3) * 0.011,
+    speed: 0.28 + (index % 4) * 0.08,
+    phase: index * 1.1,
+  }))
+}
 
 export function WaterOrb({ percent, rotating, enabled, size, label, color, onPress }: WaterOrbProps) {
   const canvas = useRef<HTMLCanvasElement>(null)
-  const repaintStill = useRef<(() => void) | null>(null)
-  // 每帧读最新属性，不触发 React 重渲染
-  const latest = useRef({ occupancy: clamp(percent / 100), rotating, color: hexToRgb(color) })
-  latest.current = { occupancy: clamp(percent / 100), rotating, color: hexToRgb(color) }
+  const wakeRef = useRef<(() => void) | null>(null)
+  const latest = useRef({ occupancy: clamp01(percent / 100), rotating, rgb: parseRgb(color) })
+  latest.current = { occupancy: clamp01(percent / 100), rotating, rgb: parseRgb(color) }
 
   useEffect(() => {
     const element = canvas.current!
-    const c = element.getContext('2d')!
+    const ctx = element.getContext('2d')!
     const reduced = matchMedia('(prefers-reduced-motion: reduce)')
     const dpr = Math.min(devicePixelRatio || 1, 2)
-    element.width = Math.round(size * dpr)
-    element.height = Math.round(size * dpr)
-    let level = latest.current.occupancy, requestedLevel = level, lastFill = level
-    let t = 0, agitation = 0, accumulator = 0, previous = 0, frame = 0
-    const fluid = new Fluid(level)
-    const bubbles = new Bubbles()
-    const texture = document.createElement('canvas')
-    texture.width = texture.height = resolution
-    const textureContext = texture.getContext('2d')!
-    const pixels = textureContext.createImageData(resolution, resolution)
-    const field = new Float32Array(resolution * resolution)
-    const physicalField = new Float32Array(resolution * resolution)
-    const blurred = new Float32Array(resolution * resolution)
-    const surfaceHeights = new Float64Array(resolution)
-    const splatRadius = 6.8
+    const pixelSize = Math.max(1, Math.round(size * dpr))
+    element.width = pixelSize
+    element.height = pixelSize
 
-    const splat = (x0: number, y0: number, destination: Float32Array) => {
-      const cx = (x0 + 1) * resolution / 2, cy = (y0 + 1) * resolution / 2
-      for (let y = Math.max(0, Math.floor(cy - splatRadius)); y <= Math.min(resolution - 1, cy + splatRadius); y++) {
-        for (let x = Math.max(0, Math.floor(cx - splatRadius)); x <= Math.min(resolution - 1, cx + splatRadius); x++) {
-          const d = ((x - cx) ** 2 + (y - cy) ** 2) / (splatRadius * splatRadius)
-          if (d < 1) destination[y * resolution + x] += (1 - d) ** 2
+    const shell = buildGlassShell(pixelSize)
+    const bubbles = createBubbles()
+    let level = latest.current.occupancy
+    let turbulence = latest.current.rotating ? 1 : 0
+    let phase = 0
+    let tilt = 0
+    let lastTick = 0
+    let lastPaint = 0
+    let frame = 0
+
+    const drawFrame = (now: number) => {
+      frame = 0
+      const { occupancy, rotating: spinning, rgb } = latest.current
+      const calmIdle = !spinning && Math.abs(level - occupancy) < 0.002 && turbulence < 0.02
+      const emptySettled = calmIdle && occupancy <= 0.002 && level <= 0.002
+
+      const dt = lastTick ? Math.min((now - lastTick) / 1000, 0.05) : 0.016
+      lastTick = now
+
+      if (reduced.matches) {
+        level = occupancy
+        turbulence = 0
+      } else {
+        level += (occupancy - level) * Math.min(1, dt * 4.5)
+        turbulence += ((spinning ? 1 : 0) - turbulence) * Math.min(1, dt * 3.5)
+        phase += dt * (2.2 + turbulence * 5.2)
+        tilt = turbulence > 0.01 ? Math.sin(phase * 0.55) * 0.24 * turbulence : tilt * Math.max(0, 1 - dt * 5)
+        for (const bubble of bubbles) {
+          bubble.y -= dt * bubble.speed * (0.45 + turbulence * 1.4)
+          if (bubble.y < -0.75) bubble.y = 0.92
         }
+      }
+
+      if (!calmIdle || reduced.matches || emptySettled || now - lastPaint >= CALM_INTERVAL_MS || lastPaint === 0) {
+        lastPaint = now
+        ctx.setTransform(1, 0, 0, 1, 0, 0)
+        ctx.clearRect(0, 0, pixelSize, pixelSize)
+
+        const visualLevel = Math.max(level, turbulence * 0.18)
+        if (visualLevel > 0.002) {
+          const half = pixelSize / 2
+          const [r, g, b] = rgb
+          const surfaceY = 0.96 - visualLevel * 1.88
+          const amp1 = reduced.matches ? 0 : 0.016 + turbulence * 0.055
+          const amp2 = reduced.matches ? 0 : 0.009 + turbulence * 0.032
+
+          ctx.save()
+          ctx.setTransform(half, 0, 0, half, half, half)
+          ctx.beginPath()
+          ctx.arc(0, 0, 0.96, 0, TAU)
+          ctx.clip()
+
+          const body = ctx.createLinearGradient(0, surfaceY - 0.1, 0, 1)
+          body.addColorStop(0, `rgba(${r}, ${g}, ${b}, 0.72)`)
+          body.addColorStop(0.55, `rgba(${r}, ${g}, ${b}, 0.9)`)
+          body.addColorStop(1, `rgba(${Math.round(r * 0.72)}, ${Math.round(g * 0.72)}, ${Math.round(b * 0.72)}, 0.98)`)
+
+          ctx.beginPath()
+          const steps = 36
+          for (let i = 0; i <= steps; i++) {
+            const x = -1.02 + (2.04 * i) / steps
+            const y = surfaceY
+              + tilt * x
+              + Math.sin(x * 3.1 + phase) * amp1
+              + Math.cos(x * 5.3 - phase * 1.35) * amp2
+            if (i === 0) ctx.moveTo(x, y)
+            else ctx.lineTo(x, y)
+          }
+          ctx.lineTo(1.04, 1.04)
+          ctx.lineTo(-1.04, 1.04)
+          ctx.closePath()
+          ctx.fillStyle = body
+          ctx.fill()
+
+          // 旋转时加几颗轻微上浮的气泡和液面高光线
+          if (!reduced.matches && visualLevel > 0.06) {
+            ctx.beginPath()
+            for (let i = 0; i <= steps; i++) {
+              const x = -1.02 + (2.04 * i) / steps
+              const y = surfaceY
+                + tilt * x
+                + Math.sin(x * 3.1 + phase) * amp1
+                + Math.cos(x * 5.3 - phase * 1.35) * amp2
+              if (i === 0) ctx.moveTo(x, y)
+              else ctx.lineTo(x, y)
+            }
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.34)'
+            ctx.lineWidth = 0.018
+            ctx.stroke()
+
+            if (turbulence > 0.05) {
+              ctx.fillStyle = `rgba(255, 255, 255, ${(0.28 * turbulence).toFixed(3)})`
+              for (const bubble of bubbles) {
+                const bx = bubble.x + Math.sin(phase * 0.8 + bubble.phase) * 0.05
+                if (bubble.y > surfaceY + 0.06) {
+                  ctx.beginPath()
+                  ctx.arc(bx, bubble.y, bubble.radius, 0, TAU)
+                  ctx.fill()
+                }
+              }
+            }
+          }
+          ctx.restore()
+        }
+
+        ctx.setTransform(1, 0, 0, 1, 0, 0)
+        ctx.drawImage(shell, 0, 0)
+      }
+
+      if (!reduced.matches && !document.hidden && !emptySettled) {
+        frame = requestAnimationFrame(drawFrame)
       }
     }
-    // 气泡预热：一打开就有气泡，而不是从空开始
-    let bubblesReady = false
 
-    function draw(now: number) {
-      const dt = previous ? Math.min((now - previous) / 1000, .05) : 0
-      previous = now
-      const target = latest.current
-      const still = reduced.matches
-      if (still) { level = target.occupancy; requestedLevel = level; agitation = 0 }
-      t += still ? 0 : dt
-      if (!target.rotating) requestedLevel = target.occupancy
-      // 翻滚平息后才回落水位，不跳到新水位
-      if (!target.rotating && agitation < .18) {
-        level += (requestedLevel - level) * (1 - Math.exp(-dt * 3))
-        if (Math.abs(requestedLevel - level) < .003) {
-          level = requestedLevel
-          if (Math.abs(lastFill - level) > .002) { fluid.fill(level); lastFill = level }
-        }
-      }
-      agitation = still ? 0 : agitation + ((target.rotating ? 1 : 0) - agitation) * (1 - Math.exp(-dt * (target.rotating ? 3 : 1.8)))
-      const fluidBlend = Math.min(1, agitation * 2)
-      // 只在轮换翻滚时跑物理；平时水面是解析波浪，省掉这部分开销
-      if (!still && (target.rotating || agitation > .01)) {
-        accumulator += dt
-        let steps = 0
-        while (accumulator >= 1 / 120 && steps < 6) { fluid.step(1 / 120, target.rotating); accumulator -= 1 / 120; steps++ }
-      } else accumulator = 0
-
-      c.setTransform(dpr, 0, 0, dpr, 0, 0)
-      c.clearRect(0, 0, size, size)
-      c.translate(size / 2, size / 2)
-      c.scale(size * .465, size * .465)
-      c.save()
-      c.beginPath(); c.arc(0, 0, .99, 0, TAU); c.clip()
-      // 卡通外壳：干净的浅色底和一圈描边，不做写实折射
-      const shell = c.createRadialGradient(-.24, -.28, .12, .08, .12, 1.2)
-      shell.addColorStop(0, 'rgba(255,255,255,.12)')
-      shell.addColorStop(.6, 'rgba(231,243,255,.09)')
-      shell.addColorStop(.84, 'rgba(149,188,228,.14)')
-      shell.addColorStop(1, 'rgba(211,232,251,.34)')
-      c.fillStyle = shell
-      c.fillRect(-1, -1, 2, 2)
-
-      // 翻滚时由粒子重建连续水面，不旋转一张画好的遮罩
-      if (fluidBlend > 0) {
-        physicalField.fill(0)
-        for (const particle of fluid.particles) splat(particle.x, particle.y, physicalField)
-        for (let y = 0; y < resolution; y++) for (let x = 0; x < resolution; x++) {
-          let sum = 0
-          for (let k = -2; k <= 2; k++) sum += physicalField[y * resolution + Math.max(0, Math.min(resolution - 1, x + k))]
-          blurred[y * resolution + x] = sum / 5
-        }
-        for (let y = 0; y < resolution; y++) for (let x = 0; x < resolution; x++) {
-          let sum = 0
-          for (let k = -2; k <= 2; k++) sum += blurred[Math.max(0, Math.min(resolution - 1, y + k)) * resolution + x]
-          field[y * resolution + x] = sum / 5
-        }
-      }
-      // 平时的海面：波峰波谷向前推进，占用越高浪越大越快
-      const waveSpeed = .85 + level * 2.8
-      const waveAmplitude = (.009 + .035 * level * level) * Math.min(1, level * 20, (1 - level) * 16)
-      const surface = (x: number) => 1 - 2 * level + waveAmplitude * (
-        Math.sin(x * 4.4 - t * waveSpeed) + .38 * Math.sin(x * 8.2 - t * waveSpeed * 1.36 + .8) + .15 * Math.sin(x * 13.1 + t * waveSpeed * .65))
-      const data = pixels.data
-      const [red, green, blue] = target.color
-      const threshold = .7 - agitation * .2
-      // 同一列的水面高度相同，一帧只计算一次；保留双精度以保持原来的像素结果。
-      for (let x = 0; x < resolution; x++) surfaceHeights[x] = surface(x / resolution * 2 - 1)
-      for (let y = 0; y < resolution; y++) for (let x = 0; x < resolution; x++) {
-        const index = y * resolution + x, k = index * 4
-        const ny = y / resolution * 2 - 1
-        const sea = Math.max(0, Math.min(4, (ny - surfaceHeights[x]) / .016 + 1))
-        const value = sea * (1 - fluidBlend) + field[index] * fluidBlend
-        data[k] = red; data[k + 1] = green; data[k + 2] = blue
-        data[k + 3] = Math.round(Math.max(0, Math.min(1, (value - threshold) * 7)) * 216)
-      }
-      textureContext.putImageData(pixels, 0, 0)
-      c.imageSmoothingEnabled = true
-      c.drawImage(texture, -1, -1, 2, 2)
-
-      const submerged = (x: number, y: number) => {
-        if (x * x + y * y > .96 * .96) return false
-        if (fluidBlend < .5) return y > surface(x) + .006
-        const ix = Math.floor((x + 1) * resolution / 2), iy = Math.floor((y + 1) * resolution / 2)
-        return ix >= 0 && ix < resolution && iy >= 0 && iy < resolution && physicalField[iy * resolution + ix] > 1.1
-      }
-      const flow = (x: number, y: number): [number, number] => {
-        let vx = 0, vy = 0, weight = 0
-        for (const particle of fluid.particles) {
-          const d = (particle.x - x) ** 2 + (particle.y - y) ** 2
-          if (d < .035) { const w = .035 - d; vx += particle.vx * w; vy += particle.vy * w; weight += w }
-        }
-        return weight ? [vx / weight, vy / weight] : [0, 0]
-      }
-      if (!bubblesReady) { for (let i = 0; i < 240; i++) bubbles.step(1 / 60, level, submerged, () => [0, 0]); bubblesReady = true }
-      if (!still) bubbles.step(dt, level, submerged, fluidBlend > 0 ? flow : () => [0, 0])
-      c.save()
-      if (fluidBlend < .5) {
-        c.beginPath(); c.moveTo(-1.1, 1.1); c.lineTo(-1.1, surface(-1.1))
-        for (let x = -1.1; x <= 1.11; x += .015) c.lineTo(x, surface(x))
-        c.lineTo(1.1, 1.1); c.closePath(); c.clip()
-      }
-      // 水位回落期间不画气泡
-      const showBubbles = target.rotating || level <= requestedLevel + .003
-      for (const bubble of showBubbles ? bubbles.items : []) {
-        const alpha = bubble.state === 'popping' ? Math.max(0, 1 - bubble.pop / .22) : Math.min(1, bubble.age / .18)
-        c.globalAlpha = alpha
-        c.beginPath(); c.arc(bubble.x, bubble.y, bubble.radius, 0, TAU)
-        c.fillStyle = 'rgba(255,255,255,.62)'; c.fill()
-      }
-      c.globalAlpha = 1
-      c.restore()
-      // 柔和的球体光照：正面亮，右下边缘稍暗
-      const volume = c.createRadialGradient(-.28, -.38, .08, .08, .12, 1.28)
-      volume.addColorStop(0, 'rgba(255,255,255,.25)')
-      volume.addColorStop(.42, 'rgba(255,255,255,.06)')
-      volume.addColorStop(.66, 'rgba(178,218,255,.02)')
-      volume.addColorStop(.86, 'rgba(167,213,255,.05)')
-      volume.addColorStop(1, 'rgba(155,207,255,.08)')
-      c.fillStyle = volume; c.fillRect(-1, -1, 2, 2)
-      // 薄玻璃厚度
-      const rim = c.createRadialGradient(0, 0, .73, 0, 0, 1.01)
-      rim.addColorStop(0, 'rgba(255,255,255,0)')
-      rim.addColorStop(.53, 'rgba(194,227,255,.03)')
-      rim.addColorStop(.76, 'rgba(183,223,255,.06)')
-      rim.addColorStop(.89, 'rgba(245,252,255,.78)')
-      rim.addColorStop(1, 'rgba(172,218,255,.20)')
-      c.fillStyle = rim; c.fillRect(-1, -1, 2, 2)
-      const transmitted = c.createRadialGradient(.18, .84, 0, .18, .84, .48)
-      transmitted.addColorStop(0, 'rgba(236,250,255,.30)')
-      transmitted.addColorStop(1, 'rgba(236,250,255,0)')
-      c.fillStyle = transmitted; c.fillRect(-1, -1, 2, 2)
-      c.beginPath(); c.arc(-.23, -.84, .035, 0, TAU); c.fillStyle = '#fff'; c.fill()
-      c.restore()
-      c.beginPath(); c.arc(0, 0, .99, 0, TAU)
-      c.strokeStyle = 'rgba(159,210,255,.30)'; c.lineWidth = .013; c.stroke()
-      if (!still) frame = requestAnimationFrame(draw)
-    }
-    const resume = () => {
+    const wake = () => {
       cancelAnimationFrame(frame)
-      previous = 0
-      if (!document.hidden) frame = requestAnimationFrame(draw)
+      frame = 0
+      lastTick = 0
+      lastPaint = 0
+      if (!document.hidden) {
+        frame = requestAnimationFrame(drawFrame)
+      }
     }
-    resume()
-    repaintStill.current = () => { if (reduced.matches) resume() }
-    document.addEventListener('visibilitychange', resume)
-    reduced.addEventListener('change', resume)
+
+    wakeRef.current = wake
+    wake()
+    document.addEventListener('visibilitychange', wake)
+    reduced.addEventListener('change', wake)
     return () => {
       cancelAnimationFrame(frame)
-      document.removeEventListener('visibilitychange', resume)
-      reduced.removeEventListener('change', resume)
-      repaintStill.current = null
-      fluid.dispose()
+      document.removeEventListener('visibilitychange', wake)
+      reduced.removeEventListener('change', wake)
+      wakeRef.current = null
     }
   }, [size])
 
-  useEffect(() => { repaintStill.current?.() }, [percent, color])
+  useEffect(() => {
+    wakeRef.current?.()
+  }, [percent, rotating, color])
 
-  return <button type="button" className="water-orb" style={{ width: size, height: size }} aria-label={label} aria-disabled={!enabled}
-    onClick={() => { if (enabled) onPress?.() }}>
-    <canvas ref={canvas} style={{ width: size, height: size }} aria-hidden="true" />
-  </button>
+  return (
+    <button
+      type="button"
+      className="water-orb"
+      style={{ width: size, height: size }}
+      aria-label={label}
+      aria-disabled={!enabled}
+      onClick={() => { if (enabled) onPress?.() }}
+    >
+      <canvas ref={canvas} style={{ width: size, height: size }} aria-hidden="true" />
+    </button>
+  )
 }

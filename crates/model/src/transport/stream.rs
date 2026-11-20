@@ -1,5 +1,4 @@
-//! 与协议无关的 SSE 分帧和读取循环；每个事件的处理和最终回复的生成由 openai 模块里
-//! 各协议的解码器实现。
+//! 与协议无关的 SSE 分帧和读取循环；每个事件的处理和最终回复的生成由各协议的解码器实现。
 
 use reqwest::Response;
 use tokio_util::sync::CancellationToken;
@@ -66,7 +65,7 @@ impl SseFrameDecoder {
         } else {
             (line, &[] as &[u8])
         };
-        // Chat 和 Responses 的流事件内容都在 data 行里，忽略 event、id、retry 等其他 SSE 字段。
+        // Messages 和 Responses 的流事件内容都在 data 行里，忽略 event、id、retry 等其他 SSE 字段。
         if field == b"data" {
             if !self.event_data.is_empty() {
                 self.event_data.push(b'\n');
@@ -76,15 +75,20 @@ impl SseFrameDecoder {
         None
     }
 
-    fn finish(&self, malformed: fn(&'static str) -> ProviderError) -> Result<(), ProviderError> {
-        if !self.pending.is_empty() || !self.event_data.is_empty() {
-            return Err(malformed("event_frame_unterminated"));
+    fn finish(&mut self) -> Option<Vec<u8>> {
+        if self.pending.is_empty() && !self.event_data.is_empty() {
+            Some(std::mem::take(&mut self.event_data))
+        } else {
+            None
         }
-        Ok(())
+    }
+
+    fn has_unterminated(&self) -> bool {
+        !self.pending.is_empty() || !self.event_data.is_empty()
     }
 }
 
-/// 各协议的 SSE 解码器（Chat / Responses 各实现一个）。
+/// 各协议的 SSE 解码器（Messages / Responses 各实现一个）。
 pub(crate) trait SseStreamDecoder: Sized {
     /// 本协议的格式错误构造函数，参数是错误原因。
     fn frame_malformed() -> fn(&'static str) -> ProviderError;
@@ -111,7 +115,16 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
             return Err(provider_cancelled_error());
         }
         let Some(chunk) = chunk else {
-            frames.finish(D::frame_malformed())?;
+            if let Some(trailing) = frames.finish() {
+                decoder.dispatch_event(&trailing)?;
+                if decoder.protocol_complete() {
+                    return Ok(());
+                }
+                return Err(D::frame_malformed()("event_frame_unterminated"));
+            }
+            if frames.has_unterminated() {
+                return Err(D::frame_malformed()("event_frame_unterminated"));
+            }
             return Ok(());
         };
         let complete = frames.push(&chunk);
@@ -127,5 +140,5 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
 }
 
 pub(crate) fn provider_stream_malformed_error(message: &'static str, reason: &'static str) -> ProviderError {
-    ProviderError::diagnostic(ModelErrorKind::Other, message, vec![reason.to_string()])
+    ProviderError::diagnostic(ModelErrorKind::Other, message, &[reason.to_string()])
 }

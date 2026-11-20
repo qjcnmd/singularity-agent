@@ -3,7 +3,7 @@ import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import { formatTokenCount } from '../copy'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import type { ProviderConfigurationInput, RedactedProvider } from '../protocol'
-import { applyProtocol, blankModel, capacityConfigurationError, reasoningConfigurationError } from '../modelConfiguration'
+import { blankModel, capacityConfigurationError, reasoningConfigurationError } from '../modelConfiguration'
 import { ModelEditor } from './ModelEditor'
 import { Dialog } from './Dialog'
 import { ProtocolPicker } from './ProtocolPicker'
@@ -21,7 +21,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
   const [name, setName] = useState(provider?.displayName ?? '')
   const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? '')
   const [apiKey, setApiKey] = useState('')
-  const [protocol, setProtocol] = useState<ProviderConfigurationInput['apiProtocol']>(provider?.apiProtocol ?? 'chat')
+  const [protocol, setProtocol] = useState<ProviderConfigurationInput['apiProtocol']>(provider?.apiProtocol ?? 'messages')
   const [models, setModels] = useState<ModelInput[]>(() => provider?.models ?? [])
   const [modelEditor, setModelEditor] = useState<{ index: number | null; draft: ModelInput } | null>(null)
   const origin = actionOrigin.inline('model.saveProvider', providerId.trim())
@@ -38,7 +38,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
     if (!active) setModelEditor(null)
     // 收起动画仍保留组件；关闭编辑器时就丢弃未返回的查询。
     return () => { discoveryRevision.current += 1 }
-  }, [providerId, baseUrl, apiKey, active])
+  }, [providerId, protocol, baseUrl, apiKey, active])
   const saveError = state.actionErrors[origin]
   const commitModel = (index: number | null, draft: ModelInput): string | null => {
     if (invalidModelId(models, index, draft.modelId)) return '请输入有效且不重复的模型 ID。'
@@ -61,7 +61,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
     setFetching(true)
     try {
       const found = await appStore.transport.rpc('model.discover', {
-        providerId: providerId.trim(), baseUrl, apiKey: apiKey.trim() || null,
+        providerId: providerId.trim(), apiProtocol: protocol, baseUrl, apiKey: apiKey.trim() || null,
       })
       if (revision !== discoveryRevision.current) return
       if (found.length === 0) {
@@ -117,12 +117,13 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
         setFailure(`模型 ${id}：${capacityError}`)
         return
       }
-      const reasoningError = reasoningConfigurationError(model, protocol)
+      const normalized = { ...model, modelId: id }
+      const reasoningError = reasoningConfigurationError(normalized, protocol)
       if (reasoningError !== null) {
         setFailure(`模型 ${id}：${reasoningError}`)
         return
       }
-      submitted.push({ ...model, modelId: id })
+      submitted.push(normalized)
     }
     const result = await appStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl, apiProtocol: protocol, models: submitted }, apiKey.trim())
     if (result) {
@@ -163,7 +164,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
                     <div className="sg-model-row">
                       <span className="catalog-id">{model.modelId}</span>
                       <small>{model.maxContextTokens === null ? '' : `${formatTokenCount(model.maxContextTokens)} 上下文`}{model.reasoningVariants?.length ? ` · ${model.reasoningVariants.join(' / ')}` : ''}</small>
-                      <button type="button" className="quiet-button" onClick={() => setModelEditor({ index, draft: applyProtocol(model, protocol) })}>编辑</button>
+                      <button type="button" className="quiet-button" onClick={() => setModelEditor({ index, draft: model })}>编辑</button>
                       <button type="button" className="icon-button small danger" aria-label={`删除模型 ${model.modelId}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}><X size={14} /></button>
                     </div>
                     {reasoningError && <p className="form-error" role="alert">{reasoningError}</p>}

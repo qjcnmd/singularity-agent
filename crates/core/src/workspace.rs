@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::display_path;
 
 /// 已规范化的项目目录路径。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalWorkspacePath {
     native: PathBuf,
     display: String,
@@ -74,7 +74,7 @@ pub(crate) fn project_root(cwd: &Path) -> Result<PathBuf, String> {
             Ok(_) => return Ok(ancestor.to_path_buf()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(format!("project_root_marker_read_failed:{}:{error}", marker.display()));
+                return Err(format!("cannot inspect project root marker ({}): {error}", marker.display()));
             }
         }
     }

@@ -7,7 +7,7 @@
 |[已确认的取舍](docs/decisions.md)|审查、修复、精简之前。表里的条目不当缺陷报告，也不重复提议修改|
 |[架构说明](docs/architecture.md)|定位源码、判断状态由谁维护、确认运行边界|
 |[architecture.html](architecture.html)|改执行顺序、条件分支、失败或停止处理之前和之后|
-|[工作台交互](docs/desktop-ui.md)|改工作台界面之前|
+|[directory.html](directory.html)|查看代码分布和主要导出入口；增删源码文件或公开符号后|
 |[开发指南](docs/development.md)|构建、检查、打包|
 |[安装与配置](docs/INSTALL.md)|改配置文件、数据目录、指令或技能的加载规则|
 
@@ -30,8 +30,7 @@
 |`crates/protocol/src/` 中的 DTO 或 RPC|运行 `cargo run -p singularity\_protocol --features typescript --example export\_types`，更新前端调用方|
 |Rust 公共函数或类型|受影响的调用方|
 |执行顺序、条件分支、模块关系、数据流、失败或停止处理|同一改动中更新 `architecture.html` 对应的节点、连线和说明，对照源码核对；调整过布局就看渲染画面，文字和箭头要清楚|
-|模块职责、状态由谁维护、源码入口|`docs/architecture.md`|
-|控件的操作方式|`docs/desktop-ui.md`|
+|模块职责、状态由谁维护、源码入口|`docs/architecture.md`、`directory.html`|
 |命令或启动步骤|`docs/development.md`|
 
 ## 检查

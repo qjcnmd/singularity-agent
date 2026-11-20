@@ -1,275 +1,33 @@
-# Singularity 架构说明
+# 架构说明
 
-完整运行流程见根目录的 [architecture.html](../architecture.html)：所有流程和模块关系画在一张大图里，拖动画布移动，滚轮缩放；方向键和 Page Up / Page Down 移动，`+` / `-` 缩放，Home 回到起点。箭头表示顺序和分支，节点说明状态由谁维护，悬停可看源码位置。
+Singularity 是面向 Windows 本地的单用户桌面 AI 编程工作台，采用 Electron 前端 + Rust `stdio` JSON-RPC 后端进程架构。源码索引见 [directory.html](../directory.html)，完整执行与数据流见 [architecture.html](../architecture.html)。
 
-本文记录模块职责、状态由谁维护、主要流程的规则和源码入口。已经确认保留的设计见[已确认的取舍](decisions.md)，界面细节见[工作台交互](desktop-ui.md)，调试命令见[开发指南](development.md)。
+## 进程与通信
 
-## 设计原则
+- **Electron 主进程**（[main.ts](../apps/desktop/desktop/main.ts)、[backend.ts](../apps/desktop/desktop/backend.ts)、[preload.cts](../apps/desktop/desktop/preload.cts)）：维护单实例锁，通过 `SINGULARITY_HOME` 或 `~/.singularity` 派生 Chromium `userData` 目录并持久化启动主题颜色；托管 `singularity.exe` 子进程，通过 `singularity://app/` 加载静态资源，仅在受信任主框架转发 `rpc`、`connect` 与主题写入。
+- **Rust 后端**（[main.rs](../crates/app/src/main.rs)、[logging.rs](../crates/app/src/logging.rs)、[transport.rs](../crates/app/src/desktop/transport.rs)、[rpc.rs](../crates/app/src/desktop/rpc.rs)）：持有数据目录文件锁并初始化 `tracing` 滚动诊断日志（写入 `~/.singularity/logs/singularity.log`）；stdin 逐行接收 JSON-RPC 请求并派发至独立异步任务；stdout 由独立有界写入协程（`mpsc::channel(512)`）按序输出响应与 `StreamEnvelope` 事件帧，后端事件通道保留控制帧槽位并在非聚焦会话下过滤高频流式进度，避免阻塞与无界堆积。
 
-- **只显示真实发生的事**：时间线、运行状态和 Token 用量都来自已保存的记录和实际执行结果，不编造，也不静默丢弃。工作台和重新打开的历史走同一套执行流程和会话日志。
-- **轮换不丢历史**：轮换只追加用户消息整理内容，原始消息一直保存在日志里，随时可以回看完整对话。
-- **开发阶段直接改**：内部接口和保存格式直接更新，不加迁移或兼容层。
+## Rust Crates 分层与职责
+
+| Crate | 核心职责与入口 |
+| --- | --- |
+| `singularity_core` | 数据目录定位（`user_home.rs`）、规范工作区路径（`workspace.rs`）、分层 `AGENTS.md` 加载（`project_instructions.rs`）、`SKILL.md` 发现与规范路径去重（`skills.rs`）、原子写盘与中英文启发式 Token 估算（`lib.rs`） |
+| `singularity_protocol` | 共享 RPC 方法枚举（含 `session.focus`）、请求/响应 DTO、历史条目标识（`params.rs`）、运行期流事件与 TypeScript 契约导出示例（`export_types.rs`） |
+| `singularity_model` | 协议无关的模型客户端入口 `ModelClient`（`client.rs`）、`config.json` 读写与脱敏（`ModelConfigManager` + `context_window`）、`ProviderConfig` 与 `SelectedModel` 解析（`selection.rs`）、纯 LLM 语义消息模型 `Message`（不含前端展示字段）、全局 `reqwest` 连接池（`provider_client`）、SSE 切帧与终止帧校验（`transport/stream.rs`）、Messages（Anthropic 兼容 / DeepSeek）与 OpenAI Responses 双协议编解码（含思考签名与加密续接回传） |
+| `singularity_mcp` | `mcp.json` 校验与按 URL 凭据脱敏（`config.rs`）、`McpManager` 连接池（`lib.rs`，按 `(directory, server)` 复用 `ConnectionCell`、`skip` 过滤禁用项、锁外异步关闭淘汰连接）、工具调用不自动重放与原始描述/参数 Schema 保留（`client.rs`） |
+| `singularity_agent` | `Agent` 主循环（`agent/mod.rs`）、请求退避重试（`request_execution.rs`，最多 3 次、`Retry-After` 上限 60s、仅生成请求发 `MessageDiscarded`）、模块化上下文拼装与预览（`modules.rs`，所有 MCP 统一按工具粒度延迟加载，仅注摘要并经 `mcp_schema`/`mcp_call` 代理按需访问）、最多 8 并发工具调度及提问屏障（`dispatch.rs`）、纯内存消息压缩与原子组分块（`compaction.rs`）、零模型调用旧工具输出微压缩（80% 软阈值锚定水位线 `ToolOutputsPruned`）与自动/手动上下文轮换（`context_rotation.rs`，优先沿用最近实际 `input_tokens`，超窗时按剥离图片/压缩工具→压缩助手→分块滚动阶梯降级自救）、JSONL v1 会话日志（`SessionEntry::Message` 侧边独立保存 `MessageDisplay` 展示元数据）及尾行修复（`session/`）、内置工具（`bash` 进程树与 `OnceLock` shell 缓存、100KB 溢写与 `will_write_disk` 按需卸载、`read` NUL 二进制与 `limit=0` 拦截、`edit` / `write` 共用路径锁与原子写盘、20 MiB/16384px 图像校验） |
+| `singularity_app` | 工作台核心 `AppServer`（`desktop/app_server.rs`）、独立事件发布中心 `StreamHub`（`desktop/stream_hub.rs`，维护全局 `revision`、聚焦会话高频进度过滤与有界流通道高水位保护）、`tracing` 按大小滚动诊断日志（`logging.rs`）、单会话运行实体 `Conversation` / `ConversationView`（`runtime/conversation.rs`）、历史回放与累计用量聚合（`history.rs`）、会话文件目录 `ThreadCatalog`（`thread_catalog.rs`）与右侧只读文件读取（`file_view.rs`） |
+
+## 关键状态、锁序与缓存
+
+- **单向锁序**：`AppServer` 严格遵守 `lifecycle -> publication -> sessions -> 会话状态` 加锁顺序，不在锁内执行磁盘全量扫描、图片解码（`UserInput::from_uploads` 移至锁外）或长耗时网络 IO。
+- **会话内存上限**：`AppServer::sessions` 使用 `SessionCache` 限制最多缓存 `16` 个空闲已打开会话，超过时优先淘汰最久未访问且 `has_work() == false` 的空闲会话；重新打开时 `ConversationView` 以当前全局 `revision` 初始化事件序号。
+- **两段锁删除与停机**：`delete_session` 先在生命周期锁内标记 `closing` 并创建 `DeleteGuard`，锁外等待运行中操作与后台任务停止并清理磁盘目录；未打开的空闲会话直接在单次 `spawn_blocking` 中删盘。`shutdown` 通过 `JoinSet` 并发停止全部活跃会话后关闭 MCP 连接。
+- **前端状态单一来源**（`apps/desktop/src/`）：`SessionStore` / `AppStore` 持有与后端 `revision` 对齐的会话、目录和流式增量状态，断流/错误态收到 `ready` 或 `app_changed` 时恢复同步；`DraftStore` 按会话 key 250ms 防抖写入 IndexedDB 并在发送/删除/`pagehide` 时刷盘；`viewPersistence.ts` 保存视图状态与全局强调色（`accentColor`，兼容读取旧 `assistantBubble`）。
 
 ## 运行边界
 
-- 只支持 Windows x86-64 桌面。
-- 一个数据目录（默认 `~/.singularity`）只运行一个实例；`SINGULARITY_HOME` 可以指定另一个目录，给调试或自动化单独使用。
-- 渲染进程和 Rust 后端只走私有 stdio 管道，不监听 HTTP / WebSocket 端口；对外只连接用户配置的模型和 MCP 服务。
-- Agent 继承 `Singularity.exe` 的本机权限。项目只用于提供上下文和给任务分组，不限制文件访问范围。
-- 命令和 MCP 子进程放进 Windows Job Object，停止或异常退出时整棵进程树一起回收。
-
-## 模块职责
-
-| 模块 | 职责 | 源码入口 |
-| --- | --- | --- |
-| Electron 主进程与 preload | 窗口、托盘、原生对话框；隔离渲染进程与后端通信 | [main.ts](../apps/desktop/desktop/main.ts)、[preload.cts](../apps/desktop/desktop/preload.cts)、[backend.ts](../apps/desktop/desktop/backend.ts) |
-| React 工作台 | 用户输入、草稿、任务显示和界面状态 | [app.tsx](../apps/desktop/src/app.tsx)、[appStore.ts](../apps/desktop/src/appStore.ts)、[sessionStore.ts](../apps/desktop/src/sessionStore.ts) |
-| `app` | 组装后端、stdio RPC、项目与任务目录、发布事件 | [app_server.rs](../crates/app/src/desktop/app_server.rs)、[transport.rs](../crates/app/src/desktop/transport.rs) |
-| `app::runtime` | 任务的执行、停止、排队输入和历史读取 | [conversation.rs](../crates/app/src/runtime/conversation.rs)、[turn.rs](../crates/app/src/runtime/conversation/turn.rs)、[lifecycle.rs](../crates/app/src/runtime/conversation/lifecycle.rs)、[view.rs](../crates/app/src/runtime/conversation/view.rs)、[thread_catalog.rs](../crates/app/src/runtime/thread_catalog.rs) |
-| `agent` | 模型与工具循环、组装上下文、轮换、写会话日志 | [agent/mod.rs](../crates/agent/src/agent/mod.rs)、[session/mod.rs](../crates/agent/src/session/mod.rs) |
-| `model` | 模型配置、Chat / Responses 编解码、HTTP / SSE 传输 | [config/manager.rs](../crates/model/src/config/manager.rs)、[openai/provider.rs](../crates/model/src/openai/provider.rs)、[transport/http.rs](../crates/model/src/transport/http.rs) |
-| `mcp` | MCP 配置、按项目目录复用连接、发现和调用工具 | [lib.rs](../crates/mcp/src/lib.rs)、[client.rs](../crates/mcp/src/client.rs) |
-| `core` | 数据目录、工作目录规范化、原子写文件、工具定义与 Token 估算、项目指令、技能发现及全文加载 | [lib.rs](../crates/core/src/lib.rs)、[user_home.rs](../crates/core/src/user_home.rs)、[workspace.rs](../crates/core/src/workspace.rs)、[tool.rs](../crates/core/src/tool.rs)、[project_instructions.rs](../crates/core/src/project_instructions.rs)、[skills.rs](../crates/core/src/skills.rs) |
-| `protocol` | RPC 参数、结果、事件和 TypeScript 类型导出 | [rpc.rs](../crates/protocol/src/rpc.rs)、[params.rs](../crates/protocol/src/params.rs) |
-
-工作台通过 `app` 内的会话模块调用 `agent`。`model::Message` 同时用于模型回复、日志里保存的消息和下一次请求；Chat 和 Responses 在发送时才各自编码，公开历史只取可显示的部分。
-
-Agent 通过 `TurnEvent` 通知后端，后端再发布显示内容或运行快照；历史读取和实时事件共用 `HistoryItem` 与 `ThreadTurn`。每个条目自带运行、完成、失败或中断状态，工具另有等待执行状态，前端直接显示。当前回合中尚未开始的工具调用显示为等待；任务已结束或应用重启后，没有结果的调用显示为中断。工具调用和结果按条目 ID 合并为一项，流式正文只发送增量。回复保存后，按正文、思考和工具在消息中的实际顺序替换临时内容，后续工具进度更新原位置；重新读取历史使用同一套转换规则。
-
-
-### 管理页 RPC 与回复数据
-
-| 接口或字段 | 用途 |
-| --- | --- |
-| `instructions.read` | workspaceRoot 为 null 时读取全局 AGENTS.md，否则读取项目根目录 AGENTS.md；返回 path 和 content，文件不存在时正文为空 |
-| `instructions.save` | 同目录唯一临时文件写入后原子替换目标；失败清理本次临时文件并返回原错误，成功直接返回目标路径和本次写入的原文；下一轮开始时生效 |
-| `file.read` | 文件栏读取一个文本文件：路径可为绝对、`~/` 开头或相对任务工作目录；超过 2 MB、二进制或非 UTF-8 时返回原因 |
-| `SkillMetadata.path` | 点击技能项时在右侧文件栏打开对应的 `SKILL.md` 并展示路径 |
-| `HistoryItem.message.at` | 消息保存时间，显示用户发送时间及助手完成时间 |
-| `HistoryItem.message.stats` | 截至这条回复的会话累计用量（`SessionModelUsage`），只附在助手消息最后一段正文。读取历史时按日志顺序累计到这条消息；实时事件在 ProviderAttempt 累计后、发布 message/finished 时附上当时的累计，两者结果相同 |
-| `ThreadTurn.firstTokenAt` | 历史首 token 时间；实时界面在收到第一个非空增量时记录本地时间 |
-
-管理页由 `ManagePages.tsx` 调用现有 RPC 客户端；`SessionStore` 维护当前页面 `page`，由 `AppStore.setPage` 切换。打开管理页会更新选择序号，仍在提交的消息完成后不会把用户拉回会话。MCP 配置组件移到管理页，连接状态查询、编辑和操作忙碌状态由 `McpSettings.tsx` 自己维护；离页卸载时作废旧请求并停止轮询。
-
-`TimelineItem.tsx` 用每条消息的 stats 计算平均 TTFT、平均速度、总 token 和缓存比例。后台 bash 的工具结果包含 taskId，卡片据此查对应后台任务，随命令从运行变为结束、停止或失败。阅读位置继续由 `viewportAnchors` 保存，贴底动画和展开暂停由 `Conversation.tsx` 管理。
-
-`WaterOrb.tsx` 每帧按列计算水面高度并复用于该列像素；隐藏窗口暂停绘制，减少动态效果时只在水位、颜色、可见性或系统动态效果设置变化后重画。`markdown.tsx` 保留流式逐字渐显，按批将已完成动画的字符合并为文本，避免长回复一直保留逐字元素；停止和完成后直接显示全文。
-
-数据根目录由 `lock_data_directory` 在加锁前创建；模型、MCP 和项目配置的读写复用该目录。`sessions` 目录在首次创建会话时由 `SessionManager` 创建，图片目录和完整工具输出目录在首次写入时创建。
-
-## 状态由谁维护
-
-| 数据或状态 | 维护者 | 规则 |
-| --- | --- | --- |
-| 项目路径 | `app::WorkspaceStore` | 只保存规范化目录，保留显示大小写；RPC、任务分组和界面偏好以忽略大小写的目录为键，界面从路径取文件夹名；项目分组不影响工具权限 |
-| 任务运行阶段与停止 | `app::runtime::Conversation`、`TurnControls` | 会话决定能否开始新操作，单次上下文预览也计入占用并由会话持有取消信号；每个回合或独立轮换各有一份 `TurnControls`，负责提问和停止。接受停止和确定最终状态共用一把锁；操作结束或预览收尾时唤醒停止等待者 |
-| 尚未保存的输入 | 会话内的 `SteeringInbox` | 首条消息和后续消息共用一个内存队列，按顺序保存；运行快照列出待处理消息，图片按需从队列读取；重启后队列不恢复 |
-| 消息、工具结果、请求记录、用户消息整理内容、图片、完整输出 | `agent::SessionManager` 和会话附件目录 | 日志保存消息；图片在 `sessions/images/<id>/`，超长输出在 `sessions/outputs/<id>/`；轮换记录不删除原历史，删除任务时清理日志与附件 |
-| 创建任务时关闭的上下文模块 | `agent::SessionManager` | 创建时写入日志元数据，任务期间不变；全开时不写，读取时按空列表处理 |
-| 后台命令的查询和进程控制 | `agent::tools::BashTasks` | 界面和模型共用查询；已保存的终态从日志读取，内存只保留正在执行或收尾的命令和保存失败的结果 |
-| 公开历史和任务列表 | `app::runtime::ThreadCatalog` 与 `history.rs` | 按需从会话日志解析生成 |
-| 未保存的输出和最后事件序号 | `app::runtime::Conversation` | 只保存还没写入日志的正文、工具进度和轮换状态；事件序号来自 AppServer 的全局计数 |
-| 会话累计用量 | `history::accumulate_request_usage` | 读取历史和实时事件用同一套累计规则；运行状态只在内存保留累计以供实时回复附带统计，运行快照与任务列表不单独传出用量 |
-| 当前上下文用量 | `history::context_usage` | 后端从日志末尾读取最近普通请求的实际输入数，配上窗口大小（打开任务时取模型配置，每轮开始后用该轮解析出的值）；成功轮换或切换模型后清除旧读数，前端据此计算占用比例 |
-| 模型配置与密钥 | `model::ModelConfigManager` | 都存在 `config.json`，一次原子写入；协议在提供方上设置；对外目录隐藏密钥；每轮读取一次并解析模型选择，返回本轮使用的值 |
-| 本轮加载的上下文模块（指令、工具、Skills、MCP） | `ConversationView` | 加载完成时通过事件更新运行状态小面板，读取任务时补齐；普通运行状态不重复携带这些内容 |
-| MCP 配置与连接 | `mcp::McpManager` | MCP 管理页和执行共用一个实例，连接按项目目录复用；配置文件和设置接口共用 `protocol::McpTransportConfig`，省略的参数、环境变量和请求头按空值处理 |
-| 草稿、视图偏好、界面显示 | React 草稿存储、`AppStore`、`SessionStore` | 空白页共用一份草稿，已发送的任务按任务 ID 存草稿；历史读取和实时事件更新同一份回合列表 |
-
-Tokio 运行时由 `main` 持有。`Conversation` 直接持有不可变的任务身份、工作目录、已关闭模块（`thread_id`、`cwd`、`disabled_modules`）、会话写者和输入队列，可变模型选择（`model`）与运行阶段、关闭标记及单次预览控制放在 `ConversationState` 中；所有保存都经过同一个写者，`ConversationView` 只保留当前操作的临时显示条目，读取时与已保存历史合并，操作结束后清除。
-
-普通提交、独立轮换和后台续跑在 `lifecycle.rs` 检查各自的启动条件，然后共用一次建立停止控制、占用任务和发布运行状态的步骤。`view.rs` 负责历史读取、临时显示内容和事件发布；后台命令完成通知在 `background.rs` 中触发后续回合。
-
-## 一轮执行
-
-空白页没有后端会话，输入区上方显示项目选择和上下文胶囊；胶囊列出本任务会注入的指令、工具、Skills 和 MCP 服务器，关掉的模块在创建任务时随第一条消息写入日志。会话创建后输入区只显示附件、模型和发送控件。首次发送调用 `session.start` 创建会话并接受第一条消息，后续消息使用 `session.submit`。点击发送时确定项目、模型、草稿和当前页面，并将图片编码为 data URL；其他附件只传绝对路径。正文中只保留原始文字，不额外传递技能路径。后端接受时检查附件路径指向现有文件，保存用户消息时把路径列表追加到模型读取的正文，界面显示的原始文字放在 `display_text`，路径另存在消息的 `files` 中，用于历史里的文件卡片。首次发送只读取当前任务，返回任务摘要、运行状态和该任务的事件序号，前端直接加入列表；若发送期间没有切换页面，则直接打开新任务，读取正文的结果不影响发送结果。发送成功后清理未被继续编辑的草稿，失败则保留草稿。
-
-`DraftStore` 首次读取 IndexedDB 失败时，以空草稿继续编辑。后续编辑照常保存，允许覆盖当前任务的旧草稿；发送后清空、删除任务和移除项目照常清理草稿。草稿读取、自动保存和清理失败都不弹提示；自动保存失败时保留内存内容，清理失败也不影响已完成的任务删除或项目移除。
-
-技能引用以空白分隔，手动输入和候选选择都只写入 `/技能名`。`AppServer::start_session / submit` 接受输入前，由 `UserInput::from_uploads` 按当前目录解析可由用户调用的技能，按首次引用顺序去重并完整读取入口；原文后附技能名称、绝对路径、资源基准目录和全文。读取失败直接返回发送错误，首次发送不创建任务，后续发送不进入队列。输入构造一次完成校验、图片解码和技能读取，队列分别保存原文和技能追加段；Agent 消费时拼接附件路径，写入用户消息的 `content`，原文放在 `display_text`，历史恢复沿用保存内容。正文可包含多个引用，未知名称、路径和紧贴标点的词保持原文。没有技能引用时不扫描目录。技能目录只扫描直接子目录中的 `SKILL.md`，不接受根目录下平铺的 Markdown 文件；模型自动选择技能时按目录提示调用 `skill` 工具加载。
-
-输入检查通过后进入队列。会话空闲时立即创建本轮的 `TurnControls`，准备、执行和收尾都用它。准备阶段由 `Conversation::prepare_request_context` 解析模型、读取当前项目指令，再写入回合开始记录。Agent 随后扫描技能、发现 MCP 工具（跳过本任务关闭的服务器），按 `agent::agent::modules` 的模块组装本轮的指令和工具定义；同一轮的工具循环和自动轮换都复用这份定义，下一轮（包括重启后的第一轮）重新读取。全局和项目指令完整读取，不截断。
-
-每个上下文模块自带 Developer 片段、工具定义和估算 Token，模块之间互不引用：基础模块不提可选工具，各工具的一行用法跟着工具走，关掉一个模块时它的提示词和工具一起消失。工具说明只随工具定义发送；`bash` 和 `task_*`、系统提示词是锁定模块，其余模块按创建任务时记下的 ID 关闭。系统提示词、全局指令、项目指令、`bash`、`task_*`、`read`、`edit`、`view_image`、`ask_user_question`、Skills 各一个模块，MCP 每个服务器一个；关掉的 MCP 服务器不连接，也不进入本轮模块清单；运行面板只显示开启的模块。新建任务页的 `context.preview` 复用同一份组装代码，MCP 用已有连接缓存的数字，不连接服务器。
-
-本轮加载的模块清单保存在 `Conversation` 中供运行状态小面板查看，由加载完成事件更新，并在读取任务时返回完整内容；输入排队、停止、提问和轮换等运行状态更新不重复发送。下一轮加载后替换。重启后还没跑过回合时，工作台通过 `session.context` 让 `Conversation::inspect_context` 按回合开始时的同一套规则加载一次（指令文件、Skills 目录、MCP 工具），结果同样以 context/loaded 发布；本次启动已有上下文时直接沿用。
-
-预览同一时刻只登记一次；新操作、模型设置更新或关闭会取消旧预览，已取消的结果不发布。RPC 将退出取消信号传入预览，等待预览清除登记后完成；停止也会等待登记清空，项目在预览期间按既有占用规则拒绝移除。每次模型请求携带本轮完整指令和工具定义；工具说明随工具定义发送，不在 Developer 指令里重复列清单，完整工具定义也不写入历史。
-
-新任务页的上下文查询在没有项目或连接未就绪时为空闲态，清除旧结果；具备读取条件后才显示加载，切换项目作废旧请求。手动轮换的成功提示直接跟踪本次轮换条目的终态，失败、停止或无需轮换不显示成功勾；只保留成功提示的显示计时，切换任务由组件重新挂载清理。
-
-本轮指令和工具定义的 Token 预算在加载完成时计算一次，普通请求和整理请求复用这个值；下一轮重新加载和计算。
-
-内置工具由模块提供 `core::ToolDefinition` 和对应参数解析函数，只注册本任务开着的模块，发送给模型时复用该定义；`skill` 工具随 Skills 模块注册，按本轮技能目录加载入口；MCP 连接与服务器描述仍由 MCP 模块维护。
-
-Agent 按顺序保存并消费队列中的输入。准备失败时保留队列；用户停止时清空尚未消费的用户消息。回合结束后会话释放占用并检查队列：有待处理输入且允许自动继续时，创建下一轮的 `TurnControls` 并执行。新提交和回合结束共用会话的状态锁，AppServer 只转发已经构造好的事件。
-
-启动、运行和收尾期间都接受追加输入，停止期间拒绝；准备期间也能停止。队列只负责保存，能否开始新操作由 `Conversation` 决定。组装请求前先交付已到达的输入；轮换期间收到的消息进入下一次普通请求。
-
-回复达到输出上限时保留已生成的内容，即使只有思考或没有正文，也保留真实用量并按截断处理；回合保存失败原因并提示继续，其中没写完的工具调用只保存错误结果，不执行。Responses 的拒绝正文和普通正文走同一套增量处理。解码器在失败和取消时交回已生成的正文和思考，普通请求保存为带请求结果的助手消息；历史按请求结果显示失败或中断，这些消息不进入后续模型上下文或轮换。
-
-## 上下文轮换
-
-`agent::session::context` 从完整会话日志生成模型上下文。每次轮换使用一次模型请求，更新整份用户消息整理内容。助手回复和工具结果供模型理解用户表达的背景。助手工作进度、判断和执行结果留在原始日志中按需回读，更新已有整理内容时也沿用这一范围。原始消息、图片和完整工具输出继续保存在会话中。
-
-正常用户消息进入模型上下文时，附上日志已有的 UTC 时间，形式为 `[10-31 15:06:32]`。工具结果和后台通知附上明确标识的记录时间，供其中的用户回复或外部选择记录引用；它不代表外部操作的精确发生时间。日志原文和界面显示不改。整理正文在预算内优先逐条保留用户原话及时间，问答保留选择和必要的问题背景；没有新增用户表达时沿用已有文字，只有接近整体预算才合并重复、调整详略。
-
-自动轮换在下一次模型请求前检查占用，达到窗口的 90% 时触发。手动轮换使用同一套逻辑。`ContextRotationInput::select` 取得完整当前上下文，没有新增对话时直接结束，不加载模型、指令、技能或 MCP。请求末尾以程序指令追加整理要求，正文目标为 8192 Token；模型一次输出完整新版，首次生成和后续更新使用同一提示词。请求的硬输出上限沿用模型配置，并受窗口剩余空间约束。
-
-`RequestContext::rotate_selected` 分配轮换条目 ID。正文未截断且非空时，追加 `context_rotation` 记录，其中 `userMessages` 保存完整新版整理内容。记录所在位置就是分界。下一次上下文由当前指令和工具、接手提示、最新版整理内容，以及这条记录之后的正常消息组成。接手提示作为程序指令提供日志路径和工作目录，整理正文作为单独的历史材料，由模型决定何时检查环境或回读历史。整理对象包括实际用户发言和问答回复；文件指令、技能正文、接手提示、后台通知及整理要求不属于用户表达，即使传输角色为 user 也不收入正文。更新时同样移除上一版混入的这些内容。
-
-独立轮换在保存前关闭停止入口，此前接受的停止使轮换中断，开始提交后拒绝停止。自动轮换只检查本轮取消信号，后续模型和工具循环仍可停止。失败、取消或无需轮换时保留原上下文。保存成功后自动轮换继续原任务，手动轮换回到空闲并处理已经排队的输入；没有排队输入时等待用户继续。轮换期间新收到的输入由现有队列保存，随后进入正常请求。
-
-普通请求被提供方明确拒绝为上下文超限时，最多尝试一次同样的上下文轮换并重发。整理请求也超限或失败时保留原上下文并报告原因。自动轮换的错误关联到当前失败条目，重开任务可查看原因；独立轮换失败时暂停自动继续。
-
-### 请求预算与缓存
-
-普通请求和整理请求共用消息投影、工具定义和 Token 估算。工具结果按调用 ID 配对，没有结果的调用补为“结果未知”。用户时间和图片说明同时计入请求与预算，图片在写者锁外读取。内置工具和 MCP 共用 `core::ToolDefinition`，工具列表由 `core::estimate_tool_tokens` 估算。
-
-预算优先使用本轮当前模型最近一次普通回复的实际用量，再补算新增消息。每轮首次、换模型或轮换后重新估算。估算规则仍由 `core::estimate_tokens_of` 维护；它不能保证一次新增的消息或工具结果一定落在剩余空间内。思考文本也计入估算。
-
-整理请求保留本轮指令、工具定义和完整当前对话，末尾追加整理要求。当前已有的接手提示和用户消息整理内容保持原位置，尽量复用提供方的前缀缓存。请求组装与正文检查集中在 [context_rotation.rs](../crates/agent/src/agent/context_rotation.rs)。
-
-## 工具
-
-工具参数在注册表里检查。Bash 的命令和说明都必须是字符串，说明至少含一个字符（空格照常保留），与发给模型的定义一致；不满足时沿用工具参数错误的保存路径。最多同时运行八个工具（含 MCP）：每完成一个就保存结果、发布完成事件，再启动下一个。实时完成事件与历史读取共用 `message::public_tool_result`，从工具结果消息生成正文、图片、错误、耗时、源文件行号和后台任务 ID。工具结果的 `content` 仅供模型读取，`display_output` 在展示内容不同时保存界面正文，`background_task_id` 用于关联原始 bash 卡片；提供方编码不发送这两个本地字段，前端不再从模型正文解析任务 ID。提问工具先等其他工具结束，再单独执行。保存失败时不再启动剩余调用，取消并等待已启动的工具结束。
-
-Bash 用 Tokio 异步读取 stdout 和 stderr，同时等待主进程退出、超时或取消，不用读管道线程或轮询。进度回调异步发送到有界队列，队列满时等待消费，不阻塞运行时线程。Bash 和 MCP 子进程都通过 `process-wrap` 加入 Job Object 并隐藏控制台窗口。前台命令结束（含正常退出、超时、取消或错误）时先通过 Job Object 终止整棵进程树，最多等 5 秒回收主进程，再最多用 2 秒读完剩余输出；管道超时未闭合时停止读取并附加截断提示，关闭作业句柄时终止残留后代进程。写完整输出文件的同步 IO 放在 `block_in_place` 里，不占用运行时线程。
-
-Bash 的 stdout/stderr 各自保留 UTF-8 与 ANSI 解析状态，经 `vte` 清除模型不需要的终端控制序列后按接收顺序合并。模型纯文本和界面原始彩色输出分别捕获，复用相同的截断规则；每份尾缓冲最多 100 KiB，长输出分别产生完整文件，前台短输出不额外落盘，转入后台后纯文本输出持续保存到文件。跨块控制序列在过滤不可见字符之前解析，不改子进程的颜色环境。模型读取游标只计算纯文本 UTF-8 字节，状态和提示不计入正文。
-
-MCP 的结果和 Bash 的两种输出视图共用一套捕获：最多显示 2000 行或 50KB，接收输出时首次超限就在 `sessions/outputs/<id>/` 创建文件保存完整文本，后续输出继续追加；读取进度和结束捕获只生成显示内容及文件位置。输出目录由会话提供，经工具执行上下文传给捕获器；前台转后台时沿用同一份捕获状态。接收、预览和最终结果共用截断与文件说明规则；未截断的最终结果直接移交已捕获的正文，运行中预览仍保留捕获状态。保存失败只报告原因，不重试。结构化内容和文字里的同一份 JSON 只保留一次。轮换、停止和重新打开任务保留完整输出；删除任务先停止执行，再清理图片、完整输出和日志。
-
-## 后台命令
-
-`Conversation` 持有后台进程管理器，普通回合结束不会关闭它。`bash` 用 `yield_time_ms` 控制等待时间：默认 10 秒，允许 0～30000 毫秒；为 0 时启动成功就返回任务 ID，等到时间仍未结束就返回同一进程的 ID，不重新执行。总时限只由可选的 `timeout_ms` 指定，转到后台后沿用；不指定时一直运行到退出或被停止。
-
-模型用 `task_list` 查看后台命令，用 `task_output` 立即读取新增输出，用 `task_stop` 停止单个命令。`task_output` 只接收任务 ID，没有等待参数或模型维护的游标。运行中的 `BashTasks` 为每个命令保存已返回的字节位置和是否已交付终态；启动结果、主动读取和完成通知共用这份内存状态，界面读取不消费它。主动读取与通知按同一把锁取得最新快照并推进位置，不重复交付正文，已通过主动读取交付的终态不再产生通知正文。这份状态不持久化；重开后的历史查询从保存记录读取。
-
-转入后台时保存完整纯文本输出文件，后续输出持续追加，模型可用 `read` 或搜索回看旧内容。原有尾部保留和显示上限继续生效，超限时说明省略范围及文件位置；文件写入失败直接报告。界面继续显示累计彩色输出。后台开始和终态记录沿用现有日志结构，不接管旧 PID。
-
-`BashTasks` 通过会话写者保存开始和最终状态；进度只在内存中更新并发布。每次更新释放数据锁后，直接调用 `Conversation::on_background_update`，完成发布再处理该命令的下一次更新；中间没有转发队列或监听任务。任务读取与事件发布仍共用会话视图锁，旧进度不会晚于较新的命令状态发布。开始记录和进程条目一起登记，查询不会把刚启动的命令误认为历史中断。命令自然结束时，保存终态、把通知放进输入队列，再发布最终状态并释放进程条目；`Conversation` 负责启动待处理的回合。后台完成结果区分进程回收失败与日志保存失败，保存失败先暂停自动继续，再发布保留在内存中的失败任务和会话错误，界面立即结束运行显示；两种失败都保留内存条目，`task_output` 和单独停止仍报告真实原因；关闭等待只返回回收失败，已结束进程的旧保存错误不阻止删除任务。查询以最后保存的终态为准，只有仍为运行中的记录才读取实时输出；没有对应活进程的运行记录显示为中断。
-
-回合结束和后台唤醒共用一个入口：检查空闲、允许自动继续、会话未关闭、队列非空。输入队列只保存命令 ID；真正交付通知时取未读正文与最终状态，保存为内部通知，不伪装成用户消息。模型有独立工作就继续，没有独立工作则结束本次响应，命令完成后自动续跑，不使用查询或 sleep 等待。用户停止前台会暂停自动继续，后台命令继续运行；下一条用户消息恢复。单独停止后台命令不触发模型继续。停止操作只在任务不存在、进程回收或终态保存失败时报错；命令自身的非零退出码留在命令结果中。模型工具仍按命令结果判断成功或失败。
-
-实现参考了 [Codex 的命令工具](https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs)、[会话进程管理](https://github.com/openai/codex/blob/main/codex-rs/core/src/unified_exec/process_manager.rs)和 [Claude Code 的后台命令](https://code.claude.com/docs/en/interactive-mode.md#background-bash-commands)。后台增量读取和携带输出的完成通知同时参考了 [DSH 的作业工具](https://github.com/deepseek-ai/deepseek-harness/blob/ce7073d51254c26cd63b22a60835b8f948deb447/packages/jobs/tool-jobs/src/index.ts)与 [OpenCode 的 shell 工具](https://github.com/anomalyco/opencode/blob/69269e4ebe309a08919b3c9be7948b9fd699c3a4/packages/core/src/tool/plugin/shell.ts)。本项目不引入交互终端、远程执行或重启接管。
-
-`bash::Process` 直接持有进程和 Windows Job Object，负责启动、读取输出、超时和回收。前台转后台时移交同一个 `Process`；结束时先终止并等待整棵进程树，再收完输出并返回结果。
-
-## 模型请求
-
-`OpenAiProvider::complete_stream` 在同一个协议分支里完成请求编码、选择端点和解码，续接数据使用实际请求的端点。提供方地址填 API 根，保留完整的自定义路径，再追加接口路径。SSE 切帧器接受 CR、LF、CRLF，跨数据块的 CRLF 只算一个换行；只忽略流开头的 UTF-8 BOM。
-
-自动重试只用于网络故障、超时、限流、请求冲突和服务繁忙，最多尝试三次；未知的提供方错误直接显示。重试遵守服务端要求的最短等待，等待期间可以停止。模型请求与模型列表查询共用 HTTP 状态分类：408、409、429 和 5xx 归为暂时失败；列表查询仍由用户手动重试。响应体里有已知错误码（如上下文超限）时以错误码为准。
-
-已经显示部分正文或思考时，符合条件的故障仍自动重试。重试前移除本次未完成的输出，保留请求记录和已上报用量，再重新生成整次回复；失败片段不进入模型上下文。等待期间任务保持运行，不单独显示重试提示。最后一次失败时保存已有正文和思考供查看，并显示错误。
-
-模型选择在配置、RPC、草稿、运行状态和会话设置中统一用 `ModelSelection`（提供方、模型、思考档位）。空白页用全局默认值填充选择；首次发送必须带明确的模型，日志的第一条记录保存该选择。已有任务始终使用最后保存的选择，全局默认值变化不替换它。思考档位只取任务保存的选择；未选择时使用提供方默认行为。档位直接用提供方的名称，开关在协议编码时转换。Responses 按原顺序保存正文、思考和工具调用，编号、阶段、签名和加密内容跟随对应内容块。提供方私有字段只发给原来的提供方、模型、协议和地址。Chat 续接保留提供方实际返回的思考字段，包括合法的空字符串。显示思考在首个非空文本到达时固定来源；同一块中顶层思考优先，随后流式增量、成功、失败及取消后的最终文本始终使用同一来源，私有 `reasoning_details` 仍完整保留供续接。object 型 usage 在收到时直接解析为用量；无效 object 覆盖为未知，缺失或非 object 不覆盖已有值。
-
-正常未截断回复直接检查内容块中是否有非空白正文或工具调用，并逐调用校验 ID 非空且唯一、名称非空；长度截断保留既有例外。校验不拼接整段正文，也不构造工具引用列表。
-
-Chat 的 `on` 只适用于 `thinking_type` 和 `enable_thinking` 开关字段；默认的 `reasoning_effort` 字段和 Responses 协议使用具体档位或 `off`。模型编辑器按这条规则提供选项，保存表单和后端读取配置时也检查；已有无效选项保留供用户修正。
-
-模型发现只返回当前提供方的模型 ID。导入只添加尚未配置的 ID，容量和思考选项由用户手动填写；已有模型的参数保持原值。切换模型 ID 时保留已填写的参数。查询失败显示 HTTP 状态及提供方有界错误正文，正文读取失败附实际读取原因；目录直接过滤、排序并去重模型 ID，不构造中间条目列表。
-
-模型配置由 `ModelConfigManager` 读写；保存或删除成功后直接从写入的配置生成隐藏密钥的目录，`AppServer` 在发布锁内递增序号并返回该目录，修改失败直接返回原因。增删项目或删除任务成功后异步发布目录快照，读取任务列表失败不影响已保存的结果。`config.json` 的读写入口在 [config/user/mod.rs](../crates/model/src/config/user/mod.rs)。模型、MCP 和项目登记都用 `core::write_json_atomic` 写文件（缩进 JSON、末尾换行、原子替换），各自负责建目录、错误提示和写入成功后更新内存。替换文件直接使用标准库的 `std::fs::rename`，写入临时文件后仍先刷盘。
-
-## 用量
-
-普通回复把消息、实际用量和耗时写进同一行日志；最终失败或取消时，已有的正文和思考也按同样方式保存。需要重试的失败尝试、没有可显示内容的失败和整理请求单独记录。重试和取消时已上报的用量也计入合计。
-
-模型回复和请求记录共用 `protocol::ModelUsage`。每次请求结束后先保存，再更新内存中的累计用量与运行快照的当前上下文用量；单次请求记录和模型设置保留在日志里，不转成界面历史条目。每次请求使用一条日志记录的 ID，保存回复或单独的请求结果时沿用它；重试分配新 ID，请求结果内不重复保存 ID。输入和输出计数都有效时才算有用量；总数优先用提供方上报的值，没有时取输入与输出之和。缓存计数可选；没上报不当成零，明确的零照常保存。
-
-## 会话日志
-
-会话文件以换行作为一行完成的标记。只读打开时忽略没有换行的末尾，写打开时截掉它；完整行解析失败仍报告实际错误。创建任务时独占新建日志，直接写入文件头和初始模型设置；读取时检查第一条记录含模型选择，后续记录可以更新选择。
-
-历史从首条回合开始记录起分组，初始模型设置不生成空回合。回合 ID 同时用作开始记录的 ID，结束记录引用它；每个历史回合还有开始时间和状态，没有结束记录时显示中断。实时事件由回合开始事件创建回合，其余事件更新已有回合；读取历史已经包含该回合时，开始事件保留其中的内容。独立轮换显示在最近一轮内。
-
-完整历史投影按记录顺序共享一次局部用量累计：只在首回合前初始化，随后逐回合推进，每条回复仍附截至当时的累计值。实时消息的时间同样使用日志追加返回的保存时间，重新打开历史保持一致。
-
-任务摘要直接逆序读取最近一条回合开始或结束记录，确定末轮状态；更新时间取最近一条非元数据记录，修改模型设置或任务名称不刷新时间。只有读取完整历史时才划分全部回合。后台命令、轮换和请求记录不改变回合划分。
-
-图片先写入独立编号的文件，写完才在日志里保存引用；重试写入相同内容。保存、读取和删除图片共用 `agent::session::session_images_directory` 生成目录。预览已打开任务的图片时，从输入队列或当前写者的记录里查找，不重新解析整份日志；未打开的任务从文件读取。
-
-数据文件的位置、备份和维护见[安装与配置的数据目录章节](INSTALL.md#数据目录)。
-
-## 工作台同步
-
-RPC 在一张方法匹配表中分发；文件读写进入阻塞工作线程，网络查询和停止等待直接异步执行。退出时取消网络查询；上下文预览沿 RPC 接收退出取消信号并完成收尾，传输层先收齐已接受的 RPC，再停止各会话。
-
-工作台事件经单消费者队列依次写到 stdio，不丢事件。连接状态由 `RpcClient` 管理；`SessionStore` 收到就绪事件后直接读取工作台，其余事件由 `sync` 更新状态。项目和历史读取分别显示加载和错误。RPC 错误只携带实际原因，界面在操作处显示原因。应用目录快照带上各任务的当前阶段和未保存的错误，刷新页面后侧栏仍能显示准备失败或保存失败。目录读取失败直接显示原因，由用户重试。
-
-时间线的历史行只随 `facts` 与末轮保存失败标记重新派生，相邻思考、工具分组和耗时行保留稳定引用；运行时错误、提问和排队消息随后单独组合，无关用量、上下文或后台进度不触发历史重建。同回合内相邻思考仅在展示层合并，保留首项 ID 和各段原文，不跨越工具或正文；相邻同名工具在展示层分组，保留各条原对象和顺序，提问保持独立；组内详情与计数共用后台状态解析，阅读位置记录到组首条。其他条目保持 `HistoryItem` 原对象，由组件直接读取类型、状态和内容。耗时与回合错误单独插入，停止和中断条目携带已记录的回合结束时间。计时依据回合自身状态；准备新回合或独立轮换不会让上一轮重新开始计时。组件通过原对象引用跳过未变化条目的重绘。
-
-标题和正文实际改变展开状态前共用锚点保护通知，保存阅读位置并暂停贴底 400ms；拖选、链接与正文内控件不触发正文收起，也不发该通知。
-
-主题与气泡变量写入后解析强调色，再经 Composer 明确传给水球画布，颜色更新不依赖无关状态渲染。翻滚时只构造一次原始粒子场，气泡湿区判断直接读取，水面由该场水平、垂直模糊生成。
-
-读取任务时，已保存的正文、思考、用户消息整理内容和工具结果优先于同 ID 的临时内容。临时内容只补未保存的条目，或更新尚无结果的工具进度；保存完成而完成事件尚未处理时，读取也不会退回旧内容。
-
-历史图片读取失败属于请求材料错误，日志仍可写时保存真实失败原因；不把它归为日志写入失败。保存失败时，结束快照让当前页面里尚未结束的正文、思考和工具停止显示运行状态，保留临时内容并显示一次实际错误。它不补写历史或结束时间；重新读取仍以已保存的日志为准。准备失败不改变上一轮的结果。
-
-创建任务在 RPC 结果里返回同一时刻的任务摘要、运行状态和该任务的事件序号，不扫描其他任务。首次发送只更新对应任务，不改变整个目录的序号；较早生成的目录更新仍生效，并保留读取开始后收到的新任务或新摘要。`SessionStore` 把摘要加入列表后打开会话，与选择已有任务共用读取入口。用户消息保存、任务改名和操作结束直接推送该任务的摘要，替换列表中的一行并按更新时间排序，不触发全目录读取。
-
-读取任务期间暂存实时事件，按读取开始时的全局事件序号比较读取结果和事件，丢弃过时的响应；不能用发送事件时的序号替代读取开始时的序号。每次读取完整历史；切到空白页时作废未返回的读取并回放暂存的事件。读取失败时保留草稿和停止按钮，重试后恢复正文。阅读位置保存条目 ID 和偏移，临时输出借用相邻的已保存条目定位。
-
-后台命令统一保存在前端的 `liveSessions` 中：读取任务时接收完整列表，之后只由后台命令事件更新；普通运行状态和操作结束快照不携带后台输出，也不扫描后台历史。未选中的任务只保留运行阶段、错误、后台命令，以及运行状态和摘要的事件序号，不缓存完整上下文、输入队列或用量。
-
-模型读取、保存和删除直接返回脱敏目录及新序号；前端只更新模型列表。设置页的“重新读取”使用 `model.read`，只读取 `config.json`，不扫描会话日志。序号防止晚到的旧目录覆盖刚保存的配置。完整工作台读取只用于初始化、显式重读和项目或任务增删，不是局部操作成功的前提。
-
-未提交的问答按任务和问题保存在 `SessionStore` 内存中，切换任务时保留，提交成功或后端确认问题结束后清除；刷新页面后需要重新填写。
-
-文件标签统一目录末尾斜杠，解析为规范化的小写 `file:///` URL 作为键，同一文件的相对路径、绝对路径和不同斜杠写法共用一个标签。
-
-导航、输入候选、模型与项目选择、发送和复制等纯控件禁止选字，点击直接执行；正文内的链接、图表和可折叠内容检查拖选，防止复制文字时触发展开、收起或跳转。Skill 候选使用技能目录条目，输入前缀筛选本次目录；切换任务、项目、关闭技能输入或进入等待回答时作废未完成的读取结果；候选请求、显隐、键盘处理和 ARIA 共用同一启用条件。
-
-任务菜单、模型、协议和气泡调色盘浮层共用原生 Popover 的显隐、层叠和关闭行为：任务菜单和协议下拉通过 CSS 锚点跟随触发按钮定位；模型浮层在展开时按触发按钮计算固定位置，打开期间切换模型导致按钮宽度变化时不移动；气泡调色盘按右键指针坐标定位。项目选择菜单使用 CSS 锚点定位与 `Disclosure` 展开过渡。组件只处理选择、焦点和方向键操作。调色盘的弹出和选中动画用 motion，和消息出现共用同一套弹簧。具体位置和间距见[工作台交互](desktop-ui.md#弹窗与浮层)。
-
-## MCP
-
-`McpManager` 按项目目录复用健康的连接；关闭 SDK 的工具目录缓存，每轮首次组装定义时直接查询服务器，查询失败不返回旧目录；取消发现时终止并等待本次服务器子任务收尾，再返回调用方。本任务关掉的服务器不连接，也不出现在本轮的模块清单里。模型看到的工具定义来自本轮的实际目录，执行时在同一份目录里检查名称和参数。设置变化下一轮生效；服务器在运行中移除工具时，调用直接失败，不重试；HTTP 会话过期也不由 SDK 重新初始化并重放本次调用。发送和响应共用本地调用时限，停止或超时后的取消通知最多再等三秒；通知失败返回原因，保留共享连接，不打断同服务器的其他调用。
-
-连接为 MCP 管理页和新建任务页保留最近发现的工具名称、说明和估算 Token；完整工具定义交给本轮执行，包含参数格式的定义不随连接长期保留。`McpTool` 持有共享的 `core::ToolDefinition` 及调用连接，注册表直接使用这份定义，不重新映射字段。
-
-MCP 图片直接把 Base64 内容交给图片入口解码，按实际字节识别格式，与上传和文件读取共用图片检查与保存；不先拼成 data URL 再拆开。图片损坏时保留工具返回的文字，并将该工具结果标为错误。
-
-列表读取、保存和删除都一次返回完整配置、当前项目的已有连接状态和最近发现的工具，界面不逐个查询服务器。读取不会启动服务或查询远端；页面挂载时每次读取结束后等一秒再批量刷新，任务新建立的连接也会更新到页面；组件自己的忙碌状态暂停轮询并禁用保存、取消等操作，离页卸载时作废旧请求并停止计时。读取失败停止自动刷新并显示原因，可点击“重新读取”恢复；保存失败保留表单。只有失败状态显示“重试连接”，通过独立的 `mcp.reconnect` 重建当前项目的连接并发现工具，连接失败随服务器状态返回。
-
-本地服务器放在 Windows Job Object 里，关闭句柄时终止整棵进程树，后端异常退出也会回收。
-
-## 删除、移除与退出
-
-删除任务先禁止该任务接受新操作，等执行结束后删除日志和附件；失败则恢复。删除成功后旧会话对象保持关闭，异步收尾不能重新启动它；草稿另行清理，读取草稿失败不阻止删除。
-
-移除项目时，在应用生命周期锁内检查该项目的会话是否有执行、上下文预览、后台命令或待处理输入，有则拒绝；否则注销项目和已加载的会话，关闭该目录的 MCP 连接。会话文件保留，重新添加项目后按需打开。前端按当前任务列表清理对应草稿。
-
-删除单个任务直接等待该会话停止：先取消并等待上下文预览、前台操作和轮换，再停止后台命令并等待完成。进程回收失败会阻止删除；进程已回收后的旧终态保存错误仍供输出和单独停止查询，但不再阻止删除日志与附件。应用退出时在退出入口并行停止所有会话，全部结束后再关闭 MCP 连接。Electron 完全退出最多等待十秒。
-
-问答成功结果使用已导出的 `UserQuestion`、`UserQuestionAnswer` 类型展示。问题和答案由后端校验，成功结果由 `UserQuestions::ask` 序列化；前端不再次过滤字段，也不把内部格式错误转成空答案或“未回答”。失败和停止仍按工具失败结果显示。
-
-## 源码导航
-
-| 修改场景 | 源码入口 |
-| --- | --- |
-| 桌面 RPC 与同步 | [后端 rpc.rs](../crates/app/src/desktop/rpc.rs)、[rpcClient.ts](../apps/desktop/src/rpcClient.ts)、[sync.ts](../apps/desktop/src/sync.ts) |
-| 开始执行、停止与追加输入 | [conversation.rs](../crates/app/src/runtime/conversation.rs)、[turn.rs](../crates/app/src/runtime/conversation/turn.rs)、[inbox.rs](../crates/agent/src/agent/inbox.rs) |
-| 工具名称与参数检查、并发调度 | [registry.rs](../crates/agent/src/tools/registry.rs)、[dispatch.rs](../crates/agent/src/agent/dispatch.rs) |
-| 文件读写、看图、命令执行与提问 | [read.rs](../crates/agent/src/tools/read.rs)、[edit.rs](../crates/agent/src/tools/edit.rs)、[view_image.rs](../crates/agent/src/tools/view_image.rs)、[bash/mod.rs](../crates/agent/src/tools/bash/mod.rs)、[questions.rs](../crates/agent/src/agent/questions.rs) |
-| 后台进程、保存与自动继续 | [bash/tasks.rs](../crates/agent/src/tools/bash/tasks.rs)、[conversation/background.rs](../crates/app/src/runtime/conversation/background.rs)、[BackgroundTasks.tsx](../apps/desktop/src/components/BackgroundTasks.tsx) |
-| 模型请求、错误分类与重试 | [request_execution.rs](../crates/agent/src/request_execution.rs)、[openai/provider.rs](../crates/model/src/openai/provider.rs) |
-| 上下文与轮换 | [session/context.rs](../crates/agent/src/session/context.rs)、[agent/context_rotation.rs](../crates/agent/src/agent/context_rotation.rs)、[conversation/context_rotation.rs](../crates/app/src/runtime/conversation/context_rotation.rs) |
-| 会话格式、追加写入与末尾修复 | [format.rs](../crates/agent/src/session/format.rs)、[manager.rs](../crates/agent/src/session/manager.rs)、[file.rs](../crates/agent/src/session/file.rs) |
-| 历史、时间线与用量显示 | [history.rs](../crates/app/src/runtime/history.rs)、[activity.rs](../crates/app/src/runtime/conversation/activity.rs)、[timeline.ts](../apps/desktop/src/timeline.ts)、[TimelineItem.tsx](../apps/desktop/src/components/TimelineItem.tsx) |
-| 水球发送与停止 | [WaterOrb.tsx](../apps/desktop/src/components/orb/WaterOrb.tsx)、[fluid.ts](../apps/desktop/src/components/orb/fluid.ts)、[bubbles.ts](../apps/desktop/src/components/orb/bubbles.ts)；LiquidFun WASM 内联字节加载 |
-| 管理页与运行状态 | [ManagePages.tsx](../apps/desktop/src/components/ManagePages.tsx) 读写指令和技能，[McpSettings.tsx](../apps/desktop/src/components/McpSettings.tsx) 管理 MCP；[RunPanel.tsx](../apps/desktop/src/components/RunPanel.tsx) 与 [ContextPanel.tsx](../apps/desktop/src/components/ContextPanel.tsx) 显示上下文和后台命令 |
-
-运行流程变化时更新 `architecture.html`；职责、状态维护者或源码入口变化时更新本文。
-
-## 精确编辑文件
-
-`tools/edit.rs` 提供 `edit(path, edits)`：每项包含 `old_text` 和 `new_text`。同文件各项匹配同一份当前原文，必须唯一且不重叠，全部通过后一次写入。空替换文字表示删除；空原文、无变化、非 UTF-8 或含 NUL 的文件返回错误。匹配仅将 CRLF 与 LF 视为等价，其他字符严格相同；保留 BOM 和替换范围外的原字节，替换内容沿用目标片段的换行风格。
-
-文件路径先解析到实际目标；进程内共用按 Windows 路径归一化后的编辑锁，从读取持有到写入完成，不同文件仍可并发。队列等待可取消；提交前再次检查停止，提交开始后等待真实写入结果。锁只协调内置 edit，不协调 Bash、MCP 或外部进程。相互依赖的修改按先后调用，独立位置合并到一次 edits 中。
-
-`core::write_bytes_atomic` 将新内容写入同目录临时文件、刷盘后替换目标；JSON 配置写入复用同一入口。结果通过现有 ToolExecution 与工具结果消息保存，`edit.rs` 使用 similar 生成带两行上下文的 unified diff 和完整增删行数，模型正文与本地展示共用该差异；内容最多 2000 行或 50 KiB，截断明确提示。`EditDiff.tsx` 解析已保存的展示正文、按文件语言高亮并显示行号；不依赖当前磁盘内容重建历史差异，历史不重放编辑。
+1. **单实例本地桌面应用**：面向 Windows 本地单用户，数据集中保存在单一 `~/.singularity`（或 `SINGULARITY_HOME`）下并加独占目录锁；不处理多实例并发写入同一数据目录，也不扩展跨平台服务端或网络接入。
+2. **项目归类而非强沙箱**：工作区登记只决定 `AGENTS.md`、项目 Skills、MCP 目录键和工具默认工作目录，不对文件或命令施加额外内核级路径限制（由用户自行判断操作边界）。
+3. **日志格式固定 v1**：不编写向后兼容的历史日志迁移逻辑；`0.1.0` 阶段变更日志格式时直接清理本地会话目录验证。
+4. **本地直接交互模式**：不包含后台常驻守护进程、定时任务、外部 IM 网关或自动评测基础设施；扩展能力见 [已确认的取舍](decisions.md)。

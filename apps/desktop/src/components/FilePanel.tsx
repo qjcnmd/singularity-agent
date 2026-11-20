@@ -34,7 +34,12 @@ export function FilePanel() {
   }, [active?.id, active?.opened, attempt])
 
   useEffect(() => {
-    setDocuments(all => Object.fromEntries(Object.entries(all).filter(([id]) => state.fileTabs.some(tab => tab.id === id))))
+    const openIds = new Set(state.fileTabs.map(tab => tab.id))
+    setDocuments(all => Object.fromEntries(Object.entries(all).filter(([id]) => openIds.has(id))))
+    setSources(all => {
+      const next = new Set([...all].filter(id => openIds.has(id)))
+      return next.size === all.size ? all : next
+    })
   }, [state.fileTabs])
 
   if (!active) return null
@@ -70,9 +75,10 @@ function TabButton({ tab, selected }: { tab: FileTab; selected: boolean }) {
 const maxHighlightedLength = 200_000
 
 function CodeView({ code, language }: { code: string; language: string }) {
+  const normalized = code.replace(/\r\n/g, '\n')
   // 很大的文件逐行高亮会卡住界面，只显示纯文本。
-  const tokens = useCodeTokens(code, code.length > maxHighlightedLength ? 'text' : language)
-  const lines = code.split('\n')
+  const tokens = useCodeTokens(normalized, normalized.length > maxHighlightedLength ? 'text' : language)
+  const lines = normalized.split('\n')
   return <div className="file-code">{lines.map((line, row) => <div key={row} className="tool-line">
     <span className="tool-line-number">{row + 1}</span>
     <span>{tokens?.[row] ? <CodeTokens tokens={tokens[row]} /> : line}</span>

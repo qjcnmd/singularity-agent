@@ -30,8 +30,9 @@ pub(crate) fn read_text_file(cwd: &str, path: &str) -> Result<TextDocument, RpcE
 }
 
 fn resolve(cwd: &str, path: &str) -> PathBuf {
-    let home = std::env::home_dir();
-    if let (Some(rest), Some(home)) = (path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")), home) {
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"))
+        && let Some(home) = std::env::home_dir()
+    {
         return home.join(rest);
     }
     let path = Path::new(path);

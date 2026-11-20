@@ -158,7 +158,13 @@ export class SessionStore {
         : {}),
     })
     this.saveSelection()
+    this.syncFocus(null)
     if (this.resyncing === null) this.flushFrames()
+  }
+
+  private syncFocus(sessionId: string | null): void {
+    if (this.state.connection !== 'ready') return
+    void this.transport.rpc('session.focus', { sessionId }).catch(() => { /* 断连时由下次重连同步焦点。 */ })
   }
 
   draftKey(): string | null {
@@ -207,8 +213,10 @@ export class SessionStore {
 
   private onFrame(frame: StreamEnvelope): void {
     if (this.resyncing === null && this.latestRead == null && this.state.bootstrapLoad.status === 'error') {
-      // 等待重试时只更新运行状态，正文由重试补读，不积存工具输出。
-      if (frame.type === 'session_changed' || frame.type === 'session_settled' || frame.type === 'background_task_updated') this.applyFrame(frame)
+      // 等待重试时只更新运行状态或恢复帧，正文由重试或恢复读取补全，不积存工具输出。
+      if (frame.type === 'ready' || frame.type === 'app_changed' || frame.type === 'session_changed' || frame.type === 'session_settled' || frame.type === 'background_task_updated') {
+        this.applyFrame(frame)
+      }
       return
     }
     // 重同步、读取会话或等待初始目录期间先暂存流式帧，完成后再按序回放。
@@ -227,6 +235,8 @@ export class SessionStore {
     }
     if (frame.type === 'app_read_failed' && frame.revision > this.state.revision) {
       this.patch({ bootstrapLoad: { status: 'error', error: frame.error } })
+    } else if (frame.type === 'app_changed' && frame.revision > this.state.revision && this.state.bootstrapLoad.status === 'error') {
+      this.patch({ bootstrapLoad: { status: 'idle', error: null } })
     }
     const state = reduceStream(this.state, frame)
     this.applySync(state, (frame.type === 'background_task_updated' && frame.payload.task.state.status === 'running')
@@ -257,6 +267,7 @@ export class SessionStore {
             sessionLoad: { status: 'idle', error: null },
             bootstrapLoad: { status: 'idle', error: null },
           })
+          this.syncFocus(null)
         }
       } catch (error) {
         this.patch({ bootstrapLoad: { status: 'error', error: this.toActionError(error) } })
@@ -332,6 +343,7 @@ export class SessionStore {
     this.patch(patch, progress)
     if (selectionDropped) {
       this.saveSelection()
+      this.syncFocus(null)
       if (this.resyncing === null) this.flushFrames()
     }
   }

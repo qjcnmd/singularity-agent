@@ -1,15 +1,30 @@
 import { contextRotationText } from './copy'
 import { hasErrorItem } from './execution'
-import type { HistoryItem, PendingQuestion, ReadSource, SessionRuntime, ThreadTurn, ToolStatus, VisibleBackgroundTask } from './protocol'
+import type { HistoryItem, PendingQuestion, SessionModelUsage, SessionRuntime, ThreadTurn, ToolStatus, VisibleBackgroundTask } from './protocol'
 
 type ToolItem = Extract<HistoryItem, { type: 'tool' }>
 export type ToolGroup = { type: 'tool_group'; name: string; rows: Array<{ key: string; item: ToolItem }> }
+export type TurnDurationInfo = { startedAt: string; firstTokenAt?: string; finishedAt?: string }
+export type TerminalItem = { type: 'terminal'; status: 'failed' | 'interrupted'; text: string; at?: string }
+export type TypingItem = { type: 'typing' }
+export type TurnStatsItem = { type: 'stats'; stats: SessionModelUsage; at?: string }
+export type ActivityRowItem =
+  | Extract<HistoryItem, { type: 'thinking' | 'tool' | 'context_rotation' | 'context_rotation_result' }>
+  | ToolGroup
+  | TerminalItem
+  | TypingItem
+export type ActivityGroup = {
+  type: 'activity_group'
+  rows: Array<{ key: string; item: ActivityRowItem }>
+  duration?: TurnDurationInfo
+}
 
-export type TimelineContent = HistoryItem | ToolGroup
-  | { type: 'duration'; startedAt: string; firstTokenAt?: string; finishedAt?: string }
-  | { type: 'terminal'; status: 'failed' | 'interrupted'; text: string; at?: string }
-  | { type: 'typing' }
-  | { type: 'question'; request: PendingQuestion }
+export type TimelineContent = HistoryItem | ToolGroup | ActivityGroup
+  | ({ type: 'duration' } & TurnDurationInfo)
+  | TerminalItem
+  | TypingItem
+  | TurnStatsItem
+  | { type: 'question'; request: PendingQuestion; duration?: TurnDurationInfo }
 
 /** 只补充排列和阅读位置；历史条目原样交给组件。 */
 export interface TimelineRow {
@@ -34,7 +49,7 @@ export function buildHistoryRows(turns: ThreadTurn[] | undefined, failureFromRun
 }
 
 export function buildTimeline(rows: TimelineRow[], turns: ThreadTurn[] | undefined, runtime: Pick<SessionRuntime, 'failure' | 'pendingQuestion' | 'pendingMessages'> | undefined): TimelineRow[] {
-  if (!runtime) return rows
+  if (!runtime) return groupActivityRuns(rows)
   const failure = runtime.failure
   const question = runtime.pendingQuestion
   let result = rows
@@ -49,7 +64,7 @@ export function buildTimeline(rows: TimelineRow[], turns: ThreadTurn[] | undefin
     result = [...result]
     result[asking] = { key: `question:${question.itemId}`, stable: false, item: { type: 'question', request: question } }
   }
-  if (runtime.pendingMessages.length === 0) return result
+  if (runtime.pendingMessages.length === 0) return groupActivityRuns(result)
   // 用户消息写入事件可能先于运行快照到达，按 ID 去重。
   const savedMessages = new Set(rows.flatMap(row => row.item.type === 'message' && row.item.role === 'user' ? [row.item.id] : []))
   result = [...result]
@@ -58,12 +73,75 @@ export function buildTimeline(rows: TimelineRow[], turns: ThreadTurn[] | undefin
     result.push({ key: `pending:${message.itemId}`, stable: false,
       item: { id: message.itemId, type: 'message', role: 'user', status: 'completed', text: message.text, images: message.images, files: message.files } })
   }
-  return result
+  return groupActivityRuns(result)
+}
+
+function isActivityItem(item: TimelineContent): item is ActivityRowItem {
+  return item.type === 'thinking'
+    || item.type === 'tool'
+    || item.type === 'tool_group'
+    || item.type === 'context_rotation'
+    || item.type === 'context_rotation_result'
+    || item.type === 'typing'
+    || item.type === 'terminal'
+}
+
+/** 将连续的非文本步骤与状态（思考、工具、轮换、等待、中断、报错）合入白卡；前置耗时并入卡顶栏，提问独立成同款白卡。 */
+function groupActivityRuns(rows: TimelineRow[]): TimelineRow[] {
+  const grouped: TimelineRow[] = []
+  for (const row of rows) {
+    if (row.item.type === 'question') {
+      const previous = grouped.at(-1)
+      if (previous?.item.type === 'duration') {
+        const { startedAt, firstTokenAt, finishedAt } = previous.item
+        grouped[grouped.length - 1] = {
+          ...row,
+          item: { ...row.item, duration: { startedAt, firstTokenAt, finishedAt } },
+        }
+      } else {
+        grouped.push(row)
+      }
+      continue
+    }
+    if (!isActivityItem(row.item)) {
+      grouped.push(row)
+      continue
+    }
+    const previous = grouped.at(-1)
+    if (previous?.item.type === 'activity_group') {
+      previous.item.rows.push({ key: row.key, item: row.item })
+      previous.stable = previous.stable && row.stable
+    } else if (previous?.item.type === 'duration') {
+      const { startedAt, firstTokenAt, finishedAt } = previous.item
+      grouped[grouped.length - 1] = {
+        key: `activity:${row.key}`,
+        stable: row.stable,
+        item: {
+          type: 'activity_group',
+          rows: [{ key: row.key, item: row.item }],
+          duration: { startedAt, firstTokenAt, finishedAt },
+        },
+      }
+    } else {
+      grouped.push({
+        key: `activity:${row.key}`,
+        stable: row.stable,
+        item: { type: 'activity_group', rows: [{ key: row.key, item: row.item }] },
+      })
+    }
+  }
+  return grouped
+}
+
+function hasModelStats(stats: SessionModelUsage | undefined): stats is SessionModelUsage {
+  return stats !== undefined && (stats.ttftRequests > 0 || stats.decodeMs > 0 || stats.usagePresent)
 }
 
 function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): TimelineRow[] {
   const items = mergeAdjacentThinking(turn.items)
   const lastStepIndex = items.findLastIndex(item => item.type !== 'context_rotation' && item.type !== 'context_rotation_result')
+  const lastStep = lastStepIndex >= 0 ? items[lastStepIndex] : undefined
+  const hasFinalAssistantStats = lastStep?.type === 'message' && lastStep.role === 'assistant' && hasModelStats(lastStep.stats)
   const result: TimelineRow[] = items.map((item, index) => ({
     key: item.type === 'context_rotation' || item.type === 'context_rotation_result'
       ? `contextRotation:${item.id}` : `content:${turn.turnId}:${item.id}`,
@@ -91,6 +169,13 @@ function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): TimelineRow[] 
   if (turn.status === 'failed' && !hasErrorItem(turn, turn.error) && (turn.error || !failureFromRuntime)) {
     result.push({ key: `content:${turn.turnId}:terminal`, stable: true,
       item: { type: 'terminal', status: 'failed', text: turn.error?.message ?? '执行失败', at: turn.finishedAt } })
+  }
+  // 没有最终助手正文承接统计时，在活动卡片下方单独显示一行用量统计。
+  if (turn.status !== 'running' && !hasFinalAssistantStats && hasModelStats(turn.stats)) {
+    result.push({
+      key: `content:${turn.turnId}:stats`, stable: true,
+      item: { type: 'stats', stats: turn.stats, at: turn.finishedAt },
+    })
   }
   return groupAdjacentTools(result)
 }
@@ -126,52 +211,6 @@ function mergeAdjacentThinking(items: HistoryItem[]): HistoryItem[] {
   return merged
 }
 
-export function toolArgument(name: string, args: unknown): string | null {
-  const input = record(args)
-  const value = name === 'bash' ? input.command : name === 'read' || name === 'edit' || name === 'view_image' ? input.path : name === 'skill' ? input.name : undefined
-  return typeof value === 'string' ? value : null
-}
-
-export function toolSummary(name: string, args: unknown): string {
-  if (name === 'task_list') return '列出后台命令'
-  if (name === 'task_output') return '查看后台命令输出'
-  if (name === 'task_stop') return '停止后台命令'
-  if (name === 'ask_user_question') {
-    const questions = record(args).questions
-    const question = Array.isArray(questions) ? record(questions[0]).question : undefined
-    return typeof question === 'string' ? firstLine(question) : ''
-  }
-  if (name === 'bash') {
-    const description = record(args).description
-    if (typeof description === 'string' && description.trim()) return firstLine(description.trim())
-  }
-  return firstLine(toolArgument(name, args) ?? '')
-}
-
-export function displayPath(path: string, cwd: string, userHome?: string | null): string {
-  const normalized = path.replace(/\\/g, '/')
-  const root = cwd.replace(/\\/g, '/').replace(/\/$/, '')
-  if (normalized.toLowerCase().startsWith(`${root.toLowerCase()}/`)) return normalized.slice(root.length + 1)
-  const home = userHome?.replace(/\\/g, '/').replace(/\/$/, '')
-  if (home && normalized.toLowerCase() === home.toLowerCase()) return '~'
-  if (home && normalized.toLowerCase().startsWith(`${home.toLowerCase()}/`)) return `~${normalized.slice(home.length)}`
-  return path
-}
-
-export function pathFromArgs(name: string, args: unknown): string | null {
-  if (name !== 'read' && name !== 'edit' && name !== 'view_image') return null
-  const value = toolArgument(name, args)
-  return value?.trim() ? value : null
-}
-
-export function firstLine(text: string): string {
-  return text.split(/\r?\n/, 1)[0]?.trim() ?? ''
-}
-
-function record(value: unknown): Record<string, unknown> {
-  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
-}
-
 export function formatTurnDuration(milliseconds: number): string {
   const seconds = Math.max(0, Math.floor(milliseconds / 1000))
   return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m${seconds % 60}s` : `${Math.floor(seconds / 3600)}h${Math.floor(seconds % 3600 / 60)}m`
@@ -185,14 +224,6 @@ export function formatClock(value: string, includeDate = false): string {
   const date = new Date(value)
   const clock = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
   return includeDate && date.toDateString() !== new Date().toDateString() ? `${date.getMonth() + 1}/${date.getDate()} ${clock}` : clock
-}
-
-/** 为 `read` 工具输出的前 `source.lineCount` 行标注源文件行号；超出部分的截断或分页提示不标行号。 */
-export function readOutputLines(text: string, source: ReadSource): Array<{ text: string; number?: number }> {
-  const lines = text.replace(/\r\n/g, '\n').split('\n')
-  return lines.map((line, index) => index < source.lineCount
-    ? { text: line, number: source.startLine + index }
-    : { text: line })
 }
 
 /** 单条详情与分组计数共用后台任务终态，避免命令转后台后仍显示成功。 */

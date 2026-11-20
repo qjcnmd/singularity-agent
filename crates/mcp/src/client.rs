@@ -10,7 +10,6 @@ use rmcp::{
         streamable_http_client::StreamableHttpClientTransportConfig, which_command,
     },
 };
-use sha2::{Digest, Sha256};
 use singularity_protocol::McpTransportConfig;
 use std::{
     path::Path,
@@ -55,86 +54,17 @@ impl Connection {
     pub async fn connect(cwd: &Path, config: ServerConfig) -> Result<Self, String> {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let root = reqwest::Url::from_directory_path(cwd)
-            .map_err(|_| "MCP 项目目录无法转换为文件 URI。")?
+            .map_err(|()| format!("MCP 项目目录无法转换为文件 URI：{}", cwd.display()))?
             .to_string();
         let handler = Handler { root };
         let startup = Duration::from_secs(config.startup_timeout_sec);
         let connect = async {
             let service = match &config.transport {
                 McpTransportConfig::Stdio { command, args, cwd: configured_cwd, env } => {
-                    let directory = configured_cwd
-                        .as_ref()
-                        .map(|path| cwd.join(path))
-                        .unwrap_or_else(|| cwd.to_path_buf());
-                    let executable = if Path::new(command).components().count() > 1 {
-                        directory.join(command)
-                    } else {
-                        command.into()
-                    };
-                    let mut command =
-                        which_command(executable).map_err(|error| format!("无法启动 MCP：{error}"))?;
-                    command.args(args).envs(env).current_dir(directory);
-                    #[cfg(windows)]
-                    let command = {
-                        use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
-                        let mut wrapped = CommandWrap::from(command);
-                        // 后端异常退出时也由 Windows 回收服务器的整棵进程树。
-                        wrapped
-                            .wrap(CreationFlags(windows::Win32::System::Threading::CREATE_NO_WINDOW))
-                            .wrap(JobObject)
-                            .wrap(KillOnDrop);
-                        wrapped
-                    };
-                    let (transport, stderr) = TokioChildProcess::builder(command)
-                        .stderr(std::process::Stdio::piped())
-                        .spawn()
-                        .map_err(|error| format!("无法启动 MCP：{error}"))?;
-                    if let Some(mut stderr) = stderr {
-                        let logs = Arc::clone(&logs);
-                        tokio::spawn(async move {
-                            let mut buffer = [0u8; 2048];
-                            while let Ok(size) = stderr.read(&mut buffer).await {
-                                if size == 0 {
-                                    break;
-                                }
-                                let mut logs = logs.lock().expect("MCP stderr lock poisoned");
-                                // 管道分块可能落在 UTF-8 字符内部；保留字节，到报告错误时再解码。
-                                logs.extend_from_slice(&buffer[..size]);
-                                if logs.len() > 4096 {
-                                    let start = logs.len() - 4096;
-                                    logs.drain(..start);
-                                }
-                            }
-                        });
-                    }
-                    handler.serve(transport).await.map_err(|error| format!("MCP 初始化失败：{error}"))?
+                    connect_stdio(cwd, handler, &logs, command, args, configured_cwd.as_deref(), env).await?
                 }
                 McpTransportConfig::Http { url, headers } => {
-                    // 与现有模型传输使用同一 ring provider，避免两个 TLS 默认实现冲突。
-                    let _ = rustls::crypto::ring::default_provider().install_default();
-                    let client = reqwest::Client::builder()
-                        // 与模型共用 reqwest 后也可能启用 gzip；MCP 流继续直接读取原始分块。
-                        .no_gzip()
-                        .connect_timeout(startup)
-                        .build()
-                        .map_err(|error| format!("无法建立 MCP HTTP 客户端：{error}"))?;
-                    let headers = headers
-                        .iter()
-                        .map(|(name, value)| {
-                            (
-                                reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                                    .expect("MCP header name was validated when loading configuration"),
-                                reqwest::header::HeaderValue::from_str(value)
-                                    .expect("MCP header value was validated when loading configuration"),
-                            )
-                        })
-                        .collect();
-                    let mut transport_config =
-                        StreamableHttpClientTransportConfig::with_uri(url.clone()).custom_headers(headers);
-                    // 会话过期也直接报告调用失败，不能由 SDK 重放可能有副作用的工具。
-                    transport_config.reinit_on_expired_session = false;
-                    let transport = StreamableHttpClientTransport::with_client(client, transport_config);
-                    handler.serve(transport).await.map_err(|error| format!("MCP 初始化失败：{error}"))?
+                    connect_http(handler, startup, url, headers).await?
                 }
             };
             // 每轮实际读取工具目录；发现失败时也不回退到 SDK 缓存。
@@ -226,28 +156,93 @@ impl Connection {
         if let Some(mut service) = self.service.lock().await.take()
             && let Err(error) = service.close_with_timeout(Duration::from_secs(3)).await
         {
-            eprintln!("MCP shutdown: {}", self.config.redact(error.to_string()));
+            tracing::warn!(error = %self.config.redact(error.to_string()), "MCP shutdown failed");
         }
     }
 }
 
-/// 常规工具名保留可读前缀；长名称或分隔符冲突使用稳定摘要，适配模型 API 的名称约束。
-pub(crate) fn tool_alias(server: &str, tool: &str) -> String {
-    let alias = format!("mcp__{server}__{tool}");
-    if alias.len() <= 64
-        && !server.contains("__")
-        && alias.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
-        return alias;
-    }
-    let readable = |value: &str| {
-        value
-            .chars()
-            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-            .take(16)
-            .collect::<String>()
+async fn connect_stdio(
+    cwd: &Path,
+    handler: Handler,
+    logs: &Arc<Mutex<Vec<u8>>>,
+    command: &str,
+    args: &[String],
+    configured_cwd: Option<&str>,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<RunningService<RoleClient, Handler>, String> {
+    let directory = configured_cwd.map(|path| cwd.join(path)).unwrap_or_else(|| cwd.to_path_buf());
+    let executable = if Path::new(command).components().count() > 1 {
+        directory.join(command)
+    } else {
+        command.into()
     };
-    let digest = Sha256::digest(format!("{server}\0{tool}").as_bytes());
-    let suffix = digest[..8].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-    format!("mcp__{}__{}_{suffix}", readable(server), readable(tool))
+    let mut command = which_command(executable).map_err(|error| format!("无法启动 MCP：{error}"))?;
+    command.args(args).envs(env).current_dir(directory);
+    #[cfg(windows)]
+    let command = {
+        use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
+        let mut wrapped = CommandWrap::from(command);
+        // 后端异常退出时也由 Windows 回收服务器的整棵进程树。
+        wrapped
+            .wrap(CreationFlags(windows::Win32::System::Threading::CREATE_NO_WINDOW))
+            .wrap(JobObject)
+            .wrap(KillOnDrop);
+        wrapped
+    };
+    let (transport, stderr) = TokioChildProcess::builder(command)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("无法启动 MCP：{error}"))?;
+    if let Some(mut stderr) = stderr {
+        let logs = Arc::clone(logs);
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 2048];
+            while let Ok(size) = stderr.read(&mut buffer).await {
+                if size == 0 {
+                    break;
+                }
+                let mut logs = logs.lock().expect("MCP stderr lock poisoned");
+                // 管道分块可能落在 UTF-8 字符内部；保留字节，到报告错误时再解码。
+                logs.extend_from_slice(&buffer[..size]);
+                if logs.len() > 4096 {
+                    let start = logs.len() - 4096;
+                    logs.drain(..start);
+                }
+            }
+        });
+    }
+    handler.serve(transport).await.map_err(|error| format!("MCP 初始化失败：{error}"))
+}
+
+async fn connect_http(
+    handler: Handler,
+    startup: Duration,
+    url: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Result<RunningService<RoleClient, Handler>, String> {
+    // 与现有模型传输使用同一 ring provider，避免两个 TLS 默认实现冲突。
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = reqwest::Client::builder()
+        // 与模型共用 reqwest 后也可能启用 gzip；MCP 流继续直接读取原始分块。
+        .no_gzip()
+        .connect_timeout(startup)
+        .build()
+        .map_err(|error| format!("无法建立 MCP HTTP 客户端：{error}"))?;
+    let headers = headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                    .expect("MCP header name was validated when loading configuration"),
+                reqwest::header::HeaderValue::from_str(value)
+                    .expect("MCP header value was validated when loading configuration"),
+            )
+        })
+        .collect();
+    let mut transport_config =
+        StreamableHttpClientTransportConfig::with_uri(url.to_owned()).custom_headers(headers);
+    // 会话过期也直接报告调用失败，不能由 SDK 重放可能有副作用的工具。
+    transport_config.reinit_on_expired_session = false;
+    let transport = StreamableHttpClientTransport::with_client(client, transport_config);
+    handler.serve(transport).await.map_err(|error| format!("MCP 初始化失败：{error}"))
 }

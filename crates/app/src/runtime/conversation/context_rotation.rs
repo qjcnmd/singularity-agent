@@ -8,7 +8,7 @@ impl Conversation {
     pub(crate) async fn rotate_context_thread(
         self: &Arc<Self>,
         controls: &TurnControls,
-        sink: &mut (dyn FnMut(TurnEvent) + Send),
+        sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<TurnStatus, TurnErrorDetail> {
         let Some(input) = ContextRotationInput::select(&self.writer).await else {
             controls.finish_cancel();

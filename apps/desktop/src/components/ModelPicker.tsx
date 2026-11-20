@@ -2,6 +2,7 @@ import '../styles/model-picker.css'
 import { EffortSlider } from './EffortSlider'
 import { ExpandChevron } from './ExpandChevron'
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
+import { Check } from 'lucide-react'
 import { usePopoverFocus, focusableElements, navigateList } from '../interactions'
 import { sortReasoningVariants, selectedModel } from '../modelChoices'
 import type { ModelSelection, ModelConfigurationInput, RedactedProvider } from '../protocol'
@@ -135,7 +136,7 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
                       onClick={() => { void chooseModel({ provider, model }) }}
                     >
                       <span className="sg-modelName">{model.modelId}</span>
-                      <span className="sg-check">{isSelected && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>}</span>
+                      <span className="sg-check">{isSelected && <Check size={16} strokeWidth={2.2} aria-hidden="true" />}</span>
                     </button>
                   )
                 })}

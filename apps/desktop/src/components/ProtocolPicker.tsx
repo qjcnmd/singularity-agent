@@ -5,7 +5,7 @@ import { ExpandChevron } from './ExpandChevron'
 import { Disclosure } from './Disclosure'
 import type { ProviderApiProtocol } from '../protocol'
 
-const protocols = [['chat', 'Chat Completions'], ['responses', 'Responses']] as const
+const protocols = [['messages', 'Messages'], ['responses', 'Responses']] as const
 
 export function ProtocolPicker({ value, onChange }: { value: ProviderApiProtocol; onChange: (value: ProviderApiProtocol) => void }) {
   const [open, setOpen] = useState(false)

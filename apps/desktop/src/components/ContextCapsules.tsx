@@ -37,9 +37,29 @@ function useContextModules(workspaceRoot: string | null, connection: string) {
 const groupTitles: Record<ContextGroup, string> = { instructions: '指令', tools: '工具', skills: '技能', mcp: 'MCP' }
 const groupOrder: ContextGroup[] = ['instructions', 'tools', 'skills', 'mcp']
 
+const capsulesFields = ['drafts', 'bootstrap', 'connection', 'selectedWorkspaceRoot', 'pendingActions'] as const
+
+function sameDisabledModules(previous: string[] | undefined, next: string[] | undefined): boolean {
+  const left = previous ?? []
+  const right = next ?? []
+  return left.length === right.length && left.every((id, index) => id === right[index])
+}
+
+function sameCapsulesState(
+  previous: Pick<AppState, typeof capsulesFields[number]>,
+  next: Pick<AppState, typeof capsulesFields[number]>,
+): boolean {
+  const root = next.selectedWorkspaceRoot ?? ''
+  return previous.selectedWorkspaceRoot === next.selectedWorkspaceRoot
+    && Object.is(previous.bootstrap, next.bootstrap)
+    && Object.is(previous.connection, next.connection)
+    && Object.is(previous.pendingActions, next.pendingActions)
+    && sameDisabledModules(previous.drafts?.[root]?.disabledModules, next.drafts?.[root]?.disabledModules)
+}
+
 /** 新任务页输入框上方：项目选择和上下文胶囊。胶囊决定接下来这个任务注入哪些内容，创建后固定。 */
 export function ContextCapsules() {
-  const state = useAppStore(['drafts', 'bootstrap', 'connection', 'selectedWorkspaceRoot', 'pendingActions'])
+  const state = useAppStore(capsulesFields, sameCapsulesState)
   const { query, retry } = useContextModules(state.selectedWorkspaceRoot, state.connection)
   const disabled = new Set(appStore.inputDraft().disabledModules)
   return <div className="context-capsules">

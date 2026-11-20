@@ -34,8 +34,8 @@ function useStreamedText(text: string, streaming: boolean) {
     const reveal = (now: number) => {
       // 把服务端成批到达的文字摊到 80ms 里送完，不一截一截跳出。
       const progress = Math.min(1, (now - started) / 80)
-      // 高刷新率屏幕也不必每帧重新解析 Markdown。
-      if (progress === 1 || now - lastPaint.current >= 1000 / 60) {
+      // 节流渲染频率，避免高刷屏每帧重新解析整段 Markdown。
+      if (progress === 1 || now - lastPaint.current >= 50) {
         let end = start + Math.ceil((text.length - start) * progress)
         // 不在 UTF-16 代理对中间截断 emoji 等字符。
         const previous = text.charCodeAt(end - 1)
@@ -157,5 +157,5 @@ function CodeBlock({ children }: { children?: ReactNode }) {
 
 const HighlightedCode = memo(function HighlightedCode({ code, language }: { code: string; language: string }) {
   const tokens = useCodeTokens(code, language)
-  return <pre><code>{tokens === null ? <StreamText>{code}</StreamText> : tokens.map((line, row) => <span key={row}><CodeTokens tokens={line} renderText={text => <StreamText>{text}</StreamText>} />{row < tokens.length - 1 ? '\n' : ''}</span>)}</code></pre>
+  return <pre><code>{tokens === null ? code : tokens.map((line, row) => <span key={row}><CodeTokens tokens={line} />{row < tokens.length - 1 ? '\n' : ''}</span>)}</code></pre>
 })

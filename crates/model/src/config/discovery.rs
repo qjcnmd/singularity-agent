@@ -4,15 +4,25 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-use super::{ProviderError, configuration_error, validate_base_url, validate_identifier};
+use super::{
+    ProviderError, configuration_error, validate_base_url, validate_identifier, validate_provider_value,
+};
 use crate::ModelErrorKind;
 use crate::error::{append_provider_http_diagnostic, parse_provider_error_body};
-use crate::transport::http::{client_builder, transport_error_source};
+use crate::transport::http::{
+    BoundedBodyReadError, MAX_HTTP_ERROR_BODY_BYTES, client_builder, read_bounded_error_body,
+    transport_error_source,
+};
 
-/// 查询提供方的模型 ID；调用方只提供编辑器里的取值和解析好的凭据。
-pub async fn discover(base_url: &str, api_key: &str) -> Result<Vec<String>, ProviderError> {
-    let base_url = crate::openai::canonical_base_url(base_url);
+/// 查询提供方的模型 ID；调用方只提供编辑器里的取值、协议类型和解析好的凭据。
+pub async fn discover(
+    base_url: &str,
+    api_key: &str,
+    protocol: singularity_protocol::ProviderApiProtocol,
+) -> Result<Vec<String>, ProviderError> {
+    let base_url = crate::provider::canonical_base_url(base_url);
     validate_base_url(base_url)?;
+    validate_provider_value(api_key, "api_key")?;
     let client = client_builder()
         .timeout(std::time::Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
@@ -21,12 +31,20 @@ pub async fn discover(base_url: &str, api_key: &str) -> Result<Vec<String>, Prov
             // 客户端构造失败和请求失败是两回事：保留底层原因方便定位。
             configuration_error(format!("模型查询客户端无法启动（{}）。", transport_error_source(error)))
         })?;
-    let request = client.get(crate::openai::models_endpoint(base_url));
-    let request = if api_key.is_empty() {
-        request
-    } else {
-        request.bearer_auth(api_key)
-    };
+    let mut request = client.get(crate::provider::models_endpoint(base_url));
+    match protocol {
+        singularity_protocol::ProviderApiProtocol::Messages => {
+            request = request.header("anthropic-version", crate::ANTHROPIC_VERSION);
+            if !api_key.is_empty() {
+                request = request.header("x-api-key", api_key);
+            }
+        }
+        singularity_protocol::ProviderApiProtocol::Responses => {
+            if !api_key.is_empty() {
+                request = request.bearer_auth(api_key);
+            }
+        }
+    }
     let response = request.send().await.map_err(discovery_transport_error)?;
     if !response.status().is_success() {
         return Err(discovery_http_error(response).await);
@@ -83,12 +101,13 @@ async fn discovery_http_error(response: reqwest::Response) -> ProviderError {
         crate::error::provider_error_kind_for_http_status(status),
         format!("获取模型失败：HTTP {status}。"),
     );
-    match response.bytes().await {
+    match read_bounded_error_body(response, MAX_HTTP_ERROR_BODY_BYTES, None).await {
         Ok(body) => {
             let fields = parse_provider_error_body(&body);
             append_provider_http_diagnostic(&mut error.message, &fields, &body);
         }
-        Err(read_error) => error
+        Err(BoundedBodyReadError::Cancelled) => unreachable!("no cancellation token passed"),
+        Err(BoundedBodyReadError::Transport(read_error)) => error
             .message
             .push_str(&format!(" 无法读取提供方错误响应（{}）。", transport_error_source(read_error))),
     }

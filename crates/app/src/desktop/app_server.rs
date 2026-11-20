@@ -16,12 +16,66 @@ use singularity_protocol::{
 };
 use tokio::sync::mpsc;
 
+use super::stream_hub::StreamHub;
 use super::workspace_store::WorkspaceStore;
+
+const MAX_CACHED_SESSIONS: usize = 16;
+
+#[derive(Default)]
+pub(super) struct SessionCache {
+    entries: HashMap<String, (Arc<Conversation>, u64)>,
+    next_access: u64,
+}
+
+impl SessionCache {
+    pub(super) fn get(&mut self, id: &str) -> Option<Arc<Conversation>> {
+        self.next_access += 1;
+        let access = self.next_access;
+        let (conversation, last_access) = self.entries.get_mut(id)?;
+        *last_access = access;
+        Some(Arc::clone(conversation))
+    }
+
+    pub(super) fn insert(&mut self, id: String, conversation: Arc<Conversation>) {
+        self.next_access += 1;
+        self.entries.insert(id, (conversation, self.next_access));
+        if self.entries.len() > MAX_CACHED_SESSIONS {
+            self.evict_idle();
+        }
+    }
+
+    pub(super) fn remove(&mut self, id: &str) -> Option<Arc<Conversation>> {
+        self.entries.remove(id).map(|(conversation, _)| conversation)
+    }
+
+    pub(super) fn retain(&mut self, mut predicate: impl FnMut(&str, &Arc<Conversation>) -> bool) {
+        self.entries.retain(|id, (conversation, _)| predicate(id, conversation));
+    }
+
+    pub(super) fn conversations(&self) -> impl Iterator<Item = (&String, &Arc<Conversation>)> {
+        self.entries.iter().map(|(id, (conversation, _))| (id, conversation))
+    }
+
+    fn evict_idle(&mut self) {
+        let mut candidates: Vec<(u64, String)> = self
+            .entries
+            .iter()
+            .filter(|(_, (conversation, _))| {
+                !conversation.has_work() && conversation.status().failure.is_none()
+            })
+            .map(|(id, (_, access))| (*access, id.clone()))
+            .collect();
+        candidates.sort_unstable_by_key(|(access, _)| *access);
+        let overflow = self.entries.len().saturating_sub(MAX_CACHED_SESSIONS);
+        for (_, id) in candidates.into_iter().take(overflow) {
+            self.entries.remove(&id);
+        }
+    }
+}
 
 /// 提交 RPC 在消息入队后返回；后续准备、保存和执行状态通过会话事件发布。
 pub struct AppServer {
-    weak: std::sync::Weak<Self>,
-    revision: Mutex<u64>,
+    hub: Arc<StreamHub>,
     /// 保证完整工作台快照按构造顺序发布；不涉及任务执行和普通增量事件。
     app_publication: Mutex<()>,
     /// 任务创建、删除和项目移除的短锁：「查找或创建任务 → 接受输入」与
@@ -35,8 +89,7 @@ pub struct AppServer {
     pub(super) mcp: Arc<singularity_mcp::McpManager>,
     /// 应用数据目录；技能列表和任务执行读取同一个目录。
     home: std::path::PathBuf,
-    sessions: Mutex<HashMap<String, Arc<Conversation>>>,
-    stream: mpsc::UnboundedSender<StreamEnvelope>,
+    sessions: Mutex<SessionCache>,
 }
 
 impl AppServer {
@@ -46,11 +99,10 @@ impl AppServer {
         models: Arc<ModelConfigManager>,
         mcp: Arc<singularity_mcp::McpManager>,
         home: std::path::PathBuf,
-        stream: mpsc::UnboundedSender<StreamEnvelope>,
+        stream: mpsc::Sender<StreamEnvelope>,
     ) -> Arc<Self> {
-        Arc::new_cyclic(|weak| Self {
-            weak: weak.clone(),
-            revision: Mutex::new(0),
+        Arc::new(Self {
+            hub: StreamHub::new(stream),
             app_publication: Mutex::new(()),
             lifecycle: Mutex::new(()),
             catalog,
@@ -58,13 +110,16 @@ impl AppServer {
             models,
             mcp,
             home,
-            sessions: Mutex::new(HashMap::new()),
-            stream,
+            sessions: Mutex::new(SessionCache::default()),
         })
     }
 
+    pub fn set_focused_session(&self, session_id: Option<String>) {
+        self.hub.set_focused_session(session_id);
+    }
+
     pub fn revision(&self) -> u64 {
-        *self.revision.lock().expect("stream revision lock poisoned")
+        self.hub.revision()
     }
 
     pub(super) fn scope_directory(&self, workspace: Option<&str>) -> Result<std::path::PathBuf, RpcError> {
@@ -110,20 +165,32 @@ impl AppServer {
         &self,
         catalog: singularity_protocol::RedactedModelCatalog,
     ) -> singularity_protocol::ModelCatalogResult {
-        let mut revision = self.revision.lock().expect("stream revision lock poisoned");
-        *revision += 1;
-        singularity_protocol::ModelCatalogResult { catalog, revision: *revision }
+        singularity_protocol::ModelCatalogResult {
+            catalog,
+            revision: self.hub.next_revision(),
+        }
     }
 
     pub async fn discover_models(
         &self,
         provider_id: &str,
+        api_protocol: singularity_protocol::ProviderApiProtocol,
         base_url: &str,
         api_key: Option<&str>,
     ) -> Result<Vec<String>, RpcError> {
         // 先取出本次查询用的密钥，网络请求期间不持有配置锁。
-        let api_key = self.models.discovery_credential(provider_id, api_key).map_err(RpcError::new)?;
-        singularity_model::discover_models(base_url, &api_key).await.map_err(RpcError::new)
+        let models = Arc::clone(&self.models);
+        let provider_id = provider_id.to_owned();
+        let api_key = api_key.map(str::to_owned);
+        let api_key = tokio::task::spawn_blocking(move || {
+            models.discovery_credential(&provider_id, api_key.as_deref())
+        })
+        .await
+        .expect("model credential lookup completes while the backend is running")
+        .map_err(RpcError::new)?;
+        singularity_model::discover_models(base_url, &api_key, api_protocol)
+            .await
+            .map_err(RpcError::new)
     }
 
     /// 收到第一条消息才创建任务；空白页在后端没有任务和日志文件。
@@ -131,16 +198,22 @@ impl AppServer {
         self: &Arc<Self>,
         params: singularity_protocol::SessionStartParams,
     ) -> Result<singularity_protocol::SessionStartResult, RpcError> {
-        let _lifecycle = self.lock_lifecycle();
         let workspace = self.workspace(&params.workspace_root)?;
+        let skills_enabled = !params
+            .disabled_modules
+            .iter()
+            .any(|id| id == singularity_agent::agent::modules::SKILLS_MODULE_ID);
         let input = UserInput::from_uploads(
             params.text,
             params.images,
             params.files,
             std::path::Path::new(&workspace.root),
             &self.home,
+            skills_enabled,
         )
         .map_err(RpcError::new)?;
+        let _lifecycle = self.lock_lifecycle();
+        let workspace = self.workspace(&params.workspace_root)?;
         let thread = self
             .catalog
             .create_thread(&workspace.root, params.selection, params.disabled_modules)
@@ -151,6 +224,7 @@ impl AppServer {
     }
 
     pub fn read_session(&self, session_id: &str) -> Result<SessionReadResult, RpcError> {
+        self.set_focused_session(Some(session_id.to_owned()));
         // 只有查找或打开任务需要生命周期锁；读取历史在锁外进行。
         let conversation = {
             let _lifecycle = self.lock_lifecycle();
@@ -161,7 +235,7 @@ impl AppServer {
 
     fn open_conversation(&self, session_id: &str) -> Result<Arc<Conversation>, RpcError> {
         // 任务表的锁只用于查找；打开日志文件在锁外进行。
-        let open = self.lock_sessions().get(session_id).cloned();
+        let open = self.lock_sessions().get(session_id);
         if let Some(conversation) = open {
             return Ok(conversation);
         }
@@ -181,13 +255,13 @@ impl AppServer {
     /// 在生命周期锁内登记新打开的任务；已打开的任务由 open_conversation 直接返回。
     fn insert_conversation(&self, session: singularity_agent::session::SessionManager) -> Arc<Conversation> {
         let id = session.session_id().to_owned();
-        let weak = self.weak.clone();
         let conversation = Conversation::new(
             session,
             self.home.clone(),
             Arc::clone(&self.models),
             Arc::clone(&self.mcp),
-            Arc::new(move |event| weak.upgrade().map(|app| app.emit(event)).unwrap_or_default()),
+            self.hub.revision(),
+            self.hub.publisher(),
         );
         self.lock_sessions().insert(id, Arc::clone(&conversation));
         conversation
@@ -226,27 +300,25 @@ impl AppServer {
         self.lifecycle.lock().expect("app_server lifecycle lock poisoned")
     }
 
-    /// 发布一个事件：在这里递增全局事件序号，随事件一起发给前端。
     fn emit(&self, event: StreamEvent) -> u64 {
-        let mut order = self.revision.lock().expect("stream revision lock poisoned");
-        *order += 1;
-        let _ = self.stream.send(StreamEnvelope { revision: *order, event });
-        *order
+        self.hub.emit(event)
     }
 
-    fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Conversation>>> {
+    fn lock_sessions(&self) -> std::sync::MutexGuard<'_, SessionCache> {
         self.sessions.lock().expect("app_server session map lock poisoned")
     }
 
     /// 管道关闭时等待已接受的操作和子进程结束。
     pub async fn shutdown(&self) {
-        let sessions: Vec<_> = self.lock_sessions().values().cloned().collect();
+        let sessions: Vec<_> =
+            self.lock_sessions().conversations().map(|(_, conv)| Arc::clone(conv)).collect();
         let mut stops = tokio::task::JoinSet::new();
         for session in sessions {
             stops.spawn(async move { session.stop().await });
         }
         while let Some(result) = stops.join_next().await {
             if let Err(error) = result.expect("session shutdown completes while the runtime is running") {
+                tracing::warn!(error = %error, "session shutdown reported an error");
                 eprintln!("{error}");
             }
         }

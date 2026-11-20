@@ -4,11 +4,11 @@
 
 use std::sync::Arc;
 
-use singularity_agent::agent::{Agent, AgentConfig, AgentError, RequestContext, TurnEvent};
+use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, RequestContext};
 use singularity_agent::session::{LedgerRecord, lock_writer, with_writer_async};
-use singularity_model::OpenAiProvider;
+use singularity_model::ModelClient;
 
-use singularity_protocol::{Turn, TurnErrorDetail, TurnStatus};
+use singularity_protocol::{Turn, TurnErrorDetail, TurnEvent, TurnStatus};
 
 use super::Conversation;
 
@@ -22,7 +22,7 @@ impl Conversation {
     pub(super) async fn run_single_turn(
         self: &Arc<Self>,
         controls: &Arc<crate::runtime::conversation::TurnControls>,
-        sink: &mut (dyn FnMut(TurnEvent) + Send),
+        sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<TurnStatus, TurnErrorDetail> {
         let conversation = Arc::clone(self);
         let preparing = Arc::clone(controls);
@@ -45,11 +45,11 @@ impl Conversation {
             turn_id: turn_id.clone(),
             status: TurnStatus::Running,
         };
-        sink(TurnEvent::TurnStarted { turn, started_at });
+        sink(AgentEvent::Turn(TurnEvent::TurnStarted { turn, started_at }));
 
         let run_result = {
-            let mut on_event = |event: TurnEvent| match event {
-                TurnEvent::ItemUpdated { ref item }
+            let mut on_event = |event: AgentEvent| match event {
+                AgentEvent::Turn(TurnEvent::ItemUpdated { ref item })
                     if matches!(
                         item,
                         singularity_protocol::HistoryItem::ContextRotation { .. }
@@ -65,7 +65,7 @@ impl Conversation {
                     );
                     controls.set_rotating(active);
                     sink(event);
-                    sink(TurnEvent::SessionStateChanged {});
+                    sink(AgentEvent::SessionStateChanged);
                 }
                 event => sink(event),
             };
@@ -107,16 +107,21 @@ impl Conversation {
             };
         let manually_stopped = crate::runtime::history::is_manually_stopped(turn_status, cancel_accepted);
         if let Some(error) = &error {
-            sink(TurnEvent::TurnFailed { error: error.clone(), finished_at });
+            sink(AgentEvent::Turn(TurnEvent::TurnFailed {
+                error: error.clone(),
+                finished_at,
+                stats: None,
+            }));
         } else {
-            sink(TurnEvent::TurnCompleted {
+            sink(AgentEvent::Turn(TurnEvent::TurnCompleted {
                 turn: Turn {
                     turn_id: turn_id.clone(),
                     status: turn_status,
                 },
                 manually_stopped,
                 finished_at,
-            });
+                stats: None,
+            }));
         }
         Ok(turn_status)
     }
@@ -178,7 +183,7 @@ impl Conversation {
     }
     /// 普通回合与独立轮换共用的准备步骤；每次都重新读取模型配置和项目指令。
     pub(super) fn prepare_request_context(&self) -> Result<RequestContext, TurnErrorDetail> {
-        let provider = OpenAiProvider::new(&self.models, &self.model()).map_err(preparation_error)?;
+        let provider = ModelClient::new(&self.models, &self.model()).map_err(preparation_error)?;
         let instruction_home = self.home.clone();
         let initial_instructions =
             singularity_core::load_agent_instructions(std::path::Path::new(&self.cwd), &instruction_home)

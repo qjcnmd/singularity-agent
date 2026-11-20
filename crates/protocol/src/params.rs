@@ -12,7 +12,7 @@ pub enum RequestPurpose {
 }
 
 /// 提供方为一次请求上报的 Token 数和缓存命中数。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelUsage {
     pub input_tokens: u64,
@@ -25,7 +25,7 @@ pub struct ModelUsage {
 
 /// 一次请求尝试的结果、耗时和用量；保存到日志后由后端统计。
 /// 不含密钥或提供方私有数据。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestObservation {
     pub purpose: RequestPurpose,
@@ -176,9 +176,13 @@ pub struct ThreadTurn {
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub error: Option<crate::TurnErrorDetail>,
     pub items: Vec<HistoryItem>,
+    /// 截至本轮结束时整个会话的累计用量；运行中的回合为空。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub stats: Option<SessionModelUsage>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 /// 回合开始和结束事件中携带的回合标识与状态。
@@ -191,7 +195,7 @@ pub struct Turn {
 ///
 /// 每次请求尝试计一次，重试也计入，与日志中的请求记录一致。首 Token 耗时只统计
 /// 实际测到的请求，Token 数只统计上报了用量的请求。
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionModelUsage {

@@ -1,9 +1,9 @@
 //! 组装模型请求：本轮的指令和工具定义，加上从会话日志生成的对话上下文。
 //! 发送、重试和保存请求记录在 crate::request_execution，普通请求和整理请求共用。
 
-use super::{Agent, AgentError, RequestContext, Result, modules};
+use super::{Agent, AgentError, AgentEvent, RequestContext, Result, modules};
 use crate::request_execution::{execute_request, output_budget_tokens};
-use crate::session::{context, lock_writer};
+use crate::session::{LedgerRecord, context, lock_writer, with_writer_async};
 use singularity_model::Message;
 use singularity_model::{ModelTurnRequest, ModelTurnResponse};
 use singularity_protocol::TurnEvent;
@@ -34,12 +34,12 @@ impl RequestContext {
     /// 本轮首次请求前加载定义，后续请求复用。
     pub(super) async fn ensure_definitions(
         &mut self,
-        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<()> {
         if self.definitions.is_none() {
             let (definitions, context) = self.load_definitions(cancellation).await?;
-            on_event(TurnEvent::ContextLoaded { context });
+            on_event(AgentEvent::Turn(TurnEvent::ContextLoaded { context }));
             self.definitions = Some(definitions);
         }
         Ok(())
@@ -53,7 +53,7 @@ impl RequestContext {
         let home = self.config.instruction_home.clone();
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
         let skill_cwd = cwd.clone();
-        let instructions = std::mem::take(&mut self.config.initial_instructions);
+        let instructions = self.config.initial_instructions.clone();
         let disabled = &self.config.disabled_modules;
         let skills = tokio::task::spawn_blocking(move || {
             singularity_core::skills::SkillCatalog::discover(&skill_cwd, &home)
@@ -97,10 +97,35 @@ impl RequestContext {
         )
     }
 
+    /// 达到软压力阈值时先执行零模型调用的旧工具输出微压缩，通过写入锚定水位线保持后续前缀稳定。
+    pub(super) async fn prune_tool_outputs_if_needed(&self) -> Result<()> {
+        let candidate = {
+            let writer = lock_writer(&self.session);
+            context::select_prune_target(
+                &writer,
+                self.provider.model_identity(),
+                self.request_definitions().estimated_tokens,
+                self.context_window(),
+            )
+        };
+        if let Some((before_entry_id, saved_tokens)) = candidate {
+            tracing::info!(
+                before_entry_id = %before_entry_id,
+                saved_tokens,
+                "pruning older tool outputs to defer full context rotation"
+            );
+            with_writer_async(&self.session, move |writer| {
+                writer.append_record(LedgerRecord::ToolOutputsPruned { before_entry_id })
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     /// 组装并发送一次普通请求；输入 Token 估算与轮换判断用同一规则。
     async fn request_response(
         &mut self,
-        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<(ModelTurnResponse, String, String)> {
         let definitions = self.request_definitions();
@@ -142,20 +167,22 @@ impl RequestContext {
 }
 
 impl Agent {
-    /// 生成一次模型回复：需要时先轮换，再组装并发送请求。
-    /// 提供方明确返回上下文超限时，轮换后重新组装并重发，最多一次。
+    /// 生成一次模型回复：先按需微压缩旧工具输出，仍接近上限时再轮换，然后组装并发送请求。
+    /// 提供方明确返回上下文超限时，强制降级轮换后重新组装并重发，最多一次。
     pub(super) async fn generate_response(
         &mut self,
-        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<(ModelTurnResponse, String, String)> {
+        self.requests.prune_tool_outputs_if_needed().await?;
         self.requests.rotate_context_if_needed(on_event, cancellation).await?;
         self.drain_inputs(on_event, cancellation).await?;
         let overflow = match self.requests.request_response(on_event, cancellation).await {
             Err(AgentError::Provider(error)) if error.is_context_overflow() => error,
             result => return result,
         };
-        if !self.requests.rotate_now(on_event, cancellation).await? {
+        tracing::warn!(error = %overflow, "provider reported context overflow; triggering forced rotation");
+        if !self.requests.rotate_now(on_event, cancellation, true).await? {
             return Err(AgentError::Provider(overflow));
         }
         // 轮换后只重发一次，仍然超限时直接把错误返回给调用方。

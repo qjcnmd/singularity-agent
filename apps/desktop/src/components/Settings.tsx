@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useState, type CSSProperties } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore } from '../appStore'
+import { palette, resolveAccentId } from '../bubbleColors'
 import type { RedactedProvider } from '../protocol'
-import { messageFontSize } from '../viewPersistence'
+import { messageFontSize, normalizeMessageFontSize } from '../viewPersistence'
 import { ProviderEditor } from './ProviderEditor'
 import { Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
@@ -11,11 +12,15 @@ import { X } from 'lucide-react'
 type ProviderEditorState = null | 'new' | RedactedProvider
 
 export function Settings() {
-  const state = useAppStore(['theme', 'bootstrap', 'settingsOpen', 'messageFontSize', 'actionErrors', 'pendingActions'])
+  const state = useAppStore(['theme', 'accentColor', 'bootstrap', 'settingsOpen', 'messageFontSize', 'actionErrors', 'pendingActions'])
+  const [fontSizeDraft, setFontSizeDraft] = useState(() => String(state.messageFontSize))
   const [editor, setEditor] = useState<ProviderEditorState>(null)
   const [editorVersion, setEditorVersion] = useState(0)
   const [removing, setRemoving] = useState<RedactedProvider | null>(null)
   const [refreshing, setRefreshing] = useState(false)
+  useEffect(() => {
+    setFontSizeDraft(String(state.messageFontSize))
+  }, [state.messageFontSize])
   const busy = [...state.pendingActions].some(key =>
     ['model.saveProvider', 'model.removeProvider'].some(method => key.startsWith(pendingKey(method, ''))))
   const catalog = state.bootstrap?.modelCatalog
@@ -49,8 +54,16 @@ export function Settings() {
     }
   }
 
-  function changeMessageFontSize(value: string) {
-    if (value !== '') appStore.setMessageFontSize(Number(value))
+  function commitFontSizeDraft() {
+    const trimmed = fontSizeDraft.trim()
+    const parsed = Number(trimmed)
+    if (trimmed === '' || !Number.isFinite(parsed)) {
+      setFontSizeDraft(String(state.messageFontSize))
+      return
+    }
+    const clamped = normalizeMessageFontSize(parsed)
+    appStore.setMessageFontSize(clamped)
+    setFontSizeDraft(String(clamped))
   }
 
   async function rereadModelConfiguration() {
@@ -74,10 +87,41 @@ export function Settings() {
                 {([['light', '浅色'], ['dark', '深色']] as const).map(([theme, label]) => <button key={theme} type="button" role="radio" aria-checked={state.theme === theme} onClick={() => appStore.setTheme(theme)}>{label}</button>)}
               </div>
             </div>
+            <div className="settings-row"><span>强调色</span>
+              <div className="accent-swatches" role="radiogroup" aria-label="强调色">
+                {palette.map(color => (
+                  <button
+                    key={color.id}
+                    type="button"
+                    className="accent-swatch"
+                    role="radio"
+                    aria-checked={resolveAccentId(state.accentColor) === color.id}
+                    aria-label={color.label}
+                    title={color.label}
+                    style={{ '--swatch': color.solid } as CSSProperties}
+                    onClick={() => appStore.setAccentColor(color.id)}
+                  />
+                ))}
+              </div>
+            </div>
             <div className="settings-row"><span>消息字号</span>
               <div className="stepper">
                 <button type="button" className="icon-button small" aria-label="减小字号" disabled={state.messageFontSize <= messageFontSize.min} onClick={() => appStore.setMessageFontSize(state.messageFontSize - .5)}>−</button>
-                <input className="input" type="number" aria-label="消息字号" min={messageFontSize.min} max={messageFontSize.max} step=".5" value={state.messageFontSize} onChange={event => changeMessageFontSize(event.target.value)} />
+                <input
+                  className="input"
+                  type="number"
+                  aria-label="消息字号"
+                  min={messageFontSize.min}
+                  max={messageFontSize.max}
+                  step=".5"
+                  value={fontSizeDraft}
+                  onChange={event => setFontSizeDraft(event.target.value)}
+                  onBlur={commitFontSizeDraft}
+                  onKeyDown={event => {
+                    if (event.key === 'Enter') { commitFontSizeDraft(); event.currentTarget.blur() }
+                    else if (event.key === 'Escape') { setFontSizeDraft(String(state.messageFontSize)); event.currentTarget.blur() }
+                  }}
+                />
                 <span>px</span>
                 <button type="button" className="icon-button small" aria-label="增大字号" disabled={state.messageFontSize >= messageFontSize.max} onClick={() => appStore.setMessageFontSize(state.messageFontSize + .5)}>+</button>
               </div>
@@ -105,8 +149,13 @@ export function Settings() {
                         if (expanded) setEditor(null)
                         else openEditor(provider)
                       }}>
-                        <span className="provider-avatar" aria-hidden="true">{(provider.displayName || provider.providerId).slice(0, 1)}</span>
-                        <span className="row-card-title"><strong>{provider.displayName || provider.providerId}</strong><small>{provider.models.length} 个模型 · {provider.baseUrl}</small></span>
+                        <span className="row-card-title">
+                          <span className="row-card-head-line">
+                            <strong>{provider.displayName || provider.providerId}</strong>
+                            <span className="proto-tag">{provider.apiProtocol === 'responses' ? 'Responses' : 'Messages'}</span>
+                          </span>
+                          <small>{provider.models.length} 个模型 · {provider.baseUrl}</small>
+                        </span>
                         <span className={`credential${provider.credentialConfigured ? ' on' : ''}`}>{provider.credentialConfigured ? '已配置密钥' : '无密钥'}</span>
                         <ExpandChevron expanded={expanded} size={16} />
                       </button>
