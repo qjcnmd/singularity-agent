@@ -11,9 +11,7 @@ use std::sync::{Arc, Mutex};
 use crate::runtime::{CatalogError, Conversation, ConversationError, ThreadCatalog};
 use agent::agent::UserInput;
 use model::{ModelConfigManager, ProviderError};
-use protocol::{
-    AppBootstrap, ProviderConfigurationInput, RpcError, SessionReadResult, StreamEnvelope, StreamEvent,
-};
+use protocol::{ProviderConfigurationInput, RpcError, SessionReadResult, StreamEnvelope, StreamEvent};
 use tokio::sync::mpsc;
 
 use super::stream_hub::StreamHub;
@@ -194,6 +192,7 @@ impl AppServer {
             params.text,
             params.images,
             params.files,
+            Vec::new(),
             std::path::Path::new(&workspace.root),
             &self.home,
             skill_expansion,
@@ -252,28 +251,23 @@ impl AppServer {
             Arc::clone(&self.models),
             Arc::clone(&self.mcp),
             self.hub.revision(),
-            self.hub.publisher(),
+            Arc::clone(&self.hub),
         );
         self.lock_sessions().insert(id, Arc::clone(&conversation));
         conversation
     }
 
-    /// 发布完整的工作台快照；快照生成失败不影响已保存的操作结果。
-    /// 在释放生命周期锁之后调用，读取目录期间其他任务仍可操作。
+    /// 在释放生命周期锁之后调用；在发布锁内生成并发出应用级快照，读取目录期间其他任务仍可操作。
     fn publish_app_snapshot(&self) {
         let _publication = self.lock_app_publication();
-        self.publish_app_result(self.bootstrap_with_catalog(self.models.redacted_catalog()));
-    }
-
-    fn publish_app_result(&self, snapshot: Result<AppBootstrap, RpcError>) {
-        match snapshot {
+        match self.bootstrap_with_catalog(self.models.redacted_catalog()) {
             Ok(payload) => {
-                self.emit(StreamEvent::AppChanged { payload });
+                self.hub.emit(StreamEvent::AppChanged { payload });
             }
             // 操作已经保存，RPC 照常返回结果；读取列表失败由客户端显示列表错误，
             // 不悄悄保留旧列表。
             Err(error) => {
-                self.emit(StreamEvent::AppReadFailed { error });
+                self.hub.emit(StreamEvent::AppReadFailed { error });
             }
         }
     }
@@ -289,10 +283,6 @@ impl AppServer {
     /// 只在公开入口的最外层获取。
     fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
         self.lifecycle.lock().expect("app_server lifecycle lock poisoned")
-    }
-
-    fn emit(&self, event: StreamEvent) -> u64 {
-        self.hub.emit(event)
     }
 
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, SessionCache> {

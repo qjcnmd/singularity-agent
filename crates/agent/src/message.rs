@@ -16,13 +16,6 @@ pub fn user_text_for_display<'a>(
     }
 }
 
-fn user_files(display: Option<&MessageDisplay>) -> Vec<String> {
-    match display {
-        Some(MessageDisplay::User { files, .. }) => files.clone(),
-        _ => Vec::new(),
-    }
-}
-
 /// 用户和助手消息中可显示的条目，历史读取和完成事件共用。提供方私有字段不转换；
 /// 工具结果由历史读取时挂到对应调用上，这里不处理。
 /// `saved_at` 是消息写入日志的时间。助手回复的累计用量由调用方挂到最后一段正文上。
@@ -43,7 +36,10 @@ pub fn public_items(
         }
     };
     let mut images = message.images().cloned().collect::<Vec<_>>();
-    let mut files = user_files(display);
+    let (mut files, mut annotations) = match display {
+        Some(MessageDisplay::User { files, annotations, .. }) => (files.clone(), annotations.clone()),
+        _ => (Vec::new(), Vec::new()),
+    };
     let (mut text_index, mut thinking_index, mut call_index) = (0, 0, 0);
     message
         .content()
@@ -53,7 +49,10 @@ pub fn public_items(
             Some(match block {
                 ContentBlock::Text { text, .. } => {
                     let text = user_text_for_display(display, index, text);
-                    if text.is_empty() && (text_index != 0 || (images.is_empty() && files.is_empty())) {
+                    if text.is_empty()
+                        && (text_index != 0
+                            || (images.is_empty() && files.is_empty() && annotations.is_empty()))
+                    {
                         return None;
                     }
                     let id = crate::session::text_item_id(entry_id, text_index);
@@ -67,6 +66,7 @@ pub fn public_items(
                         stats: None,
                         images: std::mem::take(&mut images),
                         files: std::mem::take(&mut files),
+                        annotations: std::mem::take(&mut annotations),
                     }
                 }
                 ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {

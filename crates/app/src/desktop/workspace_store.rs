@@ -91,13 +91,11 @@ impl WorkspaceStore {
 
     /// 移除登记；目录中的文件及会话历史由各自所有者管理。
     pub(crate) fn remove(&self, workspace_root: &str) -> Result<(), WorkspaceError> {
-        let key = app_core::CanonicalWorkspacePath::from_saved(workspace_root)
-            .map_err(WorkspaceError::InvalidInput)?;
         self.update(|registry| {
             let position = registry
                 .workspaces
                 .iter()
-                .position(|workspace| app_core::same_saved_path(&workspace.root, key.display()))
+                .position(|workspace| app_core::same_saved_path(&workspace.root, workspace_root))
                 .ok_or(WorkspaceError::NotFound)?;
             registry.workspaces.remove(position);
             Ok(())

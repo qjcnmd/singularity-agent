@@ -6,6 +6,7 @@
 
 use std::{
     collections::VecDeque,
+    fmt::Write as _,
     sync::{Arc, Mutex},
 };
 
@@ -26,13 +27,15 @@ impl SkillExpansion {
     }
 }
 
-/// 文字、图片和附件路径作为一个输入一起接受和交付。
+/// 文字、图片、附件路径和批注作为一个输入一起接受和交付。
 #[derive(Debug, Clone)]
 pub struct UserInput {
     pub text: String,
     pub images: Vec<crate::image::InputImage>,
     /// 附件文件的绝对路径；只交给模型路径，由模型用读取工具查看内容。
     pub files: Vec<String>,
+    /// 用户对历史助手回复片段添加的文字批注。
+    pub annotations: Vec<protocol::MessageAnnotation>,
     /// 接受输入时读取的技能全文；原始任务文字单独保留供界面显示。
     skill_instructions: String,
 }
@@ -43,11 +46,28 @@ impl UserInput {
         text: String,
         images: Vec<protocol::ImageUpload>,
         files: Vec<String>,
+        annotations: Vec<protocol::MessageAnnotation>,
         cwd: &std::path::Path,
         home: &std::path::Path,
         skill_expansion: SkillExpansion,
     ) -> Result<Self, String> {
-        if text.trim().is_empty() && images.is_empty() && files.is_empty() {
+        let mut clean_annotations = Vec::with_capacity(annotations.len());
+        for annotation in annotations {
+            let message_id = annotation.message_id.trim().to_owned();
+            if message_id.is_empty() {
+                return Err("批注缺少目标消息标识。".into());
+            }
+            let quote = annotation.quote.trim().to_owned();
+            if quote.is_empty() {
+                return Err("批注引用内容不能为空。".into());
+            }
+            clean_annotations.push(protocol::MessageAnnotation {
+                message_id,
+                quote,
+                comment: annotation.comment.trim().to_owned(),
+            });
+        }
+        if text.trim().is_empty() && images.is_empty() && files.is_empty() && clean_annotations.is_empty() {
             return Err("输入不能为空。".into());
         }
         let mut seen_files = std::collections::HashSet::new();
@@ -64,20 +84,55 @@ impl UserInput {
                 unique_files.push(path);
             }
         }
+        let skill_instructions = match skill_expansion {
+            SkillExpansion::Enabled => load_selected_skills(
+                std::iter::once(text.as_str())
+                    .chain(clean_annotations.iter().map(|item| item.comment.as_str())),
+                cwd,
+                home,
+            )?,
+            SkillExpansion::Disabled => String::new(),
+        };
         Ok(Self {
-            skill_instructions: match skill_expansion {
-                SkillExpansion::Enabled => load_selected_skills(&text, cwd, home)?,
-                SkillExpansion::Disabled => String::new(),
-            },
+            skill_instructions,
             text,
             images: images.into_iter().map(crate::image::InputImage::upload).collect::<Result<_, _>>()?,
             files: unique_files,
+            annotations: clean_annotations,
         })
     }
 
-    /// 模型看到的文字：原始任务后附所选技能，附件路径列在最后。
-    pub(super) fn text_with_files(&self) -> String {
-        let mut text = self.text.clone();
+    /// 模型看到的文字：批注区块（如有）在最前，接原始任务、所选技能，附件路径列在最后。
+    pub(super) fn model_text(&self) -> String {
+        let mut text = String::new();
+        if !self.annotations.is_empty() {
+            text.push_str("<annotations>");
+            for (index, annotation) in self.annotations.iter().enumerate() {
+                let _ = write!(
+                    text,
+                    "\n<annotation index=\"{}\">\n<quote>\n{}\n</quote>",
+                    index + 1,
+                    escape_annotation_tags(&annotation.quote)
+                );
+                if !annotation.comment.is_empty() {
+                    let _ = write!(
+                        text,
+                        "\n<comment>\n{}\n</comment>",
+                        escape_annotation_tags(&annotation.comment)
+                    );
+                }
+                text.push_str("\n</annotation>");
+            }
+            text.push_str("\n</annotations>");
+        }
+        if !self.text.trim().is_empty() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&self.text);
+        } else if text.is_empty() {
+            text.push_str(&self.text);
+        }
         text.push_str(&self.skill_instructions);
         if !self.files.is_empty() {
             if text.trim().is_empty() {
@@ -95,10 +150,23 @@ impl UserInput {
     }
 }
 
+/// 转义批注正文中可能提前闭合结构区块的结束标签。
+fn escape_annotation_tags(text: &str) -> String {
+    text.replace("</quote>", "<\\/quote>")
+        .replace("</comment>", "<\\/comment>")
+        .replace("</annotation>", "<\\/annotation>")
+        .replace("</annotations>", "<\\/annotations>")
+}
+
 /// 按空白分隔的引用顺序读取技能，同一技能只加载一次，未知名称不影响原文。
-fn load_selected_skills(text: &str, cwd: &std::path::Path, home: &std::path::Path) -> Result<String, String> {
-    let mut references = text
-        .split_whitespace()
+fn load_selected_skills<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+) -> Result<String, String> {
+    let mut references = texts
+        .into_iter()
+        .flat_map(str::split_whitespace)
         .filter_map(|word| word.strip_prefix('/'))
         .filter(|name| !name.is_empty())
         .peekable();
@@ -145,7 +213,7 @@ impl QueuedInput {
     }
 
     /// 队列只保存命令 ID；交给模型时从后台管理器取未读输出与终态。
-    pub fn background(task_id: String) -> Self {
+    pub(crate) fn background(task_id: String) -> Self {
         Self {
             input: QueuedInputKind::Background { task_id },
             message_id: crate::session::new_entry_id(),

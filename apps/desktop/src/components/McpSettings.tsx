@@ -20,25 +20,35 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
   const [expanded, setExpanded] = useState<string | null>(null)
   const [editor, setEditor] = useState<McpServerInput | 'new' | null>(null)
   const [removing, setRemoving] = useState<McpServerInput | null>(null)
-  const revision = useRef(0)
+  const epoch = useRef(0)
+  const loadRevision = useRef(0)
+  const reconnectRevisions = useRef<Map<string, number>>(new Map())
 
   const load = useCallback(async () => {
-    const version = ++revision.current
+    const ep = epoch.current
+    const version = ++loadRevision.current
     try {
       const servers = await appStore.transport.rpc('mcp.list', { workspaceRoot })
-      if (version === revision.current) setServers(servers)
+      if (ep === epoch.current && version === loadRevision.current) setServers(servers)
     } catch (error) {
-      if (version === revision.current) {
+      if (ep === epoch.current && version === loadRevision.current) {
         setError(error instanceof Error ? error.message : '读取 MCP 配置失败。')
       }
-    } finally { if (version === revision.current) setLoading(false) }
+    } finally {
+      if (ep === epoch.current && version === loadRevision.current) setLoading(false)
+    }
   }, [workspaceRoot])
 
   useEffect(() => {
     setLoading(true)
     setError(null)
     void load()
-    return () => { revision.current += 1 }
+    const revisions = reconnectRevisions.current
+    return () => {
+      epoch.current += 1
+      loadRevision.current += 1
+      revisions.clear()
+    }
   }, [load])
 
   useEffect(() => {
@@ -51,16 +61,23 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
   }, [busy, loading, error, reconnecting, servers, load])
 
   async function reconnect(serverId: string) {
-    const version = ++revision.current
+    const ep = epoch.current
+    loadRevision.current += 1
+    const version = (reconnectRevisions.current.get(serverId) ?? 0) + 1
+    reconnectRevisions.current.set(serverId, version)
     setReconnecting(count => count + 1)
     setServers(current => current.map(state => state.server.serverId === serverId
       ? { ...state, status: 'connecting', error: null, tools: [] } : state))
     try {
       const result = await appStore.transport.rpc('mcp.reconnect', { serverId, workspaceRoot })
-      if (revision.current === version) setServers(current => current.map(state => state.server.serverId === serverId ? result : state))
+      if (ep === epoch.current && reconnectRevisions.current.get(serverId) === version) {
+        setServers(current => current.map(state => state.server.serverId === serverId ? result : state))
+      }
     } catch (error) {
-      if (revision.current === version) setServers(current => current.map(state => state.server.serverId === serverId
-        ? { ...state, status: 'failed', error: error instanceof Error ? error.message : '连接 MCP 失败。', tools: [] } : state))
+      if (ep === epoch.current && reconnectRevisions.current.get(serverId) === version) {
+        setServers(current => current.map(state => state.server.serverId === serverId
+          ? { ...state, status: 'failed', error: error instanceof Error ? error.message : '连接 MCP 失败。', tools: [] } : state))
+      }
     } finally {
       setReconnecting(count => Math.max(0, count - 1))
     }
@@ -70,16 +87,20 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
     if (busy) return false
     setBusy(true)
     setError(null)
-    const version = ++revision.current
+    const startEpoch = epoch.current
+    loadRevision.current += 1
     try {
       const servers = await action()
-      if (version !== revision.current) return false
+      if (startEpoch !== epoch.current) return false
+      epoch.current += 1
+      loadRevision.current += 1
+      reconnectRevisions.current.clear()
       setServers(servers)
       setLoading(false)
       return true
     }
     catch (error) {
-      if (version === revision.current) setError(error instanceof Error ? error.message : '保存 MCP 配置失败。')
+      if (startEpoch === epoch.current) setError(error instanceof Error ? error.message : '保存 MCP 配置失败。')
       return false
     }
     finally { setBusy(false) }

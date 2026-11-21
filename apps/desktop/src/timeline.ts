@@ -4,10 +4,10 @@ import type { HistoryItem, PendingQuestion, SessionModelUsage, SessionRuntime, T
 
 type ToolItem = Extract<HistoryItem, { type: 'tool' }>
 export type ToolGroup = { type: 'tool_group'; name: string; rows: Array<{ key: string; item: ToolItem }> }
-export type TurnDurationInfo = { startedAt: string; firstTokenAt?: string; finishedAt?: string }
-export type TerminalItem = { type: 'terminal'; status: 'failed' | 'interrupted'; text: string; at?: string }
-export type TypingItem = { type: 'typing' }
-export type TurnStatsItem = { type: 'stats'; stats: SessionModelUsage; at?: string }
+type TurnDurationInfo = { startedAt: string; firstTokenAt?: string; finishedAt?: string }
+type TerminalItem = { type: 'terminal'; status: 'failed' | 'interrupted'; text: string; at?: string }
+type TypingItem = { type: 'typing' }
+type TurnStatsItem = { type: 'stats'; stats: SessionModelUsage; at?: string }
 export type ActivityRowItem =
   | Extract<HistoryItem, { type: 'thinking' | 'tool' | 'context_rotation' | 'context_rotation_result' }>
   | ToolGroup
@@ -19,24 +19,30 @@ export type ActivityGroup = {
   duration?: TurnDurationInfo
 }
 
-export type TimelineContent = HistoryItem | ToolGroup | ActivityGroup
+type TimelineContent = HistoryItem | ToolGroup | ActivityGroup
   | ({ type: 'duration' } & TurnDurationInfo)
   | TerminalItem
   | TypingItem
   | TurnStatsItem
   | { type: 'question'; request: PendingQuestion; duration?: TurnDurationInfo }
 
-/** 只补充排列和阅读位置；历史条目原样交给组件。 */
-export interface TimelineRow {
+type RawTimelineRow = {
   key: string
   stable: boolean
   item: TimelineContent
 }
 
-const turnRowCache = new WeakMap<ThreadTurn, TimelineRow[]>()
+/** 只补充排列和阅读位置；活动条目均由 `groupActivityRuns` 收进 `activity_group`。 */
+export interface TimelineRow {
+  key: string
+  stable: boolean
+  item: Exclude<TimelineContent, ActivityRowItem>
+}
+
+const turnRowCache = new WeakMap<ThreadTurn, RawTimelineRow[]>()
 
 /** 只有事实或上一回合的保存失败状态变化时，才重新排列历史。 */
-export function buildHistoryRows(turns: ThreadTurn[] | undefined, failureFromRuntime: boolean): TimelineRow[] {
+export function buildHistoryRows(turns: ThreadTurn[] | undefined, failureFromRuntime: boolean): RawTimelineRow[] {
   return turns?.flatMap(turn => {
     if (failureFromRuntime && turn === turns.at(-1)) return turnRows(turn, true)
     let cached = turnRowCache.get(turn)
@@ -48,7 +54,7 @@ export function buildHistoryRows(turns: ThreadTurn[] | undefined, failureFromRun
   }) ?? []
 }
 
-export function buildTimeline(rows: TimelineRow[], turns: ThreadTurn[] | undefined, runtime: Pick<SessionRuntime, 'failure' | 'pendingQuestion' | 'pendingMessages'> | undefined): TimelineRow[] {
+export function buildTimeline(rows: RawTimelineRow[], turns: ThreadTurn[] | undefined, runtime: Pick<SessionRuntime, 'failure' | 'pendingQuestion' | 'pendingMessages'> | undefined): TimelineRow[] {
   if (!runtime) return groupActivityRuns(rows)
   const failure = runtime.failure
   const question = runtime.pendingQuestion
@@ -71,7 +77,16 @@ export function buildTimeline(rows: TimelineRow[], turns: ThreadTurn[] | undefin
   for (const message of runtime.pendingMessages) {
     if (savedMessages.has(message.itemId)) continue
     result.push({ key: `pending:${message.itemId}`, stable: false,
-      item: { id: message.itemId, type: 'message', role: 'user', status: 'completed', text: message.text, images: message.images, files: message.files } })
+      item: {
+        id: message.itemId,
+        type: 'message',
+        role: 'user',
+        status: 'completed',
+        text: message.text,
+        images: message.images,
+        files: message.files,
+        annotations: message.annotations,
+      } })
   }
   return groupActivityRuns(result)
 }
@@ -87,7 +102,7 @@ function isActivityItem(item: TimelineContent): item is ActivityRowItem {
 }
 
 /** 将连续的非文本步骤与状态（思考、工具、轮换、等待、中断、报错）合入白卡；前置耗时并入卡顶栏，提问独立成同款白卡。 */
-function groupActivityRuns(rows: TimelineRow[]): TimelineRow[] {
+function groupActivityRuns(rows: RawTimelineRow[]): TimelineRow[] {
   const grouped: TimelineRow[] = []
   for (const row of rows) {
     if (row.item.type === 'question') {
@@ -99,12 +114,12 @@ function groupActivityRuns(rows: TimelineRow[]): TimelineRow[] {
           item: { ...row.item, duration: { startedAt, firstTokenAt, finishedAt } },
         }
       } else {
-        grouped.push(row)
+        grouped.push({ key: row.key, stable: row.stable, item: row.item })
       }
       continue
     }
     if (!isActivityItem(row.item)) {
-      grouped.push(row)
+      grouped.push({ key: row.key, stable: row.stable, item: row.item })
       continue
     }
     const previous = grouped.at(-1)
@@ -137,12 +152,12 @@ function hasModelStats(stats: SessionModelUsage | undefined): stats is SessionMo
   return stats !== undefined && (stats.ttftRequests > 0 || stats.decodeMs > 0 || stats.usagePresent)
 }
 
-function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): TimelineRow[] {
+function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): RawTimelineRow[] {
   const items = mergeAdjacentThinking(turn.items)
   const lastStepIndex = items.findLastIndex(item => item.type !== 'context_rotation' && item.type !== 'context_rotation_result')
   const lastStep = lastStepIndex >= 0 ? items[lastStepIndex] : undefined
   const hasFinalAssistantStats = lastStep?.type === 'message' && lastStep.role === 'assistant' && hasModelStats(lastStep.stats)
-  const result: TimelineRow[] = items.map((item, index) => ({
+  const result: RawTimelineRow[] = items.map((item, index) => ({
     key: item.type === 'context_rotation' || item.type === 'context_rotation_result'
       ? `contextRotation:${item.id}` : `content:${turn.turnId}:${item.id}`,
     stable: !('status' in item) || item.status !== 'running' || item.type === 'tool',
@@ -181,8 +196,8 @@ function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): TimelineRow[] 
 }
 
 /** 提问保持独立，避免把等待用户回答的入口藏在折叠组里。 */
-function groupAdjacentTools(rows: TimelineRow[]): TimelineRow[] {
-  const grouped: TimelineRow[] = []
+function groupAdjacentTools(rows: RawTimelineRow[]): RawTimelineRow[] {
+  const grouped: RawTimelineRow[] = []
   for (const row of rows) {
     const tool = row.item
     const previous = grouped.at(-1)

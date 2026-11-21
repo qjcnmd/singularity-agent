@@ -6,8 +6,7 @@ use serde_json::Value;
 
 use crate::config::selection::SelectedModel;
 use crate::error::{ModelErrorKind, ProviderError};
-use crate::types::{Message, ModelTurnResponse, ModelUsage, ProviderMessageMetadata};
-use crate::{MESSAGES_PATH, MODELS_PATH, RESPONSES_PATH};
+use crate::types::{Message, ModelTurnResponse, ProviderMessageMetadata};
 
 /// 流式解码过程中发给调用方的增量事件。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,16 +24,21 @@ pub(crate) fn canonical_base_url(value: &str) -> &str {
     value.trim().trim_end_matches('/')
 }
 
-pub(crate) fn messages_endpoint(base_url: &str) -> String {
-    format!("{}{MESSAGES_PATH}", canonical_base_url(base_url))
+pub(crate) fn endpoint(base_url: &str, path: &str) -> String {
+    format!("{}{path}", canonical_base_url(base_url))
 }
 
-pub(crate) fn responses_endpoint(base_url: &str) -> String {
-    format!("{}{RESPONSES_PATH}", canonical_base_url(base_url))
-}
-
-pub(crate) fn models_endpoint(base_url: &str) -> String {
-    format!("{}{MODELS_PATH}", canonical_base_url(base_url))
+/// 拆分消息开头连续的 `Developer` 指令，供 Messages (`system`) 与 Responses (`instructions`) 共用。
+pub(crate) fn split_leading_instructions(messages: &[Message]) -> (Option<String>, &[Message]) {
+    let instruction_count =
+        messages.iter().take_while(|message| matches!(message, Message::Developer { .. })).count();
+    let instructions = messages[..instruction_count]
+        .iter()
+        .map(Message::content_text)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    ((!instructions.is_empty()).then_some(instructions), &messages[instruction_count..])
 }
 
 /// 消息里提供方私有的续接数据（加密思考、签名等），只有提供方、模型、协议和请求地址
@@ -95,25 +99,6 @@ pub(crate) fn serialize_tool_call_arguments(arguments: &Value) -> String {
         Value::String(raw) => raw.clone(),
         other => other.to_string(),
     }
-}
-
-pub(crate) fn parse_usage(
-    usage: Option<&Value>,
-    input_field: &str,
-    output_field: &str,
-    cached_path: &str,
-) -> Option<ModelUsage> {
-    let usage = usage?;
-    let count = |value: Option<&Value>| value.and_then(Value::as_u64);
-    let input_tokens = count(usage.get(input_field))?;
-    let output_tokens = count(usage.get(output_field))?;
-    Some(ModelUsage {
-        input_tokens,
-        output_tokens,
-        total_tokens: count(usage.get("total_tokens"))
-            .unwrap_or_else(|| input_tokens.saturating_add(output_tokens)),
-        cached_input_tokens: count(usage.pointer(cached_path)),
-    })
 }
 
 pub(crate) fn provider_response_validation_error(message: &str, errors: &[impl AsRef<str>]) -> ProviderError {

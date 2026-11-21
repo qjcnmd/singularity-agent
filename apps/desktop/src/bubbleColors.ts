@@ -1,6 +1,6 @@
 import type { PersistedView } from './viewPersistence'
 
-export interface PaletteColor {
+interface PaletteColor {
   id: string
   label: string
   solid: string
@@ -32,8 +32,5 @@ export function bubbleVariables(view: Pick<PersistedView, 'accentColor'>): Recor
     '--accent': chosen.solid,
     '--accent-soft': `color-mix(in srgb, ${chosen.solid} 11%, var(--canvas))`,
     '--ink-on-accent': chosen.ink,
-    '--assistant-bubble-bg': `color-mix(in srgb, ${chosen.solid} 10%, var(--surface))`,
-    '--user-bubble-bg': 'var(--accent)',
-    '--user-bubble-ink': 'var(--ink-on-accent)',
   }
 }

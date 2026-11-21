@@ -35,7 +35,7 @@ pub enum SessionError {
     InvalidSession(String),
 }
 
-pub type Result<T> = std::result::Result<T, SessionError>;
+pub(super) type Result<T> = std::result::Result<T, SessionError>;
 /// 完整新版用户消息整理内容；记录所在位置就是上下文切换分界。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,6 +71,9 @@ pub enum MessageDisplay {
         /// 用户随消息附上的文件路径，界面展示为附件卡片。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<String>,
+        /// 用户随消息附上的文本批注，界面展示为引用卡片。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        annotations: Vec<protocol::MessageAnnotation>,
     },
     #[serde(rename_all = "camelCase")]
     Tool {
@@ -224,22 +227,21 @@ impl SessionHeader {
     }
 
     pub(super) fn validate(self) -> Result<Self> {
-        let header = self;
-        if header.kind != SESSION_HEADER_TYPE {
+        if self.kind != SESSION_HEADER_TYPE {
             return Err(SessionError::InvalidHeader("first entry is not a session header".into()));
         }
-        Uuid::parse_str(&header.id).map_err(|_| {
-            SessionError::InvalidHeader(format!("header id must be a valid UUID: {}", header.id))
+        Uuid::parse_str(&self.id).map_err(|_| {
+            SessionError::InvalidHeader(format!("header id must be a valid UUID: {}", self.id))
         })?;
-        if header.version != CURRENT_SESSION_VERSION {
+        if self.version != CURRENT_SESSION_VERSION {
             return Err(SessionError::InvalidHeader(format!(
                 "unsupported session version; expected {CURRENT_SESSION_VERSION}"
             )));
         }
-        if header.timestamp.trim().is_empty() {
+        if self.timestamp.trim().is_empty() {
             return Err(SessionError::InvalidHeader("header timestamp is required".into()));
         }
-        Ok(header)
+        Ok(self)
     }
 
     pub(super) fn canonical_cwd(&self) -> Result<std::path::PathBuf> {

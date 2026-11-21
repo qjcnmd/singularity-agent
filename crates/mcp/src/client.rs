@@ -101,9 +101,7 @@ impl Connection {
     pub async fn connect(cwd: &Path, config: ServerConfig) -> Result<Self, McpError> {
         let stderr_capture = StderrCapture::default();
         let root = reqwest::Url::from_directory_path(cwd)
-            .map_err(|()| {
-                McpError::InvalidConfig(format!("MCP 项目目录无法转换为文件 URI：{}", cwd.display()))
-            })?
+            .map_err(|()| McpError::new(format!("MCP 项目目录无法转换为文件 URI：{}", cwd.display())))?
             .to_string();
         let handler = Handler { root };
         let startup = Duration::from_secs(config.startup_timeout_sec);
@@ -134,19 +132,18 @@ impl Connection {
             })
         };
         let result = tokio::time::timeout(startup, connect).await.unwrap_or_else(|_| {
-            Err(McpError::Timeout(format!("MCP 初始化超过 {} 秒。", config.startup_timeout_sec)))
+            Err(McpError::new(format!("MCP 初始化超过 {} 秒。", config.startup_timeout_sec)))
         });
         match result {
             Ok(connection) => Ok(connection),
             Err(error) => {
                 let logs = stderr_capture.read_tail().await;
-                Err(error.map_message(|message| {
-                    config.redact(if logs.is_empty() {
-                        message
-                    } else {
-                        format!("{message}\n{logs}")
-                    })
-                }))
+                let message = error.to_string();
+                Err(McpError::new(config.redact(if logs.is_empty() {
+                    message
+                } else {
+                    format!("{message}\n{logs}")
+                })))
             }
         }
     }
@@ -155,8 +152,8 @@ impl Connection {
         // 每轮读取目录，服务器更新工具后下轮生效。
         tokio::time::timeout(Duration::from_secs(self.config.startup_timeout_sec), self.peer.list_all_tools())
             .await
-            .map_err(|_| McpError::Timeout("MCP 工具发现超时。".to_string()))?
-            .map_err(|error| McpError::Transport(self.config.redact(format!("MCP 工具发现失败：{error}"))))
+            .map_err(|_| McpError::new("MCP 工具发现超时。"))?
+            .map_err(|error| McpError::new(self.config.redact(format!("MCP 工具发现失败：{error}"))))
     }
 
     pub fn instructions(&self) -> Option<String> {
@@ -169,17 +166,12 @@ impl Connection {
         args: serde_json::Map<String, serde_json::Value>,
         signal: &CancellationToken,
     ) -> Result<CallToolResult, McpError> {
-        enum AbortKind {
-            Cancelled,
-            Timeout,
-        }
-
         let params = CallToolRequestParams::new(name.to_string()).with_arguments(args);
         let mut request_id = None;
         // SDK 的响应超时仍会等待取消通知刷入管道；在这里统一限制发送和响应等待。
-        let (abort_kind, reason) = tokio::select! {
+        let reason = tokio::select! {
             biased;
-            () = signal.cancelled() => (AbortKind::Cancelled, "Operation aborted".to_string()),
+            () = signal.cancelled() => "Operation aborted".to_string(),
             result = tokio::time::timeout(Duration::from_secs(self.config.tool_timeout_sec), async {
                 let request = self.peer.send_cancellable_request(
                     ClientRequest::CallToolRequest(CallToolRequest::new(params)),
@@ -190,14 +182,14 @@ impl Connection {
             }) => match result {
                 Ok(result) => {
                     let result = result.map_err(|error| {
-                        McpError::Transport(self.config.redact(format!("MCP 调用失败：{error}")))
+                        McpError::new(self.config.redact(format!("MCP 调用失败：{error}")))
                     })?;
                     return match result {
                         ServerResult::CallToolResult(result) => Ok(result),
-                        _ => Err(McpError::Transport("MCP 服务器返回了不支持的工具结果。".into())),
+                        _ => Err(McpError::new("MCP 服务器返回了不支持的工具结果。")),
                     };
                 }
-                Err(_) => (AbortKind::Timeout, format!("MCP 调用超过 {} 秒。", self.config.tool_timeout_sec)),
+                Err(_) => format!("MCP 调用超过 {} 秒。", self.config.tool_timeout_sec),
             },
         };
         let message = if let Some(id) = request_id {
@@ -216,10 +208,7 @@ impl Connection {
         } else {
             reason
         };
-        Err(match abort_kind {
-            AbortKind::Cancelled => McpError::Cancelled(message),
-            AbortKind::Timeout => McpError::Timeout(message),
-        })
+        Err(McpError::new(message))
     }
 
     pub async fn close(mut self) {
@@ -254,10 +243,9 @@ async fn connect_stdio(
     };
     let mut command = tokio::task::spawn_blocking(move || which_command(executable))
         .await
-        .map_err(|error| McpError::Transport(format!("无法启动 MCP：{error}")))?
-        .map_err(|error| McpError::Transport(format!("无法启动 MCP：{error}")))?;
+        .map_err(|error| McpError::new(format!("无法启动 MCP：{error}")))?
+        .map_err(|error| McpError::new(format!("无法启动 MCP：{error}")))?;
     command.args(args).envs(env).current_dir(directory);
-    #[cfg(windows)]
     let command = {
         use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
         let mut wrapped = CommandWrap::from(command);
@@ -271,14 +259,14 @@ async fn connect_stdio(
     let (transport, stderr) = TokioChildProcess::builder(command)
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|error| McpError::Transport(format!("无法启动 MCP：{error}")))?;
+        .map_err(|error| McpError::new(format!("无法启动 MCP：{error}")))?;
     if let Some(stderr) = stderr {
         stderr_capture.attach(stderr);
     }
     handler
         .serve(transport)
         .await
-        .map_err(|error| McpError::Transport(format!("MCP 初始化失败：{error}")))
+        .map_err(|error| McpError::new(format!("MCP 初始化失败：{error}")))
 }
 
 async fn connect_http(
@@ -290,18 +278,17 @@ async fn connect_http(
     // 与现有模型传输使用同一 ring provider，避免两个 TLS 默认实现冲突。
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
-        // 与模型共用 reqwest 后也可能启用 gzip；MCP 流继续直接读取原始分块。
         .no_gzip()
         .connect_timeout(startup)
         .build()
-        .map_err(|error| McpError::Transport(format!("无法建立 MCP HTTP 客户端：{error}")))?;
+        .map_err(|error| McpError::new(format!("无法建立 MCP HTTP 客户端：{error}")))?;
     let headers = headers
         .iter()
         .map(|(name, value)| {
             let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                .map_err(|error| McpError::InvalidConfig(format!("MCP 请求头名称无效（{name}）：{error}")))?;
+                .map_err(|error| McpError::new(format!("MCP 请求头名称无效（{name}）：{error}")))?;
             let header_value = reqwest::header::HeaderValue::from_str(value)
-                .map_err(|error| McpError::InvalidConfig(format!("MCP 请求头值无效（{name}）：{error}")))?;
+                .map_err(|error| McpError::new(format!("MCP 请求头值无效（{name}）：{error}")))?;
             Ok((header_name, header_value))
         })
         .collect::<Result<_, McpError>>()?;
@@ -313,5 +300,5 @@ async fn connect_http(
     handler
         .serve(transport)
         .await
-        .map_err(|error| McpError::Transport(format!("MCP 初始化失败：{error}")))
+        .map_err(|error| McpError::new(format!("MCP 初始化失败：{error}")))
 }

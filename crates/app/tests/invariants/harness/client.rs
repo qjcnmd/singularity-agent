@@ -295,4 +295,34 @@ impl BackendClient {
         self.rpc_ok("session.focus", json!({ "sessionId": session_id })).await;
         session_id
     }
+
+    pub async fn submit(&mut self, session_id: &str, text: &str) {
+        self.rpc_ok(
+            "session.submit",
+            json!({ "sessionId": session_id, "text": text, "images": [], "files": [] }),
+        )
+        .await;
+    }
+
+    pub async fn register_test_mcp(&mut self, workspace: &str, script_path: &std::path::Path) {
+        self.rpc_ok(
+            "mcp.save",
+            json!({
+                "workspaceRoot": workspace,
+                "server": {
+                    "serverId": "probe",
+                    "startupTimeoutSec": 20,
+                    "toolTimeoutSec": 20,
+                    "transport": {
+                        "type": "stdio",
+                        "command": "node",
+                        "args": [script_path.to_string_lossy()],
+                        "cwd": workspace,
+                        "env": {}
+                    }
+                }
+            }),
+        )
+        .await;
+    }
 }

@@ -160,7 +160,8 @@ fn build_history(with_leading_handoff: bool, steps: Vec<HistoryStep>) -> Vec<Mes
                 }
                 messages.push(Message::Assistant {
                     content,
-                    provider_metadata: Some(ProviderMessageMetadata::Messages {
+                    provider_metadata: Some(ProviderMessageMetadata {
+                        protocol: protocol::ProviderApiProtocol::Messages,
                         provider_name: "p".into(),
                         model_name: "m".into(),
                         endpoint: "https://example.invalid/v1/messages".into(),

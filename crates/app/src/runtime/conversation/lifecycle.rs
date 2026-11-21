@@ -2,9 +2,8 @@
 use std::sync::Arc;
 
 use super::activity::Activity;
-use super::{
-    Conversation, ConversationError, ConversationState, Operation, TurnControls, TurnLifecycle, view,
-};
+use super::state::{ConversationState, TurnControls, TurnLifecycle};
+use super::{Conversation, ConversationError, Operation, view};
 use agent::agent::{QueuedInput, UserInput};
 use protocol::{SessionFailure, SessionOperation, SessionPhase, StreamEvent, TurnStatus};
 
@@ -145,7 +144,7 @@ impl Conversation {
             .shutdown()
             .await
             .inspect_err(|message| self.background_error(message.clone()))
-            .map_err(ConversationError::BackgroundShutdown)
+            .map_err(ConversationError::Message)
     }
     /// 删除期间拒绝新操作；失败时由 guard 重新开放。
     pub(crate) fn begin_delete(self: &Arc<Self>) -> Result<DeleteGuard, ConversationError> {

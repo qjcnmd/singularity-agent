@@ -26,16 +26,11 @@ export function messagesTextEvents({ thinking, text, inputTokens = 100, outputTo
   return events
 }
 
-export function messagesToolEvents({ preface, calls, inputTokens = 100, outputTokens = 40 }) {
+export function messagesToolEvents({ calls, inputTokens = 100, outputTokens = 40 }) {
   const events = [
     sse({ type: 'message_start', message: { usage: { input_tokens: inputTokens, output_tokens: 1 } } }),
   ]
   let index = 0
-  if (preface) {
-    events.push(sse({ type: 'content_block_start', index, content_block: { type: 'text', text: preface } }))
-    events.push(sse({ type: 'content_block_stop', index }))
-    index += 1
-  }
   for (const { id, name, args } of calls) {
     events.push(sse({ type: 'content_block_start', index, content_block: { type: 'tool_use', id, name, input: {} } }))
     events.push(sse({ type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(args) } }))
@@ -55,34 +50,19 @@ export function createGate() {
 
 /**
  * 极简本地测试 HTTP SSE 回放服务器（仅测试使用，零外部依赖）。
- * 支持按路由队列或动态回调返回 Anthropic Messages SSE 与 `/v1/models`。
+ * 按脚本队列返回 Anthropic Messages SSE 响应。
  */
 export async function startMockModelServer() {
   const queue = []
-  const requests = []
-  let models = ['e2e-model']
-  let fallback = null
 
   const server = createServer(async (req, res) => {
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
-    const raw = Buffer.concat(chunks).toString('utf8')
-    const body = raw ? JSON.parse(raw) : null
-    const url = req.url ?? '/'
+    const serialized = Buffer.concat(chunks).toString('utf8')
 
-    if (req.method === 'GET' && url.endsWith('/models')) {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ data: models.map(id => ({ id })) }))
-      return
-    }
-
-    requests.push({ method: req.method, url, body })
-    const serialized = raw
     let entryIdx = queue.findIndex(item => item.matchText && serialized.includes(item.matchText))
     if (entryIdx < 0) entryIdx = queue.findIndex(item => !item.matchText)
-    const entry = entryIdx >= 0
-      ? queue.splice(entryIdx, 1)[0]
-      : (fallback ? fallback(body, requests.length) : null)
+    const entry = entryIdx >= 0 ? queue.splice(entryIdx, 1)[0] : null
     if (!entry) {
       res.writeHead(500, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: { message: 'unexpected E2E model request' } }))
@@ -99,7 +79,7 @@ export async function startMockModelServer() {
       'Cache-Control': 'no-cache',
       Connection: 'close',
     })
-    const gates = entry.gates ?? (entry.gate ? [{ afterIndex: entry.gateIndex ?? 1, gate: entry.gate }] : [])
+    const gates = entry.gates ?? []
     for (let i = 0; i < entry.events.length; i += 1) {
       if (res.writableEnded || res.destroyed) break
       res.write(entry.events[i])
@@ -120,11 +100,8 @@ export async function startMockModelServer() {
   const address = server.address()
   return {
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
-    requests,
-    setModels(list) { models = list },
     enqueue(events, options = {}) { queue.push({ events, ...options }) },
     enqueueError(status, jsonError, options = {}) { queue.push({ status, jsonError, ...options }) },
-    setFallback(fn) { fallback = fn },
     async close() {
       server.closeAllConnections?.()
       await new Promise(resolve => server.close(resolve))

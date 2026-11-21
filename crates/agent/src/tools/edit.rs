@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 const MAX_EDIT_FILE_BYTES: u64 = 20 * 1024 * 1024;
@@ -20,35 +20,49 @@ use super::registry::{
 static FILE_EDITS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 规范化目标路径的锁键：文件已存在时直接规范化，否则规范化最近已存在的祖先目录再拼回后缀，
+/// 规范化目标路径的锁键：从目标路径向上回溯并折叠 `.` / `..` 直到找到已存在且可规范化的祖先目录再拼回后缀，
 /// 确保 `edit` 与 `write` 对同一目标（含新建文件）共用同一把进程级路径锁。
 pub(super) fn file_lock_key(path: &Path) -> std::io::Result<String> {
-    if let Ok(canonical) = path.canonicalize() {
-        return Ok(app_core::workspace_key(&canonical));
-    }
     let mut missing = Vec::new();
+    let mut skip_parents = 0usize;
     let mut cursor = path;
     loop {
-        if let Ok(canonical) = cursor.canonicalize() {
-            let mut full = canonical;
+        if skip_parents == 0
+            && let Ok(mut full) = cursor.canonicalize()
+        {
             for component in missing.into_iter().rev() {
                 full.push(component);
             }
             return Ok(app_core::workspace_key(&full));
         }
-        let Some(name) = cursor.file_name() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("cannot resolve parent directory for {}", path.display()),
-            ));
-        };
-        missing.push(name.to_os_string());
-        cursor = cursor.parent().ok_or_else(|| {
+        match cursor.components().next_back() {
+            Some(Component::CurDir) => {}
+            Some(Component::ParentDir) => skip_parents += 1,
+            Some(Component::Normal(name)) => {
+                if let Some(remaining) = skip_parents.checked_sub(1) {
+                    skip_parents = remaining;
+                } else {
+                    missing.push(name.to_os_string());
+                }
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("cannot resolve parent directory for {}", path.display()),
+                ));
+            }
+        }
+        let parent = cursor.parent().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("cannot resolve parent directory for {}", path.display()),
             )
         })?;
+        cursor = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
     }
 }
 

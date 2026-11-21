@@ -1,0 +1,64 @@
+/* 助手回复批注：CSS Custom Highlight、编号角标、划词浮层、输入区汇总条与气泡上方轻胶囊 */
+::highlight(sg-annotation) { background-color: color-mix(in srgb, var(--accent) 18%, transparent); text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--accent) 62%, transparent); text-decoration-thickness: 1.5px; text-underline-offset: 2px; }
+::highlight(sg-annotation-active) { background-color: color-mix(in srgb, var(--accent) 30%, transparent); text-decoration: underline; text-decoration-color: var(--accent); text-decoration-thickness: 2px; text-underline-offset: 2px; }
+::highlight(sg-annotation-flash) { background-color: color-mix(in srgb, var(--accent) 36%, transparent); text-decoration: underline; text-decoration-color: var(--accent); text-decoration-thickness: 2px; text-underline-offset: 2px; }
+:root[data-theme=dark] ::highlight(sg-annotation) { background-color: color-mix(in srgb, var(--accent) 28%, transparent); text-decoration-color: color-mix(in srgb, var(--accent) 72%, transparent); }
+:root[data-theme=dark] ::highlight(sg-annotation-active) { background-color: color-mix(in srgb, var(--accent) 44%, transparent); }
+:root[data-theme=dark] ::highlight(sg-annotation-flash) { background-color: color-mix(in srgb, var(--accent) 50%, transparent); }
+
+.annotation-badge-layer { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+.annotation-badge { position: absolute; pointer-events: auto; display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px; border: 1.5px solid var(--canvas); border-radius: 999px; background: var(--accent); color: var(--ink-on-accent); font-size: 10.5px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; cursor: pointer; box-shadow: 0 1px 4px rgb(0 0 0 / 20%); transition: transform var(--spring-dur) var(--spring), box-shadow 140ms; }
+.annotation-badge:hover, .annotation-badge.is-active { transform: scale(1.12); box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 45%, transparent); }
+
+.annotation-popover { position: absolute; z-index: 12; transform: translate(-50%, -100%); pointer-events: auto; }
+.annotation-popover.is-below { transform: translate(-50%, 0); }
+.annotation-trigger-button { display: inline-flex; align-items: center; gap: 5px; height: 32px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 999px; background: color-mix(in srgb, var(--raised) 94%, transparent); backdrop-filter: blur(22px) saturate(170%); -webkit-backdrop-filter: blur(22px) saturate(170%); color: var(--ink); font-size: 12.5px; font-weight: 500; cursor: pointer; box-shadow: var(--shadow-floating); transition: background 120ms, transform var(--spring-dur) var(--spring); }
+.annotation-trigger-button:hover { background: var(--raised); transform: translateY(-1px); }
+.annotation-trigger-button:active { transform: scale(.96); transition-duration: 80ms; }
+
+.annotation-editor { display: flex; align-items: center; gap: 6px; width: min(360px, calc(100vw - 48px)); max-width: 100%; padding: 6px 7px 6px 14px; border: 1px solid var(--line-strong); border-radius: 22px; background: color-mix(in srgb, var(--raised) 95%, transparent); backdrop-filter: blur(26px) saturate(180%); -webkit-backdrop-filter: blur(26px) saturate(180%); box-shadow: var(--shadow-floating); }
+.annotation-input { flex: 1; min-width: 0; min-height: 22px; max-height: 96px; border: 0; outline: 0; resize: none; background: transparent; color: var(--ink); font: 13.5px/1.5 var(--font-sans); field-sizing: content; }
+.annotation-input::placeholder { color: var(--ink-faint); }
+.annotation-action-button, .annotation-confirm-button { flex: none; display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 50%; cursor: pointer; transition: background 120ms, color 120ms, transform var(--spring-dur) var(--spring); }
+.annotation-action-button { background: transparent; color: var(--ink-faint); }
+.annotation-action-button:hover { background: var(--surface-hover); color: var(--ink); }
+.annotation-action-button.is-danger:hover { background: var(--danger-soft); color: var(--danger); }
+.annotation-confirm-button { background: var(--accent); color: var(--ink-on-accent); }
+.annotation-confirm-button:hover { filter: brightness(1.06); }
+.annotation-confirm-button:active, .annotation-action-button:active { transform: scale(.93); transition-duration: 80ms; }
+
+/* 输入卡片顶部批注汇总条 */
+.draft-annotations { margin: -2px -4px 8px -6px; padding: 2px 4px 6px; border-bottom: 1px solid var(--line); }
+.draft-annotations-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.draft-annotations-toggle { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-soft); font-size: 12.5px; font-weight: 500; cursor: pointer; transition: background 120ms, color 120ms; }
+.draft-annotations-toggle:hover { background: var(--soft-fill); color: var(--ink); }
+.draft-annotations-clear { height: 24px; padding: 0 8px; border: 0; border-radius: 7px; background: transparent; color: var(--ink-faint); font-size: 12px; cursor: pointer; transition: background 120ms, color 120ms; }
+.draft-annotations-clear:hover { background: var(--soft-fill); color: var(--ink); }
+.draft-annotations-list { display: grid; gap: 2px; max-height: 168px; overflow-y: auto; padding-top: 4px; }
+.draft-annotation-row { display: flex; align-items: center; gap: 4px; border-radius: 10px; transition: background 120ms; }
+.draft-annotation-row:hover { background: var(--soft-fill); }
+.draft-annotation-jump { flex: 1; min-width: 0; display: flex; align-items: flex-start; gap: 8px; padding: 6px 8px; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.draft-annotation-index, .sent-annotation-index { flex: none; display: inline-flex; align-items: center; justify-content: center; min-width: 17px; height: 17px; margin-top: 1px; padding: 0 4px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-ink); font-size: 10.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.draft-annotation-content { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.draft-annotation-quote { color: var(--ink-soft); font-size: 12px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.draft-annotation-comment { color: var(--ink); font-size: 12.5px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.draft-annotation-remove { flex: none; display: grid; place-items: center; width: 24px; height: 24px; margin-right: 4px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--ink-faint); cursor: pointer; transition: background 120ms, color 120ms; }
+.draft-annotation-remove:hover { background: var(--soft-fill-hover); color: var(--ink); }
+
+/* 用户消息气泡正上方的已发送批注轻胶囊与折叠列表 */
+.sent-annotations { display: grid; justify-items: end; max-width: 100%; margin: 0 0 6px; }
+.sent-annotations:last-child { margin-bottom: 0; }
+.sent-annotations-pill { display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--card); color: var(--ink-soft); font-size: var(--meta-font-size); font-weight: 500; cursor: pointer; transition: background 120ms, color 120ms, border-color 120ms; }
+.sent-annotations-pill:hover { background: var(--fill-subtle); color: var(--ink); }
+.sent-annotations > .content-disclosure { width: min(440px, 100%); }
+.sent-annotations-list { display: grid; margin-top: 6px; padding: 4px; border: 1px solid var(--line-strong); border-radius: 14px; background: var(--card); box-shadow: var(--shadow-soft); }
+.sent-annotation-item { display: grid; gap: 3px; padding: 6px 8px; border-radius: 10px; }
+.sent-annotation-item + .sent-annotation-item { border-top: 1px solid var(--line); border-top-left-radius: 0; border-top-right-radius: 0; }
+.sent-annotation-quote { display: flex; align-items: flex-start; gap: 7px; padding: 0; border: 0; background: transparent; color: var(--ink-soft); text-align: left; cursor: pointer; transition: color 120ms; }
+.sent-annotation-quote:hover { color: var(--ink); }
+.sent-annotation-quote-text { min-width: 0; font-size: var(--meta-font-size); line-height: 1.45; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+.sent-annotation-comment { padding-left: 24px; color: var(--ink); font-size: var(--block-font-size); line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+@media (prefers-reduced-motion: reduce) {
+  .annotation-badge, .annotation-trigger-button, .annotation-action-button, .annotation-confirm-button { transition: none; }
+}

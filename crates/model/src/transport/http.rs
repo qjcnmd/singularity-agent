@@ -43,7 +43,6 @@ pub(crate) fn client_builder() -> reqwest::ClientBuilder {
 
 /// 获取全局共享的 reqwest Client 单例（复用连接池与 TLS 会话）。
 const PROVIDER_CONNECT_TIMEOUT_SECONDS: u64 = 30;
-pub(crate) const PROVIDER_USER_AGENT: &str = app_core::identity::USER_AGENT;
 
 pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -51,18 +50,39 @@ pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
         return Ok(client.clone());
     }
     let client = client_builder()
-        // 禁用全局 gzip，SSE 流按到达字节即时解析；禁用自动重定向，防止自定义鉴权头随跨源跳转外泄。
-        .no_gzip()
+        // 禁用自动重定向，防止自定义鉴权头随跨源跳转外泄；流式 SSE 响应不用 gzip，避免压缩缓冲延迟首字节。
         .redirect(reqwest::redirect::Policy::none())
+        .no_gzip()
         .connect_timeout(Duration::from_secs(PROVIDER_CONNECT_TIMEOUT_SECONDS))
         .read_timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
-        .user_agent(PROVIDER_USER_AGENT)
+        .user_agent(app_core::identity::USER_AGENT)
         .build()
         .map_err(provider_transport_error)?;
     Ok(CLIENT.get_or_init(|| client).clone())
 }
 
-pub(crate) fn sensitive_header_value(value: &str) -> Result<reqwest::header::HeaderValue, ProviderError> {
+pub(crate) fn apply_provider_auth(
+    mut request: reqwest::RequestBuilder,
+    protocol: protocol::ProviderApiProtocol,
+    api_key: &str,
+) -> Result<reqwest::RequestBuilder, ProviderError> {
+    match protocol {
+        protocol::ProviderApiProtocol::Messages => {
+            request = request.header("anthropic-version", crate::ANTHROPIC_VERSION);
+            if !api_key.is_empty() {
+                request = request.header("x-api-key", sensitive_header_value(api_key)?);
+            }
+        }
+        protocol::ProviderApiProtocol::Responses => {
+            if !api_key.is_empty() {
+                request = request.bearer_auth(api_key);
+            }
+        }
+    }
+    Ok(request)
+}
+
+fn sensitive_header_value(value: &str) -> Result<reqwest::header::HeaderValue, ProviderError> {
     let mut header = reqwest::header::HeaderValue::from_str(value)
         .map_err(|_| crate::config::configuration_error("模型配置无效：api_key 只能包含可见 ASCII 字符"))?;
     header.set_sensitive(true);
@@ -86,39 +106,28 @@ pub(crate) enum BoundedBodyReadError {
     Transport(reqwest::Error),
 }
 
-/// 读取有大小上限的 HTTP 错误响应正文；超出上限后截断，避免大错误页占满内存。
-pub(crate) async fn read_bounded_error_body(
-    mut response: reqwest::Response,
-    max_bytes: usize,
-    cancellation: &CancellationToken,
-) -> Result<Vec<u8>, BoundedBodyReadError> {
-    let mut body = Vec::new();
-    while body.len() < max_bytes {
-        if cancellation.is_cancelled() {
-            return Err(BoundedBodyReadError::Cancelled);
-        }
-        let chunk = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(BoundedBodyReadError::Cancelled),
-            result = response.chunk() => result.map_err(BoundedBodyReadError::Transport)?,
-        };
-        let Some(chunk) = chunk else {
-            break;
-        };
-        let remaining = max_bytes - body.len();
-        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-    }
-    Ok(body)
-}
-
-/// 读取有大小上限的 HTTP 响应正文（无取消令牌路径）；超出上限后截断。
+/// 读取有大小上限的 HTTP 响应正文；超出上限后截断，避免大错误页占满内存。
 pub(crate) async fn read_bounded_body(
     mut response: reqwest::Response,
     max_bytes: usize,
-) -> Result<Vec<u8>, reqwest::Error> {
+    cancellation: Option<&CancellationToken>,
+) -> Result<Vec<u8>, BoundedBodyReadError> {
     let mut body = Vec::new();
     while body.len() < max_bytes {
-        let Some(chunk) = response.chunk().await? else {
+        let chunk = match cancellation {
+            Some(token) => {
+                if token.is_cancelled() {
+                    return Err(BoundedBodyReadError::Cancelled);
+                }
+                tokio::select! {
+                    biased;
+                    () = token.cancelled() => return Err(BoundedBodyReadError::Cancelled),
+                    result = response.chunk() => result.map_err(BoundedBodyReadError::Transport)?,
+                }
+            }
+            None => response.chunk().await.map_err(BoundedBodyReadError::Transport)?,
+        };
+        let Some(chunk) = chunk else {
             break;
         };
         let remaining = max_bytes - body.len();

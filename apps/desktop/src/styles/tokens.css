@@ -23,7 +23,6 @@
   --fill: #f3f3f5;
   --fill-hover: #f0f0f2;
   --button-hover: #ececef;
-  --nav-ink: #212022;
   --surface-hover: rgb(0 0 0 / 4.5%);
   --ink: #141413;
   --message-ink: #0d0d0d;
@@ -32,7 +31,6 @@
   --ink-on-accent: #fff;
   --line: #ececee;
   --line-strong: #e0e0e3;
-  --bubble-fill: #f2f2f5;
   --soft-fill: rgb(0 0 0 / 4%);
   --soft-fill-hover: rgb(0 0 0 / 7%);
   --inset: rgb(255 255 255 / 72%);
@@ -40,9 +38,7 @@
   --glass-ring: rgb(0 0 0 / 10%);
   --glass-ring-focus: rgb(0 0 0 / 20%);
   --glass-drop: 0 10px 30px -12px rgb(0 0 0 / 18%);
-  --default-accent: #1783ff;
-  --default-accent-soft: color-mix(in srgb, var(--default-accent) 10%, #fff);
-  --accent: var(--default-accent);
+  --accent: #1783ff;
   --accent-ink: color-mix(in srgb, var(--accent) 76%, #000);
   --accent-soft: color-mix(in srgb, var(--accent) 10%, #fff);
   --danger: #ff3b30;
@@ -93,7 +89,6 @@ button { color: inherit; user-select: none; }
   --fill: #2f2f2f;
   --fill-hover: #333333;
   --button-hover: #3a3a3a;
-  --nav-ink: #d6d6d6;
   --surface-hover: rgb(255 255 255 / 7%);
   --ink: #ededed;
   --message-ink: #ffffff;
@@ -101,18 +96,15 @@ button { color: inherit; user-select: none; }
   --ink-faint: #a0a0a0;
   --line: #333333;
   --line-strong: #4d4d4d;
-  --bubble-fill: #2c2c2e;
   --soft-fill: rgb(255 255 255 / 6%);
   --soft-fill-hover: rgb(255 255 255 / 10%);
   --inset: rgb(0 0 0 / 22%);
   --glass-ring: rgb(255 255 255 / 12%);
   --glass-ring-focus: rgb(255 255 255 / 24%);
   --glass-drop: 0 10px 30px -10px rgb(0 0 0 / 60%);
-  --default-accent: #f472b6;
-  --default-accent-soft: #4a1d33;
-  --accent: var(--default-accent);
+  --accent: #f472b6;
   --accent-ink: var(--accent);
-  --accent-soft: var(--default-accent-soft);
+  --accent-soft: #4a1d33;
   --danger: #ff453a;
   --danger-ink: #ff8a80;
   --danger-soft: #46201f;

@@ -48,15 +48,14 @@ impl SessionManager {
         selection: protocol::ModelSelection,
         disabled_modules: Vec<String>,
     ) -> Result<Self> {
-        let parsed_id = uuid::Uuid::parse_str(session_id).map_err(|_| {
+        let invalid_id = || {
             SessionError::InvalidHeader(format!(
                 "session id must be a canonical lowercase UUID: {session_id}"
             ))
-        })?;
+        };
+        let parsed_id = uuid::Uuid::parse_str(session_id).map_err(|_| invalid_id())?;
         if parsed_id.to_string() != session_id {
-            return Err(SessionError::InvalidHeader(format!(
-                "session id must be a canonical lowercase UUID: {session_id}"
-            )));
+            return Err(invalid_id());
         }
         let cwd = app_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
         let cwd_display = cwd.display().to_string();
@@ -112,7 +111,7 @@ impl SessionManager {
 
 impl SessionData {
     /// 这个任务的图片目录：`sessions/images/<任务 ID>`。
-    pub fn image_directory(&self) -> PathBuf {
+    pub(crate) fn image_directory(&self) -> PathBuf {
         let parent = self.file.parent().expect("session has a parent directory");
         super::session_images_directory(parent, &self.session_id)
     }
@@ -199,7 +198,7 @@ impl SessionManager {
         })
     }
 
-    pub(super) fn append_entry(&mut self, entry: SessionEntry) -> Result<String> {
+    fn append_entry(&mut self, entry: SessionEntry) -> Result<String> {
         // 上次写入失败可能留下残缺行，必须重新打开并截掉残缺末尾后才能继续追加。
         if let Some(error) = &self.append_error {
             return Err(SessionError::Io(std::io::Error::new(

@@ -54,7 +54,11 @@ stats?: SessionModelUsage, images?: Array<ImageAttachment>,
 /**
  * 用户随消息附上的文件路径；模型按路径自己读取，文件本身不复制。
  */
-files?: Array<string>, } | { "type": "thinking", id: string, status: TurnStatus, text: string, } | { "type": "tool", id: string, status: ToolStatus, name: string, args: JsonValue, result: ToolResult | null, } | { "type": "context_rotation", id: string, userMessages: string, } | { "type": "context_rotation_result", id: string, status: TurnStatus, message: string | null, };
+files?: Array<string>,
+/**
+ * 用户随消息附上的助手回复批注列表。
+ */
+annotations?: Array<MessageAnnotation>, } | { "type": "thinking", id: string, status: TurnStatus, text: string, } | { "type": "tool", id: string, status: ToolStatus, name: string, args: JsonValue, result: ToolResult | null, } | { "type": "context_rotation", id: string, userMessages: string, } | { "type": "context_rotation_result", id: string, status: TurnStatus, message: string | null, };
 
 export type HistoryMessageRole = "user" | "assistant";
 
@@ -90,6 +94,20 @@ export type McpToolInfo = { name: string, description: string, };
 
 export type McpTransportConfig = { "type": "stdio", command: string, args: Array<string>, cwd?: string | null, env?: { [key in string]: string }, } | { "type": "http", url: string, headers?: { [key in string]: string }, };
 
+export type MessageAnnotation = {
+/**
+ * 被批注的助手消息条目 ID，供界面点击引用时定位原消息。
+ */
+messageId: string,
+/**
+ * 被选中的原始文本片段。
+ */
+quote: string,
+/**
+ * 用户填写的批注说明；允许为空（仅引用原文）。
+ */
+comment: string, };
+
 export type ModelCatalogResult = { catalog: RedactedModelCatalog, revision: number, };
 
 export type ModelConfigurationInput = { modelId: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<string> | null, };
@@ -102,7 +120,7 @@ export type PendingQuestion = {
  */
 itemId: string, questions: Array<UserQuestion>, };
 
-export type PendingUserMessage = { itemId: string, text: string, images: Array<ImageAttachment>, files: Array<string>, };
+export type PendingUserMessage = { itemId: string, text: string, images: Array<ImageAttachment>, files: Array<string>, annotations?: Array<MessageAnnotation>, };
 
 export type ProviderApiProtocol = "messages" | "responses";
 
@@ -206,7 +224,7 @@ export type SessionStartResult = { summary: ThreadSummary, status: SessionStatus
 
 export type SessionStatus = { phase: SessionPhase, failure: SessionFailure | null, };
 
-export type SessionTextParams = { sessionId: string, text: string, images: Array<ImageUpload>, files: Array<string>, };
+export type SessionTextParams = { sessionId: string, text: string, images: Array<ImageUpload>, files: Array<string>, annotations?: Array<MessageAnnotation>, };
 
 export type SkillCatalog = { skills: Array<SkillMetadata>, diagnostics: Array<string>, };
 

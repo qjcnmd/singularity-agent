@@ -13,7 +13,7 @@ pub struct ImageAttachment {
 }
 
 /// 工作台提交的图片；格式和尺寸由 Rust 根据实际内容确定。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImageUpload {

@@ -11,8 +11,6 @@ export function normalizeMessageFontSize(value: number): number {
   return Number.isFinite(value) ? Math.min(messageFontSize.max, Math.max(messageFontSize.min, value)) : messageFontSize.default
 }
 
-const storageKey = VIEW_STORAGE_KEY
-
 
 export interface PersistedView {
   theme: 'light' | 'dark'
@@ -44,7 +42,7 @@ export function loadPersisted(): PersistedView {
     viewportAnchors: {},
   }
   try {
-    const stored = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as (Partial<PersistedView> & { assistantBubble?: string }) | null
+    const stored = JSON.parse(localStorage.getItem(VIEW_STORAGE_KEY) ?? 'null') as (Partial<PersistedView> & { assistantBubble?: string }) | null
     if (!stored) return fallback
     const accentColor = resolveAccentId(stored.accentColor ?? stored.assistantBubble)
     return { ...fallback, ...stored, accentColor }
@@ -56,7 +54,7 @@ export function loadPersisted(): PersistedView {
 export function persistView(value: PersistedView): void {
   const { theme, messageFontSize, accentColor, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, viewportAnchors } = value
   const view: PersistedView = { theme, messageFontSize, accentColor, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, viewportAnchors }
-  localStorage.setItem(storageKey, JSON.stringify(view))
+  localStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify(view))
 }
 
 export function clampFilePanelWidth(value: number): number {

@@ -39,10 +39,10 @@
   opacity: 0;
   transform: translateY(6px) scale(.96);
   transform-origin: bottom center;
-  transition: opacity var(--disclosure-collapse-duration) var(--disclosure-collapse-ease),
-    transform var(--disclosure-collapse-duration) var(--disclosure-collapse-ease),
-    display var(--disclosure-collapse-duration) allow-discrete,
-    overlay var(--disclosure-collapse-duration) allow-discrete;
+  transition: opacity var(--disclosure-duration) var(--smooth),
+    transform var(--disclosure-duration) var(--smooth),
+    display var(--disclosure-duration) allow-discrete,
+    overlay var(--disclosure-duration) allow-discrete;
 }
 .picker-disclosure.is-open, .picker-disclosure:popover-open {
   display: block;

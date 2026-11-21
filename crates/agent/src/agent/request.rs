@@ -88,27 +88,13 @@ impl RequestContext {
         self.definitions.as_ref().expect("definitions are loaded before model requests")
     }
 
-    /// 估算下一次请求的输入 Token 数（最近一次实际用量加上新增消息，或全量估算），供自动轮换判断使用。
-    pub(super) async fn context_pressure_tokens(&self) -> u64 {
-        let session = std::sync::Arc::clone(&self.session);
-        let identity = (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned());
-        let overhead_tokens = self.request_definitions().estimated_tokens;
-        tokio::task::spawn_blocking(move || {
-            with_writer(&session, |writer| {
-                context::estimated_tokens(writer.data(), (&identity.0, &identity.1), overhead_tokens)
-            })
-        })
-        .await
-        .expect("context pressure estimate completes while the runtime is running")
-    }
-
-    /// 达到软压力阈值时先执行零模型调用的旧工具输出微压缩，通过写入锚定水位线保持后续前缀稳定。
-    pub(super) async fn prune_tool_outputs_if_needed(&self) -> Result<()> {
+    /// 达到软压力阈值时先执行零模型调用的旧工具输出微压缩，并返回最新的输入 Token 估算供自动轮换判断。
+    pub(super) async fn prune_tool_outputs_if_needed(&self) -> Result<u64> {
         let session = std::sync::Arc::clone(&self.session);
         let identity = (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned());
         let overhead_tokens = self.request_definitions().estimated_tokens;
         let context_window = self.context_window();
-        let candidate = tokio::task::spawn_blocking(move || {
+        let (current_tokens, candidate) = tokio::task::spawn_blocking(move || {
             with_writer(&session, |writer| {
                 context::select_prune_target(
                     writer.data(),
@@ -131,7 +117,7 @@ impl RequestContext {
             })
             .await?;
         }
-        Ok(())
+        Ok(current_tokens)
     }
 
     /// 组装并发送一次普通请求；输入 Token 估算与轮换判断用同一规则。
@@ -184,8 +170,8 @@ impl Agent {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<(ModelTurnResponse, String, String)> {
-        self.requests.prune_tool_outputs_if_needed().await?;
-        self.requests.rotate_context_if_needed(on_event, cancellation).await?;
+        let pressure_tokens = self.requests.prune_tool_outputs_if_needed().await?;
+        self.requests.rotate_context_if_needed(pressure_tokens, on_event, cancellation).await?;
         self.drain_inputs(on_event, cancellation).await?;
         let overflow = match self.requests.request_response(on_event, cancellation).await {
             Err(AgentError::Provider(error)) if error.is_context_overflow() => error,

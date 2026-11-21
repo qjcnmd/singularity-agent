@@ -114,12 +114,6 @@ impl StreamHub {
         tracing::warn!(revision, "stream channel saturated; dropping stream event");
         revision
     }
-
-    /// 生成交给单个 `Conversation` 使用的发布回调。
-    pub(crate) fn publisher(self: &Arc<Self>) -> Arc<dyn Fn(StreamEvent) -> u64 + Send + Sync> {
-        let hub = Arc::clone(self);
-        Arc::new(move |event| hub.emit(event))
-    }
 }
 
 /// 识别可按焦点过滤、也可在背压高水位线时让路的高频进度帧，返回其所属会话 ID。

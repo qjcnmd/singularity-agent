@@ -1,12 +1,4 @@
 use super::{ModelToolCall, ProviderBlockMetadata, ProviderMessageMetadata};
-/// 发给模型时的消息角色；后台通知作为 `user` 消息发送。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModelRole {
-    Developer,
-    User,
-    Assistant,
-    Tool,
-}
 
 /// 消息体内部的结构化内容块；一条消息的内容就是若干块组成的有序列表。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -97,7 +89,7 @@ impl Message {
         }
     }
 
-    pub fn provider_metadata(&self) -> Option<&ProviderMessageMetadata> {
+    pub(crate) fn provider_metadata(&self) -> Option<&ProviderMessageMetadata> {
         match self {
             Self::Assistant { provider_metadata, .. } => provider_metadata.as_ref(),
             _ => None,
@@ -113,15 +105,6 @@ impl Message {
     /// 构造 Harness 或技能目录指令。
     pub fn developer(text: impl Into<String>) -> Self {
         Self::Developer { content: vec![ContentBlock::text(text)] }
-    }
-    /// 编码时通知按用户消息发送，工具结果带上对应的调用 ID。
-    pub(crate) fn role(&self) -> ModelRole {
-        match self {
-            Self::Developer { .. } => ModelRole::Developer,
-            Self::User { .. } | Self::Notification { .. } => ModelRole::User,
-            Self::Assistant { .. } => ModelRole::Assistant,
-            Self::ToolResult { .. } => ModelRole::Tool,
-        }
     }
     /// Provider 解码和中断收尾共用的助手消息；正文与思考按同一顺序保存。
     pub fn assistant(

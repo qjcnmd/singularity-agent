@@ -13,11 +13,11 @@ struct CancelState {
 }
 
 /// 一次操作（回合或独立轮换）的提问和停止控制；输入队列和写者由任务持有。
-pub(crate) struct TurnControls {
-    pub(crate) turn_id: String,
+pub(super) struct TurnControls {
+    pub(super) turn_id: String,
     cancellation: CancellationToken,
     cancel_state: Mutex<CancelState>,
-    pub(crate) questions: Arc<agent::agent::UserQuestions>,
+    pub(super) questions: Arc<agent::agent::UserQuestions>,
 }
 
 impl TurnControls {
@@ -34,15 +34,15 @@ impl TurnControls {
         }
     }
 
-    pub(crate) fn set_rotating(&self, active: bool) {
+    pub(super) fn set_rotating(&self, active: bool) {
         self.cancel_state.lock().expect("cancel window lock poisoned").rotating = active;
     }
 
-    pub(crate) fn is_rotating(&self) -> bool {
+    pub(super) fn is_rotating(&self) -> bool {
         self.cancel_state.lock().expect("cancel window lock poisoned").rotating
     }
 
-    pub(crate) fn cancellation(&self) -> &CancellationToken {
+    pub(super) fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
     }
 
@@ -60,7 +60,7 @@ impl TurnControls {
     }
 
     /// 保存最终状态前关闭停止入口，并返回用户是否停止过；已接受的停止一定计入本轮结果。
-    pub(crate) fn finish_cancel(&self) -> bool {
+    pub(super) fn finish_cancel(&self) -> bool {
         let mut state = self.cancel_state.lock().expect("cancel window lock poisoned");
         state.accepting = false;
         state.user_stopped
@@ -81,6 +81,13 @@ pub(super) struct ConversationState {
 }
 
 impl ConversationState {
+    pub(super) fn has_work(&self, bash_tasks: &agent::tools::BashTasks) -> bool {
+        self.turn.is_busy()
+            || self.context_preview.is_some()
+            || bash_tasks.is_busy()
+            || !self.steering_inbox.lock().expect("turn inbox lock poisoned").pending().is_empty()
+    }
+
     /// 回合结束和后台通知共用的继续条件；暂停或关闭时不自动处理输入。
     pub(super) fn has_pending_resume(&self) -> bool {
         self.auto_resume

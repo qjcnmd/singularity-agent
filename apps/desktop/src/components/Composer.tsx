@@ -1,6 +1,7 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Plus } from 'lucide-react'
 import { actionOrigin, appStore, useAppStore, pendingKey } from '../appStore'
+import { hasDraftContent } from '../drafts'
 import { ModelPicker } from './ModelPicker'
 import { ContextCapsules } from './ContextCapsules'
 import { WaterOrb } from './orb/WaterOrb'
@@ -8,6 +9,7 @@ import { motion, useReducedMotion } from 'motion/react'
 import { inputTrigger, useSkillCandidates } from '../inputCandidates'
 import { smooth } from '../motion'
 import { DraftImages, FileChips, useAttachmentInput } from './Images'
+import { DraftAnnotationsTray } from './Annotations'
 import { selectedSessionPhase } from '../sessionState'
 
 export const Composer = memo(ComposerView)
@@ -15,7 +17,7 @@ export const Composer = memo(ComposerView)
 function ComposerView({ accent }: { accent: string }) {
   const reducedMotion = useReducedMotion()
   const state = useAppStore(['drafts', 'pendingActions', 'bootstrap', 'bootstrapLoad', 'connection', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'liveSessions', 'sessionLoad'])
-  const { text: draft, images: imageDraft, files: fileDraft, disabledModules } = appStore.inputDraft()
+  const { text: draft, images: imageDraft, files: fileDraft, annotations: annotationDraft, disabledModules } = appStore.inputDraft()
   const sessionId = state.selectedSessionId
   const draftKey = appStore.draftKey()
   const pendingQuestion = state.session?.runtime.pendingQuestion
@@ -40,7 +42,7 @@ function ComposerView({ accent }: { accent: string }) {
   const candidateRetry = useRef<HTMLButtonElement>(null)
   const sessionOrigin = actionOrigin.session(sessionId)
   const contextUsage = state.session?.runtime.contextUsage
-  const occupancy = contextUsage ? { ...contextUsage, percent: Math.min(100, Math.round(contextUsage.used / contextUsage.capacity * 100)) } : null
+  const percent = contextUsage ? Math.min(100, Math.round(contextUsage.used / contextUsage.capacity * 100)) : 0
   useEffect(() => {
     setCaret(textarea.current?.selectionStart ?? draft.length)
   }, [draft, state.selectedSessionId, state.selectedWorkspaceRoot])
@@ -93,8 +95,8 @@ function ComposerView({ accent }: { accent: string }) {
     observer.observe(node)
     return () => { observer.disconnect(); main.style.removeProperty('--composer-height') }
   }, [])
-  const showsStop = busy && (pendingQuestion || (draft.trim() === '' && imageDraft.length === 0 && fileDraft.length === 0))
-  const orb = <WaterOrb size={40} color={accent} percent={occupancy?.percent ?? 0} rotating={phase === 'rotating'}
+  const showsStop = busy && (pendingQuestion || !hasDraftContent({ text: draft, images: imageDraft, files: fileDraft, annotations: annotationDraft }))
+  const orb = <WaterOrb size={40} color={accent} percent={percent} rotating={phase === 'rotating'}
     enabled={showsStop ? phase !== 'stopping' && !state.pendingActions.has(pendingKey('session.abort', sessionOrigin)) : canSubmit}
     label={showsStop ? phase === 'stopping' ? '正在停止当前回合' : '停止当前回合' : blockedReason ?? '发送消息'}
     onPress={() => { if (showsStop) void appStore.stopActive(); else void appStore.submitDraft() }} />
@@ -144,6 +146,11 @@ function ComposerView({ accent }: { accent: string }) {
         </div></div>
       </div>
       <div {...attachmentInput.handlers} className="composer-card">
+        <DraftAnnotationsTray
+          annotations={annotationDraft}
+          remove={id => appStore.removeAnnotation(id)}
+          clear={() => appStore.clearAnnotations()}
+        />
         <DraftImages images={imageDraft} remove={index => { if (draftKey !== null) appStore.setImages(draftKey, imageDraft.filter((_, at) => at !== index)) }} />
         <FileChips files={fileDraft} remove={index => { if (draftKey !== null) appStore.setFiles(draftKey, fileDraft.filter((_, at) => at !== index)) }} />
         <textarea

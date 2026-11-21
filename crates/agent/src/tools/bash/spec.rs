@@ -1,6 +1,6 @@
 //! Bash 与后台任务工具的参数和说明。
 
-use std::{num::NonZeroU64, sync::LazyLock};
+use std::num::NonZeroU64;
 
 use serde::Deserialize;
 use serde_json::json;
@@ -10,13 +10,6 @@ use crate::tools::registry::{ToolExecution, error_result};
 pub(super) const MAX_WAIT_MS: u64 = 30_000;
 /// 单条命令总超时的安全上限（24 小时），避免极端参数导致 `Instant` 加法溢出。
 pub(super) const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
-
-static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "Execute a Bash command in the current working directory (Git Bash on Windows). Use POSIX syntax; `2>nul` creates a file named nul. Returns stdout and stderr, truncated to the last {}; full truncated output is saved to a file. Independent commands may run in parallel; send dependent commands in order. Each command starts exactly once. yield_time_ms controls how long to wait before returning a task ID for a still-running command (0 to 30000 ms, default 10000); use 0 to return immediately. Use task_list, task_output and task_stop to manage background commands. Background completion automatically delivers status and new output. Continue independent work; if none remains, give a brief status message and finish this response; you will resume on completion. Do not poll, sleep, or repeatedly read logs to wait. timeout_ms optionally limits total execution time, including time spent in the background; without it there is no total time limit. Stopping a task terminates its entire process tree. No interactive stdin or PTY is available.",
-        crate::tools::registry::default_cap_summary()
-    )
-});
 
 /// 已解析的 Bash 调用；由工具注册表检查等待时间。
 #[derive(Debug, Clone, Deserialize)]
@@ -62,7 +55,10 @@ pub(crate) struct TaskListArgs {}
 pub(crate) fn spec() -> app_core::ToolDefinition {
     app_core::ToolDefinition {
         name: "bash".to_string(),
-        description: DESCRIPTION.clone(),
+        description: format!(
+            "Execute a Bash command in the current working directory (Git Bash on Windows). Use POSIX syntax; `2>nul` creates a file named nul. Returns stdout and stderr, truncated to the last {}; full truncated output is saved to a file. Independent commands may run in parallel; send dependent commands in order. Each command starts exactly once. yield_time_ms controls how long to wait before returning a task ID for a still-running command (0 to 30000 ms, default 10000); use 0 to return immediately. Use task_list, task_output and task_stop to manage background commands. Background completion automatically delivers status and new output. Continue independent work; if none remains, give a brief status message and finish this response; you will resume on completion. Do not poll, sleep, or repeatedly read logs to wait. timeout_ms optionally limits total execution time, including time spent in the background; without it there is no total time limit. Stopping a task terminates its entire process tree. No interactive stdin or PTY is available.",
+            crate::tools::registry::default_cap_summary()
+        ),
         parameters_schema: json!({
             "type": "object",
             "properties": {

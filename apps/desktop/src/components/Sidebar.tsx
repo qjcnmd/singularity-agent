@@ -1,9 +1,8 @@
 import { SelectionSlider } from './SelectionSlider'
 import { APP_NAME } from '../identity'
 import { workspaceKey } from '../workspace'
-import { X, Minus, Plus } from 'lucide-react'
-import { SidebarToggle } from './SidebarToggle'
-import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { X, Minus, Plus, PanelLeft } from 'lucide-react'
+import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
 import type { ThreadSummary, Workspace } from '../protocol'
 import { sessionTitles } from '../sessionTitle'
@@ -282,7 +281,17 @@ function relativeTime(value: string): string {
   return days < 7 ? `${days}天` : new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric' }).format(then)
 }
 
-function SessionList({ activeKey, children }: { activeKey: string | null; children: import('react').ReactNode }) {
+function SidebarToggle({ expanded, controls, onClick }: {
+  expanded: boolean
+  controls: string
+  onClick: () => void
+}) {
+  return <button type="button" className="icon-button" aria-label={expanded ? '收起侧栏' : '展开侧栏'} aria-expanded={expanded} aria-controls={controls} onClick={onClick}>
+    <PanelLeft size={18} aria-hidden="true" />
+  </button>
+}
+
+function SessionList({ activeKey, children }: { activeKey: string | null; children: ReactNode }) {
   const container = useRef<HTMLDivElement>(null)
   return <div ref={container} className="session-list"><SelectionSlider container={container} activeKey={activeKey} />{children}</div>
 }

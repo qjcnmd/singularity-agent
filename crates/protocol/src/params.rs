@@ -54,7 +54,7 @@ pub struct ReadSource {
 }
 
 /// 工具的结果，放在对应的工具条目里；工具还没结束时为空。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResult {
@@ -63,7 +63,7 @@ pub struct ToolResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub background_task_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(
         feature = "typescript",
         ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
@@ -78,8 +78,22 @@ pub struct ToolResult {
     pub duration_ms: Option<u64>,
 }
 
+/// 用户对某条助手回复片段的文字批注。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessageAnnotation {
+    /// 被批注的助手消息条目 ID，供界面点击引用时定位原消息。
+    pub message_id: String,
+    /// 被选中的原始文本片段。
+    pub quote: String,
+    /// 用户填写的批注说明；允许为空（仅引用原文）。
+    #[serde(default)]
+    pub comment: String,
+}
+
 /// 历史中可展示为消息的角色；工具调用单独显示。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryMessageRole {
@@ -90,7 +104,7 @@ pub enum HistoryMessageRole {
 /// 工作台显示的一条历史：只含显示需要的字段，不含提供方私有的续接数据。
 ///
 /// 回合的 ID 和状态保存在 ThreadTurn 上，条目里不重复。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum HistoryItem {
@@ -107,16 +121,20 @@ pub enum HistoryItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         stats: Option<SessionModelUsage>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(skip_serializing_if = "Vec::is_empty")]
         #[cfg_attr(
             feature = "typescript",
             ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
         )]
         images: Vec<crate::ImageAttachment>,
         /// 用户随消息附上的文件路径；模型按路径自己读取，文件本身不复制。
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(skip_serializing_if = "Vec::is_empty")]
         #[cfg_attr(feature = "typescript", ts(as = "Option<Vec<String>>", optional))]
         files: Vec<String>,
+        /// 用户随消息附上的助手回复批注列表。
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(feature = "typescript", ts(as = "Option<Vec<MessageAnnotation>>", optional))]
+        annotations: Vec<MessageAnnotation>,
     },
     Thinking {
         id: String,
@@ -194,7 +212,7 @@ pub struct Turn {
 ///
 /// 每次请求尝试计一次，重试也计入，与日志中的请求记录一致。首 Token 耗时只统计
 /// 实际测到的请求，Token 数只统计上报了用量的请求。
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionModelUsage {
@@ -227,7 +245,7 @@ pub enum TurnStatus {
 }
 
 /// 工具调用的状态；收到调用后先排队，实际开始执行时才进入 Running。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolStatus {

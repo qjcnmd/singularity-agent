@@ -16,7 +16,6 @@ import {
 } from '../src/identity.js'
 import type { DirectoryPickResult, RpcResponse } from '../src/protocol.generated.js'
 
-const entry = APP_ENTRY
 const configuredHome = process.env[HOME_ENV_VAR]
 const home = resolve(configuredHome?.trim() ? configuredHome : join(homedir(), DATA_DIR_NAME))
 // 数据目录决定 Chromium profile：不同目录各用各的锁和视图状态。
@@ -48,7 +47,7 @@ function show(): void {
 }
 
 function trusted(event: Electron.IpcMainInvokeEvent): void {
-  if (event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || event.senderFrame.url !== entry) {
+  if (event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || event.senderFrame.url !== APP_ENTRY) {
     throw new Error('Untrusted desktop IPC sender')
   }
 }
@@ -85,10 +84,10 @@ async function start(): Promise<void> {
     if (/^https?:\/\//.test(url)) void shell.openExternal(url)
     return { action: 'deny' }
   })
-  window.webContents.on('will-navigate', (event, url) => { if (url !== entry) event.preventDefault() })
+  window.webContents.on('will-navigate', (event, url) => { if (url !== APP_ENTRY) event.preventDefault() })
   window.webContents.on('did-start-loading', () => { subscribed = false })
   window.webContents.session.setPermissionRequestHandler((contents, permission, callback) => {
-    callback(contents === window.webContents && contents.getURL() === entry && permission === 'clipboard-sanitized-write')
+    callback(contents === window.webContents && contents.getURL() === APP_ENTRY && permission === 'clipboard-sanitized-write')
   })
   backend.on('frame', frame => { if (subscribed && !window.isDestroyed()) window.webContents.send(IPC_CHANNELS.frame, frame) })
   ipcMain.handle(IPC_CHANNELS.connect, async event => {
@@ -124,7 +123,7 @@ async function start(): Promise<void> {
   tray.setContextMenu(Menu.buildFromTemplate([{ label: `打开 ${APP_NAME}`, click: show }, { label: '退出', click: () => app.quit() }]))
   tray.on('click', show)
   window.on('close', event => { if (!quitting) { event.preventDefault(); window.hide() } })
-  await window.loadURL(entry)
+  await window.loadURL(APP_ENTRY)
   show()
 }
 

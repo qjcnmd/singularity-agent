@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events'
 import type { RpcResponse, StreamEnvelope } from '../src/protocol.generated.js'
 
 export class Backend extends EventEmitter {
-  readonly child
+  private readonly child
   readonly ready: Promise<StreamEnvelope>
   private nextId = 0
   private pending = new Map<number, { resolve: (value: RpcResponse) => void; reject: (error: Error) => void }>()

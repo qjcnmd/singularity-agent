@@ -81,6 +81,7 @@ impl Conversation {
                         text: input.text.clone(),
                         images: input.images.iter().map(|image| image.attachment.clone()).collect(),
                         files: input.files.clone(),
+                        annotations: input.annotations.clone(),
                     })
                 })
                 .collect(),
@@ -109,7 +110,7 @@ impl Conversation {
         })
     }
     pub(super) fn publish(&self, view: &mut ConversationView, event: StreamEvent) {
-        view.last_event_revision = (self.publish)(event);
+        view.last_event_revision = self.hub.emit(event);
     }
 
     pub(super) fn publish_changed(&self, view: &mut ConversationView) {

@@ -1,7 +1,7 @@
 /**
  * 代码高亮：按需加载 Shiki 语言语法并生成支持明暗双主题的 Token。
  */
-import { createElement, useEffect, useMemo, useState, type ReactNode, type CSSProperties } from 'react'
+import { createElement, useEffect, useMemo, useState, type CSSProperties } from 'react'
 
 /**
  * 支持高亮的语言加载表；使用静态 `import()` 让打包器按语言拆包。
@@ -135,7 +135,7 @@ export function useCodeTokens(code: string, language: string) {
   }, [loaded, code, lang])
 }
 
-export function CodeTokens({ tokens, renderText }: { tokens: CodeLine; renderText?: (text: string) => ReactNode }) {
+export function CodeTokens({ tokens }: { tokens: CodeLine }) {
   return tokens.map((token, column) => createElement('span', {
     key: column,
     className: 'code-token',
@@ -144,5 +144,5 @@ export function CodeTokens({ tokens, renderText }: { tokens: CodeLine; renderTex
       fontStyle: (token.fontStyle ?? 0) & 1 ? 'italic' : undefined,
       fontWeight: (token.fontStyle ?? 0) & 2 ? 'bold' : undefined,
     } as CSSProperties,
-  }, renderText ? renderText(token.content) : token.content))
+  }, token.content))
 }

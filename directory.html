@@ -139,28 +139,24 @@ pre {
 │           ├── Skill                                     <span class="c"># load_instructions() 仅调用时读正文</span>
 │           └── discover_skill()                          <span class="c"># 解析 SKILL.md YAML frontmatter 元数据</span>
 │
-├── model/                                                <span class="c"># 模型配置、纯 LLM 消息类型、协议无关客户端与编解码（23 .rs）</span>
+├── model/                                                <span class="c"># 模型配置、纯 LLM 消息类型、协议无关客户端与编解码（22 .rs）</span>
 │   └── src/                                              <span class="c"># 模型层源码</span>
-│       ├── lib.rs                                        <span class="c"># 导出 ModelClient、端点路径、默认超时与 HTTP 状态常量</span>
-│       ├── client.rs                                     <span class="c"># ModelClient：统一入口（provider_name/model_name），按协议分发与 HTTP 鉴权</span>
-│       ├── error.rs                                      <span class="c"># 4 类错误分类；bounded_provider_error_diagnostic()</span>
+│       ├── lib.rs                                        <span class="c"># 导出 ModelClient、ProviderError、模型类型与默认超时</span>
+│       ├── client.rs                                     <span class="c"># ModelClient：统一入口（provider_name/model_name），按协议分发请求</span>
+│       ├── error.rs                                      <span class="c"># 4 类错误分类；apply_provider_error_body() / bounded_provider_error_diagnostic()</span>
 │       │   ├── ModelErrorKind                            <span class="c"># Cancelled / Temporary / ContextLengthExceeded / Other</span>
 │       │   ├── ProviderError                             <span class="c"># is_context_overflow / is_retryable</span>
 │       │   ├── provider_error_kind_for_fields()          <span class="c"># 按错误码与 Messages 错误类型识别上下文超限与可重试错误</span>
-│       │   ├── for_http_status()                         <span class="c"># 408 / 409 / 429 / 5xx 判 Temporary</span>
-│       │   └── append_provider_http_diagnostic()         <span class="c"># 从响应体抽取可读 HTTP 错误片段</span>
-│       ├── config/                                       <span class="c"># config.json 读写、选择解析与模型探测（6 文件）</span>
-│       │   ├── mod.rs                                    <span class="c"># validate_base_url / validate_provider_value</span>
+│       │   └── provider_error_kind_for_http_status()     <span class="c"># 408 / 409 / 429 / 5xx 判 Temporary</span>
+│       ├── config/                                       <span class="c"># config.json 读写、选择解析与模型探测（5 文件）</span>
+│       │   ├── mod.rs                                    <span class="c"># validate_base_url / validate_provider_value / validate_identifier / validate_reasoning_variants</span>
 │       │   ├── manager.rs                                <span class="c"># ModelConfigManager：config.json 单一读写管理器</span>
-│       │   │   ├── ModelConfigManager                    <span class="c"># open / resolve / validate / redacted_catalog</span>
+│       │   │   ├── ModelConfigManager                    <span class="c"># open / resolve / validate_selection / redacted_catalog</span>
 │       │   │   ├── context_window()                      <span class="c"># 按选中模型返回上下文窗口上限</span>
 │       │   │   ├── save_provider()                       <span class="c"># 锁内原子替换；空 key 留旧值并清失效选中</span>
 │       │   │   ├── remove_provider()                     <span class="c"># 移除提供方并回退无效默认选择</span>
 │       │   │   ├── model_definitions()                   <span class="c"># 校验并转换表单模型列表</span>
 │       │   │   └── discovery_credential()                <span class="c"># 提取在线 /models 探测凭据</span>
-│       │   ├── schema.rs                                 <span class="c"># 标识符与推理档位校验</span>
-│       │   │   ├── validate_identifier()                 <span class="c"># 校验 provider_id 与 model_id 合法字符</span>
-│       │   │   └── validate_reasoning_variants()         <span class="c"># 校验可用推理档位（Responses 拒 on 开关）</span>
 │       │   ├── selection.rs                              <span class="c"># 选中 ID → ProviderConfig + SelectedModel</span>
 │       │   │   ├── ProviderConfig                        <span class="c"># 解码后的提供方 URL 与密钥</span>
 │       │   │   ├── SelectedModel                         <span class="c"># 当前选中模型、协议及推理档位</span>
@@ -205,21 +201,19 @@ pre {
 │       └── responses/                                    <span class="c"># Responses SSE 流解码器</span>
 │           └── stream.rs                                 <span class="c"># ResponsesSseDecoder：转发增量并校验终态事件</span>
 │
-├── mcp/                                                  <span class="c"># MCP 客户端连接池（5 .rs）</span>
-│   └── src/                                              <span class="c"># MCP 连接管理（5 文件）</span>
+├── mcp/                                                  <span class="c"># MCP 客户端连接池（4 .rs）</span>
+│   └── src/                                              <span class="c"># MCP 连接管理（4 文件）</span>
 │       ├── lib.rs                                        <span class="c"># McpManager：ConnectionPool 代际校验、持锁重连、skip 过滤与停机排空关闭任务</span>
 │       │   ├── McpManager                                <span class="c"># 按目录复用连接：tools / discover / reconnect</span>
 │       │   ├── disconnect_directory()                    <span class="c"># 锁内取句柄、锁外等子进程关闭</span>
-│       │   ├── shutdown()                                <span class="c"># 停机时并发关闭所有目录 MCP 连接</span>
-│       │   └── McpTool                                   <span class="c"># 单工具 call() 调用入口</span>
-│       ├── error.rs                                      <span class="c"># McpError 结构化错误类型（区分取消/超时/配置/传输/IO）</span>
+│       │   └── shutdown()                                <span class="c"># 停机时并发关闭所有目录 MCP 连接</span>
 │       ├── config.rs                                     <span class="c"># mcp.json 校验、HTTP URL 凭据精确脱敏与原子读写</span>
 │       │   ├── Configuration                             <span class="c"># mcp.json 解析；validate() 校验传输配置</span>
 │       │   └── ServerConfig                              <span class="c"># redact() 脱敏 env/headers 与 HTTP userinfo/query</span>
 │       ├── client.rs                                     <span class="c"># rmcp SDK 连接与超时取消</span>
 │       │   └── Connection                                <span class="c"># connect / call (不重放) / close</span>
-│       └── result.rs                                     <span class="c"># MCP CallToolResult → 文本/图片附件转换</span>
-│           ├── McpToolResult                             <span class="c"># MCP 工具转换后的文本与图片附件结果</span>
+│       └── result.rs                                     <span class="c"># McpError、McpTool / McpDiscovery 及 CallToolResult 转换</span>
+│           ├── McpTool / McpToolResult                   <span class="c"># 单工具 call() 入口与转换后的文本/图片结果</span>
 │           └── convert()                                 <span class="c"># 将 MCP CallToolResult 转为内部结果</span>
 │
 ├── agent/                                                <span class="c"># Agent 主循环、上下文、工具、会话日志（34 .rs）</span>
@@ -238,7 +232,7 @@ pre {
 │       │   │   └── Agent                                 <span class="c"># run() 主循环；append_message() 写盘发事件</span>
 │       │   ├── request.rs                                <span class="c"># RequestDefinitions 懒加载与单轮生成入口</span>
 │       │   │   ├── RequestDefinitions                    <span class="c"># ensure/load_definitions 懒取 MCP</span>
-│       │   │   ├── context_pressure_tokens()             <span class="c"># 计算当前上下文压力 token 阈值</span>
+│       │   │   ├── prune_tool_outputs_if_needed()        <span class="c"># 检查压力阈值并写入旧工具输出剪枝水位线</span>
 │       │   │   └── generate_response()                   <span class="c"># 准备上下文、调用重试执行并写盘回复</span>
 │       │   ├── modules.rs                                <span class="c"># 模块化 Context 拼装（含 write 与全 MCP 统一按需延迟加载）</span>
 │       │   │   ├── SYSTEM_PROMPT / BASH / WRITE / SKILLS_MODULE_ID <span class="c"># 锁定底座与可选模块 ID 常量</span>
@@ -248,7 +242,7 @@ pre {
 │       │   │   ├── dispatch_tools()                      <span class="c"># JoinSet 至多 8 并发；遇提问等先行工具全完</span>
 │       │   │   └── finish_tool()                         <span class="c"># 收口单工具结果、补写盘与发射完成事件</span>
 │       │   ├── inbox.rs                                  <span class="c"># SteeringInbox 双通道队列与 SkillExpansion 技能展开控制</span>
-│       │   │   ├── UserInput                             <span class="c"># from_uploads() 校验图片/绝对路径/files 去重并按 SkillExpansion 展开</span>
+│       │   │   ├── UserInput                             <span class="c"># from_uploads() 校验图片/批注、绝对路径去重并按 SkillExpansion 展开</span>
 │       │   │   └── SteeringInbox                         <span class="c"># cancel() 只清用户排队，保留后台通知</span>
 │       │   ├── questions.rs                              <span class="c"># UserQuestions 内存挂起提问池</span>
 │       │   │   └── UserQuestions                         <span class="c"># ask() 挂起；answer() 非法保留原题</span>
@@ -376,7 +370,8 @@ pre {
     ├── sessionStore.ts                                   <span class="c"># 会话状态树、错误态 ready/app_changed 恢复、断流重试</span>
     ├── sync.ts                                           <span class="c"># resetBaseline 分离 revision/summaryRevision；空会话接受淘汰重读</span>
     ├── execution.ts                                      <span class="c"># 流式 TurnEvent 归约与空索引防越界</span>
-    ├── drafts.ts                                         <span class="c"># DraftStore：IndexedDB 按 key 250ms 防抖写入，发送/pagehide 立即刷盘</span>
+    ├── drafts.ts                                         <span class="c"># DraftStore：IndexedDB 按 key 250ms 防抖写入（含文本批注草稿），发送/pagehide 立即刷盘</span>
+    ├── annotations.ts                                    <span class="c"># 助手回复可见纯文本锚点捕获/重定位、CSS Custom Highlight 注册与批注跳转总线</span>
     ├── viewPersistence.ts                                <span class="c"># localStorage 视图偏好与 accentColor（迁移旧 assistantBubble）</span>
     ├── bubbleColors.ts                                   <span class="c"># 9 色强调色调色盘与 CSS 变量映射</span>
     ├── highlight.ts                                      <span class="c"># Shiki 20 种常用语言按需加载，失败清理缓存可重试</span>
@@ -389,8 +384,8 @@ pre {
     ├── components/                                       <span class="c"># 界面组件</span>
     │   ├── ErrorBoundary.tsx                             <span class="c"># 顶层渲染异常兜底与一键重载</span>
     │   ├── Sidebar.tsx                                   <span class="c"># 项目折叠、任务列表（60s 刷新时间）、重命名与删任务确认弹窗</span>
-    │   ├── SidebarToggle.tsx / ExpandChevron.tsx         <span class="c"># 统一使用 lucide-react 图标</span>
-    │   ├── Conversation.tsx                              <span class="c"># 消息画布（保留原生右键选字复制）与跟底滚动</span>
+    │   ├── ExpandChevron.tsx                             <span class="c"># 统一使用 lucide-react 图标</span>
+    │   ├── Conversation.tsx / Annotations.tsx            <span class="c"># 消息画布与跟底滚动；划词两步批注浮层、编号角标、草稿汇总条与已发批注卡片</span>
     │   ├── TimelineItem.tsx / ToolCard.tsx / ToolGroupRow.tsx <span class="c"># 无框助手正文、活动白卡（ActivityCard）、集中式工具展示与 StepStatusIcon</span>
     │   ├── Composer.tsx / ContextCapsules.tsx            <span class="c"># 输入区、禁用 skills 时停用 / 补全、按 disabledModules 精确订阅</span>
     │   ├── ModelPicker.tsx / EffortSlider.tsx            <span class="c"># 单层模型选择浮层 + Codex 风格纯 CSS 慢水流胶囊滑块</span>
@@ -401,7 +396,7 @@ pre {
     │   ├── RunPanel.tsx / ContextPanel.tsx               <span class="c"># 展开时按需扫描上下文轮换与后台命令</span>
     │   ├── FilePanel.tsx / Images.tsx                    <span class="c"># 只读文件栏（CRLF 规范化与源码缓存清理）、WeakMap 稳定图片键</span>
     │   └── CommandOutput.tsx / Disclosure.tsx / SelectionSlider.tsx <span class="c"># ANSI 缓存、关闭兜底定时器与直接子项监听</span>
-    └── styles/                                           <span class="c"># tokens / shell / pages / conversation / composer / settings / model-picker / images / questions / surfaces</span></pre>
+    └── styles/                                           <span class="c"># tokens / shell / pages / conversation / composer / annotations / settings / model-picker / images / questions / surfaces</span></pre>
 </article>
 </body>
 </html>

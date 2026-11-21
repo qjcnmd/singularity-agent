@@ -1,10 +1,39 @@
 import { DRAFTS_DB_NAME } from './identity'
 import type { ModelSelection, ImageUpload } from './protocol'
 
+/** 未发送的文本批注草稿：记录相对所属助手消息可见纯文本的偏移与前后文摘录，切任务或重开后可恢复高亮。 */
+export interface DraftAnnotation {
+  id: string
+  messageId: string
+  quote: string
+  comment: string
+  startOffset: number
+  endOffset: number
+  prefix: string
+  suffix: string
+}
+
 /** files 是附件文件的绝对路径，发送时只把路径交给后端；disabledModules 是新任务关闭的上下文模块 ID，只在空白页使用。 */
-export interface Draft { text: string; images: File[]; files: string[]; selection?: ModelSelection; disabledModules?: string[] }
-export const emptyDraft: Draft = { text: '', images: [], files: [] }
-const hasDraft = (draft: Draft | undefined) => draft !== undefined && (draft.text !== '' || draft.images.length > 0 || draft.files.length > 0 || draft.selection !== undefined || (draft.disabledModules?.length ?? 0) > 0)
+export interface Draft {
+  text: string
+  images: File[]
+  files: string[]
+  annotations: DraftAnnotation[]
+  selection?: ModelSelection
+  disabledModules?: string[]
+}
+export const emptyDraft: Draft = { text: '', images: [], files: [], annotations: [] }
+export const hasDraftContent = (draft: Pick<Draft, 'text' | 'images' | 'files' | 'annotations'>) =>
+  draft.text.trim() !== '' || draft.images.length > 0 || draft.files.length > 0 || draft.annotations.length > 0
+
+const hasDraft = (draft: Draft | undefined) => draft !== undefined && (
+  draft.text !== ''
+  || draft.images.length > 0
+  || draft.files.length > 0
+  || draft.annotations.length > 0
+  || draft.selection !== undefined
+  || (draft.disabledModules?.length ?? 0) > 0
+)
 
 export type DraftSnapshot = Readonly<Record<string, Draft>>
 
@@ -48,9 +77,10 @@ export class DraftStore {
     return true
   }
 
-  /** 发送期间继续编辑的内容仍保留。 */
+  /** 发送期间继续编辑的内容仍保留；若正文或附件继续被编辑，仍按 ID/comment 清理本次已提交的批注。 */
   async clearIfUnchanged(sessionId: string, submitted: Draft): Promise<void> {
-    if (this.snapshot?.[sessionId] === submitted) {
+    const current = this.snapshot?.[sessionId]
+    if (current === submitted) {
       this.cancelPending([sessionId])
       if (this.snapshot !== null) {
         const drafts = { ...this.snapshot }
@@ -58,7 +88,24 @@ export class DraftStore {
         this.publish(drafts)
       }
       await persistDraft(sessionId, emptyDraft).catch(() => {})
+      return
     }
+    if (!current || submitted.annotations.length === 0) return
+    const submittedComments = new Map(submitted.annotations.map(item => [item.id, item.comment]))
+    const remaining = current.annotations.filter(item => submittedComments.get(item.id) !== item.comment)
+    if (remaining.length === current.annotations.length) return
+    const next = { ...current, annotations: remaining }
+    if (!hasDraft(next)) {
+      this.cancelPending([sessionId])
+      if (this.snapshot !== null) {
+        const drafts = { ...this.snapshot }
+        delete drafts[sessionId]
+        this.publish(drafts)
+      }
+      await persistDraft(sessionId, emptyDraft).catch(() => {})
+      return
+    }
+    await this.set(sessionId, next)
   }
 
   /** 清理失败不影响已完成的任务删除或项目移除。 */
@@ -136,7 +183,12 @@ async function loadDrafts(): Promise<Record<string, Draft>> {
   request.onsuccess = () => {
     const cursor = request.result
     if (!cursor) return
-    result[String(cursor.key)] = { ...cursor.value as Draft, files: (cursor.value as Partial<Draft>).files ?? [] }
+    const saved = cursor.value as Partial<Draft>
+    result[String(cursor.key)] = {
+      ...saved as Draft,
+      files: saved.files ?? [],
+      annotations: saved.annotations ?? [],
+    }
     cursor.continue()
   }
   await complete(transaction)

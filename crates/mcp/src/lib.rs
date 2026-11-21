@@ -2,11 +2,9 @@
 
 mod client;
 mod config;
-mod error;
 mod result;
 
-pub use error::McpError;
-pub use result::McpToolResult;
+pub use result::{McpDiscovery, McpError, McpServerDiscovery, McpTool, McpToolResult};
 
 use client::Connection;
 use config::{Configuration, ServerConfig};
@@ -29,6 +27,16 @@ struct ConnectionState {
     tokens: u64,
 }
 
+impl ConnectionState {
+    fn new_cell() -> ConnectionCell {
+        Arc::new(tokio::sync::Mutex::new(Self {
+            connection: None,
+            catalog: Ok(Vec::new()),
+            tokens: 0,
+        }))
+    }
+}
+
 type Connections = BTreeMap<(String, String), (ServerConfig, ConnectionCell)>;
 
 #[derive(Default)]
@@ -38,11 +46,11 @@ struct ConnectionPool {
 }
 
 impl ConnectionPool {
-    /// 以 mcp.json 为准：移除配置已改或已删除的连接，返回待异步关闭的旧槽位。
-    fn evict_stale(&mut self, config: &Configuration) -> Vec<ConnectionCell> {
+    /// 以 mcp.json 为准：移除配置已改、已删除或强制刷新的连接，返回待异步关闭的旧槽位。
+    fn evict_stale(&mut self, config: &Configuration, force_id: Option<&str>) -> Vec<ConnectionCell> {
         let mut evicted = Vec::new();
         self.entries.retain(|(_, id), (previous, cell)| {
-            if config.servers.get(id) == Some(previous) {
+            if force_id != Some(id.as_str()) && config.servers.get(id) == Some(previous) {
                 true
             } else {
                 evicted.push(Arc::clone(cell));
@@ -51,29 +59,6 @@ impl ConnectionPool {
         });
         evicted
     }
-}
-
-struct DiscoverEntry {
-    id: String,
-    config: ServerConfig,
-    cell: ConnectionCell,
-}
-
-struct PreparedDiscover {
-    active: Vec<DiscoverEntry>,
-    evicted: Vec<ConnectionCell>,
-}
-
-struct ReconnectEntry {
-    id: String,
-    config: ServerConfig,
-    cell: ConnectionCell,
-    guard: ConnectionGuard,
-}
-
-struct PreparedReconnect {
-    entry: ReconnectEntry,
-    evicted: Vec<ConnectionCell>,
 }
 
 /// MCP 配置和连接的管理者；设置页和 Agent 共用同一个实例。
@@ -88,77 +73,6 @@ impl std::fmt::Debug for McpManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpManager").field("home", &self.home).finish_non_exhaustive()
     }
-}
-
-/// 本轮发现的一个 MCP 工具；调用时使用发现时的连接，本轮内不变。
-#[derive(Clone)]
-pub struct McpTool {
-    pub name: String,
-    pub description: String,
-    pub parameters_schema: serde_json::Value,
-    connection: Arc<Connection>,
-}
-
-impl std::fmt::Debug for McpTool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("McpTool")
-            .field("name", &self.name)
-            .field("description", &self.description)
-            .field("parameters_schema", &self.parameters_schema)
-            .finish_non_exhaustive()
-    }
-}
-
-impl McpTool {
-    /// 判断该工具是否无需传入任何参数，供延迟加载摘要标注 `(no args)`。
-    pub fn has_no_args(&self) -> bool {
-        let Some(object) = self.parameters_schema.as_object() else {
-            return false;
-        };
-        let required_empty =
-            object.get("required").and_then(serde_json::Value::as_array).is_none_or(Vec::is_empty);
-        let props_empty = object
-            .get("properties")
-            .and_then(serde_json::Value::as_object)
-            .is_none_or(serde_json::Map::is_empty);
-        let has_dynamic_or_composed = ["anyOf", "oneOf", "allOf", "patternProperties", "$ref"]
-            .iter()
-            .any(|key| object.contains_key(*key))
-            || matches!(
-                object.get("additionalProperties"),
-                Some(value) if *value != serde_json::Value::Bool(false)
-            );
-        required_empty && props_empty && !has_dynamic_or_composed
-    }
-
-    /// 调用服务器原始工具；连接负责总超时和有界取消通知，调用不会自动重试。
-    pub async fn call(
-        &self,
-        arguments: serde_json::Map<String, serde_json::Value>,
-        signal: &CancellationToken,
-    ) -> Result<McpToolResult, McpError> {
-        let result = self.connection.call(&self.name, arguments, signal).await?;
-        Ok(result::convert(result))
-    }
-}
-
-/// 一台服务器本轮的发现结果；连不上时没有工具，失败原因在 `error`。
-#[derive(Debug)]
-pub struct McpServerDiscovery {
-    pub id: String,
-    pub tools: Vec<McpTool>,
-    /// 要写进 Developer 指令的内容：服务器自带的说明，或连接失败的原因。
-    pub prompt: Option<String>,
-    /// 这台服务器的 `prompt`（服务器说明或失败提示）在请求里的估算 Token 数。
-    pub tokens: u64,
-    pub error: Option<String>,
-}
-
-/// 一次工具发现的结果；`error` 是 mcp.json 读不出来的原因，此时没有服务器。
-#[derive(Debug, Default)]
-pub struct McpDiscovery {
-    pub servers: Vec<McpServerDiscovery>,
-    pub error: Option<String>,
 }
 
 impl McpManager {
@@ -197,9 +111,9 @@ impl McpManager {
         tokio::task::spawn_blocking(move || {
             let _config_guard = config_lock.lock().expect("MCP config lock poisoned");
             let mut config = config::read(&home)?;
-            let config = config.servers.remove(&id).ok_or(McpError::NotFound)?;
+            let config = config.servers.remove(&id).ok_or_else(McpError::not_found)?;
             let pool = connections.lock().expect("MCP connection lock poisoned");
-            Ok(Self::server_state(id, config, &directory_key(&cwd), &pool.entries))
+            Ok(Self::server_state(id, config, &app_core::workspace_key(&cwd), &pool.entries))
         })
         .await
         .expect("MCP config read completes while the runtime is running")
@@ -236,8 +150,8 @@ impl McpManager {
         let id = input.server_id.clone();
         let config = ServerConfig::from_input(input);
         config.validate(&id)?;
-        self.update(&id, cwd, |all| {
-            all.servers.insert(id.clone(), config);
+        self.update(&id.clone(), cwd, |all| {
+            all.servers.insert(id, config);
             Ok(())
         })
     }
@@ -248,7 +162,7 @@ impl McpManager {
     /// 同步获取配置锁并执行磁盘读写与刷盘，异步上下文应在阻塞线程池中调用。
     pub fn remove(&self, id: &str, cwd: &Path) -> Result<Vec<McpServerState>, McpError> {
         self.update(id, cwd, |all| {
-            all.servers.remove(id).ok_or(McpError::NotFound)?;
+            all.servers.remove(id).ok_or_else(McpError::not_found)?;
             Ok(())
         })
     }
@@ -267,15 +181,8 @@ impl McpManager {
             config::write(&self.home, &config)?;
             let mut pool = self.lock_pool();
             pool.generation = pool.generation.wrapping_add(1);
-            let mut evicted = Vec::new();
-            pool.entries.retain(|(_, server), (_, cell)| {
-                if server == id {
-                    evicted.push(Arc::clone(cell));
-                    false
-                } else {
-                    true
-                }
-            });
+            // 保存同 ID 时哪怕配置值未变也淘汰旧连接，确保本地 stdio 脚本修改后下次调用拉起新进程。
+            let evicted = pool.evict_stale(&config, Some(id));
             let states = Self::states(config, cwd, &pool.entries);
             (evicted, states)
         };
@@ -284,7 +191,7 @@ impl McpManager {
     }
 
     fn states(config: Configuration, cwd: &Path, connections: &Connections) -> Vec<McpServerState> {
-        let directory = directory_key(cwd);
+        let directory = app_core::workspace_key(cwd);
         config
             .servers
             .into_iter()
@@ -292,76 +199,64 @@ impl McpManager {
             .collect()
     }
 
+    #[expect(
+        clippy::type_complexity,
+        reason = "internal tuple avoids single-use helper structs"
+    )]
     fn prepare_discover(
         &self,
         snapshot_generation: u64,
         config: Configuration,
         cwd: &Path,
         skip: &[String],
-    ) -> Option<PreparedDiscover> {
+    ) -> Option<(Vec<(String, ServerConfig, ConnectionCell)>, Vec<ConnectionCell>)> {
         let mut pool = self.lock_pool();
         if pool.generation != snapshot_generation {
             return None;
         }
-        let evicted = pool.evict_stale(&config);
+        let evicted = pool.evict_stale(&config, None);
         let mut active = Vec::new();
-        let directory = directory_key(cwd);
+        let directory = app_core::workspace_key(cwd);
         for (id, config) in config.servers {
             if skip.contains(&id) {
                 continue;
             }
             let key = (directory.clone(), id.clone());
-            let (_, cell) = pool.entries.entry(key).or_insert_with(|| {
-                (
-                    config.clone(),
-                    Arc::new(tokio::sync::Mutex::new(ConnectionState {
-                        connection: None,
-                        catalog: Ok(Vec::new()),
-                        tokens: 0,
-                    })),
-                )
-            });
-            active.push(DiscoverEntry { id, config, cell: Arc::clone(cell) });
+            let (_, cell) =
+                pool.entries.entry(key).or_insert_with(|| (config.clone(), ConnectionState::new_cell()));
+            active.push((id, config, Arc::clone(cell)));
         }
-        Some(PreparedDiscover { active, evicted })
+        Some((active, evicted))
     }
 
+    #[expect(
+        clippy::type_complexity,
+        reason = "internal tuple avoids single-use helper structs"
+    )]
     fn prepare_reconnect(
         &self,
         snapshot_generation: u64,
         config: &Configuration,
         cwd: &Path,
         id: &str,
-    ) -> Result<Option<PreparedReconnect>, McpError> {
+    ) -> Result<Option<(ServerConfig, ConnectionCell, ConnectionGuard, Vec<ConnectionCell>)>, McpError> {
         let mut pool = self.lock_pool();
         if pool.generation != snapshot_generation {
             return Ok(None);
         }
         let Some(server_config) = config.servers.get(id).cloned() else {
-            return Err(McpError::NotFound);
+            return Err(McpError::not_found());
         };
-        let mut evicted = pool.evict_stale(config);
-        let key = (directory_key(cwd), id.to_owned());
+        let mut evicted = pool.evict_stale(config, None);
+        let key = (app_core::workspace_key(cwd), id.to_owned());
         if let Some((_, old_cell)) = pool.entries.remove(&key) {
             evicted.push(old_cell);
         }
-        let cell = Arc::new(tokio::sync::Mutex::new(ConnectionState {
-            connection: None,
-            catalog: Ok(Vec::new()),
-            tokens: 0,
-        }));
+        let cell = ConnectionState::new_cell();
         // 先占住新 cell 再放进连接表：关闭旧连接期间状态显示 Connecting，并发 discover 不会抢先启动。
         let guard = Arc::clone(&cell).try_lock_owned().expect("fresh MCP connection cell is unlocked");
         pool.entries.insert(key, (server_config.clone(), Arc::clone(&cell)));
-        Ok(Some(PreparedReconnect {
-            entry: ReconnectEntry {
-                id: id.to_owned(),
-                config: server_config,
-                cell,
-                guard,
-            },
-            evicted,
-        }))
+        Ok(Some((server_config, cell, guard, evicted)))
     }
 
     async fn tools(
@@ -392,24 +287,22 @@ impl McpManager {
                         .collect());
                     let tools: Vec<_> = listed
                         .into_iter()
-                        .map(|tool| McpTool {
-                            name: tool.name.into_owned(),
-                            description: tool.description.map(String::from).unwrap_or_default(),
-                            parameters_schema: serde_json::Value::Object(Arc::unwrap_or_clone(
-                                tool.input_schema,
-                            )),
-                            connection: Arc::clone(&connection),
+                        .map(|tool| {
+                            McpTool::new(
+                                tool.name.into_owned(),
+                                tool.description.map(String::from).unwrap_or_default(),
+                                serde_json::Value::Object(Arc::unwrap_or_clone(tool.input_schema)),
+                                Arc::clone(&connection),
+                            )
                         })
                         .collect();
                     let prompt = connection.instructions().map(|text| format!("MCP server {id}:\n{text}"));
                     // 仅估算服务器自身说明文本；统一延迟加载的工具摘要由 agent 模块按实际注入口径计算。
-                    let tokens = prompt.as_deref().map_or(0, app_core::estimate_tokens_of);
-                    state.tokens = tokens;
+                    state.tokens = prompt.as_deref().map_or(0, app_core::estimate_tokens_of);
                     Ok(McpServerDiscovery {
                         id: id.clone(),
                         tools,
                         prompt,
-                        tokens,
                         error: None,
                     })
                 }
@@ -427,14 +320,12 @@ impl McpManager {
             let error = error.to_string();
             tracing::warn!(server_id = %id, error = %error, "MCP server discovery failed");
             let prompt = format!("Unavailable MCP server {id}:\n{error}");
-            let tokens = app_core::estimate_tokens_of(&prompt);
-            state.tokens = tokens;
+            state.tokens = app_core::estimate_tokens_of(&prompt);
             state.catalog = Err(error.clone());
             McpServerDiscovery {
                 id,
                 tools: Vec::new(),
                 prompt: Some(prompt),
-                tokens,
                 error: Some(error),
             }
         })
@@ -443,7 +334,7 @@ impl McpManager {
     /// 每轮获取全部服务器的工具（`skip` 里的服务器不连接）；复用健康连接，重新读取目录。
     /// BTreeMap 与名称排序保持请求定义顺序稳定。
     pub async fn discover(&self, cwd: &Path, signal: &CancellationToken, skip: &[String]) -> McpDiscovery {
-        let PreparedDiscover { active: entries, evicted } = loop {
+        let (entries, evicted) = loop {
             if signal.is_cancelled() {
                 return McpDiscovery::default();
             }
@@ -465,12 +356,12 @@ impl McpManager {
         };
         self.spawn_close(evicted);
         let mut pending = tokio::task::JoinSet::new();
-        for entry in entries {
+        for (id, config, cell) in entries {
             let cwd = cwd.to_path_buf();
             pending.spawn(async move {
                 // 同一项目的并发准备共用连接；失败的工具调用不会走这里重放。
-                let state = entry.cell.lock_owned().await;
-                Self::tools(entry.id, &cwd, entry.config, state).await
+                let state = cell.lock_owned().await;
+                Self::tools(id, &cwd, config, state).await
             });
         }
         let mut discovered = BTreeMap::new();
@@ -500,7 +391,7 @@ impl McpManager {
 
     /// 用户明确重试时重建该项目的连接并发现工具，连接失败随服务器状态返回。
     pub async fn reconnect(&self, id: &str, cwd: &Path) -> Result<McpServerState, McpError> {
-        let PreparedReconnect { entry, evicted } = loop {
+        let (config, cell, guard, evicted) = loop {
             let (generation, config) = self.read_snapshot().await?;
             if let Some(prepared) = self.prepare_reconnect(generation, &config, cwd, id)? {
                 break prepared;
@@ -512,11 +403,11 @@ impl McpManager {
         let still_current = self
             .lock_pool()
             .entries
-            .get(&(directory_key(cwd), entry.id.clone()))
-            .is_some_and(|(_, current)| Arc::ptr_eq(current, &entry.cell));
+            .get(&(app_core::workspace_key(cwd), id.to_owned()))
+            .is_some_and(|(_, current)| Arc::ptr_eq(current, &cell));
         if still_current {
             // 连接失败保存在状态中，与执行准备失败使用同一份原因。
-            let _ = Self::tools(entry.id, cwd, entry.config, entry.guard).await;
+            let _ = Self::tools(id.to_owned(), cwd, config, guard).await;
         }
         // 重连等待期间设置可能已修改，返回时读取当前配置和连接。
         self.read_server_state(id.to_owned(), cwd.to_path_buf()).await
@@ -566,7 +457,7 @@ impl McpManager {
     /// 立即移除项目持有的连接，再等待这些连接退出；重新添加项目会建立新连接。
     pub fn disconnect_directory(&self, cwd: &Path) -> impl Future<Output = ()> + Send + 'static + use<> {
         let mut pool = self.lock_pool();
-        let key = directory_key(cwd);
+        let key = app_core::workspace_key(cwd);
         let cells = pool
             .entries
             .extract_if(.., |(directory, _), _| directory == &key)
@@ -575,21 +466,7 @@ impl McpManager {
         close_connections(cells)
     }
 
-    /// 所有任务停止后关闭全部连接，等待 SDK 回收本地进程。
-    pub async fn shutdown(&self) {
-        let cells = std::mem::take(&mut self.lock_pool().entries)
-            .into_values()
-            .map(|(_, cell)| cell)
-            .collect();
-        let pending = std::mem::take(&mut *self.closing.lock().expect("MCP closing lock poisoned"));
-        let drain = async move {
-            for handle in pending {
-                if let Err(error) = handle.await {
-                    tracing::warn!(error = %error, "MCP detached close task failed");
-                }
-            }
-        };
-        tokio::join!(close_connections(cells), drain);
+    async fn drain_closing(&self) {
         loop {
             let remaining = std::mem::take(&mut *self.closing.lock().expect("MCP closing lock poisoned"));
             if remaining.is_empty() {
@@ -601,6 +478,16 @@ impl McpManager {
                 }
             }
         }
+    }
+
+    /// 所有任务停止后关闭全部连接，等待 SDK 回收本地进程。
+    pub async fn shutdown(&self) {
+        let cells = std::mem::take(&mut self.lock_pool().entries)
+            .into_values()
+            .map(|(_, cell)| cell)
+            .collect();
+        tokio::join!(close_connections(cells), self.drain_closing());
+        self.drain_closing().await;
     }
 }
 
@@ -616,9 +503,4 @@ async fn close_connections(cells: Vec<ConnectionCell>) {
         });
     }
     while closing.join_next().await.is_some() {}
-}
-
-// 原生路径带有 Windows 长路径前缀，界面路径没有；两者按同一目录复用和关闭连接。
-fn directory_key(cwd: &Path) -> String {
-    app_core::workspace_key(cwd)
 }

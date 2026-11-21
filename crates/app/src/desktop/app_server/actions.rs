@@ -28,6 +28,7 @@ impl AppServer {
             params.text,
             params.images,
             params.files,
+            params.annotations,
             std::path::Path::new(&cwd),
             &self.home,
             skill_expansion,
@@ -148,9 +149,7 @@ impl AppServer {
             conversation.update_settings(selection).map_err(conversation_error)
         })
     }
-}
 
-impl AppServer {
     pub(crate) async fn stop_background_task(
         self: &Arc<Self>,
         session_id: &str,

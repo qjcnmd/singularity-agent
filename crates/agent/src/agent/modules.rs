@@ -24,7 +24,7 @@ const EDIT: &str = "edit";
 const WRITE: &str = "write";
 const VIEW_IMAGE: &str = "view-image";
 const QUESTION: &str = "ask-user-question";
-pub const SKILLS_MODULE_ID: &str = "skills";
+pub(super) const SKILLS_MODULE_ID: &str = "skills";
 pub(super) const MCP_PREFIX: &str = "mcp:";
 
 /// 所有 MCP 服务器统一采用按工具粒度的延迟加载：仅在 Developer 指令注入紧凑摘要，
@@ -282,14 +282,8 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
             0
         };
         let tokens = base_tokens + proxy;
-        let detail = match &server.error {
-            Some(error) => format!("连接失败：{error}"),
-            None if server.tools.is_empty() => "已连接（无可用工具）".to_string(),
-            None => {
-                let names = server.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join("、");
-                format!("按需加载（共 {} 个工具）：{names}", server.tools.len())
-            }
-        };
+        let detail =
+            mcp_server_detail(server.error.as_deref(), server.tools.iter().map(|tool| tool.name.as_str()));
         if collector.push(&module_id, ContextGroup::Mcp, &server.id, detail, tokens, false) {
             collector.developer.extend(prompt);
             if has_tools {
@@ -352,14 +346,10 @@ pub fn preview(
         } else {
             server.tokens
         };
-        let detail = match (&server.status, server.error) {
-            (protocol::McpConnectionStatus::NotConnected, _) => "尚未连接，创建任务时才会连接".to_string(),
-            (_, Some(error)) => format!("连接失败：{error}"),
-            (_, None) if server.tools.is_empty() => "已连接（无可用工具）".to_string(),
-            (_, None) => {
-                let names = server.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join("、");
-                format!("按需加载（共 {} 个工具）：{names}", server.tools.len())
-            }
+        let detail = if server.status == protocol::McpConnectionStatus::NotConnected {
+            "尚未连接，创建任务时才会连接".to_string()
+        } else {
+            mcp_server_detail(server.error.as_deref(), server.tools.iter().map(|tool| tool.name.as_str()))
         };
         ContextModule {
             id: mcp_module_id(&id),
@@ -372,6 +362,18 @@ pub fn preview(
         }
     }));
     modules
+}
+
+fn mcp_server_detail(error: Option<&str>, tool_names: impl Iterator<Item = impl AsRef<str>>) -> String {
+    if let Some(error) = error {
+        return format!("连接失败：{error}");
+    }
+    let names: Vec<String> = tool_names.map(|name| name.as_ref().to_owned()).collect();
+    if names.is_empty() {
+        "已连接（无可用工具）".to_string()
+    } else {
+        format!("按需加载（共 {} 个工具）：{}", names.len(), names.join("、"))
+    }
 }
 
 /// 生成 Developer 指令；`tool_guidelines` 是本任务开着的工具模块各自提供的一行用法，

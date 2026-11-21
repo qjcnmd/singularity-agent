@@ -5,8 +5,8 @@ export type { AppState, ActionError, FileTab } from './sessionStore'
 import { selectedModel } from './modelChoices'
 import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, clampFilePanelWidth, type PersistedView } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
-import { emptyDraft, imageUpload, type Draft } from './drafts'
-import type { ModelSelection, ProviderConfigurationInput, RpcMethod, RpcParams, ViewportAnchor } from './protocol'
+import { emptyDraft, hasDraftContent, imageUpload, type Draft, type DraftAnnotation } from './drafts'
+import type { ModelSelection, ProviderConfigurationInput, RpcMethod, RpcParams, UserQuestionAnswer, ViewportAnchor } from './protocol'
 import { selectedSessionPhase } from './sessionState'
 import { acceptModelCatalog } from './sync'
 
@@ -41,6 +41,42 @@ class AppStore extends SessionStore {
   setFiles(id: string, files: string[], append = false): void {
     const draft = this.drafts.get(id)
     void this.drafts.set(id, { ...draft, files: append ? [...new Set([...draft.files, ...files])] : files })
+  }
+
+  addAnnotation(annotation: Omit<DraftAnnotation, 'id'>): void {
+    const key = this.draftKey()
+    if (key === null || this.state.selectedSessionId === null) return
+    const draft = this.inputDraft()
+    void this.drafts.set(key, {
+      ...draft,
+      annotations: [...draft.annotations, { ...annotation, id: crypto.randomUUID() }],
+    })
+  }
+
+  updateAnnotation(id: string, comment: string): void {
+    const key = this.draftKey()
+    if (key === null) return
+    const draft = this.inputDraft()
+    const annotations = draft.annotations.map(item => (item.id === id ? { ...item, comment } : item))
+    void this.drafts.set(key, { ...draft, annotations })
+  }
+
+  removeAnnotation(id: string): void {
+    const key = this.draftKey()
+    if (key === null) return
+    const draft = this.inputDraft()
+    void this.drafts.set(key, {
+      ...draft,
+      annotations: draft.annotations.filter(item => item.id !== id),
+    })
+  }
+
+  clearAnnotations(): void {
+    const key = this.draftKey()
+    if (key === null) return
+    const draft = this.inputDraft()
+    if (draft.annotations.length === 0) return
+    void this.drafts.set(key, { ...draft, annotations: [] })
   }
 
   /** 新任务页的上下文胶囊：只记关掉的模块；随草稿保存，发送后和草稿一起清空，下次新建任务重新全开。 */
@@ -78,7 +114,12 @@ class AppStore extends SessionStore {
     else if (state.session?.runtime.pendingQuestion) blockedReason = '请先回答问题'
     else if (submitPending) blockedReason = '正在发送…'
     else if (!active && !this.modelAvailable()) blockedReason = '请选择模型'
-    return { canSubmit: state.drafts !== null && blockedReason === null && (draft.text.trim() !== '' || draft.images.length > 0 || draft.files.length > 0), blockedReason } as const
+    return {
+      canSubmit: state.drafts !== null
+        && blockedReason === null
+        && hasDraftContent(draft),
+      blockedReason,
+    } as const
   }
 
   async submitDraft(): Promise<boolean> {
@@ -96,7 +137,10 @@ class AppStore extends SessionStore {
       if (sessionId === null) {
         if (selection === null) throw new Error('请选择模型')
         await this.startSession({ ...input, workspaceRoot, selection, disabledModules: draft.disabledModules ?? [] }, navigation)
-      } else await this.transport.rpc('session.submit', { ...input, sessionId })
+      } else {
+        const annotations = draft.annotations.map(({ messageId, quote, comment }) => ({ messageId, quote, comment }))
+        await this.transport.rpc('session.submit', { ...input, sessionId, annotations })
+      }
       await this.drafts.clearIfUnchanged(key, draft)
     })
   }
@@ -114,7 +158,7 @@ class AppStore extends SessionStore {
     this.patch({ questionDrafts: { ...this.state.questionDrafts, [sessionId]: draft } })
   }
 
-  async answerQuestion(itemId: string, answers: import('./protocol').UserQuestionAnswer[]): Promise<boolean> {
+  async answerQuestion(itemId: string, answers: UserQuestionAnswer[]): Promise<boolean> {
     const sessionId = this.state.selectedSessionId
     const accepted = await this.sessionAction('session.answerQuestion', sessionId => ({ sessionId, itemId, answers }), itemId)
     if (accepted && sessionId !== null && this.state.questionDrafts[sessionId]?.itemId === itemId) {

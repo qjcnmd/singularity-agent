@@ -64,13 +64,16 @@ impl Process {
     }
 
     fn ingest(&mut self, chunk: &OutputChunk) {
-        if self.capture.will_write_disk(&chunk.display) || self.model_capture.will_write_disk(&chunk.model) {
+        self.capture.ingest(&chunk.display);
+        let force_spill = self.capture.is_truncated() && !self.model_capture.has_spill();
+        if force_spill || self.model_capture.will_write_disk(&chunk.model) {
             run_blocking_in_place(|| {
-                self.capture.ingest(&chunk.display);
                 self.model_capture.ingest(&chunk.model);
+                if force_spill {
+                    self.model_capture.persist();
+                }
             });
         } else {
-            self.capture.ingest(&chunk.display);
             self.model_capture.ingest(&chunk.model);
         }
     }
@@ -118,7 +121,7 @@ impl Process {
         Ok(Self {
             child,
             output,
-            capture: CaptureState::new(output_directory.to_path_buf()),
+            capture: CaptureState::new_in_memory(),
             model_capture: CaptureState::new(output_directory.to_path_buf()),
             progress,
             started,
@@ -149,7 +152,7 @@ impl Process {
                     None => {},
                 }
             }
-            if let Some(output) = self.capture.current_output() {
+            if let Some(output) = self.capture.current_output(self.model_capture.spill_note().as_deref()) {
                 return ProcessEvent::Progress {
                     display: output,
                     model: self.model_output(),
@@ -159,7 +162,7 @@ impl Process {
     }
 
     pub(super) fn display_output(&self) -> String {
-        self.capture.display_output()
+        self.capture.display_output(self.model_capture.spill_note().as_deref())
     }
 
     pub(super) fn model_output(&self) -> CommandOutputSnapshot {
@@ -204,8 +207,11 @@ impl Process {
         }
         let mut model_output = self.model_capture.snapshot();
         model_output.incomplete = truncated;
-        let display = finished_output(self.capture, &outcome, truncated);
-        let mut execution = ToolExecution::text(finished_output(self.model_capture, &outcome, truncated));
+        let (display_content, _) = self.capture.finish();
+        let (model_content, spill_note) = self.model_capture.finish();
+        let display = finished_output(display_content, spill_note.as_deref(), &outcome, truncated);
+        let mut execution =
+            ToolExecution::text(finished_output(model_content, spill_note.as_deref(), &outcome, truncated));
         if display != execution.content {
             execution.display = Some(Box::new(ToolDisplay {
                 output: display,
@@ -218,9 +224,13 @@ impl Process {
     }
 }
 
-/// 模型与界面共享结束原因和截断提示规则，只使用各自的捕获正文。
-fn finished_output(capture: CaptureState, outcome: &Outcome, truncated: bool) -> String {
-    let (mut content, spill_note) = capture.finish();
+/// 模型与界面共享结束原因和截断提示规则，只使用各自的捕获正文与同一份溢写文件说明。
+fn finished_output(
+    mut content: String,
+    spill_note: Option<&str>,
+    outcome: &Outcome,
+    truncated: bool,
+) -> String {
     match outcome {
         Outcome::Exited(0) => {}
         Outcome::Exited(code) => append_status(&mut content, &format!("Command exited with code {code}")),
@@ -234,7 +244,7 @@ fn finished_output(capture: CaptureState, outcome: &Outcome, truncated: bool) ->
         append_status(&mut content, OUTPUT_TRUNCATED_BACKGROUND_NOTE);
     }
     if let Some(note) = spill_note {
-        append_status(&mut content, &note);
+        append_status(&mut content, note);
     }
     content
 }

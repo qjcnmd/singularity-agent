@@ -11,11 +11,12 @@ use crate::error::{
     provider_error_fields,
 };
 use crate::provider::{
-    finalize_provider_response, image_data_url, message_metadata_for, parse_tool_call_arguments, parse_usage,
+    finalize_provider_response, image_data_url, message_metadata_for, parse_tool_call_arguments,
     provider_response_validation_error, reasoning_wire_decision, serialize_tool_call_arguments,
+    split_leading_instructions,
 };
 use crate::types::{
-    ContentBlock, Message, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
+    ContentBlock, Message, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse, ModelUsage,
     ProviderBlockMetadata, ProviderMessageMetadata,
 };
 
@@ -180,25 +181,35 @@ pub(crate) fn parse_openai_responses_response(
         };
         content.push(block);
     }
-    let provider_metadata = Some(ProviderMessageMetadata::Responses {
+    let provider_metadata = Some(ProviderMessageMetadata {
+        protocol: protocol::ProviderApiProtocol::Responses,
         provider_name: config.provider_name.clone(),
         model_name: model_name.into(),
         endpoint: endpoint.into(),
     });
     Ok(finalize_provider_response(ModelTurnResponse {
         assistant_message: Message::Assistant { content, provider_metadata },
-        usage: parse_usage(
-            payload.get("usage"),
-            "input_tokens",
-            "output_tokens",
-            "/input_tokens_details/cached_tokens",
-        ),
+        usage: parse_responses_usage(payload.get("usage")),
         stop_reason: if length_truncated {
             ModelStopReason::Length
         } else {
             ModelStopReason::Stop
         },
     }))
+}
+
+fn parse_responses_usage(usage: Option<&Value>) -> Option<ModelUsage> {
+    let usage = usage?;
+    let count = |value: Option<&Value>| value.and_then(Value::as_u64);
+    let input_tokens = count(usage.get("input_tokens"))?;
+    let output_tokens = count(usage.get("output_tokens"))?;
+    Some(ModelUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens: count(usage.get("total_tokens"))
+            .unwrap_or_else(|| input_tokens.saturating_add(output_tokens)),
+        cached_input_tokens: count(usage.pointer("/input_tokens_details/cached_tokens")),
+    })
 }
 
 /// message content 规则：缺 content 算协议错误，text/output_text 与 refusal 都拼成可见文本。
@@ -231,16 +242,9 @@ pub(crate) fn openai_responses_input(
     provider_name: &str,
     endpoint: &str,
 ) -> Result<(Option<String>, Vec<Value>), ProviderError> {
-    let instruction_count =
-        messages.iter().take_while(|message| message.role() == ModelRole::Developer).count();
-    let instructions = messages[..instruction_count]
-        .iter()
-        .map(Message::content_text)
-        .filter(|message| !message.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let (instructions, rest) = split_leading_instructions(messages);
     let mut items = Vec::new();
-    for message in &messages[instruction_count..] {
+    for message in rest {
         match message {
             Message::ToolResult { tool_call_id, .. } => {
                 items.push(json!({
@@ -314,7 +318,7 @@ pub(crate) fn openai_responses_input(
             }
         }
     }
-    Ok(((!instructions.is_empty()).then_some(instructions), items))
+    Ok((instructions, items))
 }
 
 fn responses_content(

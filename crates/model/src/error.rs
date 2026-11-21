@@ -67,11 +67,6 @@ impl ProviderError {
     pub fn is_retryable(&self) -> bool {
         self.kind == ModelErrorKind::Temporary
     }
-
-    pub fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
-        self.retry_after = retry_after;
-        self
-    }
 }
 
 /// 提供方响应体里表示上下文超限的错误码；只做全等匹配。
@@ -119,34 +114,34 @@ pub(crate) fn provider_wire_facts(fields: &ProviderErrorBodyFields) -> Vec<Strin
 
 /// 解析非 2xx 响应体中的 {"error": {"code": "...", "message": "..."}}；没有 error
 /// 或 error 不是对象时，各字段都为空。
-pub(crate) fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields {
+fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields {
     serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|payload| payload.get("error").map(provider_error_fields))
         .unwrap_or_default()
 }
 
-/// HTTP 错误共用的有界诊断；只补充原因，不改变调用方选定的错误分类。
-pub(crate) fn append_provider_http_diagnostic(
-    message: &mut String,
-    fields: &ProviderErrorBodyFields,
-    body: &[u8],
-) {
-    let facts = provider_wire_facts(fields);
+/// HTTP 错误共用的有界诊断；已知错误码或类型会覆写状态码粗分类，并补充有界原因。
+pub(crate) fn apply_provider_error_body(error: &mut ProviderError, body: &[u8]) {
+    let fields = parse_provider_error_body(body);
+    if let Some(kind) = provider_error_kind_for_fields(&fields) {
+        error.kind = kind;
+    }
+    let facts = provider_wire_facts(&fields);
     if !facts.is_empty() {
-        let _ = write!(message, " ({})", facts.join(", "));
+        let _ = write!(error.message, " ({})", facts.join(", "));
     }
     let diagnostic = match fields.message.as_deref() {
         Some(message) => bounded_provider_error_diagnostic(message),
         None => bounded_provider_error_diagnostic(&String::from_utf8_lossy(body)),
     };
     if !diagnostic.is_empty() {
-        let _ = write!(message, " Provider diagnostic: {diagnostic}");
+        let _ = write!(error.message, " Provider diagnostic: {diagnostic}");
     }
 }
 
 /// 提供方错误码或类型到 `ModelErrorKind` 的映射；未命中时返回 `None`，由调用方决定分类。
-pub(crate) fn provider_error_kind_for_fields(fields: &ProviderErrorBodyFields) -> Option<ModelErrorKind> {
+fn provider_error_kind_for_fields(fields: &ProviderErrorBodyFields) -> Option<ModelErrorKind> {
     match fields.code.as_deref() {
         Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE) => return Some(ModelErrorKind::ContextLengthExceeded),
         Some(PROVIDER_RATE_LIMIT_EXCEEDED_CODE | PROVIDER_SERVER_ERROR_CODE) => {
@@ -172,9 +167,7 @@ pub(crate) fn provider_error_kind_for_fields(fields: &ProviderErrorBodyFields) -
 /// 超时、限流和服务端故障共用重试策略，具体状态码保留在错误文字里。
 pub(crate) fn provider_error_kind_for_http_status(status: u16) -> ModelErrorKind {
     match status {
-        crate::HTTP_STATUS_REQUEST_TIMEOUT
-        | crate::HTTP_STATUS_CONFLICT
-        | crate::HTTP_STATUS_RATE_LIMITED => ModelErrorKind::Temporary,
+        408 | 409 | 429 => ModelErrorKind::Temporary,
         status if (500..=599).contains(&status) => ModelErrorKind::Temporary,
         _ => ModelErrorKind::Other,
     }

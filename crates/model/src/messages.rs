@@ -9,8 +9,10 @@ use serde_json::{Value, json};
 
 use crate::config::selection::SelectedModel;
 use crate::error::{ModelErrorKind, ProviderError};
-use crate::provider::{image_data_url, message_metadata_for, reasoning_wire_decision};
-use crate::types::{ContentBlock, Message, ModelRole, ModelTurnRequest};
+use crate::provider::{
+    image_data_url, message_metadata_for, reasoning_wire_decision, split_leading_instructions,
+};
+use crate::types::{ContentBlock, Message, ModelTurnRequest};
 
 pub(crate) fn messages_stream_request_payload(
     request: &ModelTurnRequest,
@@ -76,17 +78,10 @@ fn encode_messages(
     provider_name: &str,
     endpoint: &str,
 ) -> Result<(Option<String>, Vec<Value>), ProviderError> {
-    let instruction_count =
-        messages.iter().take_while(|message| message.role() == ModelRole::Developer).count();
-    let system = messages[..instruction_count]
-        .iter()
-        .map(Message::content_text)
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let (system, rest) = split_leading_instructions(messages);
 
     let mut grouped: Vec<(&'static str, Vec<Value>)> = Vec::new();
-    for message in &messages[instruction_count..] {
+    for message in rest {
         let (role, blocks) = match message {
             Message::ToolResult { tool_call_id, is_error, .. } => {
                 let mut block = json!({
@@ -125,7 +120,7 @@ fn encode_messages(
         .into_iter()
         .map(|(role, content)| json!({ "role": role, "content": content }))
         .collect();
-    Ok(((!system.is_empty()).then_some(system), encoded))
+    Ok((system, encoded))
 }
 
 fn encode_user_blocks(
@@ -148,19 +143,10 @@ fn encode_tool_result_content(
     message: &Message,
     images: &HashMap<String, String>,
 ) -> Result<Value, ProviderError> {
-    let text = message.content_text();
     if message.images().next().is_none() {
-        return Ok(json!(text));
+        return Ok(json!(message.content_text()));
     }
-    let mut blocks = Vec::new();
-    if !text.is_empty() {
-        blocks.push(json!({ "type": "text", "text": text }));
-    }
-    for image in message.images() {
-        let url = image_data_url(images, &image.id)?;
-        blocks.push(encode_image_block(url, &image.id)?);
-    }
-    Ok(json!(blocks))
+    Ok(json!(encode_user_blocks(message, images)?))
 }
 
 fn encode_assistant_blocks(content: &[ContentBlock], same_provider: bool) -> Vec<Value> {

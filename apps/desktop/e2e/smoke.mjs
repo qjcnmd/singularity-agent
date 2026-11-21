@@ -162,7 +162,7 @@ async function runPackagedSmoke(page, mock) {
   await page.getByText('PACKAGED_SMOKE_REPLY_OK').waitFor({ state: 'visible', timeout: 20_000 })
 }
 
-async function runFullSmoke(page, mock, env) {
+async function runFullSmoke(page, mock) {
   // 1. 冷启动、富文本（公式/Mermaid/工具卡片）渲染（含 reducedMotion）与刷新还原。
   console.log('  [1/4] cold start, rich rendering (KaTeX + Mermaid + tool card) & reload recovery')
   await page.emulateMedia({ reducedMotion: 'reduce' })
@@ -346,7 +346,6 @@ async function runFullSmoke(page, mock, env) {
 
   await page.getByRole('button', { name: 'MCP', exact: true }).click()
   await page.getByRole('heading', { name: /MCP/ }).first().waitFor({ state: 'visible', timeout: 10_000 })
-  assert.ok(env.home, 'env active')
 }
 
 async function main() {
@@ -366,7 +365,7 @@ async function main() {
     if (packagedOnly) {
       await runPackagedSmoke(launched.page, mock)
     } else {
-      await runFullSmoke(launched.page, mock, env)
+      await runFullSmoke(launched.page, mock)
     }
     console.log('Desktop E2E smoke passed.')
   } finally {

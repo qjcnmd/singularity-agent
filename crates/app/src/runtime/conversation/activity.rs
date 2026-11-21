@@ -39,6 +39,7 @@ impl Activity {
                             role: HistoryMessageRole::Assistant,
                             images: Vec::new(),
                             files: Vec::new(),
+                            annotations: Vec::new(),
                             status: TurnStatus::Running,
                         }
                     });

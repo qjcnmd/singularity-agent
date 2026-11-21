@@ -171,7 +171,7 @@ impl Conversation {
             let requests = tokio::task::spawn_blocking(move || conversation.prepare_request_context())
                 .await
                 .expect("context preparation completes while the runtime is running")
-                .map_err(|error| ConversationError::ContextPreview(error.message))?;
+                .map_err(|error| ConversationError::Message(error.message))?;
             Ok::<_, ConversationError>(requests.inspect_context(&signal).await?)
         }
         .await;

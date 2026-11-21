@@ -1,4 +1,4 @@
-.activity-output:has(.edit-diff) { max-height: none; overflow: hidden; background: transparent; border-radius: 0; }
+.activity-card .activity-output:has(.edit-diff), .activity-output:has(.edit-diff) { max-height: none; overflow: hidden; background: transparent; border: 0; border-radius: 0; }
 .edit-diff { overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: transparent; }
 .edit-diff-header { display: flex; align-items: center; gap: 10px; min-height: 34px; padding: 5px 12px; background: transparent; border-bottom: 1px solid var(--line); font-size: var(--block-font-size); color: var(--ink-soft); }
 .edit-filename { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

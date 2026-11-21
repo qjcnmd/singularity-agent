@@ -5,19 +5,15 @@ use std::fmt::Write as _;
 use protocol::ProviderApiProtocol;
 use tokio_util::sync::CancellationToken;
 
-use crate::ANTHROPIC_VERSION;
 use crate::config::selection::{ProviderConfig, SelectedModel};
 use crate::config::{ModelConfigManager, ModelConfigurationSnapshot};
-use crate::error::{
-    ProviderError, append_provider_http_diagnostic, parse_provider_error_body,
-    provider_error_kind_for_fields, provider_error_kind_for_http_status,
-};
+use crate::error::{ProviderError, apply_provider_error_body, provider_error_kind_for_http_status};
 use crate::messages::{messages_stream_request_payload, read_messages_sse_stream};
-use crate::provider::{ProviderStreamEvent, messages_endpoint, responses_endpoint};
+use crate::provider::{ProviderStreamEvent, endpoint};
 use crate::responses::{openai_responses_stream_request_payload, read_responses_sse_stream};
 use crate::transport::http::{
-    BoundedBodyReadError, MAX_HTTP_ERROR_BODY_BYTES, provider_cancelled_error, provider_transport_error,
-    read_bounded_error_body, sensitive_header_value,
+    BoundedBodyReadError, MAX_HTTP_ERROR_BODY_BYTES, apply_provider_auth, provider_cancelled_error,
+    provider_transport_error, read_bounded_body,
 };
 use crate::transport::{provider_client, provider_future, retry_after_delay};
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
@@ -82,12 +78,12 @@ impl ModelClient {
         let provider_name = &self.config.provider_name;
         let encoded = match selection.protocol {
             ProviderApiProtocol::Messages => {
-                let endpoint = messages_endpoint(&self.config.base_url);
+                let endpoint = endpoint(&self.config.base_url, "/messages");
                 messages_stream_request_payload(request, selection, provider_name, &endpoint)
                     .map(|payload| (endpoint, payload))
             }
             ProviderApiProtocol::Responses => {
-                let endpoint = responses_endpoint(&self.config.base_url);
+                let endpoint = endpoint(&self.config.base_url, "/responses");
                 openai_responses_stream_request_payload(request, selection, provider_name, &endpoint)
                     .map(|payload| (endpoint, payload))
             }
@@ -135,20 +131,11 @@ impl ModelClient {
         payload: &serde_json::Value,
         cancellation: &CancellationToken,
     ) -> Result<reqwest::Response, ProviderError> {
-        let mut request = self.client.post(endpoint).json(payload);
-        match self.selected_model.protocol {
-            ProviderApiProtocol::Messages => {
-                request = request.header("anthropic-version", ANTHROPIC_VERSION);
-                if !self.config.api_key.is_empty() {
-                    request = request.header("x-api-key", sensitive_header_value(&self.config.api_key)?);
-                }
-            }
-            ProviderApiProtocol::Responses => {
-                if !self.config.api_key.is_empty() {
-                    request = request.bearer_auth(&self.config.api_key);
-                }
-            }
-        }
+        let request = apply_provider_auth(
+            self.client.post(endpoint).json(payload),
+            self.selected_model.protocol,
+            &self.config.api_key,
+        )?;
         let response = provider_future(cancellation, request.send()).await?;
         if response.status().is_success() {
             Ok(response)
@@ -166,9 +153,9 @@ impl ModelClient {
         let mut error = ProviderError::new(
             provider_error_kind_for_http_status(status_code),
             format!("Provider returned HTTP {status_code}."),
-        )
-        .with_retry_after(retry_after_delay(response.headers()));
-        let body = match read_bounded_error_body(response, MAX_HTTP_ERROR_BODY_BYTES, cancellation).await {
+        );
+        error.retry_after = retry_after_delay(response.headers());
+        let body = match read_bounded_body(response, MAX_HTTP_ERROR_BODY_BYTES, Some(cancellation)).await {
             Ok(body) => body,
             Err(BoundedBodyReadError::Cancelled) => return provider_cancelled_error(),
             Err(BoundedBodyReadError::Transport(read_error)) => {
@@ -180,12 +167,8 @@ impl ModelClient {
                 return error;
             }
         };
-        let fields = parse_provider_error_body(&body);
         // 已知错误码或错误类型比 HTTP 状态更准确，例如 400 里的上下文超限需要触发轮换。
-        if let Some(kind) = provider_error_kind_for_fields(&fields) {
-            error.kind = kind;
-        }
-        append_provider_http_diagnostic(&mut error.message, &fields, &body);
+        apply_provider_error_body(&mut error, &body);
         error
     }
 }

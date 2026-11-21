@@ -1,6 +1,6 @@
 import { useEffect, useState, type CSSProperties } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore } from '../appStore'
-import { palette, resolveAccentId } from '../bubbleColors'
+import { palette } from '../bubbleColors'
 import type { RedactedProvider } from '../protocol'
 import { messageFontSize, normalizeMessageFontSize } from '../viewPersistence'
 import { ProviderEditor } from './ProviderEditor'
@@ -95,7 +95,7 @@ export function Settings() {
                     type="button"
                     className="accent-swatch"
                     role="radio"
-                    aria-checked={resolveAccentId(state.accentColor) === color.id}
+                    aria-checked={state.accentColor === color.id}
                     aria-label={color.label}
                     title={color.label}
                     style={{ '--swatch': color.solid } as CSSProperties}
@@ -142,7 +142,7 @@ export function Settings() {
               {providerRows.map(provider => {
                 const expanded = editingProvider?.providerId === provider.providerId
                 return (
-                  <div key={provider.providerId} className={`settings-provider${expanded ? ' is-open' : ''}`}>
+                  <div key={provider.providerId}>
                     <div className="sg-row-head">
                       <button type="button" className="sg-provider-toggle" disabled={busy} aria-expanded={expanded} aria-controls={`provider-editor-${provider.providerId}`} onClick={() => {
                         appStore.clearError(actionOrigin.inline('model.saveProvider', provider.providerId))
@@ -171,7 +171,7 @@ export function Settings() {
                   </div>
               )})}
               {editor !== 'new' && <button type="button" className="settings-row settings-add" disabled={unreadable || busy} onClick={() => openEditor('new')}>添加提供方</button>}
-              <Disclosure open={editor === 'new'}><div className="settings-provider is-open"><ProviderEditor key={editorVersion} state={state} active={state.settingsOpen && editor === 'new'} onDone={() => setEditor(null)} /></div></Disclosure>
+              <Disclosure open={editor === 'new'}><div><ProviderEditor key={editorVersion} state={state} active={state.settingsOpen && editor === 'new'} onDone={() => setEditor(null)} /></div></Disclosure>
             </div>
         </section>
       </div>

@@ -239,12 +239,7 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
             .await;
         client.wait_settled(&session_id).await;
 
-        client
-            .rpc_ok(
-                "session.submit",
-                json!({ "sessionId": session_id, "text": "hello round 2", "images": [], "files": [] }),
-            )
-            .await;
+        client.submit(&session_id, "hello round 2").await;
         client.wait_settled(&session_id).await;
 
         // 协议续接与工具闭环不变量：工具结果正确送达模型，且第二轮回传第一轮同提供方的推理续接元数据。
@@ -379,12 +374,7 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
             json!({ "sessionId": session_id, "selection": { "provider": "resp-b", "model": "r-b", "reasoning": "high" } }),
         )
         .await;
-    client
-        .rpc_ok(
-            "session.submit",
-            json!({ "sessionId": session_id, "text": "turn 2 on resp-b", "images": [], "files": [] }),
-        )
-        .await;
+    client.submit(&session_id, "turn 2 on resp-b").await;
     client.wait_settled(&session_id).await;
 
     client
@@ -393,12 +383,7 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
             json!({ "sessionId": session_id, "selection": { "provider": "msg-c", "model": "m-c", "reasoning": "high" } }),
         )
         .await;
-    client
-        .rpc_ok(
-            "session.submit",
-            json!({ "sessionId": session_id, "text": "turn 3 on msg-c", "images": [], "files": [] }),
-        )
-        .await;
+    client.submit(&session_id, "turn 3 on msg-c").await;
     client.wait_settled(&session_id).await;
 
     let reqs = server.model_requests();

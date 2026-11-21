@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 pub use self::inbox::{QueuedInput, SkillExpansion, SteeringInbox, SteeringInboxHandle, UserInput};
 pub use self::questions::UserQuestions;
 pub use crate::image::InputImage;
-pub use protocol::TurnEvent;
+use protocol::TurnEvent;
 
 /// Agent 发出的事件：可转发为前端 `TurnEvent`，或通知外层更新状态与累计用量。
 #[derive(Debug, Clone, PartialEq)]
@@ -101,7 +101,7 @@ impl AgentError {
     }
 }
 
-pub type Result<T> = std::result::Result<T, AgentError>;
+pub(crate) type Result<T> = std::result::Result<T, AgentError>;
 
 /// 普通生成和独立轮换共用的模型、指令和工具定义、会话写者；轮换不需要工具执行所需的状态。
 pub struct RequestContext {
@@ -272,10 +272,14 @@ impl Agent {
             }
         };
         let images: Vec<_> = input.images.iter().map(|image| image.attachment.clone()).collect();
-        let model_text = input.text_with_files();
+        let model_text = input.model_text();
         let display_text = (model_text != input.text).then(|| input.text.clone());
-        let display = (display_text.is_some() || !input.files.is_empty())
-            .then(|| MessageDisplay::User { display_text, files: input.files.clone() });
+        let display = (display_text.is_some() || !input.files.is_empty() || !input.annotations.is_empty())
+            .then(|| MessageDisplay::User {
+                display_text,
+                files: input.files.clone(),
+                annotations: input.annotations.clone(),
+            });
         let mut content = vec![model::ContentBlock::text(model_text)];
         content.extend(images.iter().cloned().map(model::ContentBlock::Image));
         let message = Message::User { content };
@@ -289,6 +293,7 @@ impl Agent {
                 stats: None,
                 images,
                 files: input.files.clone(),
+                annotations: input.annotations.clone(),
                 role: protocol::HistoryMessageRole::User,
                 status: protocol::TurnStatus::Completed,
             },

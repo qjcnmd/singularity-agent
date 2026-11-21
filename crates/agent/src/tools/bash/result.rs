@@ -4,28 +4,13 @@ use std::fmt::Write as _;
 
 use protocol::{BackgroundTask, BackgroundTaskState, CommandOutputSnapshot};
 
-use crate::tools::registry::{
-    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, ToolDisplay, ToolExecution, error_result,
-};
+use crate::tools::registry::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, ToolDisplay, ToolExecution};
 
-#[derive(Clone, Copy)]
-pub(super) enum TaskDisplayMode {
-    None,
-    Summary,
-    SummaryWithOutput,
-}
-
-pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> Result<String, String> {
-    if cursor > output.total_bytes {
-        return Err(format!("cursor {cursor} exceeds output size {}", output.total_bytes));
-    }
+pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> String {
+    let cursor = cursor.min(output.total_bytes);
     let retained_start = output.total_bytes.saturating_sub(output.text.len() as u64);
-    let Ok(offset) = usize::try_from(cursor.saturating_sub(retained_start)) else {
-        return Err("cursor is out of range".into());
-    };
-    if !output.text.is_char_boundary(offset) {
-        return Err("cursor must be at a UTF-8 character boundary".into());
-    }
+    let offset = usize::try_from(cursor.saturating_sub(retained_start)).unwrap_or(0);
+    let offset = output.text.ceil_char_boundary(offset.min(output.text.len()));
     let unread = &output.text[offset..];
     let byte_start = unread.ceil_char_boundary(unread.len().saturating_sub(DEFAULT_MAX_BYTES));
     let line_start = unread
@@ -53,49 +38,28 @@ pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> Result
     } else if let Some(path) = &output.full_output {
         let _ = write!(result, "\nFull output: {path}");
     }
-    Ok(result)
+    result
 }
 
-pub(super) fn task_result(
-    task: &BackgroundTask,
-    cursor: Option<u64>,
-    display_mode: TaskDisplayMode,
-) -> ToolExecution {
-    match try_task_result(task, cursor, display_mode) {
-        Ok(result) => result,
-        Err(error) => error_result(error),
-    }
-}
-
-pub(super) fn try_task_result(
-    task: &BackgroundTask,
-    cursor: Option<u64>,
-    display_mode: TaskDisplayMode,
-) -> Result<ToolExecution, String> {
+pub(super) fn task_result(task: &BackgroundTask, cursor: Option<u64>, include_output: bool) -> ToolExecution {
     let mut content = format!("Task {}: {}", task.task_id, state_text(&task.state));
     if let Some(cursor) = cursor {
-        let output = output_text(&task.model_output, cursor)?;
         content.push('\n');
-        content.push_str(&output);
+        content.push_str(&output_text(&task.model_output, cursor));
+    }
+    let mut summary = task_summary(task, &task.state);
+    if include_output {
+        summary["output"] = serde_json::json!(task.output);
     }
     let mut result = ToolExecution::text(content);
-    match display_mode {
-        TaskDisplayMode::None => {}
-        TaskDisplayMode::Summary | TaskDisplayMode::SummaryWithOutput => {
-            let mut summary = task_summary(task, &task.state);
-            if matches!(display_mode, TaskDisplayMode::SummaryWithOutput) {
-                summary["output"] = serde_json::json!(task.output);
-            }
-            result.display = Some(Box::new(ToolDisplay {
-                output: serde_json::to_string(&summary).expect("task result serializes"),
-                background_task_id: Some(task.task_id.clone()),
-            }));
-        }
-    }
+    result.display = Some(Box::new(ToolDisplay {
+        output: serde_json::to_string(&summary).expect("task result serializes"),
+        background_task_id: Some(task.task_id.clone()),
+    }));
     result.is_error = matches!(task.state,
         BackgroundTaskState::Exited { exit_code, .. } if exit_code != 0)
         || matches!(task.state, BackgroundTaskState::Failed { .. } | BackgroundTaskState::Interrupted);
-    Ok(result)
+    result
 }
 
 pub(super) fn state_text(state: &BackgroundTaskState) -> String {

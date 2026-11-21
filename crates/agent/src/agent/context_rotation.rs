@@ -38,6 +38,7 @@ const ORGANIZE_USER_MESSAGES: &str = r"请结合当前对话，更新这份用�
 impl RequestContext {
     pub(super) async fn rotate_context_if_needed(
         &mut self,
+        current_tokens: u64,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<()> {
@@ -47,7 +48,7 @@ impl RequestContext {
         let trigger =
             u64::try_from(u128::from(self.context_window()) * AUTO_CONTEXT_ROTATION_TRIGGER_PERCENT / 100)
                 .unwrap_or(u64::MAX);
-        if self.context_pressure_tokens().await >= trigger {
+        if current_tokens >= trigger {
             self.rotate_now(on_event, cancellation, false).await?;
         }
         Ok(())
@@ -155,7 +156,7 @@ impl RequestContext {
         };
         let estimated_full_input = base_tokens.saturating_add(instruction_tokens);
 
-        let user_messages = if !force_compact && estimated_full_input <= input_budget {
+        let standard = if !force_compact && estimated_full_input <= input_budget {
             // 常规路径：保留完整历史、图片与工具定义，尽量命中提供方前缀缓存。
             let full_defs = definitions.clone();
             let full_messages = input.messages.clone();
@@ -186,31 +187,14 @@ impl RequestContext {
             )
             .await
             {
-                Ok((response, _, _)) => validate_user_messages(&response)?,
+                Ok((response, _, _)) => Some(validate_user_messages(&response)?),
                 Err(AgentError::Provider(error)) if error.is_context_overflow() => {
                     tracing::warn!(
                         estimated_tokens = estimated_full_input,
                         window = model.context_window(),
                         "standard context rotation overflowed; falling back to degraded compaction"
                     );
-                    let plan = RotationPlan {
-                        definitions: &definitions,
-                        instruction: &instruction,
-                        instruction_tokens,
-                        model,
-                        input_budget,
-                    };
-                    let overflowed_tokens = (!input.messages.iter().any(|m| m.images().next().is_some()))
-                        .then(|| compaction::messages_tokens(&input.messages));
-                    self.rotate_degraded(
-                        &plan,
-                        input.messages,
-                        &input.image_directory,
-                        overflowed_tokens,
-                        on_event,
-                        cancellation,
-                    )
-                    .await?
+                    None
                 }
                 Err(error) => return Err(error),
             }
@@ -221,25 +205,31 @@ impl RequestContext {
                 budget = input_budget,
                 "context rotation entering degraded compaction path"
             );
-            let plan = RotationPlan {
-                definitions: &definitions,
-                instruction: &instruction,
-                instruction_tokens,
-                model,
-                input_budget,
-            };
-            let overflowed_tokens = (force_compact
-                && !input.messages.iter().any(|m| m.images().next().is_some()))
-            .then(|| compaction::messages_tokens(&input.messages));
-            self.rotate_degraded(
-                &plan,
-                input.messages,
-                &input.image_directory,
-                overflowed_tokens,
-                on_event,
-                cancellation,
-            )
-            .await?
+            None
+        };
+        let user_messages = match standard {
+            Some(text) => text,
+            None => {
+                let plan = RotationPlan {
+                    definitions: &definitions,
+                    instruction: &instruction,
+                    instruction_tokens,
+                    model,
+                    input_budget,
+                };
+                let overflowed_tokens = ((force_compact || estimated_full_input <= input_budget)
+                    && !input.messages.iter().any(|m| m.images().next().is_some()))
+                .then(|| compaction::messages_tokens(&input.messages));
+                self.rotate_degraded(
+                    &plan,
+                    input.messages,
+                    &input.image_directory,
+                    overflowed_tokens,
+                    on_event,
+                    cancellation,
+                )
+                .await?
+            }
         };
 
         if !begin_commit() || cancellation.is_cancelled() {
@@ -251,6 +241,41 @@ impl RequestContext {
         with_writer_async(&self.session, move |writer| writer.append_context_rotation_with_id(&id, entry))
             .await?;
         Ok(user_messages)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "stage helper avoids duplicating degraded-rotation checks"
+    )]
+    async fn try_degraded_stage(
+        &self,
+        plan: &RotationPlan<'_>,
+        history: &[Message],
+        last_overflow_tokens: &mut Option<u64>,
+        stage: &str,
+        next_stage: &str,
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
+        cancellation: &CancellationToken,
+    ) -> Result<Option<String>> {
+        let history_tokens = compaction::messages_tokens(history);
+        let total_tokens = plan
+            .definitions
+            .estimated_tokens
+            .saturating_add(history_tokens)
+            .saturating_add(plan.instruction_tokens);
+        if total_tokens <= plan.input_budget
+            && last_overflow_tokens.is_none_or(|previous| history_tokens < previous)
+        {
+            match self.send_degraded_rotation(plan, history, total_tokens, on_event, cancellation).await {
+                Ok(text) => return Ok(Some(text)),
+                Err(AgentError::Provider(error)) if error.is_context_overflow() => {
+                    *last_overflow_tokens = Some(history_tokens);
+                    tracing::warn!("{stage} degraded rotation overflowed; escalating to {next_stage}");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
     }
 
     async fn rotate_degraded(
@@ -265,43 +290,36 @@ impl RequestContext {
         // 阶梯 1：剥离图片二进制（保留路径说明）并折叠所有历史工具结果。
         compaction::strip_images_to_captions(&mut history, image_directory);
         compaction::compact_tool_results(&mut history);
-        let stage1_history_tokens = compaction::messages_tokens(&history);
-        let stage1_tokens = plan
-            .definitions
-            .estimated_tokens
-            .saturating_add(stage1_history_tokens)
-            .saturating_add(plan.instruction_tokens);
-        if stage1_tokens <= plan.input_budget
-            && last_overflow_tokens.is_none_or(|previous| stage1_history_tokens < previous)
+        if let Some(text) = self
+            .try_degraded_stage(
+                plan,
+                &history,
+                &mut last_overflow_tokens,
+                "stage-1",
+                "stage-2",
+                on_event,
+                cancellation,
+            )
+            .await?
         {
-            match self.send_degraded_rotation(plan, &history, stage1_tokens, on_event, cancellation).await {
-                Ok(text) => return Ok(text),
-                Err(AgentError::Provider(error)) if error.is_context_overflow() => {
-                    last_overflow_tokens = Some(stage1_history_tokens);
-                    tracing::warn!("stage-1 degraded rotation overflowed; escalating to stage-2");
-                }
-                Err(error) => return Err(error),
-            }
+            return Ok(text);
         }
 
         // 阶梯 2：进一步剥离助手思考并折叠超长助手正文与工具调用参数，完整保留用户发言。
         compaction::compact_assistant_messages(&mut history);
-        let stage2_history_tokens = compaction::messages_tokens(&history);
-        let stage2_tokens = plan
-            .definitions
-            .estimated_tokens
-            .saturating_add(stage2_history_tokens)
-            .saturating_add(plan.instruction_tokens);
-        if stage2_tokens <= plan.input_budget
-            && last_overflow_tokens.is_none_or(|previous| stage2_history_tokens < previous)
+        if let Some(text) = self
+            .try_degraded_stage(
+                plan,
+                &history,
+                &mut last_overflow_tokens,
+                "stage-2",
+                "chunked rotation",
+                on_event,
+                cancellation,
+            )
+            .await?
         {
-            match self.send_degraded_rotation(plan, &history, stage2_tokens, on_event, cancellation).await {
-                Ok(text) => return Ok(text),
-                Err(AgentError::Provider(error)) if error.is_context_overflow() => {
-                    tracing::warn!("stage-2 degraded rotation overflowed; escalating to chunked rotation");
-                }
-                Err(error) => return Err(error),
-            }
+            return Ok(text);
         }
 
         // 阶梯 3：按原子消息组切分，逐批滚动整理；单批可用预算留出上一版整理正文的空间。
@@ -325,16 +343,17 @@ impl RequestContext {
         &self,
         plan: &RotationPlan<'_>,
         previous_summary: Option<&str>,
-        mut chunk: Vec<Message>,
+        chunk: Vec<Message>,
         depth: u8,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<String> {
-        let mut batch = Vec::with_capacity(chunk.len() + 1);
+        let mut batch = Vec::with_capacity(chunk.len() + usize::from(previous_summary.is_some()));
         if let Some(summary) = previous_summary {
             batch.push(Message::user(format!("上一版用户消息整理正文：\n\n{summary}")));
         }
-        batch.extend(chunk.iter().cloned());
+        let chunk_offset = batch.len();
+        batch.extend(chunk);
         let estimated = plan
             .definitions
             .estimated_tokens
@@ -344,7 +363,7 @@ impl RequestContext {
             Ok(text) => Ok(text),
             Err(AgentError::Provider(error)) if error.is_context_overflow() && depth < 3 => {
                 // 估算低估导致单批仍超窗：将当前批按原子组折半，或极端单条消息截短后重试。
-                let mut groups = compaction::atomic_groups(std::mem::take(&mut chunk));
+                let mut groups = compaction::atomic_groups(batch.drain(chunk_offset..).collect());
                 if groups.len() >= 2 {
                     let mid = groups.len() / 2;
                     let right_groups = groups.split_off(mid);

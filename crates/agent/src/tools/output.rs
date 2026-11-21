@@ -32,7 +32,7 @@ impl SpillWriter {
 /// 输出首次超过显示上限（2000 行或 50KB）时在会话目录创建文件写入已有缓冲，之后每段输出都追加进去；
 /// 写入失败时记下原因，结果里改为说明完整输出没能保存。
 pub(super) struct CaptureState {
-    directory: PathBuf,
+    directory: Option<PathBuf>,
     tail: String,
     total_bytes: usize,
     completed_lines: usize,
@@ -43,11 +43,22 @@ pub(super) struct CaptureState {
 impl CaptureState {
     /// 转入后台后保留完整正文，主动回读不依赖模型的增量读取位置。
     pub(super) fn persist(&mut self) {
-        if self.spill.is_none() {
-            self.spill = Some(SpillWriter::create(&self.directory, &self.tail));
+        if self.spill.is_none()
+            && let Some(directory) = &self.directory
+        {
+            self.spill = Some(SpillWriter::create(directory, &self.tail));
         }
     }
+
     pub(super) fn new(directory: PathBuf) -> Self {
+        Self::with_directory(Some(directory))
+    }
+
+    pub(super) fn new_in_memory() -> Self {
+        Self::with_directory(None)
+    }
+
+    fn with_directory(directory: Option<PathBuf>) -> Self {
         Self {
             directory,
             tail: String::new(),
@@ -65,11 +76,18 @@ impl CaptureState {
         self.completed_lines + usize::from(has_open_line)
     }
 
-    fn is_truncated(&self) -> bool {
+    pub(super) fn is_truncated(&self) -> bool {
         self.total_lines() > DEFAULT_MAX_LINES || self.total_bytes > DEFAULT_MAX_BYTES
     }
 
+    pub(super) fn has_spill(&self) -> bool {
+        self.spill.is_some()
+    }
+
     pub(super) fn will_write_disk(&self, text: &str) -> bool {
+        if self.directory.is_none() {
+            return false;
+        }
         match &self.spill {
             Some(Ok(_)) => return true,
             Some(Err(_)) => return false,
@@ -89,7 +107,7 @@ impl CaptureState {
 
     /// 运行中显示的输出：第一次有输出立即返回，之后有新输出时最多每 100ms 返回一次；
     /// 超出上限时附上完整输出文件的位置。
-    pub(super) fn current_output(&mut self) -> Option<String> {
+    pub(super) fn current_output(&mut self, spill_note: Option<&str>) -> Option<String> {
         let now = Instant::now();
         if self.total_bytes == 0
             || self.last_progress.is_some_and(|(last, bytes)| {
@@ -99,16 +117,16 @@ impl CaptureState {
             return None;
         }
         self.last_progress = Some((now, self.total_bytes));
-        Some(self.display_output())
+        Some(self.display_output(spill_note))
     }
 
     /// 无节流的当前显示输出（含截断说明与溢写路径说明）；前台转后台时用于生成一致快照。
-    pub(super) fn display_output(&self) -> String {
+    pub(super) fn display_output(&self, spill_note: Option<&str>) -> String {
         if self.total_bytes == 0 {
             return String::new();
         }
         let mut content = self.final_output();
-        if let Some(note) = self.spill_note() {
+        if let Some(note) = spill_note {
             let _ = write!(content, "\n\n{note}");
         }
         content
@@ -126,8 +144,11 @@ impl CaptureState {
             self.spill = Some(Err(error));
         }
         self.tail.push_str(text);
-        if self.spill.is_none() && self.is_truncated() {
-            self.spill = Some(SpillWriter::create(&self.directory, &self.tail));
+        if self.spill.is_none()
+            && self.is_truncated()
+            && let Some(directory) = &self.directory
+        {
+            self.spill = Some(SpillWriter::create(directory, &self.tail));
         }
         if self.tail.len() > INTERNAL_TAIL_MAX_BYTES {
             self.tail = truncate_string_to_bytes_from_end(&self.tail, INTERNAL_TAIL_MAX_BYTES);
@@ -160,7 +181,7 @@ impl CaptureState {
         (content, note)
     }
 
-    fn spill_note(&self) -> Option<String> {
+    pub(super) fn spill_note(&self) -> Option<String> {
         self.spill.as_ref().map(|spill| match spill {
             Ok(spill) => format!("Full output: {}", spill.path.display()),
             Err(error) => format!("Full output could not be saved: {error}"),

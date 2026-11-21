@@ -4,6 +4,7 @@ import { ArrowDown } from 'lucide-react'
 import { appStore, type AppState } from '../appStore'
 import { type TimelineRow } from '../timeline'
 import { TimelineItem } from './TimelineItem'
+import { useConversationAnnotations } from './Annotations'
 import { defaultAnchor } from '../viewPersistence'
 
 interface Props {
@@ -16,7 +17,9 @@ export function Conversation({ state, items }: Props) {
   const currentItems = useRef(items)
   currentItems.current = items
   const itemIdentity = useMemo(() => items.map((item) => item.key).join('\u0000'), [items])
+  const surface = useRef<HTMLDivElement>(null)
   const viewport = useRef<HTMLDivElement>(null)
+  const documentNode = useRef<HTMLDivElement>(null)
   const observedTop = useRef(0)
   const frame = useRef(0)
   const restoredSession = useRef<string | null>(null)
@@ -75,13 +78,12 @@ export function Conversation({ state, items }: Props) {
     restoredSession.current = sessionId
     const observer = new ResizeObserver(restoreViewport)
     observer.observe(node)
-    const document = node.querySelector<HTMLElement>('.conversation-document')
-    if (document !== null) observer.observe(document)
+    if (documentNode.current !== null) observer.observe(documentNode.current)
     return () => { observer.disconnect(); cancelAnimationFrame(frame.current); frame.current = 0 }
   }, [itemIdentity, sessionId, state.session?.runtime.phase])
 
   const saveReadingPosition = (node: HTMLDivElement, element: HTMLElement) => {
-    const anchorElement = element.closest<HTMLElement>('.activity-card, .tool-group') ?? element
+    const anchorElement = element.closest<HTMLElement>('.activity-card') ?? element
     const items = currentItems.current
     const index = items.findIndex(item => item.key === anchorElement.dataset.itemId)
     // 重试会撤回流式片段；用它之前最近的已保存条目记录位置。
@@ -110,6 +112,16 @@ export function Conversation({ state, items }: Props) {
   }, [])
 
 
+  const anchorFirstVisible = useCallback((node: HTMLDivElement) => {
+    const viewportTop = node.getBoundingClientRect().top
+    for (const item of node.querySelectorAll<HTMLElement>('[data-item-id]')) {
+      if (item.getBoundingClientRect().bottom >= viewportTop) {
+        saveReadingPosition(node, item)
+        break
+      }
+    }
+  }, [])
+
   const onScroll = () => {
     const node = viewport.current
     if (node === null) return
@@ -125,13 +137,7 @@ export function Conversation({ state, items }: Props) {
       if (anchor.mode !== 'following') appStore.setViewportAnchor(defaultAnchor())
       return
     }
-    const viewportTop = node.getBoundingClientRect().top
-    for (const item of node.querySelectorAll<HTMLElement>('[data-item-id]')) {
-      if (item.getBoundingClientRect().bottom >= viewportTop) {
-        saveReadingPosition(node, item)
-        break
-      }
-    }
+    anchorFirstVisible(node)
   }
 
   const returnToLatest = () => {
@@ -143,16 +149,32 @@ export function Conversation({ state, items }: Props) {
     node.focus({ preventScroll: true })
   }
 
-  const interruptFollow = () => {
+  const interruptFollow = useCallback(() => {
     cancelAnimationFrame(frame.current)
     frame.current = 0
     const node = viewport.current
     if (!node) return
     if (node.scrollHeight - node.clientHeight - node.scrollTop < 32) return
-    const top = node.getBoundingClientRect().top
-    const first = [...node.querySelectorAll<HTMLElement>('[data-item-id]')].find(item => item.getBoundingClientRect().bottom >= top)
-    if (first) saveReadingPosition(node, first)
-  }
+    anchorFirstVisible(node)
+  }, [anchorFirstVisible])
+
+  const anchorForJump = useCallback((target: HTMLElement) => {
+    cancelAnimationFrame(frame.current)
+    frame.current = 0
+    const node = viewport.current
+    if (!node) return
+    const item = target.closest<HTMLElement>('[data-item-id]')
+    if (item) saveReadingPosition(node, item)
+  }, [])
+
+  const { badgeLayer, floatingPopover } = useConversationAnnotations({
+    sessionId: state.session ? sessionId : null,
+    itemIdentity,
+    surfaceRef: surface,
+    viewportRef: viewport,
+    documentRef: documentNode,
+    onJumpAnchor: anchorForJump,
+  })
 
   // 空白新任务由外层 MainContent 处理；这里只处理已选任务的读取中与读取失败状态。
   if (state.session === null) {
@@ -169,14 +191,16 @@ export function Conversation({ state, items }: Props) {
   }
 
   return (
-    <div className="conversation-surface"><div className="conversation-scroll" ref={viewport} tabIndex={0} aria-label="任务内容" onScroll={onScroll} onWheel={interruptFollow} onTouchStart={interruptFollow} onPointerDown={interruptFollow} onKeyDown={event => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) interruptFollow() }}>
+    <div className="conversation-surface" ref={surface}><div className="conversation-scroll" ref={viewport} tabIndex={0} aria-label="任务内容" onScroll={onScroll} onWheel={interruptFollow} onTouchStart={interruptFollow} onPointerDown={interruptFollow} onKeyDown={event => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) interruptFollow() }}>
       {/* 切换任务时整页淡入，消息不各自弹出；任务里新出现的消息才逐条弹出。 */}
-      <motion.div key={sessionId} className="conversation-document"
+      <motion.div key={sessionId} ref={documentNode} className="conversation-document"
         initial={reduced ? false : { opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: .2, ease: 'easeOut' }}>
         <AnimatePresence initial={false}>{items.map(item => <TimelineItem key={item.key} item={item.item} itemKey={item.key} onDisclosureChange={preserveDisclosurePosition} cwd={state.session!.summary.cwd} userHome={state.bootstrap?.userHome} sessionId={sessionId ?? undefined} />)}</AnimatePresence>
+        {badgeLayer}
       </motion.div>
 
     </div>
+      {floatingPopover}
       {awayFromLatest && <button type="button" className="return-to-latest" aria-label="回到最新消息" onClick={returnToLatest}>
         <ArrowDown size={16} aria-hidden="true" />
       </button>}

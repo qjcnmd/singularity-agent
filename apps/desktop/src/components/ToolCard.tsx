@@ -98,7 +98,7 @@ export function useBackgroundTasks(sessionId: string | undefined, enabled: boole
   return enabled ? liveSessions[sessionId ?? '']?.backgroundTasks : undefined
 }
 
-export interface ToolCardProps {
+interface ToolCardProps {
   item: ToolItem
   itemKey: string
   cwd: string
@@ -122,9 +122,12 @@ export function ToolCard({ item, itemKey, cwd, userHome, sessionId, onDisclosure
     : (spec?.summary ? spec.summary(input) : firstLine(argument ?? '')) || firstLine(item.result?.output ?? '')
 
   return (
-    <article className={`timeline-item activity-step timeline-tool status-${status}`} data-item-id={itemKey} aria-label={`${title}，${factStatusText[status]}`}>
+    <article className="timeline-item activity-step" data-item-id={itemKey} aria-label={`${title}，${factStatusText[status]}`}>
       <button type="button" className="activity-toggle" {...selectionGuard(() => setExpanded(value => !value))} aria-expanded={expanded}>
-        <StepLabel title={title} icon={<StepStatusIcon name={item.name} status={status} />} />
+        <span className="step-label">
+          <span className="step-icon" aria-hidden="true"><StepStatusIcon name={item.name} status={status} /></span>
+          <span className="step-title">{title}</span>
+        </span>
         <span className="step-summary">{summary}</span>
         {status === 'interrupted' && <span className="item-status">{factStatusText.interrupted}</span>}
         {status === 'pending' && <span className="item-status">{factStatusText.pending}</span>}
@@ -136,13 +139,6 @@ export function ToolCard({ item, itemKey, cwd, userHome, sessionId, onDisclosure
       </div></Disclosure>
     </article>
   )
-}
-
-function StepLabel({ title, icon }: { title: string; icon?: ReactNode }) {
-  return <span className="step-label">
-    {icon !== undefined && <span className="step-icon" aria-hidden="true">{icon}</span>}
-    <span className="step-title">{title}</span>
-  </span>
 }
 
 function QuestionAnswers({ questions, output }: { questions?: UserQuestion[]; output: string }) {

@@ -10,12 +10,11 @@ use serde_json::Value;
 use super::{ProviderError, configuration_error, validate_api_key, validate_base_url, validate_identifier};
 use crate::ModelErrorKind;
 use crate::error::{
-    append_provider_http_diagnostic, bounded_provider_error_diagnostic, parse_provider_error_body,
-    provider_error_kind_for_fields, provider_error_kind_for_http_status,
+    apply_provider_error_body, bounded_provider_error_diagnostic, provider_error_kind_for_http_status,
 };
 use crate::transport::http::{
-    MAX_HTTP_ERROR_BODY_BYTES, PROVIDER_USER_AGENT, client_builder, read_bounded_body,
-    sensitive_header_value, transport_error_source,
+    BoundedBodyReadError, MAX_HTTP_ERROR_BODY_BYTES, apply_provider_auth, client_builder, read_bounded_body,
+    transport_error_source,
 };
 
 const MAX_DISCOVERY_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -29,7 +28,7 @@ fn discovery_client() -> Result<reqwest::Client, ProviderError> {
     let client = client_builder()
         .timeout(Duration::from_secs(DISCOVERY_TIMEOUT_SECONDS))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(PROVIDER_USER_AGENT)
+        .user_agent(app_core::identity::USER_AGENT)
         .build()
         .map_err(|error| {
             // 客户端构造失败和请求失败是两回事：保留底层原因方便定位。
@@ -48,20 +47,8 @@ pub async fn discover(
     validate_base_url(base_url)?;
     validate_api_key(api_key)?;
     let client = discovery_client()?;
-    let mut request = client.get(crate::provider::models_endpoint(base_url));
-    match protocol {
-        protocol::ProviderApiProtocol::Messages => {
-            request = request.header("anthropic-version", crate::ANTHROPIC_VERSION);
-            if !api_key.is_empty() {
-                request = request.header("x-api-key", sensitive_header_value(api_key)?);
-            }
-        }
-        protocol::ProviderApiProtocol::Responses => {
-            if !api_key.is_empty() {
-                request = request.bearer_auth(api_key);
-            }
-        }
-    }
+    let request =
+        apply_provider_auth(client.get(crate::provider::endpoint(base_url, "/models")), protocol, api_key)?;
     let response = request.send().await.map_err(discovery_transport_error)?;
     if !response.status().is_success() {
         return Err(discovery_http_error(response).await);
@@ -126,18 +113,13 @@ async fn discovery_http_error(response: reqwest::Response) -> ProviderError {
         provider_error_kind_for_http_status(status),
         format!("获取模型失败：HTTP {status}。"),
     );
-    match read_bounded_body(response, MAX_HTTP_ERROR_BODY_BYTES).await {
-        Ok(body) => {
-            let fields = parse_provider_error_body(&body);
-            if let Some(kind) = provider_error_kind_for_fields(&fields) {
-                error.kind = kind;
-            }
-            append_provider_http_diagnostic(&mut error.message, &fields, &body);
-        }
-        Err(read_error) => {
+    match read_bounded_body(response, MAX_HTTP_ERROR_BODY_BYTES, None).await {
+        Ok(body) => apply_provider_error_body(&mut error, &body),
+        Err(BoundedBodyReadError::Transport(read_error)) => {
             let _ =
                 write!(error.message, " 无法读取提供方错误响应（{}）。", transport_error_source(read_error));
         }
+        Err(BoundedBodyReadError::Cancelled) => unreachable!("un-cancellable body read"),
     }
     error
 }

@@ -12,8 +12,7 @@ mod state;
 mod turn;
 mod view;
 
-pub(crate) use self::state::TurnControls;
-use self::state::{ConversationState, TurnLifecycle};
+use self::state::{ConversationState, TurnControls, TurnLifecycle};
 
 use std::sync::{Arc, Mutex};
 
@@ -21,12 +20,14 @@ use agent::agent::QueuedInput;
 use agent::session::{SessionMetadata, SessionWriter, lock_writer};
 use protocol::SessionPhase;
 
+use crate::desktop::stream_hub::StreamHub;
+
 pub(crate) struct Conversation {
     pub(crate) thread_id: String,
     pub(crate) cwd: String,
     pub(crate) disabled_modules: Vec<String>,
     view: Mutex<view::ConversationView>,
-    publish: Arc<dyn Fn(protocol::StreamEvent) -> u64 + Send + Sync>,
+    hub: Arc<StreamHub>,
     changed: tokio::sync::Notify,
     home: std::path::PathBuf,
     models: Arc<model::ModelConfigManager>,
@@ -46,15 +47,7 @@ pub(crate) enum ConversationError {
     #[error("session cannot accept this operation in its current phase")]
     Busy,
     #[error("{0}")]
-    Configuration(String),
-    #[error("任务名称不能为空。")]
-    InvalidName,
-    #[error("{0}")]
-    Question(String),
-    #[error("{0}")]
-    BackgroundShutdown(String),
-    #[error("{0}")]
-    ContextPreview(String),
+    Message(String),
     #[error(transparent)]
     Agent(#[from] agent::agent::AgentError),
     #[error(transparent)]
@@ -69,7 +62,7 @@ impl Conversation {
         models: Arc<model::ModelConfigManager>,
         mcp: Arc<mcp::McpManager>,
         initial_revision: u64,
-        publish: Arc<dyn Fn(protocol::StreamEvent) -> u64 + Send + Sync>,
+        hub: Arc<StreamHub>,
     ) -> Arc<Self> {
         let data = session.data();
         let model = data
@@ -107,7 +100,7 @@ impl Conversation {
                 cwd,
                 disabled_modules,
                 view: Mutex::new(view::ConversationView::new(usage, initial_revision)),
-                publish,
+                hub,
                 changed: tokio::sync::Notify::new(),
                 home,
                 models,
@@ -133,23 +126,14 @@ impl Conversation {
 
     /// 在同一次加锁中检查执行、后台命令和待处理输入，避免检查途中后台通知启动新回合。
     pub(crate) fn has_work(&self) -> bool {
-        let state = self.lock_state();
-        state.turn.is_busy()
-            || state.context_preview.is_some()
-            || self.bash_tasks.is_busy()
-            || !state.steering_inbox.lock().expect("turn inbox lock poisoned").pending().is_empty()
+        self.lock_state().has_work(&self.bash_tasks)
     }
 
     /// 单次按 `view -> state` 加锁判断是否允许从内存缓存淘汰：删除中、存在未保存错误或有活可做时均不可淘汰。
     pub(crate) fn can_evict(&self) -> bool {
         let view = self.lock_view();
         let state = self.lock_state();
-        !state.closing
-            && view.failure.is_none()
-            && !state.turn.is_busy()
-            && state.context_preview.is_none()
-            && !self.bash_tasks.is_busy()
-            && state.steering_inbox.lock().expect("turn inbox lock poisoned").pending().is_empty()
+        !state.closing && view.failure.is_none() && !state.has_work(&self.bash_tasks)
     }
 
     pub(super) fn phase(&self) -> SessionPhase {
@@ -190,9 +174,9 @@ impl Conversation {
     ) -> Result<(), ConversationError> {
         match &self.lock_state().turn {
             TurnLifecycle::Running(controls) if !controls.cancellation().is_cancelled() => {
-                controls.questions.answer(item_id, answers).map_err(ConversationError::Question)
+                controls.questions.answer(item_id, answers).map_err(ConversationError::Message)
             }
-            _ => Err(ConversationError::Question("该任务已停止等待回答。".into())),
+            _ => Err(ConversationError::Message("该任务已停止等待回答。".into())),
         }
     }
 
@@ -215,7 +199,7 @@ impl Conversation {
     pub(crate) fn rename(&self, name: &str) -> Result<(), ConversationError> {
         let name = name.trim();
         if name.is_empty() {
-            return Err(ConversationError::InvalidName);
+            return Err(ConversationError::Message("任务名称不能为空。".into()));
         }
         let mut view = self.lock_view();
         lock_writer(&self.writer).append_metadata(SessionMetadata::ThreadName { name: name.to_string() })?;
@@ -228,11 +212,10 @@ impl Conversation {
         &self,
         selection: &protocol::ModelSelection,
     ) -> Result<(), ConversationError> {
-        self.models
+        let context_window = self
+            .models
             .validate_selection(selection)
-            .map_err(|error| format!("invalid model selection: {error}"))
-            .map_err(ConversationError::Configuration)?;
-        let context_window = self.models.context_window(selection);
+            .map_err(|error| ConversationError::Message(format!("invalid model selection: {error}")))?;
         let mut view = self.lock_view();
         let mut state = self.lock_state();
         if &state.model == selection {

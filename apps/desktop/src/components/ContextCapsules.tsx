@@ -1,4 +1,4 @@
-import { useId, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useId, useLayoutEffect, useRef, useState } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
 import { formatTokenCount, workspaceName } from '../copy'
 import { navigateList, useDismissOnOutside } from '../interactions'
@@ -49,16 +49,17 @@ function sameCapsulesState(
   previous: Pick<AppState, typeof capsulesFields[number]>,
   next: Pick<AppState, typeof capsulesFields[number]>,
 ): boolean {
-  const root = next.selectedWorkspaceRoot ?? ''
+  const prevModules = previous.selectedWorkspaceRoot === null ? undefined : previous.drafts?.['new-task']?.disabledModules
+  const nextModules = next.selectedWorkspaceRoot === null ? undefined : next.drafts?.['new-task']?.disabledModules
   return previous.selectedWorkspaceRoot === next.selectedWorkspaceRoot
     && Object.is(previous.bootstrap, next.bootstrap)
     && Object.is(previous.connection, next.connection)
     && Object.is(previous.pendingActions, next.pendingActions)
-    && sameDisabledModules(previous.drafts?.[root]?.disabledModules, next.drafts?.[root]?.disabledModules)
+    && sameDisabledModules(prevModules, nextModules)
 }
 
 /** 新任务页输入框上方：项目选择和上下文胶囊。胶囊决定接下来这个任务注入哪些内容，创建后固定。 */
-export function ContextCapsules() {
+export const ContextCapsules = memo(function ContextCapsules() {
   const state = useAppStore(capsulesFields, sameCapsulesState)
   const { query, retry } = useContextModules(state.selectedWorkspaceRoot, state.connection)
   const disabled = new Set(appStore.inputDraft().disabledModules)
@@ -71,7 +72,7 @@ export function ContextCapsules() {
       {query.status === 'ready' && <ModuleGroups modules={query.modules} disabled={disabled} />}
     </div>
   </div>
-}
+})
 
 function ModuleGroups({ modules, disabled }: { modules: ContextModule[]; disabled: ReadonlySet<string> }) {
   const total = modules.filter(module => module.locked || !disabled.has(module.id)).reduce((sum, module) => sum + module.tokens, 0)
@@ -135,7 +136,7 @@ function ProjectCapsule({ state }: { state: ProjectState }) {
       disabled={state.pendingActions.has(pendingKey('directory.pick', actionOrigin.directoryPicker))} onClick={() => setOpen(value => !value)}>
       <span className="capsule-name">{selected ? workspaceName(selected) : '选择项目'}</span><ExpandChevron expanded={open} size={12} />
     </button>
-    <div className="project-menu" data-open={open}>
+    <div className="project-menu">
       <Disclosure open={open}><div id={menuId} className="project-options" role="group" aria-label="项目选项">
         {workspaces.map(workspace => <button key={workspaceKey(workspace.root)} type="button" aria-pressed={workspaceKey(workspace.root) === state.selectedWorkspaceRoot} onClick={() => pick(workspaceKey(workspace.root))}>
           <span>{workspaceName(workspace)}</span><span className="check" aria-hidden="true">{workspaceKey(workspace.root) === state.selectedWorkspaceRoot ? '✓' : ''}</span>

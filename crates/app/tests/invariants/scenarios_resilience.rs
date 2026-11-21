@@ -106,21 +106,11 @@ async fn stream_fault_recovery_and_truncation_invariants() {
     );
 
     // 2. 失败片段保留在历史展示中，但绝不进入下一轮模型请求上下文
-    client
-        .rpc_ok(
-            "session.submit",
-            json!({ "sessionId": session_id, "text": "trigger quota fail", "images": [], "files": [] }),
-        )
-        .await;
+    client.submit(&session_id, "trigger quota fail").await;
     let settled2 = client.wait_settled(&session_id).await;
     assert_eq!(settled2.pointer("/summary/status").and_then(Value::as_str), Some("failed"));
 
-    client
-        .rpc_ok(
-            "session.submit",
-            json!({ "sessionId": session_id, "text": "continue after failure", "images": [], "files": [] }),
-        )
-        .await;
+    client.submit(&session_id, "continue after failure").await;
     let settled3 = client.wait_settled(&session_id).await;
     assert_eq!(settled3.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
 
@@ -133,12 +123,7 @@ async fn stream_fault_recovery_and_truncation_invariants() {
 
     // 3. 超长 Retry-After 立即收敛失败
     let start_fast_fail = std::time::Instant::now();
-    client
-        .rpc_ok(
-            "session.submit",
-            json!({ "sessionId": session_id, "text": "trigger long retry-after", "images": [], "files": [] }),
-        )
-        .await;
+    client.submit(&session_id, "trigger long retry-after").await;
     let settled4 = client.wait_settled(&session_id).await;
     assert_eq!(settled4.pointer("/summary/status").and_then(Value::as_str), Some("failed"));
     assert!(
@@ -147,12 +132,7 @@ async fn stream_fault_recovery_and_truncation_invariants() {
     );
 
     // 4. 输出长度截断不执行未完整工具调用
-    client
-        .rpc_ok(
-            "session.submit",
-            json!({ "sessionId": session_id, "text": "trigger truncated tool", "images": [], "files": [] }),
-        )
-        .await;
+    client.submit(&session_id, "trigger truncated tool").await;
     let settled5 = client.wait_settled(&session_id).await;
     assert_eq!(settled5.pointer("/summary/status").and_then(Value::as_str), Some("failed"));
     assert!(
@@ -309,26 +289,7 @@ async fn context_pressure_and_overflow_invariants() {
             2048,
         )
         .await;
-    client
-        .rpc_ok(
-            "mcp.save",
-            json!({
-                "workspaceRoot": ws,
-                "server": {
-                    "serverId": "probe",
-                    "startupTimeoutSec": 20,
-                    "toolTimeoutSec": 20,
-                    "transport": {
-                        "type": "stdio",
-                        "command": "node",
-                        "args": [mcp_script.to_string_lossy()],
-                        "cwd": ws,
-                        "env": {}
-                    }
-                }
-            }),
-        )
-        .await;
+    client.register_test_mcp(&ws, &mcp_script).await;
 
     let session_id = client
         .start_session(
@@ -345,17 +306,7 @@ async fn context_pressure_and_overflow_invariants() {
     assert_eq!(s1.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
 
     // 第二轮发送新的关键意图：无论内部怎么压缩/轮换，最新用户消息必须保留并最终收敛成功。
-    client
-        .rpc_ok(
-            "session.submit",
-            json!({
-                "sessionId": session_id,
-                "text": "LATEST_INTENT_MUST_SURVIVE",
-                "images": [],
-                "files": []
-            }),
-        )
-        .await;
+    client.submit(&session_id, "LATEST_INTENT_MUST_SURVIVE").await;
     let s2 = client.wait_settled(&session_id).await;
     assert_eq!(
         s2.pointer("/summary/status").and_then(Value::as_str),
@@ -394,12 +345,7 @@ async fn context_pressure_and_overflow_invariants() {
         20,
         "end_turn",
     )));
-    client
-        .rpc_ok(
-            "session.submit",
-            json!({ "sessionId": session_id, "text": "after failed rotation", "images": [], "files": [] }),
-        )
-        .await;
+    client.submit(&session_id, "after failed rotation").await;
     let s3 = client.wait_settled(&session_id).await;
     assert_eq!(s3.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
 
@@ -407,12 +353,7 @@ async fn context_pressure_and_overflow_invariants() {
     // 逼出连续多轮分块/收缩轮换，验证所有子请求均合法且绝不产出空 messages。
     for idx in 0..3 {
         let heavy = format!("HEAVY_POST_ROTATION_TURN_{idx}: {}", "payload_segment_".repeat(320));
-        client
-            .rpc_ok(
-                "session.submit",
-                json!({ "sessionId": session_id, "text": heavy, "images": [], "files": [] }),
-            )
-            .await;
+        client.submit(&session_id, &heavy).await;
         let settled = client.wait_settled(&session_id).await;
         assert_eq!(settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
     }
@@ -481,12 +422,7 @@ async fn abort_delete_corruption_and_focus_invariants() {
         20,
         "tool_use",
     )));
-    client
-        .rpc_ok(
-            "session.submit",
-            json!({ "sessionId": s_abort, "text": "run slow bash then abort", "images": [], "files": [] }),
-        )
-        .await;
+    client.submit(&s_abort, "run slow bash then abort").await;
     client
         .wait_event(DEFAULT_TIMEOUT, |frame| {
             frame.get("sessionId").and_then(Value::as_str) == Some(s_abort.as_str())
@@ -522,12 +458,7 @@ async fn abort_delete_corruption_and_focus_invariants() {
         20,
         "tool_use",
     )));
-    client
-        .rpc_ok(
-            "session.submit",
-            json!({ "sessionId": s_abort, "text": "ask then abort", "images": [], "files": [] }),
-        )
-        .await;
+    client.submit(&s_abort, "ask then abort").await;
     client
         .wait_event(DEFAULT_TIMEOUT, |frame| {
             frame.get("type").and_then(Value::as_str) == Some("session_changed")
@@ -547,12 +478,7 @@ async fn abort_delete_corruption_and_focus_invariants() {
         20,
         "end_turn",
     )));
-    client
-        .rpc_ok(
-            "session.submit",
-            json!({ "sessionId": s_abort, "text": "continue after aborts", "images": [], "files": [] }),
-        )
-        .await;
+    client.submit(&s_abort, "continue after aborts").await;
     let continued = client.wait_settled(&s_abort).await;
     assert_eq!(
         continued.pointer("/summary/status").and_then(Value::as_str),

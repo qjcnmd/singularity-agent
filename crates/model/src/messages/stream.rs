@@ -381,7 +381,8 @@ impl<'a> MessagesSseDecoder<'a> {
                 MessagesBlock::Text { .. } => {}
             }
         }
-        let provider_metadata = Some(ProviderMessageMetadata::Messages {
+        let provider_metadata = Some(ProviderMessageMetadata {
+            protocol: protocol::ProviderApiProtocol::Messages,
             provider_name: config.provider_name.clone(),
             model_name: model_name.into(),
             endpoint: endpoint.into(),

@@ -14,14 +14,11 @@ app_core = { path = "../core" }
 protocol = { path = "../protocol" }
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 rmcp = { version = "3.10.0", default-features = false, features = ["client", "transport-child-process", "which-command", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
 reqwest.workspace = true
 rustls.workspace = true
-
-[target.'cfg(windows)'.dependencies]
 process-wrap.workspace = true
 windows.workspace = true

@@ -93,6 +93,12 @@ pub struct PendingUserMessage {
     pub text: String,
     pub images: Vec<crate::ImageAttachment>,
     pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(
+        feature = "typescript",
+        ts(as = "Option<Vec<crate::MessageAnnotation>>", optional)
+    )]
+    pub annotations: Vec<crate::MessageAnnotation>,
 }
 
 /// 提供方、模型和可选推理档位；配置、会话和桌面请求共用。

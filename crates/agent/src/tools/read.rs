@@ -3,7 +3,6 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::LazyLock;
 
 use serde::Deserialize;
 use serde_json::json;
@@ -13,15 +12,6 @@ use super::registry::{
     ABORTED_MESSAGE, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, ToolExecution, default_cap_summary,
     default_max_kb, error_result,
 };
-
-static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "Read a text file. Text output is limited to {} (whichever is hit first). Use the returned offset to continue with unread lines. A line larger than {}KB is explicitly marked incomplete; use bash to read that line in byte ranges.",
-        default_cap_summary(),
-        default_max_kb()
-    )
-});
-const NAME: &str = "read";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,8 +23,12 @@ pub(crate) struct ReadArgs {
 
 pub(crate) fn spec() -> app_core::ToolDefinition {
     app_core::ToolDefinition {
-        name: NAME.to_string(),
-        description: DESCRIPTION.clone(),
+        name: "read".to_string(),
+        description: format!(
+            "Read a text file. Text output is limited to {} (whichever is hit first). Use the returned offset to continue with unread lines. A line larger than {}KB is explicitly marked incomplete; use bash to read that line in byte ranges.",
+            default_cap_summary(),
+            default_max_kb()
+        ),
         parameters_schema: json!({
             "type": "object",
             "properties": {

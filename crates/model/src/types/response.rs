@@ -4,7 +4,7 @@ use crate::ProviderError;
 
 /// 把 Messages 与 Responses 两种协议统一后的停止原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelStopReason {
+pub(crate) enum ModelStopReason {
     Stop,
     Length,
     Failed(ProviderError),
@@ -19,12 +19,12 @@ pub struct ModelTurnResponse {
     pub assistant_message: Message,
     /// 输入与输出计数都有效上报时才有值；未知用量不当成零。
     pub usage: Option<ModelUsage>,
-    pub stop_reason: ModelStopReason,
+    pub(crate) stop_reason: ModelStopReason,
 }
 
 impl ModelTurnResponse {
     /// 请求失败时保留已生成的消息，用量保持未知。
-    pub fn failed(error: ProviderError, assistant_message: Message) -> Self {
+    pub(crate) fn failed(error: ProviderError, assistant_message: Message) -> Self {
         Self {
             assistant_message,
             usage: None,

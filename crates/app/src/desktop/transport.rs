@@ -50,14 +50,11 @@ pub(crate) async fn run(
     let mut requests = JoinSet::new();
     let shutdown = CancellationToken::new();
     let result = async {
-        send_line(
-            &writer_tx,
-            &protocol::StreamEnvelope {
-                revision: app.revision(),
-                event: StreamEvent::Ready,
-            },
-        )
-        .await?;
+        let ready = encode_line(&protocol::StreamEnvelope {
+            revision: app.revision(),
+            event: StreamEvent::Ready,
+        })?;
+        writer_tx.send(ready).await.map_err(|_| "desktop pipe writer closed".to_string())?;
         let mut pending_write: Option<Vec<u8>> = None;
         let mut next_request_seq = 0u64;
         loop {
@@ -124,9 +121,4 @@ fn encode_line(value: &impl Serialize) -> Result<Vec<u8>, String> {
     let mut bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
     Ok(bytes)
-}
-
-async fn send_line(writer_tx: &mpsc::Sender<Vec<u8>>, value: &impl Serialize) -> Result<(), String> {
-    let bytes = encode_line(value)?;
-    writer_tx.send(bytes).await.map_err(|_| "desktop pipe writer closed".to_string())
 }

@@ -44,8 +44,8 @@ pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionM
 }
 
 /// 在短临界区内访问会话写者，避免把 `MutexGuard` 暴露给调用方。
-pub fn with_writer<R>(writer: &SessionWriter, operation: impl FnOnce(&mut SessionManager) -> R) -> R {
-    operation(&mut writer.lock().expect("session writer lock poisoned"))
+pub(crate) fn with_writer<R>(writer: &SessionWriter, operation: impl FnOnce(&mut SessionManager) -> R) -> R {
+    operation(&mut lock_writer(writer))
 }
 
 /// 在阻塞线程池中使用会话写者，文件 IO 不占用异步运行时线程。

@@ -11,29 +11,6 @@ use crate::harness::{
     messages_tools_sse, write_test_mcp_script,
 };
 
-async fn register_test_mcp(client: &mut BackendClient, workspace: &str, script_path: &std::path::Path) {
-    client
-        .rpc_ok(
-            "mcp.save",
-            json!({
-                "workspaceRoot": workspace,
-                "server": {
-                    "serverId": "probe",
-                    "startupTimeoutSec": 20,
-                    "toolTimeoutSec": 20,
-                    "transport": {
-                        "type": "stdio",
-                        "command": "node",
-                        "args": [script_path.to_string_lossy()],
-                        "cwd": workspace,
-                        "env": {}
-                    }
-                }
-            }),
-        )
-        .await;
-}
-
 #[tokio::test]
 async fn mcp_lazy_loading_and_module_gating() {
     let env = TestEnv::new("mcp-gating");
@@ -77,7 +54,7 @@ async fn mcp_lazy_loading_and_module_gating() {
     client
         .setup_workspace_and_provider(&ws, "local", "messages", &server.base_url, "demo", 64000, 4096)
         .await;
-    register_test_mcp(&mut client, &ws, &mcp_script).await;
+    client.register_test_mcp(&ws, &mcp_script).await;
 
     // 1. 开启 MCP 时：开发者指令包含服务器说明与摘要，而原始工具名不直接塞入顶级 tools 定义，需经 mcp_schema/mcp_call 代理。
     let s1 = client
@@ -208,7 +185,7 @@ async fn tool_scheduling_question_barrier_and_queued_input() {
     client
         .setup_workspace_and_provider(&ws, "local", "messages", &server.base_url, "demo", 64000, 4096)
         .await;
-    register_test_mcp(&mut client, &ws, &mcp_script).await;
+    client.register_test_mcp(&ws, &mcp_script).await;
 
     let session_id = client
         .start_session(&ws, "local", "demo", None, "start parallel + question", vec![], vec![])
@@ -252,17 +229,7 @@ async fn tool_scheduling_question_barrier_and_queued_input() {
 
     // 等到第 2 次请求真正到达上游（并卡在门闸处），此时在运行中提交带 /snap-skill 的排队消息。
     server.wait_for_request_count(2).await;
-    client
-        .rpc_ok(
-            "session.submit",
-            json!({
-                "sessionId": session_id,
-                "text": "follow up with /snap-skill",
-                "images": [],
-                "files": []
-            }),
-        )
-        .await;
+    client.submit(&session_id, "follow up with /snap-skill").await;
 
     // 排队期间修改磁盘上的技能文件，验证已入队输入保留发送时的快照。
     std::fs::write(&skill_file, "---\nname: snap-skill\ndescription: snapshot\n---\nMUTATED_SKILL_V2\n")
@@ -380,12 +347,7 @@ async fn background_bash_resume_and_cleanup() {
     );
 
     // 触发长后台任务，并验证可以通过 RPC 立即停止且不阻塞后端退出。
-    client
-        .rpc_ok(
-            "session.submit",
-            json!({ "sessionId": session_id, "text": "start long job", "images": [], "files": [] }),
-        )
-        .await;
+    client.submit(&session_id, "start long job").await;
     client.wait_settled(&session_id).await;
 
     let read = client.rpc_ok("session.read", json!({ "sessionId": session_id })).await;

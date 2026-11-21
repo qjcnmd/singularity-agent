@@ -2,13 +2,11 @@
 
 mod discovery;
 pub(crate) mod manager;
-pub(crate) mod schema;
 pub(crate) mod selection;
 pub(crate) mod user;
 
 pub use discovery::discover as discover_models;
 pub use manager::{ModelConfigManager, ModelConfigurationSnapshot};
-pub(crate) use schema::*;
 pub(crate) use user::*;
 
 use super::{ModelErrorKind, ProviderError};
@@ -18,6 +16,30 @@ use selection::{ProviderConfig, SelectedModel, resolve_model_definition, resolve
 
 pub(crate) fn configuration_error(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ModelErrorKind::Other, message)
+}
+
+pub(crate) fn validate_identifier(value: &str, label: &str) -> Result<(), ProviderError> {
+    if value.is_empty() || value.chars().any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(configuration_error(format!("模型配置无效：{label} 不能为空，也不能包含空白或控制字符")));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_reasoning_variants(
+    protocol: ProviderApiProtocol,
+    variants: &[String],
+) -> Result<(), ProviderError> {
+    for (index, variant) in variants.iter().enumerate() {
+        validate_identifier(variant, "推理档位")?;
+        if variants[..index].contains(variant) {
+            return Err(configuration_error(format!("推理档位不能重复：{variant}")));
+        }
+        if protocol == ProviderApiProtocol::Responses && variant == "on" {
+            return Err(configuration_error("Responses 须选择具体思考档位，不支持 on 开关"));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_provider_value(value: &str, name: &str) -> Result<(), ProviderError> {

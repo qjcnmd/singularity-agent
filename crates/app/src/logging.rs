@@ -4,7 +4,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use app_core::identity::{APP_SLUG, LOG_ENV_VAR, LOG_FILE_NAME};
 use tracing_subscriber::EnvFilter;
@@ -15,11 +15,7 @@ const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const ROTATE_RETRY_BACKOFF_BYTES: u64 = 256 * 1024;
 const MAX_ARCHIVES: usize = 3;
 
-const DEFAULT_FILTER: &str = concat!(
-    "info,",
-    env!("CARGO_CRATE_NAME"),
-    "=info,agent=info,model=info,mcp=info,hyper=warn,reqwest=warn,rustls=warn,rmcp=warn"
-);
+const DEFAULT_FILTER: &str = "info,hyper=warn,reqwest=warn,rustls=warn,rmcp=warn";
 
 /// 初始化全局诊断日志；日志目录或文件不可写时降级静默，不影响应用启动。
 pub(crate) fn init(home: &Path) {
@@ -39,10 +35,7 @@ pub(crate) fn init(home: &Path) {
         .try_init();
 }
 
-#[derive(Clone)]
-struct RollingLogWriter {
-    inner: Arc<Mutex<RollingState>>,
-}
+struct RollingLogWriter(Mutex<RollingState>);
 
 struct RollingState {
     path: PathBuf,
@@ -53,20 +46,23 @@ struct RollingState {
 
 impl RollingLogWriter {
     fn new(path: PathBuf) -> Self {
-        let size = fs::metadata(&path).map_or(0, |meta| meta.len());
-        let file = OpenOptions::new().create(true).append(true).open(&path).ok();
-        Self {
-            inner: Arc::new(Mutex::new(RollingState {
-                path,
-                file,
-                size,
-                next_rotate_at: MAX_LOG_BYTES,
-            })),
-        }
+        let mut state = RollingState {
+            path,
+            file: None,
+            size: 0,
+            next_rotate_at: MAX_LOG_BYTES,
+        };
+        state.reopen_append();
+        Self(Mutex::new(state))
     }
 }
 
 impl RollingState {
+    fn reopen_append(&mut self) {
+        self.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
+        self.size = fs::metadata(&self.path).map_or(0, |meta| meta.len());
+    }
+
     fn rotate_if_needed(&mut self, incoming: usize) {
         if self.size.saturating_add(incoming as u64) <= self.next_rotate_at {
             return;
@@ -92,15 +88,13 @@ impl RollingState {
             }
             let _ = fs::rename(&staging, &self.path);
         }
-        self.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
-        self.size = fs::metadata(&self.path).map_or(0, |meta| meta.len());
+        self.reopen_append();
         self.next_rotate_at = self.size.saturating_add(ROTATE_RETRY_BACKOFF_BYTES);
     }
 
     fn write_bytes(&mut self, buf: &[u8]) {
         if self.file.is_none() {
-            self.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
-            self.size = fs::metadata(&self.path).map_or(0, |meta| meta.len());
+            self.reopen_append();
             if self.size < MAX_LOG_BYTES {
                 self.next_rotate_at = MAX_LOG_BYTES;
             }
@@ -122,20 +116,16 @@ fn archive_path(base: &Path, index: usize) -> PathBuf {
     base.with_file_name(format!("{stem}.{index}.{ext}"))
 }
 
-struct GuardWriter {
-    inner: Arc<Mutex<RollingState>>,
-}
-
-impl Write for GuardWriter {
+impl Write for &RollingLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Ok(mut state) = self.inner.lock() {
+        if let Ok(mut state) = self.0.lock() {
             state.write_bytes(buf);
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if let Ok(mut state) = self.inner.lock()
+        if let Ok(mut state) = self.0.lock()
             && let Some(file) = &mut state.file
         {
             let _ = file.flush();
@@ -145,9 +135,9 @@ impl Write for GuardWriter {
 }
 
 impl<'a> MakeWriter<'a> for RollingLogWriter {
-    type Writer = GuardWriter;
+    type Writer = &'a Self;
 
     fn make_writer(&'a self) -> Self::Writer {
-        GuardWriter { inner: Arc::clone(&self.inner) }
+        self
     }
 }

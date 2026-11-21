@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
-use super::{Conversation, TurnControls};
+use super::Conversation;
+use super::state::TurnControls;
 use agent::agent::{AgentError, AgentEvent, context_rotation_unneeded};
 use agent::session::ContextRotationInput;
 use protocol::{TurnErrorDetail, TurnStatus};
 
 impl Conversation {
     /// 独立轮换复用会话写者和本次操作的停止控制。
-    pub(crate) async fn rotate_context_thread(
+    pub(super) async fn rotate_context_thread(
         self: &Arc<Self>,
         controls: &TurnControls,
         sink: &mut (dyn FnMut(AgentEvent) + Send),

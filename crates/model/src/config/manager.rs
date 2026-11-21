@@ -48,9 +48,11 @@ impl ModelConfigManager {
         resolve_model_selection(&config, selection)
     }
 
-    /// 只检查模型选择能否解析，不创建 HTTP 客户端。
-    pub fn validate_selection(&self, selection: &ModelSelection) -> Result<(), ProviderError> {
-        self.resolve(selection).map(|_| ())
+    /// 检查模型选择能否解析，并顺带返回对应的上下文窗口上限（不创建 HTTP 客户端）。
+    pub fn validate_selection(&self, selection: &ModelSelection) -> Result<Option<u64>, ProviderError> {
+        self.resolve(selection).map(|(_, selected)| {
+            (selected.max_context_tokens > 0).then(|| u64::from(selected.max_context_tokens))
+        })
     }
 
     pub fn context_window(&self, selection: &ModelSelection) -> Option<u64> {

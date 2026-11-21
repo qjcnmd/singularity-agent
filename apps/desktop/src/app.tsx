@@ -18,19 +18,18 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
 export function App() {
   const state = useAppStore(['theme', 'messageFontSize', 'accentColor', 'sidebarCollapsed', 'sidebarWidth', 'fileTabs', 'filePanelWidth'])
-  const [accent, setAccent] = useState(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())
   const [, setViewportWidth] = useState(() => window.innerWidth)
   const filePanelOpen = state.fileTabs.length > 0
+  const variables = bubbleVariables(state)
+  const accent = variables['--accent']
   useLayoutEffect(() => {
     document.documentElement.dataset.theme = state.theme
     void window.desktop.setTheme(state.theme)
   }, [state.theme])
   useLayoutEffect(() => { document.documentElement.style.setProperty('--message-font-size', `${state.messageFontSize}px`) }, [state.messageFontSize])
   useLayoutEffect(() => {
-    for (const [name, value] of Object.entries(bubbleVariables(state))) document.documentElement.style.setProperty(name, value)
-    // CSS 是主题色的唯一来源；写入主题与强调色变量后再把解析值交给画布。
-    setAccent(getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())
-  }, [state.theme, state.accentColor])
+    for (const [name, value] of Object.entries(variables)) document.documentElement.style.setProperty(name, value)
+  }, [variables])
   useEffect(() => { appStore.start(); return () => appStore.stop() }, [])
   useEffect(() => {
     if (!filePanelOpen) return

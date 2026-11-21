@@ -15,7 +15,7 @@ use crate::session::{LedgerRecord, SessionEntry, with_writer};
 use crate::tools::registry::{ABORTED_MESSAGE, ToolDisplay, ToolExecution, error_result};
 
 use super::exec::{Outcome, Process, ProcessEvent};
-use super::result::{TaskDisplayMode, state_text, task_result, task_summary, try_task_result};
+use super::result::{output_text, state_text, task_result, task_summary};
 use super::spec::BashArgs;
 
 /// 已保存的开始、结束，或仅供显示的输出更新。
@@ -152,9 +152,13 @@ impl BashTasks {
         if position.terminal {
             return Ok(None);
         }
-        let result = try_task_result(&task, Some(position.end), TaskDisplayMode::None)?;
-        let content =
-            format!("<background-task>\nCommand: {}\n{}\n</background-task>", task.command, result.content);
+        let content = format!(
+            "<background-task>\nCommand: {}\nTask {}: {}\n{}\n</background-task>",
+            task.command,
+            task.task_id,
+            state_text(&task.state),
+            output_text(&task.model_output, position.end),
+        );
         Ok(Some((content, task.model_output.total_bytes, !task.state.is_running())))
     }
 
@@ -170,7 +174,7 @@ impl BashTasks {
         let mut delivered = self.delivered.lock().expect("bash output delivery lock");
         let task = self.task(task_id)?;
         let position = delivered.entry(task_id.to_owned()).or_default();
-        let result = try_task_result(&task, Some(position.end), TaskDisplayMode::SummaryWithOutput)?;
+        let result = task_result(&task, Some(position.end), true);
         position.end = task.model_output.total_bytes;
         position.terminal = !task.state.is_running();
         Ok(result)
@@ -184,7 +188,7 @@ impl BashTasks {
     /// 取消后台命令并等待回收、保存终态；操作成功后返回模型可查看的命令结果。
     pub(crate) async fn tool_stop(self: &Arc<Self>, task_id: &str) -> ToolExecution {
         match self.stop_task(task_id).await {
-            Ok(task) => task_result(&task, None, TaskDisplayMode::Summary),
+            Ok(task) => task_result(&task, None, false),
             Err(error) => error_result(error),
         }
     }
@@ -300,7 +304,7 @@ impl BashTasks {
         // 保存开始记录期间可能已经收到停止；这时等进程回收、最终状态保存后再返回。
         if signal.is_cancelled() || entry.cancel.is_cancelled() {
             entry.cancel.cancel();
-            self.clone().run_background(entry.clone(), process).await;
+            self.clone().run_background(entry, process).await;
             let manager = Arc::clone(self);
             let id = task_id.clone();
             let mut result = tokio::task::spawn_blocking(move || manager.take_output(&id))

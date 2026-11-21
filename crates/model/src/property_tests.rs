@@ -150,27 +150,24 @@ fn build_conversation(
                     }));
                     call_ids.push(id);
                 }
-                let provider_metadata = Some(match (protocol, same_provider) {
-                    (ProviderApiProtocol::Messages, true) => ProviderMessageMetadata::Messages {
+                let provider_metadata = Some(if same_provider {
+                    ProviderMessageMetadata {
+                        protocol,
                         provider_name: provider_name.into(),
                         model_name: model_name.into(),
                         endpoint: endpoint.into(),
-                    },
-                    (ProviderApiProtocol::Messages, false) => ProviderMessageMetadata::Messages {
+                    }
+                } else {
+                    let suffix = match protocol {
+                        ProviderApiProtocol::Messages => "/v1/messages",
+                        ProviderApiProtocol::Responses => "/v1/responses",
+                    };
+                    ProviderMessageMetadata {
+                        protocol,
                         provider_name: "other-provider".into(),
                         model_name: "other-model".into(),
-                        endpoint: "https://other.example/v1/messages".into(),
-                    },
-                    (ProviderApiProtocol::Responses, true) => ProviderMessageMetadata::Responses {
-                        provider_name: provider_name.into(),
-                        model_name: model_name.into(),
-                        endpoint: endpoint.into(),
-                    },
-                    (ProviderApiProtocol::Responses, false) => ProviderMessageMetadata::Responses {
-                        provider_name: "other-provider".into(),
-                        model_name: "other-model".into(),
-                        endpoint: "https://other.example/v1/responses".into(),
-                    },
+                        endpoint: format!("https://other.example{suffix}"),
+                    }
                 });
                 messages.push(Message::Assistant { content, provider_metadata });
                 for id in call_ids {

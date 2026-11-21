@@ -52,10 +52,10 @@ impl ServerConfig {
         if id.is_empty()
             || !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
         {
-            return Err(McpError::InvalidConfig("MCP 名称只能包含英文字母、数字、下划线和连字符。".into()));
+            return Err(McpError::new("MCP 名称只能包含英文字母、数字、下划线和连字符。"));
         }
         if self.startup_timeout_sec == 0 || self.tool_timeout_sec == 0 {
-            return Err(McpError::InvalidConfig("MCP 超时必须大于零秒。".into()));
+            return Err(McpError::new("MCP 超时必须大于零秒。"));
         }
         match &self.transport {
             McpTransportConfig::Stdio { command, args, cwd, env } => {
@@ -63,39 +63,37 @@ impl ServerConfig {
                     || command.contains('\0')
                     || args.iter().any(|arg| arg.contains('\0'))
                 {
-                    return Err(McpError::InvalidConfig("MCP 启动命令或参数无效。".into()));
+                    return Err(McpError::new("MCP 启动命令或参数无效。"));
                 }
                 if cwd.as_ref().is_some_and(|cwd| cwd.trim().is_empty() || cwd.contains('\0')) {
-                    return Err(McpError::InvalidConfig("MCP 工作目录无效。".into()));
+                    return Err(McpError::new("MCP 工作目录无效。"));
                 }
                 if env
                     .iter()
                     .any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0'))
                 {
-                    return Err(McpError::InvalidConfig("MCP 环境变量无效。".into()));
+                    return Err(McpError::new("MCP 环境变量无效。"));
                 }
             }
             McpTransportConfig::Http { url, headers } => {
                 let parsed = reqwest::Url::parse(url).map_err(|error| {
-                    McpError::InvalidConfig(self.redact(format!("MCP 服务器 {id} 地址无效：{error}")))
+                    McpError::new(self.redact(format!("MCP 服务器 {id} 地址无效：{error}")))
                 })?;
                 if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-                    return Err(McpError::InvalidConfig(format!(
+                    return Err(McpError::new(format!(
                         "MCP 服务器 {id} 地址必须是有效的 HTTP 或 HTTPS URL。"
                     )));
                 }
                 let mut seen_headers = std::collections::HashSet::with_capacity(headers.len());
                 for (key, value) in headers {
                     let name = reqwest::header::HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
-                        McpError::InvalidConfig(format!("MCP 服务器 {id} 请求头名称无效（{key}）：{error}"))
+                        McpError::new(format!("MCP 服务器 {id} 请求头名称无效（{key}）：{error}"))
                     })?;
                     if !seen_headers.insert(name) {
-                        return Err(McpError::InvalidConfig(format!(
-                            "MCP 服务器 {id} 请求头名称重复（{key}）。"
-                        )));
+                        return Err(McpError::new(format!("MCP 服务器 {id} 请求头名称重复（{key}）。")));
                     }
                     reqwest::header::HeaderValue::from_str(value).map_err(|error| {
-                        McpError::InvalidConfig(format!("MCP 服务器 {id} 请求头值无效（{key}）：{error}"))
+                        McpError::new(format!("MCP 服务器 {id} 请求头值无效（{key}）：{error}"))
                     })?;
                 }
             }
@@ -296,19 +294,12 @@ pub(crate) fn read(home: &Path) -> Result<Configuration, McpError> {
             return Ok(Configuration::default());
         }
         Err(source) => {
-            return Err(McpError::Io {
-                context: format!("无法读取 {}", path.display()),
-                source,
-            });
+            return Err(McpError::io(&format!("无法读取 {}", path.display()), source));
         }
     };
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
     let config: Configuration = serde_json::from_slice(bytes).map_err(|error| {
-        McpError::InvalidConfig(format!(
-            "mcp.json 格式无效（第 {} 行，第 {} 列）。",
-            error.line(),
-            error.column()
-        ))
+        McpError::new(format!("mcp.json 格式无效（第 {} 行，第 {} 列）。", error.line(), error.column()))
     })?;
     for (id, server) in &config.servers {
         server.validate(id)?;
@@ -317,8 +308,6 @@ pub(crate) fn read(home: &Path) -> Result<Configuration, McpError> {
 }
 
 pub(crate) fn write(home: &Path, config: &Configuration) -> Result<(), McpError> {
-    app_core::write_json_atomic(&home.join("mcp.json"), config).map_err(|source| McpError::Io {
-        context: "无法保存 mcp.json".into(),
-        source,
-    })
+    app_core::write_json_atomic(&home.join("mcp.json"), config)
+        .map_err(|source| McpError::io("无法保存 mcp.json", source))
 }

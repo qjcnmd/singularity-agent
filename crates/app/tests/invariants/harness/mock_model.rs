@@ -137,14 +137,14 @@ impl MockModelServer {
         self.state.lock().expect("state lock").fallback = Some(Arc::new(responder));
     }
 
-    pub fn requests(&self) -> Vec<CapturedRequest> {
-        self.state.lock().expect("state lock").requests.clone()
-    }
-
     pub fn model_requests(&self) -> Vec<CapturedRequest> {
-        self.requests()
-            .into_iter()
+        self.state
+            .lock()
+            .expect("state lock")
+            .requests
+            .iter()
             .filter(|req| req.path.ends_with("/messages") || req.path.ends_with("/responses"))
+            .cloned()
             .collect()
     }
 

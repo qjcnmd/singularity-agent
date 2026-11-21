@@ -270,24 +270,18 @@ pub(crate) fn prepare_context(
     )
 }
 
-/// 只估算输入 Token，轮换判断和输出预算共用。
-pub(crate) fn estimated_tokens(session: &SessionData, identity: (&str, &str), definition_tokens: u64) -> u64 {
-    let (entries, pruned_until) = resolve_context_entries(session);
-    input_tokens(session, &entries, pruned_until, identity, definition_tokens)
-}
-
-/// 若上下文达到微压缩阈值且存在足够多可折叠的旧工具输出/旧图片，返回新的锚定水位线条目 ID。
+/// 若上下文达到微压缩阈值且存在足够多可折叠的旧工具输出/旧图片，返回压缩后的估算输入 Token 与新水位线。
 pub(crate) fn select_prune_target(
     session: &SessionData,
     identity: (&str, &str),
     definition_tokens: u64,
     context_window: u64,
-) -> Option<(String, u64)> {
+) -> (u64, Option<(String, u64)>) {
     let (entries, existing_pruned) = resolve_context_entries(session);
     let current = input_tokens(session, &entries, existing_pruned, identity, definition_tokens);
     let trigger = u64::try_from(u128::from(context_window) * PRUNE_TRIGGER_PERCENT / 100).unwrap_or(u64::MAX);
     if current < trigger {
-        return None;
+        return (current, None);
     }
     let tool_positions: Vec<usize> = entries
         .iter()
@@ -298,20 +292,23 @@ pub(crate) fn select_prune_target(
         })
         .collect();
     if tool_positions.len() <= PRUNE_KEEP_RECENT_TOOL_RESULTS {
-        return None;
+        return (current, None);
     }
     let candidate_cutoff = tool_positions[tool_positions.len() - PRUNE_KEEP_RECENT_TOOL_RESULTS - 1];
     if existing_pruned.is_some_and(|existing| candidate_cutoff <= existing) {
-        return None;
+        return (current, None);
     }
     let before_est = context_token_estimate(&entries, existing_pruned, session);
     let after_est = context_token_estimate(&entries, Some(candidate_cutoff), session);
     let saved = before_est.saturating_sub(after_est);
     let min_savings = PRUNE_MIN_SAVINGS_TOKENS.max(context_window / 20);
     if saved < min_savings {
-        return None;
+        return (current, None);
     }
-    Some((entries[candidate_cutoff].id().to_owned(), saved))
+    (
+        after_est.saturating_add(definition_tokens),
+        Some((entries[candidate_cutoff].id().to_owned(), saved)),
+    )
 }
 
 /// 整理请求使用完整的当前上下文，与普通请求共用消息投影。
@@ -444,14 +441,7 @@ pub(crate) fn load_images(
         }
         let captions = image_captions(message, directory);
         if !captions.is_empty() {
-            let content = match message {
-                Message::Developer { content }
-                | Message::Notification { content }
-                | Message::User { content }
-                | Message::Assistant { content, .. }
-                | Message::ToolResult { content, .. } => content,
-            };
-            content.push(ContentBlock::text(captions));
+            crate::compaction::message_content_mut(message).push(ContentBlock::text(captions));
         }
     }
     Ok(images)

@@ -66,7 +66,7 @@ impl AppServer {
                     workspace.root
                 )));
             }
-            app.workspaces.remove(&workspace_root).map_err(RpcError::new)?;
+            app.workspaces.remove(&workspace.root).map_err(RpcError::new)?;
             sessions.retain(|_, conversation| {
                 if belongs(conversation) {
                     conversation.mark_closing();

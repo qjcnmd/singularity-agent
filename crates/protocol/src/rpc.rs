@@ -150,6 +150,12 @@ pub struct SessionTextParams {
     pub text: String,
     pub images: Vec<ImageUpload>,
     pub files: Vec<String>,
+    #[serde(default)]
+    #[cfg_attr(
+        feature = "typescript",
+        ts(as = "Option<Vec<crate::MessageAnnotation>>", optional)
+    )]
+    pub annotations: Vec<crate::MessageAnnotation>,
 }
 
 #[derive(Debug, Deserialize)]

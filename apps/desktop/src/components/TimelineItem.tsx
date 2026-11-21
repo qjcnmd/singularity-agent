@@ -1,6 +1,7 @@
 import { ExpandChevron } from './ExpandChevron'
 import { APP_NAME } from '../identity'
 import { AttachedImages, FileChips } from './Images'
+import { SentAnnotations } from './Annotations'
 import { QuestionPanel } from './QuestionPanel'
 import { Disclosure } from './Disclosure'
 import { ToolGroupRow } from './ToolGroupRow'
@@ -12,13 +13,13 @@ import { pop } from '../motion'
 import { useBodyCollapse, useSelectionGuard } from '../interactions'
 import { MarkdownBody } from '../markdown'
 import { contextRotationText, factStatusText, formatTokenCount } from '../copy'
-import { formatClock, contextRotationResultText, formatTurnDuration, toolDisplay, type ActivityGroup, type ActivityRowItem, type TimelineContent } from '../timeline'
+import { formatClock, contextRotationResultText, formatTurnDuration, toolDisplay, type ActivityGroup, type ActivityRowItem, type TimelineRow } from '../timeline'
 import type { HistoryItem, SessionModelUsage, ToolStatus, VisibleBackgroundTask } from '../protocol'
 
 const previewLineCount = 8
 
 interface Props {
-  item: TimelineContent
+  item: TimelineRow['item']
   itemKey: string
   cwd: string
   userHome?: string | null
@@ -38,9 +39,6 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
   if (item.type === 'activity_group') {
     return <ActivityCard group={item} itemKey={itemKey} cwd={cwd} userHome={userHome} sessionId={sessionId} onDisclosureChange={onDisclosureChange} />
   }
-  if (item.type === 'tool_group') return <ToolGroupRow group={item} itemKey={itemKey} sessionId={sessionId} onDisclosureChange={onDisclosureChange}>
-    {item.rows.map(row => <ToolCard key={row.key} item={row.item} itemKey={`${row.key}:group-child`} cwd={cwd} userHome={userHome} sessionId={sessionId} onDisclosureChange={onDisclosureChange} />)}
-  </ToolGroupRow>
   if (item.type === 'duration') return <TurnDuration itemKey={itemKey} {...item} />
   if (item.type === 'stats') return <MessageStatsLine itemKey={itemKey} stats={item.stats} at={item.at} />
   if (item.type === 'question') return (
@@ -48,7 +46,7 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
       initial={reduced ? false : { opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       transition={reduced ? { duration: 0 } : { duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
-      className="timeline-item activity-card question-card"
+      className="timeline-item activity-card"
       data-item-id={itemKey}
       aria-label="询问用户"
     >
@@ -59,37 +57,31 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
       />
     </motion.section>
   )
-  if (item.type === 'typing') return <article
-    className="timeline-item message-item timeline-assistant" data-item-id={itemKey} aria-label="正在输入">
-    <div className="message-bubble typing-bubble"><LoaderCircle size={13} className="spinner" aria-hidden="true" /></div>
-  </article>
 
-  if (item.type === 'terminal') {
-    return <div className={`timeline-item message-item timeline-assistant${item.status === 'interrupted' ? ' terminal-interruption' : ''}`} data-item-id={itemKey}>
-      {item.status === 'failed'
-        ? <div className="message-bubble error-bubble" role="alert"><CircleAlert size={15} className="error-icon" aria-hidden="true" /><span>{item.text}</span></div>
-        : <article className="activity-step"><div className="activity-toggle"><CircleX size={13} className="bad" /><span className="step-title">{item.text}</span></div></article>}
-      {item.at && <time className="turn-stats" dateTime={item.at} title="结束时间">{formatClock(item.at, true)}</time>}
-    </div>
-  }
-
-  if (item.type === 'message') {
-    const body = canCollapse && !expanded ? userLines.slice(0, previewLineCount).join('\n') : item.text
-    const attachments = <>
-      {sessionId && item.images && <AttachedImages sessionId={sessionId} images={item.images} />}
-      {item.files && <FileChips files={item.files} />}
-    </>
-    return (
-      <motion.article initial={{ opacity: 0, y: item.role === 'user' ? 36 : 10, scale: item.role === 'user' ? .84 : .9 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={reduced ? { duration: 0 } : { ...pop, opacity: { duration: .16 } }} style={{ originX: item.role === 'user' ? 1 : 0, originY: 1 }}
-        className={`timeline-item message-item timeline-${item.role} status-${item.status}`}
-        data-item-id={itemKey}
-        aria-label={`${item.role === 'user' ? '你' : APP_NAME}，${factStatusText[item.status]}`}
-      >
-        {item.role === 'user' && item.at && <time className="msg-time" dateTime={item.at}>{formatClock(item.at, true)}</time>}
+  const body = canCollapse && !expanded ? userLines.slice(0, previewLineCount).join('\n') : item.text
+  const annotatableId = item.role === 'assistant' && item.status !== 'running' && item.status !== 'failed' ? item.id : undefined
+  const hasBubbleContent = item.role === 'assistant'
+    || item.text.trim() !== ''
+    || (item.images?.length ?? 0) > 0
+    || (item.files?.length ?? 0) > 0
+    || item.status === 'failed'
+  const attachments = <>
+    {sessionId && item.images && <AttachedImages sessionId={sessionId} images={item.images} />}
+    {item.files && <FileChips files={item.files} />}
+  </>
+  return (
+    <motion.article initial={{ opacity: 0, y: item.role === 'user' ? 36 : 10, scale: item.role === 'user' ? .84 : .9 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={reduced ? { duration: 0 } : { ...pop, opacity: { duration: .16 } }} style={{ originX: item.role === 'user' ? 1 : 0, originY: 1 }}
+      className={`timeline-item message-item timeline-${item.role}`}
+      data-item-id={itemKey}
+      aria-label={`${item.role === 'user' ? '你' : APP_NAME}，${factStatusText[item.status]}`}
+    >
+      {item.role === 'user' && item.at && <time className="msg-time" dateTime={item.at}>{formatClock(item.at, true)}</time>}
+      {item.role === 'user' && item.annotations && <SentAnnotations annotations={item.annotations} defaultExpanded={!hasBubbleContent} />}
+      {hasBubbleContent && (
         <div className={`message-bubble${item.status === 'failed' ? ' error-bubble' : ''}`}>
         {item.status === 'failed' && <CircleAlert size={15} className="error-icon" aria-hidden="true" />}
         {item.role === 'user' && attachments}
-        <div className="timeline-body message-body">{item.role === 'user' ? <div className="user-text">{body}</div> : <MarkdownBody text={body} streaming={item.status === 'running'} />}</div>
+        <div className="timeline-body message-body" data-annotatable-message-id={annotatableId}>{item.role === 'user' ? <div className="user-text">{body}</div> : <MarkdownBody text={body} streaming={item.status === 'running'} />}</div>
         {item.role === 'assistant' && attachments}
         {canCollapse && (
           <button type="button" className="expand-button" aria-expanded={expanded} {...selectionGuard(() => setExpanded((value) => !value))}>
@@ -97,15 +89,10 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
           </button>
         )}
         </div>
-        {item.role === 'assistant' && <MessageStatsLine stats={item.stats} at={item.at} />}
-      </motion.article>
-    )
-  }
-
-  if (item.type === 'thinking') return <ReasoningRow item={item} itemKey={itemKey} onDisclosureChange={onDisclosureChange} />
-  if (item.type === 'context_rotation' || item.type === 'context_rotation_result') return <ContextRotationRow item={item} itemKey={itemKey} onDisclosureChange={onDisclosureChange} />
-
-  return <ToolCard item={item} itemKey={itemKey} cwd={cwd} userHome={userHome} sessionId={sessionId} onDisclosureChange={onDisclosureChange} />
+      )}
+      {item.role === 'assistant' && <MessageStatsLine stats={item.stats} at={item.at} />}
+    </motion.article>
+  )
 })
 
 function summarizeActivity(rows: ActivityGroup['rows'], tasks: VisibleBackgroundTask[] | undefined) {
@@ -200,7 +187,7 @@ function ActivityCard({ group, itemKey, cwd, userHome, sessionId, onDisclosureCh
       initial={reduced ? false : { opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       transition={reduced ? { duration: 0 } : { duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
-      className={`timeline-item activity-card status-${status}`}
+      className="timeline-item activity-card"
       data-item-id={itemKey}
       aria-label={label}
     >
@@ -265,7 +252,7 @@ const ActivityStepRow = memo(function ActivityStepRow({ item, itemKey, cwd, user
       )
     }
     return (
-      <div className="activity-status-row is-interrupted" data-item-id={itemKey}>
+      <div className="activity-status-row" data-item-id={itemKey}>
         <CircleX size={14} className="bad" aria-hidden="true" />
         <span className="step-title">{item.text}</span>
         {item.at && <time className="activity-row-time" dateTime={item.at} title="结束时间">{formatClock(item.at, true)}</time>}
@@ -311,7 +298,7 @@ function ReasoningRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemKe
   // 思考中保持单行滚动展示最新文字，新字从右侧进入、旧字在左侧淡出。
   const ticker = running && !expanded
   // 标题行不动，全文在下方展开；展开时标题行的摘要淡出，避免同一句话出现两次。
-  return <article className={`timeline-item activity-step reasoning-row status-${item.status}${ticker ? ' is-streaming' : ''}`} data-item-id={itemKey}>
+  return <article className="timeline-item activity-step reasoning-row" data-item-id={itemKey}>
     <button type="button" className="activity-toggle" aria-expanded={expanded} {...guard(() => setExpanded(value => !value))}>
       <StepStatusIcon name="thinking" status={item.status} />
       <span className={`step-title${running ? ' activity-shimmer' : ''}`}>{running ? '思考中' : '思考'}</span>
@@ -332,7 +319,7 @@ function ContextRotationRow({ item, itemKey, onDisclosureChange }: Pick<Props, '
   const guard = useSelectionGuard(onDisclosureChange)
   const collapseBody = useBodyCollapse(expanded ? () => setExpanded(false) : undefined, onDisclosureChange)
   const status = item.type === 'context_rotation' ? 'completed' : item.status
-  return <article className={`timeline-item activity-step timeline-context-rotation status-${status}`} data-item-id={itemKey}>
+  return <article className="timeline-item activity-step" data-item-id={itemKey}>
     <button type="button" className="activity-toggle" aria-expanded={canExpand ? expanded : undefined} aria-disabled={!canExpand}
       {...guard(canExpand ? () => setExpanded(value => !value) : undefined)}>
       <StepStatusIcon name="context_rotation" status={status} />

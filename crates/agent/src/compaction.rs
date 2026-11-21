@@ -181,7 +181,7 @@ pub(crate) fn shrink_messages_by_half(messages: &mut [Message]) {
     }
 }
 
-fn message_content_mut(message: &mut Message) -> &mut Vec<ContentBlock> {
+pub(crate) fn message_content_mut(message: &mut Message) -> &mut Vec<ContentBlock> {
     match message {
         Message::Developer { content }
         | Message::Notification { content }

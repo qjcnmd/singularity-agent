@@ -88,7 +88,7 @@ pub(crate) enum PreparedTool {
     Skill(skill::SkillArgs, Arc<SkillCatalog>),
     Question(super::question::QuestionArgs),
     Bash(bash::BashArgs),
-    TaskList(bash::TaskListArgs),
+    TaskList,
     TaskOutput(bash::TaskIdArgs),
     TaskStop(bash::TaskIdArgs),
     McpSchema(Vec<McpTool>),
@@ -116,27 +116,18 @@ impl PreparedTool {
             Self::Bash(args) => {
                 Box::pin(bash_tasks.execute(args, cwd, output_directory, signal, on_update)).await
             }
-            Self::TaskList(_) => tokio::task::spawn_blocking(move || bash_tasks.tool_list())
-                .await
-                .expect("tool worker completes while the runtime is running"),
-            Self::TaskOutput(args) => {
-                tokio::task::spawn_blocking(move || bash_tasks.output(&args.task_id, &signal))
-                    .await
-                    .expect("tool worker completes while the runtime is running")
-            }
             Self::TaskStop(args) => Box::pin(bash_tasks.tool_stop(&args.task_id)).await,
-            Self::Read(args) => tokio::task::spawn_blocking(move || read::execute(&args, &cwd, &signal))
+            Self::TaskList | Self::TaskOutput(_) | Self::Read(_) | Self::ViewImage(_) | Self::Skill(_, _) => {
+                tokio::task::spawn_blocking(move || match self {
+                    Self::TaskList => bash_tasks.tool_list(),
+                    Self::TaskOutput(args) => bash_tasks.output(&args.task_id, &signal),
+                    Self::Read(args) => read::execute(&args, &cwd, &signal),
+                    Self::ViewImage(args) => view_image::execute(&args, &cwd, &signal),
+                    Self::Skill(args, catalog) => skill::execute(&args, &catalog),
+                    _ => unreachable!("non-blocking tool handled above"),
+                })
                 .await
-                .expect("tool worker completes while the runtime is running"),
-            Self::ViewImage(args) => {
-                tokio::task::spawn_blocking(move || view_image::execute(&args, &cwd, &signal))
-                    .await
-                    .expect("tool worker completes while the runtime is running")
-            }
-            Self::Skill(args, catalog) => {
-                tokio::task::spawn_blocking(move || skill::execute(&args, &catalog))
-                    .await
-                    .expect("tool worker completes while the runtime is running")
+                .expect("tool worker completes while the runtime is running")
             }
             Self::Question(_) => unreachable!("questions execute on the turn control plane"),
         }
@@ -160,7 +151,9 @@ pub(crate) fn bash_tool() -> BuiltinTool {
 /// 后台命令的查看、读取输出和停止；说明里与 bash 互相引用，两者一起提供。
 pub(crate) fn task_tools() -> Vec<BuiltinTool> {
     vec![
-        (bash::task_list_spec(), |args| deserialize_args_or_error(args).map(PreparedTool::TaskList)),
+        (bash::task_list_spec(), |args| {
+            deserialize_args_or_error::<bash::TaskListArgs>(args).map(|_| PreparedTool::TaskList)
+        }),
         (bash::task_output_spec(), |args| {
             deserialize_args_or_error(args).map(PreparedTool::TaskOutput)
         }),

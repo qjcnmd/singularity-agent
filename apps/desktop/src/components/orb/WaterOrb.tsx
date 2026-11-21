@@ -176,25 +176,8 @@ export function WaterOrb({ percent, rotating, enabled, size, label, color, onPre
           body.addColorStop(0.55, `rgba(${r}, ${g}, ${b}, 0.9)`)
           body.addColorStop(1, `rgba(${Math.round(r * 0.72)}, ${Math.round(g * 0.72)}, ${Math.round(b * 0.72)}, 0.98)`)
 
-          ctx.beginPath()
           const steps = 36
-          for (let i = 0; i <= steps; i++) {
-            const x = -1.02 + (2.04 * i) / steps
-            const y = surfaceY
-              + tilt * x
-              + Math.sin(x * 3.1 + phase) * amp1
-              + Math.cos(x * 5.3 - phase * 1.35) * amp2
-            if (i === 0) ctx.moveTo(x, y)
-            else ctx.lineTo(x, y)
-          }
-          ctx.lineTo(1.04, 1.04)
-          ctx.lineTo(-1.04, 1.04)
-          ctx.closePath()
-          ctx.fillStyle = body
-          ctx.fill()
-
-          // 旋转时加几颗轻微上浮的气泡和液面高光线
-          if (!reduced.matches && visualLevel > 0.06) {
+          const traceWave = () => {
             ctx.beginPath()
             for (let i = 0; i <= steps; i++) {
               const x = -1.02 + (2.04 * i) / steps
@@ -205,6 +188,18 @@ export function WaterOrb({ percent, rotating, enabled, size, label, color, onPre
               if (i === 0) ctx.moveTo(x, y)
               else ctx.lineTo(x, y)
             }
+          }
+
+          traceWave()
+          ctx.lineTo(1.04, 1.04)
+          ctx.lineTo(-1.04, 1.04)
+          ctx.closePath()
+          ctx.fillStyle = body
+          ctx.fill()
+
+          // 旋转时加几颗轻微上浮的气泡和液面高光线
+          if (!reduced.matches && visualLevel > 0.06) {
+            traceWave()
             ctx.strokeStyle = 'rgba(255, 255, 255, 0.34)'
             ctx.lineWidth = 0.018
             ctx.stroke()
