@@ -4,7 +4,7 @@
 //! 本地 HTTP 协议回放桩与测试 MCP stdio 脚本）验证跨模块契约与系统级不变量；
 //! 不锁死内部实现细节、具体策略阈值或参数常数。
 
-#[path = "invariants/harness.rs"]
+#[path = "invariants/harness/mod.rs"]
 mod harness;
 #[path = "invariants/scenarios_core.rs"]
 mod scenarios_core;

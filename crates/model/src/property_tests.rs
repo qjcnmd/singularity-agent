@@ -211,11 +211,13 @@ fn sse_line_strategy() -> impl Strategy<Value = String> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// SSE 分帧不变量：任意合法事件流（含多行 data、UTF-8、BOM、注释、CRLF/CR/LF）
-    /// 按任意字节粒度切分 chunk 后，解出的事件序列必须与原始序列完全一致。
+    /// SSE 分帧不变量：任意合法事件流（含多行 data、UTF-8、BOM、注释、CRLF/CR/LF，
+    /// 以及最后一个事件有无结尾空行直接 EOF）按任意字节粒度切分 chunk 后，
+    /// 解出的事件序列必须与原始序列完全一致。
     #[test]
     fn sse_frame_decoder_chunk_split_invariance(
         with_bom in any::<bool>(),
+        terminate_last_event in any::<bool>(),
         eol_kind in 0u8..3,
         events in prop::collection::vec(
             prop::collection::vec(sse_line_strategy(), 1..=3),
@@ -233,7 +235,7 @@ proptest! {
             wire.extend_from_slice(b"\xef\xbb\xbf");
         }
         let mut expected = Vec::new();
-        for lines in &events {
+        for (idx, lines) in events.iter().enumerate() {
             // 穿插注释与非 data 字段，验证分帧器正确忽略。
             wire.extend_from_slice(b": keepalive");
             wire.extend_from_slice(eol);
@@ -244,7 +246,9 @@ proptest! {
                 wire.extend_from_slice(line.as_bytes());
                 wire.extend_from_slice(eol);
             }
-            wire.extend_from_slice(eol);
+            if idx + 1 < events.len() || terminate_last_event {
+                wire.extend_from_slice(eol);
+            }
             expected.push(lines.join("\n").into_bytes());
         }
 
@@ -307,6 +311,7 @@ proptest! {
         let mut expected_tools: HashSet<String> = HashSet::new();
         for msg in encoded {
             let role = msg.get("role").and_then(Value::as_str).expect("role");
+            prop_assert!(matches!(role, "user" | "assistant"), "unsupported Messages role: {role}");
             if let Some(prev) = prev_role {
                 prop_assert_ne!(prev, role, "roles must strictly alternate");
             }
@@ -319,17 +324,17 @@ proptest! {
                     if b.get("type").and_then(Value::as_str) == Some("tool_result") {
                         let id = b.get("tool_use_id").and_then(Value::as_str).expect("tool_use_id");
                         prop_assert!(expected_tools.contains(id), "orphaned tool_result");
-                        seen.insert(id.to_string());
+                        prop_assert!(seen.insert(id.to_string()), "duplicate tool_result id: {id}");
                     }
                 }
                 prop_assert_eq!(seen, expected_tools.clone(), "tool_use/tool_result mismatch");
                 expected_tools.clear();
-            } else if role == "assistant" {
+            } else {
                 prop_assert!(expected_tools.is_empty());
                 for b in blocks {
                     if b.get("type").and_then(Value::as_str) == Some("tool_use") {
                         let id = b.get("id").and_then(Value::as_str).expect("tool_use id");
-                        expected_tools.insert(id.to_string());
+                        prop_assert!(expected_tools.insert(id.to_string()), "duplicate tool_use id: {id}");
                     }
                 }
             }
@@ -380,12 +385,13 @@ proptest! {
         for item in input {
             match item.get("type").and_then(Value::as_str) {
                 Some("function_call") => {
-                    calls.insert(item.get("call_id").and_then(Value::as_str).expect("call_id").to_string());
+                    let id = item.get("call_id").and_then(Value::as_str).expect("call_id");
+                    prop_assert!(calls.insert(id.to_string()), "duplicate function_call id: {id}");
                 }
                 Some("function_call_output") => {
                     let id = item.get("call_id").and_then(Value::as_str).expect("call_id");
                     prop_assert!(calls.contains(id), "orphaned function_call_output");
-                    outputs.insert(id.to_string());
+                    prop_assert!(outputs.insert(id.to_string()), "duplicate function_call_output id: {id}");
                 }
                 _ => {}
             }

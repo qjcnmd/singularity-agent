@@ -173,6 +173,19 @@ fn build_history(with_leading_handoff: bool, steps: Vec<HistoryStep>) -> Vec<Mes
     messages
 }
 
+/// 提取消息变体与关联工具 ID（不比较会被合法截短的正文文本），用于验证切块守恒与保序。
+fn message_identity(msg: &Message) -> (&'static str, Vec<String>) {
+    match msg {
+        Message::Developer { .. } => ("developer", Vec::new()),
+        Message::User { .. } => ("user", Vec::new()),
+        Message::Notification { .. } => ("notification", Vec::new()),
+        Message::Assistant { .. } => {
+            ("assistant", msg.tool_calls().map(|c| c.tool_call_id.clone()).collect())
+        }
+        Message::ToolResult { tool_call_id, .. } => ("tool_result", vec![tool_call_id.clone()]),
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -224,8 +237,15 @@ proptest! {
             }
         }
 
+        let expected_identities: Vec<_> = history.iter().map(message_identity).collect();
         let chunks = partition_into_chunks(history, chunk_budget);
         prop_assert!(!chunks.is_empty());
+        let actual_identities: Vec<_> = chunks.iter().flatten().map(message_identity).collect();
+        prop_assert_eq!(
+            actual_identities,
+            expected_identities,
+            "chunking must preserve all messages, order, and tool IDs"
+        );
         for chunk in chunks {
             prop_assert!(!chunk.is_empty(), "chunk must not be empty");
             prop_assert!(
@@ -241,7 +261,10 @@ proptest! {
                             "unanswered tool_call before next assistant in chunk"
                         );
                         for call in msg.tool_calls() {
-                            open_calls.insert(call.tool_call_id.clone());
+                            prop_assert!(
+                                open_calls.insert(call.tool_call_id.clone()),
+                                "duplicate tool_call id in chunk"
+                            );
                         }
                     }
                     Message::ToolResult { tool_call_id, .. } => {
@@ -292,23 +315,32 @@ proptest! {
         }
         let expected_entries = manager.entries().len();
         let path = sessions.join(session_file_name(&session_id));
-        let valid_len = std::fs::metadata(&path).expect("metadata").len();
+        let valid_bytes = std::fs::read(&path).expect("read valid log");
         drop(manager);
 
         {
             let mut file = std::fs::OpenOptions::new().append(true).open(&path).expect("open for append");
             file.write_all(&trailing_bytes).expect("append truncated tail");
         }
+        let tampered_bytes = std::fs::read(&path).expect("read tampered log");
 
         let readonly = SessionData::open(&path).expect("readonly open ignores incomplete tail");
         prop_assert_eq!(readonly.entries().len(), expected_entries);
+        prop_assert_eq!(
+            std::fs::read(&path).expect("read after readonly open"),
+            tampered_bytes,
+            "readonly open must never modify session file on disk"
+        );
 
         let repaired = SessionManager::open_existing(&path, &session_id).expect("writer repairs tail");
         prop_assert_eq!(repaired.entries().len(), expected_entries);
         drop(repaired);
 
-        let repaired_len = std::fs::metadata(&path).expect("metadata after repair").len();
-        prop_assert_eq!(repaired_len, valid_len, "repair must truncate back to exact valid boundary");
+        prop_assert_eq!(
+            std::fs::read(&path).expect("read after repair"),
+            valid_bytes,
+            "repair must restore exact valid prefix bytes"
+        );
     }
 
     /// 任意随机字节内容绝不能使会话日志解析器 panic。
