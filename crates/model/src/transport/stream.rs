@@ -142,3 +142,21 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
 pub(crate) fn provider_stream_malformed_error(message: &'static str, reason: &'static str) -> ProviderError {
     ProviderError::diagnostic(ModelErrorKind::Other, message, &[reason.to_string()])
 }
+
+#[cfg(test)]
+pub(crate) fn decode_sse_chunks(chunks: &[&[u8]]) -> (Vec<Vec<u8>>, bool) {
+    let mut frames = SseFrameDecoder::default();
+    let mut events = Vec::new();
+    for chunk in chunks {
+        let complete = frames.push(chunk);
+        for line in complete.split_inclusive(|byte| *byte == b'\n') {
+            if let Some(frame) = frames.process_line(line) {
+                events.push(frame);
+            }
+        }
+    }
+    if let Some(trailing) = frames.finish() {
+        events.push(trailing);
+    }
+    (events, frames.has_unterminated())
+}

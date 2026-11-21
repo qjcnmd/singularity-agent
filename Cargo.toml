@@ -49,6 +49,7 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
 uuid = { version = "1.11", features = ["v4"] }
+proptest = { version = "1.6", default-features = false, features = ["std"] }
 
 # 内部程序异常直接终止；普通操作失败仍通过 Result 返回。
 [profile.dev]

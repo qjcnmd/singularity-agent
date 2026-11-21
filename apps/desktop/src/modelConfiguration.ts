@@ -33,6 +33,7 @@ function supportsThinkingToggle(protocol: ProviderApiProtocol): boolean {
 /** 模型弹窗和提供方保存共用思考选项规则，切换协议后也能直接指出不适用的档位。 */
 export function reasoningConfigurationError(model: ReasoningConfiguration, protocol: ProviderApiProtocol): string | null {
   const declared = model.reasoningVariants ?? []
+  // oxlint-disable-next-line no-control-regex
   if (declared.some(variant => !variant || /[\s\x00-\x1f\x7f]/.test(variant))) return '思考档位无效，请取消选择此档位。'
   if (new Set(declared).size !== declared.length) return '思考选项不能重名。'
   if (protocol === 'responses' && declared.includes('on')) return 'Responses 须选择具体思考档位，不支持 on 开关。'

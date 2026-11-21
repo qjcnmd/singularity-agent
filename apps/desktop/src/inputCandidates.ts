@@ -9,7 +9,7 @@ export function inputTrigger(text: string, caret: number): { start: number; end:
     if (/\s/u.test(marker)) break
     if (marker !== '/') continue
     const previous = text[start - 1]
-    if (previous && !/\s/u.test(previous) || /[\/\\]/u.test(text.slice(start + 1, caret))) continue
+    if (previous && !/\s/u.test(previous) || /[/\\]/u.test(text.slice(start + 1, caret))) continue
     return { start, end: caret, query: text.slice(start + 1, caret) }
   }
   return null

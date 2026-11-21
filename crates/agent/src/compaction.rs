@@ -105,20 +105,31 @@ pub(crate) fn compact_assistant_messages(messages: &mut [Message]) {
     }
 }
 
-/// 将 Assistant 工具调用与其对应的 ToolResult 绑定在同一原子组内，避免切块后产生孤立工具结果。
+/// 将前置 Developer 接手提示与后续消息、以及 Assistant 工具调用与其对应的 ToolResult 绑定在同一原子组内，
+/// 避免切块后产生孤立工具结果或仅含 Developer 消息的空 `messages` 批次。
 pub(crate) fn atomic_groups(messages: Vec<Message>) -> Vec<Vec<Message>> {
     let mut groups: Vec<Vec<Message>> = Vec::new();
     let mut iter = messages.into_iter().peekable();
     while let Some(message) = iter.next() {
-        let has_calls =
-            matches!(&message, Message::Assistant { .. }) && message.tool_calls().next().is_some();
         let mut group = vec![message];
+        while matches!(group.last(), Some(Message::Developer { .. })) && iter.peek().is_some() {
+            group.push(iter.next().expect("peeked message following developer exists"));
+        }
+        let has_calls = group.last().is_some_and(|last| {
+            matches!(last, Message::Assistant { .. }) && last.tool_calls().next().is_some()
+        });
         if has_calls {
             while matches!(iter.peek(), Some(Message::ToolResult { .. })) {
                 group.push(iter.next().expect("peeked tool result exists"));
             }
         }
-        groups.push(group);
+        if group.iter().all(|m| matches!(m, Message::Developer { .. }))
+            && let Some(previous) = groups.last_mut()
+        {
+            previous.extend(group);
+        } else {
+            groups.push(group);
+        }
     }
     groups
 }

@@ -10,6 +10,8 @@ pub use agent::AgentEvent;
 pub(crate) mod compaction;
 mod image;
 pub mod message;
+#[cfg(test)]
+mod property_tests;
 mod request_execution;
 pub mod session;
 pub mod tools;

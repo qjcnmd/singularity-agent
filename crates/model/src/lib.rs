@@ -18,6 +18,8 @@ mod client;
 pub(crate) mod config;
 mod error;
 mod messages;
+#[cfg(test)]
+mod property_tests;
 mod provider;
 mod responses;
 mod transport;

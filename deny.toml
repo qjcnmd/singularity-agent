@@ -6,6 +6,9 @@ yanked = "deny"
 unmaintained = "all"
 unsound = "all"
 unused-ignored-advisory = "deny"
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "Transitive dependency chrono via rmcp 3.10.0 (unmaintained notice, no upstream replacement yet); workspace crates use time directly." },
+]
 
 [bans]
 # The current lockfile has target/transitive duplicates and the workspace uses

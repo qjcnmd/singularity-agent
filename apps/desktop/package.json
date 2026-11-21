@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "build": "tsc -b && tsc -p tsconfig.desktop.json && vite build",
+    "lint": "oxlint -c .oxlintrc.json --deny-warnings src desktop e2e",
     "typecheck": "tsc -b && tsc -p tsconfig.desktop.json --noEmit",
     "start": "electron .",
     "prepare:runtime": "node desktop/prepare.mjs",
-    "package": "electron-builder --config electron-builder.json --win --dir"
+    "package": "electron-builder --config electron-builder.json --win --dir",
+    "test:e2e": "node e2e/smoke.mjs"
   },
   "dependencies": {
     "@shikijs/core": "4.4.3",
@@ -34,6 +36,8 @@
     "@vitejs/plugin-react": "6.1.1",
     "electron": "44.5.0",
     "electron-builder": "26.15.3",
+    "oxlint": "^1.94.0",
+    "playwright-core": "^1.65.1",
     "typescript": "7.0.2",
     "vite": "8.2.4"
   },

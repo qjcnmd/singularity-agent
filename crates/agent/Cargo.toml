@@ -29,3 +29,6 @@ similar = "3.2.1"
 [target.'cfg(windows)'.dependencies]
 process-wrap = { version = "10.0", features = ["tokio1", "job-object", "creation-flags"] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
+
+[dev-dependencies]
+proptest.workspace = true

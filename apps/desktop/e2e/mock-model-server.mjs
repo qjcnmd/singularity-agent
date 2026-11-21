@@ -1,0 +1,133 @@
+import { createServer } from 'node:http'
+
+function sse(payload) {
+  return `data: ${JSON.stringify(payload)}\n\n`
+}
+
+export function messagesTextEvents({ thinking, text, inputTokens = 100, outputTokens = 40, stopReason = 'end_turn' }) {
+  const events = [
+    sse({ type: 'message_start', message: { usage: { input_tokens: inputTokens, output_tokens: 1 } } }),
+  ]
+  let index = 0
+  if (thinking) {
+    events.push(sse({ type: 'content_block_start', index, content_block: { type: 'thinking', thinking: '', signature: '' } }))
+    events.push(sse({ type: 'content_block_delta', index, delta: { type: 'thinking_delta', thinking } }))
+    events.push(sse({ type: 'content_block_delta', index, delta: { type: 'signature_delta', signature: 'sig-e2e' } }))
+    events.push(sse({ type: 'content_block_stop', index }))
+    index += 1
+  }
+  if (text) {
+    events.push(sse({ type: 'content_block_start', index, content_block: { type: 'text', text: '' } }))
+    events.push(sse({ type: 'content_block_delta', index, delta: { type: 'text_delta', text } }))
+    events.push(sse({ type: 'content_block_stop', index }))
+  }
+  events.push(sse({ type: 'message_delta', delta: { stop_reason: stopReason }, usage: { output_tokens: outputTokens } }))
+  events.push(sse({ type: 'message_stop' }))
+  return events
+}
+
+export function messagesToolEvents({ preface, calls, inputTokens = 100, outputTokens = 40 }) {
+  const events = [
+    sse({ type: 'message_start', message: { usage: { input_tokens: inputTokens, output_tokens: 1 } } }),
+  ]
+  let index = 0
+  if (preface) {
+    events.push(sse({ type: 'content_block_start', index, content_block: { type: 'text', text: preface } }))
+    events.push(sse({ type: 'content_block_stop', index }))
+    index += 1
+  }
+  for (const { id, name, args } of calls) {
+    events.push(sse({ type: 'content_block_start', index, content_block: { type: 'tool_use', id, name, input: {} } }))
+    events.push(sse({ type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(args) } }))
+    events.push(sse({ type: 'content_block_stop', index }))
+    index += 1
+  }
+  events.push(sse({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: outputTokens } }))
+  events.push(sse({ type: 'message_stop' }))
+  return events
+}
+
+export function createGate() {
+  let release
+  const promise = new Promise(resolve => { release = resolve })
+  return { promise, release }
+}
+
+/**
+ * 极简本地测试 HTTP SSE 回放服务器（仅测试使用，零外部依赖）。
+ * 支持按路由队列或动态回调返回 Anthropic Messages SSE 与 `/v1/models`。
+ */
+export async function startMockModelServer() {
+  const queue = []
+  const requests = []
+  let models = ['e2e-model']
+  let fallback = null
+
+  const server = createServer(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const raw = Buffer.concat(chunks).toString('utf8')
+    const body = raw ? JSON.parse(raw) : null
+    const url = req.url ?? '/'
+
+    if (req.method === 'GET' && url.endsWith('/models')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ data: models.map(id => ({ id })) }))
+      return
+    }
+
+    requests.push({ method: req.method, url, body })
+    const serialized = raw
+    let entryIdx = queue.findIndex(item => item.matchText && serialized.includes(item.matchText))
+    if (entryIdx < 0) entryIdx = queue.findIndex(item => !item.matchText)
+    const entry = entryIdx >= 0
+      ? queue.splice(entryIdx, 1)[0]
+      : (fallback ? fallback(body, requests.length) : null)
+    if (!entry) {
+      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: { message: 'unexpected E2E model request' } }))
+      return
+    }
+    if (entry.jsonError) {
+      res.writeHead(entry.status ?? 400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(entry.jsonError))
+      return
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'close',
+    })
+    const gates = entry.gates ?? (entry.gate ? [{ afterIndex: entry.gateIndex ?? 1, gate: entry.gate }] : [])
+    for (let i = 0; i < entry.events.length; i += 1) {
+      if (res.writableEnded || res.destroyed) break
+      res.write(entry.events[i])
+      for (const step of gates) {
+        if (step.afterIndex === i) {
+          step.onReached?.()
+          await Promise.race([
+            step.gate.promise,
+            new Promise(resolve => req.once('close', resolve)),
+          ])
+        }
+      }
+    }
+    if (!res.writableEnded) res.end()
+  })
+
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    requests,
+    setModels(list) { models = list },
+    enqueue(events, options = {}) { queue.push({ events, ...options }) },
+    enqueueError(status, jsonError, options = {}) { queue.push({ status, jsonError, ...options }) },
+    setFallback(fn) { fallback = fn },
+    async close() {
+      server.closeAllConnections?.()
+      await new Promise(resolve => server.close(resolve))
+    },
+  }
+}

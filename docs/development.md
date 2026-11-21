@@ -71,11 +71,32 @@ cargo fmt --all -- --check
 
 ### 静态分析与编译检查
 ```powershell
-# 运行 Clippy 静态检查
+# 运行 Rust Clippy 静态检查
 cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
 
-# 检查所有二进制与库的编译
-cargo check --workspace --all-targets
+# 运行前端与桌面主进程 Lint（oxlint）及严格 TypeScript 构建检查
+npm --prefix apps/desktop run lint
+npm --prefix apps/desktop run build
+
+# 验证跨端协议 TypeScript 声明与 Rust DTO 同步（无漂移）
+cargo run -p singularity_protocol --features typescript --example export_types --locked
+git diff --ignore-cr-at-eol --exit-code -- apps/desktop/src/protocol.generated.ts
+```
+
+### 常驻自动化回归测试
+
+常驻测试只保留与内部实现解耦的黑盒不变量套件与通用属性测试（保留与清理标准见[仓库指令](../AGENTS.md#检查)）：
+
+```powershell
+# 1. Rust 全部常驻测试（含 model/agent 属性测试 + app 后端黑盒不变量集成测试，CI 自动运行）
+cargo test --workspace --locked
+
+# 2. 桌面端 Electron + Playwright 冒烟测试（先完成前端构建与 prepare:runtime）
+npm --prefix apps/desktop run test:e2e
+
+# 3. 指定打包产物运行完整 4 条 E2E（--exe）或快速打包冒烟（--packaged）
+node apps/desktop/e2e/smoke.mjs --exe=C:/Users/$env:USERNAME/Desktop/Singularity/Singularity.exe
+node apps/desktop/e2e/smoke.mjs --packaged=C:/Users/$env:USERNAME/Desktop/Singularity/Singularity.exe
 ```
 
 ## 3. 跨端协议同步 (TypeScript DTO)
@@ -118,4 +139,4 @@ npm --prefix apps/desktop run package -- --config.directories.output=D:/Singular
 产物输出于 `D:/SingularityBuild/release/win-unpacked/`。退出 Singularity 后整体替换 `~/Desktop/Singularity`，从桌面目录验证通过后删除临时成品，只保留桌面这一份运行包。用户数据保留在 `~/.singularity`。
 
 ### CI
-- **CI 工作流** (`.github/workflows/ci.yml`)：推送到 `main` 时运行 Rust 格式化检查、Clippy、编译、前端构建及依赖检查。
+- **CI 工作流** (`.github/workflows/ci.yml`)：推送到 `main` 时运行前端 Lint 与严格构建、Rust 格式化检查、跨端协议声明同步校验、Clippy、编译、属性测试与后端黑盒不变量测试，以及依赖安全检查。

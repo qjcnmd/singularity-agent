@@ -86,6 +86,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
     event.preventDefault()
     setFailure(null)
     appStore.clearError(origin)
+    // oxlint-disable-next-line no-control-regex
     if (!/^[^\s\x00-\x1f\x7f]+$/.test(providerId.trim())) {
       setFailure('请输入不含空白和控制字符的提供方 ID。')
       return
@@ -213,5 +214,6 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
 
 function invalidModelId(models: ModelInput[], index: number | null, value: string): boolean {
   const id = value.trim()
+  // oxlint-disable-next-line no-control-regex
   return !id || /[\s\x00-\x1f\x7f]/.test(id) || models.some((model, at) => at !== index && model.modelId.trim() === id)
 }
