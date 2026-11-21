@@ -80,7 +80,7 @@ pub(crate) fn parse_tool_call_arguments(value: Option<&Value>) -> Result<Value, 
     };
     Err(provider_response_validation_error(
         "provider tool arguments were missing or had an invalid type",
-        &[reason.into()],
+        &[reason],
     ))
 }
 
@@ -116,7 +116,7 @@ pub(crate) fn parse_usage(
     })
 }
 
-pub(crate) fn provider_response_validation_error(message: &str, errors: &[String]) -> ProviderError {
+pub(crate) fn provider_response_validation_error(message: &str, errors: &[impl AsRef<str>]) -> ProviderError {
     ProviderError::diagnostic(ModelErrorKind::Other, message, errors)
 }
 

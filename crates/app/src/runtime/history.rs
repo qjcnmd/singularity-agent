@@ -270,21 +270,22 @@ pub fn accumulate_request_usage(
     observation: &singularity_protocol::RequestObservation,
 ) {
     if let Some(ttft_ms) = observation.ttft_ms {
-        usage.ttft_ms += ttft_ms;
-        usage.ttft_requests += 1;
+        usage.ttft_ms = usage.ttft_ms.saturating_add(ttft_ms);
+        usage.ttft_requests = usage.ttft_requests.saturating_add(1);
     }
     let Some(request_usage) = &observation.usage else {
         return;
     };
-    usage.input_tokens += request_usage.input_tokens;
-    usage.cached_input_tokens += request_usage.cached_input_tokens.unwrap_or(0);
-    usage.total_tokens += request_usage.total_tokens;
+    usage.input_tokens = usage.input_tokens.saturating_add(request_usage.input_tokens);
+    usage.cached_input_tokens =
+        usage.cached_input_tokens.saturating_add(request_usage.cached_input_tokens.unwrap_or(0));
+    usage.total_tokens = usage.total_tokens.saturating_add(request_usage.total_tokens);
     usage.cache_usage_complete &= request_usage.cached_input_tokens.is_some();
     if let Some(ms) = observation.decode_ms
         && ms > 0
     {
-        usage.decode_ms += ms;
-        usage.decode_tokens += request_usage.output_tokens;
+        usage.decode_ms = usage.decode_ms.saturating_add(ms);
+        usage.decode_tokens = usage.decode_tokens.saturating_add(request_usage.output_tokens);
     }
     usage.usage_present = true;
 }

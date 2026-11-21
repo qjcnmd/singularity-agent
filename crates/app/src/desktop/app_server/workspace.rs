@@ -26,7 +26,7 @@ impl AppServer {
         let session_states: BTreeMap<_, _> = self
             .lock_sessions()
             .conversations()
-            .map(|(id, conversation)| (id.clone(), conversation.status()))
+            .map(|(id, conversation)| (id.to_owned(), conversation.status()))
             .collect();
         let sessions_by_workspace = group_threads(&workspaces, threads);
         Ok(AppBootstrap {
@@ -55,10 +55,9 @@ impl AppServer {
             let belongs = |conversation: &std::sync::Arc<crate::runtime::Conversation>| {
                 singularity_core::same_saved_path(&conversation.cwd, &workspace.root)
             };
-            if sessions
-                .conversations()
-                .any(|(_, conversation)| belongs(conversation) && conversation.has_work())
-            {
+            if sessions.conversations().any(|(_, conversation)| {
+                belongs(conversation) && (conversation.has_work() || conversation.is_deleting())
+            }) {
                 return Err(RpcError::new(format!(
                     "项目 {} 仍有运行中的任务、后台命令或待处理输入。",
                     workspace.root

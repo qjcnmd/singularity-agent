@@ -86,8 +86,13 @@ impl InputImage {
         };
         if matches!(format, ImageFormat::Gif | ImageFormat::Bmp) {
             let mut encoded = Cursor::new(Vec::new());
-            decoded.write_to(&mut encoded, ImageFormat::Png).map_err(|error| error.to_string())?;
+            decoded
+                .write_to(&mut encoded, ImageFormat::Png)
+                .map_err(|error| format!("图片编码失败：{error}"))?;
             bytes = encoded.into_inner();
+            if bytes.len() > MAX_IMAGE_BYTES {
+                return Err("转换后的 PNG 图片大小超过 20 MB 上限。".into());
+            }
         }
         Ok(Self {
             attachment: ImageAttachment {

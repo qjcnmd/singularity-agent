@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::time::Duration;
 
 /// 提供方失败的处理类别，具体原因保存在错误文字里。
@@ -13,7 +14,7 @@ pub enum ModelErrorKind {
 }
 
 /// 提供方失败，含错误分类、可显示的诊断信息和重试等待时间。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderError {
     pub kind: ModelErrorKind,
     pub message: String,
@@ -39,11 +40,20 @@ impl ProviderError {
     }
 
     /// 构造带分类的诊断错误，把具体原因并进各入口实际显示的错误文本里。
-    pub(crate) fn diagnostic(kind: ModelErrorKind, message: impl Into<String>, details: &[String]) -> Self {
+    pub(crate) fn diagnostic(
+        kind: ModelErrorKind,
+        message: impl Into<String>,
+        details: &[impl AsRef<str>],
+    ) -> Self {
         let mut message = message.into();
         if !details.is_empty() {
             message.push_str(": ");
-            message.push_str(&details.join(", "));
+            for (index, detail) in details.iter().enumerate() {
+                if index > 0 {
+                    message.push_str(", ");
+                }
+                message.push_str(detail.as_ref());
+            }
         }
         Self::new(kind, message)
     }
@@ -76,7 +86,7 @@ pub(crate) const MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS: usize = 256;
 #[derive(Default)]
 pub(crate) struct ProviderErrorBodyFields {
     pub(crate) code: Option<String>,
-    /// 响应里的 error.type；不用于分类，只附在错误消息里便于排查。
+    /// 响应里的 error.type；在 `code` 未命中时作为兜底分类依据，并附在错误消息里便于排查。
     pub(crate) wire_type: Option<String>,
     pub(crate) message: Option<String>,
 }
@@ -121,14 +131,14 @@ pub(crate) fn append_provider_http_diagnostic(
 ) {
     let facts = provider_wire_facts(fields);
     if !facts.is_empty() {
-        message.push_str(&format!(" ({})", facts.join(", ")));
+        let _ = write!(message, " ({})", facts.join(", "));
     }
     let diagnostic = match fields.message.as_deref() {
         Some(message) => bounded_provider_error_diagnostic(message),
         None => bounded_provider_error_diagnostic(&String::from_utf8_lossy(body)),
     };
     if !diagnostic.is_empty() {
-        message.push_str(&format!(" Provider diagnostic: {diagnostic}"));
+        let _ = write!(message, " Provider diagnostic: {diagnostic}");
     }
 }
 

@@ -298,7 +298,8 @@ async fn handle_http_connection(
                 bytes.len()
             );
             for (k, v) in headers {
-                head.push_str(&format!("{k}: {v}\r\n"));
+                use std::fmt::Write as _;
+                let _ = write!(head, "{k}: {v}\r\n");
             }
             head.push_str("\r\n");
             stream.write_all(head.as_bytes()).await?;

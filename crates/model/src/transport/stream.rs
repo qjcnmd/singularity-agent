@@ -6,6 +6,9 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{ModelErrorKind, ProviderError};
 use crate::transport::http::{provider_cancelled_error, provider_future};
 
+/// 单条 SSE 帧或单行缓冲的内存上限（16 MiB），足以容纳含加密推理块的终态事件，同时防止异常 HTTP 200 正文无限增长。
+const MAX_SSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 /// 把网络数据块切成 SSE 事件。
 #[derive(Default)]
 struct SseFrameDecoder {
@@ -17,8 +20,9 @@ struct SseFrameDecoder {
 
 impl SseFrameDecoder {
     /// 接收一段 chunk，交出其中所有完整的行；没有结尾换行的部分留给下次读取。
-    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, &'static str> {
         let mut last_newline = None;
+        let mut line_len = self.pending.len();
         for &byte in chunk {
             // CR 已经结束上一行；紧随其后的 LF 即使跨 chunk 到达也直接跳过，避免多切出空行。
             let follows_cr = self.previous_cr;
@@ -30,16 +34,22 @@ impl SseFrameDecoder {
             self.pending.push(byte);
             if byte == b'\n' {
                 last_newline = Some(self.pending.len());
+                line_len = 0;
+            } else {
+                line_len += 1;
+                if line_len > MAX_SSE_FRAME_BYTES {
+                    return Err("event_frame_too_large");
+                }
             }
         }
         let Some(end) = last_newline else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let tail = self.pending.split_off(end);
-        std::mem::replace(&mut self.pending, tail)
+        Ok(std::mem::replace(&mut self.pending, tail))
     }
 
-    fn process_line(&mut self, line: &[u8]) -> Option<Vec<u8>> {
+    fn process_line(&mut self, line: &[u8]) -> Result<Option<Vec<u8>>, &'static str> {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         // 第一行完整后才检查 BOM，因此它的三个字节可以分散在不同 chunk 中。
         let line = if self.first_line_processed {
@@ -50,13 +60,13 @@ impl SseFrameDecoder {
         };
         if line.is_empty() {
             if self.event_data.is_empty() {
-                return None;
+                return Ok(None);
             }
-            return Some(std::mem::take(&mut self.event_data));
+            return Ok(Some(std::mem::take(&mut self.event_data)));
         }
         // 冒号开头的行是 SSE 注释（常作保活），整行忽略。
         if line.first() == Some(&b':') {
-            return None;
+            return Ok(None);
         }
         let (field, value) = if let Some(separator) = line.iter().position(|byte| *byte == b':') {
             // 值前按 SSE 约定只去掉一个空格。
@@ -67,12 +77,16 @@ impl SseFrameDecoder {
         };
         // Messages 和 Responses 的流事件内容都在 data 行里，忽略 event、id、retry 等其他 SSE 字段。
         if field == b"data" {
+            let extra = usize::from(!self.event_data.is_empty()) + value.len();
+            if self.event_data.len().saturating_add(extra) > MAX_SSE_FRAME_BYTES {
+                return Err("event_frame_too_large");
+            }
             if !self.event_data.is_empty() {
                 self.event_data.push(b'\n');
             }
             self.event_data.extend_from_slice(value);
         }
-        None
+        Ok(None)
     }
 
     fn finish(&mut self) -> Option<Vec<u8>> {
@@ -127,9 +141,9 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
             }
             return Ok(());
         };
-        let complete = frames.push(&chunk);
+        let complete = frames.push(&chunk).map_err(D::frame_malformed())?;
         for line in complete.split_inclusive(|byte| *byte == b'\n') {
-            if let Some(frame) = frames.process_line(line) {
+            if let Some(frame) = frames.process_line(line).map_err(D::frame_malformed())? {
                 decoder.dispatch_event(&frame)?;
                 if decoder.protocol_complete() {
                     return Ok(());
@@ -140,7 +154,7 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
 }
 
 pub(crate) fn provider_stream_malformed_error(message: &'static str, reason: &'static str) -> ProviderError {
-    ProviderError::diagnostic(ModelErrorKind::Other, message, &[reason.to_string()])
+    ProviderError::diagnostic(ModelErrorKind::Other, message, &[reason])
 }
 
 #[cfg(test)]
@@ -148,10 +162,14 @@ pub(crate) fn decode_sse_chunks(chunks: &[&[u8]]) -> (Vec<Vec<u8>>, bool) {
     let mut frames = SseFrameDecoder::default();
     let mut events = Vec::new();
     for chunk in chunks {
-        let complete = frames.push(chunk);
+        let Ok(complete) = frames.push(chunk) else {
+            return (events, true);
+        };
         for line in complete.split_inclusive(|byte| *byte == b'\n') {
-            if let Some(frame) = frames.process_line(line) {
-                events.push(frame);
+            match frames.process_line(line) {
+                Ok(Some(frame)) => events.push(frame),
+                Ok(None) => {}
+                Err(_) => return (events, true),
             }
         }
     }

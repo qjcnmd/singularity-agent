@@ -1,5 +1,7 @@
 //! 协议无关的模型客户端入口：按提供方协议分发到 Messages 或 Responses 编码器与流解码器。
 
+use std::fmt::Write as _;
+
 use singularity_protocol::ProviderApiProtocol;
 use tokio_util::sync::CancellationToken;
 
@@ -15,7 +17,7 @@ use crate::provider::{ProviderStreamEvent, messages_endpoint, responses_endpoint
 use crate::responses::{openai_responses_stream_request_payload, read_responses_sse_stream};
 use crate::transport::http::{
     BoundedBodyReadError, MAX_HTTP_ERROR_BODY_BYTES, provider_cancelled_error, provider_transport_error,
-    read_bounded_error_body,
+    read_bounded_error_body, sensitive_header_value,
 };
 use crate::transport::{provider_client, provider_future, retry_after_delay};
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
@@ -133,7 +135,7 @@ impl ModelClient {
             ProviderApiProtocol::Messages => {
                 request = request.header("anthropic-version", ANTHROPIC_VERSION);
                 if !self.config.api_key.is_empty() {
-                    request = request.header("x-api-key", &self.config.api_key);
+                    request = request.header("x-api-key", sensitive_header_value(&self.config.api_key)?);
                 }
             }
             ProviderApiProtocol::Responses => {
@@ -166,10 +168,11 @@ impl ModelClient {
                 Ok(body) => body,
                 Err(BoundedBodyReadError::Cancelled) => return provider_cancelled_error(),
                 Err(BoundedBodyReadError::Transport(read_error)) => {
-                    error.message.push_str(&format!(
+                    let _ = write!(
+                        error.message,
                         " Could not read provider error response: {}",
                         provider_transport_error(read_error).message
-                    ));
+                    );
                     return error;
                 }
             };

@@ -1,8 +1,12 @@
 //! 单文件批量精确替换；同一目标在整个进程内依次读改写。
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
+
+const MAX_EDIT_FILE_BYTES: u64 = 20 * 1024 * 1024;
 
 use serde::Deserialize;
 use serde_json::json;
@@ -140,6 +144,34 @@ pub(crate) async fn execute(args: EditArgs, cwd: PathBuf, signal: CancellationTo
     with_file_lock(key, signal, move |signal| execute_locked(&args, &target, signal)).await
 }
 
+/// 有界读取已打开的 UTF-8 文本文件：先通过文件句柄校验上限与前 64 KB NUL 嗅探，避免大二进制文件占满内存。
+pub(super) fn read_opened_text_file(file: File, display_path: &str) -> Result<String, String> {
+    let metadata = file.metadata().map_err(|error| format!("Could not inspect {display_path}: {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{display_path} is not a regular file"));
+    }
+    if metadata.len() > MAX_EDIT_FILE_BYTES {
+        return Err(format!("{display_path} exceeds the 20 MB text file limit"));
+    }
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let head = reader.fill_buf().map_err(|error| format!("Could not read {display_path}: {error}"))?;
+    if head.contains(&0) {
+        return Err(format!("{display_path} is a binary file, not UTF-8 text"));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    reader
+        .take(MAX_EDIT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Could not read {display_path}: {error}"))?;
+    if bytes.len() as u64 > MAX_EDIT_FILE_BYTES {
+        return Err(format!("{display_path} exceeds the 20 MB text file limit"));
+    }
+    if bytes.contains(&0) {
+        return Err(format!("{display_path} is a binary file, not UTF-8 text"));
+    }
+    String::from_utf8(bytes).map_err(|error| format!("Could not read {display_path} as UTF-8 text: {error}"))
+}
+
 fn execute_locked(
     args: &EditArgs,
     target: &Path,
@@ -148,11 +180,8 @@ fn execute_locked(
     if signal.is_cancelled() {
         return Err(ABORTED_MESSAGE.into());
     }
-    let content = std::fs::read_to_string(target)
-        .map_err(|error| format!("Could not read {} as UTF-8 text: {error}", args.path))?;
-    if content.contains('\0') {
-        return Err(format!("{} is not a text file", args.path));
-    }
+    let file = File::open(target).map_err(|error| format!("Could not read {}: {error}", args.path))?;
+    let content = read_opened_text_file(file, &args.path)?;
     let source = content.strip_prefix('\u{feff}').unwrap_or(&content);
     let view = source.replace("\r\n", "\n");
     // 只记录被折叠的 CR，匹配位置映射回原字节，避免重写未修改区域的换行。

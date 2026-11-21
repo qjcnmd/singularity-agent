@@ -1,6 +1,9 @@
 //! 从 `config.json` 解析选中的提供方连接参数、模型容量与推理档位。
 
-use super::*;
+use super::{
+    ModelSelection, ProviderApiProtocol, ProviderError, UserConfigFile, UserConfigModel, configuration_error,
+    validate_api_key, validate_base_url, validate_reasoning_variants,
+};
 
 pub(crate) struct ProviderConfig {
     pub(crate) provider_name: String,
@@ -30,7 +33,7 @@ pub(super) fn resolve_model_selection(
         .ok_or_else(|| configuration_error("模型选择器指定的模型未在提供方配置中声明"))?;
     validate_base_url(&provider.base_url)?;
     let key = provider.api_key.as_str();
-    validate_provider_value(key, "api_key")?;
+    validate_api_key(key)?;
     let model = resolve_model_definition(
         model,
         provider.api_protocol,

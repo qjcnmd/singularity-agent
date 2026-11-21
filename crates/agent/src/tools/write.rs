@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::edit::{file_lock_key, format_diff_result, with_file_lock};
+use super::edit::{file_lock_key, format_diff_result, read_opened_text_file, with_file_lock};
 use super::registry::{ABORTED_MESSAGE, ToolExecution, error_result};
 
 #[derive(Debug, Deserialize)]
@@ -62,15 +62,8 @@ fn execute_locked(
     if signal.is_cancelled() {
         return Err(ABORTED_MESSAGE.into());
     }
-    let (before, existed) = match std::fs::read(target) {
-        Ok(bytes) => {
-            if bytes.contains(&0) {
-                return Err(format!("{} is a binary file, not UTF-8 text", args.path));
-            }
-            let text = String::from_utf8(bytes)
-                .map_err(|error| format!("Could not read existing {} as UTF-8 text: {error}", args.path))?;
-            (text, true)
-        }
+    let (before, existed) = match std::fs::File::open(target) {
+        Ok(file) => (read_opened_text_file(file, &args.path)?, true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
         Err(error) => return Err(format!("Could not inspect {}: {error}", args.path)),
     };

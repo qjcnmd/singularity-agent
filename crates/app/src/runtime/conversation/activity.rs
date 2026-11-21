@@ -10,6 +10,10 @@ pub(super) struct Activity {
     items: Vec<HistoryItem>,
 }
 impl Activity {
+    pub(super) fn with_turn_id(turn_id: Option<String>) -> Self {
+        Self { turn_id, items: Vec::new() }
+    }
+
     pub(super) fn turn_id(&self) -> Option<String> {
         self.turn_id.clone()
     }

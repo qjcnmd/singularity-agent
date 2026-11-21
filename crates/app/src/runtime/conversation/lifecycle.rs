@@ -1,6 +1,12 @@
 //! 用户输入、独立轮换和后台续跑共用的启动、收尾与关闭流程。
-use super::*;
-use singularity_protocol::{SessionFailure, SessionOperation, StreamEvent, TurnStatus};
+use std::sync::Arc;
+
+use super::activity::Activity;
+use super::{
+    Conversation, ConversationError, ConversationState, Operation, TurnControls, TurnLifecycle, view,
+};
+use singularity_agent::agent::{QueuedInput, UserInput};
+use singularity_protocol::{SessionFailure, SessionOperation, SessionPhase, StreamEvent, TurnStatus};
 
 impl Conversation {
     // 三个入口都已在状态锁内检查允许启动；占用任务、清理上次显示状态和发布由这里一起完成。
@@ -17,7 +23,7 @@ impl Conversation {
         }
         state.turn = TurnLifecycle::Running(Arc::clone(&controls));
         drop(state);
-        view.begin();
+        view.begin((source == SessionOperation::Turn).then(|| controls.turn_id.clone()));
         self.publish_changed(view);
         Operation { source, controls }
     }
@@ -46,7 +52,7 @@ impl Conversation {
         if failure.is_some() {
             view.failure = failure;
         }
-        view.activity = Default::default();
+        view.activity = Activity::default();
         self.lock_state().turn = TurnLifecycle::Idle;
         let payload = self.runtime(&view);
         self.publish(

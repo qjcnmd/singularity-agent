@@ -1,10 +1,10 @@
 //! MCP 服务器配置、连接状态与设置 RPC 的参数类型。
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 /// 文件与设置接口共用的 MCP 连接配置；省略的参数、环境变量和请求头按空值处理。
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum McpTransportConfig {
@@ -22,6 +22,36 @@ pub enum McpTransportConfig {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
     },
+}
+
+impl fmt::Debug for McpTransportConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stdio { command, args, cwd, env } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", args)
+                .field("cwd", cwd)
+                .field("env_keys", &env.keys().collect::<Vec<_>>())
+                .finish(),
+            Self::Http { url, headers } => f
+                .debug_struct("Http")
+                .field("url", &redact_url_for_debug(url))
+                .field("header_keys", &headers.keys().collect::<Vec<_>>())
+                .finish(),
+        }
+    }
+}
+
+fn redact_url_for_debug(url: &str) -> String {
+    let without_query = url.split(['?', '#']).next().unwrap_or("");
+    let Some((scheme, rest)) = without_query.split_once("://") else {
+        return "[redacted]".to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    format!("{scheme}://{host}{path}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

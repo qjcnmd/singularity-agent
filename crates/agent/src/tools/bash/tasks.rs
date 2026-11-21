@@ -15,7 +15,7 @@ use crate::session::{LedgerRecord, SessionEntry, lock_writer};
 use crate::tools::registry::{ABORTED_MESSAGE, ToolDisplay, ToolExecution, error_result};
 
 use super::exec::{Outcome, Process, ProcessEvent};
-use super::result::{state_text, task_result, task_summary};
+use super::result::{TaskDisplayMode, state_text, task_result, task_summary, try_task_result};
 use super::spec::BashArgs;
 
 /// 已保存的开始、结束，或仅供显示的输出更新。
@@ -30,7 +30,7 @@ struct Entry {
     done: watch::Sender<Option<Result<(), CompletionError>>>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct OutputDelivery {
     end: u64,
     terminal: bool,
@@ -131,49 +131,58 @@ impl BashTasks {
         {
             return error_result(error.message());
         }
-        self.take_output(task_id, false)
-            .map(|result| result.expect("explicit reads always return status"))
-            .unwrap_or_else(error_result)
+        self.take_output(task_id).unwrap_or_else(error_result)
     }
 
-    /// 到交付时才取输出，避免已排队的通知与后续主动读取重复携带正文。
-    pub(crate) fn completion_message(&self, task_id: &str) -> Result<Option<String>, String> {
-        self.take_output(task_id, true).map(|result| result.map(|result| result.content))
+    /// 准备后台完成通知但不推进游标；由调用方在消息落盘后再调用 `confirm_delivered`。
+    pub(crate) fn prepare_completion_message(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(String, u64, bool)>, String> {
+        let delivered = self.delivered.lock().expect("bash output delivery lock");
+        let task = self.task(task_id)?;
+        let position = delivered.get(task_id).copied().unwrap_or_default();
+        if position.terminal {
+            return Ok(None);
+        }
+        let result = try_task_result(&task, Some(position.end), TaskDisplayMode::None)?;
+        let content =
+            format!("<background-task>\nCommand: {}\n{}\n</background-task>", task.command, result.content);
+        Ok(Some((content, task.model_output.total_bytes, !task.state.is_running())))
     }
 
-    fn take_output(&self, task_id: &str, notification: bool) -> Result<Option<ToolExecution>, String> {
+    /// 后台完成通知成功写入日志后提交已交付水位。
+    pub(crate) fn confirm_delivered(&self, task_id: &str, end: u64, terminal: bool) {
+        let mut delivered = self.delivered.lock().expect("bash output delivery lock");
+        let position = delivered.entry(task_id.to_owned()).or_default();
+        position.end = position.end.max(end);
+        position.terminal |= terminal;
+    }
+
+    fn take_output(&self, task_id: &str) -> Result<ToolExecution, String> {
         let mut delivered = self.delivered.lock().expect("bash output delivery lock");
         let task = self.task(task_id)?;
         let position = delivered.entry(task_id.to_owned()).or_default();
-        if notification && position.terminal {
-            return Ok(None);
-        }
-        let mut result = task_result(&task, Some(position.end), (!notification).then_some(true));
-        if notification {
-            result.content = format!(
-                "<background-task>\nCommand: {}\n{}\n</background-task>",
-                task.command, result.content
-            );
-        }
+        let result = try_task_result(&task, Some(position.end), TaskDisplayMode::SummaryWithOutput)?;
         position.end = task.model_output.total_bytes;
         position.terminal = !task.state.is_running();
-        Ok(Some(result))
+        Ok(result)
     }
 
     /// 取消后台命令并等待回收、保存终态。
-    pub async fn stop(&self, task_id: &str) -> Result<(), String> {
+    pub async fn stop(self: &Arc<Self>, task_id: &str) -> Result<(), String> {
         self.stop_task(task_id).await.map(|_| ())
     }
 
     /// 取消后台命令并等待回收、保存终态；操作成功后返回模型可查看的命令结果。
-    pub(crate) async fn tool_stop(&self, task_id: &str) -> ToolExecution {
+    pub(crate) async fn tool_stop(self: &Arc<Self>, task_id: &str) -> ToolExecution {
         match self.stop_task(task_id).await {
-            Ok(task) => task_result(&task, None, Some(false)),
+            Ok(task) => task_result(&task, None, TaskDisplayMode::Summary),
             Err(error) => error_result(error),
         }
     }
 
-    async fn stop_task(&self, task_id: &str) -> Result<BackgroundTask, String> {
+    async fn stop_task(self: &Arc<Self>, task_id: &str) -> Result<BackgroundTask, String> {
         if let Some(entry) = self.entry(task_id) {
             let mut done = entry.done.subscribe();
             if done.borrow().is_none() {
@@ -184,7 +193,11 @@ impl BashTasks {
                 return Err(error.message().to_owned());
             }
         }
-        self.task(task_id)
+        let manager = Arc::clone(self);
+        let id = task_id.to_owned();
+        tokio::task::spawn_blocking(move || manager.task(&id))
+            .await
+            .expect("bash task lookup completes while the runtime is running")
     }
 
     /// 停止并等待全部活进程；只返回回收错误，已结束命令的保存失败不阻止关闭或删除。
@@ -282,17 +295,21 @@ impl BashTasks {
         if signal.is_cancelled() || entry.cancel.is_cancelled() {
             entry.cancel.cancel();
             self.clone().run_background(entry.clone(), process).await;
-            let mut result = self
-                .take_output(&task_id, false)
-                .map(|result| result.expect("cancelled command returns its output"))
+            let manager = Arc::clone(self);
+            let id = task_id.clone();
+            let mut result = tokio::task::spawn_blocking(move || manager.take_output(&id))
+                .await
+                .expect("bash output read completes while the runtime is running")
                 .unwrap_or_else(error_result);
             result.is_error = true;
             return result;
         }
-        let mut result = self
-            .take_output(&task_id, false)
-            .expect("background command was registered")
-            .expect("initial output is returned");
+        let manager = Arc::clone(self);
+        let id = task_id.clone();
+        let mut result = tokio::task::spawn_blocking(move || manager.take_output(&id))
+            .await
+            .expect("bash output read completes while the runtime is running")
+            .expect("background command was registered");
         result.content.push_str("\n\nThe command continues in the background. Completion will deliver its status and new output automatically. Continue independent work; if nothing can proceed, give a brief status message and finish this response; you will resume when it finishes. Do not poll, sleep, or repeatedly read its log to wait. Use task_output only when current output helps you act now.");
         let manager = self.clone();
         tokio::spawn(async move {

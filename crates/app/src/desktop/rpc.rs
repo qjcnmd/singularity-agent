@@ -27,7 +27,13 @@ async fn dispatch(
 ) -> Result<Value, RpcError> {
     match request {
         RpcRequest::McpReconnect(params) => {
-            let cwd = app.scope_directory(params.workspace_root.as_deref())?;
+            let cwd = {
+                let app = Arc::clone(&app);
+                let workspace_root = params.workspace_root;
+                tokio::task::spawn_blocking(move || app.scope_directory(workspace_root.as_deref()))
+                    .await
+                    .expect("RPC worker completes while the backend is running")?
+            };
             let inspect = async { app.mcp.reconnect(&params.server_id, &cwd).await.map_err(RpcError::new) };
             Ok(value(unless_shutdown(shutdown, inspect).await?))
         }

@@ -20,10 +20,13 @@ impl Agent {
         cancellation: &CancellationToken,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        let (cwd, output_directory) = {
-            let writer = lock_writer(&self.requests.session);
+        let session = Arc::clone(&self.requests.session);
+        let (cwd, output_directory) = tokio::task::spawn_blocking(move || {
+            let writer = lock_writer(&session);
             (writer.cwd().to_path_buf(), writer.output_directory())
-        };
+        })
+        .await
+        .expect("session path lookup completes while the runtime is running");
         let mut pending = tool_calls
             .into_iter()
             .enumerate()

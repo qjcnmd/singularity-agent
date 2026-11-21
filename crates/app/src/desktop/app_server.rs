@@ -52,17 +52,15 @@ impl SessionCache {
         self.entries.retain(|id, (conversation, _)| predicate(id, conversation));
     }
 
-    pub(super) fn conversations(&self) -> impl Iterator<Item = (&String, &Arc<Conversation>)> {
-        self.entries.iter().map(|(id, (conversation, _))| (id, conversation))
+    pub(super) fn conversations(&self) -> impl Iterator<Item = (&str, &Arc<Conversation>)> {
+        self.entries.iter().map(|(id, (conversation, _))| (id.as_str(), conversation))
     }
 
     fn evict_idle(&mut self) {
         let mut candidates: Vec<(u64, String)> = self
             .entries
             .iter()
-            .filter(|(_, (conversation, _))| {
-                !conversation.has_work() && conversation.status().failure.is_none()
-            })
+            .filter(|(_, (conversation, _))| conversation.can_evict())
             .map(|(id, (_, access))| (*access, id.clone()))
             .collect();
         candidates.sort_unstable_by_key(|(access, _)| *access);
@@ -224,12 +222,12 @@ impl AppServer {
     }
 
     pub fn read_session(&self, session_id: &str) -> Result<SessionReadResult, RpcError> {
-        self.set_focused_session(Some(session_id.to_owned()));
-        // 只有查找或打开任务需要生命周期锁；读取历史在锁外进行。
+        // 只有查找或打开任务需要生命周期锁；确认存在后再切焦点，避免无效 ID 覆盖当前会话焦点。
         let conversation = {
             let _lifecycle = self.lock_lifecycle();
             self.open_conversation(session_id)?
         };
+        self.set_focused_session(Some(session_id.to_owned()));
         conversation.read().map_err(catalog_error)
     }
 

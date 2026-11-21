@@ -119,9 +119,18 @@ pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
 
 fn checked_session_path(sessions_dir: &Path, thread_id: &str) -> Result<PathBuf, CatalogError> {
     let path = thread_session_path(sessions_dir, thread_id);
-    Uuid::parse_str(thread_id).map_err(|error| {
+    let parsed = Uuid::parse_str(thread_id).map_err(|error| {
         CatalogError::session(thread_id, &path, SessionError::InvalidSession(error.to_string()))
     })?;
+    if parsed.to_string() != thread_id {
+        return Err(CatalogError::session(
+            thread_id,
+            &path,
+            SessionError::InvalidSession(format!(
+                "session id must be a canonical lowercase UUID: {thread_id}"
+            )),
+        ));
+    }
     Ok(path)
 }
 

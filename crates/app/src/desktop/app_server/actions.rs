@@ -1,4 +1,10 @@
-use super::*;
+use std::sync::Arc;
+
+use singularity_agent::agent::UserInput;
+use singularity_protocol::RpcError;
+
+use super::{AppServer, catalog_error, conversation_error};
+use crate::runtime::Conversation;
 
 impl AppServer {
     pub fn image_data(&self, session_id: &str, image_id: &str) -> Result<String, RpcError> {

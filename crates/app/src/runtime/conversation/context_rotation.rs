@@ -1,5 +1,7 @@
-use super::*;
-use singularity_agent::agent::{AgentError, context_rotation_unneeded};
+use std::sync::Arc;
+
+use super::{Conversation, TurnControls};
+use singularity_agent::agent::{AgentError, AgentEvent, context_rotation_unneeded};
 use singularity_agent::session::ContextRotationInput;
 use singularity_protocol::{TurnErrorDetail, TurnStatus};
 

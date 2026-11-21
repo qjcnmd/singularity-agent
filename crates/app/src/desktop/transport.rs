@@ -55,6 +55,7 @@ pub async fn run(
             },
         )
         .await?;
+        let mut pending_write: Option<Vec<u8>> = None;
         loop {
             tokio::select! {
                 biased;
@@ -72,16 +73,23 @@ pub async fn run(
                         Response { id: call.id, response }
                     });
                 }
-                result = requests.join_next(), if !requests.is_empty() => {
+                permit = writer_tx.reserve(), if pending_write.is_some() => {
+                    let permit = permit.map_err(|_| "desktop pipe writer closed".to_string())?;
+                    permit.send(pending_write.take().expect("pending_write is guarded by is_some"));
+                }
+                result = requests.join_next(), if !requests.is_empty() && pending_write.is_none() => {
                     let response = result.expect("nonempty RPC task set")
                         .expect("RPC task completes while the runtime is running");
-                    send_line(&writer_tx, &response).await?;
+                    pending_write = Some(encode_line(&response)?);
                 }
-                event = events.recv() => {
+                event = events.recv(), if pending_write.is_none() => {
                     let Some(frame) = event else { break };
-                    send_line(&writer_tx, &frame).await?;
+                    pending_write = Some(encode_line(&frame)?);
                 }
             }
+        }
+        if let Some(bytes) = pending_write {
+            let _ = writer_tx.send(bytes).await;
         }
         Ok(())
     }
@@ -100,8 +108,13 @@ pub async fn run(
     result.and(write_result)
 }
 
-async fn send_line(writer_tx: &mpsc::Sender<Vec<u8>>, value: &impl Serialize) -> Result<(), String> {
+fn encode_line(value: &impl Serialize) -> Result<Vec<u8>, String> {
     let mut bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
+    Ok(bytes)
+}
+
+async fn send_line(writer_tx: &mpsc::Sender<Vec<u8>>, value: &impl Serialize) -> Result<(), String> {
+    let bytes = encode_line(value)?;
     writer_tx.send(bytes).await.map_err(|_| "desktop pipe writer closed".to_string())
 }

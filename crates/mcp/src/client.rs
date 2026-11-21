@@ -3,7 +3,10 @@
 use crate::config::ServerConfig;
 use rmcp::{
     ClientHandler, RoleClient, ServiceExt,
-    model::*,
+    model::{
+        CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientRequest,
+        RootsCapabilities, ServerResult, Tool,
+    },
     service::{Peer, PeerRequestOptions, RequestContext, RunningService},
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
@@ -12,7 +15,7 @@ use rmcp::{
 };
 use singularity_protocol::McpTransportConfig;
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -21,28 +24,33 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Connection {
     peer: Peer<RoleClient>,
-    service: tokio::sync::Mutex<Option<RunningService<RoleClient, Handler>>>,
+    service: RunningService<RoleClient, Handler>,
     config: ServerConfig,
 }
 
 // 当前主流服务器仍以 legacy initialize/roots 协商；不广告未实现的 sampling/elicitation。
-#[allow(deprecated)]
 pub(crate) struct Handler {
     root: String,
 }
 
-#[allow(deprecated)]
+#[expect(
+    deprecated,
+    reason = "legacy initialize/roots negotiation with current MCP servers"
+)]
 impl ClientHandler for Handler {
-    fn get_info(&self) -> ClientInfo {
-        let mut info = ClientInfo::default();
+    fn get_info(&self) -> rmcp::model::ClientInfo {
+        let mut info = rmcp::model::ClientInfo::default();
         info.client_info.name = "Singularity".into();
         info.client_info.version = env!("CARGO_PKG_VERSION").into();
         info.capabilities.roots = Some(RootsCapabilities::default());
         info
     }
 
-    async fn list_roots(&self, _: RequestContext<RoleClient>) -> Result<ListRootsResult, rmcp::ErrorData> {
-        Ok(ListRootsResult::new(vec![Root::new(&self.root)]))
+    async fn list_roots(
+        &self,
+        _: RequestContext<RoleClient>,
+    ) -> Result<rmcp::model::ListRootsResult, rmcp::ErrorData> {
+        Ok(rmcp::model::ListRootsResult::new(vec![rmcp::model::Root::new(&self.root)]))
     }
 }
 
@@ -71,7 +79,7 @@ impl Connection {
             service.set_response_cache_config(rmcp::service::ClientCacheConfig::disabled()).await;
             Ok(Self {
                 peer: service.peer().clone(),
-                service: tokio::sync::Mutex::new(Some(service)),
+                service,
                 config: config.clone(),
             })
         };
@@ -152,11 +160,14 @@ impl Connection {
         Err(reason)
     }
 
-    pub async fn close(&self) {
-        if let Some(mut service) = self.service.lock().await.take()
-            && let Err(error) = service.close_with_timeout(Duration::from_secs(3)).await
-        {
-            tracing::warn!(error = %self.config.redact(error.to_string()), "MCP shutdown failed");
+    pub async fn close(mut self) {
+        // 给 rmcp 内部 3 秒优雅退出的基础上预留额外时间，确保超时后能完成 kill。
+        match self.service.close_with_timeout(Duration::from_secs(5)).await {
+            Ok(Some(_)) => {}
+            Ok(None) => tracing::warn!("MCP shutdown timed out after 5s"),
+            Err(error) => {
+                tracing::warn!(error = %self.config.redact(error.to_string()), "MCP shutdown failed");
+            }
         }
     }
 }
@@ -170,7 +181,10 @@ async fn connect_stdio(
     configured_cwd: Option<&str>,
     env: &std::collections::BTreeMap<String, String>,
 ) -> Result<RunningService<RoleClient, Handler>, String> {
-    let directory = configured_cwd.map(|path| cwd.join(path)).unwrap_or_else(|| cwd.to_path_buf());
+    // 剥离 Windows verbatim 前缀后再拼接相对路径与设置 current_dir，避免 Win32/cmd.exe 拒绝。
+    let base = PathBuf::from(singularity_core::display_path(cwd));
+    let directory = configured_cwd.map(|path| base.join(path)).unwrap_or(base);
+    let directory = std::path::absolute(&directory).unwrap_or(directory);
     let executable = if Path::new(command).components().count() > 1 {
         directory.join(command)
     } else {

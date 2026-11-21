@@ -22,10 +22,13 @@ impl Bindings {
             return;
         }
         T::visit_generics(self);
-        // 具名类型才写 export 声明，其余只递归其依赖。
+        // 具名类型才写 export 声明，其余只递归其依赖；同名但定义冲突时直接暴露。
         if T::output_path().is_some() {
             let name = T::ident(&self.config);
-            self.declarations.insert(name, format!("export {}", T::decl(&self.config)));
+            let decl = format!("export {}", T::decl(&self.config));
+            if let Some(previous) = self.declarations.insert(name.clone(), decl.clone()) {
+                assert_eq!(previous, decl, "conflicting TypeScript export identifier: {name}");
+            }
         }
         T::visit_dependencies(self);
     }

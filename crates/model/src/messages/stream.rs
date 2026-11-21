@@ -1,6 +1,21 @@
 use std::collections::BTreeMap;
 
-use super::*;
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+use crate::config::selection::{ProviderConfig, SelectedModel};
+use crate::error::{
+    ModelErrorKind, ProviderError, bounded_provider_error_diagnostic, provider_embedded_error,
+    provider_error_fields,
+};
+use crate::provider::{
+    ProviderStreamEvent, finalize_provider_response, parse_tool_arguments, provider_response_validation_error,
+};
+use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
+use crate::types::{
+    ContentBlock, Message, ModelStopReason, ModelToolCall, ModelTurnResponse, ModelUsage,
+    ProviderBlockMetadata, ProviderMessageMetadata,
+};
 
 pub(crate) async fn read_messages_sse_stream(
     cancellation: &CancellationToken,
@@ -31,7 +46,6 @@ enum MessagesBlock {
         name: String,
         initial_input: Option<Value>,
         partial_json: String,
-        has_json_delta: bool,
     },
 }
 
@@ -95,8 +109,14 @@ impl SseStreamDecoder for MessagesSseDecoder<'_> {
     }
 
     fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError> {
-        let payload = serde_json::from_slice::<Value>(data)
-            .map_err(|_| provider_messages_stream_malformed_error("event_data_invalid_json"))?;
+        let payload = serde_json::from_slice::<Value>(data).map_err(|error| {
+            let detail = bounded_provider_error_diagnostic(&error.to_string());
+            ProviderError::diagnostic(
+                ModelErrorKind::Other,
+                "provider Messages stream was malformed",
+                &["event_data_invalid_json", detail.as_str()],
+            )
+        })?;
         let event_type = payload
             .get("type")
             .and_then(Value::as_str)
@@ -160,6 +180,9 @@ impl<'a> MessagesSseDecoder<'a> {
 
     fn handle_block_start(&mut self, payload: &Value) -> Result<(), ProviderError> {
         let index = block_index(payload)?;
+        if self.blocks.contains_key(&index) {
+            return Err(provider_messages_stream_malformed_error("content_block_index_duplicate"));
+        }
         let content_block = payload
             .get("content_block")
             .and_then(Value::as_object)
@@ -207,7 +230,6 @@ impl<'a> MessagesSseDecoder<'a> {
                     name,
                     initial_input,
                     partial_json: String::new(),
-                    has_json_delta: false,
                 }
             }
             _ => {
@@ -262,12 +284,11 @@ impl<'a> MessagesSseDecoder<'a> {
                     .ok_or_else(|| provider_messages_stream_malformed_error("signature_delta_missing"))?;
                 signature.push_str(chunk);
             }
-            ("input_json_delta", MessagesBlock::ToolUse { partial_json, has_json_delta, .. }) => {
+            ("input_json_delta", MessagesBlock::ToolUse { partial_json, .. }) => {
                 let chunk = delta
                     .get("partial_json")
                     .and_then(Value::as_str)
                     .ok_or_else(|| provider_messages_stream_malformed_error("input_json_delta_missing"))?;
-                *has_json_delta = true;
                 if !chunk.is_empty() {
                     partial_json.push_str(chunk);
                     (self.on_event)(ProviderStreamEvent::ToolCallDelta);
@@ -304,15 +325,16 @@ impl<'a> MessagesSseDecoder<'a> {
                     ));
                 }
                 Some(other) => {
+                    let other = bounded_provider_error_diagnostic(other);
                     return Err(provider_response_validation_error(
                         &format!("provider Messages response reported an unsupported stop_reason: {other}"),
-                        &["messages_stop_reason_unsupported".to_string()],
+                        &["messages_stop_reason_unsupported"],
                     ));
                 }
                 None => {
                     return Err(provider_response_validation_error(
                         "provider Messages stream did not report stop_reason",
-                        &["messages_stop_reason_missing".to_string()],
+                        &["messages_stop_reason_missing"],
                     ));
                 }
             };
@@ -338,19 +360,9 @@ impl<'a> MessagesSseDecoder<'a> {
                             metadata: Some(ProviderBlockMetadata(fields)),
                         });
                     }
-                    MessagesBlock::ToolUse {
-                        id,
-                        name,
-                        initial_input,
-                        partial_json,
-                        has_json_delta,
-                    } => {
-                        let arguments = if has_json_delta {
-                            if partial_json.trim().is_empty() {
-                                json!({})
-                            } else {
-                                parse_tool_arguments(&partial_json)
-                            }
+                    MessagesBlock::ToolUse { id, name, initial_input, partial_json } => {
+                        let arguments = if !partial_json.trim().is_empty() {
+                            parse_tool_arguments(&partial_json)
                         } else {
                             initial_input.unwrap_or_else(|| json!({}))
                         };

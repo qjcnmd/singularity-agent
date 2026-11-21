@@ -29,6 +29,14 @@ pub(crate) fn validate_provider_value(value: &str, name: &str) -> Result<(), Pro
     Ok(())
 }
 
+pub(crate) fn validate_api_key(value: &str) -> Result<(), ProviderError> {
+    validate_provider_value(value, "api_key")?;
+    if reqwest::header::HeaderValue::from_str(value).is_err() {
+        return Err(configuration_error("模型配置无效：api_key 只能包含可见 ASCII 字符"));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_base_url(value: &str) -> Result<(), ProviderError> {
     validate_provider_value(value, "base_url")?;
     if value.is_empty() {

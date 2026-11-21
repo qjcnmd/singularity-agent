@@ -99,10 +99,16 @@ impl Process {
         );
         let mut progress = tokio::time::interval(Duration::from_millis(100));
         progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let timeout = args.timeout_ms.map(|ms| {
-            let ms = ms.get();
-            (started + Duration::from_millis(ms), ms)
-        });
+        let timeout = args
+            .timeout_ms
+            .map(|ms| {
+                let ms = ms.get();
+                started
+                    .checked_add(Duration::from_millis(ms))
+                    .map(|deadline| (deadline, ms))
+                    .ok_or_else(|| format!("timeout_ms is out of range: {ms}"))
+            })
+            .transpose()?;
         Ok(Self {
             child,
             output,

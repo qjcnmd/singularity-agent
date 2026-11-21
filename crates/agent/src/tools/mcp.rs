@@ -2,6 +2,7 @@
 //! `mcp_call` 调用单个 MCP 工具并校验返回图片、截断超长文本输出。
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -135,7 +136,7 @@ pub(super) async fn execute(
                     match InputImage::from_base64(format!("{}.image", tool.name), &data) {
                         Ok(image) => execution.images.push(image),
                         Err(error) => {
-                            execution.content.push_str(&format!("\n\nMCP 图片无效：{error}"));
+                            let _ = write!(execution.content, "\n\nMCP 图片无效：{error}");
                             execution.is_error = true;
                         }
                     }
@@ -149,7 +150,7 @@ pub(super) async fn execute(
         let (content, note) = output.finish();
         execution.content = content;
         if let Some(note) = note {
-            execution.content.push_str(&format!("\n\n{note}"));
+            let _ = write!(execution.content, "\n\n{note}");
         }
         execution
     })

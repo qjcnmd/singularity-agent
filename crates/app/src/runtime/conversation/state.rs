@@ -21,9 +21,9 @@ pub(crate) struct TurnControls {
 }
 
 impl TurnControls {
-    pub fn new(turn_id: impl Into<String>) -> Self {
+    pub fn new(turn_id: String) -> Self {
         Self {
-            turn_id: turn_id.into(),
+            turn_id,
             cancellation: CancellationToken::new(),
             cancel_state: Mutex::new(CancelState {
                 accepting: true,

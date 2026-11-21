@@ -1,5 +1,6 @@
 //! 工具输出的捕获：只在内存保留末尾部分，统计行数和字节数，超出显示上限时把完整输出写到会话目录。
 
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -69,8 +70,10 @@ impl CaptureState {
     }
 
     pub(super) fn will_write_disk(&self, text: &str) -> bool {
-        if self.spill.is_some() {
-            return true;
+        match &self.spill {
+            Some(Ok(_)) => return true,
+            Some(Err(_)) => return false,
+            None => {}
         }
         if self.total_bytes.saturating_add(text.len()) > DEFAULT_MAX_BYTES {
             return true;
@@ -93,7 +96,7 @@ impl CaptureState {
         self.last_progress = Some((now, self.total_bytes));
         let mut content = self.final_output();
         if let Some(note) = self.spill_note() {
-            content.push_str(&format!("\n\n{note}"));
+            let _ = write!(content, "\n\n{note}");
         }
         Some(content)
     }

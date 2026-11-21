@@ -42,19 +42,30 @@ pub(crate) fn client_builder() -> reqwest::ClientBuilder {
 }
 
 /// 获取全局共享的 reqwest Client 单例（复用连接池与 TLS 会话）。
+const PROVIDER_CONNECT_TIMEOUT_SECONDS: u64 = 30;
+
 pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     if let Some(client) = CLIENT.get() {
         return Ok(client.clone());
     }
     let client = client_builder()
-        // 禁用全局 gzip，SSE 流按到达字节即时解析
+        // 禁用全局 gzip，SSE 流按到达字节即时解析；禁用自动重定向，防止自定义鉴权头随跨源跳转外泄。
         .no_gzip()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(PROVIDER_CONNECT_TIMEOUT_SECONDS))
         .read_timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
         .user_agent(format!("singularity-agent/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(provider_transport_error)?;
     Ok(CLIENT.get_or_init(|| client).clone())
+}
+
+pub(crate) fn sensitive_header_value(value: &str) -> Result<reqwest::header::HeaderValue, ProviderError> {
+    let mut header = reqwest::header::HeaderValue::from_str(value)
+        .map_err(|_| crate::config::configuration_error("模型配置无效：api_key 只能包含可见 ASCII 字符"))?;
+    header.set_sensitive(true);
+    Ok(header)
 }
 
 /// 提取网络传输异常的最内层错误原因；剥离可能含凭据的 URL，并限制最大长度。
@@ -104,8 +115,13 @@ pub(crate) async fn read_bounded_error_body(
 }
 
 pub(crate) fn provider_transport_error(error: reqwest::Error) -> ProviderError {
+    let kind = if error.is_builder() {
+        ModelErrorKind::Other
+    } else {
+        ModelErrorKind::Temporary
+    };
     let message = format!("provider transport failed: {}", transport_error_source(error));
-    ProviderError::new(ModelErrorKind::Temporary, message)
+    ProviderError::new(kind, message)
 }
 
 pub(crate) fn provider_cancelled_error() -> ProviderError {

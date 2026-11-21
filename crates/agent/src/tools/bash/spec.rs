@@ -8,6 +8,8 @@ use serde_json::json;
 use crate::tools::registry::{ToolExecution, error_result};
 
 pub(super) const MAX_WAIT_MS: u64 = 30_000;
+/// 单条命令总超时的安全上限（24 小时），避免极端参数导致 `Instant` 加法溢出。
+pub(super) const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
@@ -32,6 +34,9 @@ impl BashArgs {
     pub(crate) fn validate(self) -> Result<Self, ToolExecution> {
         if self.description.is_empty() {
             return Err(error_result("description must not be empty"));
+        }
+        if self.timeout_ms.is_some_and(|ms| ms.get() > MAX_TIMEOUT_MS) {
+            return Err(error_result(format!("timeout_ms must be at most {MAX_TIMEOUT_MS}")));
         }
         if self.yield_time_ms > MAX_WAIT_MS {
             return Err(error_result("yield_time_ms must be between 0 and 30000"));
@@ -63,7 +68,7 @@ pub(crate) fn spec() -> singularity_core::ToolDefinition {
             "properties": {
                 "command": { "type": "string", "description": "Bash command to execute" },
                 "description": { "type": "string", "minLength": 1, "description": "Short description of this command" },
-                "timeout_ms": { "type": "integer", "minimum": 1, "description": "Optional total execution timeout in milliseconds; no time limit when omitted" },
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_MS, "description": "Optional total execution timeout in milliseconds; no time limit when omitted" },
                 "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "default": 10000, "description": "Wait before returning a task ID; 0 returns immediately" }
             },
             "required": ["command", "description"],

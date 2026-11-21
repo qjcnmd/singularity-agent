@@ -4,16 +4,16 @@ mod stream;
 pub(crate) use self::stream::read_responses_sse_stream;
 
 use serde_json::{Value, json};
-use tokio_util::sync::CancellationToken;
 
 use crate::config::selection::{ProviderConfig, SelectedModel};
-use crate::error::{ModelErrorKind, ProviderError, provider_embedded_error, provider_error_fields};
-use crate::provider::{
-    ProviderStreamEvent, finalize_provider_response, image_data_url, message_metadata_for,
-    parse_tool_call_arguments, parse_usage, provider_response_validation_error, reasoning_wire_decision,
-    serialize_tool_call_arguments,
+use crate::error::{
+    ModelErrorKind, ProviderError, bounded_provider_error_diagnostic, provider_embedded_error,
+    provider_error_fields,
 };
-use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
+use crate::provider::{
+    finalize_provider_response, image_data_url, message_metadata_for, parse_tool_call_arguments, parse_usage,
+    provider_response_validation_error, reasoning_wire_decision, serialize_tool_call_arguments,
+};
 use crate::types::{
     ContentBlock, Message, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
     ProviderBlockMetadata, ProviderMessageMetadata,
@@ -97,12 +97,15 @@ pub(crate) fn parse_openai_responses_response(
                 "provider Responses response was stopped by content filter",
             ));
         }
+        let status = status.map(bounded_provider_error_diagnostic).filter(|s| !s.is_empty());
+        let reason = incomplete_reason.map(bounded_provider_error_diagnostic).filter(|s| !s.is_empty());
         return Err(provider_response_validation_error(
             &format!(
-                "provider Responses payload was not completed (reason: {})",
-                incomplete_reason.unwrap_or("unknown")
+                "provider Responses payload was not completed (status: {}, reason: {})",
+                status.as_deref().unwrap_or("missing"),
+                reason.as_deref().unwrap_or("unknown")
             ),
-            &["responses_status_not_completed".to_string()],
+            &["responses_status_not_completed"],
         ));
     }
     // 内容按提供方输出的顺序保存；续接字段跟随各块，正文和参数不重复保存。
@@ -111,7 +114,7 @@ pub(crate) fn parse_openai_responses_response(
         _ => {
             return Err(provider_response_validation_error(
                 "provider Responses payload missing output items",
-                &["responses_output_missing".to_string()],
+                &["responses_output_missing"],
             ));
         }
     };
@@ -120,7 +123,7 @@ pub(crate) fn parse_openai_responses_response(
         let Some(item_type) = item.get("type").and_then(Value::as_str) else {
             return Err(provider_response_validation_error(
                 "provider Responses output item type was missing",
-                &["responses_output_item_type_missing".into()],
+                &["responses_output_item_type_missing"],
             ));
         };
         let block = match item_type {
@@ -128,7 +131,7 @@ pub(crate) fn parse_openai_responses_response(
                 let text = parse_responses_message_content(item.get("content")).map_err(|evidence| {
                     provider_response_validation_error(
                         "provider Responses message content was invalid",
-                        &[evidence.into()],
+                        &[evidence],
                     )
                 })?;
                 ContentBlock::Text {
@@ -149,7 +152,7 @@ pub(crate) fn parse_openai_responses_response(
                 if item.get("id").and_then(Value::as_str).is_none_or(str::is_empty) {
                     return Err(provider_response_validation_error(
                         "provider Responses reasoning item id was missing",
-                        &["responses_reasoning_item_id_missing".into()],
+                        &["responses_reasoning_item_id_missing"],
                     ));
                 }
                 let thinking = item
@@ -168,7 +171,7 @@ pub(crate) fn parse_openai_responses_response(
             _ => {
                 return Err(provider_response_validation_error(
                     "provider Responses payload contained an unsupported output item",
-                    &["responses_output_item_unsupported".into()],
+                    &["responses_output_item_unsupported"],
                 ));
             }
         };
@@ -247,29 +250,49 @@ pub(crate) fn openai_responses_input(
                 let same_provider =
                     message_metadata_for(message, selection, provider_name, endpoint).is_some();
                 for block in message.content() {
-                    let (mut item, metadata) = match block {
+                    let (fields, metadata): (Vec<(&str, Value)>, Option<&ProviderBlockMetadata>) = match block
+                    {
                         ContentBlock::Text { text, metadata } => (
-                            json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":text}]}),
+                            vec![
+                                ("type", json!("message")),
+                                ("role", json!("assistant")),
+                                ("content", json!([{"type": "output_text", "text": text}])),
+                            ],
                             metadata.as_ref(),
                         ),
                         ContentBlock::Thinking { thinking, metadata }
                             if same_provider && metadata.is_some() =>
                         {
+                            let summary = if thinking.is_empty() {
+                                vec![]
+                            } else {
+                                vec![json!({"type": "summary_text", "text": thinking})]
+                            };
                             (
-                                json!({"type":"reasoning", "summary": if thinking.is_empty() { vec![] } else { vec![json!({"type":"summary_text", "text":thinking})] }}),
+                                vec![("type", json!("reasoning")), ("summary", json!(summary))],
                                 metadata.as_ref(),
                             )
                         }
                         ContentBlock::ToolCall(call) => (
-                            json!({"type":"function_call", "call_id":call.tool_call_id, "name":call.tool_name, "arguments":serialize_tool_call_arguments(&call.arguments)}),
+                            vec![
+                                ("type", json!("function_call")),
+                                ("call_id", json!(call.tool_call_id)),
+                                ("name", json!(call.tool_name)),
+                                ("arguments", json!(serialize_tool_call_arguments(&call.arguments))),
+                            ],
                             call.metadata.as_ref(),
                         ),
                         _ => continue,
                     };
-                    if same_provider && let Some(metadata) = metadata {
-                        item.as_object_mut().expect("encoded item is an object").extend(metadata.0.clone());
+                    let mut map = if same_provider {
+                        metadata.map(|meta| meta.0.clone()).unwrap_or_default()
+                    } else {
+                        serde_json::Map::new()
+                    };
+                    for (key, value) in fields {
+                        map.insert(key.to_string(), value);
                     }
-                    items.push(item);
+                    items.push(Value::Object(map));
                 }
             }
             ModelRole::Developer | ModelRole::User => {

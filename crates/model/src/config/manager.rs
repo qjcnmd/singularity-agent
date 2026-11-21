@@ -9,11 +9,16 @@ use singularity_protocol::{
     ModelConfigurationInput, ProviderConfigurationInput, RedactedModelCatalog, RedactedProvider,
 };
 
-use super::*;
+use super::{
+    ModelSelection, ProviderApiProtocol, ProviderConfig, ProviderError, SelectedModel, UserConfigFile,
+    UserConfigModel, UserConfigProvider, configuration_error, read_user_config_file,
+    resolve_model_definition, resolve_model_selection, validate_api_key, validate_base_url,
+    validate_identifier, write_user_config_file,
+};
 
 /// 本轮模型的上下文窗口和最大输出，每轮开始时确定，用于轮换判断和输出预算。
 /// 修改设置只影响之后的回合。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelConfigurationSnapshot {
     pub max_context_tokens: u32,
     pub max_output_tokens: u32,
@@ -54,7 +59,7 @@ impl ModelConfigManager {
         let _access = self.lock();
         let config = read_user_config_file(&self.directory).ok()??;
         let model = config.providers.get(&selection.provider)?.models.get(&selection.model)?;
-        Some(u64::from(model.max_context_tokens))
+        (model.max_context_tokens > 0).then(|| u64::from(model.max_context_tokens))
     }
     /// 移除提供方，返回保存后的目录（不含密钥）。正在运行的回合不受影响。
     pub fn remove_provider(&self, provider_id: &str) -> Result<RedactedModelCatalog, ProviderError> {
@@ -82,7 +87,7 @@ impl ModelConfigManager {
                 .and_then(|config| config.providers.get(provider_id).map(|provider| provider.api_key.clone()))
                 .unwrap_or_default(),
         };
-        validate_provider_value(&key, "api_key")?;
+        validate_api_key(&key)?;
         Ok(key)
     }
 
@@ -109,19 +114,17 @@ impl ModelConfigManager {
     ) -> Result<RedactedModelCatalog, ProviderError> {
         let _access = self.lock();
         validate_identifier(&input.provider_id, "提供方标识")?;
-        if let Some(key) = api_key {
-            validate_provider_value(key, "api_key")?;
-        }
         // API 根只去掉首尾空白和结尾斜杠；保留完整路径，再追加各协议的端点。
         let base_url = crate::provider::canonical_base_url(&input.base_url).to_string();
         validate_base_url(&base_url)?;
         let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
-        // 先检查全部模型，任何一项不通过都在写文件之前返回。
+        // 先检查全部模型与最终密钥，任何一项不通过都在写文件之前返回。
         let models = model_definitions(input.models, input.api_protocol)?;
         let key = api_key
             .map(str::to_string)
             .or_else(|| config.providers.get(&input.provider_id).map(|provider| provider.api_key.clone()))
             .unwrap_or_default();
+        validate_api_key(&key)?;
         config.providers.insert(
             input.provider_id,
             UserConfigProvider {

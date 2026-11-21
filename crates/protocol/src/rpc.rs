@@ -1,7 +1,16 @@
 //! 工作台全部 RPC 方法名、请求参数与返回类型的对应关系。
 
-use crate::*;
+#[cfg(feature = "typescript")]
+use crate::{
+    AppBootstrap, ContextModule, DirectoryPickResult, McpServerState, ModelCatalogResult, SessionReadResult,
+    SessionStartResult, SkillCatalog, TextDocument, Workspace,
+};
+use crate::{
+    ImageUpload, McpListParams, McpSaveParams, McpServerParams, ModelSelection, ProviderApiProtocol,
+    ProviderConfigurationInput, QuestionAnswerParams,
+};
 use serde::Deserialize;
+use std::fmt;
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -54,7 +63,7 @@ pub struct FileReadParams {
     pub path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSaveParams {
@@ -64,6 +73,15 @@ pub struct ProviderSaveParams {
     pub api_key: Option<String>,
 }
 
+impl fmt::Debug for ProviderSaveParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderSaveParams")
+            .field("provider", &self.provider)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -71,15 +89,26 @@ pub struct ProviderParams {
     pub provider_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoverModelsParams {
     pub provider_id: String,
-    pub api_protocol: crate::ProviderApiProtocol,
+    pub api_protocol: ProviderApiProtocol,
     pub base_url: String,
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub api_key: Option<String>,
+}
+
+impl fmt::Debug for DiscoverModelsParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DiscoverModelsParams")
+            .field("provider_id", &self.provider_id)
+            .field("api_protocol", &self.api_protocol)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,9 +132,9 @@ pub struct SessionFocusParams {
 #[serde(rename_all = "camelCase")]
 pub struct SessionStartParams {
     pub workspace_root: String,
-    pub selection: crate::ModelSelection,
+    pub selection: ModelSelection,
     pub text: String,
-    pub images: Vec<crate::ImageUpload>,
+    pub images: Vec<ImageUpload>,
     /// 附件文件的绝对路径。
     pub files: Vec<String>,
     /// 创建时关闭的上下文模块 ID，任务期间不变。
@@ -118,7 +147,7 @@ pub struct SessionStartParams {
 pub struct SessionTextParams {
     pub session_id: String,
     pub text: String,
-    pub images: Vec<crate::ImageUpload>,
+    pub images: Vec<ImageUpload>,
     pub files: Vec<String>,
 }
 
@@ -143,7 +172,7 @@ pub struct SessionRenameParams {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettingsParams {
     pub session_id: String,
-    pub selection: crate::ModelSelection,
+    pub selection: ModelSelection,
 }
 
 // 请求参数和客户端返回类型由同一份方法表声明。
@@ -168,7 +197,7 @@ macro_rules! rpc_methods {
     };
 }
 rpc_methods! {
-    AppBootstrap => "app.bootstrap" (EmptyParams) -> crate::AppBootstrap,
+    AppBootstrap => "app.bootstrap" (EmptyParams) -> AppBootstrap,
     DirectoryPick => "directory.pick" (EmptyParams) -> DirectoryPickResult,
     FileRead => "file.read" (FileReadParams) -> TextDocument,
     SkillsList => "skills.list" (WorkspaceParams) -> SkillCatalog,
@@ -192,7 +221,7 @@ rpc_methods! {
     SessionRename => "session.rename" (SessionRenameParams) -> (),
     SessionDelete => "session.delete" (SessionParams) -> (),
     SessionSubmit => "session.submit" (SessionTextParams) -> (),
-    SessionAnswerQuestion => "session.answerQuestion" (crate::QuestionAnswerParams) -> (),
+    SessionAnswerQuestion => "session.answerQuestion" (QuestionAnswerParams) -> (),
     SessionAbort => "session.abort" (SessionParams) -> (),
     SessionRotateContext => "session.rotateContext" (SessionParams) -> (),
     SessionContext => "session.context" (SessionParams) -> (),

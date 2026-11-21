@@ -1,12 +1,16 @@
 //! 任务运行态视图、流式与待处理项状态及事件发布。
-use super::*;
+use super::activity::Activity;
+use super::{Conversation, TurnLifecycle};
+use singularity_agent::agent::AgentEvent;
+use singularity_agent::session::lock_writer;
 use singularity_protocol::{
-    SessionFailure, SessionReadResult, SessionRuntime, StreamEvent, TurnEventEnvelope,
+    SessionFailure, SessionPhase, SessionReadResult, SessionRuntime, StreamEvent, TurnEvent,
+    TurnEventEnvelope,
 };
 
 pub(super) struct ConversationView {
     pub(super) last_event_revision: u64,
-    pub(super) activity: super::activity::Activity,
+    pub(super) activity: Activity,
     pub(super) failure: Option<SessionFailure>,
     usage: singularity_protocol::SessionModelUsage,
     pub(super) context: Option<singularity_protocol::InjectedContext>,
@@ -15,14 +19,14 @@ impl ConversationView {
     pub(super) fn new(usage: singularity_protocol::SessionModelUsage, initial_revision: u64) -> Self {
         Self {
             last_event_revision: initial_revision,
-            activity: Default::default(),
+            activity: Activity::default(),
             failure: None,
             usage,
             context: None,
         }
     }
-    pub(super) fn begin(&mut self) {
-        self.activity = Default::default();
+    pub(super) fn begin(&mut self, turn_id: Option<String>) {
+        self.activity = Activity::with_turn_id(turn_id);
         self.failure = None;
     }
 }
@@ -63,7 +67,7 @@ impl Conversation {
             ),
             pending_question: match &state.turn {
                 TurnLifecycle::Running(controls) => controls.questions.pending(),
-                _ => None,
+                TurnLifecycle::Idle => None,
             },
             pending_messages: state
                 .steering_inbox

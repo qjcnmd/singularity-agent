@@ -51,6 +51,16 @@ impl SessionManager {
         selection: singularity_protocol::ModelSelection,
         disabled_modules: Vec<String>,
     ) -> Result<Self> {
+        let parsed_id = uuid::Uuid::parse_str(session_id).map_err(|_| {
+            SessionError::InvalidHeader(format!(
+                "session id must be a canonical lowercase UUID: {session_id}"
+            ))
+        })?;
+        if parsed_id.to_string() != session_id {
+            return Err(SessionError::InvalidHeader(format!(
+                "session id must be a canonical lowercase UUID: {session_id}"
+            )));
+        }
         let cwd = singularity_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
         let cwd_display = cwd.display().to_string();
         std::fs::create_dir_all(sessions_dir)?;
@@ -201,17 +211,15 @@ impl SessionManager {
             )));
         }
         let timestamp = entry.timestamp().to_string();
-        let serialized = serde_json::to_string(&entry)?;
+        let mut bytes = serde_json::to_vec(&entry)?;
+        bytes.push(b'\n');
         let mut handle = OpenOptions::new().append(true).open(&self.file)?;
         // 记下写入错误，阻止后续追加把新记录拼在残缺行后面。
-        handle
-            .write_all(serialized.as_bytes())
-            .and_then(|()| handle.write_all(b"\n"))
-            .map_err(|error| {
-                let error = Arc::new(error);
-                self.append_error = Some(Arc::clone(&error));
-                SessionError::Io(std::io::Error::new(error.kind(), error))
-            })?;
+        handle.write_all(&bytes).map_err(|error| {
+            let error = Arc::new(error);
+            self.append_error = Some(Arc::clone(&error));
+            SessionError::Io(std::io::Error::new(error.kind(), error))
+        })?;
         self.data.entries.push(entry);
         Ok(timestamp)
     }

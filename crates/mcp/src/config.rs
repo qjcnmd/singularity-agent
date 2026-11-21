@@ -76,9 +76,9 @@ impl ServerConfig {
             }
             McpTransportConfig::Http { url, headers } => {
                 let parsed = reqwest::Url::parse(url)
-                    .map_err(|error| format!("MCP 服务器 {id} 地址无效（{url}）：{error}"))?;
+                    .map_err(|error| self.redact(format!("MCP 服务器 {id} 地址无效：{error}")))?;
                 if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-                    return Err(format!("MCP 服务器 {id} 地址必须是有效的 HTTP 或 HTTPS URL：{url}"));
+                    return Err(format!("MCP 服务器 {id} 地址必须是有效的 HTTP 或 HTTPS URL。"));
                 }
                 for (key, value) in headers {
                     reqwest::header::HeaderName::from_bytes(key.as_bytes())
@@ -163,7 +163,8 @@ pub(crate) fn read(home: &Path) -> Result<Configuration, String> {
         }
         Err(error) => return Err(format!("无法读取 {}：{error}", path.display())),
     };
-    let config: Configuration = serde_json::from_slice(&bytes).map_err(|error| {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    let config: Configuration = serde_json::from_slice(bytes).map_err(|error| {
         format!("mcp.json 格式无效（第 {} 行，第 {} 列）。", error.line(), error.column())
     })?;
     for (id, server) in &config.servers {

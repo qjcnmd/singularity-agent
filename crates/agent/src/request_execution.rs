@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// 输出上限取模型上限与窗口剩余空间的最小值。
-pub(crate) fn output_budget_tokens(model: &ModelConfigurationSnapshot, input_tokens: u64) -> u32 {
+pub(crate) fn output_budget_tokens(model: ModelConfigurationSnapshot, input_tokens: u64) -> u32 {
     let room = model.context_window().saturating_sub(input_tokens);
     model.max_output_tokens.min(u32::try_from(room).unwrap_or(u32::MAX))
 }

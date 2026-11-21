@@ -39,7 +39,7 @@ pub(crate) fn spec() -> singularity_core::ToolDefinition {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },
-                "offset": { "type": "integer", "description": "Line number to start reading from (1-indexed)" },
+                "offset": { "type": "integer", "minimum": 1, "description": "Line number to start reading from (1-indexed)" },
                 "limit": { "type": "integer", "minimum": 1, "description": format!("Maximum number of lines to read (omitted: default {DEFAULT_MAX_LINES} lines)") },
             },
             "required": ["path"],
@@ -78,6 +78,9 @@ fn execute_reader(
     reader: &mut impl BufRead,
     signal: &CancellationToken,
 ) -> ToolExecution {
+    if offset == Some(0) {
+        return error_result("offset must be at least 1");
+    }
     if limit == Some(0) {
         return error_result("limit must be at least 1");
     }
@@ -121,10 +124,6 @@ fn execute_reader(
             return error_result(ABORTED_MESSAGE);
         }
         line_number += 1;
-        // 选中窗口已经满了（例如 limit 为 0）时，不必再读或换算后面的行。
-        if state.selected.len() >= user_line_limit {
-            break;
-        }
         // 展示预算按实际发回的文本来算：非法 UTF-8 字节被替换成 U+FFFD 后会变长，
         // 若按原始字节数计算，就可能发出超过预算的正文。
         let text = String::from_utf8_lossy(&line);

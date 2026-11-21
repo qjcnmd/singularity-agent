@@ -1,18 +1,21 @@
 //! 从用户配置的提供方查询可用模型 ID。
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 use serde_json::Value;
 
-use super::{
-    ProviderError, configuration_error, validate_base_url, validate_identifier, validate_provider_value,
-};
+use super::{ProviderError, configuration_error, validate_api_key, validate_base_url, validate_identifier};
 use crate::ModelErrorKind;
-use crate::error::{append_provider_http_diagnostic, parse_provider_error_body};
+use crate::error::{
+    append_provider_http_diagnostic, bounded_provider_error_diagnostic, parse_provider_error_body,
+};
 use crate::transport::http::{
     BoundedBodyReadError, MAX_HTTP_ERROR_BODY_BYTES, client_builder, read_bounded_error_body,
-    transport_error_source,
+    sensitive_header_value, transport_error_source,
 };
+
+const MAX_DISCOVERY_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// 查询提供方的模型 ID；调用方只提供编辑器里的取值、协议类型和解析好的凭据。
 pub async fn discover(
@@ -22,7 +25,7 @@ pub async fn discover(
 ) -> Result<Vec<String>, ProviderError> {
     let base_url = crate::provider::canonical_base_url(base_url);
     validate_base_url(base_url)?;
-    validate_provider_value(api_key, "api_key")?;
+    validate_api_key(api_key)?;
     let client = client_builder()
         .timeout(std::time::Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
@@ -36,7 +39,7 @@ pub async fn discover(
         singularity_protocol::ProviderApiProtocol::Messages => {
             request = request.header("anthropic-version", crate::ANTHROPIC_VERSION);
             if !api_key.is_empty() {
-                request = request.header("x-api-key", api_key);
+                request = request.header("x-api-key", sensitive_header_value(api_key)?);
             }
         }
         singularity_protocol::ProviderApiProtocol::Responses => {
@@ -53,13 +56,21 @@ pub async fn discover(
     read_listing(&body)
 }
 
-/// 分两步读取响应：先读字节，再解析 JSON，这样网络中断和无效 JSON 能报成不同的错误。
+/// 分两步读取响应：先按上限分块读字节，再解析 JSON，这样网络中断、超大响应和无效 JSON 能报成不同的错误。
 /// 直接用 Response::json 时，reqwest 把读取中断也算作解码错误（is_decode() 为 true），
 /// 两者分不开。
-async fn read_response_body(response: reqwest::Response) -> Result<Value, ProviderError> {
-    let bytes = response.bytes().await.map_err(discovery_transport_error)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|_| ProviderError::new(ModelErrorKind::Other, "提供方未返回有效的模型目录。"))
+async fn read_response_body(mut response: reqwest::Response) -> Result<Value, ProviderError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(discovery_transport_error)? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_DISCOVERY_BODY_BYTES {
+            return Err(ProviderError::new(ModelErrorKind::Other, "模型目录响应过大。"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|error| {
+        let detail = bounded_provider_error_diagnostic(&error.to_string());
+        ProviderError::new(ModelErrorKind::Other, format!("提供方未返回有效的模型目录（{detail}）。"))
+    })
 }
 
 /// 发现失败保留去掉 URL、截断后的原因；目录查询由用户手动重试。
@@ -107,9 +118,10 @@ async fn discovery_http_error(response: reqwest::Response) -> ProviderError {
             append_provider_http_diagnostic(&mut error.message, &fields, &body);
         }
         Err(BoundedBodyReadError::Cancelled) => unreachable!("no cancellation token passed"),
-        Err(BoundedBodyReadError::Transport(read_error)) => error
-            .message
-            .push_str(&format!(" 无法读取提供方错误响应（{}）。", transport_error_source(read_error))),
+        Err(BoundedBodyReadError::Transport(read_error)) => {
+            let _ =
+                write!(error.message, " 无法读取提供方错误响应（{}）。", transport_error_source(read_error));
+        }
     }
     error
 }

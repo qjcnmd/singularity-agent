@@ -1,10 +1,19 @@
 //! 模型任务结果与工作台累计展示分开；游标只计算去除终端控制序列后的正文。
 
+use std::fmt::Write as _;
+
 use singularity_protocol::{BackgroundTask, BackgroundTaskState, CommandOutputSnapshot};
 
 use crate::tools::registry::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, ToolDisplay, ToolExecution, error_result,
 };
+
+#[derive(Clone, Copy)]
+pub(super) enum TaskDisplayMode {
+    None,
+    Summary,
+    SummaryWithOutput,
+}
 
 pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> Result<String, String> {
     if cursor > output.total_bytes {
@@ -33,16 +42,16 @@ pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> Result
         if text.is_empty() { "(no new output)" } else { text }
     );
     if start > cursor {
-        result.push_str(&format!("\n[Output bytes {cursor}–{start} omitted.]"));
+        let _ = write!(result, "\n[Output bytes {cursor}–{start} omitted.]");
     }
     if output.incomplete {
         result.push('\n');
         result.push_str(super::exec::OUTPUT_TRUNCATED_BACKGROUND_NOTE);
     }
     if let Some(error) = &output.file_error {
-        result.push_str(&format!("\nFull output could not be saved: {error}"));
+        let _ = write!(result, "\nFull output could not be saved: {error}");
     } else if let Some(path) = &output.full_output {
-        result.push_str(&format!("\nFull output: {path}"));
+        let _ = write!(result, "\nFull output: {path}");
     }
     Ok(result)
 }
@@ -50,33 +59,43 @@ pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> Result
 pub(super) fn task_result(
     task: &BackgroundTask,
     cursor: Option<u64>,
-    display_output: Option<bool>,
+    display_mode: TaskDisplayMode,
 ) -> ToolExecution {
+    match try_task_result(task, cursor, display_mode) {
+        Ok(result) => result,
+        Err(error) => error_result(error),
+    }
+}
+
+pub(super) fn try_task_result(
+    task: &BackgroundTask,
+    cursor: Option<u64>,
+    display_mode: TaskDisplayMode,
+) -> Result<ToolExecution, String> {
     let mut content = format!("Task {}: {}", task.task_id, state_text(&task.state));
     if let Some(cursor) = cursor {
-        match output_text(&task.model_output, cursor) {
-            Ok(output) => {
-                content.push('\n');
-                content.push_str(&output);
-            }
-            Err(error) => return error_result(error),
-        }
+        let output = output_text(&task.model_output, cursor)?;
+        content.push('\n');
+        content.push_str(&output);
     }
     let mut result = ToolExecution::text(content);
-    if let Some(include_output) = display_output {
-        let mut summary = task_summary(task, &task.state);
-        if include_output {
-            summary["output"] = serde_json::json!(task.output);
+    match display_mode {
+        TaskDisplayMode::None => {}
+        TaskDisplayMode::Summary | TaskDisplayMode::SummaryWithOutput => {
+            let mut summary = task_summary(task, &task.state);
+            if matches!(display_mode, TaskDisplayMode::SummaryWithOutput) {
+                summary["output"] = serde_json::json!(task.output);
+            }
+            result.display = Some(Box::new(ToolDisplay {
+                output: serde_json::to_string(&summary).expect("task result serializes"),
+                background_task_id: Some(task.task_id.clone()),
+            }));
         }
-        result.display = Some(Box::new(ToolDisplay {
-            output: serde_json::to_string(&summary).expect("task result serializes"),
-            background_task_id: Some(task.task_id.clone()),
-        }));
     }
     result.is_error = matches!(task.state,
         BackgroundTaskState::Exited { exit_code, .. } if exit_code != 0)
         || matches!(task.state, BackgroundTaskState::Failed { .. } | BackgroundTaskState::Interrupted);
-    result
+    Ok(result)
 }
 
 pub(super) fn state_text(state: &BackgroundTaskState) -> String {

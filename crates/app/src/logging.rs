@@ -12,6 +12,7 @@ use tracing_subscriber::fmt::MakeWriter;
 const LOG_DIR_NAME: &str = "logs";
 const LOG_FILE_NAME: &str = "singularity.log";
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+const ROTATE_RETRY_BACKOFF_BYTES: u64 = 256 * 1024;
 const MAX_ARCHIVES: usize = 3;
 
 const DEFAULT_FILTER: &str = "info,singularity_app=info,singularity_agent=info,singularity_model=info,singularity_mcp=info,hyper=warn,reqwest=warn,rustls=warn,rmcp=warn";
@@ -43,6 +44,7 @@ struct RollingState {
     path: PathBuf,
     file: Option<File>,
     size: u64,
+    next_rotate_at: u64,
 }
 
 impl RollingLogWriter {
@@ -50,14 +52,19 @@ impl RollingLogWriter {
         let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         let file = OpenOptions::new().create(true).append(true).open(&path).ok();
         Self {
-            inner: Arc::new(Mutex::new(RollingState { path, file, size })),
+            inner: Arc::new(Mutex::new(RollingState {
+                path,
+                file,
+                size,
+                next_rotate_at: MAX_LOG_BYTES,
+            })),
         }
     }
 }
 
 impl RollingState {
     fn rotate_if_needed(&mut self, incoming: usize) {
-        if self.size.saturating_add(incoming as u64) <= MAX_LOG_BYTES {
+        if self.size.saturating_add(incoming as u64) <= self.next_rotate_at {
             return;
         }
         self.file.take();
@@ -70,16 +77,26 @@ impl RollingState {
                 let _ = fs::rename(&target, &next);
             }
         }
-        let _ = fs::rename(&self.path, archive_path(&self.path, 1));
-        self.file = OpenOptions::new().create(true).truncate(true).write(true).open(&self.path).ok();
-        self.size = 0;
+        if fs::rename(&self.path, archive_path(&self.path, 1)).is_ok() {
+            self.file = OpenOptions::new().create(true).truncate(true).write(true).open(&self.path).ok();
+            self.size = 0;
+            self.next_rotate_at = MAX_LOG_BYTES;
+        } else {
+            self.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
+            self.size = fs::metadata(&self.path).map(|meta| meta.len()).unwrap_or(0);
+            self.next_rotate_at = self.size.saturating_add(ROTATE_RETRY_BACKOFF_BYTES);
+        }
     }
 
     fn write_bytes(&mut self, buf: &[u8]) {
-        self.rotate_if_needed(buf.len());
         if self.file.is_none() {
             self.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
+            self.size = fs::metadata(&self.path).map(|meta| meta.len()).unwrap_or(0);
+            if self.size < MAX_LOG_BYTES {
+                self.next_rotate_at = MAX_LOG_BYTES;
+            }
         }
+        self.rotate_if_needed(buf.len());
         if let Some(file) = &mut self.file {
             if file.write_all(buf).is_ok() {
                 self.size = self.size.saturating_add(buf.len() as u64);

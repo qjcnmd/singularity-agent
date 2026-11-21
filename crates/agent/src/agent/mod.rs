@@ -241,13 +241,19 @@ impl Agent {
         let input = match &request.input {
             QueuedInputKind::User(input) => input,
             QueuedInputKind::Background { task_id } => {
-                if let Some(text) =
-                    self.bash_tasks.completion_message(task_id).map_err(std::io::Error::other)?
+                let tasks = Arc::clone(&self.bash_tasks);
+                let id = task_id.clone();
+                if let Some((text, end, terminal)) =
+                    tokio::task::spawn_blocking(move || tasks.prepare_completion_message(&id))
+                        .await
+                        .expect("bash completion lookup completes while the runtime is running")
+                        .map_err(std::io::Error::other)?
                 {
                     let message = Message::Notification {
                         content: vec![singularity_model::ContentBlock::text(text)],
                     };
                     self.append_message(&request.message_id, message, None, &[]).await?;
+                    self.bash_tasks.confirm_delivered(task_id, end, terminal);
                 }
                 lock_inbox(&self.inbox).confirm_saved(&request.message_id);
                 return Ok(());

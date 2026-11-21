@@ -17,9 +17,9 @@ use self::state::{ConversationState, TurnLifecycle};
 
 use std::sync::{Arc, Mutex};
 
-use singularity_agent::agent::{AgentEvent, QueuedInput, UserInput};
+use singularity_agent::agent::QueuedInput;
 use singularity_agent::session::{SessionMetadata, SessionWriter, lock_writer};
-use singularity_protocol::{SessionPhase, TurnEvent};
+use singularity_protocol::SessionPhase;
 
 pub struct Conversation {
     pub(crate) thread_id: String,
@@ -129,6 +129,18 @@ impl Conversation {
             || state.context_preview.is_some()
             || self.bash_tasks.is_busy()
             || !state.steering_inbox.lock().expect("turn inbox lock poisoned").pending().is_empty()
+    }
+
+    /// 单次按 `view -> state` 加锁判断是否允许从内存缓存淘汰：删除中、存在未保存错误或有活可做时均不可淘汰。
+    pub fn can_evict(&self) -> bool {
+        let view = self.lock_view();
+        let state = self.lock_state();
+        !state.closing
+            && view.failure.is_none()
+            && !state.turn.is_busy()
+            && state.context_preview.is_none()
+            && !self.bash_tasks.is_busy()
+            && state.steering_inbox.lock().expect("turn inbox lock poisoned").pending().is_empty()
     }
 
     pub fn phase(&self) -> SessionPhase {

@@ -44,7 +44,7 @@ impl RequestContext {
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        if self.context_pressure_tokens()
+        if self.context_pressure_tokens().await
             >= (self.context_window() as f64 * AUTO_CONTEXT_ROTATION_TRIGGER_RATIO).floor() as u64
         {
             self.rotate_now(on_event, cancellation, false).await?;
@@ -161,7 +161,7 @@ impl RequestContext {
             let full_messages = input.messages.clone();
             let full_dir = input.image_directory.clone();
             let full_instruction = instruction.clone();
-            let max_output_tokens = output_budget_tokens(&model, estimated_full_input);
+            let max_output_tokens = output_budget_tokens(model, estimated_full_input);
             let request = tokio::task::spawn_blocking(move || {
                 let mut messages = full_defs.messages;
                 messages.extend(full_messages);
@@ -193,14 +193,17 @@ impl RequestContext {
                         window = model.context_window(),
                         "standard context rotation overflowed; falling back to degraded compaction"
                     );
+                    let plan = RotationPlan {
+                        definitions: &definitions,
+                        instruction: &instruction,
+                        instruction_tokens,
+                        model,
+                        input_budget,
+                    };
                     self.rotate_degraded(
-                        &definitions,
+                        &plan,
                         input.messages,
                         &input.image_directory,
-                        &instruction,
-                        instruction_tokens,
-                        &model,
-                        input_budget,
                         on_event,
                         cancellation,
                     )
@@ -215,18 +218,15 @@ impl RequestContext {
                 budget = input_budget,
                 "context rotation entering degraded compaction path"
             );
-            self.rotate_degraded(
-                &definitions,
-                input.messages,
-                &input.image_directory,
-                &instruction,
+            let plan = RotationPlan {
+                definitions: &definitions,
+                instruction: &instruction,
                 instruction_tokens,
-                &model,
+                model,
                 input_budget,
-                on_event,
-                cancellation,
-            )
-            .await?
+            };
+            self.rotate_degraded(&plan, input.messages, &input.image_directory, on_event, cancellation)
+                .await?
         };
 
         if !begin_commit() || cancellation.is_cancelled() {
@@ -240,39 +240,24 @@ impl RequestContext {
         Ok(user_messages)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn rotate_degraded(
         &self,
-        definitions: &super::request::RequestDefinitions,
+        plan: &RotationPlan<'_>,
         mut history: Vec<Message>,
         image_directory: &std::path::Path,
-        instruction: &Message,
-        instruction_tokens: u64,
-        model: &ModelConfigurationSnapshot,
-        input_budget: u64,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<String> {
         // 阶梯 1：剥离图片二进制（保留路径说明）并折叠所有历史工具结果。
         compaction::strip_images_to_captions(&mut history, image_directory);
         compaction::compact_tool_results(&mut history);
-        let stage1_tokens = definitions
+        let stage1_tokens = plan
+            .definitions
             .estimated_tokens
             .saturating_add(compaction::messages_tokens(&history))
-            .saturating_add(instruction_tokens);
-        if stage1_tokens <= input_budget {
-            match self
-                .send_degraded_rotation(
-                    definitions,
-                    &history,
-                    instruction,
-                    stage1_tokens,
-                    model,
-                    on_event,
-                    cancellation,
-                )
-                .await
-            {
+            .saturating_add(plan.instruction_tokens);
+        if stage1_tokens <= plan.input_budget {
+            match self.send_degraded_rotation(plan, &history, stage1_tokens, on_event, cancellation).await {
                 Ok(text) => return Ok(text),
                 Err(AgentError::Provider(error)) if error.is_context_overflow() => {
                     tracing::warn!("stage-1 degraded rotation overflowed; escalating to stage-2");
@@ -283,23 +268,13 @@ impl RequestContext {
 
         // 阶梯 2：进一步剥离助手思考并折叠超长助手正文与工具调用参数，完整保留用户发言。
         compaction::compact_assistant_messages(&mut history);
-        let stage2_tokens = definitions
+        let stage2_tokens = plan
+            .definitions
             .estimated_tokens
             .saturating_add(compaction::messages_tokens(&history))
-            .saturating_add(instruction_tokens);
-        if stage2_tokens <= input_budget {
-            match self
-                .send_degraded_rotation(
-                    definitions,
-                    &history,
-                    instruction,
-                    stage2_tokens,
-                    model,
-                    on_event,
-                    cancellation,
-                )
-                .await
-            {
+            .saturating_add(plan.instruction_tokens);
+        if stage2_tokens <= plan.input_budget {
+            match self.send_degraded_rotation(plan, &history, stage2_tokens, on_event, cancellation).await {
                 Ok(text) => return Ok(text),
                 Err(AgentError::Provider(error)) if error.is_context_overflow() => {
                     tracing::warn!("stage-2 degraded rotation overflowed; escalating to chunked rotation");
@@ -309,41 +284,27 @@ impl RequestContext {
         }
 
         // 阶梯 3：按原子消息组切分，逐批滚动整理；单批可用预算留出上一版整理正文的空间。
-        let fixed_overhead = definitions.estimated_tokens.saturating_add(instruction_tokens);
-        let summary_reserve = u64::from(USER_MESSAGES_TARGET_TOKENS).min(input_budget / 3);
+        let fixed_overhead = plan.definitions.estimated_tokens.saturating_add(plan.instruction_tokens);
+        let summary_reserve = u64::from(USER_MESSAGES_TARGET_TOKENS).min(plan.input_budget / 3);
         let chunk_budget =
-            input_budget.saturating_sub(fixed_overhead).saturating_sub(summary_reserve).max(1024);
+            plan.input_budget.saturating_sub(fixed_overhead).saturating_sub(summary_reserve).max(1024);
         let chunks = compaction::partition_into_chunks(history, chunk_budget);
         tracing::info!(chunk_count = chunks.len(), chunk_budget, "running chunked rolling context rotation");
         let mut rolling: Option<String> = None;
         for chunk in chunks {
             rolling = Some(
-                self.send_chunk_with_fallback(
-                    definitions,
-                    rolling.as_deref(),
-                    chunk,
-                    instruction,
-                    instruction_tokens,
-                    model,
-                    0,
-                    on_event,
-                    cancellation,
-                )
-                .await?,
+                self.send_chunk_with_fallback(plan, rolling.as_deref(), chunk, 0, on_event, cancellation)
+                    .await?,
             );
         }
         rolling.ok_or_else(|| AgentError::InvalidContextRotation("没有可供整理的历史消息。".into()))
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn send_chunk_with_fallback(
         &self,
-        definitions: &super::request::RequestDefinitions,
+        plan: &RotationPlan<'_>,
         previous_summary: Option<&str>,
         mut chunk: Vec<Message>,
-        instruction: &Message,
-        instruction_tokens: u64,
-        model: &ModelConfigurationSnapshot,
         depth: u8,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
@@ -353,22 +314,12 @@ impl RequestContext {
             batch.push(Message::user(format!("上一版用户消息整理正文：\n\n{summary}")));
         }
         batch.extend(chunk.iter().cloned());
-        let estimated = definitions
+        let estimated = plan
+            .definitions
             .estimated_tokens
             .saturating_add(compaction::messages_tokens(&batch))
-            .saturating_add(instruction_tokens);
-        match self
-            .send_degraded_rotation(
-                definitions,
-                &batch,
-                instruction,
-                estimated,
-                model,
-                on_event,
-                cancellation,
-            )
-            .await
-        {
+            .saturating_add(plan.instruction_tokens);
+        match self.send_degraded_rotation(plan, &batch, estimated, on_event, cancellation).await {
             Ok(text) => Ok(text),
             Err(AgentError::Provider(error)) if error.is_context_overflow() && depth < 3 => {
                 // 估算低估导致单批仍超窗：将当前批按原子组折半，或极端单条消息截短后重试。
@@ -378,24 +329,18 @@ impl RequestContext {
                     let left: Vec<Message> = groups[..mid].iter().flatten().cloned().collect();
                     let right: Vec<Message> = groups[mid..].iter().flatten().cloned().collect();
                     let first = Box::pin(self.send_chunk_with_fallback(
-                        definitions,
+                        plan,
                         previous_summary,
                         left,
-                        instruction,
-                        instruction_tokens,
-                        model,
                         depth + 1,
                         on_event,
                         cancellation,
                     ))
                     .await?;
                     Box::pin(self.send_chunk_with_fallback(
-                        definitions,
+                        plan,
                         Some(&first),
                         right,
-                        instruction,
-                        instruction_tokens,
-                        model,
                         depth + 1,
                         on_event,
                         cancellation,
@@ -405,12 +350,9 @@ impl RequestContext {
                     let mut single: Vec<Message> = groups.into_iter().flatten().collect();
                     compaction::shrink_messages_by_half(&mut single);
                     Box::pin(self.send_chunk_with_fallback(
-                        definitions,
+                        plan,
                         previous_summary,
                         single,
-                        instruction,
-                        instruction_tokens,
-                        model,
                         depth + 1,
                         on_event,
                         cancellation,
@@ -422,27 +364,24 @@ impl RequestContext {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn send_degraded_rotation(
         &self,
-        definitions: &super::request::RequestDefinitions,
+        plan: &RotationPlan<'_>,
         history: &[Message],
-        instruction: &Message,
         estimated_tokens: u64,
-        model: &ModelConfigurationSnapshot,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<String> {
-        let mut messages = Vec::with_capacity(definitions.messages.len() + history.len() + 1);
-        messages.extend(definitions.messages.iter().cloned());
+        let mut messages = Vec::with_capacity(plan.definitions.messages.len() + history.len() + 1);
+        messages.extend(plan.definitions.messages.iter().cloned());
         messages.extend(history.iter().cloned());
-        messages.push(instruction.clone());
-        let max_output = output_budget_tokens(model, estimated_tokens)
-            .max(model.max_output_tokens.min(MIN_ROTATION_OUTPUT_TOKENS));
+        messages.push(plan.instruction.clone());
+        let max_output = output_budget_tokens(plan.model, estimated_tokens)
+            .max(plan.model.max_output_tokens.min(MIN_ROTATION_OUTPUT_TOKENS));
         let request = ModelTurnRequest {
             messages,
             images: HashMap::new(),
-            tools: definitions.tools.clone(),
+            tools: plan.definitions.tools.clone(),
             max_output_tokens: max_output,
         };
         let (response, _, _) = execute_request(
@@ -456,6 +395,14 @@ impl RequestContext {
         .await?;
         validate_user_messages(&response)
     }
+}
+
+struct RotationPlan<'a> {
+    definitions: &'a super::request::RequestDefinitions,
+    instruction: &'a Message,
+    instruction_tokens: u64,
+    model: ModelConfigurationSnapshot,
+    input_budget: u64,
 }
 
 /// 没有新增对话时沿用原有的轮换反馈，不创建请求上下文。

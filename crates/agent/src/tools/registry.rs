@@ -115,8 +115,14 @@ impl PreparedTool {
             Self::Bash(args) => {
                 Box::pin(bash_tasks.execute(args, cwd, output_directory, signal, on_update)).await
             }
-            Self::TaskList(_) => bash_tasks.tool_list(),
-            Self::TaskOutput(args) => bash_tasks.output(&args.task_id, &signal),
+            Self::TaskList(_) => tokio::task::spawn_blocking(move || bash_tasks.tool_list())
+                .await
+                .expect("tool worker completes while the runtime is running"),
+            Self::TaskOutput(args) => {
+                tokio::task::spawn_blocking(move || bash_tasks.output(&args.task_id, &signal))
+                    .await
+                    .expect("tool worker completes while the runtime is running")
+            }
             Self::TaskStop(args) => Box::pin(bash_tasks.tool_stop(&args.task_id)).await,
             Self::Read(args) => tokio::task::spawn_blocking(move || read::execute(&args, &cwd, &signal))
                 .await

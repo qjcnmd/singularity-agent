@@ -53,20 +53,31 @@ impl StreamHub {
             }
             drop(focused);
             if self.stream.capacity() < STREAM_RESERVED_CONTROL_SLOTS {
+                let revision = *order;
+                let capacity = self.stream.capacity();
+                drop(order);
                 tracing::warn!(
                     session_id = target_session,
-                    capacity = self.stream.capacity(),
+                    capacity,
                     "dropping high-frequency progress frame under backpressure"
                 );
-                return *order;
+                return revision;
             }
         }
-        *order += 1;
-        let revision = *order;
-        if let Err(error) = self.stream.try_send(StreamEnvelope { revision, event }) {
-            tracing::warn!(revision, error = %error, "failed to enqueue stream event");
+        match self.stream.try_reserve() {
+            Ok(permit) => {
+                *order += 1;
+                let revision = *order;
+                permit.send(StreamEnvelope { revision, event });
+                revision
+            }
+            Err(error) => {
+                let revision = *order;
+                drop(order);
+                tracing::warn!(revision, error = %error, "failed to enqueue stream event");
+                revision
+            }
         }
-        revision
     }
 
     /// 生成交给单个 `Conversation` 使用的发布回调。

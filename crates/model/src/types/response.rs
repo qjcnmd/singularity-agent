@@ -3,7 +3,7 @@ use super::message::Message;
 use crate::ProviderError;
 
 /// 把 Messages 与 Responses 两种协议统一后的停止原因。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelStopReason {
     Stop,
     Length,

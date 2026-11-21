@@ -6,6 +6,8 @@
 //! 当上下文接近上限时，可先写入一条 `ToolOutputsPruned` 水位线记录，将水位线及之前
 //! 的超长旧工具输出折叠为摘要（并跳过旧图片二进制），保持后续前缀稳定以维持前缀缓存。
 
+use std::fmt::Write as _;
+
 use singularity_core::estimate_tokens_of;
 use singularity_model::{ContentBlock, Message};
 
@@ -414,14 +416,15 @@ fn message_time(entry: &SessionEntry) -> String {
 pub(crate) fn image_captions(message: &Message, directory: &std::path::Path) -> String {
     let mut captions = String::new();
     for (index, image) in message.images().enumerate() {
-        captions.push_str(&format!(
+        let _ = write!(
+            captions,
             "\n[Image #{}: {}; {} × {}; saved copy: {}]",
             index + 1,
             image.name,
             image.width,
             image.height,
             directory.join(&image.id).display()
-        ));
+        );
     }
     captions
 }

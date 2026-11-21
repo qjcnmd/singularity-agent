@@ -1,4 +1,15 @@
-use super::*;
+use serde_json::Value;
+use tokio_util::sync::CancellationToken;
+
+use super::parse_openai_responses_response;
+use crate::config::selection::{ProviderConfig, SelectedModel};
+use crate::error::{
+    ModelErrorKind, ProviderError, bounded_provider_error_diagnostic, provider_embedded_error,
+    provider_error_fields,
+};
+use crate::provider::ProviderStreamEvent;
+use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
+use crate::types::{Message, ModelTurnResponse};
 
 pub(crate) async fn read_responses_sse_stream(
     cancellation: &CancellationToken,
@@ -27,8 +38,14 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
     }
 
     fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError> {
-        let mut payload = serde_json::from_slice::<Value>(data)
-            .map_err(|_| provider_responses_stream_malformed_error("event_data_invalid_json"))?;
+        let mut payload = serde_json::from_slice::<Value>(data).map_err(|error| {
+            let detail = bounded_provider_error_diagnostic(&error.to_string());
+            ProviderError::diagnostic(
+                ModelErrorKind::Other,
+                "provider Responses stream was malformed",
+                &["event_data_invalid_json", detail.as_str()],
+            )
+        })?;
         let payload_type = payload
             .get("type")
             .and_then(Value::as_str)

@@ -51,12 +51,13 @@ impl RequestContext {
         cancellation: &CancellationToken,
     ) -> Result<(RequestDefinitions, singularity_protocol::InjectedContext)> {
         let home = self.config.instruction_home.clone();
-        let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let skill_cwd = cwd.clone();
+        let session = std::sync::Arc::clone(&self.session);
         let instructions = self.config.initial_instructions.clone();
         let disabled = &self.config.disabled_modules;
-        let skills = tokio::task::spawn_blocking(move || {
-            singularity_core::skills::SkillCatalog::discover(&skill_cwd, &home)
+        let (cwd, skills) = tokio::task::spawn_blocking(move || {
+            let cwd = lock_writer(&session).cwd().to_path_buf();
+            let skills = singularity_core::skills::SkillCatalog::discover(&cwd, &home);
+            (cwd, skills)
         })
         .await
         .expect("skill discovery completes while the runtime is running");
@@ -88,26 +89,32 @@ impl RequestContext {
     }
 
     /// 估算下一次请求的输入 Token 数（最近一次实际用量加上新增消息，或全量估算），供自动轮换判断使用。
-    pub(super) fn context_pressure_tokens(&self) -> u64 {
-        let writer = lock_writer(&self.session);
-        context::estimated_tokens(
-            &writer,
-            self.provider.model_identity(),
-            self.request_definitions().estimated_tokens,
-        )
+    pub(super) async fn context_pressure_tokens(&self) -> u64 {
+        let session = std::sync::Arc::clone(&self.session);
+        let (provider, model_name) = self.provider.model_identity();
+        let identity = (provider.to_owned(), model_name.to_owned());
+        let overhead_tokens = self.request_definitions().estimated_tokens;
+        tokio::task::spawn_blocking(move || {
+            let writer = lock_writer(&session);
+            context::estimated_tokens(&writer, (&identity.0, &identity.1), overhead_tokens)
+        })
+        .await
+        .expect("context pressure estimate completes while the runtime is running")
     }
 
     /// 达到软压力阈值时先执行零模型调用的旧工具输出微压缩，通过写入锚定水位线保持后续前缀稳定。
     pub(super) async fn prune_tool_outputs_if_needed(&self) -> Result<()> {
-        let candidate = {
-            let writer = lock_writer(&self.session);
-            context::select_prune_target(
-                &writer,
-                self.provider.model_identity(),
-                self.request_definitions().estimated_tokens,
-                self.context_window(),
-            )
-        };
+        let session = std::sync::Arc::clone(&self.session);
+        let (provider, model_name) = self.provider.model_identity();
+        let identity = (provider.to_owned(), model_name.to_owned());
+        let overhead_tokens = self.request_definitions().estimated_tokens;
+        let context_window = self.context_window();
+        let candidate = tokio::task::spawn_blocking(move || {
+            let writer = lock_writer(&session);
+            context::select_prune_target(&writer, (&identity.0, &identity.1), overhead_tokens, context_window)
+        })
+        .await
+        .expect("prune target selection completes while the runtime is running");
         if let Some((before_entry_id, saved_tokens)) = candidate {
             tracing::info!(
                 before_entry_id = %before_entry_id,
@@ -149,7 +156,7 @@ impl RequestContext {
                 messages,
                 images,
                 tools,
-                max_output_tokens: output_budget_tokens(&model, input_tokens),
+                max_output_tokens: output_budget_tokens(model, input_tokens),
             })
         })
         .await

@@ -6,19 +6,11 @@ pub(crate) use self::stream::read_messages_sse_stream;
 use std::collections::HashMap;
 
 use serde_json::{Value, json};
-use tokio_util::sync::CancellationToken;
 
-use crate::config::selection::{ProviderConfig, SelectedModel};
-use crate::error::{ModelErrorKind, ProviderError, provider_embedded_error, provider_error_fields};
-use crate::provider::{
-    ProviderStreamEvent, finalize_provider_response, image_data_url, message_metadata_for,
-    parse_tool_arguments, provider_response_validation_error, reasoning_wire_decision,
-};
-use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
-use crate::types::{
-    ContentBlock, Message, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
-    ModelUsage, ProviderBlockMetadata, ProviderMessageMetadata,
-};
+use crate::config::selection::SelectedModel;
+use crate::error::{ModelErrorKind, ProviderError};
+use crate::provider::{image_data_url, message_metadata_for, reasoning_wire_decision};
+use crate::types::{ContentBlock, Message, ModelRole, ModelTurnRequest};
 
 pub(crate) fn messages_stream_request_payload(
     request: &ModelTurnRequest,
@@ -181,14 +173,10 @@ fn encode_assistant_blocks(content: &[ContentBlock], same_provider: bool) -> Vec
                 {
                     blocks.push(Value::Object(meta.0.clone()));
                 } else if !thinking.is_empty() || metadata.is_some() {
-                    let mut encoded = json!({
-                        "type": "thinking",
-                        "thinking": thinking,
-                    });
-                    if let Some(meta) = metadata {
-                        encoded.as_object_mut().expect("thinking block is an object").extend(meta.0.clone());
-                    }
-                    blocks.push(encoded);
+                    let mut map = metadata.as_ref().map(|meta| meta.0.clone()).unwrap_or_default();
+                    map.insert("type".to_string(), json!("thinking"));
+                    map.insert("thinking".to_string(), json!(thinking));
+                    blocks.push(Value::Object(map));
                 }
             }
             ContentBlock::Text { text, .. } if !text.is_empty() => {

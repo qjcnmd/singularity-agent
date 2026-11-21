@@ -44,8 +44,8 @@ pub fn iso_minus_millis(timestamp: &str, millis: u64) -> Option<String> {
 /// 规范化路径显示：替换为正斜杠，并处理 Windows 的 UNC 与 verbatim 扩展前缀。
 pub fn display_path(path: &std::path::Path) -> String {
     let text = path.to_string_lossy().replace('\\', "/");
-    if let Some(rest) = text.strip_prefix("//?/UNC/") {
-        format!("//{rest}")
+    if text.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("//?/UNC/")) {
+        format!("//{}", &text[8..])
     } else if let Some(rest) = text.strip_prefix("//?/") {
         rest.to_owned()
     } else {

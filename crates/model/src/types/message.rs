@@ -1,7 +1,6 @@
 use super::{ModelToolCall, ProviderBlockMetadata, ProviderMessageMetadata};
 /// 发给模型时的消息角色；后台通知作为 `user` 消息发送。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelRole {
     Developer,
     User,

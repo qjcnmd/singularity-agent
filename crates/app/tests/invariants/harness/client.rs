@@ -230,7 +230,7 @@ impl BackendClient {
         assert!(status.success(), "backend exited with {status}; stderr:\n{}", self.stderr_text());
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "test harness RPC builder helper")]
     pub async fn setup_workspace_and_provider(
         &mut self,
         workspace: &str,
@@ -265,7 +265,7 @@ impl BackendClient {
         canonical
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "test harness RPC builder helper")]
     pub async fn start_session(
         &mut self,
         workspace: &str,

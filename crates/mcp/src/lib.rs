@@ -36,6 +36,7 @@ struct PreparedEntries {
 /// MCP 配置和连接的管理者；设置页和 Agent 共用同一个实例。
 pub struct McpManager {
     home: PathBuf,
+    config_lock: Mutex<()>,
     connections: Mutex<Connections>,
 }
 
@@ -96,6 +97,7 @@ impl McpManager {
     /// 绑定用户数据目录；每次设置操作和工具发现读取 mcp.json，无配置时目录为空。
     pub fn open(home: PathBuf) -> Self {
         Self {
+            config_lock: Mutex::new(()),
             connections: Mutex::new(BTreeMap::new()),
             home,
         }
@@ -137,10 +139,12 @@ impl McpManager {
         change: impl FnOnce(&mut Configuration) -> Result<(), String>,
     ) -> Result<Vec<McpServerState>, String> {
         let (evicted, states) = {
-            let mut connections = self.lock();
+            // 仅串行化 mcp.json 的读写与替换，避免在盘 IO 期间阻塞异步线程上的连接表读取。
+            let _config_guard = self.config_lock.lock().expect("MCP config lock poisoned");
             let mut config = config::read(&self.home)?;
             change(&mut config)?;
             config::write(&self.home, &config)?;
+            let mut connections = self.lock();
             let mut evicted = Vec::new();
             connections.retain(|(_, server), (_, cell)| {
                 if server == id {
@@ -420,7 +424,8 @@ async fn close_connections(cells: Vec<ConnectionCell>) {
     for cell in cells {
         closing.spawn(async move {
             let connection = cell.lock().await.connection.take();
-            if let Some(connection) = connection {
+            // 仅当没有活跃回合持有 McpTool 时主动异步关闭；否则交由最后一个工具释放时通过 Drop 清理。
+            if let Some(connection) = connection.and_then(Arc::into_inner) {
                 connection.close().await;
             }
         });
