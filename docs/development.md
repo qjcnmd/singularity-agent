@@ -21,7 +21,7 @@ Set-Location singularity-agent
 npm --prefix apps/desktop ci
 
 # 2. 编译 Rust 后端
-cargo build -p singularity_app --locked
+cargo build -p app --locked
 
 # 3. 构建前端并复制后端到桌面资源目录
 npm --prefix apps/desktop run build
@@ -40,7 +40,7 @@ Rust 后端启动后直接通过标准输入/输出处理 RPC。
   1. 在系统托盘右键退出正在运行的 Singularity 实例（同一数据目录仅允许单一实例运行）。
   2. 重新编译后端并拷贝运行时：
      ```powershell
-     cargo build -p singularity_app --locked
+     cargo build -p app --locked
      npm --prefix apps/desktop run prepare:runtime
      npm --prefix apps/desktop start
      ```
@@ -79,7 +79,7 @@ npm --prefix apps/desktop run lint
 npm --prefix apps/desktop run build
 
 # 验证跨端协议 TypeScript 声明与 Rust DTO 同步（无漂移）
-cargo run -p singularity_protocol --features typescript --example export_types --locked
+cargo run -p protocol --features typescript --example export_types --locked
 git diff --ignore-cr-at-eol --exit-code -- apps/desktop/src/protocol.generated.ts
 ```
 
@@ -105,7 +105,7 @@ node apps/desktop/e2e/smoke.mjs --packaged=C:/Users/$env:USERNAME/Desktop/Singul
 
 ```powershell
 # 自动重新生成 apps/desktop/src/protocol.generated.ts
-cargo run -p singularity_protocol --features typescript --example export_types
+cargo run -p protocol --features typescript --example export_types
 ```
 
 导出后请通过 `git status` 确认生成的前端类型定义，并检查前端调用方的类型匹配。
@@ -129,7 +129,7 @@ Windows 包通过 `electronLanguages` 只保留简体中文（`zh-CN`）和英�
 ```powershell
 # 构建 Release 版本后端与前端
 npm --prefix apps/desktop run build
-cargo build --release --locked --package singularity_app --bins
+cargo build --release --locked --package app --bins
 npm --prefix apps/desktop run prepare:runtime -- release
 
 # 使用 Electron Builder 生成免安装绿色目录

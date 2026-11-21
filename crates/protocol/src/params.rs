@@ -92,7 +92,7 @@ pub enum HistoryMessageRole {
 /// 回合的 ID 和状态保存在 ThreadTurn 上，条目里不重复。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum HistoryItem {
     Message {
         id: String,
@@ -132,7 +132,6 @@ pub enum HistoryItem {
     },
     ContextRotation {
         id: String,
-        #[serde(rename = "userMessages")]
         user_messages: String,
     },
     /// 轮换进行中、失败、中断或无需轮换；成功的整理内容用 ContextRotation 条目。

@@ -2,11 +2,11 @@
 //! 历史只包含用户能看到的消息、思考、工具和轮换内容，不带原始日志行或
 //! 提供方私有字段；任务摘要直接读取最近回合的状态，完整历史才划分全部回合。
 
-use singularity_agent::session::{
+use agent::session::{
     LedgerRecord, MessageDisplay, SessionData, SessionEntry, SessionError, SessionMetadata,
 };
-use singularity_model::{ContentBlock, Message};
-use singularity_protocol::{
+use model::{ContentBlock, Message};
+use protocol::{
     HistoryItem, SessionModelUsage, ThreadHistory, ThreadSummary, ThreadTurn, ToolStatus, TurnStatus,
 };
 
@@ -14,7 +14,7 @@ use singularity_protocol::{
 struct IndexedTurn {
     turn_id: String,
     status: TurnStatus,
-    error: Option<singularity_protocol::TurnErrorDetail>,
+    error: Option<protocol::TurnErrorDetail>,
     /// 用户主动停止导致的中断。
     manually_stopped: bool,
     entries: std::ops::Range<usize>,
@@ -55,16 +55,14 @@ impl IndexedTurn {
                             && let Some(decode_ms) =
                                 observation.as_ref().and_then(|observation| observation.decode_ms)
                         {
-                            first_token_at = singularity_core::iso_minus_millis(timestamp, decode_ms);
+                            first_token_at = app_core::iso_minus_millis(timestamp, decode_ms);
                         }
                         let status = match observation.as_ref().map(|observation| observation.status) {
-                            Some(singularity_protocol::ProviderAttemptStatus::Error) => TurnStatus::Failed,
-                            Some(singularity_protocol::ProviderAttemptStatus::Cancelled) => {
-                                TurnStatus::Interrupted
-                            }
+                            Some(protocol::ProviderAttemptStatus::Error) => TurnStatus::Failed,
+                            Some(protocol::ProviderAttemptStatus::Cancelled) => TurnStatus::Interrupted,
                             _ => TurnStatus::Completed,
                         };
-                        let mut public = singularity_agent::message::public_items(
+                        let mut public = agent::message::public_items(
                             message,
                             display.as_ref(),
                             id,
@@ -73,7 +71,7 @@ impl IndexedTurn {
                             timestamp,
                         );
                         if observation.is_some() {
-                            singularity_agent::message::attach_usage(&mut public, usage);
+                            agent::message::attach_usage(&mut public, usage);
                         }
                         for item in public {
                             if matches!(item, HistoryItem::Tool { .. }) {
@@ -93,9 +91,8 @@ impl IndexedTurn {
                         let HistoryItem::Tool { result, status, .. } = &mut items[position] else {
                             unreachable!("tool positions contain calls");
                         };
-                        let displayed =
-                            singularity_agent::message::public_tool_result(message, display.as_ref())
-                                .expect("matched a tool result message");
+                        let displayed = agent::message::public_tool_result(message, display.as_ref())
+                            .expect("matched a tool result message");
                         *status = if displayed.is_error {
                             ToolStatus::Failed
                         } else {
@@ -176,7 +173,7 @@ fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
             && &last.turn_id == id
         {
             last.status = *outcome;
-            last.error = error.clone();
+            last.error.clone_from(error);
             last.manually_stopped = is_manually_stopped(*outcome, *user_stopped);
         }
     }
@@ -188,9 +185,9 @@ const MAX_SESSION_TITLE_CHARS: usize = 8;
 /// 从最近一次生成请求读取实际输入用量；轮换成功或切换模型后不沿用旧读数。
 pub(crate) fn context_usage(
     entries: &[SessionEntry],
-    selected: &singularity_protocol::ModelSelection,
+    selected: &protocol::ModelSelection,
     capacity: Option<u64>,
-) -> Option<singularity_protocol::ContextUsage> {
+) -> Option<protocol::ContextUsage> {
     let capacity = capacity.filter(|capacity| *capacity > 0)?;
     for entry in entries.iter().rev() {
         match entry {
@@ -204,14 +201,14 @@ pub(crate) fn context_usage(
         let Some(request) = entry.request_observation() else {
             continue;
         };
-        if request.purpose == singularity_protocol::RequestPurpose::ContextRotation {
+        if request.purpose == protocol::RequestPurpose::ContextRotation {
             continue;
         }
         let Some(usage) = &request.usage else { continue };
         if request.provider != selected.provider || request.model != selected.model {
             return None;
         }
-        return Some(singularity_protocol::ContextUsage { used: usage.input_tokens, capacity });
+        return Some(protocol::ContextUsage { used: usage.input_tokens, capacity });
     }
     None
 }
@@ -223,7 +220,7 @@ fn default_title(message: &Message, display: Option<&MessageDisplay>) -> Option<
     let mut remaining = MAX_SESSION_TITLE_CHARS;
     let words = message.content().iter().enumerate().filter_map(|(index, block)| match block {
         ContentBlock::Text { text, .. } => {
-            Some(singularity_agent::message::user_text_for_display(display, index, text).split_whitespace())
+            Some(agent::message::user_text_for_display(display, index, text).split_whitespace())
         }
         ContentBlock::Thinking { .. } | ContentBlock::ToolCall(_) | ContentBlock::Image(_) => None,
     });
@@ -265,9 +262,9 @@ pub(crate) fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
 }
 
 /// 历史读取和实时事件共用的用量累计规则；每个请求的结束记录只计一次。
-pub fn accumulate_request_usage(
+pub(crate) fn accumulate_request_usage(
     usage: &mut SessionModelUsage,
-    observation: &singularity_protocol::RequestObservation,
+    observation: &protocol::RequestObservation,
 ) {
     if let Some(ttft_ms) = observation.ttft_ms {
         usage.ttft_ms = usage.ttft_ms.saturating_add(ttft_ms);
@@ -332,8 +329,7 @@ pub(crate) fn summarize_thread(session: &SessionData) -> ThreadSummary {
         .iter()
         .rev()
         .find(|entry| !matches!(entry, SessionEntry::Metadata { .. }))
-        .map(|entry| entry.timestamp().to_owned())
-        .unwrap_or_else(|| created_at.clone());
+        .map_or_else(|| created_at.clone(), |entry| entry.timestamp().to_owned());
     ThreadSummary {
         thread_id: session.session_id().to_string(),
         cwd: session.cwd_string(),

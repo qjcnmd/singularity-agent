@@ -98,14 +98,12 @@ struct MessagesSseDecoder<'a> {
     usage: MessagesUsageAccumulator,
     stop_reason: Option<String>,
     completed: bool,
-    partial_text: String,
-    partial_thinking: String,
     on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send),
 }
 
 impl SseStreamDecoder for MessagesSseDecoder<'_> {
-    fn frame_malformed() -> fn(&'static str) -> ProviderError {
-        provider_messages_stream_malformed_error
+    fn frame_malformed(reason: &'static str) -> ProviderError {
+        provider_messages_stream_malformed_error(reason)
     }
 
     fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError> {
@@ -172,8 +170,6 @@ impl<'a> MessagesSseDecoder<'a> {
             usage: MessagesUsageAccumulator::default(),
             stop_reason: None,
             completed: false,
-            partial_text: String::new(),
-            partial_thinking: String::new(),
             on_event,
         }
     }
@@ -195,7 +191,6 @@ impl<'a> MessagesSseDecoder<'a> {
             "text" => {
                 let text = content_block.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
                 if !text.is_empty() {
-                    self.partial_text.push_str(&text);
                     (self.on_event)(ProviderStreamEvent::OutputTextDelta { delta: text.clone() });
                 }
                 MessagesBlock::Text { text }
@@ -206,7 +201,6 @@ impl<'a> MessagesSseDecoder<'a> {
                 let signature =
                     content_block.get("signature").and_then(Value::as_str).unwrap_or_default().to_string();
                 if !thinking.is_empty() {
-                    self.partial_thinking.push_str(&thinking);
                     (self.on_event)(ProviderStreamEvent::ReasoningTextDelta { delta: thinking.clone() });
                 }
                 MessagesBlock::Thinking { thinking, signature }
@@ -262,7 +256,6 @@ impl<'a> MessagesSseDecoder<'a> {
                     .ok_or_else(|| provider_messages_stream_malformed_error("text_delta_missing"))?;
                 if !chunk.is_empty() {
                     text.push_str(chunk);
-                    self.partial_text.push_str(chunk);
                     (self.on_event)(ProviderStreamEvent::OutputTextDelta { delta: chunk.to_string() });
                 }
             }
@@ -273,7 +266,6 @@ impl<'a> MessagesSseDecoder<'a> {
                     .ok_or_else(|| provider_messages_stream_malformed_error("thinking_delta_missing"))?;
                 if !chunk.is_empty() {
                     thinking.push_str(chunk);
-                    self.partial_thinking.push_str(chunk);
                     (self.on_event)(ProviderStreamEvent::ReasoningTextDelta { delta: chunk.to_string() });
                 }
             }
@@ -303,97 +295,102 @@ impl<'a> MessagesSseDecoder<'a> {
     }
 
     fn finish(
-        mut self,
+        self,
         result: Result<(), ProviderError>,
         config: &ProviderConfig,
         model_name: &str,
         endpoint: &str,
     ) -> ModelTurnResponse {
-        let partial_text = std::mem::take(&mut self.partial_text);
-        let partial_thinking = std::mem::take(&mut self.partial_thinking);
-        let result = result.and_then(|()| {
+        let stop_reason = result.and_then(|()| {
             if !self.completed {
                 return Err(provider_messages_stream_terminal_missing_error());
             }
-            let stop_reason = match self.stop_reason.as_deref() {
-                Some("end_turn" | "tool_use" | "stop_sequence" | "pause_turn") => ModelStopReason::Stop,
-                Some("max_tokens") => ModelStopReason::Length,
-                Some("refusal") => {
-                    return Err(ProviderError::new(
-                        ModelErrorKind::Other,
-                        "provider Messages response was stopped by refusal",
-                    ));
-                }
+            match self.stop_reason.as_deref() {
+                Some("end_turn" | "tool_use" | "stop_sequence" | "pause_turn") => Ok(ModelStopReason::Stop),
+                Some("max_tokens") => Ok(ModelStopReason::Length),
+                Some("refusal") => Err(ProviderError::new(
+                    ModelErrorKind::Other,
+                    "provider Messages response was stopped by refusal",
+                )),
                 Some(other) => {
                     let other = bounded_provider_error_diagnostic(other);
-                    return Err(provider_response_validation_error(
+                    Err(provider_response_validation_error(
                         &format!("provider Messages response reported an unsupported stop_reason: {other}"),
                         &["messages_stop_reason_unsupported"],
-                    ));
+                    ))
                 }
-                None => {
-                    return Err(provider_response_validation_error(
-                        "provider Messages stream did not report stop_reason",
-                        &["messages_stop_reason_missing"],
-                    ));
-                }
-            };
-            let mut content = Vec::with_capacity(self.blocks.len());
-            for block in self.blocks.into_values() {
-                match block {
-                    MessagesBlock::Text { text } if !text.is_empty() => {
-                        content.push(ContentBlock::Text { text, metadata: None });
-                    }
-                    MessagesBlock::Thinking { thinking, signature } => {
-                        let metadata = (!signature.is_empty()).then(|| {
-                            let mut map = serde_json::Map::new();
-                            map.insert("signature".to_string(), Value::String(signature));
-                            ProviderBlockMetadata(map)
-                        });
-                        if !thinking.is_empty() || metadata.is_some() {
-                            content.push(ContentBlock::Thinking { thinking, metadata });
-                        }
-                    }
-                    MessagesBlock::RedactedThinking { fields } => {
-                        content.push(ContentBlock::Thinking {
-                            thinking: String::new(),
-                            metadata: Some(ProviderBlockMetadata(fields)),
-                        });
-                    }
-                    MessagesBlock::ToolUse { id, name, initial_input, partial_json } => {
-                        let arguments = if !partial_json.trim().is_empty() {
-                            parse_tool_arguments(&partial_json)
-                        } else {
-                            initial_input.unwrap_or_else(|| json!({}))
-                        };
-                        content.push(ContentBlock::ToolCall(ModelToolCall {
-                            tool_call_id: id,
-                            tool_name: name,
-                            arguments,
-                            metadata: None,
-                        }));
-                    }
-                    MessagesBlock::Text { .. } => {}
-                }
+                None => Err(provider_response_validation_error(
+                    "provider Messages stream did not report stop_reason",
+                    &["messages_stop_reason_missing"],
+                )),
             }
-            let provider_metadata = Some(ProviderMessageMetadata::Messages {
-                provider_name: config.provider_name.clone(),
-                model_name: model_name.into(),
-                endpoint: endpoint.into(),
-            });
-            Ok(finalize_provider_response(ModelTurnResponse {
-                assistant_message: Message::Assistant { content, provider_metadata },
-                usage: self.usage.into_model_usage(),
-                stop_reason,
-            }))
         });
-        match result {
-            Ok(response) => response,
-            Err(error) => ModelTurnResponse::failed(
-                error,
-                Message::assistant(partial_text, partial_thinking, Vec::new(), None),
-            ),
+        let stop_reason = match stop_reason {
+            Ok(stop_reason) => stop_reason,
+            Err(error) => {
+                let mut partial_text = String::new();
+                let mut partial_thinking = String::new();
+                for block in self.blocks.into_values() {
+                    match block {
+                        MessagesBlock::Text { text } => partial_text.push_str(&text),
+                        MessagesBlock::Thinking { thinking, .. } => partial_thinking.push_str(&thinking),
+                        MessagesBlock::RedactedThinking { .. } | MessagesBlock::ToolUse { .. } => {}
+                    }
+                }
+                return ModelTurnResponse::failed(
+                    error,
+                    Message::assistant(partial_text, partial_thinking, Vec::new(), None),
+                );
+            }
+        };
+        let mut content = Vec::with_capacity(self.blocks.len());
+        for block in self.blocks.into_values() {
+            match block {
+                MessagesBlock::Text { text } if !text.is_empty() => {
+                    content.push(ContentBlock::Text { text, metadata: None });
+                }
+                MessagesBlock::Thinking { thinking, signature } => {
+                    let metadata = (!signature.is_empty()).then(|| {
+                        let mut map = serde_json::Map::new();
+                        map.insert("signature".to_string(), Value::String(signature));
+                        ProviderBlockMetadata(map)
+                    });
+                    if !thinking.is_empty() || metadata.is_some() {
+                        content.push(ContentBlock::Thinking { thinking, metadata });
+                    }
+                }
+                MessagesBlock::RedactedThinking { fields } => {
+                    content.push(ContentBlock::Thinking {
+                        thinking: String::new(),
+                        metadata: Some(ProviderBlockMetadata(fields)),
+                    });
+                }
+                MessagesBlock::ToolUse { id, name, initial_input, partial_json } => {
+                    let arguments = if partial_json.trim().is_empty() {
+                        initial_input.unwrap_or_else(|| json!({}))
+                    } else {
+                        parse_tool_arguments(&partial_json)
+                    };
+                    content.push(ContentBlock::ToolCall(ModelToolCall {
+                        tool_call_id: id,
+                        tool_name: name,
+                        arguments,
+                        metadata: None,
+                    }));
+                }
+                MessagesBlock::Text { .. } => {}
+            }
         }
+        let provider_metadata = Some(ProviderMessageMetadata::Messages {
+            provider_name: config.provider_name.clone(),
+            model_name: model_name.into(),
+            endpoint: endpoint.into(),
+        });
+        finalize_provider_response(ModelTurnResponse {
+            assistant_message: Message::Assistant { content, provider_metadata },
+            usage: self.usage.into_model_usage(),
+            stop_reason,
+        })
     }
 }
 

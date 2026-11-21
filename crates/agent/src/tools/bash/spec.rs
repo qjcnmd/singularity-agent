@@ -59,8 +59,8 @@ pub(crate) struct TaskIdArgs {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TaskListArgs {}
 
-pub(crate) fn spec() -> singularity_core::ToolDefinition {
-    singularity_core::ToolDefinition {
+pub(crate) fn spec() -> app_core::ToolDefinition {
+    app_core::ToolDefinition {
         name: "bash".to_string(),
         description: DESCRIPTION.clone(),
         parameters_schema: json!({
@@ -77,16 +77,16 @@ pub(crate) fn spec() -> singularity_core::ToolDefinition {
     }
 }
 
-pub(crate) fn task_list_spec() -> singularity_core::ToolDefinition {
-    singularity_core::ToolDefinition {
+pub(crate) fn task_list_spec() -> app_core::ToolDefinition {
+    app_core::ToolDefinition {
         name: "task_list".to_string(),
         description: "List this session's background commands, including saved commands from earlier runs. Commands left running in saved history are interrupted; they are not restarted. Completion notifies you automatically; do not repeatedly poll.".to_string(),
         parameters_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
     }
 }
 
-pub(crate) fn task_output_spec() -> singularity_core::ToolDefinition {
-    singularity_core::ToolDefinition {
+pub(crate) fn task_output_spec() -> app_core::ToolDefinition {
+    app_core::ToolDefinition {
         name: "task_output".to_string(),
         description: "Inspect a background command when its current output helps you act now. Returns immediately with status and only output not already delivered by bash, task_output or a completion notice. No cursor or waiting is needed. Completion delivers new output automatically; do not poll. Use read on the full-output file to revisit earlier text.".to_string(),
         parameters_schema: json!({
@@ -99,8 +99,8 @@ pub(crate) fn task_output_spec() -> singularity_core::ToolDefinition {
     }
 }
 
-pub(crate) fn task_stop_spec() -> singularity_core::ToolDefinition {
-    singularity_core::ToolDefinition {
+pub(crate) fn task_stop_spec() -> app_core::ToolDefinition {
+    app_core::ToolDefinition {
         name: "task_stop".to_string(),
         description: "Stop this background command and all descendants, then wait for cleanup. Stopping an already finished command returns its existing result.".to_string(),
         parameters_schema: json!({

@@ -1,10 +1,10 @@
+use protocol::ProviderApiProtocol;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use singularity_protocol::ProviderApiProtocol;
 use std::fmt;
 
 /// 随助手消息保存在会话日志中的提供方续接信息，用于后续请求向同一模型回传思考签名或加密内容；转换前端历史条目时不展示。
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "protocol", rename_all = "snake_case")]
 pub enum ProviderMessageMetadata {
     Messages {
@@ -30,7 +30,7 @@ impl fmt::Debug for ProviderMessageMetadata {
                 Self::Responses { .. } => "responses",
             },
         );
-        debug.finish()
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -67,7 +67,7 @@ impl ProviderMessageMetadata {
 /// 原始输出中除正文、思考和工具参数之外的续接字段，不进入公开事件。
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ProviderBlockMetadata(pub serde_json::Map<String, Value>);
+pub struct ProviderBlockMetadata(pub(crate) serde_json::Map<String, Value>);
 impl fmt::Debug for ProviderBlockMetadata {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ProviderBlockMetadata([redacted])")

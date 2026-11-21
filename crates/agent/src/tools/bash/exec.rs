@@ -5,7 +5,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use process_wrap::tokio::{ChildWrapper, CommandWrap, CreationFlags, JobObject, KillOnDrop};
-use singularity_protocol::{BackgroundTaskState, CommandOutputSnapshot};
+use protocol::{BackgroundTaskState, CommandOutputSnapshot};
 use tokio::process::Command;
 use tokio::time::{Instant, Interval};
 use tokio_util::sync::CancellationToken;
@@ -60,12 +60,12 @@ pub(super) struct Process {
 
 impl Process {
     pub(super) fn persist_output(&mut self) {
-        tokio::task::block_in_place(|| self.model_capture.persist());
+        run_blocking_in_place(|| self.model_capture.persist());
     }
 
     fn ingest(&mut self, chunk: &OutputChunk) {
         if self.capture.will_write_disk(&chunk.display) || self.model_capture.will_write_disk(&chunk.model) {
-            tokio::task::block_in_place(|| {
+            run_blocking_in_place(|| {
                 self.capture.ingest(&chunk.display);
                 self.model_capture.ingest(&chunk.model);
             });
@@ -75,40 +75,46 @@ impl Process {
         }
     }
 
-    pub(super) fn spawn(args: &BashArgs, cwd: &Path, output_directory: &Path) -> Result<Self, String> {
-        let shell = bash_path()?;
-        let started = Instant::now();
-        let mut command = Command::new(&shell);
-        command
-            .args(["-c", &args.command])
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut wrapped = CommandWrap::from(command);
-        wrapped
-            .wrap(CreationFlags(windows::Win32::System::Threading::CREATE_NO_WINDOW))
-            .wrap(JobObject)
-            .wrap(KillOnDrop);
-        let mut child = wrapped
-            .spawn()
-            .map_err(|error| format!("failed to spawn shell {}: {error}", shell.display()))?;
+    pub(super) async fn spawn(args: &BashArgs, cwd: &Path, output_directory: &Path) -> Result<Self, String> {
+        let command_text = args.command.clone();
+        let cwd = cwd.to_path_buf();
+        let timeout_ms = args.timeout_ms.map(std::num::NonZeroU64::get);
+        let (mut child, started, timeout) = tokio::task::spawn_blocking(move || {
+            let shell = bash_path()?;
+            let started = Instant::now();
+            let timeout = timeout_ms
+                .map(|ms| {
+                    started
+                        .checked_add(Duration::from_millis(ms))
+                        .map(|deadline| (deadline, ms))
+                        .ok_or_else(|| format!("timeout_ms is out of range: {ms}"))
+                })
+                .transpose()?;
+            let mut command = Command::new(&shell);
+            command
+                .args(["-c", &command_text])
+                .current_dir(&cwd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut wrapped = CommandWrap::from(command);
+            wrapped
+                .wrap(CreationFlags(windows::Win32::System::Threading::CREATE_NO_WINDOW))
+                .wrap(JobObject)
+                .wrap(KillOnDrop);
+            let child = wrapped
+                .spawn()
+                .map_err(|error| format!("failed to spawn shell {}: {error}", shell.display()))?;
+            Ok::<_, String>((child, started, timeout))
+        })
+        .await
+        .expect("bash process spawn completes while the runtime is running")?;
         let output = OutputStreams::new(
             child.stdout().take().expect("bash stdout is piped"),
             child.stderr().take().expect("bash stderr is piped"),
         );
         let mut progress = tokio::time::interval(Duration::from_millis(100));
         progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let timeout = args
-            .timeout_ms
-            .map(|ms| {
-                let ms = ms.get();
-                started
-                    .checked_add(Duration::from_millis(ms))
-                    .map(|deadline| (deadline, ms))
-                    .ok_or_else(|| format!("timeout_ms is out of range: {ms}"))
-            })
-            .transpose()?;
         Ok(Self {
             child,
             output,
@@ -124,7 +130,7 @@ impl Process {
         loop {
             tokio::select! {
                 biased;
-                _ = signal.cancelled() => return ProcessEvent::Finished(Outcome::Stopped),
+                () = signal.cancelled() => return ProcessEvent::Finished(Outcome::Stopped),
                 ms = wait_deadline(self.timeout) => return ProcessEvent::Finished(Outcome::Failed(format!(
                     "Command timed out after {ms} ms and was terminated"
                 ))),
@@ -136,7 +142,7 @@ impl Process {
                     },
                     Err(error) => Outcome::Failed(format!("failed to wait for the command process: {error}")),
                 }),
-                _ = self.progress.tick() => {},
+                _ = self.progress.tick(), if self.capture.has_pending_output() => {},
                 chunk = self.output.next(), if self.output.is_open() => match chunk {
                     Some(Ok(chunk)) => self.ingest(&chunk),
                     Some(Err(error)) => return ProcessEvent::Finished(Outcome::Failed(error.to_string())),
@@ -150,6 +156,10 @@ impl Process {
                 };
             }
         }
+    }
+
+    pub(super) fn display_output(&self) -> String {
+        self.capture.display_output()
     }
 
     pub(super) fn model_output(&self) -> CommandOutputSnapshot {
@@ -177,7 +187,7 @@ impl Process {
         while self.output.is_open() {
             tokio::select! {
                 biased;
-                _ = &mut drain => { truncated = true; break; }
+                () = &mut drain => { truncated = true; break; }
                 chunk = self.output.next() => match chunk {
                     Some(Ok(chunk)) => self.ingest(&chunk),
                     Some(Err(error)) => failures.push(error.to_string()),
@@ -203,7 +213,7 @@ impl Process {
             }));
         }
         execution.is_error = !matches!(outcome, Outcome::Exited(0));
-        execution.duration_ms = Some(singularity_core::duration_millis(self.started.elapsed()));
+        execution.duration_ms = Some(app_core::duration_millis(self.started.elapsed()));
         (execution, outcome, model_output)
     }
 }
@@ -216,7 +226,7 @@ fn finished_output(capture: CaptureState, outcome: &Outcome, truncated: bool) ->
         Outcome::Exited(code) => append_status(&mut content, &format!("Command exited with code {code}")),
         Outcome::Stopped => append_status(&mut content, ABORTED_MESSAGE),
         Outcome::Failed(message) | Outcome::CleanupFailed(message) => append_status(&mut content, message),
-    };
+    }
     if content.is_empty() {
         content = "(no output)".to_string();
     }
@@ -236,6 +246,16 @@ async fn wait_deadline(timeout: Option<(Instant, u64)>) -> u64 {
             ms
         }
         None => std::future::pending().await,
+    }
+}
+
+fn run_blocking_in_place<R>(f: impl FnOnce() -> R) -> R {
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
     }
 }
 

@@ -43,13 +43,18 @@ pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionM
     writer.lock().expect("session writer lock poisoned")
 }
 
+/// 在短临界区内访问会话写者，避免把 `MutexGuard` 暴露给调用方。
+pub fn with_writer<R>(writer: &SessionWriter, operation: impl FnOnce(&mut SessionManager) -> R) -> R {
+    operation(&mut writer.lock().expect("session writer lock poisoned"))
+}
+
 /// 在阻塞线程池中使用会话写者，文件 IO 不占用异步运行时线程。
 pub async fn with_writer_async<T: Send + 'static>(
     writer: &SessionWriter,
     operation: impl FnOnce(&mut SessionManager) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     let writer = std::sync::Arc::clone(writer);
-    tokio::task::spawn_blocking(move || operation(&mut lock_writer(&writer)))
+    tokio::task::spawn_blocking(move || with_writer(&writer, operation))
         .await
         .expect("session writer completes while the runtime is running")
 }

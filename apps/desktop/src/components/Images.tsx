@@ -11,7 +11,7 @@ export function useAttachmentInput(addImages: (images: File[]) => void, addFiles
   const receive = (files: File[]) => {
     if (disabled) return false
     const images = files.filter(file => file.type.startsWith('image/'))
-    const paths = files.filter(file => !file.type.startsWith('image/')).map(file => window.singularity.pathForFile(file)).filter(path => path !== '')
+    const paths = files.filter(file => !file.type.startsWith('image/')).map(file => window.desktop.pathForFile(file)).filter(path => path !== '')
     if (images.length) addImages(images)
     if (paths.length) addFiles(paths)
     return images.length + paths.length > 0

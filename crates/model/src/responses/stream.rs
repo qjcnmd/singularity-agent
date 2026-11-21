@@ -33,8 +33,8 @@ struct ResponsesSseDecoder<'a> {
 }
 
 impl SseStreamDecoder for ResponsesSseDecoder<'_> {
-    fn frame_malformed() -> fn(&'static str) -> ProviderError {
-        provider_responses_stream_malformed_error
+    fn frame_malformed(reason: &'static str) -> ProviderError {
+        provider_responses_stream_malformed_error(reason)
     }
 
     fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError> {
@@ -85,13 +85,17 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                 }
             }
             "response.completed" | "response.incomplete" => {
-                let response = payload.get_mut("response").map(std::mem::take).ok_or_else(|| {
-                    provider_responses_stream_malformed_error(if completed {
-                        "completed_response_missing"
-                    } else {
-                        "incomplete_response_missing"
-                    })
-                })?;
+                let response = payload
+                    .get_mut("response")
+                    .filter(|value| value.is_object())
+                    .map(std::mem::take)
+                    .ok_or_else(|| {
+                        provider_responses_stream_malformed_error(if completed {
+                            "completed_response_missing"
+                        } else {
+                            "incomplete_response_missing"
+                        })
+                    })?;
                 self.terminal_response = Some(response);
             }
             "error" => {

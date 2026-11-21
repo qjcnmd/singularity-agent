@@ -1,5 +1,5 @@
 use super::message::Message;
-use singularity_core::ToolDefinition;
+use app_core::ToolDefinition;
 
 /// 发给提供方的一次模型请求，包含上下文消息、已加载的图片 data URL、工具定义和输出上限。
 #[derive(Debug, Clone, PartialEq)]

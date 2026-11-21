@@ -10,18 +10,18 @@ use super::{AgentError, AgentEvent, RequestContext, Result, TurnEvent};
 use crate::compaction;
 use crate::request_execution::{execute_request, output_budget_tokens};
 use crate::session::{ContextRotationEntry, ContextRotationInput, context, with_writer_async};
-use singularity_model::{Message, ModelConfigurationSnapshot, ModelTurnRequest, ModelTurnResponse};
-use singularity_protocol::{HistoryItem, TurnStatus};
+use model::{Message, ModelConfigurationSnapshot, ModelTurnRequest, ModelTurnResponse};
+use protocol::{HistoryItem, TurnStatus};
 use tokio_util::sync::CancellationToken;
 
-const AUTO_CONTEXT_ROTATION_TRIGGER_RATIO: f64 = 0.9;
+const AUTO_CONTEXT_ROTATION_TRIGGER_PERCENT: u128 = 90;
 
 /// 正文的软目标；请求输出上限另按模型配置和窗口余量计算。
 const USER_MESSAGES_TARGET_TOKENS: u32 = 8192;
 /// 整理请求至少预留的输出空间，避免输入把窗口挤到 `max_output_tokens == 0`。
 const MIN_ROTATION_OUTPUT_TOKENS: u32 = 2048;
 
-const ORGANIZE_USER_MESSAGES: &str = r#"请结合当前对话，更新这份用户消息整理内容，输出完整的新版本。首次整理时，直接生成第一版。
+const ORGANIZE_USER_MESSAGES: &str = r"请结合当前对话，更新这份用户消息整理内容，输出完整的新版本。首次整理时，直接生成第一版。
 
 整理对象是用户在对话中实际表达的内容，包括提问、反馈、猜测、纠正、指令，以及工具结果或后台通知中记录的用户回复。上一版用户消息整理正文用于接续此前的表达。
 
@@ -33,7 +33,7 @@ const ORGANIZE_USER_MESSAGES: &str = r#"请结合当前对话，更新这份用�
 
 每条用户表达引用相应原始消息或回复记录的时间，形式为 [10-31 15:06:32]，已有引用随原文保留。工具结果或后台通知中的用户回复使用标注的记录时间；它是记录保存时间，不声称是外部操作的精确发生时间。来源没有时间时不编造。
 
-本次回复直接给出更新后的用户消息整理正文。"#;
+本次回复直接给出更新后的用户消息整理正文。";
 
 impl RequestContext {
     pub(super) async fn rotate_context_if_needed(
@@ -44,9 +44,10 @@ impl RequestContext {
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        if self.context_pressure_tokens().await
-            >= (self.context_window() as f64 * AUTO_CONTEXT_ROTATION_TRIGGER_RATIO).floor() as u64
-        {
+        let trigger =
+            u64::try_from(u128::from(self.context_window()) * AUTO_CONTEXT_ROTATION_TRIGGER_PERCENT / 100)
+                .unwrap_or(u64::MAX);
+        if self.context_pressure_tokens().await >= trigger {
             self.rotate_now(on_event, cancellation, false).await?;
         }
         Ok(())
@@ -137,8 +138,7 @@ impl RequestContext {
         self.ensure_definitions(on_event, cancellation).await?;
         let definitions = self.request_definitions().clone();
         let model = self.provider.model_configuration();
-        let (provider_name, model_name) = self.provider.model_identity();
-        let identity = (provider_name.to_owned(), model_name.to_owned());
+        let identity = (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned());
         let instruction = Message::developer(
             ORGANIZE_USER_MESSAGES.replace("{{B}}", &USER_MESSAGES_TARGET_TOKENS.to_string()),
         );
@@ -182,7 +182,7 @@ impl RequestContext {
                 &request,
                 on_event,
                 cancellation,
-                singularity_protocol::RequestPurpose::ContextRotation,
+                protocol::RequestPurpose::ContextRotation,
             )
             .await
             {
@@ -200,10 +200,13 @@ impl RequestContext {
                         model,
                         input_budget,
                     };
+                    let overflowed_tokens = (!input.messages.iter().any(|m| m.images().next().is_some()))
+                        .then(|| compaction::messages_tokens(&input.messages));
                     self.rotate_degraded(
                         &plan,
                         input.messages,
                         &input.image_directory,
+                        overflowed_tokens,
                         on_event,
                         cancellation,
                     )
@@ -225,8 +228,18 @@ impl RequestContext {
                 model,
                 input_budget,
             };
-            self.rotate_degraded(&plan, input.messages, &input.image_directory, on_event, cancellation)
-                .await?
+            let overflowed_tokens = (force_compact
+                && !input.messages.iter().any(|m| m.images().next().is_some()))
+            .then(|| compaction::messages_tokens(&input.messages));
+            self.rotate_degraded(
+                &plan,
+                input.messages,
+                &input.image_directory,
+                overflowed_tokens,
+                on_event,
+                cancellation,
+            )
+            .await?
         };
 
         if !begin_commit() || cancellation.is_cancelled() {
@@ -245,21 +258,26 @@ impl RequestContext {
         plan: &RotationPlan<'_>,
         mut history: Vec<Message>,
         image_directory: &std::path::Path,
+        mut last_overflow_tokens: Option<u64>,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<String> {
         // 阶梯 1：剥离图片二进制（保留路径说明）并折叠所有历史工具结果。
         compaction::strip_images_to_captions(&mut history, image_directory);
         compaction::compact_tool_results(&mut history);
+        let stage1_history_tokens = compaction::messages_tokens(&history);
         let stage1_tokens = plan
             .definitions
             .estimated_tokens
-            .saturating_add(compaction::messages_tokens(&history))
+            .saturating_add(stage1_history_tokens)
             .saturating_add(plan.instruction_tokens);
-        if stage1_tokens <= plan.input_budget {
+        if stage1_tokens <= plan.input_budget
+            && last_overflow_tokens.is_none_or(|previous| stage1_history_tokens < previous)
+        {
             match self.send_degraded_rotation(plan, &history, stage1_tokens, on_event, cancellation).await {
                 Ok(text) => return Ok(text),
                 Err(AgentError::Provider(error)) if error.is_context_overflow() => {
+                    last_overflow_tokens = Some(stage1_history_tokens);
                     tracing::warn!("stage-1 degraded rotation overflowed; escalating to stage-2");
                 }
                 Err(error) => return Err(error),
@@ -268,12 +286,15 @@ impl RequestContext {
 
         // 阶梯 2：进一步剥离助手思考并折叠超长助手正文与工具调用参数，完整保留用户发言。
         compaction::compact_assistant_messages(&mut history);
+        let stage2_history_tokens = compaction::messages_tokens(&history);
         let stage2_tokens = plan
             .definitions
             .estimated_tokens
-            .saturating_add(compaction::messages_tokens(&history))
+            .saturating_add(stage2_history_tokens)
             .saturating_add(plan.instruction_tokens);
-        if stage2_tokens <= plan.input_budget {
+        if stage2_tokens <= plan.input_budget
+            && last_overflow_tokens.is_none_or(|previous| stage2_history_tokens < previous)
+        {
             match self.send_degraded_rotation(plan, &history, stage2_tokens, on_event, cancellation).await {
                 Ok(text) => return Ok(text),
                 Err(AgentError::Provider(error)) if error.is_context_overflow() => {
@@ -323,11 +344,12 @@ impl RequestContext {
             Ok(text) => Ok(text),
             Err(AgentError::Provider(error)) if error.is_context_overflow() && depth < 3 => {
                 // 估算低估导致单批仍超窗：将当前批按原子组折半，或极端单条消息截短后重试。
-                let groups = compaction::atomic_groups(std::mem::take(&mut chunk));
+                let mut groups = compaction::atomic_groups(std::mem::take(&mut chunk));
                 if groups.len() >= 2 {
                     let mid = groups.len() / 2;
-                    let left: Vec<Message> = groups[..mid].iter().flatten().cloned().collect();
-                    let right: Vec<Message> = groups[mid..].iter().flatten().cloned().collect();
+                    let right_groups = groups.split_off(mid);
+                    let left: Vec<Message> = groups.into_iter().flatten().collect();
+                    let right: Vec<Message> = right_groups.into_iter().flatten().collect();
                     let first = Box::pin(self.send_chunk_with_fallback(
                         plan,
                         previous_summary,
@@ -348,7 +370,11 @@ impl RequestContext {
                     .await
                 } else {
                     let mut single: Vec<Message> = groups.into_iter().flatten().collect();
+                    let before_tokens = compaction::messages_tokens(&single);
                     compaction::shrink_messages_by_half(&mut single);
+                    if compaction::messages_tokens(&single) >= before_tokens {
+                        return Err(AgentError::Provider(error));
+                    }
                     Box::pin(self.send_chunk_with_fallback(
                         plan,
                         previous_summary,
@@ -390,7 +416,7 @@ impl RequestContext {
             &request,
             on_event,
             cancellation,
-            singularity_protocol::RequestPurpose::ContextRotation,
+            protocol::RequestPurpose::ContextRotation,
         )
         .await?;
         validate_user_messages(&response)

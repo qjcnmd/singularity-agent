@@ -5,12 +5,21 @@ use std::path::{Path, PathBuf};
 
 use crate::display_path;
 
-/// 已规范化的项目目录路径。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 已规范化的项目目录路径；相等比较以规范显示路径（忽略大小写）为准，
+/// 避免 Windows 原生 `\\?\` 前缀差异导致同一目录比较不等。
+#[derive(Debug, Clone)]
 pub struct CanonicalWorkspacePath {
     native: PathBuf,
     display: String,
 }
+
+impl PartialEq for CanonicalWorkspacePath {
+    fn eq(&self, other: &Self) -> bool {
+        same_saved_path(&self.display, &other.display)
+    }
+}
+
+impl Eq for CanonicalWorkspacePath {}
 
 impl CanonicalWorkspacePath {
     /// 从已保存的绝对路径构造，只整理路径组件，不访问文件系统。
@@ -43,7 +52,8 @@ pub fn saved_path_key(path: &str) -> String {
 
 /// 原生路径转换为忽略大小写的展示路径比较键（去掉 Windows 长路径前缀）。
 pub fn workspace_key(path: &Path) -> String {
-    display_path(path).to_lowercase()
+    let normalized: PathBuf = path.components().collect();
+    display_path(&normalized).to_lowercase()
 }
 
 /// 已保存路径的等价比较：两边都是显示形式（正斜杠绝对路径），忽略大小写。

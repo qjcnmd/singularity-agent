@@ -3,12 +3,12 @@
 //! 回合结束记录（`operation_finished`）保存最终状态、错误和是否由用户停止。产出可见内容的普通回复
 //! 随消息保存请求耗时与用量，其余请求（重试、无输出的失败请求和整理请求）单独记为 `model_request`；指令和工具定义不写日志，每轮重新读取。
 
+use protocol::TurnStatus;
 use serde::{Deserialize, Serialize};
-use singularity_protocol::TurnStatus;
 use thiserror::Error;
 use uuid::Uuid;
 
-use singularity_model::Message;
+use model::Message;
 /// 开发阶段固定为 1，格式随当前实现更新；发布前再确定版本策略。
 const CURRENT_SESSION_VERSION: u32 = 1;
 #[derive(Debug, Error)]
@@ -19,26 +19,36 @@ pub enum SessionError {
     Json(#[from] serde_json::Error),
     #[error("session header is invalid: {0}")]
     InvalidHeader(String),
-    #[error("session line {line} is invalid: {cause}")]
-    InvalidEntry { line: usize, cause: String },
+    #[error("session line {line} is invalid: {source}")]
+    InvalidEntry {
+        line: usize,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("{message}：{source}")]
+    Context {
+        message: String,
+        #[source]
+        source: Box<SessionError>,
+    },
     #[error("{0}")]
     InvalidSession(String),
 }
 
 pub type Result<T> = std::result::Result<T, SessionError>;
 /// 完整新版用户消息整理内容；记录所在位置就是上下文切换分界。
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextRotationEntry {
     #[serde(rename = "userMessages")]
     pub user_messages: String,
 }
 /// 任务设置：模型选择、创建时关闭的上下文模块或任务名称。
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "metadataType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionMetadata {
     ThreadSettings {
-        selection: singularity_protocol::ModelSelection,
+        selection: protocol::ModelSelection,
     },
     /// 创建任务时关闭的上下文模块 ID，只写这一次；全开时不写。
     DisabledModules {
@@ -75,21 +85,19 @@ pub enum MessageDisplay {
         duration_ms: Option<u64>,
         /// `read` 实际读取到的源文件行范围。
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        read_source: Option<singularity_protocol::ReadSource>,
+        read_source: Option<protocol::ReadSource>,
     },
 }
 
 /// 执行记录：回合开始与结束、未生成消息的模型请求、旧工具输出微压缩水位线和后台命令状态。不进入模型上下文。
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "recordType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LedgerRecord {
     /// 后台命令的开始和终态；进度只在内存中发布。
-    BackgroundTaskUpdated {
-        task: singularity_protocol::BackgroundTask,
-    },
+    BackgroundTaskUpdated { task: protocol::BackgroundTask },
     /// 一次没有产生可见回复消息的模型请求（重试、无输出的失败/取消或整理请求）。
     ModelRequest {
-        observation: singularity_protocol::RequestObservation,
+        observation: protocol::RequestObservation,
     },
     /// 零模型调用的旧工具输出微压缩水位线：`before_entry_id` 及之前的超长工具结果在投影给模型时折叠为摘要，
     /// 保持后续前缀稳定以维持前缀缓存，同时不改动原始日志。
@@ -105,14 +113,14 @@ pub enum LedgerRecord {
         turn_id: String,
         outcome: TurnStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        error: Option<singularity_protocol::TurnErrorDetail>,
+        error: Option<protocol::TurnErrorDetail>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         user_stopped: bool,
     },
 }
 
 /// 日志里文件头之后的一行。
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionEntry {
     Message {
@@ -120,7 +128,7 @@ pub enum SessionEntry {
         timestamp: String,
         message: Message,
         #[serde(skip_serializing_if = "Option::is_none")]
-        observation: Option<singularity_protocol::RequestObservation>,
+        observation: Option<protocol::RequestObservation>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<MessageDisplay>,
     },
@@ -143,7 +151,7 @@ pub enum SessionEntry {
 
 impl SessionEntry {
     /// 取出这一行的模型请求记录（来自带请求记录的助手消息或单独的 `ModelRequest` 记录）。
-    pub fn request_observation(&self) -> Option<&singularity_protocol::RequestObservation> {
+    pub fn request_observation(&self) -> Option<&protocol::RequestObservation> {
         match self {
             Self::Message { observation, .. } => observation.as_ref(),
             Self::Record {
@@ -235,7 +243,7 @@ impl SessionHeader {
     }
 
     pub(super) fn canonical_cwd(&self) -> Result<std::path::PathBuf> {
-        singularity_core::CanonicalWorkspacePath::from_saved(&self.cwd)
+        app_core::CanonicalWorkspacePath::from_saved(&self.cwd)
             .map_err(SessionError::InvalidHeader)
             .map(|cwd| cwd.as_path().to_path_buf())
     }

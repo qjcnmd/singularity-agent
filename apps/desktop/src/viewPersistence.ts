@@ -1,4 +1,5 @@
 import { defaultAccentColor, resolveAccentId } from './bubbleColors'
+import { VIEW_STORAGE_KEY } from './identity'
 import type { ViewportAnchor } from './protocol'
 
 export const defaultAnchor = (): ViewportAnchor => ({
@@ -10,7 +11,7 @@ export function normalizeMessageFontSize(value: number): number {
   return Number.isFinite(value) ? Math.min(messageFontSize.max, Math.max(messageFontSize.min, value)) : messageFontSize.default
 }
 
-const storageKey = 'singularity.app.view.v1'
+const storageKey = VIEW_STORAGE_KEY
 
 
 export interface PersistedView {

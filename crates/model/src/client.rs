@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use singularity_protocol::ProviderApiProtocol;
+use protocol::ProviderApiProtocol;
 use tokio_util::sync::CancellationToken;
 
 use crate::ANTHROPIC_VERSION;
@@ -22,7 +22,7 @@ use crate::transport::http::{
 use crate::transport::{provider_client, provider_future, retry_after_delay};
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
 
-/// 调用方（`singularity_agent` / `singularity_app`）唯一面向的模型客户端抽象。
+/// 调用方（`agent` / `app`）唯一面向的模型客户端抽象。
 pub struct ModelClient {
     config: ProviderConfig,
     selected_model: SelectedModel,
@@ -46,7 +46,7 @@ impl ModelClient {
     /// 读取当前模型配置并构造本轮使用的协议客户端。
     pub fn new(
         models: &ModelConfigManager,
-        selection: &singularity_protocol::ModelSelection,
+        selection: &protocol::ModelSelection,
     ) -> Result<Self, ProviderError> {
         let (config, selected_model) = models.resolve(selection)?;
         let client = provider_client()?;
@@ -61,9 +61,14 @@ impl ModelClient {
         }
     }
 
-    /// 提供方名称和模型名称，写进请求记录与诊断日志。
-    pub fn model_identity(&self) -> (&str, &str) {
-        (&self.config.provider_name, &self.selected_model.model_name)
+    /// 提供方名称，写进请求记录与诊断日志。
+    pub fn provider_name(&self) -> &str {
+        &self.config.provider_name
+    }
+
+    /// 模型名称，写进请求记录与诊断日志。
+    pub fn model_name(&self) -> &str {
+        &self.selected_model.model_name
     }
 
     /// 发送一次流式请求并返回已校验的回复和实际用量；请求记录、计时和重试由调用方负责。
@@ -163,19 +168,18 @@ impl ModelClient {
             format!("Provider returned HTTP {status_code}."),
         )
         .with_retry_after(retry_after_delay(response.headers()));
-        let body =
-            match read_bounded_error_body(response, MAX_HTTP_ERROR_BODY_BYTES, Some(cancellation)).await {
-                Ok(body) => body,
-                Err(BoundedBodyReadError::Cancelled) => return provider_cancelled_error(),
-                Err(BoundedBodyReadError::Transport(read_error)) => {
-                    let _ = write!(
-                        error.message,
-                        " Could not read provider error response: {}",
-                        provider_transport_error(read_error).message
-                    );
-                    return error;
-                }
-            };
+        let body = match read_bounded_error_body(response, MAX_HTTP_ERROR_BODY_BYTES, cancellation).await {
+            Ok(body) => body,
+            Err(BoundedBodyReadError::Cancelled) => return provider_cancelled_error(),
+            Err(BoundedBodyReadError::Transport(read_error)) => {
+                let _ = write!(
+                    error.message,
+                    " Could not read provider error response: {}",
+                    provider_transport_error(read_error).message
+                );
+                return error;
+            }
+        };
         let fields = parse_provider_error_body(&body);
         // 已知错误码或错误类型比 HTTP 状态更准确，例如 400 里的上下文超限需要触发轮换。
         if let Some(kind) = provider_error_kind_for_fields(&fields) {

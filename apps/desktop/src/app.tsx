@@ -23,7 +23,7 @@ export function App() {
   const filePanelOpen = state.fileTabs.length > 0
   useLayoutEffect(() => {
     document.documentElement.dataset.theme = state.theme
-    void window.singularity.setTheme(state.theme)
+    void window.desktop.setTheme(state.theme)
   }, [state.theme])
   useLayoutEffect(() => { document.documentElement.style.setProperty('--message-font-size', `${state.messageFontSize}px`) }, [state.messageFontSize])
   useLayoutEffect(() => {

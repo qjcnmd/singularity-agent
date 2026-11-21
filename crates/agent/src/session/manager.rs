@@ -2,13 +2,12 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use singularity_core::now_iso;
+use app_core::now_iso;
 
-use singularity_model::Message;
+use model::Message;
 
 use super::file::{parse_session_file, repair_tail};
 use super::format::{
@@ -18,6 +17,7 @@ use super::format::{
 
 /// 可写的会话日志。记录按写入顺序排列，这个顺序就是事情发生的顺序；
 /// 一个会话只有一个 SessionManager，通过 SessionWriter 共享并按顺序追加。
+#[derive(Debug)]
 pub struct SessionManager {
     pub(super) data: SessionData,
     /// 上一次追加失败的原因；之后拒绝写入，直到重新打开日志截掉残缺的末尾。
@@ -25,6 +25,7 @@ pub struct SessionManager {
 }
 
 /// 解析后的会话内容。只读打开和写者共用这套解析结果；只读打开不会修改文件。
+#[derive(Debug)]
 pub struct SessionData {
     pub(super) file: PathBuf,
     pub(super) cwd: PathBuf,
@@ -33,22 +34,18 @@ pub struct SessionData {
     pub(super) header_timestamp: String,
 }
 
-impl Deref for SessionManager {
-    type Target = SessionData;
-
-    fn deref(&self) -> &Self::Target {
+impl SessionManager {
+    /// 只读访问底层已解析的会话内容。
+    pub fn data(&self) -> &SessionData {
         &self.data
     }
-}
-
-impl SessionManager {
     /// 新建会话日志：文件名和文件头里的 ID 都用调用方给的 UUID；文件已存在时报错，
     /// 写入失败时删除文件。
     pub fn create_with_id(
         cwd: &Path,
         sessions_dir: &Path,
         session_id: &str,
-        selection: singularity_protocol::ModelSelection,
+        selection: protocol::ModelSelection,
         disabled_modules: Vec<String>,
     ) -> Result<Self> {
         let parsed_id = uuid::Uuid::parse_str(session_id).map_err(|_| {
@@ -61,7 +58,7 @@ impl SessionManager {
                 "session id must be a canonical lowercase UUID: {session_id}"
             )));
         }
-        let cwd = singularity_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
+        let cwd = app_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
         let cwd_display = cwd.display().to_string();
         std::fs::create_dir_all(sessions_dir)?;
         let file = sessions_dir.join(super::session_file_name(session_id));
@@ -190,7 +187,7 @@ impl SessionManager {
         &mut self,
         id: &str,
         message: Message,
-        observation: Option<singularity_protocol::RequestObservation>,
+        observation: Option<protocol::RequestObservation>,
         display: Option<MessageDisplay>,
     ) -> Result<String> {
         self.append_entry(SessionEntry::Message {
@@ -213,7 +210,7 @@ impl SessionManager {
         let timestamp = entry.timestamp().to_string();
         let mut bytes = serde_json::to_vec(&entry)?;
         bytes.push(b'\n');
-        let mut handle = OpenOptions::new().append(true).open(&self.file)?;
+        let mut handle = OpenOptions::new().append(true).open(&self.data.file)?;
         // 记下写入错误，阻止后续追加把新记录拼在残缺行后面。
         handle.write_all(&bytes).map_err(|error| {
             let error = Arc::new(error);
@@ -256,7 +253,7 @@ impl SessionData {
 
     /// 工作目录的显示形式（去掉 Windows 长路径前缀），任务信息、列表和提示词共用。
     pub fn cwd_string(&self) -> String {
-        singularity_core::display_path(&self.cwd)
+        app_core::display_path(&self.cwd)
     }
 
     pub fn entries(&self) -> &[SessionEntry] {

@@ -3,25 +3,25 @@
 
 use super::{Agent, AgentError, AgentEvent, RequestContext, Result, modules};
 use crate::request_execution::{execute_request, output_budget_tokens};
-use crate::session::{LedgerRecord, context, lock_writer, with_writer_async};
-use singularity_model::Message;
-use singularity_model::{ModelTurnRequest, ModelTurnResponse};
-use singularity_protocol::TurnEvent;
+use crate::session::{LedgerRecord, context, with_writer, with_writer_async};
+use model::Message;
+use model::{ModelTurnRequest, ModelTurnResponse};
+use protocol::TurnEvent;
 use tokio_util::sync::CancellationToken;
 
 /// 本轮每次请求都会带上的指令消息和工具定义。
 #[derive(Debug, Clone)]
 pub(crate) struct RequestDefinitions {
     pub(crate) messages: Vec<Message>,
-    pub(crate) tools: Vec<singularity_core::ToolDefinition>,
+    pub(crate) tools: Vec<app_core::ToolDefinition>,
     pub(crate) estimated_tokens: u64,
 }
 
 impl RequestDefinitions {
     /// 定义在本轮内不变，加载时一次计算预算，普通请求和整理请求直接复用。
-    fn new(messages: Vec<Message>, tools: Vec<singularity_core::ToolDefinition>) -> Self {
+    fn new(messages: Vec<Message>, tools: Vec<app_core::ToolDefinition>) -> Self {
         let instructions = messages.iter().map(context::message_token_estimate).sum::<u64>();
-        let tool_tokens = singularity_core::estimate_tool_tokens(&tools);
+        let tool_tokens = app_core::estimate_tool_tokens(&tools);
         Self {
             messages,
             tools,
@@ -49,14 +49,14 @@ impl RequestContext {
     pub(super) async fn load_definitions(
         &mut self,
         cancellation: &CancellationToken,
-    ) -> Result<(RequestDefinitions, singularity_protocol::InjectedContext)> {
+    ) -> Result<(RequestDefinitions, protocol::InjectedContext)> {
         let home = self.config.instruction_home.clone();
         let session = std::sync::Arc::clone(&self.session);
         let instructions = self.config.initial_instructions.clone();
         let disabled = &self.config.disabled_modules;
         let (cwd, skills) = tokio::task::spawn_blocking(move || {
-            let cwd = lock_writer(&session).cwd().to_path_buf();
-            let skills = singularity_core::skills::SkillCatalog::discover(&cwd, &home);
+            let cwd = with_writer(&session, |writer| writer.data().cwd().to_path_buf());
+            let skills = app_core::skills::SkillCatalog::discover(&cwd, &home);
             (cwd, skills)
         })
         .await
@@ -71,7 +71,7 @@ impl RequestContext {
             return Err(AgentError::Aborted);
         }
         let assembly = modules::assemble(modules::ModuleInputs {
-            cwd: &singularity_core::display_path(&cwd),
+            cwd: &app_core::display_path(&cwd),
             instructions,
             skills,
             mcp: discovered,
@@ -80,7 +80,7 @@ impl RequestContext {
         let tools = assembly.registry.provider_schemas();
         let definitions = RequestDefinitions::new(assembly.messages, tools);
         self.registry = assembly.registry;
-        let context = singularity_protocol::InjectedContext { modules: assembly.modules };
+        let context = protocol::InjectedContext { modules: assembly.modules };
         Ok((definitions, context))
     }
 
@@ -91,12 +91,12 @@ impl RequestContext {
     /// 估算下一次请求的输入 Token 数（最近一次实际用量加上新增消息，或全量估算），供自动轮换判断使用。
     pub(super) async fn context_pressure_tokens(&self) -> u64 {
         let session = std::sync::Arc::clone(&self.session);
-        let (provider, model_name) = self.provider.model_identity();
-        let identity = (provider.to_owned(), model_name.to_owned());
+        let identity = (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned());
         let overhead_tokens = self.request_definitions().estimated_tokens;
         tokio::task::spawn_blocking(move || {
-            let writer = lock_writer(&session);
-            context::estimated_tokens(&writer, (&identity.0, &identity.1), overhead_tokens)
+            with_writer(&session, |writer| {
+                context::estimated_tokens(writer.data(), (&identity.0, &identity.1), overhead_tokens)
+            })
         })
         .await
         .expect("context pressure estimate completes while the runtime is running")
@@ -105,13 +105,18 @@ impl RequestContext {
     /// 达到软压力阈值时先执行零模型调用的旧工具输出微压缩，通过写入锚定水位线保持后续前缀稳定。
     pub(super) async fn prune_tool_outputs_if_needed(&self) -> Result<()> {
         let session = std::sync::Arc::clone(&self.session);
-        let (provider, model_name) = self.provider.model_identity();
-        let identity = (provider.to_owned(), model_name.to_owned());
+        let identity = (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned());
         let overhead_tokens = self.request_definitions().estimated_tokens;
         let context_window = self.context_window();
         let candidate = tokio::task::spawn_blocking(move || {
-            let writer = lock_writer(&session);
-            context::select_prune_target(&writer, (&identity.0, &identity.1), overhead_tokens, context_window)
+            with_writer(&session, |writer| {
+                context::select_prune_target(
+                    writer.data(),
+                    (&identity.0, &identity.1),
+                    overhead_tokens,
+                    context_window,
+                )
+            })
         })
         .await
         .expect("prune target selection completes while the runtime is running");
@@ -139,17 +144,15 @@ impl RequestContext {
         let tools = definitions.tools.clone();
         let mut messages = definitions.messages.clone();
         let overhead_tokens = definitions.estimated_tokens;
-        let (provider, model_name) = self.provider.model_identity();
-        let identity = (provider.to_owned(), model_name.to_owned());
+        let identity = (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned());
         let session = std::sync::Arc::clone(&self.session);
         let model = self.provider.model_configuration();
         let request = tokio::task::spawn_blocking(move || {
-            let (materials, input_tokens, directory) = {
-                let writer = lock_writer(&session);
+            let (materials, input_tokens, directory) = with_writer(&session, |writer| {
                 let (materials, tokens) =
-                    context::prepare_context(&writer, (&identity.0, &identity.1), overhead_tokens);
-                (materials, tokens, writer.image_directory())
-            };
+                    context::prepare_context(writer.data(), (&identity.0, &identity.1), overhead_tokens);
+                (materials, tokens, writer.data().image_directory())
+            });
             messages.extend(materials);
             let images = context::load_images(&mut messages, &directory)?;
             Ok::<_, std::io::Error>(ModelTurnRequest {
@@ -167,7 +170,7 @@ impl RequestContext {
             &request,
             on_event,
             cancellation,
-            singularity_protocol::RequestPurpose::Generation,
+            protocol::RequestPurpose::Generation,
         )
         .await
     }

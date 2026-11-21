@@ -39,13 +39,13 @@ pub(super) fn parse_session_file(file: &Path) -> Result<(SessionData, Option<u64
             Err(error) => {
                 return Err(SessionError::InvalidEntry {
                     line: line_number,
-                    cause: format!("invalid UTF-8: {error}"),
+                    source: Box::new(error),
                 });
             }
         };
         let parse_error = |error: serde_json::Error| SessionError::InvalidEntry {
             line: line_number,
-            cause: error.to_string(),
+            source: Box::new(error),
         };
         if header.is_none() {
             let parsed: SessionHeader = serde_json::from_str(text).map_err(parse_error)?;
@@ -68,7 +68,7 @@ pub(super) fn parse_session_file(file: &Path) -> Result<(SessionData, Option<u64
             ..
         })
     ) {
-        return Err(SessionError::InvalidSession("会话日志缺少初始模型选择。".into()));
+        return Err(SessionError::InvalidSession(format!("会话日志缺少初始模型选择：{}", file.display())));
     }
     Ok((
         SessionData {

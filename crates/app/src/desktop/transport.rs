@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
+use protocol::{RpcError, RpcRequest, RpcResponse, StreamEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use singularity_protocol::{RpcError, RpcRequest, RpcResponse, StreamEvent};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -25,21 +25,24 @@ struct Response {
 }
 
 const STDOUT_WRITER_CAPACITY: usize = 512;
+const STDOUT_WRITE_BATCH_BYTES: usize = 64 * 1024;
 
-pub async fn run(
+pub(crate) async fn run(
     app: Arc<AppServer>,
-    mut events: mpsc::Receiver<singularity_protocol::StreamEnvelope>,
+    mut events: mpsc::Receiver<protocol::StreamEnvelope>,
 ) -> Result<(), String> {
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(STDOUT_WRITER_CAPACITY);
-    // 独立有界写任务隔离 stdout 背压，确保大输出期间 abort/RPC 仍可及时进入且内存有上界。
+    // 独立有界写任务隔离 stdout 背压，合并队列中已就绪的帧以减少无缓冲 stdout 的阻塞写次数。
     let writer = tokio::spawn(async move {
         let mut output = tokio::io::stdout();
-        while let Some(bytes) = writer_rx.recv().await {
-            output.write_all(&bytes).await.map_err(|e| format!("write desktop pipe: {e}"))?;
-            while let Ok(more) = writer_rx.try_recv() {
-                output.write_all(&more).await.map_err(|e| format!("write desktop pipe: {e}"))?;
+        while let Some(mut bytes) = writer_rx.recv().await {
+            while bytes.len() < STDOUT_WRITE_BATCH_BYTES
+                && let Ok(more) = writer_rx.try_recv()
+            {
+                bytes.extend_from_slice(&more);
             }
+            output.write_all(&bytes).await.map_err(|e| format!("write desktop pipe: {e}"))?;
             output.flush().await.map_err(|e| format!("flush desktop pipe: {e}"))?;
         }
         Ok::<(), String>(())
@@ -49,13 +52,14 @@ pub async fn run(
     let result = async {
         send_line(
             &writer_tx,
-            &singularity_protocol::StreamEnvelope {
+            &protocol::StreamEnvelope {
                 revision: app.revision(),
                 event: StreamEvent::Ready,
             },
         )
         .await?;
         let mut pending_write: Option<Vec<u8>> = None;
+        let mut next_request_seq = 0u64;
         loop {
             tokio::select! {
                 biased;
@@ -63,11 +67,13 @@ pub async fn run(
                     let Some(line) = line.map_err(|e| format!("read desktop pipe: {e}"))? else { break };
                     let call: Request = serde_json::from_str(&line)
                         .map_err(|e| format!("invalid desktop pipe envelope: {e}"))?;
+                    next_request_seq += 1;
+                    let request_seq = next_request_seq;
                     let app = Arc::clone(&app);
                     let shutdown = shutdown.clone();
                     requests.spawn(async move {
                         let response = match serde_json::from_str::<RpcRequest>(call.request.get()) {
-                            Ok(request) => rpc::handle(&app, request, &shutdown).await,
+                            Ok(request) => rpc::handle(&app, request, request_seq, &shutdown).await,
                             Err(error) => RpcResponse::Error { error: RpcError::new(error) },
                         };
                         Response { id: call.id, response }
@@ -89,7 +95,7 @@ pub async fn run(
             }
         }
         if let Some(bytes) = pending_write {
-            let _ = writer_tx.send(bytes).await;
+            let _ = writer_tx.try_send(bytes);
         }
         Ok(())
     }
@@ -100,12 +106,18 @@ pub async fn run(
         joined.expect("accepted RPC task completes before shutdown");
     }
     app.shutdown().await;
-    while let Ok(frame) = events.try_recv() {
-        let _ = send_line(&writer_tx, &frame).await;
+    if result.is_ok() {
+        while let Ok(frame) = events.try_recv() {
+            if let Ok(bytes) = encode_line(&frame)
+                && writer_tx.try_send(bytes).is_err()
+            {
+                break;
+            }
+        }
     }
     drop(writer_tx);
     let write_result = writer.await.expect("desktop pipe writer task completes");
-    result.and(write_result)
+    write_result.and(result)
 }
 
 fn encode_line(value: &impl Serialize) -> Result<Vec<u8>, String> {

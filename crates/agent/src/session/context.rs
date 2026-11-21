@@ -8,8 +8,8 @@
 
 use std::fmt::Write as _;
 
-use singularity_core::estimate_tokens_of;
-use singularity_model::{ContentBlock, Message};
+use app_core::estimate_tokens_of;
+use model::{ContentBlock, Message};
 
 use super::format::{LedgerRecord, SessionEntry};
 use super::manager::SessionData;
@@ -21,7 +21,7 @@ fn context_rotation_handoff(session: &SessionData) -> String {
          结合整理内容和当前情境理解对话，决定如何继续。需要了解工作区时自行检查；需要补充历史信息或核实整理内容时，按时间引用查找相关记录。信息足够时直接继续。\n\n\
          历史日志：{}\n工作目录：{}\n\n\
          回读优先从最近一段历史开始，按需要向前查找。定位后读取相关上下文，结合后续修订和实际执行结果理解记录。",
-        singularity_core::display_path(&session.file),
+        app_core::display_path(&session.file),
         session.cwd_string(),
     )
 }
@@ -31,8 +31,8 @@ const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 const CONTENT_BLOCK_OVERHEAD_TOKENS: u64 = 4;
 const TOOL_RESULT_OVERHEAD_TOKENS: u64 = 4;
 
-/// 触发零模型调用微压缩的软阈值（上下文窗口占比）。
-const PRUNE_TRIGGER_RATIO: f64 = 0.80;
+/// 触发零模型调用微压缩的软阈值（上下文窗口百分比）。
+const PRUNE_TRIGGER_PERCENT: u128 = 80;
 /// 微压缩时始终完整保留的最近工具结果数量。
 const PRUNE_KEEP_RECENT_TOOL_RESULTS: usize = 4;
 /// 只有单条工具结果正文超过该字节数才会被微压缩折叠。
@@ -97,23 +97,24 @@ fn context_token_estimate(
     pruned_until: Option<usize>,
     session: &SessionData,
 ) -> u64 {
-    let mut tokens = 0;
-    let mut calls = 0;
-    let mut results = 0;
+    let mut tokens = 0u64;
+    let mut calls = 0usize;
+    let mut results = 0usize;
     for (index, entry) in entries.iter().enumerate() {
         let pruned = pruned_until.is_some_and(|cutoff| index <= cutoff);
-        tokens += entry_token_estimate(entry, pruned, session);
+        tokens = tokens.saturating_add(entry_token_estimate(entry, pruned, session));
         if let SessionEntry::Message { message, .. } = entry {
-            calls += message.tool_calls().count();
+            calls = calls.saturating_add(message.tool_calls().count());
             if message.tool_call_id().is_some() {
-                results += 1;
+                results = results.saturating_add(1);
             }
         }
     }
     let unknown_result_tokens = MESSAGE_OVERHEAD_TOKENS
-        + text_block_token_estimate(UNKNOWN_TOOL_OUTCOME)
-        + TOOL_RESULT_OVERHEAD_TOKENS;
-    tokens + calls.saturating_sub(results) as u64 * unknown_result_tokens
+        .saturating_add(text_block_token_estimate(UNKNOWN_TOOL_OUTCOME))
+        .saturating_add(TOOL_RESULT_OVERHEAD_TOKENS);
+    let missing_results = u64::try_from(calls.saturating_sub(results)).unwrap_or(u64::MAX);
+    tokens.saturating_add(missing_results.saturating_mul(unknown_result_tokens))
 }
 
 enum ContextEntry<'a> {
@@ -125,7 +126,7 @@ enum ContextEntry<'a> {
 fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
     match entry {
         SessionEntry::Message { observation: Some(observation), .. }
-            if observation.status != singularity_protocol::ProviderAttemptStatus::Ok =>
+            if observation.status != protocol::ProviderAttemptStatus::Ok =>
         {
             None
         }
@@ -177,24 +178,23 @@ pub(crate) fn message_token_estimate(message: &Message) -> u64 {
                 text_block_token_estimate(text)
             }
             // 没有提供方实际用量时按尺寸估算图片 Token；拿到回复后优先使用提供方上报的用量。
-            ContentBlock::Image(image) => {
-                u64::from(image.width).div_ceil(32) * u64::from(image.height).div_ceil(32) + 128
-            }
-            ContentBlock::ToolCall(call) => {
-                estimate_tokens_of(&call.tool_name)
-                    + estimate_tokens_of(&call.arguments.to_string())
-                    + CONTENT_BLOCK_OVERHEAD_TOKENS
-            }
+            ContentBlock::Image(image) => u64::from(image.width)
+                .div_ceil(32)
+                .saturating_mul(u64::from(image.height).div_ceil(32))
+                .saturating_add(128),
+            ContentBlock::ToolCall(call) => estimate_tokens_of(&call.tool_name)
+                .saturating_add(estimate_tokens_of(&call.arguments.to_string()))
+                .saturating_add(CONTENT_BLOCK_OVERHEAD_TOKENS),
         });
     }
     if matches!(message, Message::ToolResult { .. }) {
-        tokens += TOOL_RESULT_OVERHEAD_TOKENS;
+        tokens = tokens.saturating_add(TOOL_RESULT_OVERHEAD_TOKENS);
     }
     tokens
 }
 
 fn text_block_token_estimate(text: &str) -> u64 {
-    estimate_tokens_of(text) + CONTENT_BLOCK_OVERHEAD_TOKENS
+    estimate_tokens_of(text).saturating_add(CONTENT_BLOCK_OVERHEAD_TOKENS)
 }
 
 /// 本轮最近一次普通回复的真实用量与后续新增条目估算：`(provider, model, total_tokens, tail_tokens)`。
@@ -285,7 +285,7 @@ pub(crate) fn select_prune_target(
 ) -> Option<(String, u64)> {
     let (entries, existing_pruned) = resolve_context_entries(session);
     let current = input_tokens(session, &entries, existing_pruned, identity, definition_tokens);
-    let trigger = (context_window as f64 * PRUNE_TRIGGER_RATIO).floor() as u64;
+    let trigger = u64::try_from(u128::from(context_window) * PRUNE_TRIGGER_PERCENT / 100).unwrap_or(u64::MAX);
     if current < trigger {
         return None;
     }
@@ -315,6 +315,7 @@ pub(crate) fn select_prune_target(
 }
 
 /// 整理请求使用完整的当前上下文，与普通请求共用消息投影。
+#[derive(Debug)]
 pub struct ContextRotationInput {
     pub(crate) messages: Vec<Message>,
     pub(crate) image_directory: std::path::PathBuf,
@@ -328,13 +329,15 @@ impl ContextRotationInput {
     pub async fn select(session: &super::SessionWriter) -> Option<Self> {
         let session = std::sync::Arc::clone(session);
         tokio::task::spawn_blocking(move || {
-            let session = super::lock_writer(&session);
-            let (entries, pruned_until) = resolve_context_entries(&session);
-            entries.iter().any(|entry| matches!(entry, SessionEntry::Message { .. })).then(|| Self {
-                messages: project_messages(&entries, pruned_until, &session),
-                estimated_tokens: context_token_estimate(&entries, pruned_until, &session),
-                latest_usage: latest_reply_usage(&session, &entries, pruned_until),
-                image_directory: session.image_directory(),
+            super::with_writer(&session, |session| {
+                let data = session.data();
+                let (entries, pruned_until) = resolve_context_entries(data);
+                entries.iter().any(|entry| matches!(entry, SessionEntry::Message { .. })).then(|| Self {
+                    messages: project_messages(&entries, pruned_until, data),
+                    estimated_tokens: context_token_estimate(&entries, pruned_until, data),
+                    latest_usage: latest_reply_usage(data, &entries, pruned_until),
+                    image_directory: data.image_directory(),
+                })
             })
         })
         .await
@@ -380,7 +383,7 @@ fn prune_message_content(message: &mut Message, entry: &SessionEntry, session: &
                         &format!(
                             "earlier tool output compacted ({} bytes); inspect {} at {} if needed",
                             text.len(),
-                            singularity_core::display_path(&session.file),
+                            app_core::display_path(&session.file),
                             message_time(entry),
                         ),
                     );

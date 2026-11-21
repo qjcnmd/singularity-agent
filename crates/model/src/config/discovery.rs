@@ -2,6 +2,8 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -9,40 +11,52 @@ use super::{ProviderError, configuration_error, validate_api_key, validate_base_
 use crate::ModelErrorKind;
 use crate::error::{
     append_provider_http_diagnostic, bounded_provider_error_diagnostic, parse_provider_error_body,
+    provider_error_kind_for_fields, provider_error_kind_for_http_status,
 };
 use crate::transport::http::{
-    BoundedBodyReadError, MAX_HTTP_ERROR_BODY_BYTES, client_builder, read_bounded_error_body,
+    MAX_HTTP_ERROR_BODY_BYTES, PROVIDER_USER_AGENT, client_builder, read_bounded_body,
     sensitive_header_value, transport_error_source,
 };
 
 const MAX_DISCOVERY_BODY_BYTES: usize = 4 * 1024 * 1024;
+const DISCOVERY_TIMEOUT_SECONDS: u64 = 20;
 
-/// 查询提供方的模型 ID；调用方只提供编辑器里的取值、协议类型和解析好的凭据。
-pub async fn discover(
-    base_url: &str,
-    api_key: &str,
-    protocol: singularity_protocol::ProviderApiProtocol,
-) -> Result<Vec<String>, ProviderError> {
-    let base_url = crate::provider::canonical_base_url(base_url);
-    validate_base_url(base_url)?;
-    validate_api_key(api_key)?;
+fn discovery_client() -> Result<reqwest::Client, ProviderError> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
     let client = client_builder()
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(Duration::from_secs(DISCOVERY_TIMEOUT_SECONDS))
         .redirect(reqwest::redirect::Policy::none())
+        .user_agent(PROVIDER_USER_AGENT)
         .build()
         .map_err(|error| {
             // 客户端构造失败和请求失败是两回事：保留底层原因方便定位。
             configuration_error(format!("模型查询客户端无法启动（{}）。", transport_error_source(error)))
         })?;
+    Ok(CLIENT.get_or_init(|| client).clone())
+}
+
+/// 查询提供方的模型 ID；调用方只提供编辑器里的取值、协议类型和解析好的凭据。
+pub async fn discover(
+    base_url: &str,
+    api_key: &str,
+    protocol: protocol::ProviderApiProtocol,
+) -> Result<Vec<String>, ProviderError> {
+    let base_url = crate::provider::canonical_base_url(base_url);
+    validate_base_url(base_url)?;
+    validate_api_key(api_key)?;
+    let client = discovery_client()?;
     let mut request = client.get(crate::provider::models_endpoint(base_url));
     match protocol {
-        singularity_protocol::ProviderApiProtocol::Messages => {
+        protocol::ProviderApiProtocol::Messages => {
             request = request.header("anthropic-version", crate::ANTHROPIC_VERSION);
             if !api_key.is_empty() {
                 request = request.header("x-api-key", sensitive_header_value(api_key)?);
             }
         }
-        singularity_protocol::ProviderApiProtocol::Responses => {
+        protocol::ProviderApiProtocol::Responses => {
             if !api_key.is_empty() {
                 request = request.bearer_auth(api_key);
             }
@@ -107,18 +121,20 @@ fn read_listing(body: &Value) -> Result<Vec<String>, ProviderError> {
 
 async fn discovery_http_error(response: reqwest::Response) -> ProviderError {
     let status = response.status().as_u16();
-    // 模型发现由用户手动触发，不自动重试，只复用 HTTP 状态码的错误分类。
+    // 模型发现由用户手动触发，不自动重试，仍沿用与主调用一致的错误分类规则。
     let mut error = ProviderError::new(
-        crate::error::provider_error_kind_for_http_status(status),
+        provider_error_kind_for_http_status(status),
         format!("获取模型失败：HTTP {status}。"),
     );
-    match read_bounded_error_body(response, MAX_HTTP_ERROR_BODY_BYTES, None).await {
+    match read_bounded_body(response, MAX_HTTP_ERROR_BODY_BYTES).await {
         Ok(body) => {
             let fields = parse_provider_error_body(&body);
+            if let Some(kind) = provider_error_kind_for_fields(&fields) {
+                error.kind = kind;
+            }
             append_provider_http_diagnostic(&mut error.message, &fields, &body);
         }
-        Err(BoundedBodyReadError::Cancelled) => unreachable!("no cancellation token passed"),
-        Err(BoundedBodyReadError::Transport(read_error)) => {
+        Err(read_error) => {
             let _ =
                 write!(error.message, " 无法读取提供方错误响应（{}）。", transport_error_source(read_error));
         }

@@ -4,10 +4,10 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 
+use model::{ContentBlock, Message, ModelToolCall, ProviderMessageMetadata};
 use proptest::prelude::*;
+use protocol::ModelSelection;
 use serde_json::json;
-use singularity_model::{ContentBlock, Message, ModelToolCall, ProviderMessageMetadata};
-use singularity_protocol::ModelSelection;
 
 use crate::compaction::{
     compact_assistant_messages, compact_text, compact_tool_results, partition_into_chunks,
@@ -206,9 +206,10 @@ proptest! {
         };
         let compacted = compact_text(&input, head_bytes, tail_bytes, "compacted");
         if with_spill_line {
-            prop_assert!(
-                compacted.contains(spill_line),
-                "Full output spill path must be preserved after compaction"
+            prop_assert_eq!(
+                compacted.matches(spill_line).count(),
+                1,
+                "Full output spill path must be preserved exactly once after compaction"
             );
         }
     }
@@ -313,7 +314,7 @@ proptest! {
                 .append_message_with_id(&format!("msg_{idx}"), Message::user(text.clone()), None, None)
                 .expect("append user message");
         }
-        let expected_entries = manager.entries().len();
+        let expected_entries = manager.data().entries().len();
         let path = sessions.join(session_file_name(&session_id));
         let valid_bytes = std::fs::read(&path).expect("read valid log");
         drop(manager);
@@ -333,7 +334,7 @@ proptest! {
         );
 
         let repaired = SessionManager::open_existing(&path, &session_id).expect("writer repairs tail");
-        prop_assert_eq!(repaired.entries().len(), expected_entries);
+        prop_assert_eq!(repaired.data().entries().len(), expected_entries);
         drop(repaired);
 
         prop_assert_eq!(

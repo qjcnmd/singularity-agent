@@ -82,6 +82,11 @@ impl CaptureState {
         self.completed_lines + incoming_lines + 1 > DEFAULT_MAX_LINES
     }
 
+    /// 是否存在尚未推送到界面的新增输出（用于仅在节流缓冲非空时才轮询进度定时器）。
+    pub(super) fn has_pending_output(&self) -> bool {
+        self.total_bytes > 0 && self.last_progress.is_none_or(|(_, bytes)| bytes < self.total_bytes)
+    }
+
     /// 运行中显示的输出：第一次有输出立即返回，之后有新输出时最多每 100ms 返回一次；
     /// 超出上限时附上完整输出文件的位置。
     pub(super) fn current_output(&mut self) -> Option<String> {
@@ -94,11 +99,19 @@ impl CaptureState {
             return None;
         }
         self.last_progress = Some((now, self.total_bytes));
+        Some(self.display_output())
+    }
+
+    /// 无节流的当前显示输出（含截断说明与溢写路径说明）；前台转后台时用于生成一致快照。
+    pub(super) fn display_output(&self) -> String {
+        if self.total_bytes == 0 {
+            return String::new();
+        }
         let mut content = self.final_output();
         if let Some(note) = self.spill_note() {
             let _ = write!(content, "\n\n{note}");
         }
-        Some(content)
+        content
     }
 
     /// 接收一段已解码的输出；首次超出显示上限时把已有输出写入临时文件，再把内存缓冲限制在 100KB 内。
@@ -122,8 +135,8 @@ impl CaptureState {
     }
 
     /// 后台读取使用原始文本与绝对位置，提示文字不参与游标计算。
-    pub(super) fn snapshot(&self) -> singularity_protocol::CommandOutputSnapshot {
-        singularity_protocol::CommandOutputSnapshot {
+    pub(super) fn snapshot(&self) -> protocol::CommandOutputSnapshot {
+        protocol::CommandOutputSnapshot {
             text: self.tail.clone(),
             total_bytes: self.total_bytes as u64,
             full_output: self

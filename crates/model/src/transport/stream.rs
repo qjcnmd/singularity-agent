@@ -19,8 +19,10 @@ struct SseFrameDecoder {
 }
 
 impl SseFrameDecoder {
-    /// 接收一段 chunk，交出其中所有完整的行；没有结尾换行的部分留给下次读取。
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, &'static str> {
+    /// 接收一段 chunk，把其中所有完整的行写入 `complete`；没有结尾换行的部分留给下次读取。
+    fn push_into(&mut self, chunk: &[u8], complete: &mut Vec<u8>) -> Result<(), &'static str> {
+        complete.clear();
+        self.pending.reserve(chunk.len());
         let mut last_newline = None;
         let mut line_len = self.pending.len();
         for &byte in chunk {
@@ -42,14 +44,15 @@ impl SseFrameDecoder {
                 }
             }
         }
-        let Some(end) = last_newline else {
-            return Ok(Vec::new());
-        };
-        let tail = self.pending.split_off(end);
-        Ok(std::mem::replace(&mut self.pending, tail))
+        if let Some(end) = last_newline {
+            complete.extend_from_slice(&self.pending[..end]);
+            self.pending.drain(..end);
+        }
+        Ok(())
     }
 
-    fn process_line(&mut self, line: &[u8]) -> Result<Option<Vec<u8>>, &'static str> {
+    /// 处理一行；遇到空行且已累积 `data` 时返回 `Ok(true)`，由调用方读取 `event_data()` 后清空。
+    fn process_line(&mut self, line: &[u8]) -> Result<bool, &'static str> {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         // 第一行完整后才检查 BOM，因此它的三个字节可以分散在不同 chunk 中。
         let line = if self.first_line_processed {
@@ -59,14 +62,11 @@ impl SseFrameDecoder {
             line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line)
         };
         if line.is_empty() {
-            if self.event_data.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(std::mem::take(&mut self.event_data)));
+            return Ok(!self.event_data.is_empty());
         }
         // 冒号开头的行是 SSE 注释（常作保活），整行忽略。
         if line.first() == Some(&b':') {
-            return Ok(None);
+            return Ok(false);
         }
         let (field, value) = if let Some(separator) = line.iter().position(|byte| *byte == b':') {
             // 值前按 SSE 约定只去掉一个空格。
@@ -86,15 +86,19 @@ impl SseFrameDecoder {
             }
             self.event_data.extend_from_slice(value);
         }
-        Ok(None)
+        Ok(false)
     }
 
-    fn finish(&mut self) -> Option<Vec<u8>> {
-        if self.pending.is_empty() && !self.event_data.is_empty() {
-            Some(std::mem::take(&mut self.event_data))
-        } else {
-            None
-        }
+    fn event_data(&self) -> &[u8] {
+        &self.event_data
+    }
+
+    fn clear_event(&mut self) {
+        self.event_data.clear();
+    }
+
+    fn has_trailing_event(&self) -> bool {
+        self.pending.is_empty() && !self.event_data.is_empty()
     }
 
     fn has_unterminated(&self) -> bool {
@@ -104,8 +108,8 @@ impl SseFrameDecoder {
 
 /// 各协议的 SSE 解码器（Messages / Responses 各实现一个）。
 pub(crate) trait SseStreamDecoder: Sized {
-    /// 本协议的格式错误构造函数，参数是错误原因。
-    fn frame_malformed() -> fn(&'static str) -> ProviderError;
+    /// 构造本协议的格式错误，参数是错误原因。
+    fn frame_malformed(reason: &'static str) -> ProviderError;
 
     /// 处理一个完整的 SSE 事件。
     fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError>;
@@ -121,6 +125,7 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
     decoder: &mut D,
 ) -> Result<(), ProviderError> {
     let mut frames = SseFrameDecoder::default();
+    let mut complete = Vec::new();
 
     loop {
         let chunk = provider_future(cancellation, response.chunk()).await?;
@@ -129,22 +134,24 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
             return Err(provider_cancelled_error());
         }
         let Some(chunk) = chunk else {
-            if let Some(trailing) = frames.finish() {
-                decoder.dispatch_event(&trailing)?;
+            if frames.has_trailing_event() {
+                decoder.dispatch_event(frames.event_data())?;
+                frames.clear_event();
                 if decoder.protocol_complete() {
                     return Ok(());
                 }
-                return Err(D::frame_malformed()("event_frame_unterminated"));
+                return Err(D::frame_malformed("event_frame_unterminated"));
             }
             if frames.has_unterminated() {
-                return Err(D::frame_malformed()("event_frame_unterminated"));
+                return Err(D::frame_malformed("event_frame_unterminated"));
             }
             return Ok(());
         };
-        let complete = frames.push(&chunk).map_err(D::frame_malformed())?;
+        frames.push_into(&chunk, &mut complete).map_err(D::frame_malformed)?;
         for line in complete.split_inclusive(|byte| *byte == b'\n') {
-            if let Some(frame) = frames.process_line(line).map_err(D::frame_malformed())? {
-                decoder.dispatch_event(&frame)?;
+            if frames.process_line(line).map_err(D::frame_malformed)? {
+                decoder.dispatch_event(frames.event_data())?;
+                frames.clear_event();
                 if decoder.protocol_complete() {
                     return Ok(());
                 }
@@ -160,21 +167,26 @@ pub(crate) fn provider_stream_malformed_error(message: &'static str, reason: &'s
 #[cfg(test)]
 pub(crate) fn decode_sse_chunks(chunks: &[&[u8]]) -> (Vec<Vec<u8>>, bool) {
     let mut frames = SseFrameDecoder::default();
+    let mut complete = Vec::new();
     let mut events = Vec::new();
     for chunk in chunks {
-        let Ok(complete) = frames.push(chunk) else {
+        if frames.push_into(chunk, &mut complete).is_err() {
             return (events, true);
-        };
+        }
         for line in complete.split_inclusive(|byte| *byte == b'\n') {
             match frames.process_line(line) {
-                Ok(Some(frame)) => events.push(frame),
-                Ok(None) => {}
+                Ok(true) => {
+                    events.push(frames.event_data().to_vec());
+                    frames.clear_event();
+                }
+                Ok(false) => {}
                 Err(_) => return (events, true),
             }
         }
     }
-    if let Some(trailing) = frames.finish() {
-        events.push(trailing);
+    if frames.has_trailing_event() {
+        events.push(frames.event_data().to_vec());
+        frames.clear_event();
     }
     (events, frames.has_unterminated())
 }

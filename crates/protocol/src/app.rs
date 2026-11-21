@@ -127,7 +127,7 @@ pub struct ContextUsage {
     pub capacity: u64,
 }
 
-/// 模型设置表单读写的一项模型配置；保存时由 `singularity_model` 检查取值。
+/// 模型设置表单读写的一项模型配置；保存时由 `model` 检查取值。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -217,6 +217,14 @@ impl RpcError {
         Self { message: message.to_string() }
     }
 }
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]

@@ -5,13 +5,22 @@ import { homedir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { Backend } from './backend.js'
+import {
+  APP_ENTRY,
+  APP_NAME,
+  APP_SCHEME,
+  BACKEND_BINARY,
+  DATA_DIR_NAME,
+  HOME_ENV_VAR,
+  IPC_CHANNELS,
+} from '../src/identity.js'
 import type { DirectoryPickResult, RpcResponse } from '../src/protocol.generated.js'
 
-const entry = 'singularity://app/'
-const configuredHome = process.env.SINGULARITY_HOME
-const home = resolve(configuredHome?.trim() ? configuredHome : join(homedir(), '.singularity'))
+const entry = APP_ENTRY
+const configuredHome = process.env[HOME_ENV_VAR]
+const home = resolve(configuredHome?.trim() ? configuredHome : join(homedir(), DATA_DIR_NAME))
 // 数据目录决定 Chromium profile：不同目录各用各的锁和视图状态。
-const userDataDir = join(app.getPath('appData'), 'Singularity', createHash('sha256').update(home.toLowerCase()).digest('hex').slice(0, 16))
+const userDataDir = join(app.getPath('appData'), APP_NAME, createHash('sha256').update(home.toLowerCase()).digest('hex').slice(0, 16))
 app.setPath('userData', userDataDir)
 const themeFile = join(userDataDir, 'theme')
 
@@ -22,7 +31,7 @@ function readSavedTheme(): 'light' | 'dark' {
     return 'light'
   }
 }
-protocol.registerSchemesAsPrivileged([{ scheme: 'singularity', privileges: { standard: true, secure: true, supportFetchAPI: true } }])
+protocol.registerSchemesAsPrivileged([{ scheme: APP_SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: true } }])
 let window: BrowserWindow
 let tray: Tray
 let backend: Backend
@@ -47,27 +56,27 @@ function trusted(event: Electron.IpcMainInvokeEvent): void {
 async function start(): Promise<void> {
   const assets = join(app.getAppPath(), 'dist')
   const icon = nativeImage.createFromPath(join(app.getAppPath(), 'resources', 'icon.png'))
-  protocol.handle('singularity', request => {
+  protocol.handle(APP_SCHEME, request => {
     const url = new URL(request.url)
     const file = resolve(assets, '.' + decodeURIComponent(url.pathname === '/' ? '/index.html' : url.pathname))
     const path = relative(assets, file)
     if (url.host !== 'app' || path.startsWith('..') || isAbsolute(path)) return new Response('Not found', { status: 404 })
     return net.fetch(pathToFileURL(file).href)
   })
-  backend = new Backend(app.isPackaged ? join(process.resourcesPath, 'runtime', 'singularity.exe') : join(app.getAppPath(), 'desktop-runtime', 'singularity.exe'))
+  backend = new Backend(app.isPackaged ? join(process.resourcesPath, 'runtime', BACKEND_BINARY) : join(app.getAppPath(), 'desktop-runtime', BACKEND_BINARY))
   backend.on('failure', (error: Error) => {
     // 窗口建立前的启动失败由 await backend.ready 统一报错退出。
     if (!window || window.isDestroyed()) return
-    window.webContents.send('singularity:failure')
-    void dialog.showMessageBox({ type: 'error', title: 'Singularity', message: '工作台后端已停止', detail: error.message, buttons: ['退出'] }).then(() => app.quit())
+    window.webContents.send(IPC_CHANNELS.failure)
+    void dialog.showMessageBox({ type: 'error', title: APP_NAME, message: '工作台后端已停止', detail: error.message, buttons: ['退出'] }).then(() => app.quit())
   })
   await backend.ready
   window = new BrowserWindow({
-    title: 'Singularity', width: 1440, height: 960, minWidth: 720, minHeight: 480,
+    title: APP_NAME, width: 1440, height: 960, minWidth: 720, minHeight: 480,
     show: false, backgroundColor: readSavedTheme() === 'dark' ? '#202020' : '#ffffff', icon,
     webPreferences: { preload: join(fileURLToPath(new URL('.', import.meta.url)), 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
   })
-  Menu.setApplicationMenu(Menu.buildFromTemplate([{ label: 'Singularity', submenu: [
+  Menu.setApplicationMenu(Menu.buildFromTemplate([{ label: APP_NAME, submenu: [
     { label: '刷新工作台', accelerator: 'CmdOrCtrl+R', click: () => window.reload() },
     { role: 'toggleDevTools' }, { type: 'separator' }, { label: '退出', click: () => app.quit() },
   ] }, { role: 'editMenu' }]))
@@ -81,14 +90,14 @@ async function start(): Promise<void> {
   window.webContents.session.setPermissionRequestHandler((contents, permission, callback) => {
     callback(contents === window.webContents && contents.getURL() === entry && permission === 'clipboard-sanitized-write')
   })
-  backend.on('frame', frame => { if (subscribed && !window.isDestroyed()) window.webContents.send('singularity:frame', frame) })
-  ipcMain.handle('singularity:connect', async event => {
+  backend.on('frame', frame => { if (subscribed && !window.isDestroyed()) window.webContents.send(IPC_CHANNELS.frame, frame) })
+  ipcMain.handle(IPC_CHANNELS.connect, async event => {
     trusted(event)
     const frame = await backend.connect()
     subscribed = true
     return frame
   })
-  ipcMain.handle('singularity:theme', (event, theme) => {
+  ipcMain.handle(IPC_CHANNELS.theme, (event, theme) => {
     trusted(event)
     const next = theme === 'dark' ? 'dark' : 'light'
     try {
@@ -97,7 +106,7 @@ async function start(): Promise<void> {
     } catch {}
     window.setBackgroundColor(next === 'dark' ? '#202020' : '#ffffff')
   })
-  ipcMain.handle('singularity:rpc', async (event, request): Promise<RpcResponse> => {
+  ipcMain.handle(IPC_CHANNELS.rpc, async (event, request): Promise<RpcResponse> => {
     trusted(event)
     if (request?.method !== 'directory.pick') return backend.rpc(request)
     try {
@@ -111,8 +120,8 @@ async function start(): Promise<void> {
     }
   })
   tray = new Tray(icon.resize({ width: 20, height: 20 }))
-  tray.setToolTip('Singularity')
-  tray.setContextMenu(Menu.buildFromTemplate([{ label: '打开 Singularity', click: show }, { label: '退出', click: () => app.quit() }]))
+  tray.setToolTip(APP_NAME)
+  tray.setContextMenu(Menu.buildFromTemplate([{ label: `打开 ${APP_NAME}`, click: show }, { label: '退出', click: () => app.quit() }]))
   tray.on('click', show)
   window.on('close', event => { if (!quitting) { event.preventDefault(); window.hide() } })
   await window.loadURL(entry)
@@ -134,5 +143,5 @@ else {
       app.quit()
     })()
   })
-  void app.whenReady().then(start).catch(error => { dialog.showErrorBox('Singularity 启动失败', String(error)); app.quit() })
+  void app.whenReady().then(start).catch(error => { dialog.showErrorBox(`${APP_NAME} 启动失败`, String(error)); app.quit() })
 }

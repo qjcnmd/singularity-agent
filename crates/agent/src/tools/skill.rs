@@ -1,8 +1,8 @@
 //! `skill` 工具：按名称加载一个技能的完整指令。技能目录在 Developer 指令里，由 Skills 模块提供。
 
+use app_core::skills::SkillCatalog;
 use serde::Deserialize;
 use serde_json::json;
-use singularity_core::skills::SkillCatalog;
 
 use super::registry::{ToolExecution, error_result};
 
@@ -12,8 +12,8 @@ pub(crate) struct SkillArgs {
     pub(crate) name: String,
 }
 
-pub(crate) fn spec() -> singularity_core::ToolDefinition {
-    singularity_core::ToolDefinition {
+pub(crate) fn spec() -> app_core::ToolDefinition {
+    app_core::ToolDefinition {
         name: "skill".to_string(),
         description: "Load the complete instructions of an available skill by name. The result includes the skill's base directory, from which its relative resources are resolved.".to_string(),
         parameters_schema: json!({

@@ -5,8 +5,8 @@ use super::activity::Activity;
 use super::{
     Conversation, ConversationError, ConversationState, Operation, TurnControls, TurnLifecycle, view,
 };
-use singularity_agent::agent::{QueuedInput, UserInput};
-use singularity_protocol::{SessionFailure, SessionOperation, SessionPhase, StreamEvent, TurnStatus};
+use agent::agent::{QueuedInput, UserInput};
+use protocol::{SessionFailure, SessionOperation, SessionPhase, StreamEvent, TurnStatus};
 
 impl Conversation {
     // 三个入口都已在状态锁内检查允许启动；占用任务、清理上次显示状态和发布由这里一起完成。
@@ -38,11 +38,7 @@ impl Conversation {
         };
         self.settle(operation.source, result);
     }
-    fn settle(
-        &self,
-        source: SessionOperation,
-        result: Result<TurnStatus, singularity_protocol::TurnErrorDetail>,
-    ) {
+    fn settle(&self, source: SessionOperation, result: Result<TurnStatus, protocol::TurnErrorDetail>) {
         let failed = matches!(&result, Err(_) | Ok(TurnStatus::Failed));
         let failure = result.err().map(|error| SessionFailure { source, error });
         let mut view = self.lock_view();
@@ -67,7 +63,7 @@ impl Conversation {
     }
 
     /// 接受用户输入并启动所需执行；后续回合由会话接续。
-    pub fn start(self: &Arc<Self>, input: UserInput) -> Result<(), ConversationError> {
+    pub(crate) fn start(self: &Arc<Self>, input: UserInput) -> Result<(), ConversationError> {
         let mut view = self.lock_view();
         let mut state = self.lock_state();
         if state.closing {
@@ -94,7 +90,7 @@ impl Conversation {
     }
 
     /// 空闲时占用任务执行独立轮换；轮换标记让运行阶段显示为“轮换中”。
-    pub fn rotate_context(self: &Arc<Self>) -> Result<(), ConversationError> {
+    pub(crate) fn rotate_context(self: &Arc<Self>) -> Result<(), ConversationError> {
         let mut view = self.lock_view();
         let state = self.lock_state();
         if state.closing || state.turn.is_busy() {
@@ -126,19 +122,22 @@ impl Conversation {
         Some(self.begin_operation(&mut view, state, SessionOperation::Turn))
     }
     /// 等待前台结束，再回收所有后台进程。
-    pub async fn stop(&self) -> Result<(), String> {
-        self.set_closing(true);
+    pub(crate) async fn stop(&self) -> Result<(), ConversationError> {
+        self.mark_closing();
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            match self.phase() {
-                SessionPhase::Idle if self.lock_state().context_preview.is_none() => break,
-                SessionPhase::Idle => {}
+            let (phase, has_preview) = {
+                let state = self.lock_state();
+                (state.turn.phase(), state.context_preview.is_some())
+            };
+            match phase {
+                SessionPhase::Idle if !has_preview => break,
+                SessionPhase::Idle | SessionPhase::Stopping => {}
                 SessionPhase::Running | SessionPhase::Rotating => {
                     let _ = self.abort();
                 }
-                SessionPhase::Stopping => {}
             }
             changed.await;
         }
@@ -146,9 +145,10 @@ impl Conversation {
             .shutdown()
             .await
             .inspect_err(|message| self.background_error(message.clone()))
+            .map_err(ConversationError::BackgroundShutdown)
     }
     /// 删除期间拒绝新操作；失败时由 guard 重新开放。
-    pub fn begin_delete(self: &Arc<Self>) -> Result<DeleteGuard, ConversationError> {
+    pub(crate) fn begin_delete(self: &Arc<Self>) -> Result<DeleteGuard, ConversationError> {
         let _view = self.lock_view();
         let mut state = self.lock_state();
         if state.closing {
@@ -157,24 +157,24 @@ impl Conversation {
         state.closing = true;
         Ok(DeleteGuard { conversation: Some(Arc::clone(self)) })
     }
-    pub fn is_deleting(&self) -> bool {
+    pub(crate) fn is_deleting(&self) -> bool {
         self.lock_state().closing
     }
 }
 /// 删除未完成时恢复任务的操作入口。
-pub struct DeleteGuard {
+pub(crate) struct DeleteGuard {
     conversation: Option<Arc<Conversation>>,
 }
 impl DeleteGuard {
     /// 删除成功后保持关闭，异步收尾持有的旧对象不能再启动执行。
-    pub fn complete(mut self) {
+    pub(crate) fn complete(mut self) {
         self.conversation.take();
     }
 }
 impl Drop for DeleteGuard {
     fn drop(&mut self) {
         if let Some(conversation) = &self.conversation {
-            conversation.set_closing(false);
+            conversation.clear_closing();
         }
     }
 }

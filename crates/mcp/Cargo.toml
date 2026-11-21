@@ -1,5 +1,5 @@
 [package]
-name = "singularity_mcp"
+name = "mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,10 +10,11 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-singularity_core = { path = "../core" }
-singularity_protocol = { path = "../protocol" }
+app_core = { path = "../core" }
+protocol = { path = "../protocol" }
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
@@ -22,5 +23,5 @@ reqwest.workspace = true
 rustls.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-process-wrap = { version = "10.0", features = ["tokio1", "job-object", "creation-flags"] }
-windows = { version = "0.62", features = ["Win32_System_Threading"] }
+process-wrap.workspace = true
+windows.workspace = true

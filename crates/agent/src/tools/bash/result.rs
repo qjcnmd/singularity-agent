@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use singularity_protocol::{BackgroundTask, BackgroundTaskState, CommandOutputSnapshot};
+use protocol::{BackgroundTask, BackgroundTaskState, CommandOutputSnapshot};
 
 use crate::tools::registry::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, ToolDisplay, ToolExecution, error_result,

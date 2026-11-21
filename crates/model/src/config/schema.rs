@@ -18,7 +18,7 @@ pub(crate) fn validate_reasoning_variants(
     for (index, variant) in variants.iter().enumerate() {
         validate_identifier(variant, "推理档位")?;
         if variants[..index].contains(variant) {
-            return Err(configuration_error("推理档位不能重复"));
+            return Err(configuration_error(format!("推理档位不能重复：{variant}")));
         }
         if protocol == ProviderApiProtocol::Responses && variant == "on" {
             return Err(configuration_error("Responses 须选择具体思考档位，不支持 on 开关"));

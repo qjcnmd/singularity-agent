@@ -1,4 +1,5 @@
 import { ExpandChevron } from './ExpandChevron'
+import { APP_NAME } from '../identity'
 import { AttachedImages, FileChips } from './Images'
 import { QuestionPanel } from './QuestionPanel'
 import { Disclosure } from './Disclosure'
@@ -82,7 +83,7 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
       <motion.article initial={{ opacity: 0, y: item.role === 'user' ? 36 : 10, scale: item.role === 'user' ? .84 : .9 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={reduced ? { duration: 0 } : { ...pop, opacity: { duration: .16 } }} style={{ originX: item.role === 'user' ? 1 : 0, originY: 1 }}
         className={`timeline-item message-item timeline-${item.role} status-${item.status}`}
         data-item-id={itemKey}
-        aria-label={`${item.role === 'user' ? '你' : 'Singularity'}，${factStatusText[item.status]}`}
+        aria-label={`${item.role === 'user' ? '你' : APP_NAME}，${factStatusText[item.status]}`}
       >
         {item.role === 'user' && item.at && <time className="msg-time" dateTime={item.at}>{formatClock(item.at, true)}</time>}
         <div className={`message-bubble${item.status === 'failed' ? ' error-bubble' : ''}`}>

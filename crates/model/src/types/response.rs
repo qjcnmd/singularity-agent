@@ -13,6 +13,7 @@ pub enum ModelStopReason {
 /// 提供方返回的完成结果，连同已解析的工具调用和用量。
 ///
 /// 失败和取消也返回已收到的正文；调用方按停止原因决定保存、重试或结束。
+#[must_use]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelTurnResponse {
     pub assistant_message: Message,

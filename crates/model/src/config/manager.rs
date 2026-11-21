@@ -5,9 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use singularity_protocol::{
-    ModelConfigurationInput, ProviderConfigurationInput, RedactedModelCatalog, RedactedProvider,
-};
+use protocol::{ModelConfigurationInput, ProviderConfigurationInput, RedactedModelCatalog, RedactedProvider};
 
 use super::{
     ModelSelection, ProviderApiProtocol, ProviderConfig, ProviderError, SelectedModel, UserConfigFile,
@@ -67,7 +65,7 @@ impl ModelConfigManager {
         let mut data = read_user_config_file(&self.directory)?
             .ok_or_else(|| configuration_error("尚未配置模型提供方"))?;
         if data.providers.remove(provider_id).is_none() {
-            return Err(configuration_error("模型提供方不存在"));
+            return Err(configuration_error(format!("模型提供方不存在：{provider_id}")));
         }
         clear_invalid_default_selection(&mut data);
         write_user_config_file(&self.directory, &data)?;
@@ -155,7 +153,7 @@ fn model_definitions(
     for model in models {
         validate_identifier(&model.model_id, "模型标识")?;
         if definitions.contains_key(&model.model_id) {
-            return Err(configuration_error("同一提供方的模型标识不能重复"));
+            return Err(configuration_error(format!("同一提供方的模型标识不能重复：{}", model.model_id)));
         }
         let (model_id, configured) = model_definition(model, provider_protocol)?;
         definitions.insert(model_id, configured);
@@ -171,10 +169,10 @@ fn model_definition(
     let configured = UserConfigModel {
         max_context_tokens: model
             .max_context_tokens
-            .ok_or_else(|| configuration_error("请填写上下文窗口。"))?,
+            .ok_or_else(|| configuration_error(format!("模型 {} 请填写上下文窗口。", model.model_id)))?,
         max_output_tokens: model
             .max_output_tokens
-            .ok_or_else(|| configuration_error("请填写最大输出 Token。"))?,
+            .ok_or_else(|| configuration_error(format!("模型 {} 请填写最大输出 Token。", model.model_id)))?,
         reasoning_variants: model.reasoning_variants,
     };
     resolve_model_definition(&configured, provider_protocol, &model.model_id, None)?;

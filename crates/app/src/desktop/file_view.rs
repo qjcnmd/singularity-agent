@@ -3,7 +3,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use singularity_protocol::{RpcError, TextDocument};
+use protocol::{RpcError, TextDocument};
 
 /// 文件栏只用来查看，超过这个大小的文件交给编辑器打开。
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -11,7 +11,7 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// `path` 可以是绝对路径、`~/` 开头或相对 `cwd`；行号后缀（`file.rs:12`）由前端去掉。
 pub(crate) fn read_text_file(cwd: &str, path: &str) -> Result<TextDocument, RpcError> {
     let resolved = resolve(cwd, path.trim());
-    let shown = singularity_core::display_path(&resolved);
+    let shown = app_core::display_path(&resolved);
     let file = std::fs::File::open(&resolved).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => RpcError::new(format!("文件不存在：{shown}")),
         std::io::ErrorKind::PermissionDenied

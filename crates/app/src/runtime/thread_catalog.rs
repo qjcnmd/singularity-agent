@@ -4,31 +4,31 @@
 
 use std::path::{Path, PathBuf};
 
-use singularity_agent::session::{
+use agent::session::{
     SessionData, SessionError, SessionManager, session_images_directory, session_outputs_directory,
 };
-use singularity_protocol::ThreadSummary;
+use protocol::ThreadSummary;
 use uuid::Uuid;
 
 use crate::runtime::history::summarize_thread;
 
-pub const SESSIONS_DIR_NAME: &str = "sessions";
+pub(crate) const SESSIONS_DIR_NAME: &str = "sessions";
 
 /// `sessions/` 目录下的会话文件；不持有写者，写入由打开它的 Conversation 负责。
-pub struct ThreadCatalog {
+pub(crate) struct ThreadCatalog {
     sessions_dir: PathBuf,
 }
 
 impl ThreadCatalog {
-    pub fn new(sessions_dir: PathBuf) -> Self {
+    pub(crate) fn new(sessions_dir: PathBuf) -> Self {
         Self { sessions_dir }
     }
 
     /// 用 UUID v7 新建会话文件，写入文件头和初始模型选择；文件已存在时报错。
-    pub fn create_thread(
+    pub(crate) fn create_thread(
         &self,
         cwd: &str,
-        model: singularity_protocol::ModelSelection,
+        model: protocol::ModelSelection,
         disabled_modules: Vec<String>,
     ) -> Result<SessionManager, CatalogError> {
         let thread_id = Uuid::now_v7().to_string();
@@ -43,13 +43,13 @@ impl ThreadCatalog {
     }
 
     /// 以写入方式打开日志并截掉未写完的末尾；返回的写者交给 Conversation 长期持有。
-    pub fn open_session(&self, thread_id: &str) -> Result<SessionManager, CatalogError> {
+    pub(crate) fn open_session(&self, thread_id: &str) -> Result<SessionManager, CatalogError> {
         let path = checked_session_path(&self.sessions_dir, thread_id)?;
         SessionManager::open_existing(&path, thread_id).map_err(|error| self.session_error(thread_id, error))
     }
 
     /// 按更新时间列出当前会话；扫描期间已删除的文件不再列入。
-    pub fn list_threads(&self) -> Result<Vec<ThreadSummary>, CatalogError> {
+    pub(crate) fn list_threads(&self) -> Result<Vec<ThreadSummary>, CatalogError> {
         let entries = match std::fs::read_dir(&self.sessions_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -82,7 +82,7 @@ impl ThreadCatalog {
     }
 
     /// 读取未打开任务的图片，只接受日志里实际引用的图片 ID。
-    pub fn image_data(&self, thread_id: &str, image_id: &str) -> Result<String, CatalogError> {
+    pub(crate) fn image_data(&self, thread_id: &str, image_id: &str) -> Result<String, CatalogError> {
         // 日志能打开时，后面的失败归为图片读取失败，不报告为任务不存在。
         open_thread_read_only(&self.sessions_dir, thread_id)?
             .image_data(image_id)
@@ -93,7 +93,7 @@ impl ThreadCatalog {
     }
 
     /// 停止任务后删除日志和附件；附件删除失败时保留日志，便于重试。
-    pub fn delete(&self, thread_id: &str) -> Result<(), CatalogError> {
+    pub(crate) fn delete(&self, thread_id: &str) -> Result<(), CatalogError> {
         let path = checked_session_path(&self.sessions_dir, thread_id)?;
         for directory in [
             session_images_directory(&self.sessions_dir, thread_id),
@@ -113,8 +113,8 @@ impl ThreadCatalog {
     }
 }
 
-pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
-    sessions_dir.join(singularity_agent::session::session_file_name(thread_id))
+fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
+    sessions_dir.join(agent::session::session_file_name(thread_id))
 }
 
 fn checked_session_path(sessions_dir: &Path, thread_id: &str) -> Result<PathBuf, CatalogError> {
@@ -144,7 +144,7 @@ fn open_thread_read_only(sessions_dir: &Path, thread_id: &str) -> Result<Session
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum CatalogError {
+pub(crate) enum CatalogError {
     #[error("thread {0} was not found")]
     NotFound(String),
     #[error("session {}: {source}", path.display())]

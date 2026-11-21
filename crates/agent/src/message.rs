@@ -2,7 +2,7 @@
 
 use crate::session::MessageDisplay;
 use crate::tools::ToolExecution;
-use singularity_model::{ContentBlock, Message};
+use model::{ContentBlock, Message};
 
 /// 取出用户消息首段文本的界面展示文案：有原始输入时显示原文，模型消费含技能正文与附件路径的 `content`。
 pub fn user_text_for_display<'a>(
@@ -30,14 +30,14 @@ pub fn public_items(
     message: &Message,
     display: Option<&MessageDisplay>,
     entry_id: &str,
-    status: singularity_protocol::TurnStatus,
-    tool_status: singularity_protocol::ToolStatus,
+    status: protocol::TurnStatus,
+    tool_status: protocol::ToolStatus,
     saved_at: &str,
-) -> Vec<singularity_protocol::HistoryItem> {
-    use singularity_protocol::HistoryItem;
+) -> Vec<protocol::HistoryItem> {
+    use protocol::HistoryItem;
     let role = match message {
-        Message::User { .. } => singularity_protocol::HistoryMessageRole::User,
-        Message::Assistant { .. } => singularity_protocol::HistoryMessageRole::Assistant,
+        Message::User { .. } => protocol::HistoryMessageRole::User,
+        Message::Assistant { .. } => protocol::HistoryMessageRole::Assistant,
         Message::Developer { .. } | Message::ToolResult { .. } | Message::Notification { .. } => {
             return Vec::new();
         }
@@ -92,18 +92,12 @@ pub fn public_items(
 }
 
 /// 把会话累计用量挂到一条助手消息的最后一段正文上；没有正文时不显示。
-pub fn attach_usage(
-    items: &mut [singularity_protocol::HistoryItem],
-    usage: &singularity_protocol::SessionModelUsage,
-) {
-    if let Some(singularity_protocol::HistoryItem::Message {
+pub fn attach_usage(items: &mut [protocol::HistoryItem], usage: &protocol::SessionModelUsage) {
+    if let Some(protocol::HistoryItem::Message {
         stats,
-        role: singularity_protocol::HistoryMessageRole::Assistant,
+        role: protocol::HistoryMessageRole::Assistant,
         ..
-    }) = items
-        .iter_mut()
-        .rev()
-        .find(|item| matches!(item, singularity_protocol::HistoryItem::Message { .. }))
+    }) = items.iter_mut().rev().find(|item| matches!(item, protocol::HistoryItem::Message { .. }))
     {
         *stats = Some(usage.clone());
     }
@@ -140,7 +134,7 @@ pub(crate) fn tool_result_message(
 pub fn public_tool_result(
     message: &Message,
     display: Option<&MessageDisplay>,
-) -> Option<singularity_protocol::ToolResult> {
+) -> Option<protocol::ToolResult> {
     let Message::ToolResult { is_error, .. } = message else {
         return None;
     };
@@ -158,7 +152,7 @@ pub fn public_tool_result(
         ),
         _ => (message.content_text(), None, None, None),
     };
-    Some(singularity_protocol::ToolResult {
+    Some(protocol::ToolResult {
         output,
         background_task_id,
         images: message.images().cloned().collect(),

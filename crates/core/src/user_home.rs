@@ -2,21 +2,18 @@
 //! `.singularity`。取值无效时如实报错，不改写到别处；错误消息点名真正出问题的变量，
 //! 默认来源出问题时不归到 `SINGULARITY_HOME` 头上。
 
+use crate::identity::{DATA_DIR_NAME, HOME_ENV_VAR};
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
 };
 
-const SINGULARITY_HOME: &str = "SINGULARITY_HOME";
-
-pub const SINGULARITY_DIR_NAME: &str = ".singularity";
-
 /// 解析应用数据根目录（优先读取 `SINGULARITY_HOME` 环境变量，默认使用用户目录下的 `.singularity`）。
 pub fn resolve_home() -> Result<PathBuf, String> {
-    if let Some(value) = std::env::var_os(SINGULARITY_HOME).filter(|value| !is_blank(value)) {
+    if let Some(value) = std::env::var_os(HOME_ENV_VAR).filter(|value| !is_blank(value)) {
         let base = Path::new(&value);
-        let path = validated_root(base)
-            .map_err(|reason| format!("{SINGULARITY_HOME} {reason}: {}", base.display()))?;
+        let path =
+            validated_root(base).map_err(|reason| format!("{HOME_ENV_VAR} {reason}: {}", base.display()))?;
         return Ok(path);
     }
     let base = std::env::home_dir().ok_or_else(|| {
@@ -28,7 +25,7 @@ pub fn resolve_home() -> Result<PathBuf, String> {
             base.display()
         )
     })?;
-    Ok(base.join(SINGULARITY_DIR_NAME))
+    Ok(base.join(DATA_DIR_NAME))
 }
 
 /// 空串和纯空白都按没设置处理：否则数据根会变成一个相对路径。

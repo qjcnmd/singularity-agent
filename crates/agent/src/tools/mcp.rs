@@ -4,9 +4,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use mcp::McpTool;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use singularity_mcp::McpTool;
 use tokio_util::sync::CancellationToken;
 
 use super::{ToolExecution, error_result};
@@ -31,8 +31,8 @@ pub(crate) struct McpCallArgs {
     pub(crate) arguments: Map<String, Value>,
 }
 
-pub(crate) fn schema_spec() -> singularity_core::ToolDefinition {
-    singularity_core::ToolDefinition {
+pub(crate) fn schema_spec() -> app_core::ToolDefinition {
+    app_core::ToolDefinition {
         name: MCP_SCHEMA_TOOL_NAME.into(),
         description: "Inspect the full description and JSON input schema of one or more specific MCP tools on a server before invoking them via mcp_call. Only request the tools you need.".into(),
         parameters_schema: json!({
@@ -52,8 +52,8 @@ pub(crate) fn schema_spec() -> singularity_core::ToolDefinition {
     }
 }
 
-pub(crate) fn call_spec() -> singularity_core::ToolDefinition {
-    singularity_core::ToolDefinition {
+pub(crate) fn call_spec() -> app_core::ToolDefinition {
+    app_core::ToolDefinition {
         name: MCP_CALL_TOOL_NAME.into(),
         description: "Invoke an MCP tool by server ID and tool name. Call mcp_schema first if the tool takes arguments whose schema you have not yet inspected; tools marked (no args) can be called directly.".into(),
         parameters_schema: json!({
@@ -143,7 +143,7 @@ pub(super) async fn execute(
                 }
                 execution
             }
-            Err(error) => error_result(error),
+            Err(error) => error_result(error.to_string()),
         };
         let mut output = super::output::CaptureState::new(output_directory);
         output.ingest(&execution.content);

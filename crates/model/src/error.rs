@@ -14,6 +14,7 @@ pub enum ModelErrorKind {
 }
 
 /// 提供方失败，含错误分类、可显示的诊断信息和重试等待时间。
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderError {
     pub kind: ModelErrorKind,
@@ -77,6 +78,8 @@ impl ProviderError {
 const PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
 /// 提供方明确返回的限流错误码，允许自动重试。
 const PROVIDER_RATE_LIMIT_EXCEEDED_CODE: &str = "rate_limit_exceeded";
+/// 提供方明确返回的服务端暂时故障错误码，允许自动重试。
+const PROVIDER_SERVER_ERROR_CODE: &str = "server_error";
 /// 提供方返回的配额耗尽错误码，不自动重试。
 const PROVIDER_INSUFFICIENT_QUOTA_CODE: &str = "insufficient_quota";
 /// 附在非 2xx 错误上的提供方诊断文本长度上限（字符数）。
@@ -146,12 +149,17 @@ pub(crate) fn append_provider_http_diagnostic(
 pub(crate) fn provider_error_kind_for_fields(fields: &ProviderErrorBodyFields) -> Option<ModelErrorKind> {
     match fields.code.as_deref() {
         Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE) => return Some(ModelErrorKind::ContextLengthExceeded),
-        Some(PROVIDER_RATE_LIMIT_EXCEEDED_CODE) => return Some(ModelErrorKind::Temporary),
+        Some(PROVIDER_RATE_LIMIT_EXCEEDED_CODE | PROVIDER_SERVER_ERROR_CODE) => {
+            return Some(ModelErrorKind::Temporary);
+        }
         Some(PROVIDER_INSUFFICIENT_QUOTA_CODE) => return Some(ModelErrorKind::Other),
         _ => {}
     }
     match fields.wire_type.as_deref() {
-        Some("rate_limit_error" | "overloaded_error") => Some(ModelErrorKind::Temporary),
+        Some("rate_limit_error" | "overloaded_error" | "api_error" | "server_error") => {
+            Some(ModelErrorKind::Temporary)
+        }
+        Some(PROVIDER_INSUFFICIENT_QUOTA_CODE) => Some(ModelErrorKind::Other),
         Some("invalid_request_error") => fields.message.as_deref().and_then(|message| {
             let lower = message.to_ascii_lowercase();
             (lower.contains("prompt is too long") || lower.contains("maximum context length"))
@@ -184,7 +192,7 @@ pub(crate) fn bounded_provider_error_diagnostic(text: &str) -> String {
             continue;
         }
         if separator_pending {
-            if remaining == 0 {
+            if remaining < 2 {
                 break;
             }
             diagnostic.push(' ');

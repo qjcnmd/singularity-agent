@@ -27,6 +27,9 @@ mod types;
 
 pub use client::ModelClient;
 pub use config::{ModelConfigManager, ModelConfigurationSnapshot, discover_models};
-pub use error::*;
+pub use error::{ModelErrorKind, ProviderError};
 pub use provider::ProviderStreamEvent;
-pub use types::*;
+pub use types::{
+    ContentBlock, Message, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse, ModelUsage,
+    ProviderBlockMetadata, ProviderMessageMetadata,
+};

@@ -2,9 +2,9 @@
 
 use super::{Agent, AgentEvent, Result, TurnEvent};
 use crate::message::tool_result_message;
-use crate::session::lock_writer;
+use crate::session::with_writer;
 use crate::tools::{PreparedTool, ToolExecution, error_result};
-use singularity_model::ModelToolCall;
+use model::ModelToolCall;
 use std::{sync::Arc, time::Instant};
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -22,8 +22,9 @@ impl Agent {
     ) -> Result<()> {
         let session = Arc::clone(&self.requests.session);
         let (cwd, output_directory) = tokio::task::spawn_blocking(move || {
-            let writer = lock_writer(&session);
-            (writer.cwd().to_path_buf(), writer.output_directory())
+            with_writer(&session, |writer| {
+                (writer.data().cwd().to_path_buf(), writer.data().output_directory())
+            })
         })
         .await
         .expect("session path lookup completes while the runtime is running");
@@ -53,12 +54,12 @@ impl Agent {
                 }
                 let (item_id, call, tool) = pending.next().expect("pending tool exists");
                 on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
-                    item: singularity_protocol::HistoryItem::Tool {
+                    item: protocol::HistoryItem::Tool {
                         id: item_id.clone(),
                         name: call.tool_name,
                         args: call.arguments,
                         result: None,
-                        status: singularity_protocol::ToolStatus::Running,
+                        status: protocol::ToolStatus::Running,
                     },
                 }));
                 let tool = if signal.is_cancelled() {
@@ -71,7 +72,7 @@ impl Agent {
                     let mut execution = self
                         .questions
                         .ask(
-                            singularity_protocol::PendingQuestion {
+                            protocol::PendingQuestion {
                                 item_id: item_id.clone(),
                                 questions: args.questions,
                             },
@@ -79,7 +80,7 @@ impl Agent {
                             on_event,
                         )
                         .await;
-                    execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
+                    execution.duration_ms = Some(app_core::duration_millis(started.elapsed()));
                     if let Err(error) =
                         self.finish_tool(item_id, call.tool_call_id, execution, on_event).await
                     {
@@ -110,8 +111,7 @@ impl Agent {
                                     }
                                 })
                                 .await;
-                            execution.duration_ms =
-                                Some(singularity_core::duration_millis(started.elapsed()));
+                            execution.duration_ms = Some(app_core::duration_millis(started.elapsed()));
                             execution
                         }
                     };

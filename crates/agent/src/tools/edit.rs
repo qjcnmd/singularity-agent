@@ -24,7 +24,7 @@ static FILE_EDITS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>
 /// 确保 `edit` 与 `write` 对同一目标（含新建文件）共用同一把进程级路径锁。
 pub(super) fn file_lock_key(path: &Path) -> std::io::Result<String> {
     if let Ok(canonical) = path.canonicalize() {
-        return Ok(singularity_core::workspace_key(&canonical));
+        return Ok(app_core::workspace_key(&canonical));
     }
     let mut missing = Vec::new();
     let mut cursor = path;
@@ -34,7 +34,7 @@ pub(super) fn file_lock_key(path: &Path) -> std::io::Result<String> {
             for component in missing.into_iter().rev() {
                 full.push(component);
             }
-            return Ok(singularity_core::workspace_key(&full));
+            return Ok(app_core::workspace_key(&full));
         }
         let Some(name) = cursor.file_name() else {
             return Err(std::io::Error::new(
@@ -65,7 +65,7 @@ where
     };
     let result = tokio::select! {
         biased;
-        _ = signal.cancelled() => error_result(ABORTED_MESSAGE),
+        () = signal.cancelled() => error_result(ABORTED_MESSAGE),
         guard = Arc::clone(&lock).lock_owned() => {
             // 工作线程持有锁直到写入结束，停止不能提前放行下一个编辑。
             tokio::task::spawn_blocking(move || {
@@ -98,8 +98,8 @@ struct Replacement {
     new_text: String,
 }
 
-pub(crate) fn spec() -> singularity_core::ToolDefinition {
-    singularity_core::ToolDefinition {
+pub(crate) fn spec() -> app_core::ToolDefinition {
+    app_core::ToolDefinition {
         name: "edit".into(),
         description: "Edit an existing UTF-8 text file using one or more exact replacements. Each old_text must be nonempty and unique in the original file; edits must not overlap. All replacements are checked before writing once. Read the relevant content first. LF and CRLF match equivalently; other whitespace and characters must match exactly. Use an empty new_text to delete text. Keep enough context to identify each location. Combine independent changes to one file in a single call; do not issue dependent edits concurrently.".into(),
         parameters_schema: json!({
@@ -140,7 +140,7 @@ pub(crate) async fn execute(args: EditArgs, cwd: PathBuf, signal: CancellationTo
         Ok(target) => target,
         Err(error) => return error_result(format!("Could not edit {}: {error}", args.path)),
     };
-    let key = singularity_core::workspace_key(&target);
+    let key = app_core::workspace_key(&target);
     with_file_lock(key, signal, move |signal| execute_locked(&args, &target, signal)).await
 }
 
@@ -193,6 +193,9 @@ fn execute_locked(
     let source_offset = |offset| offset + removed.partition_point(|removed| *removed < offset);
     let mut matches = Vec::with_capacity(args.edits.len());
     for (index, edit) in args.edits.iter().enumerate() {
+        if edit.new_text.contains('\0') {
+            return Err(format!("edits[{index}].new_text must not contain NUL bytes"));
+        }
         let old = edit.old_text.replace("\r\n", "\n");
         if old.is_empty() {
             return Err(format!("edits[{index}].old_text must not be empty"));
@@ -246,7 +249,7 @@ fn execute_locked(
         return Err(ABORTED_MESSAGE.into());
     }
     // 提交开始后报告真实写入结果，不能把已完成的修改改报为取消。
-    singularity_core::write_bytes_atomic(target, updated.as_bytes())
+    app_core::write_bytes_atomic(target, updated.as_bytes())
         .map_err(|error| format!("Could not write {}: {error}", args.path))?;
     Ok(format_diff_result("Edited", &args.path, &view, &updated))
 }

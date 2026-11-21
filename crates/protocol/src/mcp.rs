@@ -116,6 +116,6 @@ pub struct McpServerState {
     pub status: McpConnectionStatus,
     pub error: Option<String>,
     pub tools: Vec<McpToolInfo>,
-    /// 最近一次发现后，这台服务器的工具定义和说明在请求里的估算 Token 数；未连接过为 0。
+    /// 最近一次发现后，这台服务器的说明或失败提示在请求里的估算 Token 数；未连接过为 0。
     pub tokens: u64,
 }

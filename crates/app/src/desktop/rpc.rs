@@ -1,17 +1,18 @@
 //! 工作台 RPC 的适配层：每个方法只分发一次，阻塞操作进入工作线程。
 use super::app_server::AppServer;
 use super::file_view::read_text_file;
+use protocol::{RpcError, RpcRequest, RpcResponse};
 use serde::Serialize;
 use serde_json::Value;
-use singularity_protocol::{RpcError, RpcRequest, RpcResponse};
 use std::sync::Arc;
 
-pub async fn handle(
+pub(super) async fn handle(
     app: &Arc<AppServer>,
     request: RpcRequest,
+    request_seq: u64,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> RpcResponse {
-    match dispatch(Arc::clone(app), request, shutdown).await {
+    match dispatch(Arc::clone(app), request, request_seq, shutdown).await {
         Ok(result) => RpcResponse::Success { result },
         Err(error) => {
             tracing::warn!(error = %error.message, "RPC request failed");
@@ -23,6 +24,7 @@ pub async fn handle(
 async fn dispatch(
     app: Arc<AppServer>,
     request: RpcRequest,
+    request_seq: u64,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<Value, RpcError> {
     match request {
@@ -97,9 +99,11 @@ async fn dispatch(
             blocking(move || app.context_preview(&params.workspace_root)).await
         }
         RpcRequest::SessionStart(params) => blocking(move || app.start_session(params)).await,
-        RpcRequest::SessionRead(params) => blocking(move || app.read_session(&params.session_id)).await,
+        RpcRequest::SessionRead(params) => {
+            blocking(move || app.read_session(&params.session_id, request_seq)).await
+        }
         RpcRequest::SessionFocus(params) => {
-            app.set_focused_session(params.session_id);
+            app.set_focused_session(request_seq, params.session_id);
             Ok(value(()))
         }
         RpcRequest::SessionImageRead(params) => {

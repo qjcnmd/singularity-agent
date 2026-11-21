@@ -21,20 +21,31 @@ unsafe_code = "forbid"
 unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
-all = { level = "warn", priority = -1 }
+all = { level = "warn", priority = -2 }
+allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
-correctness = "deny"
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+cast_possible_truncation = "warn"
+correctness = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+format_collect = "deny"
 format_push_string = "deny"
 match_wildcard_for_single_variants = "deny"
 needless_collect = "deny"
+print_stdout = "deny"
 redundant_clone = "deny"
 redundant_closure_for_method_calls = "deny"
+return_self_not_must_use = "warn"
+todo = "deny"
 trivially_copy_pass_by_ref = "deny"
+unimplemented = "deny"
 uninlined_format_args = "deny"
 unwrap_used = "deny"
 wildcard_imports = "deny"
 
 [workspace.dependencies]
+process-wrap = { version = "10.0", features = ["tokio1", "job-object", "creation-flags"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "gzip"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -53,11 +64,9 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
 uuid = { version = "1.11", features = ["v4"] }
+windows = { version = "0.62", features = ["Win32_System_Threading"] }
 proptest = { version = "1.6", default-features = false, features = ["std"] }
 
-# 内部程序异常直接终止；普通操作失败仍通过 Result 返回。
-[profile.dev]
-panic = "abort"
-
+# 发布构建中内部程序异常直接终止；普通操作失败仍通过 Result 返回。
 [profile.release]
 panic = "abort"

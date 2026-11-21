@@ -115,7 +115,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Export TypeScript protocol bindings
-        run: cargo run -p singularity_protocol --features typescript --example export_types --locked
+        run: cargo run -p protocol --features typescript --example export_types --locked
 
       - name: Verify TypeScript protocol bindings are up to date
         run: git diff --ignore-cr-at-eol --exit-code -- apps/desktop/src/protocol.generated.ts

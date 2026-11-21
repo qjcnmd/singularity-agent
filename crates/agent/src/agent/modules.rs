@@ -6,11 +6,11 @@
 
 use std::sync::Arc;
 
-use singularity_core::skills::SkillCatalog;
-use singularity_core::{InstructionFile, estimate_tokens_of, estimate_tool_tokens};
-use singularity_mcp::McpDiscovery;
-use singularity_model::Message;
-use singularity_protocol::{ContextGroup, ContextModule};
+use app_core::skills::SkillCatalog;
+use app_core::{InstructionFile, estimate_tokens_of, estimate_tool_tokens};
+use mcp::McpDiscovery;
+use model::Message;
+use protocol::{ContextGroup, ContextModule};
 
 use crate::tools::{self, ToolRegistrySnapshot};
 
@@ -156,22 +156,14 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         let text = files
             .iter()
             .map(|file| {
-                format!(
-                    "# Instructions from {}\n\n{}",
-                    singularity_core::display_path(&file.path),
-                    file.content
-                )
+                format!("# Instructions from {}\n\n{}", app_core::display_path(&file.path), file.content)
             })
             .collect::<Vec<_>>()
             .join("\n\n");
         let detail = if files.is_empty() {
             "没有找到这类指令文件".to_string()
         } else {
-            files
-                .iter()
-                .map(|file| singularity_core::display_path(&file.path))
-                .collect::<Vec<_>>()
-                .join("\n")
+            files.iter().map(|file| app_core::display_path(&file.path)).collect::<Vec<_>>().join("\n")
         };
         if collector.push(id, ContextGroup::Instructions, label, detail, estimate_tokens_of(&text), false)
             && !files.is_empty()
@@ -327,7 +319,7 @@ pub fn preview(
     cwd: &str,
     instructions: Vec<InstructionFile>,
     skills: SkillCatalog,
-    servers: Vec<singularity_protocol::McpServerState>,
+    servers: Vec<protocol::McpServerState>,
 ) -> Vec<ContextModule> {
     let mcp = McpDiscovery::default();
     let mut modules = assemble(ModuleInputs {
@@ -342,7 +334,7 @@ pub fn preview(
     modules.extend(servers.into_iter().map(|server| {
         let id = server.server.server_id;
         let has_tools = server.error.is_none()
-            && server.status == singularity_protocol::McpConnectionStatus::Connected
+            && server.status == protocol::McpConnectionStatus::Connected
             && !server.tools.is_empty();
         let tokens = if has_tools {
             let prompt = format_mcp_prompt(
@@ -350,20 +342,18 @@ pub fn preview(
                 None,
                 server.tools.iter().map(|tool| (tool.name.as_str(), tool.description.as_str(), false)),
             );
-            let proxy = if !proxy_accounted {
+            let proxy = if proxy_accounted {
+                0
+            } else {
                 proxy_accounted = true;
                 mcp_proxy_tokens()
-            } else {
-                0
             };
             estimate_tokens_of(&prompt) + server.tokens + proxy
         } else {
             server.tokens
         };
         let detail = match (&server.status, server.error) {
-            (singularity_protocol::McpConnectionStatus::NotConnected, _) => {
-                "尚未连接，创建任务时才会连接".to_string()
-            }
+            (protocol::McpConnectionStatus::NotConnected, _) => "尚未连接，创建任务时才会连接".to_string(),
             (_, Some(error)) => format!("连接失败：{error}"),
             (_, None) if server.tools.is_empty() => "已连接（无可用工具）".to_string(),
             (_, None) => {
@@ -387,15 +377,21 @@ pub fn preview(
 /// 生成 Developer 指令；`tool_guidelines` 是本任务开着的工具模块各自提供的一行用法，
 /// 文件指令和技能列表由请求组装代码另外添加。
 fn assemble_developer_instructions(cwd: &str, tool_guidelines: &[&str]) -> String {
-    let tool_guidelines: String = tool_guidelines.iter().map(|line| format!("- {line}\n")).collect();
+    let mut guidelines = String::new();
+    for line in tool_guidelines {
+        guidelines.push_str("- ");
+        guidelines.push_str(line);
+        guidelines.push('\n');
+    }
+    let app_name = app_core::identity::APP_NAME;
     // 写明平台和 shell，否则模型可能在 Git Bash 里写 cmd 语法（如 `cd /d`、`2>nul`），
     // 输出被重定向丢掉。
     format!(
-        "You are an expert coding assistant operating inside Singularity, a coding agent \
+        "You are an expert coding assistant operating inside {app_name}, a coding agent \
              harness. You help users by reading files, executing commands, editing code, and \
              writing new files.\n\n\
              Guidelines:\n\
-             {tool_guidelines}\
+             {guidelines}\
              - Use bash with rg for content searches and rg --files for file discovery; use Python or other commands for byte ranges and structured processing.\n\
              - Be concise in your responses\n\
              - Show file paths clearly when working with files\n\n\

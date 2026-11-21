@@ -23,36 +23,37 @@ pub(crate) mod request;
 
 use std::sync::Arc;
 
-use singularity_model::{ModelClient, ProviderError};
+use model::{ModelClient, ProviderError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-pub use self::inbox::{QueuedInput, SteeringInbox, SteeringInboxHandle, UserInput};
+pub use self::inbox::{QueuedInput, SkillExpansion, SteeringInbox, SteeringInboxHandle, UserInput};
 pub use self::questions::UserQuestions;
-pub use singularity_protocol::TurnEvent;
+pub use crate::image::InputImage;
+pub use protocol::TurnEvent;
 
 /// Agent 发出的事件：可转发为前端 `TurnEvent`，或通知外层更新状态与累计用量。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     Turn(TurnEvent),
     ProviderAttempt {
-        observation: singularity_protocol::RequestObservation,
+        observation: protocol::RequestObservation,
     },
     SessionStateChanged,
 }
 
 use self::inbox::{QueuedInputKind, lock_inbox};
 use crate::message::public_items;
-use crate::session::{MessageDisplay, SessionError, SessionWriter, lock_writer};
+use crate::session::{MessageDisplay, SessionError, SessionWriter, with_writer};
 use crate::tools::ToolRegistrySnapshot;
-use singularity_model::Message;
+use model::Message;
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// 文件指令（AGENTS.md 等）的用户数据根目录。
     pub instruction_home: std::path::PathBuf,
     /// 本轮在开始记录前读取的文件指令。
-    pub initial_instructions: Vec<singularity_core::InstructionFile>,
+    pub initial_instructions: Vec<app_core::InstructionFile>,
     /// 创建任务时关闭的上下文模块 ID，任务期间不变。
     pub disabled_modules: Vec<String>,
 }
@@ -91,12 +92,12 @@ impl AgentError {
     }
 
     /// 保存和发布的失败原因；轮换失败时带上轮换条目 ID，界面据此避免重复报错。
-    pub fn detail(&self) -> singularity_protocol::TurnErrorDetail {
+    pub fn detail(&self) -> protocol::TurnErrorDetail {
         let item_id = match self {
             Self::ContextRotation { item_id, .. } => Some(item_id.clone()),
             _ => None,
         };
-        singularity_protocol::TurnErrorDetail { message: self.to_string(), item_id }
+        protocol::TurnErrorDetail { message: self.to_string(), item_id }
     }
 }
 
@@ -106,17 +107,27 @@ pub type Result<T> = std::result::Result<T, AgentError>;
 pub struct RequestContext {
     session: SessionWriter,
     registry: ToolRegistrySnapshot,
-    mcp: Arc<singularity_mcp::McpManager>,
+    mcp: Arc<mcp::McpManager>,
     definitions: Option<request::RequestDefinitions>,
     provider: ModelClient,
     config: AgentConfig,
+}
+
+impl std::fmt::Debug for RequestContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestContext")
+            .field("provider", &self.provider)
+            .field("config", &self.config)
+            .field("definitions_loaded", &self.definitions.is_some())
+            .finish_non_exhaustive()
+    }
 }
 impl RequestContext {
     /// 按回合开始时的同一套规则加载指令和工具目录，只返回给工作台查看的内容，不发送请求。
     pub async fn inspect_context(
         mut self,
         cancellation: &CancellationToken,
-    ) -> Result<singularity_protocol::InjectedContext> {
+    ) -> Result<protocol::InjectedContext> {
         let (_, context) = self.load_definitions(cancellation).await?;
         Ok(context)
     }
@@ -126,7 +137,7 @@ impl RequestContext {
         provider: ModelClient,
         config: AgentConfig,
         session: SessionWriter,
-        mcp: Arc<singularity_mcp::McpManager>,
+        mcp: Arc<mcp::McpManager>,
     ) -> Self {
         Self {
             session,
@@ -144,6 +155,7 @@ impl RequestContext {
 }
 
 /// 一个普通回合的执行者：消费输入队列、调用模型、执行工具。
+#[derive(Debug)]
 pub struct Agent {
     requests: RequestContext,
     bash_tasks: Arc<crate::tools::BashTasks>,
@@ -188,8 +200,8 @@ impl Agent {
                 &assistant,
                 None,
                 &assistant_result_entry_id,
-                singularity_protocol::TurnStatus::Completed,
-                singularity_protocol::ToolStatus::Pending,
+                protocol::TurnStatus::Completed,
+                protocol::ToolStatus::Pending,
                 &saved_at,
             );
             on_event(AgentEvent::Turn(TurnEvent::MessageFinished {
@@ -250,7 +262,7 @@ impl Agent {
                         .map_err(std::io::Error::other)?
                 {
                     let message = Message::Notification {
-                        content: vec![singularity_model::ContentBlock::text(text)],
+                        content: vec![model::ContentBlock::text(text)],
                     };
                     self.append_message(&request.message_id, message, None, &[]).await?;
                     self.bash_tasks.confirm_delivered(task_id, end, terminal);
@@ -264,21 +276,21 @@ impl Agent {
         let display_text = (model_text != input.text).then(|| input.text.clone());
         let display = (display_text.is_some() || !input.files.is_empty())
             .then(|| MessageDisplay::User { display_text, files: input.files.clone() });
-        let mut content = vec![singularity_model::ContentBlock::text(model_text)];
-        content.extend(images.iter().cloned().map(singularity_model::ContentBlock::Image));
+        let mut content = vec![model::ContentBlock::text(model_text)];
+        content.extend(images.iter().cloned().map(model::ContentBlock::Image));
         let message = Message::User { content };
         let saved_at = self.append_message(&request.message_id, message, display, &input.images).await?;
         lock_inbox(&self.inbox).confirm_saved(&request.message_id);
         on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
-            item: singularity_protocol::HistoryItem::Message {
+            item: protocol::HistoryItem::Message {
                 id: request.item_id(),
                 text: input.text.clone(),
                 at: Some(saved_at),
                 stats: None,
                 images,
                 files: input.files.clone(),
-                role: singularity_protocol::HistoryMessageRole::User,
-                status: singularity_protocol::TurnStatus::Completed,
+                role: protocol::HistoryMessageRole::User,
+                status: protocol::TurnStatus::Completed,
             },
         }));
         Ok(())
@@ -298,13 +310,12 @@ impl Agent {
         let images = images.to_vec();
         Ok(tokio::task::spawn_blocking(move || {
             if !images.is_empty() {
-                let directory = lock_writer(&session).image_directory();
+                let directory = with_writer(&session, |writer| writer.data().image_directory());
                 for image in images {
                     image.save(&directory)?;
                 }
             }
-            let mut writer = lock_writer(&session);
-            writer.append_message_with_id(&id, message, None, display)
+            with_writer(&session, |writer| writer.append_message_with_id(&id, message, None, display))
         })
         .await
         .expect("message writer completes while the runtime is running")?)

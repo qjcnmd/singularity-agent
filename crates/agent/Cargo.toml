@@ -1,5 +1,5 @@
 [package]
-name = "singularity_agent"
+name = "agent"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,11 +14,11 @@ tokio-util.workspace = true
 tokio = { workspace = true, features = ["process"] }
 serde.workspace = true
 serde_json.workspace = true
-singularity_core = { path = "../core" }
+app_core = { path = "../core" }
 uuid = { workspace = true, features = ["v7"] }
-singularity_model = { path = "../model" }
-singularity_mcp = { path = "../mcp" }
-singularity_protocol = { path = "../protocol" }
+model = { path = "../model" }
+mcp = { path = "../mcp" }
+protocol = { path = "../protocol" }
 thiserror.workspace = true
 tracing.workspace = true
 base64 = "0.22"
@@ -27,8 +27,8 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 similar = "3.2.1"
 
 [target.'cfg(windows)'.dependencies]
-process-wrap = { version = "10.0", features = ["tokio1", "job-object", "creation-flags"] }
-windows = { version = "0.62", features = ["Win32_System_Threading"] }
+process-wrap.workspace = true
+windows.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

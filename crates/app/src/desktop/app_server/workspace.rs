@@ -3,13 +3,13 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use singularity_protocol::{AppBootstrap, RedactedModelCatalog, RpcError, ThreadSummary, Workspace};
+use protocol::{AppBootstrap, RedactedModelCatalog, RpcError, ThreadSummary, Workspace};
 
 use super::{AppServer, catalog_error};
 use crate::desktop::workspace_store::WorkspaceError;
 
 impl AppServer {
-    pub fn bootstrap(&self) -> Result<AppBootstrap, RpcError> {
+    pub(crate) fn bootstrap(&self) -> Result<AppBootstrap, RpcError> {
         let _publication = self.lock_app_publication();
         let catalog = self.models.redacted_catalog();
         self.bootstrap_with_catalog(catalog)
@@ -39,13 +39,16 @@ impl AppServer {
         })
     }
 
-    pub fn add_workspace(&self, root: &str) -> Result<Workspace, RpcError> {
+    pub(crate) fn add_workspace(&self, root: &str) -> Result<Workspace, RpcError> {
         let workspace = self.workspaces.add(Path::new(root)).map_err(RpcError::new)?;
         self.publish_app_snapshot();
         Ok(workspace)
     }
 
-    pub async fn remove_workspace(self: &std::sync::Arc<Self>, workspace_root: &str) -> Result<(), RpcError> {
+    pub(crate) async fn remove_workspace(
+        self: &std::sync::Arc<Self>,
+        workspace_root: &str,
+    ) -> Result<(), RpcError> {
         let app = std::sync::Arc::clone(self);
         let workspace_root = workspace_root.to_owned();
         let close = tokio::task::spawn_blocking(move || {
@@ -53,7 +56,7 @@ impl AppServer {
             let workspace = app.workspace(&workspace_root)?;
             let mut sessions = app.lock_sessions();
             let belongs = |conversation: &std::sync::Arc<crate::runtime::Conversation>| {
-                singularity_core::same_saved_path(&conversation.cwd, &workspace.root)
+                app_core::same_saved_path(&conversation.cwd, &workspace.root)
             };
             if sessions.conversations().any(|(_, conversation)| {
                 belongs(conversation) && (conversation.has_work() || conversation.is_deleting())
@@ -66,7 +69,7 @@ impl AppServer {
             app.workspaces.remove(&workspace_root).map_err(RpcError::new)?;
             sessions.retain(|_, conversation| {
                 if belongs(conversation) {
-                    conversation.set_closing(true);
+                    conversation.mark_closing();
                     false
                 } else {
                     true
@@ -84,24 +87,24 @@ impl AppServer {
         Ok(())
     }
 
-    pub fn workspace(&self, workspace_root: &str) -> Result<Workspace, RpcError> {
+    pub(crate) fn workspace(&self, workspace_root: &str) -> Result<Workspace, RpcError> {
         self.workspaces
             .find(workspace_root)
             .ok_or_else(|| RpcError::new(WorkspaceError::NotFound))
     }
 
-    pub fn skills(&self, workspace_root: &str) -> Result<singularity_protocol::SkillCatalog, RpcError> {
+    pub(crate) fn skills(&self, workspace_root: &str) -> Result<protocol::SkillCatalog, RpcError> {
         let root = self.workspace(workspace_root)?.root;
-        let catalog = singularity_core::skills::SkillCatalog::discover(Path::new(&root), &self.home);
-        Ok(singularity_protocol::SkillCatalog {
+        let catalog = app_core::skills::SkillCatalog::discover(Path::new(&root), &self.home);
+        Ok(protocol::SkillCatalog {
             skills: catalog
                 .skills
                 .into_iter()
                 .filter(|skill| skill.user_invocable)
-                .map(|skill| singularity_protocol::SkillMetadata {
+                .map(|skill| protocol::SkillMetadata {
                     name: skill.name,
                     description: skill.description,
-                    path: singularity_core::display_path(&skill.path),
+                    path: app_core::display_path(&skill.path),
                 })
                 .collect(),
             diagnostics: catalog.diagnostics,
@@ -109,47 +112,46 @@ impl AppServer {
     }
 
     /// 新建任务页的上下文胶囊：不连接 MCP 服务器，只读取指令、技能目录和已有连接的状态。
-    pub fn context_preview(
+    pub(crate) fn context_preview(
         &self,
         workspace_root: &str,
-    ) -> Result<Vec<singularity_protocol::ContextModule>, RpcError> {
+    ) -> Result<Vec<protocol::ContextModule>, RpcError> {
         let root = self.workspace(workspace_root)?.root;
         let cwd = Path::new(&root);
-        let instructions =
-            singularity_core::load_agent_instructions(cwd, &self.home).map_err(RpcError::new)?;
-        let skills = singularity_core::skills::SkillCatalog::discover(cwd, &self.home);
+        let instructions = app_core::load_agent_instructions(cwd, &self.home).map_err(RpcError::new)?;
+        let skills = app_core::skills::SkillCatalog::discover(cwd, &self.home);
         let servers = self.mcp.list(cwd).map_err(RpcError::new)?;
-        Ok(singularity_agent::agent::modules::preview(&root, instructions, skills, servers))
+        Ok(agent::agent::modules::preview(&root, instructions, skills, servers))
     }
 
     /// 全局指令是应用数据目录下的 AGENTS.md，项目指令是项目根目录下的 AGENTS.md；文件不存在时内容为空。
-    pub fn read_instructions(
+    pub(crate) fn read_instructions(
         &self,
         workspace_root: Option<&str>,
-    ) -> Result<singularity_protocol::TextDocument, RpcError> {
+    ) -> Result<protocol::TextDocument, RpcError> {
         let path = self.scope_directory(workspace_root)?.join("AGENTS.md");
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(RpcError::new(format!("{}: {error}", path.display()))),
         };
-        Ok(singularity_protocol::TextDocument {
-            path: singularity_core::display_path(&path),
+        Ok(protocol::TextDocument {
+            path: app_core::display_path(&path),
             content,
         })
     }
 
     /// 保存后在下一轮任务开始时生效；先写临时文件再替换，读取方不会看到写了一半的内容。
-    pub fn save_instructions(
+    pub(crate) fn save_instructions(
         &self,
         workspace_root: Option<&str>,
         content: &str,
-    ) -> Result<singularity_protocol::TextDocument, RpcError> {
+    ) -> Result<protocol::TextDocument, RpcError> {
         let path = self.scope_directory(workspace_root)?.join("AGENTS.md");
-        singularity_core::write_bytes_atomic(&path, content.as_bytes())
+        app_core::write_bytes_atomic(&path, content.as_bytes())
             .map_err(|error| RpcError::new(format!("{}: {error}", path.display())))?;
-        Ok(singularity_protocol::TextDocument {
-            path: singularity_core::display_path(&path),
+        Ok(protocol::TextDocument {
+            path: app_core::display_path(&path),
             content: content.to_owned(),
         })
     }
@@ -163,10 +165,10 @@ fn group_threads(
 ) -> BTreeMap<String, Vec<ThreadSummary>> {
     let mut grouped: BTreeMap<String, Vec<ThreadSummary>> = workspaces
         .iter()
-        .map(|workspace| (singularity_core::saved_path_key(&workspace.root), Vec::new()))
+        .map(|workspace| (app_core::saved_path_key(&workspace.root), Vec::new()))
         .collect();
     for thread in threads {
-        if let Some(bucket) = grouped.get_mut(&singularity_core::saved_path_key(&thread.cwd)) {
+        if let Some(bucket) = grouped.get_mut(&app_core::saved_path_key(&thread.cwd)) {
             bucket.push(thread);
         }
     }

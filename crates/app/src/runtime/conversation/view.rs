@@ -1,9 +1,9 @@
 //! 任务运行态视图、流式与待处理项状态及事件发布。
 use super::activity::Activity;
 use super::{Conversation, TurnLifecycle};
-use singularity_agent::agent::AgentEvent;
-use singularity_agent::session::lock_writer;
-use singularity_protocol::{
+use agent::agent::AgentEvent;
+use agent::session::lock_writer;
+use protocol::{
     SessionFailure, SessionPhase, SessionReadResult, SessionRuntime, StreamEvent, TurnEvent,
     TurnEventEnvelope,
 };
@@ -12,11 +12,11 @@ pub(super) struct ConversationView {
     pub(super) last_event_revision: u64,
     pub(super) activity: Activity,
     pub(super) failure: Option<SessionFailure>,
-    usage: singularity_protocol::SessionModelUsage,
-    pub(super) context: Option<singularity_protocol::InjectedContext>,
+    usage: protocol::SessionModelUsage,
+    pub(super) context: Option<protocol::InjectedContext>,
 }
 impl ConversationView {
-    pub(super) fn new(usage: singularity_protocol::SessionModelUsage, initial_revision: u64) -> Self {
+    pub(super) fn new(usage: protocol::SessionModelUsage, initial_revision: u64) -> Self {
         Self {
             last_event_revision: initial_revision,
             activity: Activity::default(),
@@ -32,21 +32,21 @@ impl ConversationView {
 }
 impl Conversation {
     /// 首次发送返回同一时刻的任务摘要、运行状态和事件序号。
-    pub fn start_result(&self) -> singularity_protocol::SessionStartResult {
+    pub(crate) fn start_result(&self) -> protocol::SessionStartResult {
         let view = self.lock_view();
         let phase = self.phase();
         let writer = lock_writer(&self.writer);
-        singularity_protocol::SessionStartResult {
-            summary: crate::runtime::history::summarize_thread(&writer),
-            status: singularity_protocol::SessionStatus { phase, failure: view.failure.clone() },
+        protocol::SessionStartResult {
+            summary: crate::runtime::history::summarize_thread(writer.data()),
+            status: protocol::SessionStatus { phase, failure: view.failure.clone() },
             revision: view.last_event_revision,
         }
     }
 
     /// 任务列表用的简要状态，只含运行阶段和未保存的错误。
-    pub fn status(&self) -> singularity_protocol::SessionStatus {
+    pub(crate) fn status(&self) -> protocol::SessionStatus {
         let view = self.lock_view();
-        singularity_protocol::SessionStatus {
+        protocol::SessionStatus {
             phase: self.phase(),
             failure: view.failure.clone(),
         }
@@ -61,7 +61,7 @@ impl Conversation {
             phase: state.turn.phase(),
             selection: state.model.clone(),
             context_usage: crate::runtime::history::context_usage(
-                lock_writer(&self.writer).entries(),
+                lock_writer(&self.writer).data().entries(),
                 &state.model,
                 state.last_context_window,
             ),
@@ -76,7 +76,7 @@ impl Conversation {
                 .pending()
                 .iter()
                 .filter_map(|request| {
-                    request.user_input().map(|input| singularity_protocol::PendingUserMessage {
+                    request.user_input().map(|input| protocol::PendingUserMessage {
                         item_id: request.item_id(),
                         text: input.text.clone(),
                         images: input.images.iter().map(|image| image.attachment.clone()).collect(),
@@ -88,14 +88,14 @@ impl Conversation {
         }
     }
     /// 历史与活动内容在同一次会话读取内合并。
-    pub fn read(&self) -> Result<SessionReadResult, crate::runtime::CatalogError> {
+    pub(crate) fn read(&self) -> Result<SessionReadResult, crate::runtime::CatalogError> {
         let view = self.lock_view();
         let runtime = self.runtime(&view);
         let background_tasks = self.bash_tasks.list().into_iter().map(Into::into).collect();
         let writer = lock_writer(&self.writer);
-        let mut history = crate::runtime::history::read_thread_history(&writer).map_err(|source| {
+        let mut history = crate::runtime::history::read_thread_history(writer.data()).map_err(|source| {
             crate::runtime::CatalogError::Session {
-                path: writer.path().to_path_buf(),
+                path: writer.data().path().to_path_buf(),
                 source,
             }
         })?;
@@ -122,9 +122,9 @@ impl Conversation {
             },
         );
     }
-    pub(super) fn summary(&self) -> singularity_protocol::ThreadSummary {
+    pub(super) fn summary(&self) -> protocol::ThreadSummary {
         let writer = lock_writer(&self.writer);
-        crate::runtime::history::summarize_thread(&writer)
+        crate::runtime::history::summarize_thread(writer.data())
     }
     pub(super) fn publish_summary(&self, view: &mut ConversationView) {
         self.publish(view, StreamEvent::SessionSummaryChanged { summary: self.summary() });
@@ -145,7 +145,7 @@ impl Conversation {
         // 请求结束先发 ProviderAttempt 累计用量，再发完成的回复或回合结束；均带上此刻的会话累计。
         match &mut event {
             TurnEvent::MessageFinished { items, .. } => {
-                singularity_agent::message::attach_usage(items, &view.usage);
+                agent::message::attach_usage(items, &view.usage);
             }
             TurnEvent::TurnCompleted { stats, .. } | TurnEvent::TurnFailed { stats, .. } => {
                 *stats = Some(view.usage.clone());
@@ -158,9 +158,8 @@ impl Conversation {
             }
             TurnEvent::ItemUpdated {
                 item:
-                    singularity_protocol::HistoryItem::Message {
-                        role: singularity_protocol::HistoryMessageRole::User,
-                        ..
+                    protocol::HistoryItem::Message {
+                        role: protocol::HistoryMessageRole::User, ..
                     },
             } => {
                 self.publish_summary(view);

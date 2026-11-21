@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react'
+import { APP_NAME } from '../identity'
 
 interface ErrorBoundaryState {
   error: Error | null
@@ -12,7 +13,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBound
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
-    console.error('Singularity UI error:', error, info.componentStack)
+    console.error(`${APP_NAME} UI error:`, error, info.componentStack)
   }
 
   render() {

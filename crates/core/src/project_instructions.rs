@@ -10,12 +10,23 @@ pub fn load_agent_instructions(cwd: &Path, home: &Path) -> Result<Vec<Instructio
     let canonical = crate::canonicalize_workspace(cwd)?;
     let cwd = canonical.as_path();
     let root = crate::workspace::project_root(cwd)?;
-    let canonical_home = std::fs::canonicalize(home).map_err(|error| {
-        format!("cannot inspect project instruction directory ({}): {error}", home.display())
-    })?;
-    let home_key = crate::workspace_key(&canonical_home);
+    let (global_dir, home_key) = match std::fs::canonicalize(home) {
+        Ok(canonical_home) => {
+            let key = crate::workspace_key(&canonical_home);
+            (canonical_home, key)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            (home.to_path_buf(), crate::workspace_key(home))
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect project instruction directory ({}): {error}",
+                crate::display_path(home),
+            ));
+        }
+    };
     // 项目目录等于数据根时已在首项作为全局指令加载，跳过重复项。
-    let directories = std::iter::once((home.to_path_buf(), true)).chain(
+    let directories = std::iter::once((global_dir, true)).chain(
         instruction_directories(&root, cwd)
             .into_iter()
             .filter(|directory| crate::workspace_key(directory) != home_key)
@@ -28,10 +39,19 @@ pub fn load_agent_instructions(cwd: &Path, home: &Path) -> Result<Vec<Instructio
             Ok(content) => content,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
-                return Err(format!("cannot read project instruction file ({}): {error}", path.display()));
+                return Err(format!(
+                    "cannot read project instruction file ({}): {error}",
+                    crate::display_path(&path),
+                ));
             }
         };
-        if !content.trim().is_empty() {
+        let stripped = content.strip_prefix('\u{feff}').unwrap_or(&content);
+        if !stripped.trim().is_empty() {
+            let content = if stripped.len() == content.len() {
+                content
+            } else {
+                stripped.to_owned()
+            };
             files.push(InstructionFile { path, content, global });
         }
     }

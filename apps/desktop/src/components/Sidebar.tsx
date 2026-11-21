@@ -1,4 +1,5 @@
 import { SelectionSlider } from './SelectionSlider'
+import { APP_NAME } from '../identity'
 import { workspaceKey } from '../workspace'
 import { X, Minus, Plus } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
@@ -72,7 +73,7 @@ function SidebarView() {
       </div>
       <div id="left-sidebar" className="sidebar sidebar-expanded" inert={state.sidebarCollapsed} aria-hidden={state.sidebarCollapsed}>
         <header className="sidebar-brand">
-          <span className="sidebar-wordmark">Singularity</span>
+          <span className="sidebar-wordmark">{APP_NAME}</span>
           <SidebarToggle expanded={!state.sidebarCollapsed} controls="left-sidebar" onClick={toggleSidebar} />
         </header>
 

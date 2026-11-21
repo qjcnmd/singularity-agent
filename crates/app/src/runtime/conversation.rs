@@ -17,74 +17,83 @@ use self::state::{ConversationState, TurnLifecycle};
 
 use std::sync::{Arc, Mutex};
 
-use singularity_agent::agent::QueuedInput;
-use singularity_agent::session::{SessionMetadata, SessionWriter, lock_writer};
-use singularity_protocol::SessionPhase;
+use agent::agent::QueuedInput;
+use agent::session::{SessionMetadata, SessionWriter, lock_writer};
+use protocol::SessionPhase;
 
-pub struct Conversation {
+pub(crate) struct Conversation {
     pub(crate) thread_id: String,
     pub(crate) cwd: String,
     pub(crate) disabled_modules: Vec<String>,
     view: Mutex<view::ConversationView>,
-    publish: Arc<dyn Fn(singularity_protocol::StreamEvent) -> u64 + Send + Sync>,
+    publish: Arc<dyn Fn(protocol::StreamEvent) -> u64 + Send + Sync>,
     changed: tokio::sync::Notify,
     home: std::path::PathBuf,
-    models: Arc<singularity_model::ModelConfigManager>,
-    mcp: Arc<singularity_mcp::McpManager>,
+    models: Arc<model::ModelConfigManager>,
+    mcp: Arc<mcp::McpManager>,
     state: Mutex<ConversationState>,
     writer: SessionWriter,
-    bash_tasks: Arc<singularity_agent::tools::BashTasks>,
+    bash_tasks: Arc<agent::tools::BashTasks>,
 }
 
 struct Operation {
-    source: singularity_protocol::SessionOperation,
+    source: protocol::SessionOperation,
     controls: Arc<TurnControls>,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ConversationError {
+pub(crate) enum ConversationError {
     #[error("session cannot accept this operation in its current phase")]
     Busy,
     #[error("{0}")]
     Configuration(String),
     #[error("任务名称不能为空。")]
     InvalidName,
+    #[error("{0}")]
+    Question(String),
+    #[error("{0}")]
+    BackgroundShutdown(String),
+    #[error("{0}")]
+    ContextPreview(String),
     #[error(transparent)]
-    Session(#[from] singularity_agent::session::SessionError),
+    Agent(#[from] agent::agent::AgentError),
+    #[error(transparent)]
+    Session(#[from] agent::session::SessionError),
 }
 
 impl Conversation {
     /// 用已打开的会话日志建立任务，后台命令直接通知这个会话。
-    pub fn new(
-        session: singularity_agent::session::SessionManager,
+    pub(crate) fn new(
+        session: agent::session::SessionManager,
         home: std::path::PathBuf,
-        models: Arc<singularity_model::ModelConfigManager>,
-        mcp: Arc<singularity_mcp::McpManager>,
+        models: Arc<model::ModelConfigManager>,
+        mcp: Arc<mcp::McpManager>,
         initial_revision: u64,
-        publish: Arc<dyn Fn(singularity_protocol::StreamEvent) -> u64 + Send + Sync>,
+        publish: Arc<dyn Fn(protocol::StreamEvent) -> u64 + Send + Sync>,
     ) -> Arc<Self> {
-        let model = session
+        let data = session.data();
+        let model = data
             .entries()
             .iter()
             .rev()
             .find_map(|entry| match entry {
-                singularity_agent::session::SessionEntry::Metadata {
+                agent::session::SessionEntry::Metadata {
                     metadata: SessionMetadata::ThreadSettings { selection },
                     ..
                 } => Some(selection.clone()),
                 _ => None,
             })
             .expect("session creation and parsing require an initial model selection");
-        let thread_id = session.session_id().to_owned();
-        let cwd = session.cwd_string();
-        let disabled_modules = session.disabled_modules();
-        let usage = crate::runtime::history::session_usage(session.entries());
+        let thread_id = data.session_id().to_owned();
+        let cwd = data.cwd_string();
+        let disabled_modules = data.disabled_modules();
+        let usage = crate::runtime::history::session_usage(data.entries());
         let context_window = models.context_window(&model);
         let writer = Arc::new(Mutex::new(session));
-        let inbox = Arc::new(std::sync::Mutex::new(singularity_agent::agent::SteeringInbox::default()));
+        let inbox = Arc::new(std::sync::Mutex::new(agent::agent::SteeringInbox::default()));
         Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
             let weak = weak.clone();
-            let bash_tasks = singularity_agent::tools::BashTasks::new(
+            let bash_tasks = agent::tools::BashTasks::new(
                 Arc::clone(&writer),
                 Arc::clone(&inbox),
                 Arc::new(move |update| {
@@ -118,12 +127,12 @@ impl Conversation {
         })
     }
 
-    pub(crate) fn model(&self) -> singularity_protocol::ModelSelection {
+    pub(crate) fn model(&self) -> protocol::ModelSelection {
         self.lock_state().model.clone()
     }
 
     /// 在同一次加锁中检查执行、后台命令和待处理输入，避免检查途中后台通知启动新回合。
-    pub fn has_work(&self) -> bool {
+    pub(crate) fn has_work(&self) -> bool {
         let state = self.lock_state();
         state.turn.is_busy()
             || state.context_preview.is_some()
@@ -132,7 +141,7 @@ impl Conversation {
     }
 
     /// 单次按 `view -> state` 加锁判断是否允许从内存缓存淘汰：删除中、存在未保存错误或有活可做时均不可淘汰。
-    pub fn can_evict(&self) -> bool {
+    pub(crate) fn can_evict(&self) -> bool {
         let view = self.lock_view();
         let state = self.lock_state();
         !state.closing
@@ -143,12 +152,12 @@ impl Conversation {
             && state.steering_inbox.lock().expect("turn inbox lock poisoned").pending().is_empty()
     }
 
-    pub fn phase(&self) -> SessionPhase {
+    pub(super) fn phase(&self) -> SessionPhase {
         self.lock_state().turn.phase()
     }
 
     /// 排队中的图片从输入队列读取；已保存的图片从当前会话记录查找。
-    pub fn image_data(&self, image_id: &str) -> Result<String, crate::runtime::CatalogError> {
+    pub(crate) fn image_data(&self, image_id: &str) -> Result<String, crate::runtime::CatalogError> {
         let image = {
             let state = self.lock_state();
             let inbox = state.steering_inbox.lock().expect("turn inbox lock poisoned");
@@ -164,28 +173,31 @@ impl Conversation {
             return Ok(image.data_url());
         }
         let writer = lock_writer(&self.writer);
-        writer.image_data(image_id).map_err(|source| crate::runtime::CatalogError::Session {
-            path: writer.path().to_path_buf(),
-            source,
-        })
+        writer
+            .data()
+            .image_data(image_id)
+            .map_err(|source| crate::runtime::CatalogError::Session {
+                path: writer.data().path().to_path_buf(),
+                source,
+            })
     }
 
     /// 答案只交给仍在等待的提问工具；任务已停止时拒绝。
-    pub fn answer_question(
+    pub(crate) fn answer_question(
         &self,
         item_id: &str,
-        answers: Vec<singularity_protocol::UserQuestionAnswer>,
-    ) -> Result<(), String> {
+        answers: Vec<protocol::UserQuestionAnswer>,
+    ) -> Result<(), ConversationError> {
         match &self.lock_state().turn {
             TurnLifecycle::Running(controls) if !controls.cancellation().is_cancelled() => {
-                controls.questions.answer(item_id, answers)
+                controls.questions.answer(item_id, answers).map_err(ConversationError::Question)
             }
-            _ => Err("该任务已停止等待回答。".into()),
+            _ => Err(ConversationError::Question("该任务已停止等待回答。".into())),
         }
     }
 
     /// 停止当前回合或轮换，清空尚未消费的输入。
-    pub fn abort(&self) -> Result<(), ConversationError> {
+    pub(crate) fn abort(&self) -> Result<(), ConversationError> {
         let mut view = self.lock_view();
         let mut state = self.lock_state();
         let TurnLifecycle::Running(controls) = &state.turn else {
@@ -200,7 +212,7 @@ impl Conversation {
     }
 
     /// 去掉名称首尾空白后立即保存展示名称。
-    pub fn rename(&self, name: &str) -> Result<(), ConversationError> {
+    pub(crate) fn rename(&self, name: &str) -> Result<(), ConversationError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(ConversationError::InvalidName);
@@ -212,14 +224,15 @@ impl Conversation {
     }
 
     /// 保存成功后更新下一轮使用的模型选择。
-    pub fn update_settings(
+    pub(crate) fn update_settings(
         &self,
-        selection: &singularity_protocol::ModelSelection,
+        selection: &protocol::ModelSelection,
     ) -> Result<(), ConversationError> {
         self.models
             .validate_selection(selection)
             .map_err(|error| format!("invalid model selection: {error}"))
             .map_err(ConversationError::Configuration)?;
+        let context_window = self.models.context_window(selection);
         let mut view = self.lock_view();
         let mut state = self.lock_state();
         if &state.model == selection {
@@ -228,6 +241,7 @@ impl Conversation {
         let mut writer = lock_writer(&self.writer);
         writer.append_metadata(SessionMetadata::ThreadSettings { selection: selection.clone() })?;
         state.model = selection.clone();
+        state.last_context_window = context_window;
         if let Some(preview) = &state.context_preview {
             preview.cancel();
         }

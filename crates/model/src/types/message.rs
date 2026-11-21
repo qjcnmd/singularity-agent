@@ -18,7 +18,7 @@ pub enum ContentBlock {
         metadata: Option<ProviderBlockMetadata>,
     },
     /// 图片文件保存在 `sessions/images/<会话 ID>/` 下，消息里只记录图片 ID、名称、类型和尺寸。
-    Image(singularity_protocol::ImageAttachment),
+    Image(protocol::ImageAttachment),
     /// 思考正文只保存一次，签名和加密内容跟随对应块。
     Thinking {
         thinking: String,
@@ -76,7 +76,7 @@ impl Message {
     }
 
     /// 消息里的图片；历史显示、预览和模型输入都从这里读取。
-    pub fn images(&self) -> impl Iterator<Item = &singularity_protocol::ImageAttachment> {
+    pub fn images(&self) -> impl Iterator<Item = &protocol::ImageAttachment> {
         self.content().iter().filter_map(|block| match block {
             ContentBlock::Image(image) => Some(image),
             _ => None,
@@ -145,7 +145,9 @@ impl Message {
 fn content_text(content: &[ContentBlock]) -> String {
     let mut text = String::new();
     for block in content {
-        if let ContentBlock::Text { text: part, .. } = block {
+        if let ContentBlock::Text { text: part, .. } = block
+            && !part.is_empty()
+        {
             if !text.is_empty() {
                 text.push('\n');
             }

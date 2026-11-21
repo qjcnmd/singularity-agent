@@ -4,19 +4,17 @@
 use crate::agent::{AgentError, AgentEvent};
 use crate::message::public_items;
 use crate::session::{LedgerRecord, SessionError, SessionWriter, with_writer_async};
-use singularity_core::duration_millis;
-use singularity_model::{
+use app_core::duration_millis;
+use model::{
     ModelClient, ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse,
     ProviderStreamEvent,
 };
-use singularity_protocol::{
-    ProviderAttemptStatus, RequestObservation, RequestPurpose, TurnEvent, TurnStatus,
-};
+use protocol::{ProviderAttemptStatus, RequestObservation, RequestPurpose, TurnEvent, TurnStatus};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// 服务端要求的等待超过此上限时直接报错，不静默挂起回合。
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+const MAX_RETRY_AFTER: Duration = Duration::from_mins(1);
 
 /// 输出上限取模型上限与窗口剩余空间的最小值。
 pub(crate) fn output_budget_tokens(model: ModelConfigurationSnapshot, input_tokens: u64) -> u32 {
@@ -35,8 +33,8 @@ pub(crate) async fn execute_request(
     purpose: RequestPurpose,
 ) -> Result<(ModelTurnResponse, String, String), AgentError> {
     if request.max_output_tokens == 0 {
-        return Err(AgentError::Provider(singularity_model::ProviderError::new(
-            ModelErrorKind::Other,
+        return Err(AgentError::Provider(model::ProviderError::new(
+            ModelErrorKind::ContextLengthExceeded,
             "当前输入已占满模型上下文，无法生成回复。请缩短指令、工具定义或消息，或选择上下文更大的模型。",
         )));
     }
@@ -82,7 +80,8 @@ pub(crate) async fn execute_request(
             Some(error) if error.kind == ModelErrorKind::Cancelled => ProviderAttemptStatus::Cancelled,
             Some(_) => ProviderAttemptStatus::Error,
         };
-        let (provider_name, model_name) = provider.model_identity();
+        let provider_name = provider.provider_name();
+        let model_name = provider.model_name();
         let observation = RequestObservation {
             purpose,
             provider: provider_name.to_string(),
@@ -104,7 +103,7 @@ pub(crate) async fn execute_request(
                 None,
                 &id,
                 item_status,
-                singularity_protocol::ToolStatus::Interrupted,
+                protocol::ToolStatus::Interrupted,
                 "",
             )
         } else {
@@ -126,7 +125,10 @@ pub(crate) async fn execute_request(
             Ok(timestamp) => timestamp,
             Err(storage) => {
                 return Err(AgentError::Session(match error {
-                    Some(error) => SessionError::InvalidSession(format!("{error}; 保存失败：{storage}")),
+                    Some(error) => SessionError::Context {
+                        message: format!("{error}; 保存失败"),
+                        source: Box::new(storage),
+                    },
                     None => storage,
                 }));
             }
@@ -143,7 +145,7 @@ pub(crate) async fn execute_request(
                 provider = provider_name,
                 model = model_name,
                 attempt,
-                delay_ms = delay.as_millis() as u64,
+                delay_ms = duration_millis(delay),
                 error = %error,
                 "provider attempt failed; retrying"
             );
@@ -151,8 +153,8 @@ pub(crate) async fn execute_request(
                 on_event(AgentEvent::Turn(TurnEvent::MessageDiscarded { message_id: id }));
             }
             tokio::select! {
-                _ = tokio::time::sleep(delay) => {},
-                _ = cancellation.cancelled() => return Err(AgentError::Aborted),
+                () = tokio::time::sleep(delay) => {},
+                () = cancellation.cancelled() => return Err(AgentError::Aborted),
             }
             continue;
         }
@@ -167,7 +169,7 @@ pub(crate) async fn execute_request(
         }
         if purpose == RequestPurpose::Generation {
             for item in &mut items {
-                if let singularity_protocol::HistoryItem::Message { at, .. } = item {
+                if let protocol::HistoryItem::Message { at, .. } = item {
                     *at = Some(saved_at.clone());
                 }
             }

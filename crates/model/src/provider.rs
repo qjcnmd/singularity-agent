@@ -122,7 +122,7 @@ pub(crate) fn provider_response_validation_error(message: &str, errors: &[impl A
 
 /// 校验模型响应：非截断响应须有正文或工具调用，工具调用 ID 非空且不重复、工具名非空。
 pub(crate) fn finalize_provider_response(mut response: ModelTurnResponse) -> ModelTurnResponse {
-    let mut errors = Vec::new();
+    let mut errors: Vec<&'static str> = Vec::new();
     if !response.is_length_truncated()
         && !response
             .assistant_message
@@ -131,22 +131,22 @@ pub(crate) fn finalize_provider_response(mut response: ModelTurnResponse) -> Mod
             .any(|block| matches!(block, crate::ContentBlock::Text { text, .. } if !text.trim().is_empty()))
         && response.assistant_message.tool_calls().next().is_none()
     {
-        errors.push("empty_response".to_string());
+        errors.push("empty_response");
     }
 
     let mut seen = HashSet::new();
     for call in response.assistant_message.tool_calls() {
         if call.tool_call_id.trim().is_empty() {
-            errors.push("missing_tool_call_id".to_string());
+            errors.push("missing_tool_call_id");
         } else if !seen.insert(call.tool_call_id.as_str()) {
-            errors.push("duplicate_tool_call_id".to_string());
+            errors.push("duplicate_tool_call_id");
         }
         if call.tool_name.trim().is_empty() {
-            errors.push("missing_tool_name".to_string());
+            errors.push("missing_tool_name");
         }
     }
 
-    errors.sort();
+    errors.sort_unstable();
     errors.dedup();
     if !errors.is_empty() {
         response.stop_reason = crate::ModelStopReason::Failed(provider_response_validation_error(
@@ -155,8 +155,16 @@ pub(crate) fn finalize_provider_response(mut response: ModelTurnResponse) -> Mod
         ));
         response.usage = None;
         if let crate::Message::Assistant { content, provider_metadata } = &mut response.assistant_message {
-            content.retain(|block| {
-                matches!(block, crate::ContentBlock::Text { .. } | crate::ContentBlock::Thinking { .. })
+            content.retain_mut(|block| match block {
+                crate::ContentBlock::Text { text, metadata } => {
+                    *metadata = None;
+                    !text.is_empty()
+                }
+                crate::ContentBlock::Thinking { thinking, metadata } => {
+                    *metadata = None;
+                    !thinking.is_empty()
+                }
+                crate::ContentBlock::Image(_) | crate::ContentBlock::ToolCall(_) => false,
             });
             *provider_metadata = None;
         }

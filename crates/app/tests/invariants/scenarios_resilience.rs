@@ -203,8 +203,7 @@ async fn context_pressure_and_overflow_invariants() {
             .iter()
             .rev()
             .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .next();
+            .find_map(|b| b.get("text").and_then(Value::as_str));
         match last_text {
             Some(text) => {
                 !text.contains("USER_ORIGIN_MARKER_ROUND_1")

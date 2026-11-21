@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use singularity_model::{ContentBlock, Message};
+use model::{ContentBlock, Message};
 
 use crate::session::context::{image_captions, message_token_estimate};
 
@@ -26,16 +26,18 @@ pub(crate) fn compact_text(text: &str, head_bytes: usize, tail_bytes: usize, not
     }
     let head_end = text.floor_char_boundary(head_bytes.min(text.len()));
     let tail_start = text.ceil_char_boundary(text.len().saturating_sub(tail_bytes));
+    let head = &text[..head_end];
+    let tail = (tail_bytes > 0 && tail_start > head_end).then(|| &text[tail_start..]);
     let full_output_line = text
         .lines()
         .rev()
         .find(|line| line.starts_with("Full output: "))
+        .filter(|line| !head.contains(line) && tail.is_none_or(|t| !t.contains(line)))
         .map(|line| format!("\n{line}"))
         .unwrap_or_default();
-    if tail_bytes == 0 || tail_start <= head_end {
-        format!("{}\n\n[... {note} ...]{full_output_line}", &text[..head_end])
-    } else {
-        format!("{}\n\n[... {note} ...]\n\n{}{full_output_line}", &text[..head_end], &text[tail_start..])
+    match tail {
+        Some(tail) => format!("{head}\n\n[... {note} ...]\n\n{tail}{full_output_line}"),
+        None => format!("{head}\n\n[... {note} ...]{full_output_line}"),
     }
 }
 

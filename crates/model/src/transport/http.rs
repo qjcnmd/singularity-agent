@@ -43,6 +43,7 @@ pub(crate) fn client_builder() -> reqwest::ClientBuilder {
 
 /// 获取全局共享的 reqwest Client 单例（复用连接池与 TLS 会话）。
 const PROVIDER_CONNECT_TIMEOUT_SECONDS: u64 = 30;
+pub(crate) const PROVIDER_USER_AGENT: &str = app_core::identity::USER_AGENT;
 
 pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -55,7 +56,7 @@ pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(PROVIDER_CONNECT_TIMEOUT_SECONDS))
         .read_timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
-        .user_agent(format!("singularity-agent/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(PROVIDER_USER_AGENT)
         .build()
         .map_err(provider_transport_error)?;
     Ok(CLIENT.get_or_init(|| client).clone())
@@ -89,23 +90,35 @@ pub(crate) enum BoundedBodyReadError {
 pub(crate) async fn read_bounded_error_body(
     mut response: reqwest::Response,
     max_bytes: usize,
-    cancellation: Option<&CancellationToken>,
+    cancellation: &CancellationToken,
 ) -> Result<Vec<u8>, BoundedBodyReadError> {
     let mut body = Vec::new();
     while body.len() < max_bytes {
-        let chunk = match cancellation {
-            Some(token) => {
-                if token.is_cancelled() {
-                    return Err(BoundedBodyReadError::Cancelled);
-                }
-                tokio::select! {
-                    () = token.cancelled() => return Err(BoundedBodyReadError::Cancelled),
-                    result = response.chunk() => result.map_err(BoundedBodyReadError::Transport)?,
-                }
-            }
-            None => response.chunk().await.map_err(BoundedBodyReadError::Transport)?,
+        if cancellation.is_cancelled() {
+            return Err(BoundedBodyReadError::Cancelled);
+        }
+        let chunk = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(BoundedBodyReadError::Cancelled),
+            result = response.chunk() => result.map_err(BoundedBodyReadError::Transport)?,
         };
         let Some(chunk) = chunk else {
+            break;
+        };
+        let remaining = max_bytes - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    Ok(body)
+}
+
+/// 读取有大小上限的 HTTP 响应正文（无取消令牌路径）；超出上限后截断。
+pub(crate) async fn read_bounded_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, reqwest::Error> {
+    let mut body = Vec::new();
+    while body.len() < max_bytes {
+        let Some(chunk) = response.chunk().await? else {
             break;
         };
         let remaining = max_bytes - body.len();
@@ -139,7 +152,8 @@ where
         return Err(provider_cancelled_error());
     }
     tokio::select! {
-        _ = cancellation.cancelled() => Err(provider_cancelled_error()),
+        biased;
+        () = cancellation.cancelled() => Err(provider_cancelled_error()),
         result = future => result
             .map_err(provider_transport_error),
     }

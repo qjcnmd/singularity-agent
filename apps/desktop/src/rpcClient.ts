@@ -17,7 +17,7 @@ export class RpcFailure extends Error {
 
 declare global {
   interface Window {
-    singularity: {
+    desktop: {
       rpc<M extends RpcMethod>(request: { method: M; params: RpcParams<M> }): Promise<RpcResponse<M>>
       setTheme(theme: 'light' | 'dark'): Promise<void>
       connect(): Promise<StreamEnvelope>
@@ -42,12 +42,12 @@ export class RpcClient {
   start(): void {
     if (!this.stopped) return
     this.stopped = false
-    this.unsubscribe = window.singularity.onFrame(frame => {
+    this.unsubscribe = window.desktop.onFrame(frame => {
       if (!this.stopped) this.onFrame(frame)
     })
-    this.unsubscribeFailure = window.singularity.onFailure(() => this.setStatus('recovering'))
+    this.unsubscribeFailure = window.desktop.onFailure(() => this.setStatus('recovering'))
     this.setStatus('connecting')
-    void window.singularity.connect().then(frame => {
+    void window.desktop.connect().then(frame => {
       if (this.stopped || this.status === 'recovering') return
       this.setStatus('ready')
       this.onFrame(frame)
@@ -66,7 +66,7 @@ export class RpcClient {
   async rpc<M extends RpcMethod>(method: M, params: RpcParams<M>): Promise<RpcResult<M>> {
     let envelope: RpcResponse<M>
     try {
-      envelope = await window.singularity.rpc({ method, params })
+      envelope = await window.desktop.rpc({ method, params })
     } catch {
       this.setStatus('recovering')
       throw new RpcFailure('工作台后端不可用。', true)

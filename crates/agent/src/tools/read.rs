@@ -31,8 +31,8 @@ pub(crate) struct ReadArgs {
     pub(crate) limit: Option<u64>,
 }
 
-pub(crate) fn spec() -> singularity_core::ToolDefinition {
-    singularity_core::ToolDefinition {
+pub(crate) fn spec() -> app_core::ToolDefinition {
+    app_core::ToolDefinition {
         name: NAME.to_string(),
         description: DESCRIPTION.clone(),
         parameters_schema: json!({
@@ -59,7 +59,7 @@ pub(crate) fn execute(args: &ReadArgs, cwd: &Path, signal: &CancellationToken) -
     };
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     match reader.fill_buf() {
-        Ok(bytes) if image::guess_format(bytes).is_ok() => {
+        Ok(bytes) if looks_like_image(bytes) => {
             return error_result(format!("{} is an image file, not text.", args.path));
         }
         Ok(bytes) if bytes.contains(&0) => {
@@ -69,6 +69,23 @@ pub(crate) fn execute(args: &ReadArgs, cwd: &Path, signal: &CancellationToken) -
         Err(error) => return error_result(format!("Could not read file: {}. {error}", args.path)),
     }
     execute_reader(&args.path, args.offset, args.limit, &mut reader, signal)
+}
+
+fn looks_like_image(bytes: &[u8]) -> bool {
+    match image::guess_format(bytes) {
+        Ok(
+            image::ImageFormat::Png
+            | image::ImageFormat::Jpeg
+            | image::ImageFormat::WebP
+            | image::ImageFormat::Gif,
+        ) => true,
+        Ok(image::ImageFormat::Bmp) => {
+            bytes.len() >= 14
+                && (bytes.contains(&0)
+                    || std::str::from_utf8(bytes).is_err_and(|err| err.error_len().is_some()))
+        }
+        _ => false,
+    }
 }
 
 fn execute_reader(
@@ -179,8 +196,8 @@ fn read_line_bytes(reader: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>
 }
 
 /// read 实际读到的源文件范围；起始行和正文行数在这里算好，说明文字不计入正文行数。
-fn read_source(start_line_display: usize, state: &ReadState) -> singularity_protocol::ReadSource {
-    singularity_protocol::ReadSource {
+fn read_source(start_line_display: usize, state: &ReadState) -> protocol::ReadSource {
+    protocol::ReadSource {
         start_line: start_line_display as u64,
         line_count: state.selected.len() as u64,
     }

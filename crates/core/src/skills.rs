@@ -21,12 +21,12 @@ pub struct Skill {
 impl Skill {
     /// 用户选择或模型调用 skill 工具时完整读取入口；辅助资源仍由模型按需读取，不受工具输出截断限制。
     pub fn load_instructions(&self) -> Result<String, String> {
-        let directory = self
-            .path
-            .parent()
-            .ok_or_else(|| format!("无法加载技能 /{}（{}）：缺少父目录", self.name, self.path.display()))?;
-        let content = fs::read_to_string(&self.path)
-            .map_err(|error| format!("无法加载技能 /{}（{}）：{error}", self.name, self.path.display()))?;
+        let directory = self.path.parent().ok_or_else(|| {
+            format!("无法加载技能 /{}（{}）：缺少父目录", self.name, crate::display_path(&self.path))
+        })?;
+        let content = fs::read_to_string(&self.path).map_err(|error| {
+            format!("无法加载技能 /{}（{}）：{error}", self.name, crate::display_path(&self.path))
+        })?;
         Ok(format!(
             "<skill>\nName: {}\nPath: {}\nBase directory: {}\nSkill instructions follow. Already loaded; do not read SKILL.md again to activate it. Resolve relative resources from the base directory using absolute tool paths.\n\n{content}\n</skill>",
             self.name,
@@ -63,16 +63,16 @@ fn discover_skill(path: &Path, file: fs::File) -> Result<Skill, String> {
     let first = lines
         .next()
         .transpose()
-        .map_err(|e| format!("{}: {e}", path.display()))?
+        .map_err(|e| format!("{}: {e}", crate::display_path(path)))?
         .unwrap_or_default();
     if first.trim_start_matches('\u{feff}').trim() != "---" {
-        return Err(format!("{}: missing YAML frontmatter", path.display()));
+        return Err(format!("{}: missing YAML frontmatter", crate::display_path(path)));
     }
     let mut yaml = String::new();
     let mut closed = false;
     for line in lines {
-        let line = line.map_err(|e| format!("{}: {e}", path.display()))?;
-        if line.trim() == "---" {
+        let line = line.map_err(|e| format!("{}: {e}", crate::display_path(path)))?;
+        if line.trim_end() == "---" {
             closed = true;
             break;
         }
@@ -80,16 +80,17 @@ fn discover_skill(path: &Path, file: fs::File) -> Result<Skill, String> {
         yaml.push('\n');
     }
     if !closed {
-        return Err(format!("{}: unclosed YAML frontmatter", path.display()));
+        return Err(format!("{}: unclosed YAML frontmatter", crate::display_path(path)));
     }
-    let meta: Metadata = serde_saphyr::from_str(&yaml).map_err(|e| format!("{}: {e}", path.display()))?;
+    let meta: Metadata =
+        serde_saphyr::from_str(&yaml).map_err(|e| format!("{}: {e}", crate::display_path(path)))?;
     if meta.name.is_empty()
         || meta.name.chars().any(|c| c.is_whitespace() || matches!(c, '/' | '\\' | '<' | '>'))
         || meta.description.trim().is_empty()
     {
         return Err(format!(
             "{}: name must be a single command name and description must be nonempty",
-            path.display()
+            crate::display_path(path)
         ));
     }
     Ok(Skill {
@@ -104,14 +105,26 @@ fn discover_skill(path: &Path, file: fs::File) -> Result<Skill, String> {
 impl SkillCatalog {
     /// 优先级从高到低：项目技能、应用主目录、共享的用户技能。
     pub fn discover(cwd: &Path, home: &Path) -> Self {
-        // 与项目指令共用同一套根目录规则。标记读不出来时不阻断技能发现：退回
-        // cwd，并像其他扫描失败一样把原因记进 diagnostics。
-        let (root, root_error) = match crate::workspace::project_root(cwd) {
-            Ok(root) => (root, None),
-            Err(error) => (cwd.to_path_buf(), Some(error)),
+        // 与项目指令共用同一套根目录规则。目录规范化或标记读不出来时不阻断技能发现：
+        // 退回可用目录，并像其他扫描失败一样把原因记进 diagnostics。
+        let mut extra_diagnostics = Vec::new();
+        let canonical = match crate::canonicalize_workspace(cwd) {
+            Ok(canonical) => Some(canonical),
+            Err(error) => {
+                extra_diagnostics.push(error);
+                None
+            }
+        };
+        let effective_cwd = canonical.as_ref().map_or(cwd, crate::CanonicalWorkspacePath::as_path);
+        let root = match crate::workspace::project_root(effective_cwd) {
+            Ok(root) => root,
+            Err(error) => {
+                extra_diagnostics.push(error);
+                effective_cwd.to_path_buf()
+            }
         };
         let mut roots = vec![
-            root.join(crate::user_home::SINGULARITY_DIR_NAME).join("skills"),
+            root.join(crate::identity::DATA_DIR_NAME).join("skills"),
             root.join(".agents").join("skills"),
             home.join("skills"),
         ];
@@ -121,14 +134,11 @@ impl SkillCatalog {
         let mut seen = std::collections::HashSet::new();
         roots.retain(|root| {
             let key = std::fs::canonicalize(root)
-                .map(|path| crate::workspace_key(&path))
-                .unwrap_or_else(|_| crate::workspace_key(root));
+                .map_or_else(|_| crate::workspace_key(root), |path| crate::workspace_key(&path));
             seen.insert(key)
         });
         let mut catalog = Self::from_roots(&roots);
-        if let Some(error) = root_error {
-            catalog.diagnostics.push(error);
-        }
+        catalog.diagnostics.extend(extra_diagnostics);
         catalog
     }
 
@@ -141,7 +151,7 @@ impl SkillCatalog {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    diagnostics.push(format!("{}: {e}", root.display()));
+                    diagnostics.push(format!("{}: {e}", crate::display_path(root)));
                     continue;
                 }
             };
@@ -157,10 +167,10 @@ impl SkillCatalog {
                                 paths.push(path.join("SKILL.md"));
                             }
                             Ok(_) => {}
-                            Err(e) => diagnostics.push(format!("{}: {e}", path.display())),
+                            Err(e) => diagnostics.push(format!("{}: {e}", crate::display_path(&path))),
                         }
                     }
-                    Err(e) => diagnostics.push(format!("{}: {e}", root.display())),
+                    Err(e) => diagnostics.push(format!("{}: {e}", crate::display_path(root))),
                 }
             }
             paths.sort();
@@ -169,7 +179,7 @@ impl SkillCatalog {
                     Ok(file) => file,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => {
-                        diagnostics.push(format!("{}: {error}", path.display()));
+                        diagnostics.push(format!("{}: {error}", crate::display_path(&path)));
                         continue;
                     }
                 };

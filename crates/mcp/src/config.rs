@@ -1,7 +1,8 @@
 //! `mcp.json` 的读写、配置校验和敏感信息脱敏。
 
+use crate::McpError;
+use protocol::{McpServerInput, McpTransportConfig};
 use serde::{Deserialize, Serialize};
-use singularity_protocol::{McpServerInput, McpTransportConfig};
 use std::{collections::BTreeMap, path::Path};
 
 #[derive(Default, Serialize, Deserialize)]
@@ -47,14 +48,14 @@ impl ServerConfig {
         }
     }
 
-    pub fn validate(&self, id: &str) -> Result<(), String> {
+    pub fn validate(&self, id: &str) -> Result<(), McpError> {
         if id.is_empty()
             || !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
         {
-            return Err("MCP 名称只能包含英文字母、数字、下划线和连字符。".into());
+            return Err(McpError::InvalidConfig("MCP 名称只能包含英文字母、数字、下划线和连字符。".into()));
         }
         if self.startup_timeout_sec == 0 || self.tool_timeout_sec == 0 {
-            return Err("MCP 超时必须大于零秒。".into());
+            return Err(McpError::InvalidConfig("MCP 超时必须大于零秒。".into()));
         }
         match &self.transport {
             McpTransportConfig::Stdio { command, args, cwd, env } => {
@@ -62,29 +63,40 @@ impl ServerConfig {
                     || command.contains('\0')
                     || args.iter().any(|arg| arg.contains('\0'))
                 {
-                    return Err("MCP 启动命令或参数无效。".into());
+                    return Err(McpError::InvalidConfig("MCP 启动命令或参数无效。".into()));
                 }
                 if cwd.as_ref().is_some_and(|cwd| cwd.trim().is_empty() || cwd.contains('\0')) {
-                    return Err("MCP 工作目录无效。".into());
+                    return Err(McpError::InvalidConfig("MCP 工作目录无效。".into()));
                 }
                 if env
                     .iter()
                     .any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0'))
                 {
-                    return Err("MCP 环境变量无效。".into());
+                    return Err(McpError::InvalidConfig("MCP 环境变量无效。".into()));
                 }
             }
             McpTransportConfig::Http { url, headers } => {
-                let parsed = reqwest::Url::parse(url)
-                    .map_err(|error| self.redact(format!("MCP 服务器 {id} 地址无效：{error}")))?;
+                let parsed = reqwest::Url::parse(url).map_err(|error| {
+                    McpError::InvalidConfig(self.redact(format!("MCP 服务器 {id} 地址无效：{error}")))
+                })?;
                 if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-                    return Err(format!("MCP 服务器 {id} 地址必须是有效的 HTTP 或 HTTPS URL。"));
+                    return Err(McpError::InvalidConfig(format!(
+                        "MCP 服务器 {id} 地址必须是有效的 HTTP 或 HTTPS URL。"
+                    )));
                 }
+                let mut seen_headers = std::collections::HashSet::with_capacity(headers.len());
                 for (key, value) in headers {
-                    reqwest::header::HeaderName::from_bytes(key.as_bytes())
-                        .map_err(|error| format!("MCP 服务器 {id} 请求头名称无效（{key}）：{error}"))?;
-                    reqwest::header::HeaderValue::from_str(value)
-                        .map_err(|error| format!("MCP 服务器 {id} 请求头值无效（{key}）：{error}"))?;
+                    let name = reqwest::header::HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
+                        McpError::InvalidConfig(format!("MCP 服务器 {id} 请求头名称无效（{key}）：{error}"))
+                    })?;
+                    if !seen_headers.insert(name) {
+                        return Err(McpError::InvalidConfig(format!(
+                            "MCP 服务器 {id} 请求头名称重复（{key}）。"
+                        )));
+                    }
+                    reqwest::header::HeaderValue::from_str(value).map_err(|error| {
+                        McpError::InvalidConfig(format!("MCP 服务器 {id} 请求头值无效（{key}）：{error}"))
+                    })?;
                 }
             }
         }
@@ -92,10 +104,10 @@ impl ServerConfig {
     }
 
     /// 网络错误、服务器 stderr 和服务端报错可能带有密钥，返回或打印前把配置中的敏感值替换掉。
-    pub fn redact(&self, mut error: String) -> String {
+    pub fn redact(&self, error: String) -> String {
         use std::borrow::Cow;
 
-        let mut values: Vec<Cow<'_, str>> = match &self.transport {
+        let values: Vec<Cow<'_, str>> = match &self.transport {
             McpTransportConfig::Stdio { env, .. } => env
                 .iter()
                 .filter(|(name, _)| is_secret_name(name))
@@ -104,14 +116,33 @@ impl ServerConfig {
             McpTransportConfig::Http { url, headers } => {
                 let mut values: Vec<Cow<'_, str>> = Vec::new();
                 if let Ok(parsed) = reqwest::Url::parse(url) {
-                    if let Some(password) = parsed.password() {
+                    if !parsed.username().is_empty() {
+                        values.push(Cow::Owned(parsed.username().to_owned()));
+                        if let Some(decoded) = percent_decode(parsed.username()) {
+                            values.push(Cow::Owned(decoded));
+                        }
+                    }
+                    if let Some(password) = parsed.password().filter(|value| !value.is_empty()) {
                         values.push(Cow::Owned(password.to_owned()));
-                        if !parsed.username().is_empty() {
-                            values.push(Cow::Owned(parsed.username().to_owned()));
+                        if let Some(decoded) = percent_decode(password) {
+                            values.push(Cow::Owned(decoded));
                         }
                     }
                     if let Some(query) = parsed.query() {
                         values.push(Cow::Owned(query.to_owned()));
+                        for pair in query.split('&') {
+                            if let Some((key, value)) = pair.split_once('=')
+                                && is_secret_name(key)
+                                && !value.is_empty()
+                            {
+                                values.push(Cow::Owned(value.to_owned()));
+                            }
+                        }
+                    }
+                    for (key, value) in parsed.query_pairs() {
+                        if is_secret_name(&key) && !value.is_empty() {
+                            values.push(Cow::Owned(value.into_owned()));
+                        }
                     }
                 } else {
                     values.push(Cow::Borrowed(url.as_str()));
@@ -124,7 +155,8 @@ impl ServerConfig {
                 );
                 for (name, value) in headers {
                     // 服务端错误可能只回显认证值，没有 Bearer / Basic 前缀。
-                    if name.eq_ignore_ascii_case("authorization")
+                    if (name.eq_ignore_ascii_case("authorization")
+                        || name.eq_ignore_ascii_case("proxy-authorization"))
                         && let Some((_, credential)) = value.split_once(' ')
                     {
                         values.push(Cow::Borrowed(credential.trim()));
@@ -133,39 +165,150 @@ impl ServerConfig {
                 values
             }
         };
-        // 先替换完整长值：短值先匹配会留下另一个凭据的后缀。
-        values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
-        for value in values {
-            if !value.is_empty() {
-                error = error.replace(value.as_ref(), "[redacted]");
+        replace_non_overlapping(error, values)
+    }
+}
+
+/// 按最长优先收集互不重叠的匹配区间并单遍替换，避免短值破坏普通文本或已生成的 `[redacted]`。
+fn replace_non_overlapping(error: String, mut values: Vec<std::borrow::Cow<'_, str>>) -> String {
+    values.retain(|value| value.len() >= 2);
+    if values.is_empty() {
+        return error;
+    }
+    values.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    values.dedup();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for value in &values {
+        let needle = value.as_ref();
+        for (start, _) in error.match_indices(needle) {
+            let end = start + needle.len();
+            if !spans
+                .iter()
+                .any(|&(existing_start, existing_end)| start < existing_end && end > existing_start)
+            {
+                spans.push((start, end));
             }
         }
-        error
+    }
+    if spans.is_empty() {
+        return error;
+    }
+    spans.sort_unstable_by_key(|&(start, _)| start);
+    let mut redacted = String::with_capacity(error.len());
+    let mut cursor = 0;
+    for (start, end) in spans {
+        redacted.push_str(&error[cursor..start]);
+        redacted.push_str("[redacted]");
+        cursor = end;
+    }
+    redacted.push_str(&error[cursor..]);
+    redacted
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    let mut changed = false;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+            changed = true;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    changed.then(|| String::from_utf8_lossy(&decoded).into_owned())
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
 fn is_secret_name(name: &str) -> bool {
-    let name = name.to_ascii_lowercase().replace('-', "_");
-    name == "authorization"
-        || name == "proxy_authorization"
-        || name == "cookie"
-        || name
-            .split('_')
-            .any(|part| matches!(part, "key" | "token" | "secret" | "password" | "credential"))
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = name.chars().peekable();
+    let mut prev: Option<char> = None;
+    while let Some(ch) = chars.next() {
+        if matches!(ch, '_' | '-') {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            prev = None;
+            continue;
+        }
+        let next = chars.peek().copied();
+        let split_camel = ch.is_ascii_uppercase()
+            && (prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
+                || (prev.as_ref().is_some_and(char::is_ascii_uppercase)
+                    && next.as_ref().is_some_and(char::is_ascii_lowercase)));
+        if split_camel && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        current.push(ch.to_ascii_lowercase());
+        prev = Some(ch);
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "authorization"
+                | "cookie"
+                | "key"
+                | "keys"
+                | "apikey"
+                | "apikeys"
+                | "token"
+                | "tokens"
+                | "accesstoken"
+                | "authtoken"
+                | "apitoken"
+                | "secret"
+                | "secrets"
+                | "clientsecret"
+                | "password"
+                | "passwords"
+                | "passwd"
+                | "credential"
+                | "credentials"
+        )
+    })
 }
 
-pub(crate) fn read(home: &Path) -> Result<Configuration, String> {
+pub(crate) fn read(home: &Path) -> Result<Configuration, McpError> {
     let path = home.join("mcp.json");
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Configuration::default());
         }
-        Err(error) => return Err(format!("无法读取 {}：{error}", path.display())),
+        Err(source) => {
+            return Err(McpError::Io {
+                context: format!("无法读取 {}", path.display()),
+                source,
+            });
+        }
     };
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
     let config: Configuration = serde_json::from_slice(bytes).map_err(|error| {
-        format!("mcp.json 格式无效（第 {} 行，第 {} 列）。", error.line(), error.column())
+        McpError::InvalidConfig(format!(
+            "mcp.json 格式无效（第 {} 行，第 {} 列）。",
+            error.line(),
+            error.column()
+        ))
     })?;
     for (id, server) in &config.servers {
         server.validate(id)?;
@@ -173,7 +316,9 @@ pub(crate) fn read(home: &Path) -> Result<Configuration, String> {
     Ok(config)
 }
 
-pub(crate) fn write(home: &Path, config: &Configuration) -> Result<(), String> {
-    singularity_core::write_json_atomic(&home.join("mcp.json"), config)
-        .map_err(|error| format!("无法保存 mcp.json：{error}"))
+pub(crate) fn write(home: &Path, config: &Configuration) -> Result<(), McpError> {
+    app_core::write_json_atomic(&home.join("mcp.json"), config).map_err(|source| McpError::Io {
+        context: "无法保存 mcp.json".into(),
+        source,
+    })
 }

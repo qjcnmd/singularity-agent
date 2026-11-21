@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
-use singularity_agent::agent::SteeringInboxHandle;
-use singularity_protocol::{ModelSelection, SessionPhase};
+use agent::agent::SteeringInboxHandle;
+use protocol::{ModelSelection, SessionPhase};
 use tokio_util::sync::CancellationToken;
 
 use super::ConversationError;
@@ -17,11 +17,11 @@ pub(crate) struct TurnControls {
     pub(crate) turn_id: String,
     cancellation: CancellationToken,
     cancel_state: Mutex<CancelState>,
-    pub(crate) questions: Arc<singularity_agent::agent::UserQuestions>,
+    pub(crate) questions: Arc<agent::agent::UserQuestions>,
 }
 
 impl TurnControls {
-    pub fn new(turn_id: String) -> Self {
+    pub(super) fn new(turn_id: String) -> Self {
         Self {
             turn_id,
             cancellation: CancellationToken::new(),
@@ -30,7 +30,7 @@ impl TurnControls {
                 rotating: false,
                 user_stopped: false,
             }),
-            questions: Arc::new(singularity_agent::agent::UserQuestions::default()),
+            questions: Arc::new(agent::agent::UserQuestions::default()),
         }
     }
 

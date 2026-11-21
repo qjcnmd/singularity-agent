@@ -4,13 +4,13 @@
 
 use std::sync::Arc;
 
-use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, RequestContext};
-use singularity_agent::session::{LedgerRecord, lock_writer, with_writer_async};
-use singularity_model::ModelClient;
+use agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, RequestContext};
+use agent::session::{LedgerRecord, lock_writer, with_writer_async};
+use model::ModelClient;
 
-use singularity_protocol::{Turn, TurnErrorDetail, TurnEvent, TurnStatus};
+use protocol::{Turn, TurnErrorDetail, TurnEvent, TurnStatus};
 
-use super::Conversation;
+use super::{Conversation, ConversationError};
 
 impl Conversation {
     /// 准备、执行并保存本轮结果，使用接受输入时创建的停止控制。
@@ -52,16 +52,13 @@ impl Conversation {
                 AgentEvent::Turn(TurnEvent::ItemUpdated { ref item })
                     if matches!(
                         item,
-                        singularity_protocol::HistoryItem::ContextRotation { .. }
-                            | singularity_protocol::HistoryItem::ContextRotationResult { .. }
+                        protocol::HistoryItem::ContextRotation { .. }
+                            | protocol::HistoryItem::ContextRotationResult { .. }
                     ) =>
                 {
                     let active = matches!(
                         item,
-                        singularity_protocol::HistoryItem::ContextRotationResult {
-                            status: TurnStatus::Running,
-                            ..
-                        }
+                        protocol::HistoryItem::ContextRotationResult { status: TurnStatus::Running, .. }
                     );
                     controls.set_rotating(active);
                     sink(event);
@@ -143,42 +140,50 @@ impl Conversation {
         Ok((agent, started_at, context_window))
     }
 
+    /// 在生命周期锁内检查并占用上下文预览槽位；已加载、正在运行、正在关闭或已有预览时返回 `None`。
+    pub(crate) fn begin_context_preview(
+        self: &Arc<Self>,
+        signal: &tokio_util::sync::CancellationToken,
+    ) -> Option<PreviewGuard> {
+        let view = self.lock_view();
+        let mut state = self.lock_state();
+        if signal.is_cancelled()
+            || view.context.is_some()
+            || state.closing
+            || state.turn.is_busy()
+            || state.context_preview.is_some()
+        {
+            return None;
+        }
+        state.context_preview = Some(signal.clone());
+        Some(PreviewGuard { conversation: Arc::clone(self) })
+    }
+
     /// 回合开始前查看上下文：本次启动已加载过就沿用，否则按回合开始时的规则加载一次，
     /// 结果和回合加载时一样通过 context/loaded 发布。
-    pub async fn inspect_context(
+    pub(crate) async fn inspect_context(
         self: &Arc<Self>,
         signal: tokio_util::sync::CancellationToken,
-    ) -> Result<(), String> {
-        {
-            let view = self.lock_view();
-            let mut state = self.lock_state();
-            if signal.is_cancelled()
-                || view.context.is_some()
-                || state.closing
-                || state.turn.is_busy()
-                || state.context_preview.is_some()
-            {
-                return Ok(());
-            }
-            state.context_preview = Some(signal.clone());
-        }
+        guard: PreviewGuard,
+    ) -> Result<(), ConversationError> {
         let conversation = Arc::clone(self);
         let result = async {
             let requests = tokio::task::spawn_blocking(move || conversation.prepare_request_context())
                 .await
                 .expect("context preparation completes while the runtime is running")
-                .map_err(|error| error.message)?;
-            requests.inspect_context(&signal).await.map_err(|error| error.to_string())
+                .map_err(|error| ConversationError::ContextPreview(error.message))?;
+            Ok::<_, ConversationError>(requests.inspect_context(&signal).await?)
         }
         .await;
-        let mut view = self.lock_view();
-        let result = if signal.is_cancelled() {
-            Ok(())
-        } else {
-            result.map(|context| self.publish_event(&mut view, TurnEvent::ContextLoaded { context }))
+        let result = {
+            let mut view = self.lock_view();
+            if signal.is_cancelled() {
+                Ok(())
+            } else {
+                result.map(|context| self.publish_event(&mut view, TurnEvent::ContextLoaded { context }))
+            }
         };
-        self.lock_state().context_preview = None;
-        self.changed.notify_waiters();
+        drop(guard);
         result
     }
     /// 普通回合与独立轮换共用的准备步骤；每次都重新读取模型配置和项目指令。
@@ -186,7 +191,7 @@ impl Conversation {
         let provider = ModelClient::new(&self.models, &self.model()).map_err(preparation_error)?;
         let instruction_home = self.home.clone();
         let initial_instructions =
-            singularity_core::load_agent_instructions(std::path::Path::new(&self.cwd), &instruction_home)
+            app_core::load_agent_instructions(std::path::Path::new(&self.cwd), &instruction_home)
                 .map_err(preparation_error)?;
         let config = AgentConfig {
             instruction_home,
@@ -194,6 +199,18 @@ impl Conversation {
             disabled_modules: self.disabled_modules.clone(),
         };
         Ok(RequestContext::new(provider, config, Arc::clone(&self.writer), Arc::clone(&self.mcp)))
+    }
+}
+
+/// 上下文预览的占用守卫；离开作用域（含取消或提前返回）时自动释放占位并唤醒关闭等待。
+pub(crate) struct PreviewGuard {
+    conversation: Arc<Conversation>,
+}
+
+impl Drop for PreviewGuard {
+    fn drop(&mut self) {
+        self.conversation.lock_state().context_preview = None;
+        self.conversation.changed.notify_waiters();
     }
 }
 

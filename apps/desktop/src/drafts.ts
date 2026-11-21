@@ -1,3 +1,4 @@
+import { DRAFTS_DB_NAME } from './identity'
 import type { ModelSelection, ImageUpload } from './protocol'
 
 /** files 是附件文件的绝对路径，发送时只把路径交给后端；disabledModules 是新任务关闭的上下文模块 ID，只在空白页使用。 */
@@ -98,7 +99,7 @@ export class DraftStore {
 let database: Promise<IDBDatabase> | undefined
 function openDatabase(): Promise<IDBDatabase> {
   return database ??= new Promise((resolve, reject) => {
-    const request = indexedDB.open('singularity.drafts', 1)
+    const request = indexedDB.open(DRAFTS_DB_NAME, 1)
     request.onupgradeneeded = () => request.result.createObjectStore('drafts')
     request.onsuccess = () => resolve(request.result)
     request.onerror = () => { database = undefined; reject(request.error) }

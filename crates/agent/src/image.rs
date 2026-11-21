@@ -1,12 +1,12 @@
 //! 用户上传、`view_image` 工具和 MCP 工具返回图片的格式识别、解码校验与文件读写。
 
-use std::io::{BufRead, BufReader, Cursor, Read};
+use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{ImageFormat, ImageReader, Limits};
-use singularity_protocol::{ImageAttachment, ImageUpload};
+use protocol::{ImageAttachment, ImageUpload};
 
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
@@ -16,7 +16,7 @@ const MAX_DECODE_ALLOC_BYTES: u64 = 128 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq)]
 pub struct InputImage {
     pub attachment: ImageAttachment,
-    bytes: Arc<Vec<u8>>,
+    bytes: Arc<[u8]>,
 }
 
 impl InputImage {
@@ -47,13 +47,24 @@ impl InputImage {
     }
 
     /// 读取图片文件并校验格式和尺寸。
-    pub(crate) fn read(path: &Path, reader: impl Read) -> Result<Self, String> {
-        let mut reader = BufReader::new(reader);
-        let head = reader.fill_buf().map_err(|error| format!("无法读取图片：{error}"))?;
-        image::guess_format(head).map_err(|_| "无法识别图片格式。")?;
-        let mut bytes = Vec::new();
+    pub(crate) fn read(path: &Path, mut reader: impl Read) -> Result<Self, String> {
+        const HEADER_PROBE_BYTES: usize = 64;
+        let mut probe = [0u8; HEADER_PROBE_BYTES];
+        let mut filled = 0;
+        while filled < HEADER_PROBE_BYTES {
+            match reader.read(&mut probe[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(format!("无法读取图片：{error}")),
+            }
+        }
+        let mut bytes = Vec::with_capacity(filled);
+        bytes.extend_from_slice(&probe[..filled]);
+        image::guess_format(&bytes).map_err(|_| "无法识别图片格式。")?;
+        let remaining = u64::try_from((MAX_IMAGE_BYTES + 1).saturating_sub(bytes.len())).unwrap_or(u64::MAX);
         reader
-            .take((MAX_IMAGE_BYTES + 1) as u64)
+            .take(remaining)
             .read_to_end(&mut bytes)
             .map_err(|error| format!("无法读取图片：{error}"))?;
         if bytes.len() > MAX_IMAGE_BYTES {
@@ -102,14 +113,14 @@ impl InputImage {
                 width,
                 height,
             },
-            bytes: Arc::new(bytes),
+            bytes: Arc::from(bytes),
         })
     }
 
     pub(crate) fn save(&self, directory: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(directory)?;
         // 图片写完才保存消息引用；重试仍写入同一份字节。
-        std::fs::write(directory.join(&self.attachment.id), self.bytes.as_slice())
+        std::fs::write(directory.join(&self.attachment.id), &self.bytes)
     }
 }
 

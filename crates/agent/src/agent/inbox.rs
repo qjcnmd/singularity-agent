@@ -9,6 +9,23 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// 控制接受用户输入时是否展开 `/skill` 引用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillExpansion {
+    Enabled,
+    Disabled,
+}
+
+impl SkillExpansion {
+    pub fn from_disabled_modules(disabled_modules: &[String]) -> Self {
+        if disabled_modules.iter().any(|id| id == super::modules::SKILLS_MODULE_ID) {
+            Self::Disabled
+        } else {
+            Self::Enabled
+        }
+    }
+}
+
 /// 文字、图片和附件路径作为一个输入一起接受和交付。
 #[derive(Debug, Clone)]
 pub struct UserInput {
@@ -24,11 +41,11 @@ impl UserInput {
     /// 接受输入前完成校验、图片解码和技能读取；失败时不进入队列。
     pub fn from_uploads(
         text: String,
-        images: Vec<singularity_protocol::ImageUpload>,
+        images: Vec<protocol::ImageUpload>,
         files: Vec<String>,
         cwd: &std::path::Path,
         home: &std::path::Path,
-        skills_enabled: bool,
+        skill_expansion: SkillExpansion,
     ) -> Result<Self, String> {
         if text.trim().is_empty() && images.is_empty() && files.is_empty() {
             return Err("输入不能为空。".into());
@@ -48,10 +65,9 @@ impl UserInput {
             }
         }
         Ok(Self {
-            skill_instructions: if skills_enabled {
-                load_selected_skills(&text, cwd, home)?
-            } else {
-                String::new()
+            skill_instructions: match skill_expansion {
+                SkillExpansion::Enabled => load_selected_skills(&text, cwd, home)?,
+                SkillExpansion::Disabled => String::new(),
             },
             text,
             images: images.into_iter().map(crate::image::InputImage::upload).collect::<Result<_, _>>()?,
@@ -89,7 +105,7 @@ fn load_selected_skills(text: &str, cwd: &std::path::Path, home: &std::path::Pat
     if references.peek().is_none() {
         return Ok(String::new());
     }
-    let catalog = singularity_core::skills::SkillCatalog::discover(cwd, home);
+    let catalog = app_core::skills::SkillCatalog::discover(cwd, home);
     let mut selected = std::collections::HashSet::new();
     let mut instructions = String::new();
     for name in references {

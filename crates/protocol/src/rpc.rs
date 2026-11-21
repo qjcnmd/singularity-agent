@@ -15,6 +15,7 @@ use std::fmt;
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(type = "Record<string, never>"))]
+#[serde(deny_unknown_fields)]
 pub struct EmptyParams {}
 
 /// 停止当前会话内的指定后台命令。

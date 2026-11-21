@@ -1,8 +1,6 @@
 //! 当前操作中还没保存的正文、工具进度和轮换状态；读取任务时叠加到已保存的历史上，
 //! 对应内容保存后就从这里移除。
-use singularity_protocol::{
-    HistoryItem, HistoryMessageRole, ThreadHistory, ToolStatus, TurnEvent, TurnStatus,
-};
+use protocol::{HistoryItem, HistoryMessageRole, ThreadHistory, ToolStatus, TurnEvent, TurnStatus};
 
 #[derive(Default)]
 pub(super) struct Activity {
@@ -56,15 +54,15 @@ impl Activity {
             }
             | TurnEvent::ToolFinished { item_id: id, .. } => self.items.retain(|item| item.id() != id),
             TurnEvent::MessageFinished { message_id, .. } | TurnEvent::MessageDiscarded { message_id } => {
-                let text = singularity_agent::session::text_item_id(message_id, 0);
-                let thinking = singularity_agent::session::thinking_item_id(message_id, 0);
+                let text = agent::session::text_item_id(message_id, 0);
+                let thinking = agent::session::thinking_item_id(message_id, 0);
                 self.items.retain(|item| item.id() != text && item.id() != thinking);
             }
             TurnEvent::ToolOutput { item_id, output } => {
                 if let Some(HistoryItem::Tool { result, .. }) =
                     self.items.iter_mut().find(|item| item.id() == item_id)
                 {
-                    *result = Some(singularity_protocol::ToolResult {
+                    *result = Some(protocol::ToolResult {
                         output: output.clone(),
                         background_task_id: None,
                         images: Vec::new(),

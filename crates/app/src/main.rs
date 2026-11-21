@@ -10,7 +10,7 @@ mod runtime;
 use crate::desktop::AppServer;
 use crate::desktop::workspace_store::WorkspaceStore;
 use crate::runtime::{SESSIONS_DIR_NAME, ThreadCatalog};
-use singularity_model::ModelConfigManager;
+use model::ModelConfigManager;
 
 pub(crate) const PROGRAM_NAME: &str = env!("CARGO_BIN_NAME");
 /// 后端事件流总容量；最后一段预留给控制与终态事件，高频进度在接近满载时让路。
@@ -27,17 +27,18 @@ fn main() {
 fn run() -> Result<(), String> {
     let (home, _data_lock) = lock_data_directory()?;
     logging::init(&home);
-    tracing::info!(home = %home.display(), "Singularity backend starting");
+    tracing::info!(home = %home.display(), app = app_core::identity::APP_NAME, "backend starting");
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     let (app, events) = prepare_desktop(&home)?;
     let result = runtime.block_on(desktop::run(app, events));
-    tracing::info!(ok = result.is_ok(), "Singularity backend stopped");
+    runtime.shutdown_background();
+    tracing::info!(ok = result.is_ok(), app = app_core::identity::APP_NAME, "backend stopped");
     result
 }
 
 /// 在整个进程生命周期内持有一把 OS 锁；锁文件还留在磁盘上，不代表有程序正持有它。
 fn lock_data_directory() -> Result<(PathBuf, std::fs::File), String> {
-    let home = singularity_core::resolve_home()?;
+    let home = app_core::resolve_home()?;
     std::fs::create_dir_all(&home)
         .map_err(|error| format!("failed to create {}: {error}", home.display()))?;
     let lock_path = home.join("instance.lock");
@@ -50,7 +51,7 @@ fn lock_data_directory() -> Result<(PathBuf, std::fs::File), String> {
         .map_err(|e| format!("failed to open {}: {e}", lock_path.display()))?;
     file.try_lock().map_err(|e| match e {
         std::fs::TryLockError::WouldBlock => {
-            format!("数据目录已被另一个 Singularity 程序使用：{}", home.display())
+            format!("数据目录已被另一个 {} 程序使用：{}", app_core::identity::APP_NAME, home.display())
         }
         std::fs::TryLockError::Error(e) => {
             format!("cannot lock data directory {}: {e}", home.display())
@@ -62,12 +63,12 @@ fn lock_data_directory() -> Result<(PathBuf, std::fs::File), String> {
 /// 装配工作台共享组件，直接交给应用服务持有。
 fn prepare_desktop(
     home: &Path,
-) -> Result<(Arc<AppServer>, tokio::sync::mpsc::Receiver<singularity_protocol::StreamEnvelope>), String> {
+) -> Result<(Arc<AppServer>, tokio::sync::mpsc::Receiver<protocol::StreamEnvelope>), String> {
     let sessions_dir = home.join(SESSIONS_DIR_NAME);
     let models = Arc::new(ModelConfigManager::open(home.to_path_buf()));
-    let mcp = Arc::new(singularity_mcp::McpManager::open(home.to_path_buf()));
+    let mcp = Arc::new(mcp::McpManager::open(home.to_path_buf()));
     let catalog = ThreadCatalog::new(sessions_dir);
-    let workspaces = WorkspaceStore::open(home)?;
+    let workspaces = WorkspaceStore::open(home).map_err(|error| error.to_string())?;
     let (stream, events) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
     Ok((AppServer::new(catalog, workspaces, models, mcp, home.to_path_buf(), stream), events))
 }

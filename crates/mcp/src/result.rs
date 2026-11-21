@@ -3,6 +3,7 @@
 use rmcp::model::{CallToolResult, ContentBlock, ResourceContents};
 
 /// 工具结果；图片保留服务器返回的 Base64 内容，由 Agent 检查和保存。
+#[derive(Debug)]
 pub struct McpToolResult {
     pub content: String,
     pub images: Vec<String>,

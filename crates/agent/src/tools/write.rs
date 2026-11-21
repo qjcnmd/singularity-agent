@@ -16,8 +16,8 @@ pub(crate) struct WriteArgs {
     content: String,
 }
 
-pub(crate) fn spec() -> singularity_core::ToolDefinition {
-    singularity_core::ToolDefinition {
+pub(crate) fn spec() -> app_core::ToolDefinition {
+    app_core::ToolDefinition {
         name: "write".into(),
         description: "Create a new UTF-8 text file or overwrite an existing text file with full content. Automatically creates missing parent directories and writes atomically. Prefer edit for targeted changes to existing files.".into(),
         parameters_schema: json!({
@@ -82,7 +82,7 @@ fn execute_locked(
     if signal.is_cancelled() {
         return Err(ABORTED_MESSAGE.into());
     }
-    singularity_core::write_bytes_atomic(target, content.as_bytes())
+    app_core::write_bytes_atomic(target, content.as_bytes())
         .map_err(|error| format!("Could not write {}: {error}", args.path))?;
     let verb = if existed { "Wrote" } else { "Created" };
     Ok(format_diff_result(verb, &args.path, &before, &content))

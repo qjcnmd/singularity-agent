@@ -4,10 +4,11 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
+use ::mcp::McpTool;
+use app_core::ToolDefinition;
+use app_core::skills::SkillCatalog;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use singularity_core::ToolDefinition;
-use singularity_core::skills::SkillCatalog;
 use tokio_util::sync::CancellationToken;
 
 use super::bash;
@@ -42,7 +43,7 @@ pub(crate) struct ToolExecution {
     /// 工具执行耗时（毫秒，仅供本地展示与统计）
     pub duration_ms: Option<u64>,
     /// read 工具读到的源文件行号范围（供前端按行展示）
-    pub read_source: Option<singularity_protocol::ReadSource>,
+    pub read_source: Option<protocol::ReadSource>,
 }
 
 /// 工具结果的本地展示正文及关联的后台命令。
@@ -64,7 +65,7 @@ impl ToolExecution {
         }
     }
 
-    pub(crate) fn with_read_source(mut self, source: singularity_protocol::ReadSource) -> Self {
+    pub(crate) fn with_read_source(mut self, source: protocol::ReadSource) -> Self {
         self.read_source = Some(source);
         self
     }
@@ -90,8 +91,8 @@ pub(crate) enum PreparedTool {
     TaskList(bash::TaskListArgs),
     TaskOutput(bash::TaskIdArgs),
     TaskStop(bash::TaskIdArgs),
-    McpSchema(Vec<singularity_mcp::McpTool>),
-    Mcp(singularity_mcp::McpTool, serde_json::Map<String, Value>),
+    McpSchema(Vec<McpTool>),
+    Mcp(McpTool, serde_json::Map<String, Value>),
 }
 
 impl PreparedTool {
@@ -197,7 +198,7 @@ pub(crate) fn question_tool() -> BuiltinTool {
 pub(crate) struct ToolRegistrySnapshot {
     tools: Vec<BuiltinTool>,
     /// 本轮已连接且有可用工具的 MCP 服务器，统一通过 `mcp_schema` / `mcp_call` 按需访问。
-    mcp_servers: BTreeMap<String, Vec<singularity_mcp::McpTool>>,
+    mcp_servers: BTreeMap<String, Vec<McpTool>>,
     /// Skills 模块开着时持有本轮的技能目录，`skill` 工具按它加载。
     skills: Option<Arc<SkillCatalog>>,
 }
@@ -211,7 +212,7 @@ impl ToolRegistrySnapshot {
         self.skills = Some(catalog);
     }
 
-    pub(crate) fn add_mcp_server(&mut self, server_id: String, tools: Vec<singularity_mcp::McpTool>) {
+    pub(crate) fn add_mcp_server(&mut self, server_id: String, tools: Vec<McpTool>) {
         if !tools.is_empty() {
             self.mcp_servers.insert(server_id, tools);
         }

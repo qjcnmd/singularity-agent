@@ -1,5 +1,5 @@
 [package]
-name = "singularity_model"
+name = "model"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,11 +15,10 @@ reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-singularity_core = { path = "../core" }
-singularity_protocol = { path = "../protocol" }
+app_core = { path = "../core" }
+protocol = { path = "../protocol" }
 time.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

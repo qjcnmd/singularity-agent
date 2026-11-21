@@ -6,7 +6,6 @@
 //! - tools：内置工具。
 
 pub mod agent;
-pub use agent::AgentEvent;
 pub(crate) mod compaction;
 mod image;
 pub mod message;

@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use proptest::prelude::*;
+use protocol::ProviderApiProtocol;
 use serde_json::{Map, Value, json};
-use singularity_protocol::ProviderApiProtocol;
 
 use crate::config::selection::SelectedModel;
 use crate::messages::messages_stream_request_payload;

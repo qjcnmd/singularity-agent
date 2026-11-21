@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 
-use singularity_protocol::{PendingQuestion, UserQuestionAnswer};
+use protocol::{PendingQuestion, UserQuestionAnswer};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +18,28 @@ struct WaitingQuestion {
 #[derive(Default)]
 pub struct UserQuestions {
     waiting: Mutex<Option<WaitingQuestion>>,
+}
+
+impl std::fmt::Debug for UserQuestions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("UserQuestions");
+        if let Ok(slot) = self.waiting.try_lock() {
+            debug.field("pending_item_id", &slot.as_ref().map(|waiting| waiting.request.item_id.as_str()));
+        }
+        debug.finish_non_exhaustive()
+    }
+}
+
+struct ClearGuard<'a> {
+    waiting: &'a Mutex<Option<WaitingQuestion>>,
+}
+
+impl Drop for ClearGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.waiting.lock() {
+            slot.take();
+        }
+    }
 }
 
 impl UserQuestions {
@@ -74,15 +96,17 @@ impl UserQuestions {
     ) -> ToolExecution {
         let (reply, receive) = oneshot::channel();
         *self.waiting.lock().expect("question lock poisoned") = Some(WaitingQuestion { request, reply });
+        let clear = ClearGuard { waiting: &self.waiting };
         on_event(AgentEvent::SessionStateChanged);
         let result = tokio::select! {
             biased;
             () = cancellation.cancelled() => error_result(ABORTED_MESSAGE),
-            answers = receive => ToolExecution::text(serde_json::json!({
-                "answers": answers.expect("pending question retains its sender until answered")
-            }).to_string()),
+            answers = receive => match answers {
+                Ok(answers) => ToolExecution::text(serde_json::json!({ "answers": answers }).to_string()),
+                Err(_) => error_result(ABORTED_MESSAGE),
+            },
         };
-        self.waiting.lock().expect("question lock poisoned").take();
+        drop(clear);
         on_event(AgentEvent::SessionStateChanged);
         result
     }

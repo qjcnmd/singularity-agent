@@ -27,7 +27,7 @@
 
 |改动|同步|
 |-|-|
-|`crates/protocol/src/` 中的 DTO 或 RPC|运行 `cargo run -p singularity\_protocol --features typescript --example export\_types`，更新前端调用方|
+|`crates/protocol/src/` 中的 DTO 或 RPC|运行 `cargo run -p protocol --features typescript --example export\_types`，更新前端调用方|
 |Rust 公共函数或类型|受影响的调用方|
 |执行顺序、条件分支、模块关系、数据流、失败或停止处理|同一改动中更新 `architecture.html` 对应的节点、连线和说明，对照源码核对；调整过布局就看渲染画面，文字和箭头要清楚|
 |模块职责、状态由谁维护、源码入口|`docs/architecture.md`、`directory.html`|

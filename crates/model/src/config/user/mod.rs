@@ -13,7 +13,7 @@ use crate::error::ProviderError;
 #[serde(deny_unknown_fields)]
 pub(crate) struct UserConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) default_model: Option<singularity_protocol::ModelSelection>,
+    pub(crate) default_model: Option<protocol::ModelSelection>,
     #[serde(default)]
     pub(crate) providers: BTreeMap<String, UserConfigProvider>,
 }
@@ -23,7 +23,7 @@ pub(crate) struct UserConfigFile {
 pub(crate) struct UserConfigProvider {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) api_key: String,
-    pub(crate) api_protocol: singularity_protocol::ProviderApiProtocol,
+    pub(crate) api_protocol: protocol::ProviderApiProtocol,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) display_name: Option<String>,
     pub(crate) base_url: String,
@@ -72,6 +72,6 @@ pub(crate) fn read_user_config_file(directory: &Path) -> Result<Option<UserConfi
 /// 键按 `BTreeMap` 排序，与文件原先的书写顺序无关。
 pub(crate) fn write_user_config_file(directory: &Path, config: &UserConfigFile) -> Result<(), ProviderError> {
     let path = directory.join(USER_CONFIG_FILE_NAME);
-    singularity_core::write_json_atomic(&path, config)
+    app_core::write_json_atomic(&path, config)
         .map_err(|error| configuration_error(format!("无法保存模型配置 {}：{error}", path.display())))
 }

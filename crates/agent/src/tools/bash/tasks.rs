@@ -6,12 +6,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use singularity_protocol::{BackgroundTask, BackgroundTaskState};
+use protocol::{BackgroundTask, BackgroundTaskState};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::session::{LedgerRecord, SessionEntry, lock_writer};
+use crate::session::{LedgerRecord, SessionEntry, with_writer};
 use crate::tools::registry::{ABORTED_MESSAGE, ToolDisplay, ToolExecution, error_result};
 
 use super::exec::{Outcome, Process, ProcessEvent};
@@ -19,6 +19,7 @@ use super::result::{TaskDisplayMode, state_text, task_result, task_summary, try_
 use super::spec::BashArgs;
 
 /// 已保存的开始、结束，或仅供显示的输出更新。
+#[derive(Debug)]
 pub enum BashTaskUpdate {
     Updated(BackgroundTask),
     Failed { task: BackgroundTask, error: String },
@@ -58,6 +59,16 @@ pub struct BashTasks {
     inbox: crate::agent::SteeringInboxHandle,
 }
 
+impl std::fmt::Debug for BashTasks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("BashTasks");
+        if let Ok(entries) = self.entries.try_lock() {
+            debug.field("active_entries", &entries.len());
+        }
+        debug.finish_non_exhaustive()
+    }
+}
+
 impl BashTasks {
     /// 保存复用会话写者；每次更新直接发布，发布完成后才继续执行。
     pub fn new(
@@ -80,15 +91,16 @@ impl BashTasks {
     }
 
     fn project_tasks<T>(&self, project: impl Fn(&BackgroundTask, &BackgroundTaskState) -> T) -> Vec<T> {
-        let writer = lock_writer(&self.writer);
-        let entries = self.entries.lock().expect("bash task entries lock");
-        let mut tasks = BTreeMap::new();
-        for record in writer.entries() {
-            if let Some(task) = recorded_task(record) {
-                tasks.insert(&task.task_id, task);
+        with_writer(&self.writer, |writer| {
+            let entries = self.entries.lock().expect("bash task entries lock");
+            let mut tasks = BTreeMap::new();
+            for record in writer.data().entries() {
+                if let Some(task) = recorded_task(record) {
+                    tasks.insert(&task.task_id, task);
+                }
             }
-        }
-        tasks.into_values().map(|task| current_task(task, &entries, &project)).collect()
+            tasks.into_values().map(|task| current_task(task, &entries, &project)).collect()
+        })
     }
 
     /// 命令执行、回收或保存终态期间仍占用会话；完成通知入队后才释放。
@@ -125,11 +137,6 @@ impl BashTasks {
     pub(crate) fn output(&self, task_id: &str, signal: &CancellationToken) -> ToolExecution {
         if signal.is_cancelled() {
             return error_result(ABORTED_MESSAGE);
-        }
-        if let Some(entry) = self.entry(task_id)
-            && let Some(Err(error)) = &*entry.done.borrow()
-        {
-            return error_result(error.message());
         }
         self.take_output(task_id).unwrap_or_else(error_result)
     }
@@ -234,11 +241,10 @@ impl BashTasks {
         if signal.is_cancelled() {
             return error_result(ABORTED_MESSAGE);
         }
-        let mut process = match Process::spawn(&args, &cwd, &output_directory) {
+        let mut process = match Process::spawn(&args, &cwd, &output_directory).await {
             Ok(process) => process,
             Err(error) => return error_result(error),
         };
-        let mut output = String::new();
         if args.yield_time_ms > 0 {
             let yield_at = tokio::time::sleep(Duration::from_millis(args.yield_time_ms));
             tokio::pin!(yield_at);
@@ -246,10 +252,10 @@ impl BashTasks {
                 tokio::select! {
                     biased;
                     event = process.next(&signal) => match event {
-                        ProcessEvent::Progress { display, .. } => { output = display.clone(); on_update(display).await; }
+                        ProcessEvent::Progress { display, .. } => on_update(display).await,
                         ProcessEvent::Finished(outcome) => return process.finish(outcome).await.0,
                     },
-                    _ = &mut yield_at => break,
+                    () = &mut yield_at => break,
                 }
             }
         }
@@ -261,7 +267,7 @@ impl BashTasks {
             task_id: Uuid::now_v7().to_string(),
             command: args.command,
             description: args.description,
-            output,
+            output: process.display_output(),
             model_output: process.model_output(),
             state: BackgroundTaskState::Running,
         };
@@ -323,16 +329,18 @@ impl BashTasks {
     }
 
     fn task(&self, task_id: &str) -> Result<BackgroundTask, String> {
-        let writer = lock_writer(&self.writer);
-        let entries = self.entries.lock().expect("bash task entries lock");
-        writer
-            .entries()
-            .iter()
-            .rev()
-            .filter_map(recorded_task)
-            .find(|task| task.task_id == task_id)
-            .map(|task| current_task(task, &entries, clone_task))
-            .ok_or_else(|| format!("Unknown background task: {task_id}"))
+        with_writer(&self.writer, |writer| {
+            let entries = self.entries.lock().expect("bash task entries lock");
+            writer
+                .data()
+                .entries()
+                .iter()
+                .rev()
+                .filter_map(recorded_task)
+                .find(|task| task.task_id == task_id)
+                .map(|task| current_task(task, &entries, clone_task))
+                .ok_or_else(|| format!("Unknown background task: {task_id}"))
+        })
     }
 
     async fn run_background(self: Arc<Self>, entry: Arc<Entry>, mut process: Process) {

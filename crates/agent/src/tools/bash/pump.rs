@@ -95,7 +95,7 @@ impl<R: AsyncRead + Unpin> OutputReader<R> {
                         return Some(Ok(OutputChunk { display, model: model.0 }));
                     }
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
                     self.closed = true;
                     return Some(Err(io::Error::new(
@@ -137,20 +137,17 @@ impl Utf8Decoder {
                         output.push_str(text);
                         consumed += valid;
                     }
-                    match error.error_len() {
-                        Some(error_len) => {
+                    if let Some(error_len) = error.error_len() {
+                        output.push('\u{FFFD}');
+                        consumed += error_len;
+                    } else {
+                        // 末尾是没写完的序列：已到 EOF 就补一个替换字节并丢掉，
+                        // 否则留到下一块输入继续拼接。
+                        if eof {
                             output.push('\u{FFFD}');
-                            consumed += error_len;
+                            consumed = self.pending.len();
                         }
-                        None => {
-                            // 末尾是没写完的序列：已到 EOF 就补一个替换字节并丢掉，
-                            // 否则留到下一块输入继续拼接。
-                            if eof {
-                                output.push('\u{FFFD}');
-                                consumed = self.pending.len();
-                            }
-                            break;
-                        }
+                        break;
                     }
                 }
             }

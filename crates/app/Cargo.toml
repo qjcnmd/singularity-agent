@@ -1,5 +1,5 @@
 [package]
-name = "singularity_app"
+name = "app"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,11 +16,11 @@ path = "src/main.rs"
 [dependencies]
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
-singularity_core = { path = "../core" }
-singularity_model = { path = "../model" }
-singularity_mcp = { path = "../mcp" }
-singularity_protocol = { path = "../protocol" }
-singularity_agent = { path = "../agent" }
+app_core = { path = "../core" }
+model = { path = "../model" }
+mcp = { path = "../mcp" }
+protocol = { path = "../protocol" }
+agent = { path = "../agent" }
 thiserror.workspace = true
 uuid = { workspace = true, features = ["v7"] }
 tokio.workspace = true

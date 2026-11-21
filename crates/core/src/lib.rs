@@ -1,10 +1,11 @@
 //! 各 crate 共用的数据目录、项目路径、AGENTS.md 加载、技能发现与基础工具函数。
 
+pub mod identity;
 mod project_instructions;
 pub mod skills;
 mod tool;
 mod user_home;
-pub mod workspace;
+mod workspace;
 
 pub use project_instructions::{InstructionFile, load_agent_instructions};
 pub use tool::{ToolDefinition, estimate_tool_tokens};
@@ -23,7 +24,7 @@ pub fn estimate_tokens_of(text: &str) -> u64 {
 }
 
 pub fn duration_millis(duration: std::time::Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 const ISO_FORMAT: &[time::format_description::FormatItem<'static>] =
@@ -70,7 +71,7 @@ pub fn write_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Resu
 
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     // 临时名只需在目标目录中唯一，不依赖目标文件名的字符编码。
-    let temporary = parent.join(format!(".singularity-tmp-{}", uuid::Uuid::new_v4().simple()));
+    let temporary = parent.join(format!(".tmp-{}", uuid::Uuid::new_v4().simple()));
     let result = (|| -> std::io::Result<()> {
         let mut handle = std::fs::File::create_new(&temporary)?;
         handle.write_all(bytes)?;

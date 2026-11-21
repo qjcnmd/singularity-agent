@@ -98,6 +98,7 @@ impl BackendClient {
                     let _ = events_tx.send(parsed);
                 }
             }
+            pending_reader.lock().expect("pending lock").clear();
         });
 
         let stderr_buf = Arc::clone(&stderr);

@@ -13,8 +13,8 @@ pub(crate) use user::*;
 
 use super::{ModelErrorKind, ProviderError};
 
+use protocol::{ModelSelection, ProviderApiProtocol};
 use selection::{ProviderConfig, SelectedModel, resolve_model_definition, resolve_model_selection};
-use singularity_protocol::{ModelSelection, ProviderApiProtocol};
 
 pub(crate) fn configuration_error(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ModelErrorKind::Other, message)
@@ -42,8 +42,9 @@ pub(crate) fn validate_base_url(value: &str) -> Result<(), ProviderError> {
     if value.is_empty() {
         return Err(configuration_error("模型配置无效：base_url 不能为空"));
     }
-    let url = reqwest::Url::parse(value)
-        .map_err(|_| configuration_error("模型配置无效：base_url 须填写完整的网址"))?;
+    let url = reqwest::Url::parse(value).map_err(|error| {
+        configuration_error(format!("模型配置无效：base_url 须填写完整的网址（{error}）"))
+    })?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()

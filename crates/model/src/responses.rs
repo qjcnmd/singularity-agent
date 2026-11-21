@@ -109,17 +109,20 @@ pub(crate) fn parse_openai_responses_response(
         ));
     }
     // 内容按提供方输出的顺序保存；续接字段跟随各块，正文和参数不重复保存。
-    let output = match payload.get_mut("output").map(std::mem::take) {
-        Some(Value::Array(items)) => items,
-        _ => {
-            return Err(provider_response_validation_error(
-                "provider Responses payload missing output items",
-                &["responses_output_missing"],
-            ));
-        }
+    let Some(Value::Array(output)) = payload.get_mut("output").map(std::mem::take) else {
+        return Err(provider_response_validation_error(
+            "provider Responses payload missing output items",
+            &["responses_output_missing"],
+        ));
     };
     let mut content = Vec::new();
     for item in output {
+        let Value::Object(item) = item else {
+            return Err(provider_response_validation_error(
+                "provider Responses output item type was missing",
+                &["responses_output_item_type_missing"],
+            ));
+        };
         let Some(item_type) = item.get("type").and_then(Value::as_str) else {
             return Err(provider_response_validation_error(
                 "provider Responses output item type was missing",
@@ -238,18 +241,18 @@ pub(crate) fn openai_responses_input(
         .join("\n\n");
     let mut items = Vec::new();
     for message in &messages[instruction_count..] {
-        match message.role() {
-            ModelRole::Tool => {
+        match message {
+            Message::ToolResult { tool_call_id, .. } => {
                 items.push(json!({
                     "type": "function_call_output",
-                    "call_id": message.tool_call_id(),
+                    "call_id": tool_call_id,
                     "output": responses_content(message, images)?,
                 }));
             }
-            ModelRole::Assistant => {
+            Message::Assistant { content, .. } => {
                 let same_provider =
                     message_metadata_for(message, selection, provider_name, endpoint).is_some();
-                for block in message.content() {
+                for block in content {
                     let (fields, metadata): (Vec<(&str, Value)>, Option<&ProviderBlockMetadata>) = match block
                     {
                         ContentBlock::Text { text, metadata } => (
@@ -295,10 +298,10 @@ pub(crate) fn openai_responses_input(
                     items.push(Value::Object(map));
                 }
             }
-            ModelRole::Developer | ModelRole::User => {
+            Message::Developer { .. } | Message::User { .. } | Message::Notification { .. } => {
                 // 开头的 developer 已折叠进 instructions；历史之后的 developer
                 // 使用 Responses 输入 schema 接受的 system 角色。
-                let role = if message.role() == ModelRole::Developer {
+                let role = if matches!(message, Message::Developer { .. }) {
                     "system"
                 } else {
                     "user"
@@ -329,10 +332,10 @@ fn responses_content(
     Ok(json!(parts))
 }
 
-fn block_metadata(item: Value, content_fields: &[&str]) -> ProviderBlockMetadata {
-    let Value::Object(mut fields) = item else {
-        unreachable!("typed output item is an object");
-    };
+fn block_metadata(
+    mut fields: serde_json::Map<String, Value>,
+    content_fields: &[&str],
+) -> ProviderBlockMetadata {
     for field in content_fields {
         fields.remove(*field);
     }

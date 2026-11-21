@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use super::{Conversation, TurnControls};
-use singularity_agent::agent::{AgentError, AgentEvent, context_rotation_unneeded};
-use singularity_agent::session::ContextRotationInput;
-use singularity_protocol::{TurnErrorDetail, TurnStatus};
+use agent::agent::{AgentError, AgentEvent, context_rotation_unneeded};
+use agent::session::ContextRotationInput;
+use protocol::{TurnErrorDetail, TurnStatus};
 
 impl Conversation {
     /// 独立轮换复用会话写者和本次操作的停止控制。
@@ -38,7 +38,7 @@ impl Conversation {
             .await;
         controls.finish_cancel();
         match result {
-            Ok(_) => Ok(TurnStatus::Completed),
+            Ok(()) => Ok(TurnStatus::Completed),
             Err(AgentError::Aborted) => Ok(TurnStatus::Interrupted),
             Err(error) => Err(error.detail()),
         }

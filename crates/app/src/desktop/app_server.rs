@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::runtime::{CatalogError, Conversation, ConversationError, ThreadCatalog};
-use singularity_agent::agent::UserInput;
-use singularity_model::{ModelConfigManager, ProviderError};
-use singularity_protocol::{
+use agent::agent::UserInput;
+use model::{ModelConfigManager, ProviderError};
+use protocol::{
     AppBootstrap, ProviderConfigurationInput, RpcError, SessionReadResult, StreamEnvelope, StreamEvent,
 };
 use tokio::sync::mpsc;
@@ -29,19 +29,18 @@ pub(super) struct SessionCache {
 
 impl SessionCache {
     pub(super) fn get(&mut self, id: &str) -> Option<Arc<Conversation>> {
-        self.next_access += 1;
-        let access = self.next_access;
         let (conversation, last_access) = self.entries.get_mut(id)?;
-        *last_access = access;
+        self.next_access += 1;
+        *last_access = self.next_access;
         Some(Arc::clone(conversation))
     }
 
     pub(super) fn insert(&mut self, id: String, conversation: Arc<Conversation>) {
+        if !self.entries.contains_key(&id) && self.entries.len() >= MAX_CACHED_SESSIONS {
+            self.evict_idle(self.entries.len() + 1 - MAX_CACHED_SESSIONS);
+        }
         self.next_access += 1;
         self.entries.insert(id, (conversation, self.next_access));
-        if self.entries.len() > MAX_CACHED_SESSIONS {
-            self.evict_idle();
-        }
     }
 
     pub(super) fn remove(&mut self, id: &str) -> Option<Arc<Conversation>> {
@@ -56,7 +55,7 @@ impl SessionCache {
         self.entries.iter().map(|(id, (conversation, _))| (id.as_str(), conversation))
     }
 
-    fn evict_idle(&mut self) {
+    fn evict_idle(&mut self, overflow: usize) {
         let mut candidates: Vec<(u64, String)> = self
             .entries
             .iter()
@@ -64,7 +63,6 @@ impl SessionCache {
             .map(|(id, (_, access))| (*access, id.clone()))
             .collect();
         candidates.sort_unstable_by_key(|(access, _)| *access);
-        let overflow = self.entries.len().saturating_sub(MAX_CACHED_SESSIONS);
         for (_, id) in candidates.into_iter().take(overflow) {
             self.entries.remove(&id);
         }
@@ -72,7 +70,7 @@ impl SessionCache {
 }
 
 /// 提交 RPC 在消息入队后返回；后续准备、保存和执行状态通过会话事件发布。
-pub struct AppServer {
+pub(crate) struct AppServer {
     hub: Arc<StreamHub>,
     /// 保证完整工作台快照按构造顺序发布；不涉及任务执行和普通增量事件。
     app_publication: Mutex<()>,
@@ -84,18 +82,18 @@ pub struct AppServer {
     workspaces: WorkspaceStore,
     /// 工作台与会话共用的模型配置入口。
     models: Arc<ModelConfigManager>,
-    pub(super) mcp: Arc<singularity_mcp::McpManager>,
+    pub(super) mcp: Arc<mcp::McpManager>,
     /// 应用数据目录；技能列表和任务执行读取同一个目录。
     home: std::path::PathBuf,
     sessions: Mutex<SessionCache>,
 }
 
 impl AppServer {
-    pub fn new(
+    pub(crate) fn new(
         catalog: ThreadCatalog,
         workspaces: WorkspaceStore,
         models: Arc<ModelConfigManager>,
-        mcp: Arc<singularity_mcp::McpManager>,
+        mcp: Arc<mcp::McpManager>,
         home: std::path::PathBuf,
         stream: mpsc::Sender<StreamEnvelope>,
     ) -> Arc<Self> {
@@ -112,67 +110,63 @@ impl AppServer {
         })
     }
 
-    pub fn set_focused_session(&self, session_id: Option<String>) {
-        self.hub.set_focused_session(session_id);
+    pub(crate) fn set_focused_session(&self, epoch: u64, session_id: Option<String>) {
+        self.hub.set_focused_session(epoch, session_id);
     }
 
-    pub fn revision(&self) -> u64 {
+    pub(crate) fn revision(&self) -> u64 {
         self.hub.revision()
     }
 
     pub(super) fn scope_directory(&self, workspace: Option<&str>) -> Result<std::path::PathBuf, RpcError> {
-        workspace
-            .map(|id| self.workspace(id).map(|workspace| workspace.root.into()))
-            .unwrap_or_else(|| Ok(self.home.clone()))
+        workspace.map_or_else(
+            || Ok(self.home.clone()),
+            |id| self.workspace(id).map(|workspace| workspace.root.into()),
+        )
     }
 
-    pub fn save_provider(
+    pub(crate) fn save_provider(
         &self,
         provider: ProviderConfigurationInput,
         api_key: Option<&str>,
-    ) -> Result<singularity_protocol::ModelCatalogResult, RpcError> {
+    ) -> Result<protocol::ModelCatalogResult, RpcError> {
         self.update_models(|models| models.save_provider(provider, api_key))
     }
 
     /// 设置页只重读模型配置，不依赖项目和会话日志。
-    pub fn read_models(&self) -> singularity_protocol::ModelCatalogResult {
+    pub(crate) fn read_models(&self) -> protocol::ModelCatalogResult {
         let _publication = self.lock_app_publication();
         self.model_catalog_result(self.models.redacted_catalog())
     }
 
-    pub fn remove_provider(
+    pub(crate) fn remove_provider(
         &self,
         provider_id: &str,
-    ) -> Result<singularity_protocol::ModelCatalogResult, RpcError> {
+    ) -> Result<protocol::ModelCatalogResult, RpcError> {
         self.update_models(|models| models.remove_provider(provider_id))
     }
 
     fn update_models(
         &self,
-        update: impl FnOnce(
-            &ModelConfigManager,
-        ) -> Result<singularity_protocol::RedactedModelCatalog, ProviderError>,
-    ) -> Result<singularity_protocol::ModelCatalogResult, RpcError> {
+        update: impl FnOnce(&ModelConfigManager) -> Result<protocol::RedactedModelCatalog, ProviderError>,
+    ) -> Result<protocol::ModelCatalogResult, RpcError> {
         let _publication = self.lock_app_publication();
         let catalog = update(&self.models).map_err(RpcError::new)?;
         Ok(self.model_catalog_result(catalog))
     }
 
     // 重读也取得新序号，避免此前生成的工作台快照覆盖刚读到的文件配置。
-    fn model_catalog_result(
-        &self,
-        catalog: singularity_protocol::RedactedModelCatalog,
-    ) -> singularity_protocol::ModelCatalogResult {
-        singularity_protocol::ModelCatalogResult {
+    fn model_catalog_result(&self, catalog: protocol::RedactedModelCatalog) -> protocol::ModelCatalogResult {
+        protocol::ModelCatalogResult {
             catalog,
             revision: self.hub.next_revision(),
         }
     }
 
-    pub async fn discover_models(
+    pub(crate) async fn discover_models(
         &self,
         provider_id: &str,
-        api_protocol: singularity_protocol::ProviderApiProtocol,
+        api_protocol: protocol::ProviderApiProtocol,
         base_url: &str,
         api_key: Option<&str>,
     ) -> Result<Vec<String>, RpcError> {
@@ -186,28 +180,23 @@ impl AppServer {
         .await
         .expect("model credential lookup completes while the backend is running")
         .map_err(RpcError::new)?;
-        singularity_model::discover_models(base_url, &api_key, api_protocol)
-            .await
-            .map_err(RpcError::new)
+        model::discover_models(base_url, &api_key, api_protocol).await.map_err(RpcError::new)
     }
 
     /// 收到第一条消息才创建任务；空白页在后端没有任务和日志文件。
-    pub fn start_session(
-        self: &Arc<Self>,
-        params: singularity_protocol::SessionStartParams,
-    ) -> Result<singularity_protocol::SessionStartResult, RpcError> {
+    pub(crate) fn start_session(
+        &self,
+        params: protocol::SessionStartParams,
+    ) -> Result<protocol::SessionStartResult, RpcError> {
         let workspace = self.workspace(&params.workspace_root)?;
-        let skills_enabled = !params
-            .disabled_modules
-            .iter()
-            .any(|id| id == singularity_agent::agent::modules::SKILLS_MODULE_ID);
+        let skill_expansion = agent::agent::SkillExpansion::from_disabled_modules(&params.disabled_modules);
         let input = UserInput::from_uploads(
             params.text,
             params.images,
             params.files,
             std::path::Path::new(&workspace.root),
             &self.home,
-            skills_enabled,
+            skill_expansion,
         )
         .map_err(RpcError::new)?;
         let _lifecycle = self.lock_lifecycle();
@@ -221,13 +210,17 @@ impl AppServer {
         Ok(conversation.start_result())
     }
 
-    pub fn read_session(&self, session_id: &str) -> Result<SessionReadResult, RpcError> {
-        // 只有查找或打开任务需要生命周期锁；确认存在后再切焦点，避免无效 ID 覆盖当前会话焦点。
+    pub(crate) fn read_session(
+        &self,
+        session_id: &str,
+        focus_epoch: u64,
+    ) -> Result<SessionReadResult, RpcError> {
+        // 只有查找或打开任务需要生命周期锁；确认存在后再按请求序号切焦点，避免无效 ID 或过期读取覆盖当前会话焦点。
         let conversation = {
             let _lifecycle = self.lock_lifecycle();
             self.open_conversation(session_id)?
         };
-        self.set_focused_session(Some(session_id.to_owned()));
+        self.set_focused_session(focus_epoch, Some(session_id.to_owned()));
         conversation.read().map_err(catalog_error)
     }
 
@@ -251,8 +244,8 @@ impl AppServer {
     }
 
     /// 在生命周期锁内登记新打开的任务；已打开的任务由 open_conversation 直接返回。
-    fn insert_conversation(&self, session: singularity_agent::session::SessionManager) -> Arc<Conversation> {
-        let id = session.session_id().to_owned();
+    fn insert_conversation(&self, session: agent::session::SessionManager) -> Arc<Conversation> {
+        let id = session.data().session_id().to_owned();
         let conversation = Conversation::new(
             session,
             self.home.clone(),
@@ -307,7 +300,7 @@ impl AppServer {
     }
 
     /// 管道关闭时等待已接受的操作和子进程结束。
-    pub async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
         let sessions: Vec<_> =
             self.lock_sessions().conversations().map(|(_, conv)| Arc::clone(conv)).collect();
         let mut stops = tokio::task::JoinSet::new();
@@ -317,7 +310,7 @@ impl AppServer {
         while let Some(result) = stops.join_next().await {
             if let Err(error) = result.expect("session shutdown completes while the runtime is running") {
                 tracing::warn!(error = %error, "session shutdown reported an error");
-                eprintln!("{error}");
+                eprintln!("{}: {error}", crate::PROGRAM_NAME);
             }
         }
         self.mcp.shutdown().await;
