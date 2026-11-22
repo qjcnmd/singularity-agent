@@ -20,6 +20,7 @@ pub struct ModelTurnResponse {
     /// 输入与输出计数都有效上报时才有值；未知用量不当成零。
     pub usage: Option<ModelUsage>,
     pub(crate) stop_reason: ModelStopReason,
+    pub(crate) refusal: bool,
 }
 
 impl ModelTurnResponse {
@@ -29,6 +30,7 @@ impl ModelTurnResponse {
             assistant_message,
             usage: None,
             stop_reason: ModelStopReason::Failed(error),
+            refusal: false,
         }
     }
 
@@ -42,5 +44,9 @@ impl ModelTurnResponse {
 
     pub fn is_length_truncated(&self) -> bool {
         self.stop_reason == ModelStopReason::Length
+    }
+
+    pub fn is_refusal(&self) -> bool {
+        self.refusal
     }
 }

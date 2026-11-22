@@ -49,7 +49,7 @@ impl ModelClient {
         Ok(Self { config, selected_model, client })
     }
 
-    /// 本次所选模型的上下文窗口和最大输出，用于输出预算和轮换判断。
+    /// 本次所选模型的上下文窗口和最大输出，用于输出预算和压缩判断。
     pub fn model_configuration(&self) -> ModelConfigurationSnapshot {
         ModelConfigurationSnapshot {
             max_context_tokens: self.selected_model.max_context_tokens,
@@ -80,16 +80,16 @@ impl ModelClient {
             ProviderApiProtocol::Messages => {
                 let endpoint = endpoint(&self.config.base_url, "/messages");
                 messages_stream_request_payload(request, selection, provider_name, &endpoint)
-                    .map(|payload| (endpoint, payload))
+                    .map(|enc| (endpoint, enc.payload, Some(enc.prefix_digest), enc.effective_reasoning))
             }
             ProviderApiProtocol::Responses => {
                 let endpoint = endpoint(&self.config.base_url, "/responses");
                 openai_responses_stream_request_payload(request, selection, provider_name, &endpoint)
-                    .map(|payload| (endpoint, payload))
+                    .map(|payload| (endpoint, payload, None, selection.reasoning_variant.clone()))
             }
         };
-        let (endpoint, payload) = match encoded {
-            Ok(pair) => pair,
+        let (endpoint, payload, prefix_digest, effective_reasoning) = match encoded {
+            Ok(encoded) => encoded,
             Err(error) => {
                 return ModelTurnResponse::failed(
                     error,
@@ -108,8 +108,17 @@ impl ModelClient {
         };
         match selection.protocol {
             ProviderApiProtocol::Messages => {
-                read_messages_sse_stream(cancellation, response, on_event, &self.config, selection, &endpoint)
-                    .await
+                read_messages_sse_stream(
+                    cancellation,
+                    response,
+                    on_event,
+                    &self.config,
+                    selection,
+                    &endpoint,
+                    prefix_digest,
+                    effective_reasoning,
+                )
+                .await
             }
             ProviderApiProtocol::Responses => {
                 read_responses_sse_stream(
@@ -167,7 +176,7 @@ impl ModelClient {
                 return error;
             }
         };
-        // 已知错误码或错误类型比 HTTP 状态更准确，例如 400 里的上下文超限需要触发轮换。
+        // 已知错误码或错误类型比 HTTP 状态更准确，例如 400 里的上下文超限需要触发压缩。
         apply_provider_error_body(&mut error, &body);
         error
     }

@@ -230,7 +230,7 @@ rpc_methods! {
     SessionSubmit => "session.submit" (SessionTextParams) -> (),
     SessionAnswerQuestion => "session.answerQuestion" (QuestionAnswerParams) -> (),
     SessionAbort => "session.abort" (SessionParams) -> (),
-    SessionRotateContext => "session.rotateContext" (SessionParams) -> (),
+    SessionCompact => "session.compact" (SessionParams) -> (),
     SessionContext => "session.context" (SessionParams) -> (),
     BackgroundTaskStop => "session.stopBackgroundTask" (BackgroundTaskParams) -> (),
     SessionUpdateSettings => "session.updateSettings" (UpdateSettingsParams) -> (),

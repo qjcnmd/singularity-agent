@@ -48,7 +48,7 @@
 
 * **数据目录**：常驻自动化测试一律使用临时隔离的 `SINGULARITY_HOME`（测试结束自动清理临时目录及派生的 Electron `userData`），不碰用户日常数据。针对真实模型的现场验收直接用用户的 `~/.singularity`，启动工作台前直接退出占用它的实例（单实例锁），不用问；验证结束后清理本次创建的项目、任务及附件，保留用户原有数据。
 * **Windows 自动化环境**：Playwright / Electron 自动化从普通 PowerShell 启动 Node 验证脚本，让 Electron 和 Rust 继承完整的 Windows 环境，不要沿用 `node_repl` 这类工具裁剪过的环境。装了 Git Bash 却报找不到时，先查验证进程的 `ProgramFiles`、`PATH` 和实际 `bash.exe` 路径，改好启动方式再重跑。
-* **模型调用与测试桩边界**：生产代码与功能现场验收只用真实的提供方和模型，不写模拟提供方（用户没指定时用 DeepSeek flash high，对验证有帮助就直接调用，不用问）。仅在测试目录内（`crates/app/tests/`、`apps/desktop/e2e/`）允许使用本地 HTTP SSE 回放/故障注入桩与测试用 MCP stdio 脚本，进程内部不做 Mock。
+* **模型调用与测试桩边界**：生产代码与功能现场验收只用真实的提供方和模型，不写模拟提供方（用户没指定时用 codearts/deepseek-v4.1-flash-1017 high，对验证有帮助就直接调用，不用问）。仅在测试目录内（`crates/app/tests/`、`apps/desktop/e2e/`）允许使用本地 HTTP SSE 回放/故障注入桩与测试用 MCP stdio 脚本，进程内部不做 Mock。
 * **临时文件**：一次性验证脚本、调查脚本、不符合保留标准的临时测试和临时数据用完就删，不留在仓库。
 * **试用包**：每次功能做完、检查通过后，按[开发指南](docs/development.md#5-打包构建与发布)更新 `Desktop/Singularity`。日常只替换改动涉及的应用归档和 Rust 后端；首次交付、Electron 或运行依赖、打包配置变化时才完整打包。替换前退出 Singularity，更新后从桌面目录验证。只保留这一份成品，临时打包文件用完删除；用户数据在 `\~/.singularity`。
 * **构建缓存**：本机 Rust 构建目录放在 D 盘，沿用 `cargo metadata` 返回的位置。功能交付后检查大小，超过 10 GiB 就运行 `cargo clean`；构建期间可以临时超过阈值，清理后下次构建需要重新编译。

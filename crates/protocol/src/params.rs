@@ -3,12 +3,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// 请求的用途：普通生成或上下文轮换；两者的用量都计入会话合计。
+/// 请求用途：普通生成或上下文压缩；两者的用量都计入会话合计。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestPurpose {
     Generation,
-    ContextRotation,
+    Compaction,
 }
 
 /// 提供方为一次请求上报的 Token 数和缓存命中数。
@@ -148,12 +148,12 @@ pub enum HistoryItem {
         args: Value,
         result: Option<ToolResult>,
     },
-    ContextRotation {
+    Compaction {
         id: String,
-        user_messages: String,
+        summary: String,
     },
-    /// 轮换进行中、失败、中断或无需轮换；成功的整理内容用 ContextRotation 条目。
-    ContextRotationResult {
+    /// 压缩进行中、失败、中断或无需压缩；成功的检查点摘要用 Compaction 条目。
+    CompactionResult {
         id: String,
         status: TurnStatus,
         message: Option<String>,
@@ -166,8 +166,8 @@ impl HistoryItem {
             Self::Message { id, .. }
             | Self::Thinking { id, .. }
             | Self::Tool { id, .. }
-            | Self::ContextRotation { id, .. }
-            | Self::ContextRotationResult { id, .. } => id,
+            | Self::Compaction { id, .. }
+            | Self::CompactionResult { id, .. } => id,
         }
     }
 }
@@ -236,7 +236,7 @@ pub struct SessionModelUsage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
-/// 回合、消息或轮换条目的执行状态。
+/// 回合、消息或压缩条目的执行状态。
 pub enum TurnStatus {
     Running,
     Completed,

@@ -17,7 +17,7 @@
 .timeline-user .msg-time { margin: 0 6px 3px 0; }
 .turn-duration { display: inline-flex; gap: 10px; margin: 10px 0 0; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
 .turn-stats { align-self: flex-start; margin: 4px 0 0; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
-/* 连续非文本步骤（思考、工具、轮换）统一收入一张可折叠白卡，新步骤向下平滑生长。 */
+/* 连续非文本步骤（思考、工具、压缩）统一收入一张可折叠白卡，新步骤向下平滑生长。 */
 .activity-card { width: min(680px, 100%); margin-top: 10px; border-radius: 16px; background: var(--card); border: 1px solid var(--line-strong); box-shadow: 0 1px 2px rgb(0 0 0 / 3.5%), 0 6px 20px -12px rgb(0 0 0 / 10%); overflow: hidden; }
 [data-theme=dark] .activity-card { border-color: var(--line); box-shadow: 0 2px 10px -3px rgb(0 0 0 / 45%); }
 .activity-card-header { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 36px; padding: 6px 12px; border: 0; background: color-mix(in srgb, var(--ink) 2.2%, transparent); color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.5; text-align: left; cursor: pointer; transition: background 120ms; }
@@ -207,5 +207,5 @@ button.activity-toggle:not([aria-disabled=true]):hover { background: var(--soft-
 .command-output-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 10px 0 14px; color: var(--ink-faint); font: var(--block-font-size) var(--font-sans); }
 .command-output pre { white-space: pre; overflow: visible; }
 .timeline-body.activity-output :is(code, pre) { font: inherit; }
-.context-rotation-content { color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.6; }
+.compaction-summary { color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.6; }
 .expand-button { border: 0; border-radius: 6px; color: inherit; background: none; font-size: var(--block-font-size); padding: 0; margin-top: 4px; opacity: .8; cursor: pointer; }

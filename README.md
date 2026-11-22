@@ -63,7 +63,7 @@ crates/
 │       │   ├── dispatch.rs                 # 工具并发调度（≤8）
 │       │   ├── inbox.rs                    # SteeringInbox 输入队列
 │       │   ├── questions.rs                # 提问工具
-│       │   └── context_rotation.rs         # 上下文轮换
+│       │   └── compaction.rs             # 上下文压缩
 │       ├── request_execution.rs            # 模型请求执行、重试、保存
 │       ├── message.rs  image.rs
 │       ├── session/
@@ -99,7 +99,7 @@ crates/
                 ├── lifecycle.rs            # 启动条件检查与执行编排
                 ├── view.rs                 # 历史读取与事件发布
                 ├── state.rs  activity.rs
-                ├── context_rotation.rs     # 独立轮换
+                ├── compaction.rs         # 独立压缩
                 └── background.rs           # 后台命令完成→唤醒回合
 ```
 

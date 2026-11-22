@@ -25,7 +25,7 @@ pub enum ContentBlock {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Message {
-    /// Harness 和技能指令，包括请求前缀、轮换接手提示和末尾的整理要求。
+    /// Harness 和技能指令。
     Developer {
         content: Vec<ContentBlock>,
     },

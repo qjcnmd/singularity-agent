@@ -58,7 +58,7 @@ files?: Array<string>,
 /**
  * 用户随消息附上的助手回复批注列表。
  */
-annotations?: Array<MessageAnnotation>, } | { "type": "thinking", id: string, status: TurnStatus, text: string, } | { "type": "tool", id: string, status: ToolStatus, name: string, args: JsonValue, result: ToolResult | null, } | { "type": "context_rotation", id: string, userMessages: string, } | { "type": "context_rotation_result", id: string, status: TurnStatus, message: string | null, };
+annotations?: Array<MessageAnnotation>, } | { "type": "thinking", id: string, status: TurnStatus, text: string, } | { "type": "tool", id: string, status: ToolStatus, name: string, args: JsonValue, result: ToolResult | null, } | { "type": "compaction", id: string, summary: string, } | { "type": "compaction_result", id: string, status: TurnStatus, message: string | null, };
 
 export type HistoryMessageRole = "user" | "assistant";
 
@@ -190,11 +190,11 @@ cacheUsageComplete: boolean,
  */
 usagePresent: boolean, };
 
-export type SessionOperation = "turn" | "context_rotation";
+export type SessionOperation = "turn" | "compaction";
 
 export type SessionParams = { sessionId: string, };
 
-export type SessionPhase = "idle" | "running" | "rotating" | "stopping";
+export type SessionPhase = "idle" | "running" | "compacting" | "stopping";
 
 export type SessionReadResult = {
 /**
@@ -272,7 +272,7 @@ export type Turn = { turnId: string, status: TurnStatus, };
 
 export type TurnErrorDetail = { message: string,
 /**
- * 已经显示了这次失败的条目 ID（如轮换条目），界面据此避免重复报错。
+ * 已经显示了这次失败的条目 ID（如压缩条目），界面据此避免重复报错。
  */
 itemId?: string, };
 
@@ -327,7 +327,7 @@ export interface RpcContract {
   "session.submit": { params: SessionTextParams; result: null }
   "session.answerQuestion": { params: QuestionAnswerParams; result: null }
   "session.abort": { params: SessionParams; result: null }
-  "session.rotateContext": { params: SessionParams; result: null }
+  "session.compact": { params: SessionParams; result: null }
   "session.context": { params: SessionParams; result: null }
   "session.stopBackgroundTask": { params: BackgroundTaskParams; result: null }
   "session.updateSettings": { params: UpdateSettingsParams; result: null }

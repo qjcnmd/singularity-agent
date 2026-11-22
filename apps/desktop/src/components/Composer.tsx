@@ -25,7 +25,7 @@ function ComposerView({ accent }: { accent: string }) {
   const attachmentInput = useAttachmentInput(images => { if (draftKey !== null) appStore.setImages(draftKey, images, true) },
     paths => { if (draftKey !== null) appStore.setFiles(draftKey, paths, true) }, inputDisabled || !!pendingQuestion)
   const phase = selectedSessionPhase(state)
-  const busy = phase === 'running' || phase === 'rotating' || phase === 'stopping'
+  const busy = phase === 'running' || phase === 'compacting' || phase === 'stopping'
   const [caret, setCaret] = useState(draft.length)
   const skillsModule = state.session?.context?.modules.find(module => module.id === 'skills')
   const skillsEnabled = sessionId === null ? !(disabledModules ?? []).includes('skills') : (skillsModule?.enabled ?? true)
@@ -96,7 +96,7 @@ function ComposerView({ accent }: { accent: string }) {
     return () => { observer.disconnect(); main.style.removeProperty('--composer-height') }
   }, [])
   const showsStop = busy && (pendingQuestion || !hasDraftContent({ text: draft, images: imageDraft, files: fileDraft, annotations: annotationDraft }))
-  const orb = <WaterOrb size={40} color={accent} percent={percent} rotating={phase === 'rotating'}
+  const orb = <WaterOrb size={40} color={accent} percent={percent} compacting={phase === 'compacting'}
     enabled={showsStop ? phase !== 'stopping' && !state.pendingActions.has(pendingKey('session.abort', sessionOrigin)) : canSubmit}
     label={showsStop ? phase === 'stopping' ? '正在停止当前回合' : '停止当前回合' : blockedReason ?? '发送消息'}
     onPress={() => { if (showsStop) void appStore.stopActive(); else void appStore.submitDraft() }} />

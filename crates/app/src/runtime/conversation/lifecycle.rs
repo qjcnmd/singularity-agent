@@ -1,4 +1,4 @@
-//! 用户输入、独立轮换和后台续跑共用的启动、收尾与关闭流程。
+//! 用户输入、独立压缩和后台续跑共用的启动、收尾与关闭流程。
 use std::sync::Arc;
 
 use super::activity::Activity;
@@ -16,7 +16,7 @@ impl Conversation {
         source: SessionOperation,
     ) -> Operation {
         let controls = Arc::new(TurnControls::new(uuid::Uuid::new_v4().to_string()));
-        controls.set_rotating(source == SessionOperation::ContextRotation);
+        controls.set_compacting(source == SessionOperation::Compaction);
         if let Some(preview) = &state.context_preview {
             preview.cancel();
         }
@@ -31,9 +31,7 @@ impl Conversation {
         let mut emit = |event| self.on_event(event);
         let result = match operation.source {
             SessionOperation::Turn => self.run_single_turn(&operation.controls, &mut emit).await,
-            SessionOperation::ContextRotation => {
-                self.rotate_context_thread(&operation.controls, &mut emit).await
-            }
+            SessionOperation::Compaction => self.compact_thread(&operation.controls, &mut emit).await,
         };
         self.settle(operation.source, result);
     }
@@ -70,7 +68,7 @@ impl Conversation {
         }
         let start = match state.turn.phase() {
             SessionPhase::Idle => true,
-            SessionPhase::Running | SessionPhase::Rotating => false,
+            SessionPhase::Running | SessionPhase::Compacting => false,
             SessionPhase::Stopping => return Err(ConversationError::Busy),
         };
         let mut inbox = state.steering_inbox.lock().expect("turn inbox lock poisoned");
@@ -88,14 +86,14 @@ impl Conversation {
         Ok(())
     }
 
-    /// 空闲时占用任务执行独立轮换；轮换标记让运行阶段显示为“轮换中”。
-    pub(crate) fn rotate_context(self: &Arc<Self>) -> Result<(), ConversationError> {
+    /// 空闲时占用任务执行独立压缩；压缩标记让运行阶段显示为“压缩中”。
+    pub(crate) fn compact(self: &Arc<Self>) -> Result<(), ConversationError> {
         let mut view = self.lock_view();
         let state = self.lock_state();
         if state.closing || state.turn.is_busy() {
             return Err(ConversationError::Busy);
         }
-        let operation = self.begin_operation(&mut view, state, SessionOperation::ContextRotation);
+        let operation = self.begin_operation(&mut view, state, SessionOperation::Compaction);
         drop(view);
         self.spawn_operation(operation);
         Ok(())
@@ -134,7 +132,7 @@ impl Conversation {
             match phase {
                 SessionPhase::Idle if !has_preview => break,
                 SessionPhase::Idle | SessionPhase::Stopping => {}
-                SessionPhase::Running | SessionPhase::Rotating => {
+                SessionPhase::Running | SessionPhase::Compacting => {
                     let _ = self.abort();
                 }
             }

@@ -36,12 +36,12 @@ pub enum SessionError {
 }
 
 pub(super) type Result<T> = std::result::Result<T, SessionError>;
-/// 完整新版用户消息整理内容；记录所在位置就是上下文切换分界。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ContextRotationEntry {
-    #[serde(rename = "userMessages")]
-    pub user_messages: String,
+pub struct CompactionEntry {
+    pub summary: String,
+    #[serde(rename = "firstKeptEntryId", default, skip_serializing_if = "Option::is_none")]
+    pub first_kept_entry_id: Option<String>,
 }
 /// 任务设置：模型选择、创建时关闭的上下文模块或任务名称。
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,7 +92,7 @@ pub enum MessageDisplay {
     },
 }
 
-/// 执行记录：回合开始与结束、未生成消息的模型请求、旧工具输出微压缩水位线和后台命令状态。不进入模型上下文。
+/// 执行记录：回合开始与结束、未生成消息的模型请求和后台命令状态。不进入模型上下文。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "recordType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LedgerRecord {
@@ -101,12 +101,6 @@ pub enum LedgerRecord {
     /// 一次没有产生可见回复消息的模型请求（重试、无输出的失败/取消或整理请求）。
     ModelRequest {
         observation: protocol::RequestObservation,
-    },
-    /// 零模型调用的旧工具输出微压缩水位线：`before_entry_id` 及之前的超长工具结果在投影给模型时折叠为摘要，
-    /// 保持后续前缀稳定以维持前缀缓存，同时不改动原始日志。
-    ToolOutputsPruned {
-        #[serde(rename = "beforeEntryId")]
-        before_entry_id: String,
     },
     /// 回合开始，记录 ID 就是回合 ID。
     OperationStarted,
@@ -135,10 +129,10 @@ pub enum SessionEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<MessageDisplay>,
     },
-    ContextRotation {
+    Compaction {
         id: String,
         timestamp: String,
-        context_rotation: ContextRotationEntry,
+        compaction: CompactionEntry,
     },
     Metadata {
         id: String,
@@ -168,7 +162,7 @@ impl SessionEntry {
     pub fn timestamp(&self) -> &str {
         match self {
             Self::Message { timestamp, .. }
-            | Self::ContextRotation { timestamp, .. }
+            | Self::Compaction { timestamp, .. }
             | Self::Metadata { timestamp, .. }
             | Self::Record { timestamp, .. } => timestamp,
         }
@@ -177,7 +171,7 @@ impl SessionEntry {
     pub fn id(&self) -> &str {
         match self {
             Self::Message { id, .. }
-            | Self::ContextRotation { id, .. }
+            | Self::Compaction { id, .. }
             | Self::Metadata { id, .. }
             | Self::Record { id, .. } => id,
         }

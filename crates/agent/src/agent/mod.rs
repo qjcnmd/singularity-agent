@@ -1,20 +1,14 @@
 //! Agent 的执行循环：调用模型、执行工具、处理运行中追加的输入。
 //!
-//! 每次循环组装请求、调用模型并执行工具；队列中的输入保存成功后才从队列移除。
-//! 模型不再调用工具时检查队列，有输入就继续；收尾期间到达的输入由任务安排下一轮。
+//! 压缩有三个触发点：切换模型且超出目标模型 90% 时先由旧模型预压缩；
+//! 同模型发送前达到窗口 90% 时保留最近 15% 并压缩前缀；
+//! 提供方明确返回上下文超限时，至少保留最后一个完整平衡单元并压缩其之前的前缀，再重发一次。
 //!
-//! 轮换有两个触发点：发送前按实际用量加新增内容估算，超过阈值就轮换；提供方明确
-//! 返回上下文超限时，轮换后重发一次，重发再失败就直接报告这次的原因。
-//!
-//! 请求记录、消息和工具结果都写进同一份会话日志，工具结果保存后才发布完成事件。
-//! 日志里缺少结果的工具调用，只在发给模型时补成“结果未知”，不修改日志。
-//! 输入队列只在内存中，不写日志。
-//!
-//! 相关模块：组装请求在 self::request，轮换在 self::context_rotation，发送和重试在
+//! 相关模块：组装请求在 self::request，压缩在 self::compaction，发送和重试在
 //! crate::request_execution，输入队列在 self::inbox；事件类型是 [`AgentEvent`]。
 
-mod context_rotation;
-pub use context_rotation::context_rotation_unneeded;
+mod compaction;
+pub use compaction::compaction_unneeded;
 mod dispatch;
 mod inbox;
 pub mod modules;
@@ -72,29 +66,29 @@ pub enum AgentError {
     #[error("模型回复达到输出上限，内容未完成。请发送消息继续。")]
     OutputTruncated,
     #[error("{0}")]
-    InvalidContextRotation(String),
-    /// 轮换失败；轮换条目本身已显示失败原因，外层据此避免重复显示同一错误。
+    InvalidCompaction(String),
+    /// 压缩失败；条目本身已显示失败原因，外层据此避免重复显示同一错误。
     #[error("{source}")]
-    ContextRotation {
+    Compaction {
         item_id: String,
         source: Box<AgentError>,
     },
 }
 
 impl AgentError {
-    /// 日志写入失败时不能再保存结束记录；轮换内部的写入失败同样算。
+    /// 日志写入失败时不再保存结束记录；压缩内部的写入失败同样算。
     pub fn is_session_failure(&self) -> bool {
         match self {
             Self::Session(_) => true,
-            Self::ContextRotation { source, .. } => source.is_session_failure(),
+            Self::Compaction { source, .. } => source.is_session_failure(),
             _ => false,
         }
     }
 
-    /// 保存和发布的失败原因；轮换失败时带上轮换条目 ID，界面据此避免重复报错。
+    /// 压缩失败时带上条目 ID，界面据此避免重复报错。
     pub fn detail(&self) -> protocol::TurnErrorDetail {
         let item_id = match self {
-            Self::ContextRotation { item_id, .. } => Some(item_id.clone()),
+            Self::Compaction { item_id, .. } => Some(item_id.clone()),
             _ => None,
         };
         protocol::TurnErrorDetail { message: self.to_string(), item_id }
@@ -103,13 +97,14 @@ impl AgentError {
 
 pub(crate) type Result<T> = std::result::Result<T, AgentError>;
 
-/// 普通生成和独立轮换共用的模型、指令和工具定义、会话写者；轮换不需要工具执行所需的状态。
+/// 普通生成和独立压缩共用的模型、指令、工具定义与会话写者。
 pub struct RequestContext {
     session: SessionWriter,
     registry: ToolRegistrySnapshot,
     mcp: Arc<mcp::McpManager>,
     definitions: Option<request::RequestDefinitions>,
     provider: ModelClient,
+    models: Arc<model::ModelConfigManager>,
     config: AgentConfig,
 }
 
@@ -135,6 +130,7 @@ impl RequestContext {
     /// 提供方和文件指令在创建时确定；技能和 MCP 工具在第一次请求前加载。
     pub fn new(
         provider: ModelClient,
+        models: Arc<model::ModelConfigManager>,
         config: AgentConfig,
         session: SessionWriter,
         mcp: Arc<mcp::McpManager>,
@@ -145,12 +141,17 @@ impl RequestContext {
             mcp,
             definitions: None,
             provider,
+            models,
             config,
         }
     }
 
     pub fn context_window(&self) -> u64 {
         self.provider.model_configuration().context_window()
+    }
+
+    pub fn model_configuration(&self) -> model::ModelConfigurationSnapshot {
+        self.provider.model_configuration()
     }
 }
 
@@ -227,6 +228,10 @@ impl Agent {
                 return Ok(());
             }
         }
+    }
+
+    pub(super) fn has_pending_inputs(&self) -> bool {
+        !lock_inbox(&self.inbox).pending().is_empty()
     }
 
     async fn drain_inputs(

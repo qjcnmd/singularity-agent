@@ -11,6 +11,12 @@ pub struct ProviderMessageMetadata {
     pub model_name: String,
     /// 实际请求地址；地址变化后不复用这份私有数据。
     pub endpoint: String,
+    /// Messages 协议生成该回复时的请求前缀链式哈希；前缀变化时仅剥离过期的带签名思考块。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_digest: Option<String>,
+    /// 生成该回复时实际使用的推理档位，供切模型预压准确恢复旧模型配置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl fmt::Debug for ProviderMessageMetadata {

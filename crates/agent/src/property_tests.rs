@@ -1,4 +1,4 @@
-//! 属性测试（Property-based Tests）：用随机输入验证上下文压缩/切块与会话日志尾行修复的通用不变量。
+//! 属性测试（Property-based Tests）：用随机输入验证上下文压缩切分、投影与会话日志尾行修复的通用不变量。
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -9,10 +9,8 @@ use proptest::prelude::*;
 use protocol::ModelSelection;
 use serde_json::json;
 
-use crate::compaction::{
-    compact_assistant_messages, compact_text, compact_tool_results, partition_into_chunks,
-};
-use crate::session::{SessionData, SessionManager, session_file_name};
+use crate::session::context::{project_messages, resolve_context_entries, select_compactable_split};
+use crate::session::{CompactionEntry, SessionData, SessionEntry, SessionManager, session_file_name};
 
 struct TempDir(PathBuf);
 
@@ -56,100 +54,57 @@ fn unicode_text_strategy(max_repeats: usize) -> impl Strategy<Value = String> {
 
 #[derive(Debug, Clone)]
 enum HistoryStep {
-    User(String),
+    User {
+        text: String,
+        with_image: bool,
+    },
     Notification(String),
-    RotationHandoff(String, String),
     AssistantWithTools {
         text: String,
         thinking: Option<String>,
         tool_outputs: Vec<String>,
-        large_args: bool,
     },
 }
 
-fn history_step_strategy() -> impl Strategy<Value = HistoryStep> {
-    prop_oneof![
-        unicode_text_strategy(4).prop_map(|s| HistoryStep::User(if s.trim().is_empty() {
-            "u".into()
-        } else {
-            s
-        })),
-        unicode_text_strategy(3).prop_map(|s| HistoryStep::Notification(if s.trim().is_empty() {
-            "n".into()
-        } else {
-            s
-        })),
-        (unicode_text_strategy(3), unicode_text_strategy(4)).prop_map(|(dev, summary)| {
-            HistoryStep::RotationHandoff(
-                if dev.trim().is_empty() {
-                    "handoff".into()
-                } else {
-                    dev
-                },
-                if summary.trim().is_empty() {
-                    "summary".into()
-                } else {
-                    summary
-                },
-            )
-        }),
-        (
-            unicode_text_strategy(30),
-            prop::option::of(unicode_text_strategy(8)),
-            prop::collection::vec(unicode_text_strategy(45), 0..=3),
-            any::<bool>(),
-        )
-            .prop_map(|(text, thinking, tool_outputs, large_args)| {
-                HistoryStep::AssistantWithTools {
-                    text: if text.trim().is_empty() {
-                        "reply".into()
-                    } else {
-                        text
-                    },
-                    thinking,
-                    tool_outputs,
-                    large_args,
-                }
-            }),
-    ]
-}
-
-fn build_history(with_leading_handoff: bool, steps: Vec<HistoryStep>) -> Vec<Message> {
+fn build_history(steps: Vec<HistoryStep>) -> Vec<Message> {
     let mut messages = Vec::new();
-    if with_leading_handoff {
-        messages.push(Message::developer("prior rotation handoff"));
-        messages.push(Message::user("prior organized summary"));
-    }
     let mut seq = 0usize;
     for step in steps {
         match step {
-            HistoryStep::User(t) => messages.push(Message::user(t)),
+            HistoryStep::User { text, with_image } => {
+                let mut content = vec![ContentBlock::text(text)];
+                if with_image {
+                    seq += 1;
+                    content.push(ContentBlock::Image(protocol::ImageAttachment {
+                        id: format!("img_{seq}.png"),
+                        name: "img.png".into(),
+                        mime_type: "image/png".into(),
+                        width: 64,
+                        height: 64,
+                    }));
+                }
+                messages.push(Message::User { content });
+            }
             HistoryStep::Notification(t) => {
                 messages.push(Message::Notification { content: vec![ContentBlock::text(t)] });
             }
-            HistoryStep::RotationHandoff(dev, summary) => {
-                messages.push(Message::developer(dev));
-                messages.push(Message::user(summary));
-            }
-            HistoryStep::AssistantWithTools { text, thinking, tool_outputs, large_args } => {
+            HistoryStep::AssistantWithTools { text, thinking, tool_outputs } => {
                 let mut content = Vec::new();
                 if let Some(thought) = thinking {
-                    content.push(ContentBlock::Thinking { thinking: thought, metadata: None });
+                    content.push(ContentBlock::Thinking {
+                        thinking: thought,
+                        metadata: serde_json::from_value(json!({ "signature": "sig_test" })).ok(),
+                    });
                 }
                 content.push(ContentBlock::text(text));
                 let mut results = Vec::new();
                 for output in tool_outputs {
                     seq += 1;
                     let id = format!("call_{seq}");
-                    let args = if large_args {
-                        json!({ "blob": "x".repeat(700), "seq": seq })
-                    } else {
-                        json!({ "seq": seq })
-                    };
                     content.push(ContentBlock::ToolCall(ModelToolCall {
                         tool_call_id: id.clone(),
                         tool_name: "tool".into(),
-                        arguments: args,
+                        arguments: json!({ "seq": seq }),
                         metadata: None,
                     }));
                     results.push(Message::ToolResult {
@@ -165,6 +120,8 @@ fn build_history(with_leading_handoff: bool, steps: Vec<HistoryStep>) -> Vec<Mes
                         provider_name: "p".into(),
                         model_name: "m".into(),
                         endpoint: "https://example.invalid/v1/messages".into(),
+                        prefix_digest: None,
+                        reasoning: None,
                     }),
                 });
                 messages.extend(results);
@@ -174,116 +131,179 @@ fn build_history(with_leading_handoff: bool, steps: Vec<HistoryStep>) -> Vec<Mes
     messages
 }
 
-/// 提取消息变体与关联工具 ID（不比较会被合法截短的正文文本），用于验证切块守恒与保序。
-fn message_identity(msg: &Message) -> (&'static str, Vec<String>) {
-    match msg {
-        Message::Developer { .. } => ("developer", Vec::new()),
-        Message::User { .. } => ("user", Vec::new()),
-        Message::Notification { .. } => ("notification", Vec::new()),
-        Message::Assistant { .. } => {
-            ("assistant", msg.tool_calls().map(|c| c.tool_call_id.clone()).collect())
+fn assert_balanced_tool_calls(messages: &[Message]) {
+    let mut open_calls: HashSet<String> = HashSet::new();
+    for msg in messages {
+        match msg {
+            Message::Assistant { .. } => {
+                assert!(open_calls.is_empty(), "unanswered tool_call before next assistant");
+                for call in msg.tool_calls() {
+                    assert!(open_calls.insert(call.tool_call_id.clone()), "duplicate tool_call id");
+                }
+            }
+            Message::ToolResult { tool_call_id, .. } => {
+                assert!(open_calls.remove(tool_call_id), "orphaned tool_result {tool_call_id}");
+            }
+            _ => {
+                assert!(open_calls.is_empty(), "non-tool message interrupted tool_call/tool_result group");
+            }
         }
-        Message::ToolResult { tool_call_id, .. } => ("tool_result", vec![tool_call_id.clone()]),
     }
+    assert!(open_calls.is_empty(), "dangling tool_call at end: {open_calls:?}");
+}
+
+#[derive(Debug, Clone)]
+struct CompactionRoundInput {
+    steps: Vec<HistoryStep>,
+    drop_last_tool_result: bool,
+    retain_tokens: u64,
+}
+
+fn compaction_round_strategy() -> impl Strategy<Value = CompactionRoundInput> {
+    (
+        prop::collection::vec(
+            prop_oneof![
+                (unicode_text_strategy(10), any::<bool>()).prop_map(|(s, with_image)| {
+                    HistoryStep::User {
+                        text: if s.trim().is_empty() { "u".into() } else { s },
+                        with_image,
+                    }
+                }),
+                unicode_text_strategy(6).prop_map(|s| HistoryStep::Notification(if s.trim().is_empty() {
+                    "n".into()
+                } else {
+                    s
+                })),
+                (
+                    unicode_text_strategy(15),
+                    prop::option::of(unicode_text_strategy(8)),
+                    prop::collection::vec(unicode_text_strategy(120), 0..=3),
+                )
+                    .prop_map(|(text, thinking, tool_outputs)| {
+                        HistoryStep::AssistantWithTools {
+                            text: if text.trim().is_empty() {
+                                "reply".into()
+                            } else {
+                                text
+                            },
+                            thinking: thinking
+                                .map(|t| if t.trim().is_empty() { "thought".into() } else { t }),
+                            tool_outputs,
+                        }
+                    }),
+            ],
+            1..=8,
+        ),
+        any::<bool>(),
+        prop_oneof![Just(0u64), 1u64..=800],
+    )
+        .prop_map(|(steps, drop_last_tool_result, retain_tokens)| CompactionRoundInput {
+            steps,
+            drop_last_tool_result,
+            retain_tokens,
+        })
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// 文本折叠不变量：任意 UTF-8 字符串（含中英文、emoji、换行）与任意头尾字节预算下，
-    /// 永不因 UTF-8 字符边界 panic，且若包含 `Full output:` 溢写路径行则必须保留。
+    /// 多轮压缩切分与投影不变量：工具配对、retain_tokens==0 留最后 1 原子组、旧检查点不复活。
     #[test]
-    fn compact_text_utf8_and_full_output_invariance(
-        body in unicode_text_strategy(60),
-        with_spill_line in any::<bool>(),
-        head_bytes in 0usize..=1500,
-        tail_bytes in 0usize..=1500,
+    fn compaction_split_and_multi_round_projection_invariants(
+        rounds in prop::collection::vec(compaction_round_strategy(), 1..=4),
     ) {
-        let spill_line = "Full output: D:/tmp/session_spill.log";
-        let input = if with_spill_line {
-            format!("{body}\n{spill_line}")
-        } else {
-            body
+        let tmp = TempDir::new("compaction-split");
+        let workspace = tmp.0.join("ws");
+        let sessions = tmp.0.join("sessions");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let session_id = uuid::Uuid::now_v7().to_string();
+        let selection = ModelSelection {
+            provider: "p".into(),
+            model: "m".into(),
+            reasoning: None,
         };
-        let compacted = compact_text(&input, head_bytes, tail_bytes, "compacted");
-        if with_spill_line {
-            prop_assert_eq!(
-                compacted.matches(spill_line).count(),
-                1,
-                "Full output spill path must be preserved exactly once after compaction"
+        let mut manager = SessionManager::create_with_id(&workspace, &sessions, &session_id, selection, vec![])
+            .expect("create session");
+        let mut seq = 0usize;
+
+        for (round_idx, round) in rounds.into_iter().enumerate() {
+            let mut round_msgs = build_history(round.steps);
+            if round.drop_last_tool_result
+                && matches!(round_msgs.last(), Some(Message::ToolResult { .. }))
+            {
+                round_msgs.pop();
+            }
+            for msg in round_msgs {
+                seq += 1;
+                let id = format!("msg_{seq}");
+                manager
+                    .append_message_with_id(&id, msg, None, None)
+                    .expect("append round message");
+            }
+
+            let data = manager.data();
+            let active_before = resolve_context_entries(data);
+            let Some((split_idx, first_kept_id)) =
+                select_compactable_split(&active_before, data, round.retain_tokens)
+            else {
+                continue;
+            };
+            prop_assert!(split_idx >= 1 && split_idx < active_before.len());
+            let prefix = &active_before[..split_idx];
+            let kept = &active_before[split_idx..];
+            prop_assert!(
+                prefix.iter().any(|e| matches!(e, SessionEntry::Message { .. })),
+                "compacted prefix must contain at least one raw message"
             );
-        }
-    }
 
-    /// 压缩与分块不变量：任意对话历史经降级压缩与原子组分块后，
-    /// 1. 绝不残留 Thinking 或 provider_metadata；
-    /// 2. 每个批次非空，且不会产出仅含 Developer 消息的空壳批次；
-    /// 3. 每个工具调用和对应工具结果始终位于同一批次且严格 1:1 配对。
-    #[test]
-    fn compaction_and_partition_preserve_invariants(
-        with_leading_handoff in any::<bool>(),
-        steps in prop::collection::vec(history_step_strategy(), 1..=10),
-        chunk_budget in 150u64..=4000,
-    ) {
-        let mut history = build_history(with_leading_handoff, steps);
-        compact_tool_results(&mut history);
-        compact_assistant_messages(&mut history);
+            assert_balanced_tool_calls(&project_messages(prefix));
 
-        for msg in &history {
-            if let Message::Assistant { content, provider_metadata } = msg {
-                prop_assert!(provider_metadata.is_none(), "provider_metadata must be stripped");
+            prop_assert!(!kept.is_empty());
+            prop_assert_eq!(first_kept_id.as_str(), kept[0].id());
+            prop_assert!(
+                !matches!(
+                    kept[0],
+                    SessionEntry::Message { message: Message::ToolResult { .. }, .. }
+                ),
+                "kept tail must not start with an orphaned ToolResult"
+            );
+            if round.retain_tokens == 0 {
+                // 即使 retain_tokens == 0 也仅保留最后 1 个完整原子单元（首条消息 + 紧随的 ToolResult）。
+                let tail_after_first_is_only_tool_results = kept[1..].iter().all(|entry| {
+                    matches!(entry, SessionEntry::Message { message: Message::ToolResult { .. }, .. })
+                });
                 prop_assert!(
-                    content.iter().all(|b| !matches!(b, ContentBlock::Thinking { .. })),
-                    "thinking blocks must be stripped"
+                    tail_after_first_is_only_tool_results,
+                    "retain_tokens == 0 must keep exactly the last balanced atomic unit"
                 );
             }
-        }
+            assert_balanced_tool_calls(&project_messages(kept));
 
-        let expected_identities: Vec<_> = history.iter().map(message_identity).collect();
-        let chunks = partition_into_chunks(history, chunk_budget);
-        prop_assert!(!chunks.is_empty());
-        let actual_identities: Vec<_> = chunks.iter().flatten().map(message_identity).collect();
-        prop_assert_eq!(
-            actual_identities,
-            expected_identities,
-            "chunking must preserve all messages, order, and tool IDs"
-        );
-        for chunk in chunks {
-            prop_assert!(!chunk.is_empty(), "chunk must not be empty");
+            let expected_kept_ids: Vec<String> = kept.iter().map(|e| e.id().to_owned()).collect();
+            let compact_id = format!("compact_{round_idx}");
+            let summary = format!("summary_{round_idx}");
+            manager
+                .append_compaction_with_id(
+                    &compact_id,
+                    CompactionEntry {
+                        summary: summary.clone(),
+                        first_kept_entry_id: Some(first_kept_id),
+                    },
+                )
+                .expect("append compaction entry");
+
+            let active_after = resolve_context_entries(manager.data());
+            prop_assert_eq!(active_after[0].id(), compact_id.as_str());
             prop_assert!(
-                chunk.iter().any(|m| !matches!(m, Message::Developer { .. })),
-                "chunk must contain at least one non-Developer message"
+                active_after[1..]
+                    .iter()
+                    .all(|e| matches!(e, SessionEntry::Message { .. })),
+                "older compaction entries must never reappear in active tail"
             );
-            let mut open_calls: HashSet<String> = HashSet::new();
-            for msg in &chunk {
-                match msg {
-                    Message::Assistant { .. } => {
-                        prop_assert!(
-                            open_calls.is_empty(),
-                            "unanswered tool_call before next assistant in chunk"
-                        );
-                        for call in msg.tool_calls() {
-                            prop_assert!(
-                                open_calls.insert(call.tool_call_id.clone()),
-                                "duplicate tool_call id in chunk"
-                            );
-                        }
-                    }
-                    Message::ToolResult { tool_call_id, .. } => {
-                        prop_assert!(
-                            open_calls.remove(tool_call_id),
-                            "orphaned tool_result {tool_call_id} in chunk"
-                        );
-                    }
-                    _ => {
-                        prop_assert!(
-                            open_calls.is_empty(),
-                            "non-tool message interrupted tool_call/tool_result group"
-                        );
-                    }
-                }
-            }
-            prop_assert!(open_calls.is_empty(), "dangling tool_call at end of chunk: {open_calls:?}");
+            let actual_kept_ids: Vec<String> =
+                active_after[1..].iter().map(|e| e.id().to_owned()).collect();
+            prop_assert_eq!(actual_kept_ids, expected_kept_ids);
+            assert_balanced_tool_calls(&project_messages(&active_after));
         }
     }
 }

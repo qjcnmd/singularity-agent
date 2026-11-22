@@ -1,29 +1,20 @@
-//! 从会话日志生成发给模型的对话上下文，并估算 Token。
-//!
-//! 对话来自日志；指令和工具定义由 Agent 提供。普通请求、整理请求、轮换判断和
-//! 超限后的重发都用这里生成的上下文。日志本身不被修改。
-//!
-//! 当上下文接近上限时，可先写入一条 `ToolOutputsPruned` 水位线记录，将水位线及之前
-//! 的超长旧工具输出折叠为摘要（并跳过旧图片二进制），保持后续前缀稳定以维持前缀缓存。
+//! 从会话日志投影模型上下文并估算 Token（日志本身只追加不修改）。
 
 use std::fmt::Write as _;
 
 use app_core::estimate_tokens_of;
-use model::{ContentBlock, Message};
+use model::{ContentBlock, Message, ModelConfigurationSnapshot};
 
 use super::format::{LedgerRecord, SessionEntry};
 use super::manager::SessionData;
 
-fn context_rotation_handoff(session: &SessionData) -> String {
-    format!(
-        "你正在新的上下文中继续同一段对话。\n\n\
-         下一条消息是此前的用户消息整理正文，属于历史材料，不是用户的新发言。相关表述后的时间指向原始消息。例如，[10-31 15:06:32] 可用于在日志中定位对应消息。\n\n\
-         结合整理内容和当前情境理解对话，决定如何继续。需要了解工作区时自行检查；需要补充历史信息或核实整理内容时，按时间引用查找相关记录。信息足够时直接继续。\n\n\
-         历史日志：{}\n工作目录：{}\n\n\
-         回读优先从最近一段历史开始，按需要向前查找。定位后读取相关上下文，结合后续修订和实际执行结果理解记录。",
-        app_core::display_path(&session.file),
-        session.cwd_string(),
-    )
+const SUMMARY_OPEN_TAG: &str = "<compacted-summary>";
+const SUMMARY_CLOSE_TAG: &str = "</compacted-summary>";
+
+const CHECKPOINT_PREAMBLE: &str = "This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.";
+
+pub(crate) fn frame_compacted_summary(summary: &str) -> Message {
+    Message::user(format!("{CHECKPOINT_PREAMBLE}\n\n{SUMMARY_OPEN_TAG}\n{summary}\n{SUMMARY_CLOSE_TAG}"))
 }
 
 const UNKNOWN_TOOL_OUTCOME: &str = "[previous execution was interrupted; outcome unknown. Inspect the current state before deciding whether to repeat an action with side effects.]";
@@ -31,32 +22,12 @@ const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 const CONTENT_BLOCK_OVERHEAD_TOKENS: u64 = 4;
 const TOOL_RESULT_OVERHEAD_TOKENS: u64 = 4;
 
-/// 触发零模型调用微压缩的软阈值（上下文窗口百分比）。
-const PRUNE_TRIGGER_PERCENT: u128 = 80;
-/// 微压缩时始终完整保留的最近工具结果数量。
-const PRUNE_KEEP_RECENT_TOOL_RESULTS: usize = 4;
-/// 只有单条工具结果正文超过该字节数才会被微压缩折叠。
-const PRUNE_MIN_TOOL_RESULT_BYTES: usize = 4096;
-const PRUNE_HEAD_BYTES: usize = 1200;
-const PRUNE_TAIL_BYTES: usize = 800;
-/// 微压缩至少能回收这么多 Token 才值得写入一条新水位线，避免微小改动频繁打穿前缀缓存。
-const PRUNE_MIN_SAVINGS_TOKENS: u64 = 4096;
-
-/// 把日志记录转换成模型消息；工具调用没有结果（如被中断）时补一条“结果未知”，
-/// 让每个调用都有对应结果。`pruned_until` 为微压缩水位线在 `entries` 中的位置（含）。
-fn project_messages(
-    entries: &[&SessionEntry],
-    pruned_until: Option<usize>,
-    session: &SessionData,
-) -> Vec<Message> {
+/// 把日志记录转换成模型消息；未配对工具调用补一条“结果未知”。
+pub(crate) fn project_messages(entries: &[&SessionEntry]) -> Vec<Message> {
     let mut messages = Vec::new();
-    let mut remaining = entries.iter().copied().enumerate().peekable();
-    while let Some((index, entry)) = remaining.next() {
-        let pruned = pruned_until.is_some_and(|cutoff| index <= cutoff);
-        if matches!(entry, SessionEntry::ContextRotation { .. }) {
-            messages.push(Message::developer(context_rotation_handoff(session)));
-        }
-        messages.push(model_message(entry, pruned, session));
+    let mut remaining = entries.iter().copied().peekable();
+    while let Some(entry) = remaining.next() {
+        messages.push(model_message(entry));
         let SessionEntry::Message { message, .. } = entry else {
             continue;
         };
@@ -65,21 +36,17 @@ fn project_messages(
             continue;
         }
         let mut results = std::collections::HashMap::new();
-        while let Some((
-            result_index,
-            SessionEntry::Message {
-                message: Message::ToolResult { tool_call_id, .. },
-                ..
-            },
-        )) = remaining.peek()
+        while let Some(SessionEntry::Message {
+            message: Message::ToolResult { tool_call_id, .. },
+            ..
+        }) = remaining.peek()
         {
-            let result_pruned = pruned_until.is_some_and(|cutoff| *result_index <= cutoff);
-            let (_, entry) = remaining.next().expect("peeked result exists");
-            results.insert(tool_call_id.as_str(), (entry, result_pruned));
+            let entry = remaining.next().expect("peeked result exists");
+            results.insert(tool_call_id.as_str(), entry);
         }
         for call in calls {
-            messages.push(if let Some((entry, result_pruned)) = results.remove(call.tool_call_id.as_str()) {
-                model_message(entry, result_pruned, session)
+            messages.push(if let Some(entry) = results.remove(call.tool_call_id.as_str()) {
+                model_message(entry)
             } else {
                 Message::ToolResult {
                     content: vec![ContentBlock::text(UNKNOWN_TOOL_OUTCOME)],
@@ -92,17 +59,12 @@ fn project_messages(
     messages
 }
 
-fn context_token_estimate(
-    entries: &[&SessionEntry],
-    pruned_until: Option<usize>,
-    session: &SessionData,
-) -> u64 {
+fn context_token_estimate(entries: &[&SessionEntry], session: &SessionData) -> u64 {
     let mut tokens = 0u64;
     let mut calls = 0usize;
     let mut results = 0usize;
-    for (index, entry) in entries.iter().enumerate() {
-        let pruned = pruned_until.is_some_and(|cutoff| index <= cutoff);
-        tokens = tokens.saturating_add(entry_token_estimate(entry, pruned, session));
+    for entry in entries {
+        tokens = tokens.saturating_add(entry_token_estimate(entry, session));
         if let SessionEntry::Message { message, .. } = entry {
             calls = calls.saturating_add(message.tool_calls().count());
             if message.tool_call_id().is_some() {
@@ -119,10 +81,9 @@ fn context_token_estimate(
 
 enum ContextEntry<'a> {
     Message(&'a Message),
-    UserMessages(&'a str),
+    Summary(&'a str),
 }
 
-/// 判断一条记录是否进入模型上下文；Token 估算、轮换输入和生成请求共用这一判断。
 fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
     match entry {
         SessionEntry::Message { observation: Some(observation), .. }
@@ -131,29 +92,15 @@ fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
             None
         }
         SessionEntry::Message { message, .. } => Some(ContextEntry::Message(message)),
-        SessionEntry::ContextRotation { context_rotation, .. } => {
-            Some(ContextEntry::UserMessages(&context_rotation.user_messages))
-        }
+        SessionEntry::Compaction { compaction, .. } => Some(ContextEntry::Summary(&compaction.summary)),
         SessionEntry::Metadata { .. } | SessionEntry::Record { .. } => None,
     }
 }
 
-/// 估算一条记录的 Token；指令和工具定义由 Agent 另外估算。
-fn entry_token_estimate(entry: &SessionEntry, pruned: bool, session: &SessionData) -> u64 {
+fn entry_token_estimate(entry: &SessionEntry, session: &SessionData) -> u64 {
     match context_entry(entry) {
         Some(ContextEntry::Message(message)) => {
-            if pruned {
-                return message_token_estimate(&model_message(entry, true, session));
-            }
-            let tokens = message_token_estimate(message)
-                + if matches!(
-                    message,
-                    Message::User { .. } | Message::ToolResult { .. } | Message::Notification { .. }
-                ) {
-                    text_block_token_estimate(&message_time(entry))
-                } else {
-                    0
-                };
+            let tokens = message_token_estimate(message);
             let captions = image_captions(message, &session.image_directory());
             if captions.is_empty() {
                 tokens
@@ -161,15 +108,11 @@ fn entry_token_estimate(entry: &SessionEntry, pruned: bool, session: &SessionDat
                 tokens.saturating_add(text_block_token_estimate(&captions))
             }
         }
-        Some(ContextEntry::UserMessages(_)) => {
-            message_token_estimate(&Message::developer(context_rotation_handoff(session)))
-                + message_token_estimate(&model_message(entry, false, session))
-        }
+        Some(ContextEntry::Summary(summary)) => message_token_estimate(&frame_compacted_summary(summary)),
         None => 0,
     }
 }
 
-/// 思考文本也计入预算；不回传思考的模型可能因此稍早轮换。
 pub(crate) fn message_token_estimate(message: &Message) -> u64 {
     let mut tokens = MESSAGE_OVERHEAD_TOKENS;
     for block in message.content() {
@@ -177,7 +120,6 @@ pub(crate) fn message_token_estimate(message: &Message) -> u64 {
             ContentBlock::Text { text, .. } | ContentBlock::Thinking { thinking: text, .. } => {
                 text_block_token_estimate(text)
             }
-            // 没有提供方实际用量时按尺寸估算图片 Token；拿到回复后优先使用提供方上报的用量。
             ContentBlock::Image(image) => u64::from(image.width)
                 .div_ceil(32)
                 .saturating_mul(u64::from(image.height).div_ceil(32))
@@ -197,11 +139,29 @@ fn text_block_token_estimate(text: &str) -> u64 {
     estimate_tokens_of(text).saturating_add(CONTENT_BLOCK_OVERHEAD_TOKENS)
 }
 
-/// 本轮最近一次普通回复的真实用量与后续新增条目估算：`(provider, model, total_tokens, tail_tokens)`。
+/// 本会话最近一次成功完成普通生成的模型选择（直接读取该回复记录的实际推理档位，不受运行中设置修改干扰）。
+pub(crate) fn last_routed_model(session: &SessionData) -> Option<protocol::ModelSelection> {
+    session.entries().iter().rev().find_map(|entry| match entry {
+        SessionEntry::Message {
+            message: Message::Assistant { provider_metadata, .. },
+            observation: Some(observation),
+            ..
+        } if observation.status == protocol::ProviderAttemptStatus::Ok
+            && observation.purpose == protocol::RequestPurpose::Generation =>
+        {
+            Some(protocol::ModelSelection {
+                provider: observation.provider.clone(),
+                model: observation.model.clone(),
+                reasoning: provider_metadata.as_ref().and_then(|meta| meta.reasoning.clone()),
+            })
+        }
+        _ => None,
+    })
+}
+
 fn latest_reply_usage(
     session: &SessionData,
     entries: &[&SessionEntry],
-    pruned_until: Option<usize>,
 ) -> Option<(String, String, u64, u64)> {
     let latest = session
         .entries()
@@ -210,9 +170,9 @@ fn latest_reply_usage(
         .take_while(|entry| {
             !matches!(
                 entry,
-                SessionEntry::ContextRotation { .. }
+                SessionEntry::Compaction { .. }
                     | SessionEntry::Record {
-                        record: LedgerRecord::OperationStarted | LedgerRecord::ToolOutputsPruned { .. },
+                        record: LedgerRecord::OperationStarted,
                         ..
                     }
             )
@@ -226,8 +186,7 @@ fn latest_reply_usage(
             .position(|entry| entry.id() == id)
             .expect("latest assistant belongs to the active context")
             + 1;
-        let tail_pruned = pruned_until.and_then(|cutoff| cutoff.checked_sub(after));
-        let tail_tokens = context_token_estimate(&entries[after..], tail_pruned, session);
+        let tail_tokens = context_token_estimate(&entries[after..], session);
         return Some((
             observation.provider.clone(),
             observation.model.clone(),
@@ -238,178 +197,147 @@ fn latest_reply_usage(
     None
 }
 
-/// 输入 Token：本轮内最近一次回复的实际用量已包含指令、工具定义和回复本身，只补算
-/// 之后新增的消息。跨轮、微压缩/轮换后或换了模型时没有可用的实际用量，全部重新估算。
 fn input_tokens(
     session: &SessionData,
     entries: &[&SessionEntry],
-    pruned_until: Option<usize>,
     identity: (&str, &str),
     definition_tokens: u64,
 ) -> u64 {
-    if let Some((provider, model, total_tokens, tail_tokens)) =
-        latest_reply_usage(session, entries, pruned_until)
+    if let Some((provider, model, total_tokens, tail_tokens)) = latest_reply_usage(session, entries)
         && provider == identity.0
         && model == identity.1
     {
         return total_tokens.saturating_add(tail_tokens);
     }
-    context_token_estimate(entries, pruned_until, session).saturating_add(definition_tokens)
+    context_token_estimate(entries, session).saturating_add(definition_tokens)
 }
 
-/// 生成请求用的消息和输入 Token 估算；图片由调用方在锁外读取。
+pub(crate) fn estimated_input_tokens(
+    session: &SessionData,
+    identity: (&str, &str),
+    definition_tokens: u64,
+) -> u64 {
+    let entries = resolve_context_entries(session);
+    input_tokens(session, &entries, identity, definition_tokens)
+}
+
 pub(crate) fn prepare_context(
     session: &SessionData,
     identity: (&str, &str),
     definition_tokens: u64,
 ) -> (Vec<Message>, u64) {
-    let (entries, pruned_until) = resolve_context_entries(session);
-    (
-        project_messages(&entries, pruned_until, session),
-        input_tokens(session, &entries, pruned_until, identity, definition_tokens),
-    )
+    let entries = resolve_context_entries(session);
+    (project_messages(&entries), input_tokens(session, &entries, identity, definition_tokens))
 }
 
-/// 若上下文达到微压缩阈值且存在足够多可折叠的旧工具输出/旧图片，返回压缩后的估算输入 Token 与新水位线。
-pub(crate) fn select_prune_target(
+/// 扣除输出预留后的有效消息预算的 15%（至少 1 token）。
+pub fn retention_budget_tokens(model: ModelConfigurationSnapshot) -> u64 {
+    let message_budget = model.context_window().saturating_sub(u64::from(model.max_output_tokens));
+    u64::try_from(u128::from(message_budget) * 15 / 100).unwrap_or(0).max(1)
+}
+
+/// 按工具调用/结果配对划分原子组，从末尾倒序保留至少 `retain_tokens`（即使为 0 也至少保留最后一个原子组）。
+pub(crate) fn select_compactable_split(
+    active: &[&SessionEntry],
     session: &SessionData,
-    identity: (&str, &str),
-    definition_tokens: u64,
-    context_window: u64,
-) -> (u64, Option<(String, u64)>) {
-    let (entries, existing_pruned) = resolve_context_entries(session);
-    let current = input_tokens(session, &entries, existing_pruned, identity, definition_tokens);
-    let trigger = u64::try_from(u128::from(context_window) * PRUNE_TRIGGER_PERCENT / 100).unwrap_or(u64::MAX);
-    if current < trigger {
-        return (current, None);
+    retain_tokens: u64,
+) -> Option<(usize, String)> {
+    let msg_start = usize::from(matches!(active.first(), Some(SessionEntry::Compaction { .. })));
+    if msg_start >= active.len() {
+        return None;
     }
-    let tool_positions: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            matches!(context_entry(entry), Some(ContextEntry::Message(Message::ToolResult { .. })))
-                .then_some(index)
-        })
-        .collect();
-    if tool_positions.len() <= PRUNE_KEEP_RECENT_TOOL_RESULTS {
-        return (current, None);
+
+    let mut units: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut i = msg_start;
+    while i < active.len() {
+        let start = i;
+        let is_tool_result =
+            matches!(context_entry(active[i]), Some(ContextEntry::Message(Message::ToolResult { .. })));
+        if is_tool_result && let Some(prev) = units.last_mut() {
+            prev.end = i + 1;
+            i += 1;
+            continue;
+        }
+        let has_calls = match active[i] {
+            SessionEntry::Message { message, .. } => {
+                matches!(message, Message::Assistant { .. }) && message.tool_calls().next().is_some()
+            }
+            _ => false,
+        };
+        i += 1;
+        if has_calls {
+            while i < active.len()
+                && matches!(context_entry(active[i]), Some(ContextEntry::Message(Message::ToolResult { .. })))
+            {
+                i += 1;
+            }
+        }
+        units.push(start..i);
     }
-    let candidate_cutoff = tool_positions[tool_positions.len() - PRUNE_KEEP_RECENT_TOOL_RESULTS - 1];
-    if existing_pruned.is_some_and(|existing| candidate_cutoff <= existing) {
-        return (current, None);
+
+    let mut accumulated = 0u64;
+    let mut keep_unit = units.len();
+    for (idx, range) in units.iter().enumerate().rev() {
+        let unit_tokens = context_token_estimate(&active[range.clone()], session);
+        accumulated = accumulated.saturating_add(unit_tokens);
+        keep_unit = idx;
+        if accumulated >= retain_tokens {
+            break;
+        }
     }
-    let before_est = context_token_estimate(&entries, existing_pruned, session);
-    let after_est = context_token_estimate(&entries, Some(candidate_cutoff), session);
-    let saved = before_est.saturating_sub(after_est);
-    let min_savings = PRUNE_MIN_SAVINGS_TOKENS.max(context_window / 20);
-    if saved < min_savings {
-        return (current, None);
+    if keep_unit == 0 {
+        return None;
     }
-    (
-        after_est.saturating_add(definition_tokens),
-        Some((entries[candidate_cutoff].id().to_owned(), saved)),
-    )
+    let split_idx = units[keep_unit].start;
+    Some((split_idx, active[split_idx].id().to_owned()))
 }
 
-/// 整理请求使用完整的当前上下文，与普通请求共用消息投影。
 #[derive(Debug)]
-pub struct ContextRotationInput {
+pub struct CompactionInput {
     pub(crate) messages: Vec<Message>,
-    pub(crate) image_directory: std::path::PathBuf,
-    /// 包括上一份用户消息整理内容和接手提示。
-    pub(crate) estimated_tokens: u64,
+    pub(crate) first_kept_entry_id: String,
+    pub(crate) prefix_estimated_tokens: u64,
+    pub(crate) total_estimated_tokens: u64,
     pub(crate) latest_usage: Option<(String, String, u64, u64)>,
+    pub(crate) image_directory: std::path::PathBuf,
 }
 
-impl ContextRotationInput {
-    /// 没有新增对话时无需准备模型、指令或工具。
-    pub async fn select(session: &super::SessionWriter) -> Option<Self> {
+impl CompactionInput {
+    /// 前缀为空或不可能小于空检查点框定时返回 `None`。
+    pub async fn select(session: &super::SessionWriter, retain_tokens: u64) -> Option<Self> {
         let session = std::sync::Arc::clone(session);
         tokio::task::spawn_blocking(move || {
             super::with_writer(&session, |session| {
                 let data = session.data();
-                let (entries, pruned_until) = resolve_context_entries(data);
-                entries.iter().any(|entry| matches!(entry, SessionEntry::Message { .. })).then(|| Self {
-                    messages: project_messages(&entries, pruned_until, data),
-                    estimated_tokens: context_token_estimate(&entries, pruned_until, data),
-                    latest_usage: latest_reply_usage(data, &entries, pruned_until),
+                let active = resolve_context_entries(data);
+                let (split_idx, first_kept_entry_id) =
+                    select_compactable_split(&active, data, retain_tokens)?;
+                let prefix_entries = &active[..split_idx];
+                let prefix_estimated_tokens = context_token_estimate(prefix_entries, data);
+                if prefix_estimated_tokens <= message_token_estimate(&frame_compacted_summary("")) {
+                    return None;
+                }
+                let kept_estimated_tokens = context_token_estimate(&active[split_idx..], data);
+                Some(Self {
+                    messages: project_messages(prefix_entries),
+                    first_kept_entry_id,
+                    prefix_estimated_tokens,
+                    total_estimated_tokens: prefix_estimated_tokens.saturating_add(kept_estimated_tokens),
+                    latest_usage: latest_reply_usage(data, &active),
                     image_directory: data.image_directory(),
                 })
             })
         })
         .await
-        .expect("context_rotation selection completes while the runtime is running")
+        .expect("compaction selection completes while the runtime is running")
     }
 }
 
-fn model_message(entry: &SessionEntry, pruned: bool, session: &SessionData) -> Message {
-    match context_entry(entry).expect("context contains messages and user message notes") {
-        ContextEntry::Message(message) => {
-            let mut message = message.clone();
-            if pruned {
-                prune_message_content(&mut message, entry, session);
-            }
-            if let Message::User { content }
-            | Message::ToolResult { content, .. }
-            | Message::Notification { content } = &mut message
-            {
-                content.push(ContentBlock::text(message_time(entry)));
-            }
-            message
-        }
-        ContextEntry::UserMessages(user_messages) => {
-            Message::user(format!("上一版用户消息整理正文：\n\n{user_messages}"))
-        }
+fn model_message(entry: &SessionEntry) -> Message {
+    match context_entry(entry).expect("context contains messages and compaction summaries") {
+        ContextEntry::Message(message) => message.clone(),
+        ContextEntry::Summary(summary) => frame_compacted_summary(summary),
     }
-}
-
-/// 对微压缩水位线及之前的消息执行确定性压缩：折叠超长工具输出并剥离旧图片二进制（保留路径说明）。
-fn prune_message_content(message: &mut Message, entry: &SessionEntry, session: &SessionData) {
-    let captions = image_captions(message, &session.image_directory());
-    let had_images = !captions.is_empty();
-    let content = match message {
-        Message::ToolResult { content, .. } => {
-            for block in content.iter_mut() {
-                if let ContentBlock::Text { text, .. } = block
-                    && text.len() > PRUNE_MIN_TOOL_RESULT_BYTES
-                {
-                    *text = crate::compaction::compact_text(
-                        text,
-                        PRUNE_HEAD_BYTES,
-                        PRUNE_TAIL_BYTES,
-                        &format!(
-                            "earlier tool output compacted ({} bytes); inspect {} at {} if needed",
-                            text.len(),
-                            app_core::display_path(&session.file),
-                            message_time(entry),
-                        ),
-                    );
-                }
-            }
-            content
-        }
-        Message::User { content } | Message::Notification { content } => content,
-        Message::Developer { .. } | Message::Assistant { .. } => return,
-    };
-    if had_images {
-        content.retain(|block| !matches!(block, ContentBlock::Image(_)));
-        content.push(ContentBlock::text(format!(
-            "{captions}\n[earlier image omitted from context; inspect the saved copy path if needed]"
-        )));
-    }
-}
-
-/// 引用沿用日志的 UTC 时间，只缩短显示，不改写原始消息。
-fn message_time(entry: &SessionEntry) -> String {
-    let time = entry.timestamp().chars().skip(5).take(14).collect::<String>().replace('T', " ");
-    let label = match entry {
-        SessionEntry::Message { message: Message::ToolResult { .. }, .. } => "工具记录时间：",
-        SessionEntry::Message {
-            message: Message::Notification { .. }, ..
-        } => "通知记录时间：",
-        _ => "",
-    };
-    format!("[{label}{time}]")
 }
 
 /// 请求附加的一个文本块；生成与预算都按整块处理，避免多张图片分别向上取整。
@@ -429,6 +357,16 @@ pub(crate) fn image_captions(message: &Message, directory: &std::path::Path) -> 
     captions
 }
 
+fn message_content_mut(message: &mut Message) -> &mut Vec<ContentBlock> {
+    match message {
+        Message::Developer { content }
+        | Message::Notification { content }
+        | Message::User { content }
+        | Message::Assistant { content, .. }
+        | Message::ToolResult { content, .. } => content,
+    }
+}
+
 /// 在写者锁外读取消息引用的图片，并在消息末尾附上图片的名称、尺寸和保存位置。
 pub(crate) fn load_images(
     messages: &mut [Message],
@@ -441,30 +379,32 @@ pub(crate) fn load_images(
         }
         let captions = image_captions(message, directory);
         if !captions.is_empty() {
-            crate::compaction::message_content_mut(message).push(ContentBlock::text(captions));
+            message_content_mut(message).push(ContentBlock::text(captions));
         }
     }
     Ok(images)
 }
 
-/// 最新整理记录本身就是分界；只接续该记录之后的正常消息，同时解析该分界之后最新的微压缩水位线。
-fn resolve_context_entries(session: &SessionData) -> (Vec<&SessionEntry>, Option<usize>) {
+/// 最新压缩检查点放最前，随后保留 `firstKeptEntryId` 起及之后的原始消息（跳过夹在中间的旧检查点）。
+pub(crate) fn resolve_context_entries(session: &SessionData) -> Vec<&SessionEntry> {
     let entries = session.entries();
-    let start = entries
-        .iter()
-        .rposition(|entry| matches!(entry, SessionEntry::ContextRotation { .. }))
-        .unwrap_or(0);
-    let active_slice = &entries[start..];
-    let prune_before_id = active_slice.iter().rev().find_map(|entry| match entry {
-        SessionEntry::Record {
-            record: LedgerRecord::ToolOutputsPruned { before_entry_id },
-            ..
-        } => Some(before_entry_id.as_str()),
-        _ => None,
-    });
-    let active: Vec<&SessionEntry> =
-        active_slice.iter().filter(|entry| context_entry(entry).is_some()).collect();
-    let pruned_until =
-        prune_before_id.and_then(|target| active.iter().rposition(|entry| entry.id() == target));
-    (active, pruned_until)
+    let latest_compact = entries.iter().rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }));
+    match latest_compact {
+        None => entries.iter().filter(|entry| context_entry(entry).is_some()).collect(),
+        Some(compact_idx) => {
+            let mut active = vec![&entries[compact_idx]];
+            if let SessionEntry::Compaction { compaction, .. } = &entries[compact_idx]
+                && let Some(first_kept_id) = &compaction.first_kept_entry_id
+                && let Some(kept_idx) = entries[..compact_idx].iter().rposition(|e| e.id() == first_kept_id)
+            {
+                active.extend(entries[kept_idx..compact_idx].iter().filter(|entry| {
+                    matches!(entry, SessionEntry::Message { .. }) && context_entry(entry).is_some()
+                }));
+            }
+            active.extend(entries[compact_idx + 1..].iter().filter(|entry| {
+                matches!(entry, SessionEntry::Message { .. }) && context_entry(entry).is_some()
+            }));
+            active
+        }
+    }
 }

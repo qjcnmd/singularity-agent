@@ -52,15 +52,20 @@ impl Conversation {
                 AgentEvent::Turn(TurnEvent::ItemUpdated { ref item })
                     if matches!(
                         item,
-                        protocol::HistoryItem::ContextRotation { .. }
-                            | protocol::HistoryItem::ContextRotationResult { .. }
+                        protocol::HistoryItem::Compaction { .. }
+                            | protocol::HistoryItem::CompactionResult { .. }
                     ) =>
                 {
                     let active = matches!(
                         item,
-                        protocol::HistoryItem::ContextRotationResult { status: TurnStatus::Running, .. }
+                        protocol::HistoryItem::CompactionResult { status: TurnStatus::Running, .. }
                     );
-                    controls.set_rotating(active);
+                    controls.set_compacting(active);
+                    sink(event);
+                    sink(AgentEvent::SessionStateChanged);
+                }
+                AgentEvent::Turn(TurnEvent::MessageDiscarded { .. }) if controls.is_compacting() => {
+                    controls.set_compacting(false);
                     sink(event);
                     sink(AgentEvent::SessionStateChanged);
                 }
@@ -186,7 +191,7 @@ impl Conversation {
         drop(guard);
         result
     }
-    /// 普通回合与独立轮换共用的准备步骤；每次都重新读取模型配置和项目指令。
+    /// 普通回合与独立压缩共用的准备步骤；每次都重新读取模型配置和项目指令。
     pub(super) fn prepare_request_context(&self) -> Result<RequestContext, TurnErrorDetail> {
         let provider = ModelClient::new(&self.models, &self.model()).map_err(preparation_error)?;
         let instruction_home = self.home.clone();
@@ -198,7 +203,13 @@ impl Conversation {
             initial_instructions,
             disabled_modules: self.disabled_modules.clone(),
         };
-        Ok(RequestContext::new(provider, config, Arc::clone(&self.writer), Arc::clone(&self.mcp)))
+        Ok(RequestContext::new(
+            provider,
+            Arc::clone(&self.models),
+            config,
+            Arc::clone(&self.writer),
+            Arc::clone(&self.mcp),
+        ))
     }
 }
 

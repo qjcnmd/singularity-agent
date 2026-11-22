@@ -150,25 +150,17 @@ async fn context_pressure_and_overflow_invariants() {
     let ws = env.workspace_str();
     let mcp_script = write_test_mcp_script(&env.home);
 
-    // 策略无关的动态上游桩：
-    // 1. 凡是请求总字符数超过模拟上限（或在约定触发点超窗）就返回真实 context_length_exceeded；
-    // 2. 无论后端采用何种压缩、微压缩、折叠或分块轮换策略，每次请求都自动经 MockModelServer
-    //    做严格协议不变量检查（tool_use/tool_result 配对、角色交替、无空块）；
-    // 3. 当后端成功收缩请求规模后，正常放行并完成对话。
+    // 策略无关的动态上游桩：请求超限时返回 context_length_exceeded，每次请求自动校验协议不变量。
     let overflow_req_len = Arc::new(AtomicUsize::new(0));
     let overflow_len_recorder = Arc::clone(&overflow_req_len);
     let recovered_req_len = Arc::new(AtomicUsize::new(0));
     let recovered_len_recorder = Arc::clone(&recovered_req_len);
-    let rotation_size_cap = Arc::new(AtomicUsize::new(26_000));
-    let rotation_cap_reader = Arc::clone(&rotation_size_cap);
-    let rotation_success_count = Arc::new(AtomicUsize::new(0));
-    let rotation_ok_counter = Arc::clone(&rotation_success_count);
+    let compaction_success_count = Arc::new(AtomicUsize::new(0));
+    let compaction_ok_counter = Arc::clone(&compaction_success_count);
     let normal_step = Arc::new(AtomicUsize::new(0));
     let step_counter = Arc::clone(&normal_step);
 
-    // 按请求结构而非提示词文案识别内部整理/轮换请求：
-    // 常规请求最后一条消息的最后一个文本块必是本测试发送的用户提示（或纯 tool_result）；
-    // 轮换请求会在末尾追加系统整理指令，因此最后一个文本块不含上述测试提示。
+    // 按末尾消息是否为测试用户提示识别内部压缩请求。
     let is_compaction_request = |body: &Value| -> bool {
         let Some(last_blocks) = body
             .get("messages")
@@ -185,59 +177,44 @@ async fn context_pressure_and_overflow_invariants() {
             .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
             .find_map(|b| b.get("text").and_then(Value::as_str));
         match last_text {
-            Some(text) => {
-                !text.contains("USER_ORIGIN_MARKER_ROUND_1")
-                    && !text.contains("LATEST_INTENT_MUST_SURVIVE")
-                    && !text.contains("after failed rotation")
-                    && !text.contains("HEAVY_POST_ROTATION_TURN")
-            }
+            Some(text) => text.contains("You are now acting as a compaction engine"),
             None => false,
         }
     };
 
     server.set_fallback(move |req, _| {
         let serialized = req.body.to_string();
-        let is_rotation_prompt = is_compaction_request(&req.body);
+        let is_compact_prompt = is_compaction_request(&req.body);
 
-        // 优先处理轮换/整理请求，绝不让常规回合的 step 计数误劫持轮换请求。
-        if is_rotation_prompt {
-            let cap = rotation_cap_reader.load(Ordering::SeqCst);
-            if serialized.len() > cap {
-                return ScriptedResponse::json(
-                    400,
-                    json!({
-                        "error": {
-                            "code": "context_length_exceeded",
-                            "message": "maximum context length exceeded during compaction"
-                        }
-                    }),
-                );
-            }
-            rotation_ok_counter.fetch_add(1, Ordering::SeqCst);
-            let summary = if serialized.contains("LATEST_INTENT_MUST_SURVIVE") {
-                "Organized user intent: run multi-tool context test and LATEST_INTENT_MUST_SURVIVE."
+        if is_compact_prompt {
+            compaction_ok_counter.fetch_add(1, Ordering::SeqCst);
+            let summary = if serialized.contains("USER_ORIGIN_MARKER_ROUND_1")
+                && !serialized.contains("FIRST_CHECKPOINT_MARKER")
+            {
+                "FIRST_CHECKPOINT_MARKER: initial work condensed."
             } else {
-                "Organized user intent: run multi-tool context test and preserve latest task."
+                "SECOND_CHECKPOINT_UNIQUE_MARKER: compacted prior heavy turns cleanly."
             };
             return ScriptedResponse::sse(messages_text_sse(None, summary, 1200, 0, 60, "end_turn"));
         }
 
-        // 第 0~1 步：连续产生带大工具结果的历史，蓄积约 38 KB 上下文压力（同时保持在自动轮换阈值内，确保第 2 轮稳定命中真实超窗）。
+        // 第 1 步先写入中等大小工具结果，确保第 1 轮在 90% 自动压缩阈值以下完成，
+        // 第 2 轮“LATEST_INTENT_MUST_SURVIVE”由上游直接触发 context_length_exceeded 溢出恢复。
         let step = step_counter.fetch_add(1, Ordering::SeqCst);
-        if step < 2 {
+        if step == 0 {
             return ScriptedResponse::sse(messages_tools_sse(
-                Some("gathering context"),
+                Some("gathering initial large context"),
                 vec![(
-                    if step == 0 { "t0" } else { "t1" },
+                    "t0",
                     "mcp_call",
-                    json!({ "server": "probe", "tool": "large_output", "arguments": { "kb": 18 } }),
+                    json!({ "server": "probe", "tool": "large_output", "arguments": { "kb": 20 } }),
                 )],
-                1500 + (step as u64) * 5000,
+                1500,
                 100,
                 "tool_use",
             ));
         }
-        if step == 2 {
+        if step == 1 {
             return ScriptedResponse::sse(messages_text_sse(
                 None,
                 "initial multi-tool work complete",
@@ -248,8 +225,11 @@ async fn context_pressure_and_overflow_invariants() {
             ));
         }
 
-        // 第 2 轮普通请求超限时，上游强拒绝 context_length_exceeded，迫使后端收缩上下文后重试。
-        if serialized.contains("LATEST_INTENT_MUST_SURVIVE") && serialized.len() > 26_000 {
+        // 第 2 轮由上游触发超窗，验证溢出恢复保留最后 1 个完整平衡单元并压缩其之前前缀。
+        if serialized.contains("LATEST_INTENT_MUST_SURVIVE")
+            && !serialized.contains("FIRST_CHECKPOINT_MARKER")
+            && serialized.len() > 20_000
+        {
             overflow_len_recorder.store(serialized.len(), Ordering::SeqCst);
             return ScriptedResponse::json(
                 400,
@@ -277,7 +257,6 @@ async fn context_pressure_and_overflow_invariants() {
     });
 
     let mut client = BackendClient::spawn(&env.home).await;
-    // 配置紧凑但足以容纳第 1 轮工具结果的上下文窗口，确保第 2 轮由上游真实触发 context_length_exceeded。
     client
         .setup_workspace_and_provider(
             &ws,
@@ -305,20 +284,23 @@ async fn context_pressure_and_overflow_invariants() {
     let s1 = client.wait_settled(&session_id).await;
     assert_eq!(s1.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
 
-    // 第二轮发送新的关键意图：无论内部怎么压缩/轮换，最新用户消息必须保留并最终收敛成功。
     client.submit(&session_id, "LATEST_INTENT_MUST_SURVIVE").await;
     let s2 = client.wait_settled(&session_id).await;
     assert_eq!(
         s2.pointer("/summary/status").and_then(Value::as_str),
         Some("completed"),
-        "context pressure/overflow must converge without deadlock"
+        "context overflow recovery must converge without deadlock"
     );
 
     let reqs = server.model_requests();
     let final_req_text = reqs.last().expect("final request").body.to_string();
     assert!(
         final_req_text.contains("LATEST_INTENT_MUST_SURVIVE"),
-        "latest user message must never be dropped by compaction/rotation"
+        "overflow recovery must keep the last balanced unit verbatim"
+    );
+    assert!(
+        final_req_text.contains("FIRST_CHECKPOINT_MARKER"),
+        "overflow recovery must compact prefix before the last unit"
     );
     let overflow_len = overflow_req_len.load(Ordering::SeqCst);
     let recovered_len = recovered_req_len.load(Ordering::SeqCst);
@@ -328,58 +310,224 @@ async fn context_pressure_and_overflow_invariants() {
         "recovered request must be strictly smaller than overflowed request (overflow={overflow_len}, recovered={recovered_len})"
     );
 
-    // 失败安全不变量：手动轮换若收到空正文，轮换应失败，但既有会话上下文不被破坏、后续消息仍可正常继续。
-    server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "   ", 500, 0, 5, "end_turn")));
-    client.rpc_ok("session.rotateContext", json!({ "sessionId": session_id })).await;
-    let rot_settled = client.wait_settled(&session_id).await;
-    assert!(
-        rot_settled.pointer("/payload/failure").is_some_and(|v| !v.is_null()),
-        "empty rotation output must be rejected"
-    );
-
-    server.enqueue(ScriptedResponse::sse(messages_text_sse(
-        None,
-        "STILL_USABLE_AFTER_FAILED_ROTATION",
-        600,
-        0,
-        20,
-        "end_turn",
-    )));
-    client.submit(&session_id, "after failed rotation").await;
-    let s3 = client.wait_settled(&session_id).await;
-    assert_eq!(s3.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
-
-    // 再次基于已有轮换历史堆积较大正文，并用动态上游体量上限（不绑定内部降级阶梯数）
-    // 逼出连续多轮分块/收缩轮换，验证所有子请求均合法且绝不产出空 messages。
-    for idx in 0..3 {
-        let heavy = format!("HEAVY_POST_ROTATION_TURN_{idx}: {}", "payload_segment_".repeat(320));
+    // 累积超过 15% 保留预算的多轮历史后，验证手动压缩空摘要报错不破坏上下文，随后二轮手动压缩成功且保留 15% 尾部。
+    for idx in 0..5 {
+        let heavy = format!("HEAVY_POST_COMPACTION_TURN_{idx}: {}", "payload_segment_".repeat(320));
         client.submit(&session_id, &heavy).await;
         let settled = client.wait_settled(&session_id).await;
         assert_eq!(settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
     }
 
-    let rot_before = rotation_success_count.load(Ordering::SeqCst);
-    rotation_size_cap.store(14_000, Ordering::SeqCst);
-    client.rpc_ok("session.rotateContext", json!({ "sessionId": session_id })).await;
-    let rot2_settled = client.wait_settled(&session_id).await;
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "   ", 500, 0, 5, "end_turn")));
+    client.rpc_ok("session.compact", json!({ "sessionId": session_id })).await;
+    let compact_settled = client.wait_settled(&session_id).await;
     assert!(
-        rot2_settled.pointer("/payload/failure").is_none_or(Value::is_null),
-        "repeated rotation under tight upstream size limit must succeed without invalid empty messages"
+        compact_settled.pointer("/payload/failure").is_some_and(|v| !v.is_null()),
+        "manual compaction with empty output must fail explicitly"
+    );
+
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(
+        None,
+        "STILL_USABLE_AFTER_FAILED_COMPACTION",
+        600,
+        0,
+        20,
+        "end_turn",
+    )));
+    client.submit(&session_id, "after failed compaction").await;
+    let s3 = client.wait_settled(&session_id).await;
+    assert_eq!(s3.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+
+    let compact_before = compaction_success_count.load(Ordering::SeqCst);
+    client.rpc_ok("session.compact", json!({ "sessionId": session_id })).await;
+    let compact2_settled = client.wait_settled(&session_id).await;
+    assert!(
+        compact2_settled.pointer("/payload/failure").is_none_or(Value::is_null),
+        "repeated manual compaction must succeed"
     );
     assert!(
-        rotation_success_count.load(Ordering::SeqCst) > rot_before,
-        "repeated rotation must complete via valid compacted/chunked requests"
+        compaction_success_count.load(Ordering::SeqCst) > compact_before,
+        "repeated compaction must invoke prefix-replay compaction"
+    );
+    client.submit(&session_id, "after retained tail compaction").await;
+    let s4 = client.wait_settled(&session_id).await;
+    assert_eq!(s4.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+    let post_compaction_req =
+        server.model_requests().last().expect("post compaction request").body.to_string();
+    assert!(
+        post_compaction_req.contains("SECOND_CHECKPOINT_UNIQUE_MARKER"),
+        "second compaction must replace previous checkpoint with unique marker"
+    );
+    assert!(
+        !post_compaction_req.contains("FIRST_CHECKPOINT_MARKER"),
+        "older checkpoint must be replaced after second compaction"
+    );
+    assert!(
+        !post_compaction_req.contains("HEAVY_POST_COMPACTION_TURN_0"),
+        "compacted old prefix turn must not reappear after compaction"
+    );
+    assert!(
+        post_compaction_req.contains("STILL_USABLE_AFTER_FAILED_COMPACTION"),
+        "retained 15% tail must survive verbatim after compaction"
     );
     server.assert_no_protocol_violations();
 
-    // 审计保真不变量：重启后磁盘完整原始历史未丢失最初的用户消息。
     client.shutdown().await;
     let mut restarted = BackendClient::spawn(&env.home).await;
     let history = restarted.rpc_ok("session.read", json!({ "sessionId": session_id })).await;
     let history_text = history.to_string();
     assert!(history_text.contains("USER_ORIGIN_MARKER_ROUND_1"));
     assert!(history_text.contains("LATEST_INTENT_MUST_SURVIVE"));
-    assert!(history_text.contains("STILL_USABLE_AFTER_FAILED_ROTATION"));
+    assert!(history_text.contains("STILL_USABLE_AFTER_FAILED_COMPACTION"));
+
+    restarted.submit(&session_id, "POST_RESTART_CONTINUATION").await;
+    let s_restart = restarted.wait_settled(&session_id).await;
+    assert_eq!(s_restart.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+    let restart_req = server.model_requests().last().expect("post restart request").body.to_string();
+    assert!(
+        restart_req.contains("SECOND_CHECKPOINT_UNIQUE_MARKER")
+            && restart_req.contains("STILL_USABLE_AFTER_FAILED_COMPACTION")
+            && !restart_req.contains("HEAVY_POST_COMPACTION_TURN_0"),
+        "restarted session generation must project persisted second checkpoint and retained tail"
+    );
+
+    // 触发 90% 自动压缩（窗口 20_000 -> >= 18_000 且 < 20_000）且返回空摘要失败时，
+    // 回合应记录警告并直接继续发主请求完成生成，不中断当前回合。
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "   ", 500, 0, 5, "end_turn")));
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(
+        None,
+        "AUTO_COMPACTION_FAIL_STILL_COMPLETED",
+        1000,
+        0,
+        20,
+        "end_turn",
+    )));
+    let reqs_before_90 = server.model_requests().len();
+    let trigger_90_turn = format!("AUTO_90_TRIGGER_TURN: {}", "z".repeat(48_500));
+    restarted.submit(&session_id, &trigger_90_turn).await;
+    let s_auto_fail = restarted.wait_settled(&session_id).await;
+    assert_eq!(
+        s_auto_fail.pointer("/summary/status").and_then(Value::as_str),
+        Some("completed"),
+        "auto compaction failure at 90% must warn and continue generation without aborting turn"
+    );
+    let post_90_reqs = server.model_requests();
+    let post_90_slice = &post_90_reqs[reqs_before_90..];
+    assert_eq!(
+        post_90_slice.len(),
+        2,
+        "90% auto-compaction failure must issue exactly 1 compaction request and 1 main generation request"
+    );
+    assert!(
+        is_compaction_request(&post_90_slice[0].body),
+        "first request at >= 90% must be automatic compaction"
+    );
+    assert!(
+        !is_compaction_request(&post_90_slice[1].body)
+            && post_90_slice[1].body.to_string().contains("AUTO_90_TRIGGER_TURN"),
+        "main generation request must proceed immediately after automatic compaction failure"
+    );
+
+    // 切到窗口更小的模型且当前历史达到新模型 90% 时：必须先用旧模型按新模型 15% 保留预算预压；
+    // 旧模型预压失败时明确报错且不得向新模型发送超限主请求；预压成功后才切由新模型生成。
+    restarted
+        .rpc_ok(
+            "model.saveProvider",
+            json!({
+                "provider": {
+                    "apiProtocol": "messages",
+                    "providerId": "local",
+                    "displayName": "local",
+                    "baseUrl": server.base_url,
+                    "models": [
+                        {
+                            "modelId": "compact-model",
+                            "maxContextTokens": 20_000,
+                            "maxOutputTokens": 2048,
+                            "reasoningVariants": ["off", "low", "high"]
+                        },
+                        {
+                            "modelId": "small-model",
+                            "maxContextTokens": 6_000,
+                            "maxOutputTokens": 1024,
+                            "reasoningVariants": ["off", "low", "high"]
+                        }
+                    ]
+                },
+                "apiKey": "test-secret-key"
+            }),
+        )
+        .await;
+    restarted
+        .rpc_ok(
+            "session.updateSettings",
+            json!({
+                "sessionId": session_id,
+                "selection": { "provider": "local", "model": "small-model", "reasoning": null }
+            }),
+        )
+        .await;
+
+    // 约 800 tokens（> small-model 15% 保留预算 746），确保旧前缀可被独立切出压缩。
+    let tail_pad = "p".repeat(3_200);
+    let reqs_before_switch_fail = server.model_requests().len();
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "   ", 500, 0, 5, "end_turn")));
+    restarted
+        .submit(&session_id, &format!("SWITCH_FAIL_SHOULD_NOT_HIT_SMALL_MODEL {tail_pad}"))
+        .await;
+    let s_switch_fail = restarted.wait_settled(&session_id).await;
+    assert_eq!(
+        s_switch_fail.pointer("/summary/status").and_then(Value::as_str),
+        Some("failed"),
+        "model-switch pre-compaction failure must abort turn explicitly"
+    );
+    let switch_fail_reqs = server.model_requests();
+    let fail_slice = &switch_fail_reqs[reqs_before_switch_fail..];
+    assert!(
+        fail_slice.iter().any(|r| {
+            is_compaction_request(&r.body)
+                && r.body.get("model").and_then(Value::as_str) == Some("compact-model")
+        }),
+        "model-switch pre-compaction must run on the previous model"
+    );
+    assert!(
+        fail_slice
+            .iter()
+            .all(|r| r.body.get("model").and_then(Value::as_str) != Some("small-model")),
+        "failed model-switch pre-compaction must not send oversized request to the target model"
+    );
+
+    let reqs_before_switch_ok = server.model_requests().len();
+    restarted.submit(&session_id, &format!("SWITCH_PRECOMPACT_OK_TURN {tail_pad}")).await;
+    let s_switch_ok = restarted.wait_settled(&session_id).await;
+    assert_eq!(
+        s_switch_ok.pointer("/summary/status").and_then(Value::as_str),
+        Some("completed"),
+        "model-switch pre-compaction success must continue generation on the target model"
+    );
+    let switch_ok_reqs = server.model_requests();
+    let ok_slice = &switch_ok_reqs[reqs_before_switch_ok..];
+    assert!(
+        ok_slice.iter().any(|r| {
+            is_compaction_request(&r.body)
+                && r.body.get("model").and_then(Value::as_str) == Some("compact-model")
+        }),
+        "successful model-switch pre-compaction must compact using the previous model"
+    );
+    let final_small_req = ok_slice.last().expect("final generation request on small-model");
+    assert_eq!(
+        final_small_req.body.get("model").and_then(Value::as_str),
+        Some("small-model"),
+        "post-compaction generation must run on the target model"
+    );
+    let final_small_text = final_small_req.body.to_string();
+    assert!(
+        final_small_text.contains("SECOND_CHECKPOINT_UNIQUE_MARKER")
+            && final_small_text.contains("SWITCH_PRECOMPACT_OK_TURN")
+            && !final_small_text.contains("AUTO_90_TRIGGER_TURN"),
+        "target model must receive compacted checkpoint and small retained tail"
+    );
+    server.assert_no_protocol_violations();
     restarted.shutdown().await;
 }
 

@@ -23,7 +23,7 @@ export function finishTurn(turn: ThreadTurn, status: TurnStatus, manuallyStopped
   return { ...turn, status, manuallyStopped, items: turn.items.map(item => 'status' in item && (item.status === 'running' || item.status === 'pending') ? { ...item, status } : item) }
 }
 function replaceMessage(turn: ThreadTurn, messageId: string, completed: HistoryItem[] = []): ThreadTurn {
-  const belongsToMessage = (item: HistoryItem) => item.id.startsWith(`${messageId}:`)
+  const belongsToMessage = (item: HistoryItem) => item.id === messageId || item.id.startsWith(`${messageId}:`)
   const position = turn.items.findIndex(belongsToMessage)
   const items = turn.items.filter(item => !belongsToMessage(item))
   items.splice(position < 0 ? items.length : position, 0, ...completed)
@@ -32,7 +32,7 @@ function replaceMessage(turn: ThreadTurn, messageId: string, completed: HistoryI
 export function acceptExecutionEvent(facts: ThreadTurn[], event: TurnEventEnvelope): ThreadTurn[] {
   if (event.method === 'context/loaded') return facts
   const id = event.turnId ?? facts.at(-1)?.turnId
-  // 还没有任何回合时，手动轮换事件挂不到具体回合上，直接跳过。
+  // 还没有任何回合时，手动压缩事件挂不到具体回合上，直接跳过。
   if (id === undefined) return facts
   const index = facts.findIndex(turn => turn.turnId === id)
   if (event.method === 'turn/started' && index < 0) {

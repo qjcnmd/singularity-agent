@@ -3,7 +3,7 @@
 
 use super::{Agent, AgentError, AgentEvent, RequestContext, Result, modules};
 use crate::request_execution::{execute_request, output_budget_tokens};
-use crate::session::{LedgerRecord, context, with_writer, with_writer_async};
+use crate::session::{context, with_writer};
 use model::Message;
 use model::{ModelTurnRequest, ModelTurnResponse};
 use protocol::TurnEvent;
@@ -88,39 +88,7 @@ impl RequestContext {
         self.definitions.as_ref().expect("definitions are loaded before model requests")
     }
 
-    /// 达到软压力阈值时先执行零模型调用的旧工具输出微压缩，并返回最新的输入 Token 估算供自动轮换判断。
-    pub(super) async fn prune_tool_outputs_if_needed(&self) -> Result<u64> {
-        let session = std::sync::Arc::clone(&self.session);
-        let identity = (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned());
-        let overhead_tokens = self.request_definitions().estimated_tokens;
-        let context_window = self.context_window();
-        let (current_tokens, candidate) = tokio::task::spawn_blocking(move || {
-            with_writer(&session, |writer| {
-                context::select_prune_target(
-                    writer.data(),
-                    (&identity.0, &identity.1),
-                    overhead_tokens,
-                    context_window,
-                )
-            })
-        })
-        .await
-        .expect("prune target selection completes while the runtime is running");
-        if let Some((before_entry_id, saved_tokens)) = candidate {
-            tracing::info!(
-                before_entry_id = %before_entry_id,
-                saved_tokens,
-                "pruning older tool outputs to defer full context rotation"
-            );
-            with_writer_async(&self.session, move |writer| {
-                writer.append_record(LedgerRecord::ToolOutputsPruned { before_entry_id })
-            })
-            .await?;
-        }
-        Ok(current_tokens)
-    }
-
-    /// 组装并发送一次普通请求；输入 Token 估算与轮换判断用同一规则。
+    /// 组装并发送一次普通请求；输入 Token 估算与压缩判断共用同一规则。
     async fn request_response(
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
@@ -163,26 +131,58 @@ impl RequestContext {
 }
 
 impl Agent {
-    /// 生成一次模型回复：先按需微压缩旧工具输出，仍接近上限时再轮换，然后组装并发送请求。
-    /// 提供方明确返回上下文超限时，强制降级轮换后重新组装并重发，最多一次。
+    async fn drain_and_prepare(
+        &mut self,
+        switch_compacted: &mut bool,
+        auto_attempted: &mut bool,
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        loop {
+            self.drain_inputs(on_event, cancellation).await?;
+            match self
+                .requests
+                .prepare_before_request(*switch_compacted, !*auto_attempted, on_event, cancellation)
+                .await?
+            {
+                super::compaction::PreRequestOutcome::None => {}
+                super::compaction::PreRequestOutcome::SwitchCompacted => *switch_compacted = true,
+                super::compaction::PreRequestOutcome::AutoAttempted => *auto_attempted = true,
+            }
+            if !self.has_pending_inputs() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// 切模型超目标 90% 时先用旧模型预压；同模型达 90% 留尾 15% 自动压缩；超窗留末 1 平衡单元压前缀重发一次。
     pub(super) async fn generate_response(
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<(ModelTurnResponse, String, String)> {
-        let pressure_tokens = self.requests.prune_tool_outputs_if_needed().await?;
-        self.requests.rotate_context_if_needed(pressure_tokens, on_event, cancellation).await?;
-        self.drain_inputs(on_event, cancellation).await?;
+        let mut switch_compacted = false;
+        let mut auto_attempted = false;
+        self.drain_and_prepare(&mut switch_compacted, &mut auto_attempted, on_event, cancellation)
+            .await?;
         let overflow = match self.requests.request_response(on_event, cancellation).await {
             Err(AgentError::Provider(error)) if error.is_context_overflow() => error,
             result => return result,
         };
-        tracing::warn!(error = %overflow, "provider reported context overflow; triggering forced rotation");
-        if !self.requests.rotate_now(on_event, cancellation, true).await? {
-            return Err(AgentError::Provider(overflow));
+        tracing::warn!(error = %overflow, "provider reported context overflow; triggering forced compaction");
+        match self.requests.compact_now(on_event, cancellation, false).await {
+            Ok(true) => {}
+            Ok(false) => return Err(AgentError::Provider(overflow)),
+            Err(AgentError::Aborted) => return Err(AgentError::Aborted),
+            Err(error) if error.is_session_failure() => return Err(error),
+            Err(error) => {
+                tracing::warn!(error = %error, "overflow compaction failed; preserving original overflow error");
+                return Err(AgentError::Provider(overflow));
+            }
         }
-        // 轮换后只重发一次，仍然超限时直接把错误返回给调用方。
-        self.drain_inputs(on_event, cancellation).await?;
+        auto_attempted = true;
+        self.drain_and_prepare(&mut switch_compacted, &mut auto_attempted, on_event, cancellation)
+            .await?;
         self.requests.request_response(on_event, cancellation).await
     }
 }

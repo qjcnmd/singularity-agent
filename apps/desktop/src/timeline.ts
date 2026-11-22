@@ -1,4 +1,4 @@
-import { contextRotationText } from './copy'
+import { compactionText } from './copy'
 import { hasErrorItem } from './execution'
 import type { HistoryItem, PendingQuestion, SessionModelUsage, SessionRuntime, ThreadTurn, ToolStatus, VisibleBackgroundTask } from './protocol'
 
@@ -9,7 +9,7 @@ type TerminalItem = { type: 'terminal'; status: 'failed' | 'interrupted'; text: 
 type TypingItem = { type: 'typing' }
 type TurnStatsItem = { type: 'stats'; stats: SessionModelUsage; at?: string }
 export type ActivityRowItem =
-  | Extract<HistoryItem, { type: 'thinking' | 'tool' | 'context_rotation' | 'context_rotation_result' }>
+  | Extract<HistoryItem, { type: 'thinking' | 'tool' | 'compaction' | 'compaction_result' }>
   | ToolGroup
   | TerminalItem
   | TypingItem
@@ -62,7 +62,7 @@ export function buildTimeline(rows: RawTimelineRow[], turns: ThreadTurn[] | unde
   // 日志写入失败时错误可能只保存在运行状态中，已有相同错误条目时不重复显示。
   if (failure && !turns?.some(turn => hasErrorItem(turn, failure.error))) {
     result = [...result, { key: 'terminal:failed', stable: false, item: { type: 'terminal', status: 'failed',
-      text: failure.source === 'context_rotation' ? `${contextRotationText.failed}：${failure.error.message}` : failure.error.message } }]
+      text: failure.source === 'compaction' ? `${compactionText.failed}：${failure.error.message}` : failure.error.message } }]
   }
   // 等待回答的提问替换对应的提问工具卡片，回答后恢复成普通工具卡片。
   const asking = question ? result.findIndex(row => row.item.type === 'tool' && row.item.id === question.itemId) : -1
@@ -95,13 +95,13 @@ function isActivityItem(item: TimelineContent): item is ActivityRowItem {
   return item.type === 'thinking'
     || item.type === 'tool'
     || item.type === 'tool_group'
-    || item.type === 'context_rotation'
-    || item.type === 'context_rotation_result'
+    || item.type === 'compaction'
+    || item.type === 'compaction_result'
     || item.type === 'typing'
     || item.type === 'terminal'
 }
 
-/** 将连续的非文本步骤与状态（思考、工具、轮换、等待、中断、报错）合入白卡；前置耗时并入卡顶栏，提问独立成同款白卡。 */
+/** 将连续的非文本步骤与状态（思考、工具、压缩、等待、中断、报错）合入白卡；前置耗时并入卡顶栏，提问独立成同款白卡。 */
 function groupActivityRuns(rows: RawTimelineRow[]): TimelineRow[] {
   const grouped: TimelineRow[] = []
   for (const row of rows) {
@@ -154,18 +154,18 @@ function hasModelStats(stats: SessionModelUsage | undefined): stats is SessionMo
 
 function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): RawTimelineRow[] {
   const items = mergeAdjacentThinking(turn.items)
-  const lastStepIndex = items.findLastIndex(item => item.type !== 'context_rotation' && item.type !== 'context_rotation_result')
+  const lastStepIndex = items.findLastIndex(item => item.type !== 'compaction' && item.type !== 'compaction_result')
   const lastStep = lastStepIndex >= 0 ? items[lastStepIndex] : undefined
   const hasFinalAssistantStats = lastStep?.type === 'message' && lastStep.role === 'assistant' && hasModelStats(lastStep.stats)
   const result: RawTimelineRow[] = items.map((item, index) => ({
-    key: item.type === 'context_rotation' || item.type === 'context_rotation_result'
-      ? `contextRotation:${item.id}` : `content:${turn.turnId}:${item.id}`,
+    key: item.type === 'compaction' || item.type === 'compaction_result'
+      ? `compaction:${item.id}` : `content:${turn.turnId}:${item.id}`,
     stable: !('status' in item) || item.status !== 'running' || item.type === 'tool',
     // 同一回合中间的过渡回复（后面还跟着工具或后续步骤）不重复显示累计统计行。
     item: item.type === 'message' && item.role === 'assistant' && index < lastStepIndex && (item.stats !== undefined || item.at !== undefined)
       ? { ...item, stats: undefined, at: undefined } : item,
   }))
-  // 准备新回合或独立轮换不会重新启动上一轮的计时；进行中的回合收到首个 token 后才显示时间行。
+  // 准备新回合或独立压缩不会重新启动上一轮的计时；进行中的回合收到首个 token 后才显示时间行。
   if (turn.finishedAt || (turn.status === 'running' && turn.firstTokenAt)) {
     const workStartIndex = items.findIndex(item => item.type !== 'message' || item.role !== 'user')
     result.splice(workStartIndex < 0 ? result.length : workStartIndex, 0, {
@@ -231,8 +231,8 @@ export function formatTurnDuration(milliseconds: number): string {
   return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m${seconds % 60}s` : `${Math.floor(seconds / 3600)}h${Math.floor(seconds % 3600 / 60)}m`
 }
 
-export function contextRotationResultText(item: Extract<HistoryItem, { type: 'context_rotation_result' }>): string {
-  return item.message ?? (item.status === 'running' ? contextRotationText.running : item.status === 'completed' ? contextRotationText.unchanged : item.status === 'interrupted' ? contextRotationText.unfinished : contextRotationText.failed)
+export function compactionResultText(item: Extract<HistoryItem, { type: 'compaction_result' }>): string {
+  return item.message ?? (item.status === 'running' ? compactionText.running : item.status === 'completed' ? compactionText.unchanged : item.status === 'interrupted' ? compactionText.unfinished : compactionText.failed)
 }
 
 export function formatClock(value: string, includeDate = false): string {

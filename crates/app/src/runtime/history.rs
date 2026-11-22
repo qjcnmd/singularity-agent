@@ -1,5 +1,5 @@
 //! 从会话日志生成工作台看到的历史、任务摘要和累计用量。
-//! 历史只包含用户能看到的消息、思考、工具和轮换内容，不带原始日志行或
+//! 历史只包含用户能看到的消息、思考、工具和压缩内容，不带原始日志行或
 //! 提供方私有字段；任务摘要直接读取最近回合的状态，完整历史才划分全部回合。
 
 use agent::session::{
@@ -101,10 +101,10 @@ impl IndexedTurn {
                         *result = Some(displayed);
                     }
                 },
-                SessionEntry::ContextRotation { context_rotation, id, .. } => {
-                    items.push(HistoryItem::ContextRotation {
+                SessionEntry::Compaction { compaction, id, .. } => {
+                    items.push(HistoryItem::Compaction {
                         id: id.clone(),
-                        user_messages: context_rotation.user_messages.clone(),
+                        summary: compaction.summary.clone(),
                     });
                 }
                 SessionEntry::Metadata { .. } => {}
@@ -182,7 +182,7 @@ fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
 
 const MAX_SESSION_TITLE_CHARS: usize = 8;
 
-/// 从最近一次生成请求读取实际输入用量；轮换成功或切换模型后不沿用旧读数。
+/// 从最近一次生成请求读取实际输入用量；压缩成功或切换模型后不沿用旧读数。
 pub(crate) fn context_usage(
     entries: &[SessionEntry],
     selected: &protocol::ModelSelection,
@@ -191,7 +191,7 @@ pub(crate) fn context_usage(
     let capacity = capacity.filter(|capacity| *capacity > 0)?;
     for entry in entries.iter().rev() {
         match entry {
-            SessionEntry::ContextRotation { .. } => return None,
+            SessionEntry::Compaction { .. } => return None,
             SessionEntry::Metadata {
                 metadata: SessionMetadata::ThreadSettings { selection },
                 ..
@@ -201,7 +201,7 @@ pub(crate) fn context_usage(
         let Some(request) = entry.request_observation() else {
             continue;
         };
-        if request.purpose == protocol::RequestPurpose::ContextRotation {
+        if request.purpose == protocol::RequestPurpose::Compaction {
             continue;
         }
         let Some(usage) = &request.usage else { continue };

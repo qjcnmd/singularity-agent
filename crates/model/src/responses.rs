@@ -77,6 +77,7 @@ pub(crate) fn parse_openai_responses_response(
     mut payload: Value,
     model_name: &str,
     endpoint: &str,
+    reasoning: Option<String>,
 ) -> Result<ModelTurnResponse, ProviderError> {
     if let Some(error) = payload.get("error").filter(|error| !error.is_null()) {
         return Err(provider_embedded_error(
@@ -117,6 +118,7 @@ pub(crate) fn parse_openai_responses_response(
         ));
     };
     let mut content = Vec::new();
+    let mut has_refusal = false;
     for item in output {
         let Value::Object(item) = item else {
             return Err(provider_response_validation_error(
@@ -132,12 +134,14 @@ pub(crate) fn parse_openai_responses_response(
         };
         let block = match item_type {
             "message" => {
-                let text = parse_responses_message_content(item.get("content")).map_err(|evidence| {
-                    provider_response_validation_error(
-                        "provider Responses message content was invalid",
-                        &[evidence],
-                    )
-                })?;
+                let (text, item_refusal) =
+                    parse_responses_message_content(item.get("content")).map_err(|evidence| {
+                        provider_response_validation_error(
+                            "provider Responses message content was invalid",
+                            &[evidence],
+                        )
+                    })?;
+                has_refusal |= item_refusal;
                 ContentBlock::Text {
                     text,
                     metadata: Some(block_metadata(item, &["content"])),
@@ -186,6 +190,8 @@ pub(crate) fn parse_openai_responses_response(
         provider_name: config.provider_name.clone(),
         model_name: model_name.into(),
         endpoint: endpoint.into(),
+        prefix_digest: None,
+        reasoning,
     });
     Ok(finalize_provider_response(ModelTurnResponse {
         assistant_message: Message::Assistant { content, provider_metadata },
@@ -195,6 +201,7 @@ pub(crate) fn parse_openai_responses_response(
         } else {
             ModelStopReason::Stop
         },
+        refusal: has_refusal,
     }))
 }
 
@@ -212,23 +219,27 @@ fn parse_responses_usage(usage: Option<&Value>) -> Option<ModelUsage> {
     })
 }
 
-/// message content 规则：缺 content 算协议错误，text/output_text 与 refusal 都拼成可见文本。
-fn parse_responses_message_content(content: Option<&Value>) -> Result<String, &'static str> {
+/// message content 规则：缺 content 算协议错误，text/output_text 与 refusal 都拼成可见文本，并单独记录 refusal。
+fn parse_responses_message_content(content: Option<&Value>) -> Result<(String, bool), &'static str> {
     match content {
         None | Some(Value::Null) => Err("responses_message_content_missing"),
-        Some(Value::String(text)) => Ok(text.clone()),
+        Some(Value::String(text)) => Ok((text.clone(), false)),
         Some(Value::Array(parts)) => {
             let mut content = String::new();
+            let mut refusal = false;
             for part in parts {
                 let text = match part.get("type").and_then(Value::as_str) {
                     Some("text" | "output_text") => part.get("text").and_then(Value::as_str),
-                    Some("refusal") => part.get("refusal").and_then(Value::as_str),
+                    Some("refusal") => {
+                        refusal = true;
+                        part.get("refusal").and_then(Value::as_str)
+                    }
                     _ => return Err("responses_message_content_part_unsupported"),
                 }
                 .ok_or("responses_message_content_text_missing")?;
                 content.push_str(text);
             }
-            Ok(content)
+            Ok((content, refusal))
         }
         Some(_) => Err("responses_message_content_invalid"),
     }

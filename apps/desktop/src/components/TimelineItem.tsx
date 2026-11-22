@@ -12,8 +12,8 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { pop } from '../motion'
 import { useBodyCollapse, useSelectionGuard } from '../interactions'
 import { MarkdownBody } from '../markdown'
-import { contextRotationText, factStatusText, formatTokenCount } from '../copy'
-import { formatClock, contextRotationResultText, formatTurnDuration, toolDisplay, type ActivityGroup, type ActivityRowItem, type TimelineRow } from '../timeline'
+import { compactionText, factStatusText, formatTokenCount } from '../copy'
+import { formatClock, compactionResultText, formatTurnDuration, toolDisplay, type ActivityGroup, type ActivityRowItem, type TimelineRow } from '../timeline'
 import type { HistoryItem, SessionModelUsage, ToolStatus, VisibleBackgroundTask } from '../protocol'
 
 const previewLineCount = 8
@@ -128,7 +128,7 @@ function summarizeActivity(rows: ActivityGroup['rows'], tasks: VisibleBackground
     stepCount += 1
     const status: ToolStatus = item.type === 'tool'
       ? toolDisplay(item, tasks).status
-      : item.type === 'context_rotation'
+      : item.type === 'compaction'
         ? 'completed'
         : item.status
     if (status === 'running') runningKind = item.type
@@ -146,7 +146,7 @@ function summarizeActivity(rows: ActivityGroup['rows'], tasks: VisibleBackground
   let label: string
   if (runningKind !== null) {
     if (stepCount === 1 && runningKind === 'thinking') label = '思考中'
-    else if (stepCount === 1 && runningKind === 'context_rotation_result') label = contextRotationText.running
+    else if (stepCount === 1 && runningKind === 'compaction_result') label = compactionText.running
     else if (runningKind === 'thinking') label = `思考中 · 共 ${stepCount} 步`
     else label = `执行中 · 共 ${stepCount} 步`
   } else if (hasTyping) {
@@ -265,7 +265,7 @@ const ActivityStepRow = memo(function ActivityStepRow({ item, itemKey, cwd, user
     </ToolGroupRow>
   }
   if (item.type === 'thinking') return <ReasoningRow item={item} itemKey={itemKey} onDisclosureChange={onDisclosureChange} />
-  if (item.type === 'context_rotation' || item.type === 'context_rotation_result') return <ContextRotationRow item={item} itemKey={itemKey} onDisclosureChange={onDisclosureChange} />
+  if (item.type === 'compaction' || item.type === 'compaction_result') return <CompactionRow item={item} itemKey={itemKey} onDisclosureChange={onDisclosureChange} />
   return <ToolCard item={item} itemKey={itemKey} cwd={cwd} userHome={userHome} sessionId={sessionId} onDisclosureChange={onDisclosureChange} />
 })
 
@@ -311,22 +311,22 @@ function ReasoningRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemKe
   </article>
 }
 
-function ContextRotationRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemKey' | 'onDisclosureChange'> & { item: Extract<HistoryItem, { type: 'context_rotation' | 'context_rotation_result' }> }) {
+function CompactionRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemKey' | 'onDisclosureChange'> & { item: Extract<HistoryItem, { type: 'compaction' | 'compaction_result' }> }) {
   const [expanded, setExpanded] = useState(false)
-  const content = item.type === 'context_rotation' ? item.userMessages : contextRotationResultText(item)
-  const title = item.type === 'context_rotation' ? contextRotationText.completed : item.status === 'failed' ? contextRotationText.failed : content
+  const content = item.type === 'compaction' ? item.summary : compactionResultText(item)
+  const title = item.type === 'compaction' ? compactionText.completed : item.status === 'failed' ? compactionText.failed : content
   const canExpand = content !== '' && content !== title
   const guard = useSelectionGuard(onDisclosureChange)
   const collapseBody = useBodyCollapse(expanded ? () => setExpanded(false) : undefined, onDisclosureChange)
-  const status = item.type === 'context_rotation' ? 'completed' : item.status
+  const status = item.type === 'compaction' ? 'completed' : item.status
   return <article className="timeline-item activity-step" data-item-id={itemKey}>
     <button type="button" className="activity-toggle" aria-expanded={canExpand ? expanded : undefined} aria-disabled={!canExpand}
       {...guard(canExpand ? () => setExpanded(value => !value) : undefined)}>
-      <StepStatusIcon name="context_rotation" status={status} />
+      <StepStatusIcon name="compaction" status={status} />
       <span role="status">{title}</span>
       {canExpand && <ExpandChevron expanded={expanded} size={14} />}
     </button>
-    <Disclosure open={expanded}><div className="activity-expanded context-rotation-content" {...collapseBody}><MarkdownBody text={content} /></div></Disclosure>
+    <Disclosure open={expanded}><div className="activity-expanded compaction-summary" {...collapseBody}><MarkdownBody text={content} /></div></Disclosure>
   </article>
 }
 

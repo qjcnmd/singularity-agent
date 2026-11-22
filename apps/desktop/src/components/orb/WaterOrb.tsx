@@ -3,7 +3,7 @@ import { useEffect, useRef } from 'react'
 type WaterOrbProps = {
   /** 上下文占用，按高度映射，0–100。 */
   percent: number
-  rotating: boolean
+  compacting: boolean
   enabled: boolean
   size: number
   label: string
@@ -104,11 +104,11 @@ function createBubbles(): OrbBubble[] {
   }))
 }
 
-export function WaterOrb({ percent, rotating, enabled, size, label, color, onPress }: WaterOrbProps) {
+export function WaterOrb({ percent, compacting, enabled, size, label, color, onPress }: WaterOrbProps) {
   const canvas = useRef<HTMLCanvasElement>(null)
   const wakeRef = useRef<(() => void) | null>(null)
-  const latest = useRef({ occupancy: clamp01(percent / 100), rotating, rgb: parseRgb(color) })
-  latest.current = { occupancy: clamp01(percent / 100), rotating, rgb: parseRgb(color) }
+  const latest = useRef({ occupancy: clamp01(percent / 100), compacting, rgb: parseRgb(color) })
+  latest.current = { occupancy: clamp01(percent / 100), compacting, rgb: parseRgb(color) }
 
   useEffect(() => {
     const element = canvas.current!
@@ -122,7 +122,7 @@ export function WaterOrb({ percent, rotating, enabled, size, label, color, onPre
     const shell = buildGlassShell(pixelSize)
     const bubbles = createBubbles()
     let level = latest.current.occupancy
-    let turbulence = latest.current.rotating ? 1 : 0
+    let turbulence = latest.current.compacting ? 1 : 0
     let phase = 0
     let tilt = 0
     let lastTick = 0
@@ -131,7 +131,7 @@ export function WaterOrb({ percent, rotating, enabled, size, label, color, onPre
 
     const drawFrame = (now: number) => {
       frame = 0
-      const { occupancy, rotating: spinning, rgb } = latest.current
+      const { occupancy, compacting: spinning, rgb } = latest.current
       const calmIdle = !spinning && Math.abs(level - occupancy) < 0.002 && turbulence < 0.02
       const emptySettled = calmIdle && occupancy <= 0.002 && level <= 0.002
 
@@ -252,7 +252,7 @@ export function WaterOrb({ percent, rotating, enabled, size, label, color, onPre
 
   useEffect(() => {
     wakeRef.current?.()
-  }, [percent, rotating, color])
+  }, [percent, compacting, color])
 
   return (
     <button

@@ -6,7 +6,6 @@
 //! - tools：内置工具。
 
 pub mod agent;
-pub(crate) mod compaction;
 mod image;
 pub mod message;
 #[cfg(test)]

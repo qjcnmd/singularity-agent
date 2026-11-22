@@ -6,9 +6,9 @@ use proptest::prelude::*;
 use protocol::ProviderApiProtocol;
 use serde_json::{Map, Value, json};
 
-use crate::config::selection::SelectedModel;
-use crate::messages::messages_stream_request_payload;
-use crate::responses::openai_responses_stream_request_payload;
+use crate::config::selection::{ProviderConfig, SelectedModel};
+use crate::messages::{messages_stream_request_payload, stream::decode_messages_events_for_test};
+use crate::responses::{openai_responses_stream_request_payload, parse_openai_responses_response};
 use crate::transport::stream::decode_sse_chunks;
 use crate::types::{
     ContentBlock, Message, ModelToolCall, ModelTurnRequest, ProviderBlockMetadata, ProviderMessageMetadata,
@@ -77,8 +77,8 @@ fn turn_step_strategy() -> impl Strategy<Value = TurnStep> {
             0usize..=3,
         )
             .prop_map(|(text, thinking, same_provider, tool_count)| {
-                // 保证助手消息至少有一个非空可见块或工具调用，符合真实响应形态。
-                let text = if text.is_none() && tool_count == 0 {
+                // 允许“仅含思考块”的截断助手回复进入随机测试，以验证剥离思考后仍保持严格角色交替。
+                let text = if text.is_none() && thinking.is_none() && tool_count == 0 {
                     Some("fallback reply".to_string())
                 } else {
                     text
@@ -156,6 +156,8 @@ fn build_conversation(
                         provider_name: provider_name.into(),
                         model_name: model_name.into(),
                         endpoint: endpoint.into(),
+                        prefix_digest: None,
+                        reasoning: None,
                     }
                 } else {
                     let suffix = match protocol {
@@ -167,6 +169,8 @@ fn build_conversation(
                         provider_name: "other-provider".into(),
                         model_name: "other-model".into(),
                         endpoint: format!("https://other.example{suffix}"),
+                        prefix_digest: None,
+                        reasoning: None,
                     }
                 });
                 messages.push(Message::Assistant { content, provider_metadata });
@@ -297,12 +301,42 @@ proptest! {
             max_output_tokens: 1024,
         };
         let payload = messages_stream_request_payload(&req, &selection, provider_name, endpoint)
-            .expect("messages encoding succeeds");
+            .expect("messages encoding succeeds")
+            .payload;
         let serialized = payload.to_string();
         prop_assert!(!serialized.contains(OTHER_MSG_SIG), "leaked foreign Messages signature");
 
         let encoded = payload.get("messages").and_then(Value::as_array).expect("messages array");
         prop_assert!(!encoded.is_empty());
+
+        if encoded.len() >= 2 {
+            let last = &encoded[encoded.len() - 1];
+            let prev = &encoded[encoded.len() - 2];
+            let trailing_tool_result = last.get("role").and_then(Value::as_str) == Some("user")
+                && last
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                    });
+            let prev_starts_with_thinking = prev.get("role").and_then(Value::as_str) == Some("assistant")
+                && prev
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .and_then(|blocks| blocks.first())
+                    .and_then(|block| block.get("type"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| matches!(kind, "thinking" | "redacted_thinking"));
+            let expected_thinking_type = if trailing_tool_result && !prev_starts_with_thinking {
+                "disabled"
+            } else {
+                "adaptive"
+            };
+            prop_assert_eq!(
+                payload.pointer("/thinking/type").and_then(Value::as_str),
+                Some(expected_thinking_type)
+            );
+        }
 
         let mut prev_role: Option<&str> = None;
         let mut expected_tools: HashSet<String> = HashSet::new();
@@ -395,4 +429,147 @@ proptest! {
         }
         prop_assert_eq!(calls, outputs, "function_call/output mismatch");
     }
+}
+
+#[test]
+fn messages_context_window_exceeded_and_responses_refusal_contract() {
+    let config = ProviderConfig {
+        provider_name: "p".into(),
+        base_url: "https://example.invalid".into(),
+        api_key: "k".into(),
+    };
+    let messages_model = SelectedModel {
+        model_name: "claude-test".into(),
+        protocol: ProviderApiProtocol::Messages,
+        max_context_tokens: 64_000,
+        max_output_tokens: 4096,
+        reasoning_variant: Some("high".into()),
+    };
+    let stream_events = vec![
+        json!({ "type": "message_start", "message": { "usage": { "input_tokens": 100 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "partial summary" } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "model_context_window_exceeded" }, "usage": { "output_tokens": 20 } }),
+        json!({ "type": "message_stop" }),
+    ];
+    let resp = decode_messages_events_for_test(
+        &stream_events,
+        &config,
+        &messages_model,
+        "https://example.invalid/v1/messages",
+    );
+    assert!(resp.error().is_some_and(crate::ProviderError::is_context_overflow));
+    assert!(!resp.is_length_truncated());
+    assert!(!resp.is_refusal());
+
+    let responses_payload = json!({
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": "msg_1",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{ "type": "refusal", "refusal": "cannot summarize" }]
+        }],
+        "usage": { "input_tokens": 100, "output_tokens": 10, "total_tokens": 110 }
+    });
+    let refusal_resp = parse_openai_responses_response(
+        &config,
+        responses_payload,
+        "gpt-test",
+        "https://example.invalid/v1/responses",
+        None,
+    )
+    .expect("responses refusal parses cleanly");
+    assert!(refusal_resp.is_refusal());
+    assert_eq!(refusal_resp.assistant_message.content_text(), "cannot summarize");
+
+    // Messages 前缀哈希绑定不变量：同前缀保留带签名思考；改写前缀（如压缩/改指令）仅剥离过期带签名/redacted 思考，保留未签名思考与正文。
+    let endpoint = "https://example.invalid/v1/messages";
+    let turn1_req = ModelTurnRequest {
+        messages: vec![Message::developer("sys v1"), Message::user("first prompt")],
+        images: HashMap::new(),
+        tools: Vec::new(),
+        max_output_tokens: 1024,
+    };
+    let turn1_digest = messages_stream_request_payload(&turn1_req, &messages_model, "p", endpoint)
+        .expect("turn 1 encodes")
+        .prefix_digest;
+    let mut signed_meta = Map::new();
+    signed_meta.insert("signature".into(), json!("SIG_BOUND_TO_V1"));
+    let mut redacted_meta = Map::new();
+    redacted_meta.insert("type".into(), json!("redacted_thinking"));
+    redacted_meta.insert("data".into(), json!("REDACTED_PAYLOAD"));
+    let assistant_v1 = Message::Assistant {
+        content: vec![
+            ContentBlock::Thinking {
+                thinking: "signed thought".into(),
+                metadata: Some(ProviderBlockMetadata(signed_meta)),
+            },
+            ContentBlock::Thinking {
+                thinking: String::new(),
+                metadata: Some(ProviderBlockMetadata(redacted_meta)),
+            },
+            ContentBlock::Thinking {
+                thinking: "UNSIGNED_THOUGHT_KEPT".into(),
+                metadata: None,
+            },
+            ContentBlock::text("ASSISTANT_BODY_KEPT"),
+        ],
+        provider_metadata: Some(ProviderMessageMetadata {
+            protocol: ProviderApiProtocol::Messages,
+            provider_name: "p".into(),
+            model_name: "claude-test".into(),
+            endpoint: endpoint.into(),
+            prefix_digest: Some(turn1_digest),
+            reasoning: None,
+        }),
+    };
+
+    let same_prefix_req = ModelTurnRequest {
+        messages: vec![
+            Message::developer("sys v1"),
+            Message::user("first prompt"),
+            assistant_v1.clone(),
+            Message::user("follow up"),
+        ],
+        images: HashMap::new(),
+        tools: Vec::new(),
+        max_output_tokens: 1024,
+    };
+    let same_payload = messages_stream_request_payload(&same_prefix_req, &messages_model, "p", endpoint)
+        .expect("same prefix encodes")
+        .payload;
+    let same_str = same_payload.to_string();
+    assert!(same_str.contains("SIG_BOUND_TO_V1"), "matching prefix must preserve signed thinking");
+    assert!(same_str.contains("REDACTED_PAYLOAD"), "matching prefix must preserve redacted thinking");
+    assert!(same_str.contains("UNSIGNED_THOUGHT_KEPT"));
+
+    let changed_prefix_req = ModelTurnRequest {
+        messages: vec![
+            Message::developer("sys v2 changed"),
+            Message::user("compacted summary"),
+            assistant_v1,
+            Message::user("follow up"),
+        ],
+        images: HashMap::new(),
+        tools: Vec::new(),
+        max_output_tokens: 1024,
+    };
+    let changed_payload =
+        messages_stream_request_payload(&changed_prefix_req, &messages_model, "p", endpoint)
+            .expect("changed prefix encodes")
+            .payload;
+    let changed_str = changed_payload.to_string();
+    assert!(
+        !changed_str.contains("SIG_BOUND_TO_V1"),
+        "changed prefix must strip stale signed thinking"
+    );
+    assert!(
+        !changed_str.contains("REDACTED_PAYLOAD"),
+        "changed prefix must strip stale redacted thinking"
+    );
+    assert!(changed_str.contains("UNSIGNED_THOUGHT_KEPT"), "unsigned thinking must stay intact");
+    assert!(changed_str.contains("ASSISTANT_BODY_KEPT"), "assistant text must stay intact");
 }

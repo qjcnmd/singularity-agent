@@ -21,7 +21,7 @@ pub(crate) async fn read_responses_sse_stream(
 ) -> ModelTurnResponse {
     let mut decoder = ResponsesSseDecoder::new(on_event);
     let result = read_sse_stream(cancellation, response, &mut decoder).await;
-    decoder.finish(result, config, &selection.model_name, endpoint)
+    decoder.finish(result, config, selection, endpoint)
 }
 
 /// Responses SSE 解码器：边收边发出正文和思考增量，保留最终的 response 对象。
@@ -138,7 +138,7 @@ impl<'a> ResponsesSseDecoder<'a> {
         mut self,
         result: Result<(), ProviderError>,
         config: &ProviderConfig,
-        model_name: &str,
+        selection: &SelectedModel,
         endpoint: &str,
     ) -> ModelTurnResponse {
         let result = result.and_then(|()| {
@@ -146,7 +146,13 @@ impl<'a> ResponsesSseDecoder<'a> {
                 .terminal_response
                 .take()
                 .ok_or_else(provider_responses_stream_terminal_missing_error)?;
-            parse_openai_responses_response(config, payload, model_name, endpoint)
+            parse_openai_responses_response(
+                config,
+                payload,
+                &selection.model_name,
+                endpoint,
+                selection.reasoning_variant.clone(),
+            )
         });
         match result {
             Ok(response) => response,

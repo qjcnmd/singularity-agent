@@ -1,12 +1,12 @@
 //! 单个任务的内存状态和执行调度。
 //!
-//! 同一任务同一时刻只运行一个操作（普通回合或手动轮换）。
+//! 同一任务同一时刻只运行一个操作（普通回合或手动压缩）。
 //!
 //! 任务持有会话写者；状态锁判断能否开始新操作，写者锁保证日志按顺序追加。
 
 mod activity;
 mod background;
-mod context_rotation;
+mod compaction;
 mod lifecycle;
 mod state;
 mod turn;
@@ -180,7 +180,7 @@ impl Conversation {
         }
     }
 
-    /// 停止当前回合或轮换，清空尚未消费的输入。
+    /// 停止当前回合或压缩，清空尚未消费的输入。
     pub(crate) fn abort(&self) -> Result<(), ConversationError> {
         let mut view = self.lock_view();
         let mut state = self.lock_state();

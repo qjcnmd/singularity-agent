@@ -17,6 +17,7 @@ use crate::types::{
     ProviderBlockMetadata, ProviderMessageMetadata,
 };
 
+#[expect(clippy::too_many_arguments, reason = "internal Messages SSE stream adapter")]
 pub(crate) async fn read_messages_sse_stream(
     cancellation: &CancellationToken,
     response: reqwest::Response,
@@ -24,10 +25,32 @@ pub(crate) async fn read_messages_sse_stream(
     config: &ProviderConfig,
     selection: &SelectedModel,
     endpoint: &str,
+    prefix_digest: Option<String>,
+    effective_reasoning: Option<String>,
 ) -> ModelTurnResponse {
     let mut decoder = MessagesSseDecoder::new(on_event);
     let result = read_sse_stream(cancellation, response, &mut decoder).await;
-    decoder.finish(result, config, &selection.model_name, endpoint)
+    decoder.finish(result, config, selection, endpoint, prefix_digest, effective_reasoning)
+}
+
+#[cfg(test)]
+pub(crate) fn decode_messages_events_for_test(
+    events: &[Value],
+    config: &ProviderConfig,
+    selection: &SelectedModel,
+    endpoint: &str,
+) -> ModelTurnResponse {
+    let mut noop = |_| {};
+    let mut decoder = MessagesSseDecoder::new(&mut noop);
+    let mut result = Ok(());
+    for event in events {
+        let bytes = serde_json::to_vec(event).expect("serialize test sse event");
+        if let Err(err) = decoder.dispatch_event(&bytes) {
+            result = Err(err);
+            break;
+        }
+    }
+    decoder.finish(result, config, selection, endpoint, None, selection.reasoning_variant.clone())
 }
 
 enum MessagesBlock {
@@ -298,8 +321,10 @@ impl<'a> MessagesSseDecoder<'a> {
         self,
         result: Result<(), ProviderError>,
         config: &ProviderConfig,
-        model_name: &str,
+        selection: &SelectedModel,
         endpoint: &str,
+        prefix_digest: Option<String>,
+        effective_reasoning: Option<String>,
     ) -> ModelTurnResponse {
         let stop_reason = result.and_then(|()| {
             if !self.completed {
@@ -308,6 +333,10 @@ impl<'a> MessagesSseDecoder<'a> {
             match self.stop_reason.as_deref() {
                 Some("end_turn" | "tool_use" | "stop_sequence" | "pause_turn") => Ok(ModelStopReason::Stop),
                 Some("max_tokens") => Ok(ModelStopReason::Length),
+                Some("model_context_window_exceeded") => Err(ProviderError::new(
+                    ModelErrorKind::ContextLengthExceeded,
+                    "provider Messages response exceeded the model context window",
+                )),
                 Some("refusal") => Err(ProviderError::new(
                     ModelErrorKind::Other,
                     "provider Messages response was stopped by refusal",
@@ -384,13 +413,16 @@ impl<'a> MessagesSseDecoder<'a> {
         let provider_metadata = Some(ProviderMessageMetadata {
             protocol: protocol::ProviderApiProtocol::Messages,
             provider_name: config.provider_name.clone(),
-            model_name: model_name.into(),
+            model_name: selection.model_name.clone(),
             endpoint: endpoint.into(),
+            prefix_digest,
+            reasoning: effective_reasoning,
         });
         finalize_provider_response(ModelTurnResponse {
             assistant_message: Message::Assistant { content, provider_metadata },
             usage: self.usage.into_model_usage(),
             stop_reason,
+            refusal: false,
         })
     }
 }

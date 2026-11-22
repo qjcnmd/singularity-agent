@@ -11,7 +11,7 @@ use model::Message;
 
 use super::file::{parse_session_file, repair_tail};
 use super::format::{
-    ContextRotationEntry, LedgerRecord, MessageDisplay, Result, SessionEntry, SessionError, SessionHeader,
+    CompactionEntry, LedgerRecord, MessageDisplay, Result, SessionEntry, SessionError, SessionHeader,
     SessionMetadata,
 };
 
@@ -116,7 +116,7 @@ impl SessionData {
         super::session_images_directory(parent, &self.session_id)
     }
 
-    /// 超长工具输出随会话保留，轮换和重新打开任务不删除文件。
+    /// 超长工具输出随会话保留，压缩和重新打开任务不删除文件。
     pub(crate) fn output_directory(&self) -> PathBuf {
         super::session_outputs_directory(
             self.file.parent().expect("session has a parent directory"),
@@ -148,16 +148,16 @@ impl SessionData {
 }
 
 impl SessionManager {
-    /// 追加一条轮换记录，ID 使用轮换开始时分配给界面条目的 ID。返回保存时间。
-    pub(crate) fn append_context_rotation_with_id(
+    /// 追加一条压缩记录，ID 使用压缩开始时分配给界面条目的 ID。返回保存时间。
+    pub(crate) fn append_compaction_with_id(
         &mut self,
         id: &str,
-        context_rotation: ContextRotationEntry,
+        compaction: CompactionEntry,
     ) -> Result<String> {
-        self.append_entry(SessionEntry::ContextRotation {
+        self.append_entry(SessionEntry::Compaction {
             id: id.to_string(),
             timestamp: now_iso(),
-            context_rotation,
+            compaction,
         })
     }
 

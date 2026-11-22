@@ -91,10 +91,8 @@ impl AppServer {
         conversation.inspect_context(signal, guard).await.map_err(conversation_error)
     }
 
-    pub(crate) fn rotate_context(&self, session_id: &str) -> Result<(), RpcError> {
-        self.apply_control(session_id, |conversation| {
-            conversation.rotate_context().map_err(conversation_error)
-        })
+    pub(crate) fn compact(&self, session_id: &str) -> Result<(), RpcError> {
+        self.apply_control(session_id, |conversation| conversation.compact().map_err(conversation_error))
     }
 
     /// 保存任务展示名称；活动执行继续使用当前写者。
