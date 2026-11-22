@@ -248,16 +248,16 @@ pre {
 │       │       ├── prepare_before_request()              <span class="c"># 单次扫描判断切模型旧模型预压（败则中止）或同模型 90% 自动压缩（可恢复错记警告并清占位）</span>
 │       │       └── validate_shrink()                     <span class="c"># 校验非空未截断且框定检查点严格小于被压缩前缀</span>
 │       ├── session/                                      <span class="c"># JSONL v1 会话日志、尾行修复与上下文投影（5 文件）</span>
-│       │   ├── mod.rs                                    <span class="c"># 导出 CompactionInput / CompactionEntry / retention_budget_tokens</span>
+│       │   ├── mod.rs                                    <span class="c"># 导出 CompactionInput / CompactionEntry / retention_budget_tokens / SavedImage / scan_session_entries</span>
 │       │   ├── format.rs                                 <span class="c"># 日志格式 v1、独立 MessageDisplay 展示元数据与同源条目 ID</span>
 │       │   │   ├── CURRENT_SESSION_VERSION               <span class="c"># 固定格式版本 v1；SessionHeader</span>
 │       │   │   ├── MessageDisplay                        <span class="c"># User / Tool 本地展示字段侧边结构，与 Message 解耦</span>
 │       │   │   ├── LedgerRecord                          <span class="c"># Operation / ModelRequest / BackgroundTaskUpdated</span>
 │       │   │   └── text_item_id()                        <span class="c"># 与 thinking/tool_item_id 保实时回放同 ID</span>
-│       │   ├── file.rs                                   <span class="c"># parse_session_file / repair_tail 修复半截尾行</span>
-│       │   ├── manager.rs                                <span class="c"># SessionManager（唯一写者，经 data() 只读）与 SessionData（只读扫描）</span>
+│       │   ├── file.rs                                   <span class="c"># scan_session_file 逐条解析完整 JSONL 行；parse_session_file 收集条目，repair_tail 修复半截尾行</span>
+│       │   ├── manager.rs                                <span class="c"># SessionManager 与 SessionData；scan_session_entries 逐条访问日志并返回工作目录与创建时间</span>
 │       │   │   ├── SessionManager                        <span class="c"># 唯一写者：create / open_existing / data / append</span>
-│       │   │   └── SessionData                           <span class="c"># open() 只读；image_data() 限已引用图</span>
+│       │   │   └── SessionData                           <span class="c"># open() 只读；image_attachment() 查找日志引用的 SavedImage，可在锁外读图</span>
 │       │   └── context.rs                                <span class="c"># 日志投影、15% 平衡切分（溢出至少留末 1 单元）与最近路由模型扫描</span>
 │       │       ├── project_messages()                    <span class="c"># 检查点＋firstKeptEntryId 保留尾部与工具配对投影</span>
 │       │       ├── select_compactable_split()            <span class="c"># 按工具调用/结果原子组倒序留 15% 或末 1 单元尾部</span>
@@ -297,8 +297,8 @@ pre {
         ├── logging.rs                                    <span class="c"># tracing 结构化诊断日志（~/.singularity/logs 按 5 MiB 滚动）</span>
         ├── desktop.rs                                    <span class="c"># 串联 app_server / stream_hub / rpc / transport / file_view / store</span>
         ├── desktop/                                      <span class="c"># stdio JSON-RPC、AppServer、事件中心与工作区存储（8 文件）</span>
-        │   ├── transport.rs                              <span class="c"># stdin 读取 + 有界 stdout 写入协程（512 槽；先收齐停机再非阻塞排空）</span>
-        │   ├── rpc.rs                                    <span class="c"># handle / dispatch（含 session.focus）：同步 IO 进 spawn_blocking</span>
+        │   ├── transport.rs                              <span class="c"># stdin 读取，成功响应嵌入 RawValue 直出；有界 stdout 写入协程（512 槽；先收齐停机再非阻塞排空）</span>
+        │   ├── rpc.rs                                    <span class="c"># handle / dispatch（含 session.focus）：同步 IO 进 spawn_blocking，成功结果序列化为 RawValue</span>
         │   ├── stream_hub.rs                             <span class="c"># StreamHub：全局 revision、焦点过滤、高水位保护与饱和末槽 Ready 重同步</span>
         │   ├── app_server.rs                             <span class="c"># AppServer：核心容器、SessionCache 与生命周期协调</span>
         │   │   ├── SessionCache                          <span class="c"># 最多缓存 16 个空闲会话，超限按 LRU 淘汰</span>
@@ -325,7 +325,7 @@ pre {
             ├── history.rs                                <span class="c"># 历史投影、中断补标、用量统计与上下文占有率</span>
             │   ├── read_thread_history()                 <span class="c"># 无终态标中断；单次遍历生成历史与回复统计</span>
             │   ├── context_usage()                       <span class="c"># 计算最新模型请求上下文占用率</span>
-            │   └── summarize_thread()                    <span class="c"># 提取列表显示用标题、预览与摘要状态</span>
+            │   └── summarize_thread() / ThreadSummaryScan <span class="c"># 逐条聚合任务列表的标题、预览与状态，共用于内存历史与磁盘扫描</span>
             ├── conversation.rs                           <span class="c"># Conversation：单个会话运行实体与原子忙闲判定</span>
             │   └── Conversation                          <span class="c"># has_work() 单锁判忙 / abort / rename</span>
             └── conversation/                             <span class="c"># Conversation 细分状态、排他调度与实时叠加（7 文件）</span>
@@ -372,9 +372,9 @@ pre {
     ├── annotations.ts                                    <span class="c"># 助手回复可见纯文本锚点捕获/重定位、CSS Custom Highlight 注册与批注跳转总线</span>
     ├── viewPersistence.ts                                <span class="c"># localStorage 视图偏好与 accentColor（迁移旧 assistantBubble）</span>
     ├── bubbleColors.ts                                   <span class="c"># 9 色强调色调色盘与 CSS 变量映射</span>
-    ├── highlight.ts                                      <span class="c"># Shiki 20 种常用语言按需加载，失败清理缓存可重试</span>
-    ├── markdown.tsx                                      <span class="c"># GFM/KaTeX/Mermaid 渲染，50ms 流式节流，代码块免拆字渐变</span>
-    ├── timeline.ts                                       <span class="c"># 历史条目与运行时尾项排列、连续非文本步骤聚合（ActivityGroup）</span>
+    ├── highlight.ts                                      <span class="c"># Shiki 语言按需加载，按语法版本复用流式 Token，增量异常时全量重算</span>
+    ├── markdown.tsx                                      <span class="c"># GFM/KaTeX/Mermaid 渲染，KaTeX 按需加载且失败可重试，50ms 流式节流</span>
+    ├── timeline.ts                                       <span class="c"># 排列历史与运行时尾项，聚合连续非文本步骤（ActivityGroup），按引用缓存历史行与活动组</span>
     ├── inputCandidates.ts                                <span class="c"># / 技能输入触发与工作区候选查询</span>
     ├── identity.ts                                       <span class="c"># 主/渲染进程共用的产品外壳、持久化键与 desktop:* IPC 常量</span>
     ├── rpcClient.ts                                      <span class="c"># Window.desktop 强类型桥接声明</span>
@@ -392,7 +392,7 @@ pre {
     │   ├── ManagePages.tsx / McpSettings.tsx             <span class="c"># 指令/Skills（workspaceKey）/MCP（字符串超时与重连暂停轮询）</span>
     │   ├── MermaidDiagram.tsx / DiagramViewer.tsx        <span class="c"># 明暗 CSS 变量自适应 Mermaid 与零尺寸保护缩放层</span>
     │   ├── RunPanel.tsx / ContextPanel.tsx               <span class="c"># 展开时按需扫描上下文压缩与后台命令</span>
-    │   ├── FilePanel.tsx / Images.tsx                    <span class="c"># 只读文件栏（CRLF 规范化与源码缓存清理）、WeakMap 稳定图片键</span>
+    │   ├── FilePanel.tsx / Images.tsx                    <span class="c"># 只读文件栏（CRLF 规范化与源码缓存清理）；WeakMap 稳定草稿图片键，已保存图片接近视口时读取</span>
     │   └── CommandOutput.tsx / Disclosure.tsx / SelectionSlider.tsx <span class="c"># ANSI 缓存、关闭兜底定时器与直接子项监听</span>
     └── styles/                                           <span class="c"># tokens / shell / pages / conversation / composer / annotations / settings / model-picker / images / questions / surfaces</span></pre>
 </article>

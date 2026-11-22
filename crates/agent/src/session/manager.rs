@@ -9,7 +9,7 @@ use app_core::now_iso;
 
 use model::Message;
 
-use super::file::{parse_session_file, repair_tail};
+use super::file::{parse_session_file, repair_tail, scan_session_file};
 use super::format::{
     CompactionEntry, LedgerRecord, MessageDisplay, Result, SessionEntry, SessionError, SessionHeader,
     SessionMetadata,
@@ -125,7 +125,7 @@ impl SessionData {
     }
 
     /// 只允许读取这份历史实际引用的图片，不接受任意文件路径。
-    pub fn image_data(&self, image_id: &str) -> Result<String> {
+    pub fn image_attachment(&self, image_id: &str) -> Result<crate::image::SavedImage> {
         let attachment = self
             .entries
             .iter()
@@ -136,14 +136,43 @@ impl SessionData {
             .flat_map(Message::images)
             .find(|image| image.id == image_id)
             .ok_or_else(|| SessionError::InvalidSession("图片不在该任务历史中。".into()))?;
-        Ok(crate::image::load_image(&self.image_directory(), attachment)?)
+        Ok(crate::image::SavedImage {
+            directory: self.image_directory(),
+            attachment: attachment.clone(),
+        })
     }
 
-    /// 只读打开日志，用于任务列表、预览和历史读取。
+    /// 读取并编码这份历史实际引用的图片。
+    pub fn image_data(&self, image_id: &str) -> Result<String> {
+        Ok(self.image_attachment(image_id)?.data_url()?)
+    }
+
+    /// 只读打开日志，用于预览和历史读取。
     ///
     /// 只读取以换行结束的完整记录，不修改文件；截掉残缺末尾由写者打开时负责。
     pub fn open(path: &Path) -> Result<Self> {
         parse_session_file(path).map(|(data, _)| data)
+    }
+}
+
+/// 逐条访问完整日志记录，成功时返回规范工作目录和日志创建时间。
+pub fn scan_session_entries(
+    path: &Path,
+    expected_id: &str,
+    visit: impl FnMut(SessionEntry),
+) -> Result<(PathBuf, String)> {
+    let (header, cwd, _) = scan_session_file(path, visit)?;
+    verify_session_id(&header.id, expected_id)?;
+    Ok((cwd, header.timestamp))
+}
+
+fn verify_session_id(actual: &str, expected: &str) -> Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(SessionError::InvalidHeader(format!(
+            "rollout header id {actual} does not match expected id {expected}"
+        )))
     }
 }
 
@@ -232,14 +261,7 @@ impl SessionData {
 
     /// 检查文件头里的 ID 与文件名是否一致；不一致说明文件损坏或被改名。
     pub fn verify_session_id(&self, expected: &str) -> Result<()> {
-        if self.session_id() == expected {
-            Ok(())
-        } else {
-            Err(SessionError::InvalidHeader(format!(
-                "rollout header id {} does not match expected id {expected}",
-                self.session_id()
-            )))
-        }
+        verify_session_id(self.session_id(), expected)
     }
 
     pub fn created_at(&self) -> &str {

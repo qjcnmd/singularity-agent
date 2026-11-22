@@ -156,14 +156,14 @@ impl Conversation {
         if let Some(image) = image {
             return Ok(image.data_url());
         }
-        let writer = lock_writer(&self.writer);
-        writer
-            .data()
-            .image_data(image_id)
-            .map_err(|source| crate::runtime::CatalogError::Session {
-                path: writer.data().path().to_path_buf(),
-                source,
-            })
+        let (attachment, path) = {
+            let writer = lock_writer(&self.writer);
+            let data = writer.data();
+            (data.image_attachment(image_id), data.path().to_path_buf())
+        };
+        attachment
+            .and_then(|image| image.data_url().map_err(Into::into))
+            .map_err(|source| crate::runtime::CatalogError::Session { path, source })
     }
 
     /// 答案只交给仍在等待的提问工具；任务已停止时拒绝。

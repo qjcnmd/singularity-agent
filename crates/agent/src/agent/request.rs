@@ -1,9 +1,10 @@
 //! 组装模型请求：本轮的指令和工具定义，加上从会话日志生成的对话上下文。
 //! 发送、重试和保存请求记录在 crate::request_execution，普通请求和整理请求共用。
 
+use super::compaction::PreRequestOutcome;
 use super::{Agent, AgentError, AgentEvent, RequestContext, Result, modules};
 use crate::request_execution::{execute_request, output_budget_tokens};
-use crate::session::{context, with_writer};
+use crate::session::{context, context::PreparedContext, with_writer};
 use model::Message;
 use model::{ModelTurnRequest, ModelTurnResponse};
 use protocol::TurnEvent;
@@ -91,6 +92,7 @@ impl RequestContext {
     /// 组装并发送一次普通请求；输入 Token 估算与压缩判断共用同一规则。
     async fn request_response(
         &mut self,
+        prepared: Option<PreparedContext>,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<(ModelTurnResponse, String, String)> {
@@ -98,22 +100,22 @@ impl RequestContext {
         let tools = definitions.tools.clone();
         let mut messages = definitions.messages.clone();
         let overhead_tokens = definitions.estimated_tokens;
-        let identity = (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned());
         let session = std::sync::Arc::clone(&self.session);
+        let identity = (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned());
         let model = self.provider.model_configuration();
         let request = tokio::task::spawn_blocking(move || {
-            let (materials, input_tokens, directory) = with_writer(&session, |writer| {
-                let (materials, tokens) =
-                    context::prepare_context(writer.data(), (&identity.0, &identity.1), overhead_tokens);
-                (materials, tokens, writer.data().image_directory())
+            let prepared = prepared.unwrap_or_else(|| {
+                with_writer(&session, |writer| {
+                    context::prepare_context(writer.data(), (&identity.0, &identity.1), overhead_tokens)
+                })
             });
-            messages.extend(materials);
-            let images = context::load_images(&mut messages, &directory)?;
+            messages.extend(prepared.messages);
+            let images = context::load_images(&mut messages, &prepared.image_directory)?;
             Ok::<_, std::io::Error>(ModelTurnRequest {
                 messages,
                 images,
                 tools,
-                max_output_tokens: output_budget_tokens(model, input_tokens),
+                max_output_tokens: output_budget_tokens(model, prepared.input_tokens),
             })
         })
         .await
@@ -137,20 +139,26 @@ impl Agent {
         auto_attempted: &mut bool,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<Option<PreparedContext>> {
         loop {
             self.drain_inputs(on_event, cancellation).await?;
-            match self
+            let prepared = match self
                 .requests
                 .prepare_before_request(*switch_compacted, !*auto_attempted, on_event, cancellation)
                 .await?
             {
-                super::compaction::PreRequestOutcome::None => {}
-                super::compaction::PreRequestOutcome::SwitchCompacted => *switch_compacted = true,
-                super::compaction::PreRequestOutcome::AutoAttempted => *auto_attempted = true,
-            }
+                PreRequestOutcome::Ready(context) => Some(context),
+                PreRequestOutcome::SwitchCompacted => {
+                    *switch_compacted = true;
+                    None
+                }
+                PreRequestOutcome::AutoAttempted => {
+                    *auto_attempted = true;
+                    None
+                }
+            };
             if !self.has_pending_inputs() {
-                return Ok(());
+                return Ok(prepared);
             }
         }
     }
@@ -163,9 +171,10 @@ impl Agent {
     ) -> Result<(ModelTurnResponse, String, String)> {
         let mut switch_compacted = false;
         let mut auto_attempted = false;
-        self.drain_and_prepare(&mut switch_compacted, &mut auto_attempted, on_event, cancellation)
+        let prepared = self
+            .drain_and_prepare(&mut switch_compacted, &mut auto_attempted, on_event, cancellation)
             .await?;
-        let overflow = match self.requests.request_response(on_event, cancellation).await {
+        let overflow = match self.requests.request_response(prepared, on_event, cancellation).await {
             Err(AgentError::Provider(error)) if error.is_context_overflow() => error,
             result => return result,
         };
@@ -181,8 +190,9 @@ impl Agent {
             }
         }
         auto_attempted = true;
-        self.drain_and_prepare(&mut switch_compacted, &mut auto_attempted, on_event, cancellation)
+        let prepared = self
+            .drain_and_prepare(&mut switch_compacted, &mut auto_attempted, on_event, cancellation)
             .await?;
-        self.requests.request_response(on_event, cancellation).await
+        self.requests.request_response(prepared, on_event, cancellation).await
     }
 }

@@ -2,9 +2,7 @@
 //! 历史只包含用户能看到的消息、思考、工具和压缩内容，不带原始日志行或
 //! 提供方私有字段；任务摘要直接读取最近回合的状态，完整历史才划分全部回合。
 
-use agent::session::{
-    LedgerRecord, MessageDisplay, SessionData, SessionEntry, SessionError, SessionMetadata,
-};
+use agent::session::{LedgerRecord, SessionData, SessionEntry, SessionError, SessionMetadata};
 use model::{ContentBlock, Message};
 use protocol::{
     HistoryItem, SessionModelUsage, ThreadHistory, ThreadSummary, ThreadTurn, ToolStatus, TurnStatus,
@@ -215,12 +213,20 @@ pub(crate) fn context_usage(
 
 /// 默认标题：把第一条用户消息里的连续空白合并成一个空格，取前 MAX_SESSION_TITLE_CHARS
 /// 个字符；没有文字时返回 None。
-fn default_title(message: &Message, display: Option<&MessageDisplay>) -> Option<String> {
+fn default_title(entry: &SessionEntry) -> Option<String> {
+    let SessionEntry::Message {
+        message: message @ Message::User { .. },
+        display,
+        ..
+    } = entry
+    else {
+        return None;
+    };
     let mut title = String::new();
     let mut remaining = MAX_SESSION_TITLE_CHARS;
     let words = message.content().iter().enumerate().filter_map(|(index, block)| match block {
         ContentBlock::Text { text, .. } => {
-            Some(agent::message::user_text_for_display(display, index, text).split_whitespace())
+            Some(agent::message::user_text_for_display(display.as_ref(), index, text).split_whitespace())
         }
         ContentBlock::Thinking { .. } | ContentBlock::ToolCall(_) | ContentBlock::Image(_) => None,
     });
@@ -289,55 +295,82 @@ pub(crate) fn accumulate_request_usage(
 
 /// 任务列表里的一项：标题、时间和最近一个回合的状态。
 pub(crate) fn summarize_thread(session: &SessionData) -> ThreadSummary {
-    let mut title = None;
-    // 回合串行写入，最近的开始或结束记录就能说明最后一轮的状态。
-    let last_turn = session.entries().iter().rev().find_map(|entry| match entry {
-        SessionEntry::Record {
-            record: LedgerRecord::OperationStarted, ..
-        } => Some((TurnStatus::Interrupted, false)),
-        SessionEntry::Record {
-            record: LedgerRecord::OperationFinished { outcome, user_stopped, .. },
-            ..
-        } => Some((*outcome, is_manually_stopped(*outcome, *user_stopped))),
-        _ => None,
-    });
-    // 最近一次命名优先；未命名时使用第一条用户输入。
+    let mut scan = ThreadSummaryScan::default();
     for entry in session.entries().iter().rev() {
-        if let SessionEntry::Metadata {
-            metadata: SessionMetadata::ThreadName { name },
-            ..
-        } = entry
-        {
-            title = Some(name.clone());
+        scan.update(entry, SummaryOrder::NewestFirst);
+        if scan.title.is_some() && scan.updated_at.is_some() && scan.last_turn.is_some() {
             break;
         }
     }
-    let title = title.or_else(|| {
-        session.entries().iter().find_map(|entry| {
-            let SessionEntry::Message { message, display, .. } = entry else {
-                return None;
-            };
-            if !matches!(message, Message::User { .. }) {
-                return None;
+    if scan.title.is_none() {
+        scan.title = session.entries().iter().find_map(default_title);
+    }
+    scan.finish(session.session_id(), session.cwd_string(), session.created_at().to_owned())
+}
+
+#[derive(Default)]
+pub(crate) struct ThreadSummaryScan {
+    updated_at: Option<String>,
+    title: Option<String>,
+    last_turn: Option<(TurnStatus, bool)>,
+}
+
+#[derive(Clone, Copy)]
+enum SummaryOrder {
+    OldestFirst,
+    NewestFirst,
+}
+
+impl ThreadSummaryScan {
+    pub(crate) fn observe(&mut self, entry: &SessionEntry) {
+        self.update(entry, SummaryOrder::OldestFirst);
+        if self.title.is_none() {
+            self.title = default_title(entry);
+        }
+    }
+
+    fn update(&mut self, entry: &SessionEntry, order: SummaryOrder) {
+        let should_replace = |has_value: bool| matches!(order, SummaryOrder::OldestFirst) || !has_value;
+        if let SessionEntry::Metadata { metadata, .. } = entry {
+            if let SessionMetadata::ThreadName { name } = metadata
+                && should_replace(self.title.is_some())
+            {
+                name.clone_into(self.title.get_or_insert_with(String::new));
             }
-            default_title(message, display.as_ref())
-        })
-    });
-    let created_at = session.created_at().to_string();
-    let updated_at = session
-        .entries()
-        .iter()
-        .rev()
-        .find(|entry| !matches!(entry, SessionEntry::Metadata { .. }))
-        .map_or_else(|| created_at.clone(), |entry| entry.timestamp().to_owned());
-    ThreadSummary {
-        thread_id: session.session_id().to_string(),
-        cwd: session.cwd_string(),
-        created_at,
-        updated_at,
-        title,
-        status: last_turn.map(|(status, _)| status),
-        manually_stopped: last_turn.is_some_and(|(_, manually_stopped)| manually_stopped),
+            return;
+        }
+        if should_replace(self.updated_at.is_some()) {
+            entry.timestamp().clone_into(self.updated_at.get_or_insert_with(String::new));
+        }
+        if !should_replace(self.last_turn.is_some()) {
+            return;
+        }
+        match entry {
+            SessionEntry::Record {
+                record: LedgerRecord::OperationStarted, ..
+            } => {
+                self.last_turn = Some((TurnStatus::Interrupted, false));
+            }
+            SessionEntry::Record {
+                record: LedgerRecord::OperationFinished { outcome, user_stopped, .. },
+                ..
+            } => {
+                self.last_turn = Some((*outcome, is_manually_stopped(*outcome, *user_stopped)));
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn finish(self, thread_id: &str, cwd: String, created_at: String) -> ThreadSummary {
+        ThreadSummary {
+            thread_id: thread_id.to_owned(),
+            cwd,
+            updated_at: self.updated_at.unwrap_or_else(|| created_at.clone()),
+            created_at,
+            title: self.title,
+            status: self.last_turn.map(|(status, _)| status),
+            manually_stopped: self.last_turn.is_some_and(|(_, manually_stopped)| manually_stopped),
+        }
     }
 }
 

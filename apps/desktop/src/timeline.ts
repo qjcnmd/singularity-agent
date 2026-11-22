@@ -40,6 +40,7 @@ export interface TimelineRow {
 }
 
 const turnRowCache = new WeakMap<ThreadTurn, RawTimelineRow[]>()
+const groupedRowCache = new WeakMap<RawTimelineRow, { sources: RawTimelineRow[]; row: TimelineRow }>()
 
 /** 只有事实或上一回合的保存失败状态变化时，才重新排列历史。 */
 export function buildHistoryRows(turns: ThreadTurn[] | undefined, failureFromRuntime: boolean): RawTimelineRow[] {
@@ -104,46 +105,48 @@ function isActivityItem(item: TimelineContent): item is ActivityRowItem {
 /** 将连续的非文本步骤与状态（思考、工具、压缩、等待、中断、报错）合入白卡；前置耗时并入卡顶栏，提问独立成同款白卡。 */
 function groupActivityRuns(rows: RawTimelineRow[]): TimelineRow[] {
   const grouped: TimelineRow[] = []
-  for (const row of rows) {
-    if (row.item.type === 'question') {
-      const previous = grouped.at(-1)
-      if (previous?.item.type === 'duration') {
-        const { startedAt, firstTokenAt, finishedAt } = previous.item
-        grouped[grouped.length - 1] = {
-          ...row,
-          item: { ...row.item, duration: { startedAt, firstTokenAt, finishedAt } },
-        }
-      } else {
-        grouped.push({ key: row.key, stable: row.stable, item: row.item })
-      }
+  for (let start = 0; start < rows.length;) {
+    const first = rows[start]
+    const durationItem = first.item.type === 'duration' ? first.item : undefined
+    const headIndex = durationItem ? start + 1 : start
+    const head = rows[headIndex]
+    const activity = head && isActivityItem(head.item)
+    const question = durationItem && head?.item.type === 'question' ? head.item : undefined
+    if (!activity && !question) {
+      grouped.push(first as TimelineRow)
+      start++
       continue
     }
-    if (!isActivityItem(row.item)) {
-      grouped.push({ key: row.key, stable: row.stable, item: row.item })
+
+    let end = headIndex + 1
+    if (activity) {
+      while (end < rows.length && isActivityItem(rows[end].item)) end++
+    }
+    const cached = groupedRowCache.get(first)
+    if (cached?.sources.length === end - start && cached.sources.every((row, index) => row === rows[start + index])) {
+      grouped.push(cached.row)
+      start = end
       continue
     }
-    const previous = grouped.at(-1)
-    if (previous?.item.type === 'activity_group') {
-      previous.item.rows.push({ key: row.key, item: row.item })
-      previous.stable = previous.stable && row.stable
-    } else if (previous?.item.type === 'duration') {
-      const { startedAt, firstTokenAt, finishedAt } = previous.item
-      grouped[grouped.length - 1] = {
-        key: `activity:${row.key}`,
-        stable: row.stable,
+
+    const duration = durationItem && {
+      startedAt: durationItem.startedAt, firstTokenAt: durationItem.firstTokenAt, finishedAt: durationItem.finishedAt,
+    }
+    const sources = rows.slice(start, end)
+    const row: TimelineRow = question
+      ? { ...head, item: { ...question, duration } }
+      : {
+        key: `activity:${head.key}`,
+        stable: sources.every((row, index) => (duration && index === 0) || row.stable),
         item: {
           type: 'activity_group',
-          rows: [{ key: row.key, item: row.item }],
-          duration: { startedAt, firstTokenAt, finishedAt },
+          rows: (duration ? sources.slice(1) : sources).map(({ key, item }) => ({ key, item: item as ActivityRowItem })),
+          ...(duration && { duration }),
         },
       }
-    } else {
-      grouped.push({
-        key: `activity:${row.key}`,
-        stable: row.stable,
-        item: { type: 'activity_group', rows: [{ key: row.key, item: row.item }] },
-      })
-    }
+    groupedRowCache.set(first, { sources, row })
+    grouped.push(row)
+    start = end
   }
   return grouped
 }

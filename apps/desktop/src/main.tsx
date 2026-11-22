@@ -1,10 +1,10 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './app'
+import { appStore } from './appStore'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { applyCssSprings } from './motion'
 import { APP_NAME } from './identity'
-import { loadPersisted } from './viewPersistence'
 import './styles/tokens.css'
 import './styles/app.css'
 
@@ -13,7 +13,7 @@ if (root === null) {
   throw new Error(`${APP_NAME} app root is missing`)
 }
 
-document.documentElement.dataset.theme = loadPersisted().theme
+document.documentElement.dataset.theme = appStore.getSnapshot().theme
 applyCssSprings()
 
 createRoot(root).render(

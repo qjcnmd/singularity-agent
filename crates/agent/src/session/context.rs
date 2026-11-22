@@ -197,7 +197,7 @@ fn latest_reply_usage(
     None
 }
 
-fn input_tokens(
+pub(crate) fn input_tokens(
     session: &SessionData,
     entries: &[&SessionEntry],
     identity: (&str, &str),
@@ -225,9 +225,26 @@ pub(crate) fn prepare_context(
     session: &SessionData,
     identity: (&str, &str),
     definition_tokens: u64,
-) -> (Vec<Message>, u64) {
+) -> PreparedContext {
     let entries = resolve_context_entries(session);
-    (project_messages(&entries), input_tokens(session, &entries, identity, definition_tokens))
+    let tokens = input_tokens(session, &entries, identity, definition_tokens);
+    PreparedContext::new(session, &entries, tokens)
+}
+
+pub(crate) struct PreparedContext {
+    pub(crate) messages: Vec<Message>,
+    pub(crate) input_tokens: u64,
+    pub(crate) image_directory: std::path::PathBuf,
+}
+
+impl PreparedContext {
+    pub(crate) fn new(session: &SessionData, entries: &[&SessionEntry], input_tokens: u64) -> Self {
+        Self {
+            messages: project_messages(entries),
+            input_tokens,
+            image_directory: session.image_directory(),
+        }
+    }
 }
 
 /// 扣除输出预留后的有效消息预算的 15%（至少 1 token）。
@@ -248,31 +265,14 @@ pub(crate) fn select_compactable_split(
     }
 
     let mut units: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut i = msg_start;
-    while i < active.len() {
-        let start = i;
-        let is_tool_result =
-            matches!(context_entry(active[i]), Some(ContextEntry::Message(Message::ToolResult { .. })));
-        if is_tool_result && let Some(prev) = units.last_mut() {
-            prev.end = i + 1;
-            i += 1;
-            continue;
+    for (index, entry) in active.iter().enumerate().skip(msg_start) {
+        if matches!(context_entry(entry), Some(ContextEntry::Message(Message::ToolResult { .. })))
+            && let Some(previous) = units.last_mut()
+        {
+            previous.end = index + 1;
+        } else {
+            units.push(index..index + 1);
         }
-        let has_calls = match active[i] {
-            SessionEntry::Message { message, .. } => {
-                matches!(message, Message::Assistant { .. }) && message.tool_calls().next().is_some()
-            }
-            _ => false,
-        };
-        i += 1;
-        if has_calls {
-            while i < active.len()
-                && matches!(context_entry(active[i]), Some(ContextEntry::Message(Message::ToolResult { .. })))
-            {
-                i += 1;
-            }
-        }
-        units.push(start..i);
     }
 
     let mut accumulated = 0u64;

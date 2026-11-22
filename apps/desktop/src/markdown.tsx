@@ -3,7 +3,6 @@ import { useReducedMotion } from 'motion/react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
-import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { CopyButton } from './components/CopyButton'
 import { MermaidDiagram } from './components/MermaidDiagram'
@@ -52,17 +51,42 @@ function useStreamedText(text: string, streaming: boolean) {
   return !streaming || reducedMotion || !text.startsWith(visible) ? text : visible
 }
 
+type KatexRenderer = typeof import('rehype-katex')['default']
+let katexRenderer: KatexRenderer | undefined
+let loadingKatex: Promise<KatexRenderer | undefined> | undefined
+const RequestKatex = createContext<(needed: true) => void>(() => {})
+
 const RenderedMarkdown = memo(function RenderedMarkdown({ text }: { text: string }) {
+  const [rehypeKatex, setRehypeKatex] = useState(() => katexRenderer)
+  const [needsKatex, requestKatex] = useState(false)
+  useEffect(() => {
+    if (!needsKatex || rehypeKatex) return
+    let active = true
+    loadingKatex ??= import('rehype-katex').then(({ default: renderer }) => katexRenderer = renderer, () => {
+      loadingKatex = undefined
+      return undefined
+    })
+    void loadingKatex.then(renderer => { if (active && renderer) setRehypeKatex(() => renderer) })
+    return () => { active = false }
+  }, [needsKatex, rehypeKatex])
   return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath]}
-      rehypePlugins={[rehypeKatex]}
-      components={markdownComponents}
-    >
-      {text || ' '}
-    </ReactMarkdown>
+    <RequestKatex.Provider value={requestKatex}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={rehypeKatex ? [rehypeKatex] : undefined}
+        components={markdownComponents}
+      >
+        {text || ' '}
+      </ReactMarkdown>
+    </RequestKatex.Provider>
   )
 })
+
+function MathSource({ children }: { children: ReactNode }) {
+  const requestKatex = useContext(RequestKatex)
+  useEffect(() => { requestKatex(true) }, [requestKatex])
+  return children
+}
 
 function MarkdownTable({ children }: { children?: ReactNode }) {
   return <div className="markdown-table-scroll"><table>{children}</table></div>
@@ -86,7 +110,10 @@ function InlineCode({ children, className }: { children?: ReactNode; className?:
   const streaming = useContext(Streaming)
   const selectionGuard = useSelectionGuard()
   const text = typeof children === 'string' ? children.trim() : ''
-  if (streaming || className || !(pathLike.test(text) || fileNameLike.test(text))) return <code className={className}><StreamText>{children}</StreamText></code>
+  if (streaming || className || !(pathLike.test(text) || fileNameLike.test(text))) {
+    const code = <code className={className}><StreamText>{children}</StreamText></code>
+    return className?.split(' ').includes('language-math') ? <MathSource>{code}</MathSource> : code
+  }
   const path = text.replace(/(?::\d+){1,2}$/, '')
   const open = () => {
     const cwd = base ?? appStore.getSnapshot().session?.summary.cwd
@@ -151,11 +178,16 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   const streaming = useContext(Streaming)
   const body = language ? <HighlightedCode code={text} language={language} /> : <pre><code><StreamText>{text}</StreamText></code></pre>
   const block = <div className="code-block"><div className="code-block-header"><span>{language || '代码'}</span><CopyButton text={text} label="复制代码" /></div>{body}</div>
+  if (props?.className?.split(' ').includes('language-math')) return <MathSource>{block}</MathSource>
   // 流式输出时代码还不完整，先显示代码，回复完成后再画图。
   return language === 'mermaid' && !streaming ? <MermaidDiagram code={text} fallback={block} /> : block
 }
 
 const HighlightedCode = memo(function HighlightedCode({ code, language }: { code: string; language: string }) {
   const tokens = useCodeTokens(code, language)
-  return <pre><code>{tokens === null ? code : tokens.map((line, row) => <span key={row}><CodeTokens tokens={line} />{row < tokens.length - 1 ? '\n' : ''}</span>)}</code></pre>
+  return <pre><code>{tokens === null ? code : tokens.map((line, row) => <HighlightedLine key={row} tokens={line} newline={row < tokens.length - 1} />)}</code></pre>
+})
+
+const HighlightedLine = memo(function HighlightedLine({ tokens, newline }: { tokens: Parameters<typeof CodeTokens>[0]['tokens']; newline: boolean }) {
+  return <span><CodeTokens tokens={tokens} />{newline ? '\n' : ''}</span>
 })

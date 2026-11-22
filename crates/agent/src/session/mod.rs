@@ -1,7 +1,7 @@
 //! JSONL 会话日志：每行一条记录，只追加不修改。
 //!
 //! SessionManager 是唯一能写日志的对象，由打开任务的 Conversation 持有；SessionData 是
-//! 解析后的只读内容，列表和预览也用它。格式定义在 format，文件解析在 file，
+//! 解析后的只读内容，任务列表则逐条扫描。格式定义在 format，文件解析在 file，
 //! 生成模型上下文在 context。
 
 pub(crate) mod context;
@@ -11,13 +11,14 @@ mod manager;
 
 use format::Result;
 
+pub use crate::image::SavedImage;
 pub use context::{CompactionInput, retention_budget_tokens};
 pub(crate) use format::tool_item_id;
 pub use format::{
     CompactionEntry, LedgerRecord, MessageDisplay, SessionEntry, SessionError, SessionMetadata, text_item_id,
     thinking_item_id,
 };
-pub use manager::{SessionData, SessionManager};
+pub use manager::{SessionData, SessionManager, scan_session_entries};
 
 pub fn session_file_name(session_id: &str) -> String {
     format!("{session_id}.jsonl")

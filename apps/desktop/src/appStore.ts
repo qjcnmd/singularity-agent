@@ -15,6 +15,12 @@ type SessionActionMethod = {
 }[RpcMethod]
 
 class AppStore extends SessionStore {
+  private anchorRevision = 0
+
+  get viewportAnchorRevision(): number {
+    return this.anchorRevision
+  }
+
   setPage(page: AppState['page']): void {
     this.selectionRequest += 1
     this.patch({ page })
@@ -262,6 +268,7 @@ class AppStore extends SessionStore {
   setViewportAnchor(anchor: ViewportAnchor): void {
     const id = this.state.selectedSessionId
     if (id === null) return
+    this.anchorRevision++
     const previous = this.state.viewportAnchors[id]
     if (previous === undefined && anchor.mode === 'following') return
     if (previous?.mode === anchor.mode

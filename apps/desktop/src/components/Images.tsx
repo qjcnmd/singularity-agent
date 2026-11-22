@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type ClipboardEvent, type DragEvent } from 'react'
+import { useEffect, useId, useRef, useState, type ClipboardEvent, type DragEvent, type Ref } from 'react'
 import { FileText, X } from 'lucide-react'
 import type { ImageAttachment } from '../protocol'
 import { appStore } from '../appStore'
@@ -56,26 +56,40 @@ export function FileChips({ files, remove }: { files: string[]; remove?: (index:
 }
 
 export function AttachedImages({ sessionId, images }: { sessionId: string; images: ImageAttachment[] }) {
-  return <div className="image-list">{images.map(image => <SavedImage key={image.id} sessionId={sessionId} image={image} />)}</div>
+  return <div className="image-list">{images.map(image => <SavedImage key={JSON.stringify([sessionId, image.id])} sessionId={sessionId} image={image} />)}</div>
 }
 
 function SavedImage({ sessionId, image }: { sessionId: string; image: ImageAttachment }) {
+  const tile = useRef<HTMLElement>(null)
   const [url, setUrl] = useState<string>()
   const [error, setError] = useState<string | null>(null)
   const [attempt, setAttempt] = useState(0)
   useEffect(() => {
     let active = true
-    setError(null)
-    void appStore.transport.rpc('session.imageRead', { sessionId, imageId: image.id }).then(
-      url => { if (active) setUrl(url) },
-      error => { if (active) setError(error instanceof Error ? error.message : String(error)) },
-    )
-    return () => { active = false }
+    const read = () => {
+      setError(null)
+      void appStore.transport.rpc('session.imageRead', { sessionId, imageId: image.id }).then(
+        url => { if (active) setUrl(url) },
+        error => { if (active) setError(error instanceof Error ? error.message : String(error)) },
+      )
+    }
+    const element = tile.current!
+    let observer: IntersectionObserver | undefined
+    if (attempt > 0) read()
+    else {
+      observer = new IntersectionObserver((entries, observer) => {
+        if (!active || !entries.some(entry => entry.isIntersecting)) return
+        observer.disconnect()
+        read()
+      }, { root: element.closest('.conversation-scroll'), rootMargin: '300px 0px' })
+      observer.observe(element)
+    }
+    return () => { active = false; observer?.disconnect() }
   }, [sessionId, image.id, attempt])
-  return <ImageTile name={image.name} url={url} error={error} retry={() => setAttempt(value => value + 1)} />
+  return <ImageTile tileRef={tile} name={image.name} url={url} error={error} retry={() => setAttempt(value => value + 1)} />
 }
 
-function ImageTile({ name, url: savedUrl, file, remove, error, retry }: { name: string; url?: string; file?: File; remove?: () => void; error?: string | null; retry?: () => void }) {
+function ImageTile({ name, url: savedUrl, file, remove, error, retry, tileRef }: { name: string; url?: string; file?: File; remove?: () => void; error?: string | null; retry?: () => void; tileRef?: Ref<HTMLElement> }) {
   const [localUrl, setLocalUrl] = useState<string>()
   useEffect(() => {
     if (!file) return
@@ -88,7 +102,7 @@ function ImageTile({ name, url: savedUrl, file, remove, error, retry }: { name: 
   const [broken, setBroken] = useState(false)
   const titleId = useId()
   useEffect(() => setBroken(false), [url])
-  return <figure className="image-tile">
+  return <figure className="image-tile" ref={tileRef}>
     <button type="button" className="image-preview" aria-label={`查看图片 ${name}`} aria-busy={!url && !error} disabled={!url || broken} onClick={() => setOpen(true)}>
       {url && !broken ? <img src={url} alt={name} onError={() => setBroken(true)} /> : <span>{error || broken ? '图片无法显示' : ''}</span>}
     </button>

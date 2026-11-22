@@ -19,6 +19,20 @@ pub struct InputImage {
     bytes: Arc<[u8]>,
 }
 
+/// 已在会话日志中找到的图片附件，可在释放写者锁后读取。
+#[derive(Debug)]
+pub struct SavedImage {
+    pub(crate) directory: std::path::PathBuf,
+    pub(crate) attachment: ImageAttachment,
+}
+
+impl SavedImage {
+    /// 从日志对应的图片目录读取附件并编码。
+    pub fn data_url(&self) -> std::io::Result<String> {
+        load_image(&self.directory, &self.attachment)
+    }
+}
+
 impl InputImage {
     /// 排队中的图片尚未保存到历史，工作台按需读取这份已校验的内容。
     pub fn data_url(&self) -> String {

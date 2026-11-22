@@ -45,7 +45,7 @@ Rules:
 - If the conversation already contains a <compacted-summary> block, it is a PRIOR checkpoint. Do not copy it forward verbatim: preserve still-true facts, drop stale ones, and merge newer information into a single consolidated summary under the same structure."#;
 
 pub(super) enum PreRequestOutcome {
-    None,
+    Ready(context::PreparedContext),
     SwitchCompacted,
     AutoAttempted,
 }
@@ -87,31 +87,31 @@ impl RequestContext {
         let overhead_tokens = self.request_definitions().estimated_tokens;
         let session = std::sync::Arc::clone(&self.session);
         let target_for_scan = (target_provider.clone(), target_model.clone());
-        let (previous_model, current_tokens) = tokio::task::spawn_blocking(move || {
+        let trigger = self.trigger_tokens();
+        let prepared = tokio::task::spawn_blocking(move || {
             with_writer(&session, |writer| {
                 let data = writer.data();
-                let previous = context::last_routed_model(data);
-                let tokens = context::estimated_input_tokens(
-                    data,
-                    (&target_for_scan.0, &target_for_scan.1),
-                    overhead_tokens,
-                );
-                (previous, tokens)
+                let target = (target_for_scan.0.as_str(), target_for_scan.1.as_str());
+                let entries = context::resolve_context_entries(data);
+                let tokens = context::input_tokens(data, &entries, target, overhead_tokens);
+                if tokens >= trigger {
+                    let previous = context::last_routed_model(data).filter(|selection| {
+                        (selection.provider.as_str(), selection.model.as_str()) != target
+                    });
+                    if previous.is_some() || allow_auto_compact {
+                        return Err((previous, tokens));
+                    }
+                }
+                Ok(context::PreparedContext::new(data, &entries, tokens))
             })
         })
         .await
         .expect("pre-request context pressure inspection completes while the runtime is running");
 
-        let trigger = self.trigger_tokens();
-        if current_tokens < trigger {
-            return Ok(PreRequestOutcome::None);
-        }
-
-        if let Some(previous_selection) = previous_model
-            && (previous_selection.provider != target_provider || previous_selection.model != target_model)
-        {
-            return self
-                .compact_for_model_switch(
+        match prepared {
+            Ok(context) => Ok(PreRequestOutcome::Ready(context)),
+            Err((Some(previous_selection), current_tokens)) => {
+                self.compact_for_model_switch(
                     previous_selection,
                     (&target_provider, &target_model),
                     current_tokens,
@@ -120,20 +120,17 @@ impl RequestContext {
                     on_event,
                     cancellation,
                 )
-                .await;
-        }
-
-        if !allow_auto_compact {
-            return Ok(PreRequestOutcome::None);
-        }
-        match self.compact_now(on_event, cancellation, true).await {
-            Ok(_) => Ok(PreRequestOutcome::AutoAttempted),
-            Err(AgentError::Aborted) => Err(AgentError::Aborted),
-            Err(error) if error.is_session_failure() => Err(error),
-            Err(error) => {
-                tracing::warn!(error = %error, "automatic context compaction failed; continuing turn");
-                Ok(PreRequestOutcome::AutoAttempted)
+                .await
             }
+            Err((None, _)) => match self.compact_now(on_event, cancellation, true).await {
+                Ok(_) => Ok(PreRequestOutcome::AutoAttempted),
+                Err(AgentError::Aborted) => Err(AgentError::Aborted),
+                Err(error) if error.is_session_failure() => Err(error),
+                Err(error) => {
+                    tracing::warn!(error = %error, "automatic context compaction failed; continuing turn");
+                    Ok(PreRequestOutcome::AutoAttempted)
+                }
+            },
         }
     }
 

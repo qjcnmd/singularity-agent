@@ -79,33 +79,25 @@ export class DraftStore {
 
   /** 发送期间继续编辑的内容仍保留；若正文或附件继续被编辑，仍按 ID/comment 清理本次已提交的批注。 */
   async clearIfUnchanged(sessionId: string, submitted: Draft): Promise<void> {
-    const current = this.snapshot?.[sessionId]
-    if (current === submitted) {
-      this.cancelPending([sessionId])
-      if (this.snapshot !== null) {
-        const drafts = { ...this.snapshot }
-        delete drafts[sessionId]
-        this.publish(drafts)
+    const snapshot = this.snapshot
+    if (snapshot === null) return
+    const current = snapshot[sessionId]
+    if (current !== submitted) {
+      if (!current || submitted.annotations.length === 0) return
+      const submittedComments = new Map(submitted.annotations.map(item => [item.id, item.comment]))
+      const remaining = current.annotations.filter(item => submittedComments.get(item.id) !== item.comment)
+      if (remaining.length === current.annotations.length) return
+      const next = { ...current, annotations: remaining }
+      if (hasDraft(next)) {
+        await this.set(sessionId, next)
+        return
       }
-      await persistDraft(sessionId, emptyDraft).catch(() => {})
-      return
     }
-    if (!current || submitted.annotations.length === 0) return
-    const submittedComments = new Map(submitted.annotations.map(item => [item.id, item.comment]))
-    const remaining = current.annotations.filter(item => submittedComments.get(item.id) !== item.comment)
-    if (remaining.length === current.annotations.length) return
-    const next = { ...current, annotations: remaining }
-    if (!hasDraft(next)) {
-      this.cancelPending([sessionId])
-      if (this.snapshot !== null) {
-        const drafts = { ...this.snapshot }
-        delete drafts[sessionId]
-        this.publish(drafts)
-      }
-      await persistDraft(sessionId, emptyDraft).catch(() => {})
-      return
-    }
-    await this.set(sessionId, next)
+    this.cancelPending([sessionId])
+    const drafts = { ...snapshot }
+    delete drafts[sessionId]
+    this.publish(drafts)
+    await persistDraft(sessionId, emptyDraft).catch(() => {})
   }
 
   /** 清理失败不影响已完成的任务删除或项目移除。 */

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use protocol::{RpcError, RpcRequest, RpcResponse, StreamEvent};
+use protocol::{RpcError, RpcRequest, StreamEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -22,6 +22,13 @@ struct Request {
 struct Response {
     id: u64,
     response: RpcResponse,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RpcResponse {
+    Success { result: Box<RawValue> },
+    Error { error: RpcError },
 }
 
 const STDOUT_WRITER_CAPACITY: usize = 512;
@@ -71,9 +78,13 @@ pub(crate) async fn run(
                     requests.spawn(async move {
                         let response = match serde_json::from_str::<RpcRequest>(call.request.get()) {
                             Ok(request) => rpc::handle(&app, request, request_seq, &shutdown).await,
-                            Err(error) => RpcResponse::Error { error: RpcError::new(error) },
+                            Err(error) => Err(RpcError::new(error)),
                         };
-                        Response { id: call.id, response }
+                        let response = match response {
+                            Ok(result) => RpcResponse::Success { result },
+                            Err(error) => RpcResponse::Error { error },
+                        };
+                        encode_line(&Response { id: call.id, response })
                     });
                 }
                 permit = writer_tx.reserve(), if pending_write.is_some() => {
@@ -81,9 +92,8 @@ pub(crate) async fn run(
                     permit.send(pending_write.take().expect("pending_write is guarded by is_some"));
                 }
                 result = requests.join_next(), if !requests.is_empty() && pending_write.is_none() => {
-                    let response = result.expect("nonempty RPC task set")
-                        .expect("RPC task completes while the runtime is running");
-                    pending_write = Some(encode_line(&response)?);
+                    pending_write = Some(result.expect("nonempty RPC task set")
+                        .expect("RPC task completes while the runtime is running")?);
                 }
                 event = events.recv(), if pending_write.is_none() => {
                     let Some(frame) = event else { break };
@@ -100,7 +110,7 @@ pub(crate) async fn run(
     // EOF 或管道故障都结束接收；先取消目录查询、收齐已接受的修改，再停止会话。
     shutdown.cancel();
     while let Some(joined) = requests.join_next().await {
-        joined.expect("accepted RPC task completes before shutdown");
+        let _ = joined.expect("accepted RPC task completes before shutdown");
     }
     app.shutdown().await;
     if result.is_ok() {

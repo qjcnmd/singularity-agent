@@ -1,7 +1,7 @@
 /**
  * 代码高亮：按需加载 Shiki 语言语法并生成支持明暗双主题的 Token。
  */
-import { createElement, useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { createElement, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 
 /**
  * 支持高亮的语言加载表；使用静态 `import()` 让打包器按语言拆包。
@@ -66,6 +66,7 @@ type Highlighter = Awaited<ReturnType<typeof import('@shikijs/core')['createHigh
 type HighlightedLines = ReturnType<Highlighter['codeToTokens']>['tokens']
 
 let highlighterPromise: Promise<Highlighter> | null = null
+let grammarEpoch = 0
 
 function loadHighlighter(): Promise<Highlighter> {
   highlighterPromise ??= Promise.all([
@@ -91,6 +92,7 @@ function loadLanguage(language: LanguageId): Promise<Highlighter> {
   if (!pending) {
     pending = Promise.all([loadHighlighter(), LANGUAGE_LOADERS[language]()]).then(async ([highlighter, grammar]) => {
       await highlighter.loadLanguage(...grammar.default)
+      grammarEpoch += 1
       return highlighter
     }).catch(error => {
       languagePromises.delete(language)
@@ -101,23 +103,53 @@ function loadLanguage(language: LanguageId): Promise<Highlighter> {
   return pending
 }
 
-function tokenize(highlighter: Highlighter, code: string, lang: LanguageId): HighlightedLines {
-  // 明暗两套配色由库一次给出；defaultColor: false 让样式只保留 CSS 变量，
-  // 由样式表按当前主题选用其中之一。
-  return highlighter.codeToTokens(code, {
-    lang,
-    themes: { light: 'github-light', dark: 'github-dark' },
-    defaultColor: false,
-  }).tokens
+type CodeLine = HighlightedLines[number]
+type GrammarState = ReturnType<Highlighter['codeToTokens']>['grammarState']
+type TokenizedCode = {
+  highlighter: Highlighter
+  lang: LanguageId
+  code: string
+  lines: HighlightedLines
+  completeEnd: number
+  grammarState: GrammarState
+  grammarEpoch: number
 }
 
-type CodeLine = HighlightedLines[number]
+function tokenize(highlighter: Highlighter, code: string, lang: LanguageId, previous: TokenizedCode | null): TokenizedCode {
+  const append = previous?.highlighter === highlighter && previous.lang === lang
+    && previous.grammarEpoch === grammarEpoch && code.startsWith(previous.code)
+  let grammarState = append ? previous.grammarState : undefined
+  const start = append ? previous.completeEnd : 0
+  const completeEnd = code.lastIndexOf('\n') + 1
+  const lines = append ? previous.lines.slice(0, -1) : []
+  const tokenizePart = (from: number, to: number) => {
+    const result = highlighter.codeToTokens(code.slice(from, to), {
+      lang,
+      themes: { light: 'github-light', dark: 'github-dark' },
+      defaultColor: false,
+      grammarState,
+    })
+    if (from > 0) for (const line of result.tokens) {
+      for (const token of line) token.offset += from
+    }
+    return result
+  }
+  if (completeEnd > start) {
+    const result = tokenizePart(start, completeEnd)
+    result.tokens.pop()
+    for (const line of result.tokens) lines.push(line)
+    grammarState = result.grammarState
+  }
+  lines.push(tokenizePart(completeEnd, code.length).tokens[0])
+  return { highlighter, lang, code, lines, completeEnd, grammarState, grammarEpoch }
+}
 
 /** 状态里只记录语言是否加载完成；token 每次渲染时按当前代码计算，不在 Promise 回调里写回。
  *  这样流式输出改变代码时，不会出现“高亮完成 → setState → 再次渲染”的连锁更新。 */
 export function useCodeTokens(code: string, language: string) {
   const lang = languageIdFor(language)
   const [loaded, setLoaded] = useState<{ highlighter: Highlighter; language: LanguageId } | null>(null)
+  const previous = useRef<TokenizedCode | null>(null)
   useEffect(() => {
     if (lang === 'text') return
     let current = true
@@ -128,11 +160,17 @@ export function useCodeTokens(code: string, language: string) {
     )
     return () => { current = false }
   }, [lang])
-  return useMemo(() => {
+  const tokenized = useMemo(() => {
     if (loaded === null || loaded.language !== lang) return null
-    try { return tokenize(loaded.highlighter, code, lang) }
-    catch { return null }
+    try { return tokenize(loaded.highlighter, code, lang, previous.current) }
+    catch {
+      if (previous.current === null) return null
+      try { return tokenize(loaded.highlighter, code, lang, null) }
+      catch { return null }
+    }
   }, [loaded, code, lang])
+  useLayoutEffect(() => { previous.current = tokenized }, [tokenized])
+  return tokenized?.lines ?? null
 }
 
 export function CodeTokens({ tokens }: { tokens: CodeLine }) {

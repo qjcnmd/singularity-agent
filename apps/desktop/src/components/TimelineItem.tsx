@@ -17,6 +17,7 @@ import { formatClock, compactionResultText, formatTurnDuration, toolDisplay, typ
 import type { HistoryItem, SessionModelUsage, ToolStatus, VisibleBackgroundTask } from '../protocol'
 
 const previewLineCount = 8
+export const maxTimelineEntryOffset = 36
 
 interface Props {
   item: TimelineRow['item']
@@ -70,7 +71,7 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
     {item.files && <FileChips files={item.files} />}
   </>
   return (
-    <motion.article initial={{ opacity: 0, y: item.role === 'user' ? 36 : 10, scale: item.role === 'user' ? .84 : .9 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={reduced ? { duration: 0 } : { ...pop, opacity: { duration: .16 } }} style={{ originX: item.role === 'user' ? 1 : 0, originY: 1 }}
+    <motion.article initial={{ opacity: 0, y: item.role === 'user' ? maxTimelineEntryOffset : 10, scale: item.role === 'user' ? .84 : .9 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={reduced ? { duration: 0 } : { ...pop, opacity: { duration: .16 } }} style={{ originX: item.role === 'user' ? 1 : 0, originY: 1 }}
       className={`timeline-item message-item timeline-${item.role}`}
       data-item-id={itemKey}
       aria-label={`${item.role === 'user' ? '你' : APP_NAME}，${factStatusText[item.status]}`}

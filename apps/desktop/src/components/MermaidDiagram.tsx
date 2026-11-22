@@ -10,7 +10,7 @@ let loading: Promise<Mermaid> | null = null
 function loadMermaid(): Promise<Mermaid> {
   return loading ??= import('mermaid').then(({ default: mermaid }) => {
     mermaid.initialize({
-      startOnLoad: false, securityLevel: 'strict', theme: 'base', look: 'classic', fontFamily: 'inherit',
+      startOnLoad: false, suppressErrorRendering: true, securityLevel: 'strict', theme: 'base', look: 'classic', fontFamily: 'inherit',
       // mermaid 12 默认节点文字超过 120px 就换行，节点又窄又容易把单词断开；放宽并加大内边距。
       flowchart: { wrappingWidth: 280, padding: 22, nodeSpacing: 56, rankSpacing: 56 },
       themeVariables: { fontSize: '15px' },
@@ -72,15 +72,18 @@ export function MermaidDiagram({ code, fallback }: { code: string; fallback: Rea
     let active = true
     setDiagram(null)
     void loadMermaid().then(async mermaid => {
-      // 先检查语法：mermaid 渲染失败时会往页面里插一张错误图，检查不过直接保留代码。
-      if (!await mermaid.parse(code, { suppressErrors: true })) return
+      if (!active) return
       // mermaid 改完节点尺寸会立即读回来排版；在 .mermaid-stage 里排版，避开减少动态效果样式给所有元素加的过渡（见 surfaces.css）。
       const stage = document.createElement('div')
       stage.className = 'mermaid-stage'
       document.body.append(stage)
-      const { svg } = await mermaid.render(id, code, stage).finally(() => stage.remove())
-      const [width = 0, height = 0] = /viewBox="[\d.-]+ [\d.-]+ ([\d.]+) ([\d.]+)/.exec(svg)?.slice(1).map(Number) ?? []
-      if (active) setDiagram({ svg, width, height })
+      try {
+        const { svg } = await mermaid.render(id, code, stage)
+        const [width = 0, height = 0] = /viewBox="[\d.-]+ [\d.-]+ ([\d.]+) ([\d.]+)/.exec(svg)?.slice(1).map(Number) ?? []
+        if (active) setDiagram({ svg, width, height })
+      } finally {
+        stage.remove()
+      }
     }).catch(() => {})
     return () => { active = false }
   }, [code, id])

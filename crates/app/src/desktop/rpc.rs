@@ -1,9 +1,9 @@
 //! 工作台 RPC 的适配层：每个方法只分发一次，阻塞操作进入工作线程。
 use super::app_server::AppServer;
 use super::file_view::read_text_file;
-use protocol::{RpcError, RpcRequest, RpcResponse};
+use protocol::{RpcError, RpcRequest};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::value::{RawValue, to_raw_value};
 use std::sync::Arc;
 
 pub(super) async fn handle(
@@ -11,14 +11,10 @@ pub(super) async fn handle(
     request: RpcRequest,
     request_seq: u64,
     shutdown: &tokio_util::sync::CancellationToken,
-) -> RpcResponse {
-    match dispatch(Arc::clone(app), request, request_seq, shutdown).await {
-        Ok(result) => RpcResponse::Success { result },
-        Err(error) => {
-            tracing::warn!(error = %error.message, "RPC request failed");
-            RpcResponse::Error { error }
-        }
-    }
+) -> Result<Box<RawValue>, RpcError> {
+    dispatch(Arc::clone(app), request, request_seq, shutdown)
+        .await
+        .inspect_err(|error| tracing::warn!(error = %error.message, "RPC request failed"))
 }
 
 async fn dispatch(
@@ -26,7 +22,7 @@ async fn dispatch(
     request: RpcRequest,
     request_seq: u64,
     shutdown: &tokio_util::sync::CancellationToken,
-) -> Result<Value, RpcError> {
+) -> Result<Box<RawValue>, RpcError> {
     match request {
         RpcRequest::McpReconnect(params) => {
             let cwd = {
@@ -126,7 +122,7 @@ async fn dispatch(
 
 async fn blocking<T: Serialize>(
     operation: impl FnOnce() -> Result<T, RpcError> + Send + 'static,
-) -> Result<Value, RpcError> {
+) -> Result<Box<RawValue>, RpcError> {
     tokio::task::spawn_blocking(move || Ok(value(operation()?)))
         .await
         .expect("RPC worker completes while the backend is running")
@@ -143,6 +139,6 @@ async fn unless_shutdown<T>(
     }
 }
 
-fn value(output: impl Serialize) -> Value {
-    serde_json::to_value(output).expect("RPC output contains JSON-compatible protocol values")
+fn value(output: impl Serialize) -> Box<RawValue> {
+    to_raw_value(&output).expect("RPC output contains JSON-compatible protocol values")
 }

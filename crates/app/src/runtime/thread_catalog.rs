@@ -5,12 +5,13 @@
 use std::path::{Path, PathBuf};
 
 use agent::session::{
-    SessionData, SessionError, SessionManager, session_images_directory, session_outputs_directory,
+    SessionData, SessionError, SessionManager, scan_session_entries, session_images_directory,
+    session_outputs_directory,
 };
 use protocol::ThreadSummary;
 use uuid::Uuid;
 
-use crate::runtime::history::summarize_thread;
+use crate::runtime::history::ThreadSummaryScan;
 
 pub(crate) const SESSIONS_DIR_NAME: &str = "sessions";
 
@@ -68,8 +69,14 @@ impl ThreadCatalog {
             let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) else {
                 continue;
             };
-            match open_thread_read_only(&self.sessions_dir, thread_id) {
-                Ok(session) => threads.push(summarize_thread(&session)),
+            let path = checked_session_path(&self.sessions_dir, thread_id)?;
+            let mut summary = ThreadSummaryScan::default();
+            match scan_session_entries(&path, thread_id, |entry| summary.observe(&entry))
+                .map_err(|error| CatalogError::session(thread_id, &path, error))
+            {
+                Ok((cwd, created_at)) => {
+                    threads.push(summary.finish(thread_id, app_core::display_path(&cwd), created_at));
+                }
                 Err(CatalogError::NotFound(_)) => {}
                 Err(error) => return Err(error),
             }

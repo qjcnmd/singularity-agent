@@ -1,16 +1,34 @@
 use std::io::BufRead;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::format::{Result, SessionEntry, SessionError, SessionHeader, SessionMetadata};
 use super::manager::SessionData;
 
 /// 逐行解析会话日志；最后一行没有换行时不解析，返回它的起始位置供写者截掉。
 pub(super) fn parse_session_file(file: &Path) -> Result<(SessionData, Option<u64>)> {
+    let mut entries = Vec::new();
+    let (header, cwd, repair) = scan_session_file(file, |entry| entries.push(entry))?;
+    Ok((
+        SessionData {
+            file: file.to_path_buf(),
+            cwd,
+            entries,
+            session_id: header.id,
+            header_timestamp: header.timestamp,
+        },
+        repair,
+    ))
+}
+
+pub(super) fn scan_session_file(
+    file: &Path,
+    mut visit: impl FnMut(SessionEntry),
+) -> Result<(SessionHeader, PathBuf, Option<u64>)> {
     let handle = std::fs::File::open(file)?;
     let mut reader = BufReader::new(handle);
-    let mut entries = Vec::new();
     let mut header = None;
+    let mut first_is_settings = None;
     let mut repair = None;
     let mut offset = 0u64;
     let mut line_number = 1usize;
@@ -52,7 +70,14 @@ pub(super) fn parse_session_file(file: &Path) -> Result<(SessionData, Option<u64
             header = Some(parsed.validate()?);
         } else {
             let entry = serde_json::from_str(text).map_err(parse_error)?;
-            entries.push(entry);
+            first_is_settings.get_or_insert(matches!(
+                entry,
+                SessionEntry::Metadata {
+                    metadata: SessionMetadata::ThreadSettings { .. },
+                    ..
+                }
+            ));
+            visit(entry);
         }
         offset += buffer.len() as u64;
         line_number += 1;
@@ -61,25 +86,10 @@ pub(super) fn parse_session_file(file: &Path) -> Result<(SessionData, Option<u64
         SessionError::InvalidSession(format!("Session file is not a valid session: {}", file.display()))
     })?;
     let cwd = header.canonical_cwd()?;
-    if !matches!(
-        entries.first(),
-        Some(SessionEntry::Metadata {
-            metadata: SessionMetadata::ThreadSettings { .. },
-            ..
-        })
-    ) {
+    if first_is_settings != Some(true) {
         return Err(SessionError::InvalidSession(format!("会话日志缺少初始模型选择：{}", file.display())));
     }
-    Ok((
-        SessionData {
-            file: file.to_path_buf(),
-            cwd,
-            entries,
-            session_id: header.id,
-            header_timestamp: header.timestamp,
-        },
-        repair,
-    ))
+    Ok((header, cwd, repair))
 }
 
 pub(super) fn repair_tail(file: &Path, offset: u64) -> Result<()> {
