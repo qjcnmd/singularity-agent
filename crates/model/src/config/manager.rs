@@ -236,3 +236,64 @@ fn catalog_from_data(data: &UserConfigFile) -> RedactedModelCatalog {
         .collect();
     RedactedModelCatalog { error, default_selection, providers }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ModelConfigManager;
+    use protocol::ModelSelection;
+
+    fn selection(reasoning: Option<&str>) -> ModelSelection {
+        ModelSelection {
+            provider: "p".into(),
+            model: "m".into(),
+            reasoning: reasoning.map(str::to_string),
+        }
+    }
+
+    fn open_with(variants: &str) -> (std::path::PathBuf, ModelConfigManager) {
+        let directory = std::env::temp_dir().join(format!(
+            "singularity-reasoning-{}-{}",
+            std::process::id(),
+            variants.len()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp config dir");
+        let config = format!(
+            r#"{{
+                "providers": {{
+                    "p": {{
+                        "api_key": "test-key",
+                        "api_protocol": "messages",
+                        "base_url": "https://example.invalid",
+                        "models": {{
+                            "m": {{
+                                "max_context_tokens": 8000,
+                                "max_output_tokens": 1024,
+                                "reasoning_variants": {variants}
+                            }}
+                        }}
+                    }}
+                }}
+            }}"#
+        );
+        std::fs::write(directory.join("config.json"), config).expect("write config");
+        let manager = ModelConfigManager::open(directory.clone());
+        (directory, manager)
+    }
+
+    #[test]
+    fn reasoning_selection_follows_the_configured_list() {
+        let (with_off, models) = open_with(r#"["off","high"]"#);
+        assert!(models.validate_selection(&selection(Some("off"))).is_ok());
+        assert!(models.validate_selection(&selection(Some("high"))).is_ok());
+        assert!(models.validate_selection(&selection(None)).is_ok());
+        let removed = models.validate_selection(&selection(Some("max")));
+        assert!(removed.is_err(), "a tier removed from the list must fail");
+        std::fs::remove_dir_all(with_off).expect("cleanup");
+
+        let (without_off, models) = open_with(r#"["high"]"#);
+        assert!(models.validate_selection(&selection(Some("high"))).is_ok());
+        assert!(models.validate_selection(&selection(None)).is_ok());
+        assert!(models.validate_selection(&selection(Some("off"))).is_err());
+        std::fs::remove_dir_all(without_off).expect("cleanup");
+    }
+}

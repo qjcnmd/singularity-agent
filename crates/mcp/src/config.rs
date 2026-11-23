@@ -311,3 +311,64 @@ pub(crate) fn write(home: &Path, config: &Configuration) -> Result<(), McpError>
     app_core::write_json_atomic(&home.join("mcp.json"), config)
         .map_err(|source| McpError::io("无法保存 mcp.json", source))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConfig;
+    use protocol::McpTransportConfig;
+    use std::collections::BTreeMap;
+
+    fn stdio(env: &[(&str, &str)]) -> ServerConfig {
+        ServerConfig {
+            startup_timeout_sec: 30,
+            tool_timeout_sec: 120,
+            transport: McpTransportConfig::Stdio {
+                command: "server".into(),
+                args: Vec::new(),
+                cwd: None,
+                env: env.iter().map(|(key, value)| ((*key).to_string(), (*value).to_string())).collect(),
+            },
+        }
+    }
+
+    fn hides(name: &str, secret: &str) {
+        let redacted = stdio(&[(name, secret)]).redact(format!("boom {secret}"));
+        assert!(!redacted.contains(secret), "{name} leaked: {redacted}");
+        assert!(redacted.contains("[redacted]"), "{name} was not redacted: {redacted}");
+    }
+
+    #[test]
+    fn redact_covers_common_secret_fields_and_encoded_passwords() {
+        for (name, secret) in [
+            ("API_KEY", "sek-api-key"),
+            ("X-Api-Key", "sek-x-api-key"),
+            ("apiKey", "sek-apiKey"),
+            ("accessToken", "sek-accessToken"),
+            ("password", "sek-password"),
+            ("Authorization", "sek-authorization"),
+            ("CACHE_KEY", "sek-cache-key"),
+            ("tokenCount", "sek-token-count"),
+        ] {
+            hides(name, secret);
+        }
+
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".into(), "Bearer sek-bearer".into());
+        let http = ServerConfig {
+            startup_timeout_sec: 30,
+            tool_timeout_sec: 120,
+            transport: McpTransportConfig::Http {
+                url: "https://user:p%2Fass@example.invalid/mcp?api_key=sek-query".into(),
+                headers,
+            },
+        };
+        let redacted = http.redact("auth p%2Fass p/ass sek-query Bearer sek-bearer tail".into());
+        for secret in ["p%2Fass", "p/ass", "sek-query", "sek-bearer"] {
+            assert!(!redacted.contains(secret), "leaked {secret} in {redacted}");
+        }
+
+        let overlapped =
+            stdio(&[("API_KEY", "sek"), ("accessToken", "sek-long")]).redact("value sek-long".into());
+        assert_eq!(overlapped, "value [redacted]");
+    }
+}

@@ -23,7 +23,6 @@ const PREFIX_DIGEST_SEED: &str = "singularity-messages-prefix/v1";
 pub(crate) struct EncodedMessagesRequest {
     pub(crate) payload: Value,
     pub(crate) prefix_digest: String,
-    pub(crate) effective_reasoning: Option<String>,
 }
 
 pub(crate) fn messages_stream_request_payload(
@@ -83,17 +82,11 @@ pub(crate) fn messages_stream_request_payload(
         payload["tools"] = tools_json;
     }
     let reasoning = reasoning_wire_decision(selection);
-    let mut effective_reasoning = selection.reasoning_variant.clone();
     match reasoning.enabled {
         Some(true) => {
-            if trailing_tool_turn_lacks_thinking(&messages) {
-                payload["thinking"] = json!({ "type": "disabled" });
-                effective_reasoning = Some("off".to_string());
-            } else {
-                payload["thinking"] = json!({ "type": "adaptive" });
-                if let Some(effort) = reasoning.effort {
-                    payload["output_config"] = json!({ "effort": effort });
-                }
+            payload["thinking"] = json!({ "type": "adaptive" });
+            if let Some(effort) = reasoning.effort {
+                payload["output_config"] = json!({ "effort": effort });
             }
         }
         Some(false) => {
@@ -101,38 +94,7 @@ pub(crate) fn messages_stream_request_payload(
         }
         None => {}
     }
-    Ok(EncodedMessagesRequest {
-        payload,
-        prefix_digest: final_digest,
-        effective_reasoning,
-    })
-}
-
-fn trailing_tool_turn_lacks_thinking(encoded: &[Value]) -> bool {
-    if encoded.len() < 2 {
-        return false;
-    }
-    let last = &encoded[encoded.len() - 1];
-    let prev = &encoded[encoded.len() - 2];
-    if last.get("role").and_then(Value::as_str) != Some("user")
-        || prev.get("role").and_then(Value::as_str) != Some("assistant")
-    {
-        return false;
-    }
-    let has_tool_result = last.get("content").and_then(Value::as_array).is_some_and(|blocks| {
-        blocks.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
-    });
-    if !has_tool_result {
-        return false;
-    }
-    let starts_with_thinking = prev
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|blocks| blocks.first())
-        .and_then(|block| block.get("type"))
-        .and_then(Value::as_str)
-        .is_some_and(|kind| matches!(kind, "thinking" | "redacted_thinking"));
-    !starts_with_thinking
+    Ok(EncodedMessagesRequest { payload, prefix_digest: final_digest })
 }
 
 fn encode_messages(
@@ -318,66 +280,161 @@ fn chain_digest(previous: &str, value: &Value) -> String {
     sha256_hex(&[previous.as_bytes(), b"\0", &serialized])
 }
 
-/// 纯 Rust FIPS 180-4 SHA-256，用于 Messages 前缀哈希绑定，不引入额外依赖。
 fn sha256_hex(parts: &[&[u8]]) -> String {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-    ];
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-    ];
-    let total_len: usize = parts.iter().map(|p| p.len()).sum();
-    let mut buf = Vec::with_capacity(total_len + 72);
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
     for part in parts {
-        buf.extend_from_slice(part);
-    }
-    buf.push(0x80);
-    while buf.len() % 64 != 56 {
-        buf.push(0);
-    }
-    buf.extend_from_slice(&((total_len as u64).wrapping_mul(8)).to_be_bytes());
-
-    for chunk in buf.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for (idx, word) in chunk.chunks_exact(4).enumerate() {
-            w[idx] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (slot, delta) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-            *slot = slot.wrapping_add(delta);
-        }
+        hasher.update(part);
     }
     let mut out = String::with_capacity(64);
-    for word in h {
-        let _ = write!(out, "{word:08x}");
+    for byte in hasher.finalize() {
+        let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::selection::{ProviderConfig, SelectedModel};
+    use crate::types::ModelToolCall;
+    use protocol::ProviderApiProtocol;
+
+    fn selection(reasoning: Option<&str>) -> SelectedModel {
+        SelectedModel {
+            model_name: "demo".into(),
+            protocol: ProviderApiProtocol::Messages,
+            max_context_tokens: 64_000,
+            max_output_tokens: 4096,
+            reasoning_variant: reasoning.map(str::to_string),
+        }
+    }
+
+    fn tool_continuation(reasoning: Option<&str>) -> EncodedMessagesRequest {
+        let assistant = Message::assistant(
+            String::new(),
+            String::new(),
+            vec![ModelToolCall {
+                tool_call_id: "call_1".into(),
+                tool_name: "bash".into(),
+                arguments: serde_json::json!({}),
+                metadata: None,
+            }],
+            None,
+        );
+        let tool_result = Message::ToolResult {
+            content: vec![crate::ContentBlock::text("ok")],
+            tool_call_id: "call_1".into(),
+            is_error: false,
+        };
+        let request = ModelTurnRequest {
+            messages: vec![Message::user("run it"), assistant, tool_result],
+            images: std::collections::HashMap::new(),
+            tools: Vec::new(),
+            max_output_tokens: 1024,
+        };
+        messages_stream_request_payload(
+            &request,
+            &selection(reasoning),
+            "p",
+            "https://example.invalid/v1/messages",
+        )
+        .expect("tool continuation encodes")
+    }
+
+    #[test]
+    fn sha256_matches_standard_vectors() {
+        assert_eq!(sha256_hex(&[b""]), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(sha256_hex(&[b"abc"]), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(sha256_hex(&[b"ab", b"c"]), sha256_hex(&[b"abc"]));
+    }
+
+    #[test]
+    fn prefix_digest_stays_on_the_sha256_chain() {
+        let request = ModelTurnRequest {
+            messages: vec![Message::developer("sys v1"), Message::user("first prompt")],
+            images: std::collections::HashMap::new(),
+            tools: Vec::new(),
+            max_output_tokens: 1024,
+        };
+        let encoded = messages_stream_request_payload(
+            &request,
+            &selection(Some("high")),
+            "p",
+            "https://example.invalid/v1/messages",
+        )
+        .expect("prefix encodes");
+        assert_eq!(encoded.prefix_digest, "ef8122c8843fdb674a0f4848d5e13cf1e3097cf5ae52753c6b27707d44115bbd");
+        let again = messages_stream_request_payload(
+            &request,
+            &selection(Some("high")),
+            "p",
+            "https://example.invalid/v1/messages",
+        )
+        .expect("prefix encodes again");
+        assert_eq!(again.prefix_digest, encoded.prefix_digest);
+    }
+
+    #[test]
+    fn selected_high_stays_when_tool_result_has_no_thinking_block() {
+        let encoded = tool_continuation(Some("high"));
+        assert_eq!(encoded.payload.pointer("/thinking/type").and_then(Value::as_str), Some("adaptive"));
+        assert_eq!(encoded.payload.pointer("/output_config/effort").and_then(Value::as_str), Some("high"));
+        let assistant = encoded
+            .payload
+            .pointer("/messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+            })
+            .expect("assistant message");
+        let first = assistant.pointer("/content/0/type").and_then(Value::as_str);
+        assert_eq!(first, Some("tool_use"));
+    }
+
+    #[test]
+    fn selected_off_disables_thinking_and_null_omits_it() {
+        let off = tool_continuation(Some("off"));
+        assert_eq!(off.payload.pointer("/thinking/type").and_then(Value::as_str), Some("disabled"));
+        assert!(off.payload.get("output_config").is_none());
+        let unset = tool_continuation(None);
+        assert!(unset.payload.get("thinking").is_none());
+        assert!(unset.payload.get("output_config").is_none());
+    }
+
+    #[test]
+    fn reply_records_the_selected_tier() {
+        let config = ProviderConfig {
+            provider_name: "p".into(),
+            base_url: "https://example.invalid".into(),
+            api_key: "k".into(),
+        };
+        let events = vec![
+            serde_json::json!({ "type": "message_start", "message": { "usage": { "input_tokens": 3 } } }),
+            serde_json::json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+            serde_json::json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "done" } }),
+            serde_json::json!({ "type": "content_block_stop", "index": 0 }),
+            serde_json::json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 1 } }),
+            serde_json::json!({ "type": "message_stop" }),
+        ];
+        for (reasoning, expected) in [
+            (Some("high"), Some("high")),
+            (Some("off"), Some("off")),
+            (None, None),
+        ] {
+            let response = super::stream::decode_messages_events_for_test(
+                &events,
+                &config,
+                &selection(reasoning),
+                "https://example.invalid/v1/messages",
+            );
+            assert!(response.error().is_none(), "{:?}", response.error());
+            assert_eq!(
+                response.assistant_message.provider_metadata().and_then(|meta| meta.reasoning.as_deref()),
+                expected
+            );
+        }
+    }
 }

@@ -159,24 +159,18 @@ impl RequestContext {
         let prev_provider = previous_selection.provider.clone();
         let prev_model = previous_selection.model.clone();
         let models = std::sync::Arc::clone(&self.models);
-        let previous_client = tokio::task::spawn_blocking(move || {
-            ModelClient::new(&models, &previous_selection).or_else(|error| {
-                if previous_selection.reasoning.is_some() {
-                    let fallback = ModelSelection { reasoning: None, ..previous_selection };
-                    ModelClient::new(&models, &fallback)
-                } else {
-                    Err(error)
-                }
-            })
-        })
-        .await
-        .expect("previous model client resolution completes while the runtime is running")
-        .map_err(|error| {
-            AgentError::InvalidCompaction(switch_error(
-                target,
-                format_args!("切换前原模型 {prev_provider}/{prev_model} 不可用（{error}），无法压缩上下文。"),
-            ))
-        })?;
+        let previous_client =
+            tokio::task::spawn_blocking(move || ModelClient::new(&models, &previous_selection))
+                .await
+                .expect("previous model client resolution completes while the runtime is running")
+                .map_err(|error| {
+                    AgentError::InvalidCompaction(switch_error(
+                        target,
+                        format_args!(
+                            "切换前原模型 {prev_provider}/{prev_model} 不可用（{error}），无法压缩上下文。"
+                        ),
+                    ))
+                })?;
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
