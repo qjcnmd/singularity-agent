@@ -139,4 +139,4 @@ npm --prefix apps/desktop run package -- --config.directories.output=D:/Singular
 产物输出于 `D:/SingularityBuild/release/win-unpacked/`。退出 Singularity 后整体替换 `~/Desktop/Singularity`，从桌面目录验证通过后删除临时成品，只保留桌面这一份运行包。用户数据保留在 `~/.singularity`。
 
 ### CI
-- **CI 工作流** (`.github/workflows/ci.yml`)：推送到 `main` 时运行前端 Lint 与严格构建、Rust 格式化检查、跨端协议声明同步校验、Clippy、编译、属性测试与后端黑盒不变量测试，以及依赖安全检查。
+- **CI 工作流** (`.github/workflows/ci.yml`)：推送到 `main`，以及目标分支为 `main` 的 pull request，运行前端 Lint 与严格构建、Rust 格式化检查、跨端协议声明同步校验、Clippy、编译、属性测试与后端黑盒不变量测试，以及依赖安全检查。
