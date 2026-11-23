@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore } from '../appStore'
 import { palette } from '../bubbleColors'
 import type { RedactedProvider } from '../protocol'
@@ -14,6 +14,7 @@ type ProviderEditorState = null | 'new' | RedactedProvider
 export function Settings() {
   const state = useAppStore(['theme', 'accentColor', 'bootstrap', 'settingsOpen', 'messageFontSize', 'actionErrors', 'pendingActions'])
   const [fontSizeDraft, setFontSizeDraft] = useState(() => String(state.messageFontSize))
+  const skipBlurCommitRef = useRef(false)
   const [editor, setEditor] = useState<ProviderEditorState>(null)
   const [editorVersion, setEditorVersion] = useState(0)
   const [removing, setRemoving] = useState<RedactedProvider | null>(null)
@@ -53,6 +54,10 @@ export function Settings() {
   }
 
   function commitFontSizeDraft() {
+    if (skipBlurCommitRef.current) {
+      skipBlurCommitRef.current = false
+      return
+    }
     const trimmed = fontSizeDraft.trim()
     const parsed = Number(trimmed)
     if (trimmed === '' || !Number.isFinite(parsed)) {
@@ -111,11 +116,18 @@ export function Settings() {
                   max={messageFontSize.max}
                   step=".5"
                   value={fontSizeDraft}
+                  onFocus={() => { skipBlurCommitRef.current = false }}
                   onChange={event => setFontSizeDraft(event.target.value)}
                   onBlur={commitFontSizeDraft}
                   onKeyDown={event => {
                     if (event.key === 'Enter') event.currentTarget.blur()
-                    else if (event.key === 'Escape') { setFontSizeDraft(String(state.messageFontSize)); event.currentTarget.blur() }
+                    else if (event.key === 'Escape') {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      skipBlurCommitRef.current = true
+                      setFontSizeDraft(String(state.messageFontSize))
+                      event.currentTarget.blur()
+                    }
                   }}
                 />
                 <span>px</span>

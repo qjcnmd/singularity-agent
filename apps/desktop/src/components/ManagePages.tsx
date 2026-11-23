@@ -35,8 +35,16 @@ export function InstructionsPage() {
   const [showSaved, setShowSaved] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
+  const workspaces = state.bootstrap?.workspaces
+  const targetExists = target === null
+    || workspaces === undefined
+    || workspaces.some(workspace => workspaceKey(workspace.root) === target)
+  const effectiveTarget = targetExists ? target : null
+  useEffect(() => {
+    if (!targetExists) setTarget(null)
+  }, [targetExists])
   const reduced = useReducedMotion()
-  const key = target ?? 'global'
+  const key = effectiveTarget ?? 'global'
   const saved = documents[key]
   const text = drafts[key] ?? saved?.content ?? ''
   const dirty = saved !== undefined && text !== saved.content
@@ -44,12 +52,12 @@ export function InstructionsPage() {
     let active = true
     setLoading(true)
     setError(null)
-    void appStore.transport.rpc('instructions.read', { workspaceRoot: target }).then(document => {
+    void appStore.transport.rpc('instructions.read', { workspaceRoot: effectiveTarget }).then(document => {
       if (active) setDocuments(current => ({ ...current, [key]: document }))
     }).catch(error => { if (active) setError(error instanceof Error ? error.message : String(error)) })
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
-  }, [target, key, reload])
+  }, [effectiveTarget, key, reload])
   useEffect(() => {
     if (!showSaved) return
     const timeout = window.setTimeout(() => setShowSaved(false), 2400)
@@ -60,7 +68,7 @@ export function InstructionsPage() {
     setShowSaved(false)
     setError(null)
     try {
-      const document = await appStore.transport.rpc('instructions.save', { workspaceRoot: target, content: text })
+      const document = await appStore.transport.rpc('instructions.save', { workspaceRoot: effectiveTarget, content: text })
       setDocuments(current => ({ ...current, [key]: document }))
       setDrafts(current => { const next = { ...current }; delete next[key]; return next })
       setShowSaved(true)
@@ -70,10 +78,10 @@ export function InstructionsPage() {
   return <PageFrame title="自定义指令" subtitle="为全局或指定项目配置默认规则（AGENTS.md）。">
     <div className="instructions-layout">
       <nav className="instruction-targets" aria-label="指令范围" role="tablist">
-        <button type="button" role="tab" disabled={saving} aria-selected={target === null} onClick={() => setTarget(null)}>全局</button>
+        <button type="button" role="tab" disabled={saving} aria-selected={effectiveTarget === null} onClick={() => setTarget(null)}>全局</button>
         {state.bootstrap?.workspaces.map(workspace => {
           const root = workspaceKey(workspace.root)
-          return <button key={root} type="button" role="tab" disabled={saving} aria-selected={target === root} onClick={() => setTarget(root)}>
+          return <button key={root} type="button" role="tab" disabled={saving} aria-selected={effectiveTarget === root} onClick={() => setTarget(root)}>
             {workspaceName(workspace)}
           </button>
         })}

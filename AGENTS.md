@@ -25,6 +25,19 @@ Windows 本地单用户桌面 AI 编程工作台：Electron 前端（`apps/deskt
   * **版本固定**：项目包版本固定 `0.1.0`，会话日志格式固定 `1`（外部依赖和标准协议按各自版本要求）。改会话格式后直接退出应用并清空 `~/.singularity/sessions/`（含附件），不写旧格式识别或迁移。
   * **验收准备**：真机现场验收前直接退出占锁的 Singularity 实例；对验证有帮助时直接调用真实模型。
 
+## 结构与体量纪律
+
+* **目标**：以“职责清晰、可维护前提下让**项目整体稳态代码量与概念数最少**”为准，不以“单次 diff 最小”在外层叠补丁；若合并重复逻辑或整理局部结构能让整体更小，允许更宽的当次改动。
+* **先复用再新增**：先复用现有状态、通知与通道，不为边缘问题新建平行状态机、冗余包装或多余持久化字段；不为躲过 600 行上限机械切碎高内聚文件。
+* **大改动收口**：修改超过约 5 个文件或净增超过约 200 行时，进门禁前先通读完整 `git diff` 清理过度设计，并在交付时如实汇报净增行数与新增文件数。
+
+## 注释纪律
+
+* 只随当前改动清理注释，不单独发起全仓扫注释提交。
+* 不写复述代码行为的注释；代码不直白时优先改命名或简化结构。
+* 能用类型、断言、Lint 或常驻测试锁死的约束，改为代码或测试强制执行，不留口头警告注释。
+* 仅保留外部不可控事实的简短说明（Windows / 第三方协议怪癖、安全或 Lint 豁免理由、CI SHA 锁定版本号如 `# v6`）。
+
 ## 改动后同步
 
 | 改动 | 同步动作 |
@@ -39,7 +52,7 @@ Windows 本地单用户桌面 AI 编程工作台：Electron 前端（`apps/deskt
 * **红线**：生产代码与功能验收只用真实提供方和模型，进程内不做 Mock；常驻自动化测试隔离 `SINGULARITY_HOME`；增删或修改测试前先读[测试保留与清理标准](docs/development.md#测试保留与清理标准)，临时脚本与非不变量测试验证后即删。
 * **分级完成判据**（通过即止，不反复重跑）：
   * **纯文档 / 配置改动**：核对文档内容与源码事实一致即可。
-  * **代码修改 / Bug 修复**：按受影响范围执行统一脚本（与 CI 全参门禁一致）：
+  * **代码修改 / Bug 修复**：按受影响范围执行统一脚本（与 CI 全参门禁一致；`rust` / `desktop` / `all` 均含 600 行上限检查，亦可单独 `-Scope size`）：
     * Rust：`pwsh -File scripts/check.ps1 -Scope rust`（`cargo fmt` + `cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings` + `cargo test --workspace --locked`）
     * 跨端协议：`pwsh -File scripts/check.ps1 -Scope protocol`
     * 前端 / 桌面主进程：`pwsh -File scripts/check.ps1 -Scope desktop`（`lint` + `build` + `cargo build -p app --locked` + `prepare:runtime` + `test:e2e`）

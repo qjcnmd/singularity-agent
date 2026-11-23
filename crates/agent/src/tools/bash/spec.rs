@@ -15,11 +15,15 @@ pub(crate) struct BashArgs {
     pub(crate) description: String,
     #[serde(default)]
     pub(crate) timeout_ms: Option<NonZeroU64>,
-    #[serde(default = "default_yield_time_ms")]
-    pub(crate) yield_time_ms: u64,
+    #[serde(default)]
+    pub(crate) yield_time_ms: Option<u64>,
 }
 
 impl BashArgs {
+    pub(crate) fn yield_time_ms(&self) -> u64 {
+        self.yield_time_ms.unwrap_or(10_000)
+    }
+
     pub(crate) fn validate(self) -> Result<Self, ToolExecution> {
         if self.description.is_empty() {
             return Err(error_result("description must not be empty"));
@@ -27,15 +31,11 @@ impl BashArgs {
         if self.timeout_ms.is_some_and(|ms| ms.get() > MAX_TIMEOUT_MS) {
             return Err(error_result(format!("timeout_ms must be at most {MAX_TIMEOUT_MS}")));
         }
-        if self.yield_time_ms > MAX_WAIT_MS {
+        if self.yield_time_ms() > MAX_WAIT_MS {
             return Err(error_result("yield_time_ms must be between 0 and 30000"));
         }
         Ok(self)
     }
-}
-
-fn default_yield_time_ms() -> u64 {
-    10_000
 }
 
 #[derive(Debug, Deserialize)]

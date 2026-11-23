@@ -66,6 +66,14 @@ const PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
 const PROVIDER_RATE_LIMIT_EXCEEDED_CODE: &str = "rate_limit_exceeded";
 const PROVIDER_SERVER_ERROR_CODE: &str = "server_error";
 const PROVIDER_INSUFFICIENT_QUOTA_CODE: &str = "insufficient_quota";
+const INVALID_REQUEST_OVERFLOW_PATTERNS: &[&str] = &[
+    "prompt is too long",
+    "maximum context length",
+    "exceed context limit",
+    "exceeds the context window",
+    "context_length_exceeded",
+    "too many tokens",
+];
 pub(crate) const MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS: usize = 256;
 
 #[derive(Default)]
@@ -136,7 +144,9 @@ fn provider_error_kind_for_fields(fields: &ProviderErrorBodyFields) -> Option<Mo
         Some(PROVIDER_INSUFFICIENT_QUOTA_CODE) => Some(ModelErrorKind::Other),
         Some("invalid_request_error") => fields.message.as_deref().and_then(|message| {
             let lower = message.to_ascii_lowercase();
-            (lower.contains("prompt is too long") || lower.contains("maximum context length"))
+            INVALID_REQUEST_OVERFLOW_PATTERNS
+                .iter()
+                .any(|pattern| lower.contains(pattern))
                 .then_some(ModelErrorKind::ContextLengthExceeded)
         }),
         _ => None,

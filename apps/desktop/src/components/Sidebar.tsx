@@ -214,11 +214,9 @@ function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () =
   const method = state.kind === 'rename' ? 'session.rename' : state.kind === 'delete' ? 'session.delete' : 'workspace.remove'
   const origin = state.kind === 'none'
     ? null
-    : state.kind === 'rename'
-      ? actionOrigin.inline(method, state.session.threadId)
-      : state.kind === 'delete'
-        ? actionOrigin.session(state.session.threadId)
-        : actionOrigin.inline(method, workspaceKey(state.workspace.root))
+    : state.kind === 'remove'
+      ? actionOrigin.inline(method, workspaceKey(state.workspace.root))
+      : actionOrigin.inline(method, state.session.threadId)
   const busy = origin !== null && pendingActions.has(pendingKey(method, origin))
   const close = () => { if (!busy) onClose() }
   const initialName = state.kind === 'rename' ? state.session.title ?? '' : ''

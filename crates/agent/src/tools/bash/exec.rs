@@ -91,6 +91,10 @@ impl Process {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            // Windows Python defaults to the ANSI code page (e.g. CP936) on piped stdio; force UTF-8 unless overridden.
+            if std::env::var_os("PYTHONUTF8").is_none() {
+                command.env("PYTHONUTF8", "1");
+            }
             let mut wrapped = CommandWrap::from(command);
             wrapped
                 .wrap(CreationFlags(windows::Win32::System::Threading::CREATE_NO_WINDOW))

@@ -11,7 +11,9 @@ use crate::error::{
 use crate::provider::{
     ProviderStreamEvent, finalize_provider_response, parse_tool_arguments, provider_response_validation_error,
 };
-use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
+use crate::transport::stream::{
+    SseStreamDecoder, provider_stream_malformed_error, provider_stream_unterminated_error, read_sse_stream,
+};
 use crate::types::{
     ContentBlock, Message, ModelStopReason, ModelToolCall, ModelTurnResponse, ModelUsage,
     ProviderBlockMetadata, ProviderMessageMetadata,
@@ -118,12 +120,17 @@ struct MessagesSseDecoder<'a> {
     usage: MessagesUsageAccumulator,
     stop_reason: Option<String>,
     completed: bool,
+    received_event: bool,
     on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send),
 }
 
 impl SseStreamDecoder for MessagesSseDecoder<'_> {
     fn frame_malformed(reason: &'static str) -> ProviderError {
         provider_messages_stream_malformed_error(reason)
+    }
+
+    fn frame_unterminated(&self) -> ProviderError {
+        provider_stream_unterminated_error("provider Messages stream was malformed", self.received_event)
     }
 
     fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError> {
@@ -175,6 +182,7 @@ impl SseStreamDecoder for MessagesSseDecoder<'_> {
             }
             _ => {}
         }
+        self.received_event = true;
         Ok(())
     }
 
@@ -190,6 +198,7 @@ impl<'a> MessagesSseDecoder<'a> {
             usage: MessagesUsageAccumulator::default(),
             stop_reason: None,
             completed: false,
+            received_event: false,
             on_event,
         }
     }
@@ -324,7 +333,7 @@ impl<'a> MessagesSseDecoder<'a> {
     ) -> ModelTurnResponse {
         let stop_reason = result.and_then(|()| {
             if !self.completed {
-                return Err(provider_messages_stream_terminal_missing_error());
+                return Err(provider_messages_stream_terminal_missing_error(self.received_event));
             }
             match self.stop_reason.as_deref() {
                 Some("end_turn" | "tool_use" | "stop_sequence" | "pause_turn") => Ok(ModelStopReason::Stop),
@@ -434,6 +443,11 @@ fn provider_messages_stream_malformed_error(reason: &'static str) -> ProviderErr
     provider_stream_malformed_error("provider Messages stream was malformed", reason)
 }
 
-fn provider_messages_stream_terminal_missing_error() -> ProviderError {
-    ProviderError::new(ModelErrorKind::Other, "provider Messages stream did not contain message_stop")
+fn provider_messages_stream_terminal_missing_error(received_event: bool) -> ProviderError {
+    let kind = if received_event {
+        ModelErrorKind::Temporary
+    } else {
+        ModelErrorKind::Other
+    };
+    ProviderError::new(kind, "provider Messages stream did not contain message_stop")
 }

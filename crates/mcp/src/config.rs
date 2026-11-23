@@ -1,7 +1,7 @@
 use crate::McpError;
 use protocol::{McpServerInput, McpTransportConfig};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::Path};
+use std::{borrow::Cow, collections::BTreeMap, path::Path};
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,70 +100,112 @@ impl ServerConfig {
     }
 
     pub fn redact(&self, error: String) -> String {
-        use std::borrow::Cow;
-
-        let values: Vec<Cow<'_, str>> = match &self.transport {
-            McpTransportConfig::Stdio { env, .. } => env
-                .iter()
-                .filter(|(name, _)| is_secret_name(name))
-                .map(|(_, value)| Cow::Borrowed(value.as_str()))
-                .collect(),
+        let mut values: Vec<Cow<'_, str>> = Vec::new();
+        match &self.transport {
+            McpTransportConfig::Stdio { args, env, .. } => {
+                for (name, value) in env {
+                    if is_secret_name(name) {
+                        collect_secret_value(value, &mut values);
+                    }
+                }
+                collect_arg_secrets(args, &mut values);
+            }
             McpTransportConfig::Http { url, headers } => {
-                let mut values: Vec<Cow<'_, str>> = Vec::new();
                 if let Ok(parsed) = reqwest::Url::parse(url) {
-                    if !parsed.username().is_empty() {
-                        values.push(Cow::Owned(parsed.username().to_owned()));
-                        if let Some(decoded) = percent_decode(parsed.username()) {
-                            values.push(Cow::Owned(decoded));
-                        }
-                    }
-                    if let Some(password) = parsed.password().filter(|value| !value.is_empty()) {
-                        values.push(Cow::Owned(password.to_owned()));
-                        if let Some(decoded) = percent_decode(password) {
-                            values.push(Cow::Owned(decoded));
-                        }
-                    }
+                    collect_parsed_url_secrets(&parsed, &mut values);
                     if let Some(query) = parsed.query() {
                         values.push(Cow::Owned(query.to_owned()));
-                        for pair in query.split('&') {
-                            if let Some((key, value)) = pair.split_once('=')
-                                && is_secret_name(key)
-                                && !value.is_empty()
-                            {
-                                values.push(Cow::Owned(value.to_owned()));
-                            }
-                        }
-                    }
-                    for (key, value) in parsed.query_pairs() {
-                        if is_secret_name(&key) && !value.is_empty() {
-                            values.push(Cow::Owned(value.into_owned()));
-                        }
                     }
                 } else {
                     values.push(Cow::Borrowed(url.as_str()));
                 }
-                values.extend(
-                    headers
-                        .iter()
-                        .filter(|(name, _)| is_secret_name(name))
-                        .map(|(_, value)| Cow::Borrowed(value.as_str())),
-                );
                 for (name, value) in headers {
-                    if (name.eq_ignore_ascii_case("authorization")
-                        || name.eq_ignore_ascii_case("proxy-authorization"))
-                        && let Some((_, credential)) = value.split_once(' ')
-                    {
-                        values.push(Cow::Borrowed(credential.trim()));
+                    if is_secret_name(name) {
+                        collect_secret_value(value, &mut values);
                     }
                 }
-                values
             }
-        };
+        }
         replace_non_overlapping(error, values)
     }
 }
 
-fn replace_non_overlapping(error: String, mut values: Vec<std::borrow::Cow<'_, str>>) -> String {
+fn collect_secret_value<'a>(value: &'a str, values: &mut Vec<Cow<'a, str>>) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    values.push(Cow::Borrowed(trimmed));
+    if let Some((scheme, rest)) = trimmed.split_once(' ')
+        && ["bearer", "basic", "token"].iter().any(|s| scheme.eq_ignore_ascii_case(s))
+        && !rest.trim().is_empty()
+    {
+        values.push(Cow::Borrowed(rest.trim()));
+    }
+}
+
+fn collect_parsed_url_secrets(parsed: &reqwest::Url, values: &mut Vec<Cow<'_, str>>) {
+    if !parsed.username().is_empty() {
+        values.push(Cow::Owned(parsed.username().to_owned()));
+        if let Some(decoded) = percent_decode(parsed.username()) {
+            values.push(Cow::Owned(decoded));
+        }
+    }
+    if let Some(password) = parsed.password().filter(|value| !value.is_empty()) {
+        values.push(Cow::Owned(password.to_owned()));
+        if let Some(decoded) = percent_decode(password) {
+            values.push(Cow::Owned(decoded));
+        }
+    }
+    if let Some(query) = parsed.query() {
+        for pair in query.split('&') {
+            if let Some((key, value)) = pair.split_once('=')
+                && is_secret_name(key)
+                && !value.is_empty()
+            {
+                values.push(Cow::Owned(value.to_owned()));
+            }
+        }
+    }
+    for (key, value) in parsed.query_pairs() {
+        if is_secret_name(&key) && !value.is_empty() {
+            values.push(Cow::Owned(value.into_owned()));
+        }
+    }
+}
+
+fn collect_arg_secrets<'a>(args: &'a [String], values: &mut Vec<Cow<'a, str>>) {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let url_candidate = if let Some((key, value)) = arg.split_once('=') {
+            let name = key.trim_start_matches('-');
+            if !name.is_empty() && is_secret_name(name) {
+                collect_secret_value(value, values);
+                None
+            } else {
+                Some(value)
+            }
+        } else if arg.starts_with('-') && is_secret_name(arg.trim_start_matches('-')) {
+            if let Some(next) = args.get(index + 1).filter(|v| !v.is_empty() && !v.starts_with('-')) {
+                collect_secret_value(next, values);
+                index += 1;
+            }
+            None
+        } else {
+            Some(arg)
+        };
+        if let Some(candidate) = url_candidate
+            && candidate.contains("://")
+            && let Ok(parsed) = reqwest::Url::parse(candidate)
+        {
+            collect_parsed_url_secrets(&parsed, values);
+        }
+        index += 1;
+    }
+}
+
+fn replace_non_overlapping(error: String, mut values: Vec<Cow<'_, str>>) -> String {
     values.retain(|value| value.len() >= 2);
     if values.is_empty() {
         return error;
@@ -234,7 +276,7 @@ fn is_secret_name(name: &str) -> bool {
     let mut chars = name.chars().peekable();
     let mut prev: Option<char> = None;
     while let Some(ch) = chars.next() {
-        if matches!(ch, '_' | '-') {
+        if !ch.is_ascii_alphanumeric() {
             if !current.is_empty() {
                 words.push(std::mem::take(&mut current));
             }
@@ -258,12 +300,20 @@ fn is_secret_name(name: &str) -> bool {
     words.iter().any(|word| {
         matches!(
             word.as_str(),
-            "authorization"
+            "auth"
+                | "authorization"
+                | "bearer"
                 | "cookie"
+                | "jwt"
                 | "key"
                 | "keys"
                 | "apikey"
                 | "apikeys"
+                | "pass"
+                | "passwd"
+                | "password"
+                | "passwords"
+                | "pat"
                 | "token"
                 | "tokens"
                 | "accesstoken"
@@ -272,9 +322,6 @@ fn is_secret_name(name: &str) -> bool {
                 | "secret"
                 | "secrets"
                 | "clientsecret"
-                | "password"
-                | "passwords"
-                | "passwd"
                 | "credential"
                 | "credentials"
         )

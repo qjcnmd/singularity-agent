@@ -37,6 +37,9 @@ pub(crate) fn openai_responses_stream_request_payload(
     if let Some(instructions) = instructions {
         payload["instructions"] = json!(instructions);
     }
+    if let Some(prompt_cache_key) = request.prompt_cache_key.as_deref().filter(|key| !key.trim().is_empty()) {
+        payload["prompt_cache_key"] = json!(prompt_cache_key);
+    }
     payload["max_output_tokens"] = json!(request.max_output_tokens);
     if !request.tools.is_empty() {
         payload["tools"] = json!(
@@ -159,14 +162,19 @@ pub(crate) fn parse_openai_responses_response(
                         &["responses_reasoning_item_id_missing"],
                     ));
                 }
-                let thinking = item
+                let mut thinking = String::new();
+                for text in item
                     .get("summary")
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
                     .filter(|part| part.get("type").and_then(Value::as_str) == Some("summary_text"))
                     .filter_map(|part| part.get("text").and_then(Value::as_str))
-                    .collect();
+                    .filter(|text| !text.is_empty())
+                {
+                    thinking.push_str(summary_part_separator(&thinking, text));
+                    thinking.push_str(text);
+                }
                 ContentBlock::Thinking {
                     thinking,
                     metadata: Some(block_metadata(item, &["summary"])),
@@ -337,6 +345,21 @@ fn responses_content(
         parts.push(json!({"type": "input_image", "image_url": url}));
     }
     Ok(json!(parts))
+}
+
+fn summary_part_separator(existing: &str, next: &str) -> &'static str {
+    if existing.is_empty()
+        || next.is_empty()
+        || existing.ends_with("\n\n")
+        || next.starts_with("\n\n")
+        || (existing.ends_with('\n') && next.starts_with('\n'))
+    {
+        ""
+    } else if existing.ends_with('\n') || next.starts_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    }
 }
 
 fn block_metadata(

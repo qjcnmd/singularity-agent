@@ -65,6 +65,11 @@ pub(super) fn resolve_model_definition(
     if max_context_tokens == 0 || max_output_tokens == 0 {
         return Err(configuration_error(format!("模型 {model_name} 的上下文窗口和最大输出 Token 须大于 0")));
     }
+    if max_output_tokens >= max_context_tokens {
+        return Err(configuration_error(format!(
+            "模型 {model_name} 的最大输出 Token（{max_output_tokens}）须小于上下文窗口（{max_context_tokens}）"
+        )));
+    }
     if let Some(value) = requested_variant
         && !reasoning_variants.iter().any(|variant| variant == value)
     {

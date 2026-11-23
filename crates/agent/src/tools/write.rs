@@ -71,10 +71,16 @@ fn execute_locked(
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Could not create parent directory for {}: {error}", args.path))?;
     }
-    let content = if existed && before.contains("\r\n") && !args.content.contains("\r\n") {
+    let preserve_bom = existed && before.starts_with('\u{feff}') && !args.content.starts_with('\u{feff}');
+    let body = if existed && before.contains("\r\n") && !args.content.contains("\r\n") {
         args.content.replace('\n', "\r\n")
     } else {
         args.content.clone()
+    };
+    let content = if preserve_bom {
+        format!("\u{feff}{body}")
+    } else {
+        body
     };
     if signal.is_cancelled() {
         return Err(ABORTED_MESSAGE.into());

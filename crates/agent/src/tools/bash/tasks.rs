@@ -234,8 +234,9 @@ impl BashTasks {
             Ok(process) => process,
             Err(error) => return error_result(error),
         };
-        if args.yield_time_ms > 0 {
-            let yield_at = tokio::time::sleep(Duration::from_millis(args.yield_time_ms));
+        let yield_ms = args.yield_time_ms();
+        if yield_ms > 0 {
+            let yield_at = tokio::time::sleep(Duration::from_millis(yield_ms));
             tokio::pin!(yield_at);
             loop {
                 tokio::select! {

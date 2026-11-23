@@ -2,13 +2,19 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 
-use model::{ContentBlock, Message, ModelToolCall, ProviderMessageMetadata};
+use model::{ContentBlock, Message, ModelConfigurationSnapshot, ModelToolCall, ProviderMessageMetadata};
 use proptest::prelude::*;
-use protocol::ModelSelection;
+use protocol::{ModelSelection, ModelUsage, ProviderAttemptStatus, RequestObservation, RequestPurpose};
 use serde_json::json;
 
-use crate::session::context::{project_messages, resolve_context_entries, select_compactable_split};
-use crate::session::{CompactionEntry, SessionData, SessionEntry, SessionManager, session_file_name};
+use crate::request_execution::{min_compaction_output_tokens, output_budget_tokens};
+use crate::session::context::{
+    frame_compacted_summary, input_tokens, message_token_estimate, plan_compaction_step, project_messages,
+    resolve_context_entries, select_compactable_split,
+};
+use crate::session::{
+    CompactionEntry, LedgerRecord, SessionData, SessionEntry, SessionManager, session_file_name,
+};
 
 struct TempDir(PathBuf);
 
@@ -202,6 +208,21 @@ fn compaction_round_strategy() -> impl Strategy<Value = CompactionRoundInput> {
         })
 }
 
+fn new_test_session(tag: &str, provider: &str, model: &str) -> (TempDir, PathBuf, String, SessionManager) {
+    let tmp = TempDir::new(tag);
+    let (workspace, sessions) = (tmp.0.join("ws"), tmp.0.join("sessions"));
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    let sid = uuid::Uuid::now_v7().to_string();
+    let sel = ModelSelection {
+        provider: provider.into(),
+        model: model.into(),
+        reasoning: None,
+    };
+    let mgr =
+        SessionManager::create_with_id(&workspace, &sessions, &sid, sel, vec![]).expect("create session");
+    (tmp, sessions, sid, mgr)
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -209,18 +230,7 @@ proptest! {
     fn compaction_split_and_multi_round_projection_invariants(
         rounds in prop::collection::vec(compaction_round_strategy(), 1..=4),
     ) {
-        let tmp = TempDir::new("compaction-split");
-        let workspace = tmp.0.join("ws");
-        let sessions = tmp.0.join("sessions");
-        std::fs::create_dir_all(&workspace).expect("create workspace");
-        let session_id = uuid::Uuid::now_v7().to_string();
-        let selection = ModelSelection {
-            provider: "p".into(),
-            model: "m".into(),
-            reasoning: None,
-        };
-        let mut manager = SessionManager::create_with_id(&workspace, &sessions, &session_id, selection, vec![])
-            .expect("create session");
+        let (_tmp, _sessions, _sid, mut manager) = new_test_session("compaction-split", "p", "m");
         let mut seq = 0usize;
 
         for (round_idx, round) in rounds.into_iter().enumerate() {
@@ -275,6 +285,20 @@ proptest! {
             }
             assert_balanced_tool_calls(&project_messages(kept));
 
+            let model = ModelConfigurationSnapshot { max_context_tokens: 4_000, max_output_tokens: 512 };
+            let overflow =
+                (round.retain_tokens == 0).then(|| input_tokens(data, &active_before, ("p", "m"), 400));
+            if let Ok(Some(step)) =
+                plan_compaction_step(data, &first_kept_id, ("p", "m"), 400, 300, model, overflow)
+            {
+                let budget = u64::from(output_budget_tokens(model, step.estimated_request_input));
+                prop_assert!(budget >= min_compaction_output_tokens(model) && budget > 0);
+                if let Some(over) = overflow {
+                    prop_assert!(step.estimated_request_input < over);
+                }
+                assert_balanced_tool_calls(&step.messages);
+            }
+
             let expected_kept_ids: Vec<String> = kept.iter().map(|e| e.id().to_owned()).collect();
             let compact_id = format!("compact_{round_idx}");
             let summary = format!("summary_{round_idx}");
@@ -302,28 +326,71 @@ proptest! {
             assert_balanced_tool_calls(&project_messages(&active_after));
         }
     }
-}
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #[test]
+    fn turn_calibration_and_foreign_thinking_invariants(
+        reply_text in unicode_seed_strategy(1, 32),
+        thinking_extra in unicode_text_strategy(60),
+        turn2_user in unicode_seed_strategy(1, 32),
+        reported_total in 500u64..=50_000,
+    ) {
+        let (_tmp, _sessions, _sid, mut mgr) = new_test_session("turn-calibration", "pa", "ma");
+        let usage = ModelUsage {
+            input_tokens: reported_total - 50,
+            output_tokens: 50,
+            total_tokens: reported_total,
+            cached_input_tokens: None,
+        };
+        let obs = RequestObservation {
+            purpose: RequestPurpose::Generation,
+            provider: "pa".into(),
+            model: "ma".into(),
+            status: ProviderAttemptStatus::Ok,
+            ttft_ms: None,
+            decode_ms: None,
+            usage: Some(usage),
+        };
+        let redacted = serde_json::from_value(json!({ "type": "redacted_thinking", "data": "x" })).ok();
+        let meta = ProviderMessageMetadata {
+            protocol: protocol::ProviderApiProtocol::Messages,
+            provider_name: "pa".into(),
+            model_name: "ma".into(),
+            endpoint: "https://example.invalid/v1/messages".into(),
+            prefix_digest: None,
+            reasoning: None,
+        };
+        let assistant = Message::Assistant {
+            content: vec![
+                ContentBlock::Thinking { thinking: thinking_extra, metadata: None },
+                ContentBlock::Thinking { thinking: String::new(), metadata: redacted },
+                ContentBlock::text(reply_text.clone()),
+            ],
+            provider_metadata: Some(meta),
+        };
+        mgr.append_message_with_id("a1", assistant, Some(obs), None).expect("append a1");
+        mgr.append_record(LedgerRecord::OperationStarted).expect("append turn boundary");
+        mgr.append_message_with_id("u2", Message::user(turn2_user.as_str()), None, None).expect("append u2");
+        let tail = message_token_estimate(&Message::user(turn2_user.as_str()));
+        let active = resolve_context_entries(mgr.data());
+        let plain = message_token_estimate(&Message::Assistant {
+            content: vec![ContentBlock::text(reply_text)],
+            provider_metadata: None,
+        });
+        prop_assert_eq!(input_tokens(mgr.data(), &active, ("pa", "ma"), 300), reported_total + tail);
+        prop_assert_eq!(input_tokens(mgr.data(), &active, ("pb", "mb"), 300), plain + tail + 300);
+        let cp = CompactionEntry { summary: "s".into(), first_kept_entry_id: Some("u2".into()) };
+        mgr.append_compaction_with_id("cp", cp).expect("append compaction");
+        let after = resolve_context_entries(mgr.data());
+        let expected = message_token_estimate(&frame_compacted_summary("s")) + tail + 300;
+        prop_assert_eq!(input_tokens(mgr.data(), &after, ("pa", "ma"), 300), expected);
+    }
 
     #[test]
     fn session_file_tail_repair_invariance(
         user_texts in prop::collection::vec(unicode_seed_strategy(1, 48), 0..=5),
         trailing_bytes in prop::collection::vec(any::<u8>().prop_filter("no newline", |b| *b != b'\n'), 1..=128),
     ) {
-        let tmp = TempDir::new("tail-repair");
-        let workspace = tmp.0.join("ws");
-        let sessions = tmp.0.join("sessions");
-        std::fs::create_dir_all(&workspace).expect("create workspace");
-        let session_id = uuid::Uuid::now_v7().to_string();
-        let selection = ModelSelection {
-            provider: "p".into(),
-            model: "m".into(),
-            reasoning: None,
-        };
-        let mut manager = SessionManager::create_with_id(&workspace, &sessions, &session_id, selection, vec![])
-            .expect("create session");
+        let (_tmp, sessions, session_id, mut manager) = new_test_session("tail-repair", "p", "m");
         for (idx, text) in user_texts.iter().enumerate() {
             manager
                 .append_message_with_id(&format!("msg_{idx}"), Message::user(text.clone()), None, None)

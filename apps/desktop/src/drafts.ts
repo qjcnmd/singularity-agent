@@ -116,11 +116,13 @@ export class DraftStore {
   }
 
   private flushAll(): void {
-    for (const [id, pending] of this.pendingSaves) {
+    if (this.pendingSaves.size === 0) return
+    const entries = [...this.pendingSaves.entries()].map(([id, pending]): [string, Draft] => {
       clearTimeout(pending.timer)
-      void persistDraft(id, pending.draft).catch(() => {})
-    }
+      return [id, pending.draft]
+    })
     this.pendingSaves.clear()
+    void persistDrafts(entries).catch(() => {})
   }
 
   private publish(drafts: DraftSnapshot): void {
@@ -129,12 +131,24 @@ export class DraftStore {
   }
 }
 
+let openDb: IDBDatabase | undefined
 let database: Promise<IDBDatabase> | undefined
 function openDatabase(): Promise<IDBDatabase> {
   return database ??= new Promise((resolve, reject) => {
     const request = indexedDB.open(DRAFTS_DB_NAME, 1)
     request.onupgradeneeded = () => request.result.createObjectStore('drafts')
-    request.onsuccess = () => resolve(request.result)
+    request.onsuccess = () => {
+      const db = request.result
+      const detach = () => {
+        if (openDb !== db) return
+        openDb = undefined
+        database = undefined
+      }
+      db.onclose = detach
+      db.onversionchange = () => { detach(); db.close() }
+      openDb = db
+      resolve(db)
+    }
     request.onerror = () => { database = undefined; reject(request.error) }
   })
 }
@@ -147,23 +161,32 @@ function complete(transaction: IDBTransaction): Promise<void> {
   })
 }
 
-async function persistDraft(id: string, draft: Draft): Promise<void> {
-  const transaction = (await openDatabase()).transaction('drafts', 'readwrite')
+async function persistDrafts(entries: Array<[string, Draft]>): Promise<void> {
+  const db = openDb ?? await openDatabase()
+  const transaction = db.transaction('drafts', 'readwrite')
   const store = transaction.objectStore('drafts')
-  if (hasDraft(draft)) store.put(draft, id)
-  else store.delete(id)
+  for (const [id, draft] of entries) {
+    if (hasDraft(draft)) store.put(draft, id)
+    else store.delete(id)
+  }
   await complete(transaction)
 }
 
+function persistDraft(id: string, draft: Draft): Promise<void> {
+  return persistDrafts([[id, draft]])
+}
+
 async function removeDrafts(ids: string[]): Promise<void> {
-  const transaction = (await openDatabase()).transaction('drafts', 'readwrite')
+  const db = openDb ?? await openDatabase()
+  const transaction = db.transaction('drafts', 'readwrite')
   const store = transaction.objectStore('drafts')
   for (const id of ids) store.delete(id)
   await complete(transaction)
 }
 
 async function loadDrafts(): Promise<Record<string, Draft>> {
-  const transaction = (await openDatabase()).transaction('drafts', 'readonly')
+  const db = openDb ?? await openDatabase()
+  const transaction = db.transaction('drafts', 'readonly')
   const result: Record<string, Draft> = {}
   const request = transaction.objectStore('drafts').openCursor()
   request.onsuccess = () => {

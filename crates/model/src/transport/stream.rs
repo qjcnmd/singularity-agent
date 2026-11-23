@@ -99,6 +99,8 @@ impl SseFrameDecoder {
 pub(crate) trait SseStreamDecoder: Sized {
     fn frame_malformed(reason: &'static str) -> ProviderError;
 
+    fn frame_unterminated(&self) -> ProviderError;
+
     fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError>;
 
     fn protocol_complete(&self) -> bool;
@@ -124,10 +126,10 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
                 if decoder.protocol_complete() {
                     return Ok(());
                 }
-                return Err(D::frame_malformed("event_frame_unterminated"));
+                return Err(decoder.frame_unterminated());
             }
             if frames.has_unterminated() {
-                return Err(D::frame_malformed("event_frame_unterminated"));
+                return Err(decoder.frame_unterminated());
             }
             return Ok(());
         };
@@ -146,6 +148,18 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
 
 pub(crate) fn provider_stream_malformed_error(message: &'static str, reason: &'static str) -> ProviderError {
     ProviderError::diagnostic(ModelErrorKind::Other, message, &[reason])
+}
+
+pub(crate) fn provider_stream_unterminated_error(
+    message: &'static str,
+    received_event: bool,
+) -> ProviderError {
+    let kind = if received_event {
+        ModelErrorKind::Temporary
+    } else {
+        ModelErrorKind::Other
+    };
+    ProviderError::diagnostic(kind, message, &["event_frame_unterminated"])
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use agent::agent::UserInput;
 use protocol::RpcError;
 
 use super::{AppServer, catalog_error, conversation_error};
-use crate::runtime::Conversation;
+use crate::runtime::{ContextPreview, Conversation};
 
 impl AppServer {
     pub(crate) fn image_data(&self, session_id: &str, image_id: &str) -> Result<String, RpcError> {
@@ -68,23 +68,30 @@ impl AppServer {
         session_id: &str,
         shutdown: &tokio_util::sync::CancellationToken,
     ) -> Result<(), RpcError> {
-        let app = Arc::clone(self);
-        let id = session_id.to_string();
         let signal = shutdown.child_token();
-        let preview_signal = signal.clone();
-        let pending = tokio::task::spawn_blocking(move || {
-            let _lifecycle = app.lock_lifecycle();
-            let conversation = app.open_action_conversation(&id)?;
-            Ok::<_, RpcError>(
-                conversation.begin_context_preview(&preview_signal).map(|guard| (conversation, guard)),
-            )
-        })
-        .await
-        .expect("conversation lookup completes while the backend is running")?;
-        let Some((conversation, guard)) = pending else {
-            return Ok(());
-        };
-        conversation.inspect_context(signal, guard).await.map_err(conversation_error)
+        loop {
+            if signal.is_cancelled() {
+                return Ok(());
+            }
+            let app = Arc::clone(self);
+            let id = session_id.to_string();
+            let preview_signal = signal.clone();
+            let (conversation, attempt) = tokio::task::spawn_blocking(move || {
+                let _lifecycle = app.lock_lifecycle();
+                let conversation = app.open_action_conversation(&id)?;
+                let attempt = conversation.begin_context_preview(&preview_signal);
+                Ok::<_, RpcError>((conversation, attempt))
+            })
+            .await
+            .expect("conversation lookup completes while the backend is running")?;
+            match attempt {
+                ContextPreview::Skip => return Ok(()),
+                ContextPreview::Busy => conversation.wait_context_preview(&signal).await,
+                ContextPreview::Run(guard) => {
+                    return conversation.inspect_context(signal, guard).await.map_err(conversation_error);
+                }
+            }
+        }
     }
 
     pub(crate) fn compact(&self, session_id: &str) -> Result<(), RpcError> {
@@ -102,6 +109,7 @@ impl AppServer {
             let lifecycle = app.lock_lifecycle();
             let Some(conversation) = app.lock_sessions().get(&id) else {
                 app.catalog.delete(&id).map_err(catalog_error)?;
+                app.hub.remove_session(&id);
                 drop(lifecycle);
                 app.publish_app_snapshot();
                 return Ok(None);
@@ -122,6 +130,7 @@ impl AppServer {
                 let _lifecycle = app.lock_lifecycle();
                 app.catalog.delete(&id).map_err(catalog_error)?;
                 app.lock_sessions().remove(&id);
+                app.hub.remove_session(&id);
                 deletion.complete();
             }
             app.publish_app_snapshot();

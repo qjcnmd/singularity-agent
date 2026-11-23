@@ -17,7 +17,7 @@ impl Agent {
         length_truncated: bool,
         cancellation: &CancellationToken,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let session = Arc::clone(&self.requests.session);
         let (cwd, output_directory) = tokio::task::spawn_blocking(move || {
             with_writer(&session, |writer| {
@@ -44,6 +44,7 @@ impl Agent {
         let (progress, mut updates) = mpsc::channel::<(String, String)>(32);
         let signal = cancellation.child_token();
         let mut save_error = None;
+        let mut all_failed = true;
         loop {
             while save_error.is_none() && workers.len() < MAX_PARALLEL_TOOLS {
                 let Some((_, _, next)) = pending.peek() else { break };
@@ -79,6 +80,7 @@ impl Agent {
                         )
                         .await;
                     execution.duration_ms = Some(app_core::duration_millis(started.elapsed()));
+                    all_failed &= execution.is_error;
                     if let Err(error) =
                         self.finish_tool(item_id, call.tool_call_id, execution, on_event).await
                     {
@@ -129,6 +131,7 @@ impl Agent {
                     while let Ok((item_id, partial_result)) = updates.try_recv() {
                         on_event(AgentEvent::Turn(TurnEvent::ToolOutput { item_id, output: partial_result }));
                     }
+                    all_failed &= execution.is_error;
                     if save_error.is_none()
                         && let Err(error) = self.finish_tool(item_id, call_id, execution, on_event).await
                     {
@@ -138,7 +141,7 @@ impl Agent {
                 }
             }
         }
-        save_error.map_or(Ok(()), Err)
+        save_error.map_or(Ok(all_failed), Err)
     }
 
     async fn finish_tool(

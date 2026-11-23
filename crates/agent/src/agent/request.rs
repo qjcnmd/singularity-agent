@@ -1,4 +1,4 @@
-use super::compaction::PreRequestOutcome;
+use super::compaction::{CompactionMode, PreRequestOutcome};
 use super::{Agent, AgentError, AgentEvent, RequestContext, Result, modules};
 use crate::request_execution::{execute_request, output_budget_tokens};
 use crate::session::{context, context::PreparedContext, with_writer};
@@ -87,7 +87,7 @@ impl RequestContext {
         prepared: Option<PreparedContext>,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
-    ) -> Result<(ModelTurnResponse, String, String)> {
+    ) -> std::result::Result<(ModelTurnResponse, String, String), (AgentError, u64)> {
         let definitions = self.request_definitions();
         let tools = definitions.tools.clone();
         let mut messages = definitions.messages.clone();
@@ -95,23 +95,29 @@ impl RequestContext {
         let session = std::sync::Arc::clone(&self.session);
         let identity = (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned());
         let model = self.provider.model_configuration();
-        let request = tokio::task::spawn_blocking(move || {
+        let (request, input_tokens) = tokio::task::spawn_blocking(move || {
             let prepared = prepared.unwrap_or_else(|| {
                 with_writer(&session, |writer| {
                     context::prepare_context(writer.data(), (&identity.0, &identity.1), overhead_tokens)
                 })
             });
+            let input_tokens = prepared.input_tokens;
             messages.extend(prepared.messages);
             let images = context::load_images(&mut messages, &prepared.image_directory)?;
-            Ok::<_, std::io::Error>(ModelTurnRequest {
-                messages,
-                images,
-                tools,
-                max_output_tokens: output_budget_tokens(model, prepared.input_tokens),
-            })
+            Ok::<_, std::io::Error>((
+                ModelTurnRequest {
+                    messages,
+                    images,
+                    tools,
+                    max_output_tokens: output_budget_tokens(model, input_tokens),
+                    prompt_cache_key: Some(prepared.session_id),
+                },
+                input_tokens,
+            ))
         })
         .await
-        .expect("context worker completes while the runtime is running")?;
+        .expect("context worker completes while the runtime is running")
+        .map_err(|error| (AgentError::from(error), 0))?;
         execute_request(
             &self.provider,
             &self.session,
@@ -121,6 +127,7 @@ impl RequestContext {
             protocol::RequestPurpose::Generation,
         )
         .await
+        .map_err(|error| (error, input_tokens))
     }
 }
 
@@ -165,12 +172,20 @@ impl Agent {
         let prepared = self
             .drain_and_prepare(&mut switch_compacted, &mut auto_attempted, on_event, cancellation)
             .await?;
-        let overflow = match self.requests.request_response(prepared, on_event, cancellation).await {
-            Err(AgentError::Provider(error)) if error.is_context_overflow() => error,
-            result => return result,
-        };
+        let (overflow, overflow_input_tokens) =
+            match self.requests.request_response(prepared, on_event, cancellation).await {
+                Err((AgentError::Provider(error), input_tokens)) if error.is_context_overflow() => {
+                    (error, input_tokens)
+                }
+                Ok(response) => return Ok(response),
+                Err((error, _)) => return Err(error),
+            };
         tracing::warn!(error = %overflow, "provider reported context overflow; triggering forced compaction");
-        match self.requests.compact_now(on_event, cancellation, false).await {
+        match self
+            .requests
+            .compact_now(on_event, cancellation, CompactionMode::Overflow { overflow_input_tokens })
+            .await
+        {
             Ok(true) => {}
             Ok(false) => return Err(AgentError::Provider(overflow)),
             Err(AgentError::Aborted) => return Err(AgentError::Aborted),
@@ -184,6 +199,9 @@ impl Agent {
         let prepared = self
             .drain_and_prepare(&mut switch_compacted, &mut auto_attempted, on_event, cancellation)
             .await?;
-        self.requests.request_response(prepared, on_event, cancellation).await
+        self.requests
+            .request_response(prepared, on_event, cancellation)
+            .await
+            .map_err(|(error, _)| error)
     }
 }

@@ -19,7 +19,16 @@ export class Backend extends EventEmitter {
     super()
     this.ready = new Promise((resolve, reject) => { this.readyResolve = resolve; this.readyReject = reject })
     this.child = spawn(binary, [], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
-    this.exited = new Promise(resolve => this.child.once('close', () => resolve()))
+    let exitStatus: number | NodeJS.Signals | null = null
+    this.child.once('exit', (code, signal) => {
+      exitStatus = code ?? signal
+    })
+    this.exited = new Promise(resolve => {
+      this.child.once('close', (code, signal) => {
+        resolve()
+        this.fail(new Error(`Rust AppServer 已退出 (${code ?? signal ?? exitStatus})。${this.diagnostic}`))
+      })
+    })
     this.child.on('error', error => this.fail(error))
     this.child.stdin.on('error', error => this.fail(error))
     this.child.stderr.setEncoding('utf8')
@@ -44,9 +53,6 @@ export class Backend extends EventEmitter {
       } catch (error) {
         this.fail(new Error(`Rust pipe response invalid: ${String(error)}`))
       }
-    })
-    this.child.once('exit', (code, signal) => {
-      this.fail(new Error(`Rust AppServer 已退出 (${code ?? signal})。${this.diagnostic}`))
     })
   }
 

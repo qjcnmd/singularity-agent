@@ -121,7 +121,7 @@ export function resetBaseline(state: SyncState, bootstrap: AppBootstrap): SyncSt
       return [id, {
         ...(keepLive ? previous : { revision: 0, ...status }),
         summaryRevision: (previous?.summaryRevision ?? 0) > bootstrap.revision ? previous?.summaryRevision : undefined,
-        backgroundTasks: previous?.backgroundTasks ?? [],
+        backgroundTasks: keepLive || id === session?.summary.threadId ? previous?.backgroundTasks ?? [] : [],
       }]
     }))
   for (const [id, live] of Object.entries(state.liveSessions)) {

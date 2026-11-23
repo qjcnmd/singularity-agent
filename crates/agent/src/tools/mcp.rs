@@ -24,7 +24,7 @@ pub(crate) struct McpSchemaArgs {
 pub(crate) struct McpCallArgs {
     pub(crate) server: String,
     pub(crate) tool: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::registry::deserialize_null_default")]
     pub(crate) arguments: Map<String, Value>,
 }
 

@@ -224,9 +224,13 @@ export class SessionStore {
       void this.resync()
       return
     }
+    const previousSelectedSessionId = this.state.selectedSessionId
+    const recoveredBootstrap = frame.type === 'app_changed'
+      && frame.revision > this.state.revision
+      && (this.state.bootstrapLoad.status === 'error' || this.state.bootstrap === null)
     if (frame.type === 'app_read_failed' && frame.revision > this.state.revision) {
       this.patch({ bootstrapLoad: { status: 'error', error: frame.error } })
-    } else if (frame.type === 'app_changed' && frame.revision > this.state.revision && this.state.bootstrapLoad.status === 'error') {
+    } else if (recoveredBootstrap) {
       this.patch({ bootstrapLoad: { status: 'idle', error: null } })
     }
     const state = reduceStream(this.state, frame)
@@ -234,6 +238,11 @@ export class SessionStore {
       || (frame.type === 'turn_event' && (
         frame.payload.method === 'item/textDelta'
         || frame.payload.method === 'tool/output')))
+    if (recoveredBootstrap) {
+      const { selectedSessionId } = this.state
+      if (selectedSessionId !== null) void this.readSession(selectedSessionId)
+      else if (previousSelectedSessionId === null) this.syncFocus(null)
+    }
     if ((frame.type === 'session_changed' || frame.type === 'session_settled')
       && this.state.session?.summary.threadId !== frame.sessionId
       && state.liveSessions[frame.sessionId]?.revision === frame.revision) {
@@ -243,7 +252,8 @@ export class SessionStore {
 
   resync(): Promise<void> {
     if (this.resyncing !== null) return this.resyncing
-    this.patch({ bootstrapLoad: { status: 'loading', error: null } })
+    const showLoading = this.state.bootstrap === null || this.state.bootstrapLoad.status === 'error'
+    if (showLoading) this.patch({ bootstrapLoad: { status: 'loading', error: null } })
     this.resyncing = (async () => {
       try {
         const bootstrap = await this.transport.rpc('app.bootstrap', {})
@@ -251,7 +261,9 @@ export class SessionStore {
         const { selectedSessionId } = this.state
         if (selectedSessionId !== null) {
           await this.readSession(selectedSessionId)
-          this.patch({ bootstrapLoad: { status: 'idle', error: null } })
+          if (this.state.bootstrapLoad.status !== 'idle') {
+            this.patch({ bootstrapLoad: { status: 'idle', error: null } })
+          }
         } else {
           this.patch({
             session: null,

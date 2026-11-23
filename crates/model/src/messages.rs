@@ -64,8 +64,9 @@ pub(crate) fn messages_stream_request_payload(
             "tools": tools_json.as_ref().unwrap_or(&Value::Null),
         }),
     );
-    let (messages, final_digest) =
+    let (mut messages, final_digest, omit_thinking) =
         encode_messages(rest, &request.images, selection, provider_name, endpoint, initial_digest)?;
+    apply_rolling_message_cache_control(&mut messages);
 
     let mut payload = json!({
         "model": selection.model_name,
@@ -81,7 +82,7 @@ pub(crate) fn messages_stream_request_payload(
     }
     let reasoning = reasoning_wire_decision(selection);
     match reasoning.enabled {
-        Some(true) => {
+        Some(true) if !omit_thinking => {
             payload["thinking"] = json!({ "type": "adaptive" });
             if let Some(effort) = reasoning.effort {
                 payload["output_config"] = json!({ "effort": effort });
@@ -90,7 +91,7 @@ pub(crate) fn messages_stream_request_payload(
         Some(false) => {
             payload["thinking"] = json!({ "type": "disabled" });
         }
-        None => {}
+        Some(true) | None => {}
     }
     Ok(EncodedMessagesRequest { payload, prefix_digest: final_digest })
 }
@@ -102,19 +103,25 @@ fn encode_messages(
     provider_name: &str,
     endpoint: &str,
     mut digest: String,
-) -> Result<(Vec<Value>, String), ProviderError> {
+) -> Result<(Vec<Value>, String, bool), ProviderError> {
     let mut encoded: Vec<Value> = Vec::new();
     let mut current_role: Option<&'static str> = None;
     let mut current_blocks: Vec<Value> = Vec::new();
+    let mut stripped_tail = (false, false);
+    let mut current_stripped = false;
+    let mut pending_assistant_stripped = false;
 
     let flush_current = |encoded: &mut Vec<Value>,
                          digest: &mut String,
                          current_role: &mut Option<&'static str>,
-                         current_blocks: &mut Vec<Value>| {
+                         current_blocks: &mut Vec<Value>,
+                         stripped_tail: &mut (bool, bool),
+                         current_stripped: &mut bool| {
         if let Some(role) = current_role.take() {
             let msg = json!({ "role": role, "content": std::mem::take(current_blocks) });
             *digest = chain_digest(digest, &msg);
             encoded.push(msg);
+            *stripped_tail = (stripped_tail.1, std::mem::take(current_stripped));
         }
     };
 
@@ -127,7 +134,7 @@ fn encode_messages(
             | Message::Notification { .. } => "user",
         };
         let mut pending_user_flush = None;
-        let blocks = match message {
+        let (blocks, stripped_signed) = match message {
             Message::ToolResult { tool_call_id, is_error, .. } => {
                 let mut block = json!({
                     "type": "tool_result",
@@ -137,7 +144,7 @@ fn encode_messages(
                 if *is_error {
                     block["is_error"] = json!(true);
                 }
-                vec![block]
+                (vec![block], false)
             }
             Message::Assistant { .. } => {
                 let meta = message_metadata_for(message, selection, provider_name, endpoint);
@@ -154,24 +161,89 @@ fn encode_messages(
                 encode_assistant_blocks(message.content(), same_provider, prefix_matches)
             }
             Message::Developer { .. } | Message::User { .. } | Message::Notification { .. } => {
-                encode_user_blocks(message, images)?
+                (encode_user_blocks(message, images)?, false)
             }
         };
         if blocks.is_empty() {
+            pending_assistant_stripped |= stripped_signed;
             continue;
         }
         if let Some((msg, next_digest)) = pending_user_flush {
             encoded.push(msg);
+            stripped_tail = (stripped_tail.1, false);
             digest = next_digest;
             current_blocks.clear();
+            current_stripped = false;
         } else if current_role.is_some_and(|prev| prev != next_role) {
-            flush_current(&mut encoded, &mut digest, &mut current_role, &mut current_blocks);
+            flush_current(
+                &mut encoded,
+                &mut digest,
+                &mut current_role,
+                &mut current_blocks,
+                &mut stripped_tail,
+                &mut current_stripped,
+            );
         }
         current_role = Some(next_role);
         current_blocks.extend(blocks);
+        if next_role == "assistant" {
+            current_stripped |= stripped_signed | std::mem::take(&mut pending_assistant_stripped);
+        } else {
+            pending_assistant_stripped = false;
+        }
     }
-    flush_current(&mut encoded, &mut digest, &mut current_role, &mut current_blocks);
-    Ok((encoded, digest))
+    flush_current(
+        &mut encoded,
+        &mut digest,
+        &mut current_role,
+        &mut current_blocks,
+        &mut stripped_tail,
+        &mut current_stripped,
+    );
+    let omit_thinking = trailing_tool_turn_stripped_signed_thinking(&encoded, stripped_tail.0);
+    Ok((encoded, digest, omit_thinking))
+}
+
+fn apply_rolling_message_cache_control(messages: &mut [Value]) {
+    let is_cacheable = |block: &Value| match block.get("type").and_then(Value::as_str) {
+        Some("text") => block.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty()),
+        Some("image" | "tool_use" | "tool_result") => true,
+        _ => false,
+    };
+    if let Some(block) = messages
+        .last_mut()
+        .and_then(|message| message.get_mut("content"))
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| blocks.iter_mut().rev().find(|block| is_cacheable(block)))
+    {
+        block["cache_control"] = json!({ "type": "ephemeral" });
+    }
+}
+
+fn trailing_tool_turn_stripped_signed_thinking(encoded: &[Value], prev_stripped: bool) -> bool {
+    let [.., prev, last] = encoded else {
+        return false;
+    };
+    if !prev_stripped
+        || last.get("role").and_then(Value::as_str) != Some("user")
+        || prev.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return false;
+    }
+    let (Some(last_blocks), Some(prev_blocks)) = (
+        last.get("content").and_then(Value::as_array),
+        prev.get("content").and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    let has_type = |blocks: &[Value], kind: &str| {
+        blocks.iter().any(|b| b.get("type").and_then(Value::as_str) == Some(kind))
+    };
+    let starts_with_thinking = prev_blocks
+        .first()
+        .and_then(|block| block.get("type").and_then(Value::as_str))
+        .is_some_and(|kind| matches!(kind, "thinking" | "redacted_thinking"));
+    has_type(last_blocks, "tool_result") && has_type(prev_blocks, "tool_use") && !starts_with_thinking
 }
 
 fn encode_user_blocks(
@@ -212,12 +284,14 @@ fn encode_assistant_blocks(
     content: &[ContentBlock],
     same_provider: bool,
     prefix_matches: bool,
-) -> Vec<Value> {
+) -> (Vec<Value>, bool) {
     let mut blocks = Vec::new();
+    let mut stripped_signed = false;
     for block in content {
         match block {
             ContentBlock::Thinking { thinking, metadata } if same_provider => {
                 if is_signed_thinking(metadata.as_ref()) && !prefix_matches {
+                    stripped_signed = true;
                     continue;
                 }
                 if let Some(meta) = metadata
@@ -249,7 +323,7 @@ fn encode_assistant_blocks(
             _ => {}
         }
     }
-    blocks
+    (blocks, stripped_signed)
 }
 
 fn encode_image_block(data_url: &str, image_id: &str) -> Result<Value, ProviderError> {

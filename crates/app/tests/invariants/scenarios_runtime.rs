@@ -347,10 +347,10 @@ async fn background_bash_resume_and_cleanup() {
             frame.get("type").and_then(Value::as_str) == Some("background_task_updated")
                 && frame.pointer("/payload/task/taskId").and_then(Value::as_str)
                     == Some(long_task_id.as_str())
-                && frame.pointer("/payload/task/state/kind").and_then(Value::as_str) != Some("running")
+                && frame.pointer("/payload/task/state/status").and_then(Value::as_str) != Some("running")
         })
         .await;
-    assert_ne!(stop_event.pointer("/payload/task/state/kind").and_then(Value::as_str), Some("running"));
+    assert_eq!(stop_event.pointer("/payload/task/state/status").and_then(Value::as_str), Some("stopped"));
 
     client.shutdown().await;
 }

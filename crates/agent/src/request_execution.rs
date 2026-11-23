@@ -11,10 +11,19 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 const MAX_RETRY_AFTER: Duration = Duration::from_mins(1);
+const MIN_COMPACTION_OUTPUT_FLOOR: u64 = 1024;
+const MIN_COMPACTION_OUTPUT_CEIL: u64 = 2048;
 
 pub(crate) fn output_budget_tokens(model: ModelConfigurationSnapshot, input_tokens: u64) -> u32 {
     let room = model.context_window().saturating_sub(input_tokens);
     model.max_output_tokens.min(u32::try_from(room).unwrap_or(u32::MAX))
+}
+
+pub(crate) fn min_compaction_output_tokens(model: ModelConfigurationSnapshot) -> u64 {
+    let window = model.context_window();
+    let proportional = (window / 20).clamp(MIN_COMPACTION_OUTPUT_FLOOR, MIN_COMPACTION_OUTPUT_CEIL);
+    let cap = u64::from(model.max_output_tokens).min(window / 4).max(1);
+    proportional.min(cap).min(u64::from(model.max_output_tokens))
 }
 
 pub(crate) async fn execute_request(

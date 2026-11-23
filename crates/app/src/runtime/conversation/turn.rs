@@ -5,6 +5,7 @@ use agent::session::{LedgerRecord, lock_writer, with_writer_async};
 use model::ModelClient;
 
 use protocol::{Turn, TurnErrorDetail, TurnEvent, TurnStatus};
+use tokio_util::sync::CancellationToken;
 
 use super::{Conversation, ConversationError};
 
@@ -128,27 +129,38 @@ impl Conversation {
         Ok((agent, started_at, context_window))
     }
 
-    pub(crate) fn begin_context_preview(
-        self: &Arc<Self>,
-        signal: &tokio_util::sync::CancellationToken,
-    ) -> Option<PreviewGuard> {
+    pub(crate) fn begin_context_preview(self: &Arc<Self>, signal: &CancellationToken) -> ContextPreview {
         let view = self.lock_view();
         let mut state = self.lock_state();
-        if signal.is_cancelled()
-            || view.context.is_some()
-            || state.closing
-            || state.turn.is_busy()
-            || state.context_preview.is_some()
-        {
-            return None;
+        if signal.is_cancelled() || view.context.is_some() || state.closing || state.turn.is_busy() {
+            return ContextPreview::Skip;
+        }
+        if state.context_preview.is_some() {
+            return ContextPreview::Busy;
         }
         state.context_preview = Some(signal.clone());
-        Some(PreviewGuard { conversation: Arc::clone(self) })
+        ContextPreview::Run(PreviewGuard { conversation: Arc::clone(self) })
+    }
+
+    pub(crate) async fn wait_context_preview(&self, signal: &CancellationToken) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if signal.is_cancelled() || self.lock_state().context_preview.is_none() {
+                return;
+            }
+            tokio::select! {
+                biased;
+                () = signal.cancelled() => return,
+                () = changed => {}
+            }
+        }
     }
 
     pub(crate) async fn inspect_context(
         self: &Arc<Self>,
-        signal: tokio_util::sync::CancellationToken,
+        signal: CancellationToken,
         guard: PreviewGuard,
     ) -> Result<(), ConversationError> {
         let conversation = Arc::clone(self);
@@ -171,6 +183,7 @@ impl Conversation {
         drop(guard);
         result
     }
+
     pub(super) fn prepare_request_context(&self) -> Result<RequestContext, TurnErrorDetail> {
         let provider = ModelClient::new(&self.models, &self.model()).map_err(preparation_error)?;
         let instruction_home = self.home.clone();
@@ -190,6 +203,12 @@ impl Conversation {
             Arc::clone(&self.mcp),
         ))
     }
+}
+
+pub(crate) enum ContextPreview {
+    Skip,
+    Busy,
+    Run(PreviewGuard),
 }
 
 pub(crate) struct PreviewGuard {

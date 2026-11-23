@@ -183,7 +183,7 @@ class AppStore extends SessionStore {
   }
 
   async deleteSession(sessionId: string): Promise<boolean> {
-    return this.action('session.delete', actionOrigin.session(sessionId), async () => {
+    return this.action('session.delete', actionOrigin.inline('session.delete', sessionId), async () => {
       await this.transport.rpc('session.delete', { sessionId })
       this.clearSessionAnchors([sessionId])
       this.clearQuestionDrafts([sessionId])

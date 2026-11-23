@@ -6,6 +6,7 @@ use protocol::{HistoryItem, ModelSelection, TurnStatus};
 use tokio_util::sync::CancellationToken;
 
 const AUTO_COMPACTION_TRIGGER_PERCENT: u64 = 90;
+const MAX_COMPACTION_PASSES: usize = 8;
 
 const COMPACTION_INSTRUCTION: &str = r#"You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context.
 
@@ -48,6 +49,19 @@ pub(super) enum PreRequestOutcome {
     AutoAttempted,
 }
 
+pub(super) enum CompactionMode<'a> {
+    Auto,
+    Overflow {
+        overflow_input_tokens: u64,
+    },
+    Manual,
+    ModelSwitch {
+        target: (&'a str, &'a str),
+        previous: (&'a str, &'a str),
+        trigger: u64,
+    },
+}
+
 impl RequestContext {
     fn trigger_tokens(&self) -> u64 {
         self.context_window() * AUTO_COMPACTION_TRIGGER_PERCENT / 100
@@ -76,11 +90,10 @@ impl RequestContext {
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        let target_provider = self.provider.provider_name().to_owned();
-        let target_model = self.provider.model_name().to_owned();
+        let target = (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned());
         let overhead_tokens = self.request_definitions().estimated_tokens;
         let session = std::sync::Arc::clone(&self.session);
-        let target_for_scan = (target_provider.clone(), target_model.clone());
+        let target_for_scan = target.clone();
         let trigger = self.trigger_tokens();
         let prepared = tokio::task::spawn_blocking(move || {
             with_writer(&session, |writer| {
@@ -107,16 +120,15 @@ impl RequestContext {
             Err((Some(previous_selection), current_tokens)) => {
                 self.compact_for_model_switch(
                     previous_selection,
-                    (&target_provider, &target_model),
+                    (&target.0, &target.1),
                     current_tokens,
-                    trigger,
                     already_switch_compacted,
                     on_event,
                     cancellation,
                 )
                 .await
             }
-            Err((None, _)) => match self.compact_now(on_event, cancellation, true).await {
+            Err((None, _)) => match self.compact_now(on_event, cancellation, CompactionMode::Auto).await {
                 Ok(_) => Ok(PreRequestOutcome::AutoAttempted),
                 Err(AgentError::Aborted) => Err(AgentError::Aborted),
                 Err(error) if error.is_session_failure() => Err(error),
@@ -128,42 +140,39 @@ impl RequestContext {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "internal model-switch pre-compaction helper"
-    )]
     async fn compact_for_model_switch(
         &self,
         previous_selection: ModelSelection,
         target: (&str, &str),
         current_tokens: u64,
-        trigger: u64,
         already_switch_compacted: bool,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<PreRequestOutcome> {
-        if already_switch_compacted {
-            return Err(AgentError::InvalidCompaction(switch_error(
+        let trigger = self.trigger_tokens();
+        let still_over = |tokens: u64| {
+            switch_invalid(
                 target,
-                format_args!(
-                    "切换前压缩后上下文（{current_tokens} token）仍达到目标模型 90% 阈值（{trigger}）。"
-                ),
-            )));
+                format_args!("切换前压缩后上下文（{tokens} token）仍达到目标模型 90% 阈值（{trigger}）。"),
+            )
+        };
+        if already_switch_compacted {
+            return Err(still_over(current_tokens));
         }
-        let prev_provider = previous_selection.provider.clone();
-        let prev_model = previous_selection.model.clone();
+        let (prev_provider, prev_model) =
+            (previous_selection.provider.clone(), previous_selection.model.clone());
         let models = std::sync::Arc::clone(&self.models);
         let previous_client =
             tokio::task::spawn_blocking(move || ModelClient::new(&models, &previous_selection))
                 .await
                 .expect("previous model client resolution completes while the runtime is running")
                 .map_err(|error| {
-                    AgentError::InvalidCompaction(switch_error(
+                    switch_invalid(
                         target,
                         format_args!(
                             "切换前原模型 {prev_provider}/{prev_model} 不可用（{error}），无法压缩上下文。"
                         ),
-                    ))
+                    )
                 })?;
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
@@ -174,23 +183,21 @@ impl RequestContext {
             return Err(AgentError::Aborted);
         }
         let Some(input) = input else {
-            return Err(AgentError::InvalidCompaction(switch_error(
+            return Err(switch_invalid(
                 target,
                 format_args!(
                     "当前上下文（{current_tokens} token）已达目标模型 90% 阈值（{trigger}），且无可压缩前缀。"
                 ),
-            )));
-        };
-        let format_failure = |error: &AgentError| {
-            switch_error(
-                target,
-                format_args!("切换前使用 {prev_provider}/{prev_model} 压缩上下文失败（{error}）。"),
-            )
+            ));
         };
         self.compact_selected_with_client(
             &previous_client,
             input,
-            Some(&format_failure),
+            CompactionMode::ModelSwitch {
+                target,
+                previous: (&prev_provider, &prev_model),
+                trigger,
+            },
             on_event,
             cancellation,
             || true,
@@ -201,12 +208,7 @@ impl RequestContext {
             return Err(AgentError::Aborted);
         }
         if after_tokens >= trigger {
-            return Err(AgentError::InvalidCompaction(switch_error(
-                target,
-                format_args!(
-                    "切换前压缩后上下文（{after_tokens} token）仍达到目标模型 90% 阈值（{trigger}）。"
-                ),
-            )));
+            return Err(still_over(after_tokens));
         }
         Ok(PreRequestOutcome::SwitchCompacted)
     }
@@ -215,15 +217,15 @@ impl RequestContext {
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
-        retain_recent: bool,
+        mode: CompactionMode<'_>,
     ) -> Result<bool> {
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        let retain_tokens = if retain_recent {
-            context::retention_budget_tokens(self.provider.model_configuration())
-        } else {
+        let retain_tokens = if matches!(mode, CompactionMode::Overflow { .. }) {
             0
+        } else {
+            context::retention_budget_tokens(self.provider.model_configuration())
         };
         let input = CompactionInput::select(&self.session, retain_tokens).await;
         if cancellation.is_cancelled() {
@@ -232,7 +234,7 @@ impl RequestContext {
         let Some(input) = input else {
             return Ok(false);
         };
-        self.compact_selected_with_client(&self.provider, input, None, on_event, cancellation, || true)
+        self.compact_selected_with_client(&self.provider, input, mode, on_event, cancellation, || true)
             .await?;
         Ok(true)
     }
@@ -245,161 +247,199 @@ impl RequestContext {
         can_commit: impl FnMut() -> bool + Send,
     ) -> Result<()> {
         self.ensure_definitions(on_event, cancellation).await?;
-        let format_failure = |error: &AgentError| error.to_string();
-        self.compact_selected_with_client(
-            &self.provider,
-            input,
-            Some(&format_failure),
-            on_event,
-            cancellation,
-            can_commit,
-        )
-        .await
+        let mode = CompactionMode::Manual;
+        self.compact_selected_with_client(&self.provider, input, mode, on_event, cancellation, can_commit)
+            .await
     }
 
     async fn compact_selected_with_client(
         &self,
         client: &ModelClient,
         input: CompactionInput,
-        format_failure: Option<&(dyn Fn(&AgentError) -> String + Sync)>,
+        mode: CompactionMode<'_>,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
         mut can_commit: impl FnMut() -> bool + Send,
     ) -> Result<()> {
-        let item_id = crate::session::new_entry_id();
-        on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
-            item: HistoryItem::CompactionResult {
-                id: item_id.clone(),
-                status: TurnStatus::Running,
-                message: None,
-            },
-        }));
-        let result = self
-            .compact_context(client, input, &item_id, on_event, cancellation, &mut can_commit)
+        let instruction_tokens = context::message_token_estimate(&Message::user(COMPACTION_INSTRUCTION));
+        let (overflow_input_tokens, stop_below) = match &mode {
+            CompactionMode::Auto => (None, Some(self.trigger_tokens())),
+            CompactionMode::ModelSwitch { trigger, .. } => (None, Some(*trigger)),
+            CompactionMode::Manual => (None, None),
+            CompactionMode::Overflow { overflow_input_tokens } => (
+                Some(*overflow_input_tokens),
+                context::compaction_input_limit(
+                    client.model_configuration(),
+                    self.request_definitions().estimated_tokens,
+                    instruction_tokens,
+                    Some(*overflow_input_tokens),
+                )
+                .map(|limit| limit.saturating_add(1)),
+            ),
+        };
+
+        let mut completed_passes = 0usize;
+        for _ in 0..MAX_COMPACTION_PASSES {
+            if cancellation.is_cancelled() {
+                return Err(AgentError::Aborted);
+            }
+            let definitions = self.request_definitions().clone();
+            let model = client.model_configuration();
+            let identity = (client.provider_name().to_owned(), client.model_name().to_owned());
+            let target_first_kept = input.first_kept_entry_id.clone();
+            let session = std::sync::Arc::clone(&self.session);
+            let prepared = tokio::task::spawn_blocking(move || -> Result<_> {
+                let step = with_writer(&session, |writer| {
+                    context::plan_compaction_step(
+                        writer.data(),
+                        &target_first_kept,
+                        (&identity.0, &identity.1),
+                        definitions.estimated_tokens,
+                        instruction_tokens,
+                        model,
+                        overflow_input_tokens,
+                    )
+                })
+                .map_err(|msg| AgentError::InvalidCompaction(msg.into()))?;
+                let Some(step) = step else {
+                    return Ok(None);
+                };
+                let mut messages = definitions.messages;
+                messages.extend(step.messages);
+                let images = context::load_images(&mut messages, &step.image_directory)?;
+                messages.push(Message::user(COMPACTION_INSTRUCTION));
+                let request = ModelTurnRequest {
+                    messages,
+                    images,
+                    tools: definitions.tools,
+                    max_output_tokens: output_budget_tokens(model, step.estimated_request_input),
+                    prompt_cache_key: Some(step.session_id),
+                };
+                Ok(Some((request, step.first_kept_entry_id, step.raw_prefix_tokens, step.is_final_chunk)))
+            })
+            .await
+            .expect("compaction preparation completes while the runtime is running");
+
+            let (request, first_kept_entry_id, raw_prefix_tokens, is_final_chunk) = match prepared {
+                Ok(Some(step)) => step,
+                Ok(None) if completed_passes > 0 => return Ok(()),
+                Ok(None) => {
+                    let err = AgentError::InvalidCompaction("当前无可压缩的有效上下文内容。".into());
+                    return Err(emit_failure(&mode, None, err, on_event));
+                }
+                Err(error) => return Err(emit_failure(&mode, None, error, on_event)),
+            };
+
+            let item_id = crate::session::new_entry_id();
+            emit_status(on_event, item_id.clone(), TurnStatus::Running, None);
+            let step_result = async {
+                let (response, _, _) = execute_request(
+                    client,
+                    &self.session,
+                    &request,
+                    on_event,
+                    cancellation,
+                    protocol::RequestPurpose::Compaction,
+                )
+                .await?;
+                let summary = validate_summary(&response, raw_prefix_tokens)?;
+                if !can_commit() || cancellation.is_cancelled() {
+                    return Err(AgentError::Aborted);
+                }
+                let entry = CompactionEntry {
+                    summary: summary.clone(),
+                    first_kept_entry_id: Some(first_kept_entry_id),
+                };
+                let id = item_id.clone();
+                with_writer_async(&self.session, move |writer| writer.append_compaction_with_id(&id, entry))
+                    .await?;
+                Ok(summary)
+            }
             .await;
-        match result {
-            Ok(summary) => {
-                on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
-                    item: HistoryItem::Compaction { id: item_id, summary },
-                }));
-                Ok(())
-            }
-            Err(error) if error.is_session_failure() => {
-                tracing::warn!(error = %error, "context compaction session write failed");
-                on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
-                    item: HistoryItem::CompactionResult {
-                        id: item_id.clone(),
-                        status: TurnStatus::Failed,
-                        message: Some(error.to_string()),
-                    },
-                }));
-                Err(AgentError::Compaction { item_id, source: Box::new(error) })
-            }
-            Err(error)
-                if matches!(error, AgentError::Aborted) || !can_commit() || cancellation.is_cancelled() =>
-            {
-                on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
-                    item: HistoryItem::CompactionResult {
-                        id: item_id,
-                        status: TurnStatus::Interrupted,
-                        message: None,
-                    },
-                }));
-                Err(AgentError::Aborted)
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "context compaction failed");
-                if let Some(format_failure) = format_failure {
-                    let message = format_failure(&error);
+
+            match step_result {
+                Ok(summary) => {
+                    completed_passes += 1;
                     on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
-                        item: HistoryItem::CompactionResult {
-                            id: item_id.clone(),
-                            status: TurnStatus::Failed,
-                            message: Some(message.clone()),
-                        },
+                        item: HistoryItem::Compaction { id: item_id, summary },
                     }));
-                    Err(AgentError::Compaction {
-                        item_id,
-                        source: Box::new(AgentError::InvalidCompaction(message)),
-                    })
-                } else {
-                    on_event(AgentEvent::Turn(TurnEvent::MessageDiscarded { message_id: item_id }));
-                    Err(error)
+                    if is_final_chunk {
+                        return Ok(());
+                    }
+                    if let Some(target_tokens) = stop_below
+                        && self.estimated_tokens().await < target_tokens
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(error) if error.is_session_failure() => {
+                    tracing::warn!(error = %error, "context compaction session write failed");
+                    emit_status(on_event, item_id.clone(), TurnStatus::Failed, Some(error.to_string()));
+                    return Err(AgentError::Compaction { item_id, source: Box::new(error) });
+                }
+                Err(error)
+                    if matches!(error, AgentError::Aborted)
+                        || cancellation.is_cancelled()
+                        || !can_commit() =>
+                {
+                    emit_status(on_event, item_id, TurnStatus::Interrupted, None);
+                    return Err(AgentError::Aborted);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "context compaction failed");
+                    return Err(emit_failure(&mode, Some(item_id), error, on_event));
                 }
             }
         }
+        let err = AgentError::InvalidCompaction(
+            "上下文压缩多轮分段后仍未收敛，请减少单轮输入或选择上下文更大的模型。".into(),
+        );
+        Err(emit_failure(&mode, None, err, on_event))
     }
+}
 
-    async fn compact_context(
-        &self,
-        client: &ModelClient,
-        input: CompactionInput,
-        item_id: &str,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-        cancellation: &CancellationToken,
-        can_commit: &mut (dyn FnMut() -> bool + Send),
-    ) -> Result<String> {
-        if cancellation.is_cancelled() {
-            return Err(AgentError::Aborted);
+fn emit_failure(
+    mode: &CompactionMode<'_>,
+    item_id: Option<String>,
+    error: AgentError,
+    on_event: &mut (dyn FnMut(AgentEvent) + Send),
+) -> AgentError {
+    let message = match mode {
+        CompactionMode::Auto | CompactionMode::Overflow { .. } => None,
+        CompactionMode::Manual => Some(error.to_string()),
+        CompactionMode::ModelSwitch { target, previous, .. } => Some(switch_error(
+            *target,
+            format_args!("切换前使用 {}/{} 压缩上下文失败（{error}）。", previous.0, previous.1),
+        )),
+    };
+    if let Some(message) = message {
+        let id = item_id.unwrap_or_else(crate::session::new_entry_id);
+        emit_status(on_event, id.clone(), TurnStatus::Failed, Some(message.clone()));
+        AgentError::Compaction {
+            item_id: id,
+            source: Box::new(AgentError::InvalidCompaction(message)),
         }
-        let definitions = self.request_definitions().clone();
-        let model = client.model_configuration();
-        let identity = (client.provider_name().to_owned(), client.model_name().to_owned());
-        let instruction = Message::user(COMPACTION_INSTRUCTION);
-        let instruction_tokens = context::message_token_estimate(&instruction);
-        let defs_est = definitions.estimated_tokens;
-        let full_est = defs_est.saturating_add(input.total_estimated_tokens);
-        let prefix_est = defs_est.saturating_add(input.prefix_estimated_tokens);
-        let base_tokens = match &input.latest_usage {
-            Some((provider, model_id, total_tokens, tail_tokens))
-                if provider == &identity.0 && model_id == &identity.1 && full_est > 0 =>
-            {
-                let real_full = total_tokens.saturating_add(*tail_tokens);
-                u64::try_from(u128::from(real_full) * u128::from(prefix_est) / u128::from(full_est))
-                    .unwrap_or(prefix_est)
-            }
-            _ => prefix_est,
-        };
-        let estimated_full_input = base_tokens.saturating_add(instruction_tokens);
-        let max_output_tokens = output_budget_tokens(model, estimated_full_input);
-        let request = tokio::task::spawn_blocking(move || {
-            let mut messages = definitions.messages;
-            messages.extend(input.messages);
-            let images = context::load_images(&mut messages, &input.image_directory)?;
-            messages.push(instruction);
-            Ok::<_, std::io::Error>(ModelTurnRequest {
-                messages,
-                images,
-                tools: definitions.tools,
-                max_output_tokens,
-            })
-        })
-        .await
-        .expect("compaction preparation completes while the runtime is running")?;
-
-        let (response, _, _) = execute_request(
-            client,
-            &self.session,
-            &request,
-            on_event,
-            cancellation,
-            protocol::RequestPurpose::Compaction,
-        )
-        .await?;
-        let summary = validate_summary_text(&response)?;
-        validate_shrink(&summary, input.prefix_estimated_tokens)?;
-
-        if !can_commit() || cancellation.is_cancelled() {
-            return Err(AgentError::Aborted);
+    } else {
+        if let Some(message_id) = item_id {
+            on_event(AgentEvent::Turn(TurnEvent::MessageDiscarded { message_id }));
         }
-        let entry = CompactionEntry {
-            summary: summary.clone(),
-            first_kept_entry_id: Some(input.first_kept_entry_id),
-        };
-        let id = item_id.to_owned();
-        with_writer_async(&self.session, move |writer| writer.append_compaction_with_id(&id, entry)).await?;
-        Ok(summary)
+        error
     }
+}
+
+fn emit_status(
+    on_event: &mut (dyn FnMut(AgentEvent) + Send),
+    id: String,
+    status: TurnStatus,
+    message: Option<String>,
+) {
+    on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
+        item: HistoryItem::CompactionResult { id, status, message },
+    }));
+}
+
+fn switch_invalid(target: (&str, &str), detail: impl std::fmt::Display) -> AgentError {
+    AgentError::InvalidCompaction(switch_error(target, detail))
 }
 
 fn switch_error((target_provider, target_model): (&str, &str), detail: impl std::fmt::Display) -> String {
@@ -413,20 +453,18 @@ pub fn compaction_unneeded(
     cancellation: &CancellationToken,
 ) -> TurnStatus {
     let id = crate::session::new_entry_id();
-    let final_status = if cancellation.is_cancelled() {
+    let done = if cancellation.is_cancelled() {
         TurnStatus::Interrupted
     } else {
         TurnStatus::Completed
     };
-    for status in [TurnStatus::Running, final_status] {
-        on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
-            item: HistoryItem::CompactionResult { id: id.clone(), status, message: None },
-        }));
+    for status in [TurnStatus::Running, done] {
+        emit_status(on_event, id.clone(), status, None);
     }
-    final_status
+    done
 }
 
-fn validate_summary_text(response: &ModelTurnResponse) -> Result<String> {
+fn validate_summary(response: &ModelTurnResponse, prefix_estimated_tokens: u64) -> Result<String> {
     if response.is_length_truncated() {
         return Err(AgentError::InvalidCompaction("上下文压缩达到输出上限，摘要不完整。".into()));
     }
@@ -437,15 +475,11 @@ fn validate_summary_text(response: &ModelTurnResponse) -> Result<String> {
     if text.trim().is_empty() {
         return Err(AgentError::InvalidCompaction("上下文压缩没有返回摘要正文。".into()));
     }
-    Ok(text)
-}
-
-fn validate_shrink(summary: &str, prefix_estimated_tokens: u64) -> Result<()> {
-    let framed = context::message_token_estimate(&context::frame_compacted_summary(summary));
+    let framed = context::message_token_estimate(&context::frame_compacted_summary(&text));
     if framed >= prefix_estimated_tokens {
         return Err(AgentError::InvalidCompaction(format!(
             "压缩摘要未小于原始上下文（{framed} >= {prefix_estimated_tokens}），已保留原上下文。"
         )));
     }
-    Ok(())
+    Ok(text)
 }

@@ -242,3 +242,11 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
 pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(args: &Value) -> Result<T, ToolExecution> {
     T::deserialize(args).map_err(|error| error_result(format!("invalid tool arguments: {error}")))
 }
+
+pub(crate) fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(<Option<T> as serde::Deserialize>::deserialize(deserializer)?.unwrap_or_default())
+}

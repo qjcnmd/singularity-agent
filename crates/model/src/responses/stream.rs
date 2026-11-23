@@ -1,14 +1,16 @@
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::parse_openai_responses_response;
+use super::{parse_openai_responses_response, summary_part_separator};
 use crate::config::selection::{ProviderConfig, SelectedModel};
 use crate::error::{
     ModelErrorKind, ProviderError, bounded_provider_error_diagnostic, provider_embedded_error,
     provider_error_fields,
 };
 use crate::provider::ProviderStreamEvent;
-use crate::transport::stream::{SseStreamDecoder, provider_stream_malformed_error, read_sse_stream};
+use crate::transport::stream::{
+    SseStreamDecoder, provider_stream_malformed_error, provider_stream_unterminated_error, read_sse_stream,
+};
 use crate::types::{Message, ModelTurnResponse};
 
 pub(crate) async fn read_responses_sse_stream(
@@ -28,12 +30,19 @@ struct ResponsesSseDecoder<'a> {
     terminal_response: Option<Value>,
     text: String,
     thinking: String,
+    last_summary_index: Option<u64>,
+    pending_reasoning_separator: bool,
+    received_event: bool,
     on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send),
 }
 
 impl SseStreamDecoder for ResponsesSseDecoder<'_> {
     fn frame_malformed(reason: &'static str) -> ProviderError {
         provider_responses_stream_malformed_error(reason)
+    }
+
+    fn frame_unterminated(&self) -> ProviderError {
+        provider_stream_unterminated_error("provider Responses stream was malformed", self.received_event)
     }
 
     fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError> {
@@ -56,6 +65,14 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                     (self.on_event)(ProviderStreamEvent::ToolCallDelta);
                 }
             }
+            "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
+                if !self.thinking.is_empty() {
+                    self.pending_reasoning_separator = true;
+                }
+                if let Some(index) = payload.get("summary_index").and_then(Value::as_u64) {
+                    self.last_summary_index = Some(index);
+                }
+            }
             "response.output_text.delta"
             | "response.refusal.delta"
             | "response.reasoning_summary_text.delta" => {
@@ -67,13 +84,31 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                         "output_text_delta_missing"
                     })
                 })?;
+                if reasoning && let Some(index) = payload.get("summary_index").and_then(Value::as_u64) {
+                    if self.last_summary_index.is_some_and(|prev| prev != index) && !self.thinking.is_empty()
+                    {
+                        self.pending_reasoning_separator = true;
+                    }
+                    self.last_summary_index = Some(index);
+                }
                 if !delta.is_empty() {
-                    if reasoning {
+                    let delta = if reasoning {
+                        let sep = if std::mem::take(&mut self.pending_reasoning_separator) {
+                            summary_part_separator(&self.thinking, delta)
+                        } else {
+                            ""
+                        };
+                        self.thinking.push_str(sep);
                         self.thinking.push_str(delta);
+                        if sep.is_empty() {
+                            delta.to_string()
+                        } else {
+                            format!("{sep}{delta}")
+                        }
                     } else {
                         self.text.push_str(delta);
-                    }
-                    let delta = delta.to_string();
+                        delta.to_string()
+                    };
                     (self.on_event)(if reasoning {
                         ProviderStreamEvent::ReasoningTextDelta { delta }
                     } else {
@@ -111,6 +146,7 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
             }
             _ => {}
         }
+        self.received_event = true;
         Ok(())
     }
 
@@ -125,6 +161,9 @@ impl<'a> ResponsesSseDecoder<'a> {
             terminal_response: None,
             text: String::new(),
             thinking: String::new(),
+            last_summary_index: None,
+            pending_reasoning_separator: false,
+            received_event: false,
             on_event,
         }
     }
@@ -140,7 +179,7 @@ impl<'a> ResponsesSseDecoder<'a> {
             let payload = self
                 .terminal_response
                 .take()
-                .ok_or_else(provider_responses_stream_terminal_missing_error)?;
+                .ok_or_else(|| provider_responses_stream_terminal_missing_error(self.received_event))?;
             parse_openai_responses_response(
                 config,
                 payload,
@@ -163,9 +202,11 @@ fn provider_responses_stream_malformed_error(reason: &'static str) -> ProviderEr
     provider_stream_malformed_error("provider Responses stream was malformed", reason)
 }
 
-fn provider_responses_stream_terminal_missing_error() -> ProviderError {
-    ProviderError::new(
-        ModelErrorKind::Other,
-        "provider Responses stream did not contain a completed terminal",
-    )
+fn provider_responses_stream_terminal_missing_error(received_event: bool) -> ProviderError {
+    let kind = if received_event {
+        ModelErrorKind::Temporary
+    } else {
+        ModelErrorKind::Other
+    };
+    ProviderError::new(kind, "provider Responses stream did not contain a completed terminal")
 }

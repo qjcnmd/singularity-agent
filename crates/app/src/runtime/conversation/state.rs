@@ -79,7 +79,16 @@ impl ConversationState {
         self.turn.is_busy()
             || self.context_preview.is_some()
             || bash_tasks.is_busy()
-            || !self.steering_inbox.lock().expect("turn inbox lock poisoned").pending().is_empty()
+            || self.has_active_inbox()
+    }
+
+    fn has_active_inbox(&self) -> bool {
+        let inbox = self.steering_inbox.lock().expect("turn inbox lock poisoned");
+        if self.auto_resume {
+            !inbox.pending().is_empty()
+        } else {
+            inbox.pending().iter().any(|entry| entry.user_input().is_some())
+        }
     }
 
     pub(super) fn has_pending_resume(&self) -> bool {

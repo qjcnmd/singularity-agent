@@ -174,13 +174,8 @@ pub(crate) fn context_usage(
 ) -> Option<protocol::ContextUsage> {
     let capacity = capacity.filter(|capacity| *capacity > 0)?;
     for entry in entries.iter().rev() {
-        match entry {
-            SessionEntry::Compaction { .. } => return None,
-            SessionEntry::Metadata {
-                metadata: SessionMetadata::ThreadSettings { selection },
-                ..
-            } if selection.provider != selected.provider || selection.model != selected.model => return None,
-            _ => {}
+        if matches!(entry, SessionEntry::Compaction { .. }) {
+            return None;
         }
         let Some(request) = entry.request_observation() else {
             continue;

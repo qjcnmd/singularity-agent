@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use protocol::{RpcError, RpcRequest, StreamEvent};
+use protocol::{RpcError, RpcRequest, RpcResponse, StreamEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -19,14 +19,7 @@ struct Request {
 #[derive(Serialize)]
 struct Response {
     id: u64,
-    response: RpcResponse,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum RpcResponse {
-    Success { result: Box<RawValue> },
-    Error { error: RpcError },
+    response: RpcResponse<Box<RawValue>>,
 }
 
 const STDOUT_WRITER_CAPACITY: usize = 512;

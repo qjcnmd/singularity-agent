@@ -51,13 +51,14 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
     }
   }, [load])
 
+  const hasConnecting = servers.some(server => server.status === 'connecting')
   useEffect(() => {
-    if (busy || loading || error || reconnecting > 0) return
+    if (busy || loading || error || reconnecting > 0 || !hasConnecting) return
     const timer = window.setTimeout(() => {
       void load()
     }, 1000)
     return () => window.clearTimeout(timer)
-  }, [busy, loading, error, reconnecting, servers, load])
+  }, [busy, loading, error, reconnecting, hasConnecting, servers, load])
 
   async function reconnect(serverId: string) {
     const ep = epoch.current

@@ -7,6 +7,7 @@ mod turn;
 mod view;
 
 use self::state::{ConversationState, TurnControls, TurnLifecycle};
+pub(crate) use self::turn::ContextPreview;
 
 use std::sync::{Arc, Mutex};
 

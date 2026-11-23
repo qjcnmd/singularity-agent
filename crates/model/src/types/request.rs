@@ -7,4 +7,5 @@ pub struct ModelTurnRequest {
     pub images: std::collections::HashMap<String, String>,
     pub tools: Vec<ToolDefinition>,
     pub max_output_tokens: u32,
+    pub prompt_cache_key: Option<String>,
 }

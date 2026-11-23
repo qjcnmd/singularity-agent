@@ -362,6 +362,14 @@ async fn context_pressure_and_overflow_invariants() {
     assert!(history_text.contains("LATEST_INTENT_MUST_SURVIVE"));
     assert!(history_text.contains("STILL_USABLE_AFTER_FAILED_COMPACTION"));
 
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(
+        None,
+        "RECOVERED_UNDER_CONTEXT_PRESSURE",
+        6_500,
+        0,
+        40,
+        "end_turn",
+    )));
     restarted.submit(&session_id, "POST_RESTART_CONTINUATION").await;
     let s_restart = restarted.wait_settled(&session_id).await;
     assert_eq!(s_restart.pointer("/summary/status").and_then(Value::as_str), Some("completed"));

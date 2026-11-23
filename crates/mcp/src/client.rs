@@ -268,6 +268,8 @@ async fn connect_http(
 ) -> Result<RunningService<RoleClient, Handler>, McpError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
+        // reqwest 跨源重定向时只移除预定义的鉴权头。
+        .redirect(reqwest::redirect::Policy::none())
         .no_gzip()
         .connect_timeout(startup)
         .build()

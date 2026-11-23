@@ -184,6 +184,39 @@ fn build_conversation(
     messages
 }
 
+fn count_cache_control(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => {
+            usize::from(map.contains_key("cache_control"))
+                + map.values().map(count_cache_control).sum::<usize>()
+        }
+        Value::Array(items) => items.iter().map(count_cache_control).sum(),
+        _ => 0,
+    }
+}
+
+fn trailing_tool_turn_stripped_in_steps(steps: &[TurnStep]) -> bool {
+    let mut iter = steps.iter().rev().skip_while(|s| match s {
+        TurnStep::Assistant { text, tool_count, .. } => text.is_none() && *tool_count == 0,
+        _ => true,
+    });
+    let Some(TurnStep::Assistant { thinking, same_provider, tool_count, .. }) = iter.next() else {
+        return false;
+    };
+    *tool_count > 0
+        && (thinking.is_some() && *same_provider
+            || iter.take_while(|s| matches!(s, TurnStep::Assistant { tool_count: 0, .. })).any(|s| {
+                matches!(
+                    s,
+                    TurnStep::Assistant {
+                        thinking: Some(_),
+                        same_provider: true,
+                        ..
+                    }
+                )
+            }))
+}
+
 fn sse_line_strategy() -> impl Strategy<Value = String> {
     prop::collection::vec(
         prop_oneof![
@@ -274,6 +307,7 @@ proptest! {
             max_output_tokens: 4096,
             reasoning_variant: Some("high".into()),
         };
+        let trailing_stripped = trailing_tool_turn_stripped_in_steps(&steps);
         let messages = build_conversation(
             leading_devs,
             steps,
@@ -287,21 +321,27 @@ proptest! {
             images: HashMap::new(),
             tools: Vec::new(),
             max_output_tokens: 1024,
+            prompt_cache_key: None,
         };
         let payload = messages_stream_request_payload(&req, &selection, provider_name, endpoint)
             .expect("messages encoding succeeds")
             .payload;
         let serialized = payload.to_string();
         prop_assert!(!serialized.contains(OTHER_MSG_SIG), "leaked foreign Messages signature");
+        prop_assert!(count_cache_control(&payload) <= 4, "explicit cache_control breakpoints exceed 4");
 
         let encoded = payload.get("messages").and_then(Value::as_array).expect("messages array");
         prop_assert!(!encoded.is_empty());
-
+        prop_assert!(encoded[..encoded.len() - 1].iter().all(|m| count_cache_control(m) == 0));
         prop_assert_eq!(
-            payload.pointer("/thinking/type").and_then(Value::as_str),
-            Some("adaptive"),
-            "a high selection stays enabled across every encoded history, including tool continuations"
+            encoded.last().and_then(|m| m.get("content")).and_then(Value::as_array).and_then(|b| b.last()).and_then(|b| b.pointer("/cache_control/type")).and_then(Value::as_str),
+            Some("ephemeral")
         );
+        if trailing_stripped {
+            prop_assert!(payload.get("thinking").is_none() && payload.get("output_config").is_none());
+        } else {
+            prop_assert_eq!(payload.pointer("/thinking/type").and_then(Value::as_str), Some("adaptive"));
+        }
 
         let mut prev_role: Option<&str> = None;
         let mut expected_tools: HashSet<String> = HashSet::new();
@@ -342,6 +382,11 @@ proptest! {
     fn responses_encoding_preserves_protocol_invariants(
         leading_devs in prop::collection::vec(non_empty_text(), 0..=3),
         steps in prop::collection::vec(turn_step_strategy(), 0..=10),
+        prompt_cache_key in prop::option::of(prop_oneof![
+            Just(String::new()),
+            Just("   ".to_string()),
+            non_empty_text(),
+        ]),
     ) {
         let provider_name = "primary";
         let model_name = "demo";
@@ -366,11 +411,14 @@ proptest! {
             images: HashMap::new(),
             tools: Vec::new(),
             max_output_tokens: 1024,
+            prompt_cache_key,
         };
         let payload = openai_responses_stream_request_payload(&req, &selection, provider_name, endpoint)
             .expect("responses encoding succeeds");
         let serialized = payload.to_string();
         prop_assert!(!serialized.contains(OTHER_RESP_ENC), "leaked foreign Responses encrypted_content");
+        let expected_cache_key = req.prompt_cache_key.as_deref().filter(|key| !key.trim().is_empty());
+        prop_assert_eq!(payload.get("prompt_cache_key").and_then(Value::as_str), expected_cache_key);
 
         let input = payload.get("input").and_then(Value::as_array).expect("input array");
         prop_assert!(!input.is_empty());
@@ -449,89 +497,89 @@ fn messages_context_window_exceeded_and_responses_refusal_contract() {
     assert_eq!(refusal_resp.assistant_message.content_text(), "cannot summarize");
 
     let endpoint = "https://example.invalid/v1/messages";
-    let turn1_req = ModelTurnRequest {
-        messages: vec![Message::developer("sys v1"), Message::user("first prompt")],
-        images: HashMap::new(),
-        tools: Vec::new(),
-        max_output_tokens: 1024,
+    let encode = |dev: &str, user: &str, tail: Vec<Message>| {
+        let mut messages = vec![Message::developer(dev), Message::user(user)];
+        messages.extend(tail);
+        let req = ModelTurnRequest {
+            messages,
+            images: HashMap::new(),
+            tools: Vec::new(),
+            max_output_tokens: 1024,
+            prompt_cache_key: None,
+        };
+        messages_stream_request_payload(&req, &messages_model, "p", endpoint).expect("messages encode")
     };
-    let turn1_digest = messages_stream_request_payload(&turn1_req, &messages_model, "p", endpoint)
-        .expect("turn 1 encodes")
-        .prefix_digest;
-    let mut signed_meta = Map::new();
-    signed_meta.insert("signature".into(), json!("SIG_BOUND_TO_V1"));
-    let mut redacted_meta = Map::new();
-    redacted_meta.insert("type".into(), json!("redacted_thinking"));
-    redacted_meta.insert("data".into(), json!("REDACTED_PAYLOAD"));
-    let assistant_v1 = Message::Assistant {
-        content: vec![
-            ContentBlock::Thinking {
-                thinking: "signed thought".into(),
-                metadata: Some(ProviderBlockMetadata(signed_meta)),
-            },
-            ContentBlock::Thinking {
-                thinking: String::new(),
-                metadata: Some(ProviderBlockMetadata(redacted_meta)),
-            },
-            ContentBlock::Thinking {
-                thinking: "UNSIGNED_THOUGHT_KEPT".into(),
-                metadata: None,
-            },
-            ContentBlock::text("ASSISTANT_BODY_KEPT"),
-        ],
+    fn ptr<'a>(p: &'a Value, path: &str) -> Option<&'a str> {
+        p.pointer(path).and_then(Value::as_str)
+    }
+    let turn1 = encode("sys v1", "first prompt", vec![]);
+    assert_eq!(ptr(&turn1.payload, "/messages/0/content/0/cache_control/type"), Some("ephemeral"));
+    let turn1_digest = turn1.prefix_digest;
+    let mk_assistant = |content| Message::Assistant {
+        content,
         provider_metadata: Some(ProviderMessageMetadata {
             protocol: ProviderApiProtocol::Messages,
             provider_name: "p".into(),
             model_name: "claude-test".into(),
             endpoint: endpoint.into(),
-            prefix_digest: Some(turn1_digest),
+            prefix_digest: Some(turn1_digest.clone()),
             reasoning: None,
         }),
     };
-
-    let same_prefix_req = ModelTurnRequest {
-        messages: vec![
-            Message::developer("sys v1"),
-            Message::user("first prompt"),
-            assistant_v1.clone(),
-            Message::user("follow up"),
-        ],
-        images: HashMap::new(),
-        tools: Vec::new(),
-        max_output_tokens: 1024,
+    let signed_block = ContentBlock::Thinking {
+        thinking: "signed thought".into(),
+        metadata: Some(ProviderBlockMetadata(Map::from_iter([(
+            "signature".into(),
+            json!("SIG_BOUND_TO_V1"),
+        )]))),
     };
-    let same_payload = messages_stream_request_payload(&same_prefix_req, &messages_model, "p", endpoint)
-        .expect("same prefix encodes")
-        .payload;
+    let assistant_v1 = mk_assistant(vec![
+        signed_block.clone(),
+        ContentBlock::Thinking {
+            thinking: String::new(),
+            metadata: Some(ProviderBlockMetadata(Map::from_iter([
+                ("type".into(), json!("redacted_thinking")),
+                ("data".into(), json!("REDACTED_PAYLOAD")),
+            ]))),
+        },
+        ContentBlock::Thinking {
+            thinking: "UNSIGNED_THOUGHT_KEPT".into(),
+            metadata: None,
+        },
+        ContentBlock::text("ASSISTANT_BODY_KEPT"),
+    ]);
+
+    let same_payload =
+        encode("sys v1", "first prompt", vec![assistant_v1.clone(), Message::user("follow up")]).payload;
     let same_str = same_payload.to_string();
-    assert!(same_str.contains("SIG_BOUND_TO_V1"), "matching prefix must preserve signed thinking");
-    assert!(same_str.contains("REDACTED_PAYLOAD"), "matching prefix must preserve redacted thinking");
+    assert!(same_str.contains("SIG_BOUND_TO_V1") && same_str.contains("REDACTED_PAYLOAD"));
     assert!(same_str.contains("UNSIGNED_THOUGHT_KEPT"));
+    assert!(same_payload.pointer("/messages/0/content/0/cache_control").is_none());
+    assert_eq!(ptr(&same_payload, "/messages/2/content/0/cache_control/type"), Some("ephemeral"));
 
-    let changed_prefix_req = ModelTurnRequest {
-        messages: vec![
-            Message::developer("sys v2 changed"),
-            Message::user("compacted summary"),
-            assistant_v1,
-            Message::user("follow up"),
-        ],
-        images: HashMap::new(),
-        tools: Vec::new(),
-        max_output_tokens: 1024,
+    let changed_str =
+        encode("sys v2 changed", "compacted summary", vec![assistant_v1, Message::user("follow up")])
+            .payload
+            .to_string();
+    assert!(!changed_str.contains("SIG_BOUND_TO_V1") && !changed_str.contains("REDACTED_PAYLOAD"));
+    assert!(changed_str.contains("UNSIGNED_THOUGHT_KEPT") && changed_str.contains("ASSISTANT_BODY_KEPT"));
+
+    let call = ContentBlock::ToolCall(ModelToolCall {
+        tool_call_id: "c1".into(),
+        tool_name: "read".into(),
+        arguments: json!({}),
+        metadata: None,
+    });
+    let res = Message::ToolResult {
+        content: vec![ContentBlock::text("ok")],
+        tool_call_id: "c1".into(),
+        is_error: false,
     };
-    let changed_payload =
-        messages_stream_request_payload(&changed_prefix_req, &messages_model, "p", endpoint)
-            .expect("changed prefix encodes")
+    let normal_tool =
+        encode("sys v1", "first prompt", vec![mk_assistant(vec![call.clone()]), res.clone()]).payload;
+    assert_eq!(ptr(&normal_tool, "/thinking/type"), Some("adaptive"));
+    let stripped_tool =
+        encode("sys v2 changed", "compacted summary", vec![mk_assistant(vec![signed_block, call]), res])
             .payload;
-    let changed_str = changed_payload.to_string();
-    assert!(
-        !changed_str.contains("SIG_BOUND_TO_V1"),
-        "changed prefix must strip stale signed thinking"
-    );
-    assert!(
-        !changed_str.contains("REDACTED_PAYLOAD"),
-        "changed prefix must strip stale redacted thinking"
-    );
-    assert!(changed_str.contains("UNSIGNED_THOUGHT_KEPT"), "unsigned thinking must stay intact");
-    assert!(changed_str.contains("ASSISTANT_BODY_KEPT"), "assistant text must stay intact");
+    assert!(stripped_tool.get("thinking").is_none() && stripped_tool.get("output_config").is_none());
 }
