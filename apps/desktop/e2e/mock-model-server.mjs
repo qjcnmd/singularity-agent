@@ -48,10 +48,6 @@ export function createGate() {
   return { promise, release }
 }
 
-/**
- * 极简本地测试 HTTP SSE 回放服务器（仅测试使用，零外部依赖）。
- * 按脚本队列返回 Anthropic Messages SSE 响应。
- */
 export async function startMockModelServer() {
   const queue = []
 

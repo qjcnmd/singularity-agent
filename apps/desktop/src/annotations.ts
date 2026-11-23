@@ -43,7 +43,6 @@ function collectTextMap(root: HTMLElement): TextMap {
   return { segments, fullText }
 }
 
-/** 始终在 Text 节点上设定起止位置，确保与 CSS Custom Highlight API 稳定协作。 */
 function rangeFromOffsets(map: TextMap, startOffset: number, endOffset: number): Range | null {
   if (startOffset < 0 || endOffset <= startOffset || endOffset > map.fullText.length) return null
   let startNode: Text | null = null
@@ -68,7 +67,6 @@ function rangeFromOffsets(map: TextMap, startOffset: number, endOffset: number):
   return range
 }
 
-/** 仅接受落在同一条已完成助手消息正文内的非空文字选区。 */
 export function captureSelectionAnnotation(selection: Selection | null, container: HTMLElement | null): CapturedAnnotation | null {
   if (!selection || selection.isCollapsed || selection.rangeCount === 0 || !container) return null
   const range = selection.getRangeAt(0)
@@ -139,7 +137,6 @@ export function resolveAnnotationRange(
   return best !== -1 ? rangeFromOffsets(map, best, best + anchor.quote.length) : null
 }
 
-/** 取选区首个非空矩形，避免换行空矩形导致浮层或角标偏移。 */
 export function rangeLeadRect(range: Range): DOMRect | null {
   for (const rect of range.getClientRects()) {
     if (rect.width > 0 && rect.height > 0) return rect

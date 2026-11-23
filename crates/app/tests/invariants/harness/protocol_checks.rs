@@ -1,14 +1,7 @@
-//! Messages（Anthropic 兼容）与 OpenAI Responses 上游请求协议不变量校验。
-
 use std::collections::HashSet;
 
 use serde_json::Value;
 
-/// Anthropic Messages 协议不变量：
-/// 1. 工具 schema 必须全部是合法 object schema；
-/// 2. 角色只能是 `user` / `assistant` 且严格交替，不存在空内容消息；
-/// 3. 每个 assistant `tool_use` 紧跟的下一条 user 消息里必须包含对应 `tool_result`，
-///    且不存在重复或孤儿 `tool_use` / `tool_result` ID。
 pub fn check_messages_request_invariants(body: &Value) -> Result<(), String> {
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         for tool in tools {
@@ -94,9 +87,6 @@ pub fn check_messages_request_invariants(body: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// OpenAI Responses 协议不变量：
-/// 1. 函数工具必须是合法 object schema；
-/// 2. 每个 `function_call` 都有匹配的 `function_call_output`，无重复 ID、无孤儿输出。
 pub fn check_responses_request_invariants(body: &Value) -> Result<(), String> {
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         for tool in tools {

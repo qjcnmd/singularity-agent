@@ -1,5 +1,3 @@
-//! OpenAI Responses 协议：请求编码、SSE 解码与响应解析。
-
 mod stream;
 pub(crate) use self::stream::read_responses_sse_stream;
 
@@ -91,7 +89,6 @@ pub(crate) fn parse_openai_responses_response(
         .and_then(|details| details.get("reason"))
         .and_then(Value::as_str);
     let length_truncated = status == Some("incomplete") && incomplete_reason == Some("max_output_tokens");
-    // 只有触达输出上限的不完整响应算正常截断，其余未完成一律失败。
     if status != Some("completed") && !length_truncated {
         if incomplete_reason == Some("content_filter") {
             return Err(ProviderError::new(
@@ -110,7 +107,6 @@ pub(crate) fn parse_openai_responses_response(
             &["responses_status_not_completed"],
         ));
     }
-    // 内容按提供方输出的顺序保存；续接字段跟随各块，正文和参数不重复保存。
     let Some(Value::Array(output)) = payload.get_mut("output").map(std::mem::take) else {
         return Err(provider_response_validation_error(
             "provider Responses payload missing output items",
@@ -219,7 +215,6 @@ fn parse_responses_usage(usage: Option<&Value>) -> Option<ModelUsage> {
     })
 }
 
-/// message content 规则：缺 content 算协议错误，text/output_text 与 refusal 都拼成可见文本，并单独记录 refusal。
 fn parse_responses_message_content(content: Option<&Value>) -> Result<(String, bool), &'static str> {
     match content {
         None | Some(Value::Null) => Err("responses_message_content_missing"),
@@ -245,7 +240,6 @@ fn parse_responses_message_content(content: Option<&Value>) -> Result<(String, b
     }
 }
 
-/// 把消息编码成 Responses 的 input；是否附带提供方私有数据见 `message_metadata_for`。
 pub(crate) fn openai_responses_input(
     messages: &[Message],
     images: &std::collections::HashMap<String, String>,
@@ -314,8 +308,6 @@ pub(crate) fn openai_responses_input(
                 }
             }
             Message::Developer { .. } | Message::User { .. } | Message::Notification { .. } => {
-                // 开头的 developer 已折叠进 instructions；历史之后的 developer
-                // 使用 Responses 输入 schema 接受的 system 角色。
                 let role = if matches!(message, Message::Developer { .. }) {
                     "system"
                 } else {

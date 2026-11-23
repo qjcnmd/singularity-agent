@@ -1,5 +1,3 @@
-//! bash 工具的执行、输出捕获与规格定义。
-
 mod exec;
 mod pump;
 mod result;

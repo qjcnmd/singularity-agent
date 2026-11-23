@@ -28,7 +28,6 @@ interface Props {
   onDisclosureChange: (element: HTMLElement) => void
 }
 
-// 历史项复用稳定引用跳过重绘；流式更新只重新渲染当前活动项。
 export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, userHome, sessionId, onDisclosureChange }: Props) {
   const userLines = item.type === 'message' && item.role === 'user' ? item.text.trimEnd().split('\n') : []
   const hiddenLines = Math.max(0, userLines.length - previewLineCount)
@@ -296,9 +295,7 @@ function ReasoningRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemKe
   const collapseBody = useBodyCollapse(expanded ? () => setExpanded(false) : undefined, onDisclosureChange)
   const running = item.status === 'running'
   const text = item.text.trim()
-  // 思考中保持单行滚动展示最新文字，新字从右侧进入、旧字在左侧淡出。
   const ticker = running && !expanded
-  // 标题行不动，全文在下方展开；展开时标题行的摘要淡出，避免同一句话出现两次。
   return <article className="timeline-item activity-step reasoning-row" data-item-id={itemKey}>
     <button type="button" className="activity-toggle" aria-expanded={expanded} {...guard(() => setExpanded(value => !value))}>
       <StepStatusIcon name="thinking" status={item.status} />
@@ -331,13 +328,11 @@ function CompactionRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemK
   </article>
 }
 
-/** 截至这条回复或该回合结束时整个会话的累计：平均首 token 时间、平均输出速度、总用量和缓存命中率。 */
 function MessageStatsLine({ itemKey, stats, at }: { itemKey?: string; stats?: SessionModelUsage; at?: string }) {
   const parts: string[] = []
   if (stats && stats.ttftRequests > 0) parts.push(`TTFT ${(stats.ttftMs / stats.ttftRequests / 1000).toFixed(1)}s`)
   if (stats && stats.decodeMs > 0) parts.push(`${Math.round(stats.decodeTokens * 1000 / stats.decodeMs)} tok/s`)
   if (stats?.usagePresent) parts.push(`${formatTokenCount(stats.totalTokens)} tokens`)
-  // 向下取整：只有全部命中时才显示 100%。
   if (stats?.usagePresent && stats.cacheUsageComplete && stats.inputTokens > 0) parts.push(`${Math.floor(stats.cachedInputTokens / stats.inputTokens * 100)}%`)
   if (at) parts.push(formatClock(at))
   return parts.length ? <p className={itemKey ? 'timeline-item turn-stats' : 'turn-stats'} data-item-id={itemKey} title="平均首 token 时间 · 平均输出速度 · 会话总用量 · 缓存命中率 · 时间">{parts.join(' · ')}</p> : null

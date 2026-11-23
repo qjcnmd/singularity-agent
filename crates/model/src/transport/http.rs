@@ -29,7 +29,6 @@ fn parse_retry_after_value(value: &str) -> Option<Duration> {
     if let Ok(seconds) = value.parse::<u64>() {
         return Some(Duration::from_secs(seconds));
     }
-    // 无效或已过期的 HTTP-date 不触发立即重发，交给调用方使用有上限的指数退避。
     let target = OffsetDateTime::parse(value, &Rfc2822).ok()?;
     let remaining = Duration::try_from(target - OffsetDateTime::now_utc()).ok()?;
     (!remaining.is_zero()).then_some(remaining)
@@ -41,7 +40,6 @@ pub(crate) fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
 }
 
-/// 获取全局共享的 reqwest Client 单例（复用连接池与 TLS 会话）。
 const PROVIDER_CONNECT_TIMEOUT_SECONDS: u64 = 30;
 
 pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
@@ -50,7 +48,7 @@ pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
         return Ok(client.clone());
     }
     let client = client_builder()
-        // 禁用自动重定向，防止自定义鉴权头随跨源跳转外泄；流式 SSE 响应不用 gzip，避免压缩缓冲延迟首字节。
+        // reqwest 跨源重定向时只移除预定义的鉴权头。
         .redirect(reqwest::redirect::Policy::none())
         .no_gzip()
         .connect_timeout(Duration::from_secs(PROVIDER_CONNECT_TIMEOUT_SECONDS))
@@ -89,7 +87,6 @@ fn sensitive_header_value(value: &str) -> Result<reqwest::header::HeaderValue, P
     Ok(header)
 }
 
-/// 提取网络传输异常的最内层错误原因；剥离可能含凭据的 URL，并限制最大长度。
 pub(crate) fn transport_error_source(error: reqwest::Error) -> String {
     let error = error.without_url();
     let mut source: &(dyn std::error::Error + 'static) = &error;
@@ -106,7 +103,6 @@ pub(crate) enum BoundedBodyReadError {
     Transport(reqwest::Error),
 }
 
-/// 读取有大小上限的 HTTP 响应正文；超出上限后截断，避免大错误页占满内存。
 pub(crate) async fn read_bounded_body(
     mut response: reqwest::Response,
     max_bytes: usize,

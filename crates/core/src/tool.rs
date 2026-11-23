@@ -1,5 +1,3 @@
-//! 内置工具和 MCP 共用的工具定义及 Token 估算；各模型协议在发送时编码。
-
 use serde::Serialize;
 use serde_json::Value;
 
@@ -11,7 +9,6 @@ pub struct ToolDefinition {
     pub parameters_schema: Value,
 }
 
-/// 空目录不占预算；非空目录按完整 JSON 列表估算，加上列表开销。
 pub fn estimate_tool_tokens<'a>(tools: impl IntoIterator<Item = &'a ToolDefinition>) -> u64 {
     let tools: Vec<_> = tools.into_iter().collect();
     if tools.is_empty() {

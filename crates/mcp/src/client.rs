@@ -1,5 +1,3 @@
-//! SDK 传输、进程生命周期及可取消的 MCP 调用。
-
 use crate::{McpError, config::ServerConfig};
 use protocol::McpTransportConfig;
 use rmcp::{
@@ -28,7 +26,6 @@ pub(crate) struct Connection {
     config: ServerConfig,
 }
 
-// 当前主流服务器仍以 legacy initialize/roots 协商；不广告未实现的 sampling/elicitation。
 pub(crate) struct Handler {
     root: String,
 }
@@ -70,7 +67,6 @@ impl StderrCapture {
                     break;
                 }
                 let mut logs = logs.lock().expect("MCP stderr lock poisoned");
-                // 管道分块可能落在 UTF-8 字符内部；保留字节，到报告错误时再解码。
                 logs.extend_from_slice(&buffer[..size]);
                 if logs.len() > 4096 {
                     let start = logs.len() - 4096;
@@ -87,7 +83,6 @@ impl StderrCapture {
             let _ = tokio::time::timeout(Duration::from_millis(200), task).await;
         }
         let logs = self.logs.lock().expect("MCP stderr lock poisoned");
-        // 尾部预算可能切掉首字符的一部分，只跳过开头残留的 UTF-8 续字节。
         let start = logs.iter().position(|byte| byte & 0xc0 != 0x80).unwrap_or(logs.len());
         String::from_utf8_lossy(&logs[start..]).into_owned()
     }
@@ -123,7 +118,6 @@ impl Connection {
                     connect_http(handler, startup, url, headers).await?
                 }
             };
-            // 每轮实际读取工具目录；发现失败时也不回退到 SDK 缓存。
             service.set_response_cache_config(rmcp::service::ClientCacheConfig::disabled()).await;
             Ok(Self {
                 peer: service.peer().clone(),
@@ -149,7 +143,6 @@ impl Connection {
     }
 
     pub async fn tools(&self) -> Result<Vec<Tool>, McpError> {
-        // 每轮读取目录，服务器更新工具后下轮生效。
         tokio::time::timeout(Duration::from_secs(self.config.startup_timeout_sec), self.peer.list_all_tools())
             .await
             .map_err(|_| McpError::new("MCP 工具发现超时。"))?
@@ -193,7 +186,6 @@ impl Connection {
             },
         };
         let message = if let Some(id) = request_id {
-            // 取消发送失败也保留共享连接，不打断同服务器的其他并行调用；远端可能继续执行。
             match tokio::time::timeout(
                 Duration::from_secs(3),
                 self.peer
@@ -249,7 +241,6 @@ async fn connect_stdio(
     let command = {
         use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
         let mut wrapped = CommandWrap::from(command);
-        // 后端异常退出时也由 Windows 回收服务器的整棵进程树。
         wrapped
             .wrap(CreationFlags(windows::Win32::System::Threading::CREATE_NO_WINDOW))
             .wrap(JobObject)
@@ -275,7 +266,6 @@ async fn connect_http(
     url: &str,
     headers: &std::collections::BTreeMap<String, String>,
 ) -> Result<RunningService<RoleClient, Handler>, McpError> {
-    // 与现有模型传输使用同一 ring provider，避免两个 TLS 默认实现冲突。
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .no_gzip()

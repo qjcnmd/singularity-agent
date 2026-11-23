@@ -1,5 +1,3 @@
-//! `mcp.json` 的读写、配置校验和敏感信息脱敏。
-
 use crate::McpError;
 use protocol::{McpServerInput, McpTransportConfig};
 use serde::{Deserialize, Serialize};
@@ -101,7 +99,6 @@ impl ServerConfig {
         Ok(())
     }
 
-    /// 网络错误、服务器 stderr 和服务端报错可能带有密钥，返回或打印前把配置中的敏感值替换掉。
     pub fn redact(&self, error: String) -> String {
         use std::borrow::Cow;
 
@@ -152,7 +149,6 @@ impl ServerConfig {
                         .map(|(_, value)| Cow::Borrowed(value.as_str())),
                 );
                 for (name, value) in headers {
-                    // 服务端错误可能只回显认证值，没有 Bearer / Basic 前缀。
                     if (name.eq_ignore_ascii_case("authorization")
                         || name.eq_ignore_ascii_case("proxy-authorization"))
                         && let Some((_, credential)) = value.split_once(' ')
@@ -167,7 +163,6 @@ impl ServerConfig {
     }
 }
 
-/// 按最长优先收集互不重叠的匹配区间并单遍替换，避免短值破坏普通文本或已生成的 `[redacted]`。
 fn replace_non_overlapping(error: String, mut values: Vec<std::borrow::Cow<'_, str>>) -> String {
     values.retain(|value| value.len() >= 2);
     if values.is_empty() {

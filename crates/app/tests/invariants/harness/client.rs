@@ -1,5 +1,3 @@
-//! 隔离的临时测试环境与进程外 `singularity.exe` JSON-RPC 黑盒客户端。
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -13,7 +11,6 @@ use tokio::sync::{mpsc, oneshot};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// RAII 临时根目录：结束时自动清理，隔离 `SINGULARITY_HOME` 与测试工作区。
 pub struct TestEnv {
     root: PathBuf,
     pub home: PathBuf,
@@ -50,7 +47,6 @@ impl Drop for TestEnv {
     }
 }
 
-/// 进程外黑盒 JSON-RPC 客户端，直接驱动编译产物 `singularity.exe`。
 pub struct BackendClient {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -177,12 +173,10 @@ impl BackendClient {
         response.pointer("/error/message").and_then(Value::as_str).unwrap_or_default().to_string()
     }
 
-    /// 只取出截至最近一次 `wait_event` 匹配为止的已缓冲事件，不拉取后续可能已到达通道的事件。
     pub fn take_buffered_events(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.buffered_events)
     }
 
-    /// 清空已缓冲事件并返回当前历史快照。
     pub fn drain_events(&mut self) -> Vec<Value> {
         while let Ok(frame) = self.events_rx.try_recv() {
             self.buffered_events.push(frame);

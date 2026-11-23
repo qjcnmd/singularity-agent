@@ -1,4 +1,3 @@
-//! 任务运行态视图、流式与待处理项状态及事件发布。
 use super::activity::Activity;
 use super::{Conversation, TurnLifecycle};
 use agent::agent::AgentEvent;
@@ -31,7 +30,6 @@ impl ConversationView {
     }
 }
 impl Conversation {
-    /// 首次发送返回同一时刻的任务摘要、运行状态和事件序号。
     pub(crate) fn start_result(&self) -> protocol::SessionStartResult {
         let view = self.lock_view();
         let phase = self.phase();
@@ -43,7 +41,6 @@ impl Conversation {
         }
     }
 
-    /// 任务列表用的简要状态，只含运行阶段和未保存的错误。
     pub(crate) fn status(&self) -> protocol::SessionStatus {
         let view = self.lock_view();
         protocol::SessionStatus {
@@ -88,7 +85,6 @@ impl Conversation {
             failure: view.failure.clone(),
         }
     }
-    /// 历史与活动内容在同一次会话读取内合并。
     pub(crate) fn read(&self) -> Result<SessionReadResult, crate::runtime::CatalogError> {
         let view = self.lock_view();
         let runtime = self.runtime(&view);
@@ -130,7 +126,6 @@ impl Conversation {
     pub(super) fn publish_summary(&self, view: &mut ConversationView) {
         self.publish(view, StreamEvent::SessionSummaryChanged { summary: self.summary() });
     }
-    /// 接收 Agent 的共同事件，更新运行状态后发布。
     pub(super) fn on_event(&self, event: AgentEvent) {
         let mut view = self.lock_view();
         match event {
@@ -143,7 +138,6 @@ impl Conversation {
         }
     }
     pub(super) fn publish_event(&self, view: &mut ConversationView, mut event: TurnEvent) {
-        // 请求结束先发 ProviderAttempt 累计用量，再发完成的回复或回合结束；均带上此刻的会话累计。
         match &mut event {
             TurnEvent::MessageFinished { items, .. } => {
                 agent::message::attach_usage(items, &view.usage);

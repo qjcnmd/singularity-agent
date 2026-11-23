@@ -32,7 +32,6 @@ type RawTimelineRow = {
   item: TimelineContent
 }
 
-/** 只补充排列和阅读位置；活动条目均由 `groupActivityRuns` 收进 `activity_group`。 */
 export interface TimelineRow {
   key: string
   stable: boolean
@@ -42,7 +41,6 @@ export interface TimelineRow {
 const turnRowCache = new WeakMap<ThreadTurn, RawTimelineRow[]>()
 const groupedRowCache = new WeakMap<RawTimelineRow, { sources: RawTimelineRow[]; row: TimelineRow }>()
 
-/** 只有事实或上一回合的保存失败状态变化时，才重新排列历史。 */
 export function buildHistoryRows(turns: ThreadTurn[] | undefined, failureFromRuntime: boolean): RawTimelineRow[] {
   return turns?.flatMap(turn => {
     if (failureFromRuntime && turn === turns.at(-1)) return turnRows(turn, true)
@@ -60,19 +58,16 @@ export function buildTimeline(rows: RawTimelineRow[], turns: ThreadTurn[] | unde
   const failure = runtime.failure
   const question = runtime.pendingQuestion
   let result = rows
-  // 日志写入失败时错误可能只保存在运行状态中，已有相同错误条目时不重复显示。
   if (failure && !turns?.some(turn => hasErrorItem(turn, failure.error))) {
     result = [...result, { key: 'terminal:failed', stable: false, item: { type: 'terminal', status: 'failed',
       text: failure.source === 'compaction' ? `${compactionText.failed}：${failure.error.message}` : failure.error.message } }]
   }
-  // 等待回答的提问替换对应的提问工具卡片，回答后恢复成普通工具卡片。
   const asking = question ? result.findIndex(row => row.item.type === 'tool' && row.item.id === question.itemId) : -1
   if (question && asking >= 0) {
     result = [...result]
     result[asking] = { key: `question:${question.itemId}`, stable: false, item: { type: 'question', request: question } }
   }
   if (runtime.pendingMessages.length === 0) return groupActivityRuns(result)
-  // 用户消息写入事件可能先于运行快照到达，按 ID 去重。
   const savedMessages = new Set(rows.flatMap(row => row.item.type === 'message' && row.item.role === 'user' ? [row.item.id] : []))
   result = [...result]
   for (const message of runtime.pendingMessages) {
@@ -102,7 +97,6 @@ function isActivityItem(item: TimelineContent): item is ActivityRowItem {
     || item.type === 'terminal'
 }
 
-/** 将连续的非文本步骤与状态（思考、工具、压缩、等待、中断、报错）合入白卡；前置耗时并入卡顶栏，提问独立成同款白卡。 */
 function groupActivityRuns(rows: RawTimelineRow[]): TimelineRow[] {
   const grouped: TimelineRow[] = []
   for (let start = 0; start < rows.length;) {
@@ -164,11 +158,9 @@ function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): RawTimelineRow
     key: item.type === 'compaction' || item.type === 'compaction_result'
       ? `compaction:${item.id}` : `content:${turn.turnId}:${item.id}`,
     stable: !('status' in item) || item.status !== 'running' || item.type === 'tool',
-    // 同一回合中间的过渡回复（后面还跟着工具或后续步骤）不重复显示累计统计行。
     item: item.type === 'message' && item.role === 'assistant' && index < lastStepIndex && (item.stats !== undefined || item.at !== undefined)
       ? { ...item, stats: undefined, at: undefined } : item,
   }))
-  // 准备新回合或独立压缩不会重新启动上一轮的计时；进行中的回合收到首个 token 后才显示时间行。
   if (turn.finishedAt || (turn.status === 'running' && turn.firstTokenAt)) {
     const workStartIndex = items.findIndex(item => item.type !== 'message' || item.role !== 'user')
     result.splice(workStartIndex < 0 ? result.length : workStartIndex, 0, {
@@ -176,19 +168,16 @@ function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): RawTimelineRow
       item: { type: 'duration', startedAt: turn.startedAt, firstTokenAt: turn.firstTokenAt, finishedAt: turn.finishedAt },
     })
   }
-  // 回合进行中但没有正在输出或执行的条目，说明在等模型回复：显示“正在输入”气泡。
   const working = turn.items.some(item => 'status' in item && (item.status === 'running' || item.status === 'pending'))
   if (turn.status === 'running' && !working) result.push({ key: `content:${turn.turnId}:typing`, stable: false, item: { type: 'typing' } })
   if (turn.status === 'interrupted') result.push({
     key: `content:${turn.turnId}:terminal`, stable: true,
     item: { type: 'terminal', status: 'interrupted', text: turn.manuallyStopped ? '已停止' : '已中断', at: turn.finishedAt },
   })
-  // 保存失败时没有回合错误详情，具体原因由运行状态显示。
   if (turn.status === 'failed' && !hasErrorItem(turn, turn.error) && (turn.error || !failureFromRuntime)) {
     result.push({ key: `content:${turn.turnId}:terminal`, stable: true,
       item: { type: 'terminal', status: 'failed', text: turn.error?.message ?? '执行失败', at: turn.finishedAt } })
   }
-  // 没有最终助手正文承接统计时，在活动卡片下方单独显示一行用量统计。
   if (turn.status !== 'running' && !hasFinalAssistantStats && hasModelStats(turn.stats)) {
     result.push({
       key: `content:${turn.turnId}:stats`, stable: true,
@@ -198,7 +187,6 @@ function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): RawTimelineRow
   return groupAdjacentTools(result)
 }
 
-/** 提问保持独立，避免把等待用户回答的入口藏在折叠组里。 */
 function groupAdjacentTools(rows: RawTimelineRow[]): RawTimelineRow[] {
   const grouped: RawTimelineRow[] = []
   for (const row of rows) {
@@ -216,7 +204,6 @@ function groupAdjacentTools(rows: RawTimelineRow[]): RawTimelineRow[] {
   return grouped
 }
 
-/** 仅合并相邻思考的展示，保留首项 ID；工具、正文和回合边界不会被跨越。 */
 function mergeAdjacentThinking(items: HistoryItem[]): HistoryItem[] {
   const merged: HistoryItem[] = []
   for (const item of items) {
@@ -244,7 +231,6 @@ export function formatClock(value: string, includeDate = false): string {
   return includeDate && date.toDateString() !== new Date().toDateString() ? `${date.getMonth() + 1}/${date.getDate()} ${clock}` : clock
 }
 
-/** 单条详情与分组计数共用后台任务终态，避免命令转后台后仍显示成功。 */
 export function toolDisplay(item: ToolItem, tasks: VisibleBackgroundTask[] = []) {
   const id = item.name === 'bash' ? item.result?.backgroundTaskId ?? null : null
   const task = id ? tasks.find(task => task.taskId === id) : undefined

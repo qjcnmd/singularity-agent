@@ -41,7 +41,6 @@ function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSe
 function acceptBootstrap(state: SyncState, bootstrap: AppBootstrap): SyncState {
   if (state.bootstrap !== null && bootstrap.revision < state.bootstrap.revision) return state
   const sessionsByWorkspace = { ...bootstrap.sessionsByWorkspace }
-  // 目录读取期间任务仍可更新；保留在这次读取开始之后收到的摘要。
   for (const [workspaceRoot, sessions] of Object.entries(state.bootstrap?.sessionsByWorkspace ?? {})) {
     const incoming = sessionsByWorkspace[workspaceRoot] ?? []
     const newer = sessions.filter(session => (state.liveSessions[session.threadId]?.summaryRevision ?? 0) > bootstrap.revision)
@@ -64,7 +63,6 @@ function sortSessions(sessions: ThreadSummary[]): ThreadSummary[] {
   return sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.threadId.localeCompare(b.threadId))
 }
 
-/** 标题和结束状态只替换所属项目中的一行，其他项目保持原来的引用。 */
 function acceptSummary(state: SyncState, summary: ThreadSummary, revision: number): SyncState {
   const bootstrap = state.bootstrap
   const previous = state.liveSessions[summary.threadId]
@@ -83,7 +81,6 @@ function acceptSummary(state: SyncState, summary: ThreadSummary, revision: numbe
   }
 }
 
-/** 首次发送只更新这个任务，不改变整个目录的事件序号。 */
 export function acceptSessionStart(state: SyncState, started: SessionStartResult): SyncState {
   if (state.bootstrap && state.bootstrap.revision >= started.revision) return state
   const next = acceptLiveSession(state, started.summary.threadId, started.status, started.revision)
@@ -184,7 +181,6 @@ export function reduceStream(state: SyncState, frame: Exclude<StreamEnvelope, { 
       if (accepted === next) return next
       const session = accepted.session
       const turn = session?.facts.at(-1)
-      // 保存失败时没有 turn/error 事件；结束页面上的临时输出，不补造已保存的结果或时间。
       if (frame.payload.failure?.source === 'turn' && session?.summary.threadId === frame.sessionId && turn?.status === 'running') {
         accepted = { ...accepted, session: { ...session,
           facts: [...session.facts.slice(0, -1), finishTurn(turn, 'failed')],

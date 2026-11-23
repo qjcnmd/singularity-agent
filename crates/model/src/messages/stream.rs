@@ -113,7 +113,6 @@ impl MessagesUsageAccumulator {
     }
 }
 
-/// Messages SSE 解码器：按内容块索引累积正文、思考、签名与工具参数，边收边推送可见增量。
 struct MessagesSseDecoder<'a> {
     blocks: BTreeMap<u64, MessagesBlock>,
     usage: MessagesUsageAccumulator,

@@ -1,10 +1,3 @@
-//! Singularity 的 Agent：模型与工具循环、会话日志和内置工具。
-//!
-//! - agent：一轮执行的入口；
-//! - session：JSONL 会话日志的读写，格式版本固定为 1；
-//! - message：把消息转换成工作台历史条目；
-//! - tools：内置工具。
-
 pub mod agent;
 mod image;
 pub mod message;

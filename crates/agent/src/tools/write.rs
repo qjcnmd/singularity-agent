@@ -1,5 +1,3 @@
-//! 创建或整文件覆写 UTF-8 文本文件；与 `edit` 共用进程级路径锁、原子写盘和差异展示。
-
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -73,7 +71,6 @@ fn execute_locked(
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Could not create parent directory for {}: {error}", args.path))?;
     }
-    // 覆写已存在文件且原文件以 CRLF 换行时，若传入纯 LF 则保留 CRLF 约定。
     let content = if existed && before.contains("\r\n") && !args.content.contains("\r\n") {
         args.content.replace('\n', "\r\n")
     } else {

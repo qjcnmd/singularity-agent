@@ -1,5 +1,3 @@
-//! 上下文压缩：按前缀缓存友好的单次前缀回放请求，将较早历史凝练为结构化检查点。
-
 use super::{AgentError, AgentEvent, RequestContext, Result, TurnEvent};
 use crate::request_execution::{execute_request, output_budget_tokens};
 use crate::session::{CompactionEntry, CompactionInput, context, with_writer, with_writer_async};
@@ -7,7 +5,7 @@ use model::{Message, ModelClient, ModelTurnRequest, ModelTurnResponse};
 use protocol::{HistoryItem, ModelSelection, TurnStatus};
 use tokio_util::sync::CancellationToken;
 
-const AUTO_COMPACTION_TRIGGER_PERCENT: u128 = 90;
+const AUTO_COMPACTION_TRIGGER_PERCENT: u64 = 90;
 
 const COMPACTION_INSTRUCTION: &str = r#"You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context.
 
@@ -52,8 +50,7 @@ pub(super) enum PreRequestOutcome {
 
 impl RequestContext {
     fn trigger_tokens(&self) -> u64 {
-        u64::try_from(u128::from(self.context_window()) * AUTO_COMPACTION_TRIGGER_PERCENT / 100)
-            .unwrap_or(u64::MAX)
+        self.context_window() * AUTO_COMPACTION_TRIGGER_PERCENT / 100
     }
 
     async fn estimated_tokens(&self) -> u64 {
@@ -69,9 +66,6 @@ impl RequestContext {
         .expect("token estimation completes while the runtime is running")
     }
 
-    /// 单次扫描会话估算下一次请求的上下文占用：
-    /// - 切换了模型且已达目标模型 90%：用上一路由模型按目标模型 15% 保留预算预压并复测，失败或仍超阈值则直接中止；
-    /// - 同模型（或首次生成）且已达 90%：按 15% 留尾自动压缩一次，可恢复故障仅记警告并清除占位后继续本轮。
     pub(super) async fn prepare_before_request(
         &mut self,
         already_switch_compacted: bool,
@@ -243,7 +237,6 @@ impl RequestContext {
         Ok(true)
     }
 
-    /// 手动压缩由调用方在保存前锁定停止结果；自动压缩不结束整轮停止窗口。
     pub async fn compact_selected(
         &mut self,
         input: CompactionInput,
@@ -291,7 +284,6 @@ impl RequestContext {
                 }));
                 Ok(())
             }
-            // 会话写盘失败必须优先向上传播，不能被并发停止信号掩盖成普通中断。
             Err(error) if error.is_session_failure() => {
                 tracing::warn!(error = %error, "context compaction session write failed");
                 on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {

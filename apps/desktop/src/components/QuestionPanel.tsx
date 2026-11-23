@@ -5,7 +5,6 @@ import { ChevronLeft, ChevronRight, Pencil } from 'lucide-react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
 import type { PendingQuestion, UserQuestionAnswer } from '../protocol'
 
-/** Agent 的提问：以独立紧凑白卡呈现，逐题分页填写，完成后原地回归普通工具步骤。 */
 export function QuestionPanel({ request, headerMeta }: { request: PendingQuestion; headerMeta?: ReactNode }) {
   const state = useAppStore(['selectedSessionId', 'questionDrafts', 'pendingActions', 'actionErrors', 'connection'])
   const reducedMotion = useReducedMotion()
@@ -28,7 +27,6 @@ export function QuestionPanel({ request, headerMeta }: { request: PendingQuestio
   const last = index === request.questions.length - 1
   const error = state.actionErrors[origin]
 
-  // 卡片出现在时间线里时不抢输入框焦点；翻到下一题后焦点跟到新题的第一个选项。
   const shownIndex = useRef(index)
   useLayoutEffect(() => {
     if (shownIndex.current === index) return
@@ -48,7 +46,6 @@ export function QuestionPanel({ request, headerMeta }: { request: PendingQuestio
     if (!last) { setIndex(index + 1, values); return }
     const missing = values.findIndex(value => !value.skipped && value.selected.length === 0 && !value.text.trim())
     if (missing >= 0) { setIndex(missing, values); return }
-    // 提交失败时仍保留本题的跳过状态，方便继续填写或重试。
     if (skip) setIndex(index, values)
     void appStore.answerQuestion(request.itemId, values)
   }

@@ -1,5 +1,3 @@
-//! Bash 与后台任务工具的参数和说明。
-
 use std::num::NonZeroU64;
 
 use serde::Deserialize;
@@ -8,10 +6,8 @@ use serde_json::json;
 use crate::tools::registry::{ToolExecution, error_result};
 
 pub(super) const MAX_WAIT_MS: u64 = 30_000;
-/// 单条命令总超时的安全上限（24 小时），避免极端参数导致 `Instant` 加法溢出。
 pub(super) const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 
-/// 已解析的 Bash 调用；由工具注册表检查等待时间。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BashArgs {

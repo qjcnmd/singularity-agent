@@ -4,7 +4,6 @@ import { RpcFailure, RpcClient } from './rpcClient'
 import type { ConnectionStatus, StreamEnvelope, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
 import { DraftStore, type DraftSnapshot } from './drafts'
 
-/** 操作来源的键：发起操作的控件和显示错误的位置用同一个键对应起来。 */
 export const actionOrigin = {
   session: (id: string | null) => `session:${id}`,
   control: (sessionId: string | null, controlId: string) => `control:${sessionId}:${controlId}`,
@@ -12,12 +11,10 @@ export const actionOrigin = {
   directoryPicker: 'directory:picker',
 }
 
-/** 这些动作在对应控件显示错误；目录选择器的错误仍显示在工作台。 */
 export function hasInlineActionError(origin: string): boolean {
   return origin.startsWith('control:') || origin.startsWith('inline:')
 }
 
-/** 进行中操作的键：方法名加来源。组件用它在已订阅的 pendingActions 里判断自己的操作是否进行中。 */
 export function pendingKey(method: string, origin: string): string {
   return `${method}:${origin}`
 }
@@ -32,10 +29,8 @@ interface SessionLoadState {
   error: ActionError | null
 }
 
-/** 右侧文件栏的一个标签页；同一文件的不同路径写法只开一个。 */
 export interface FileTab {
   id: string; path: string; cwd: string; title: string
-  /** 每次打开（包括再次点开已打开的文件）加一，文件栏据此重新读取，显示的是文件当前的内容。 */
   opened: number
 }
 
@@ -138,7 +133,6 @@ export class SessionStore {
     await this.readSession(sessionId)
   }
 
-  /** 空白页共用一份待发送草稿；第一条消息发送时才建立会话。 */
   newTask(workspaceRoot = this.state.selectedWorkspaceRoot): void {
     if (workspaceRoot === null) {
       this.patch({ page: 'chat' })
@@ -164,7 +158,7 @@ export class SessionStore {
 
   private syncFocus(sessionId: string | null): void {
     if (this.state.connection !== 'ready') return
-    void this.transport.rpc('session.focus', { sessionId }).catch(() => { /* 断连时由下次重连同步焦点。 */ })
+    void this.transport.rpc('session.focus', { sessionId }).catch(() => {})
   }
 
   draftKey(): string | null {
@@ -174,7 +168,6 @@ export class SessionStore {
   protected async startSession(params: SessionStartParams, selection: number): Promise<void> {
     const started = await this.transport.rpc('session.start', params)
     this.applySync(acceptSessionStart(this.state, started))
-    // 提交已成功；读取正文的结果不影响草稿清理，期间切换页面也不跳回。
     if (selection === this.selectionRequest) void this.selectSession(started.summary.threadId)
   }
 
@@ -213,13 +206,11 @@ export class SessionStore {
 
   private onFrame(frame: StreamEnvelope): void {
     if (this.resyncing === null && this.latestRead == null && this.state.bootstrapLoad.status === 'error') {
-      // 等待重试时只更新运行状态或恢复帧，正文由重试或恢复读取补全，不积存工具输出。
       if (frame.type === 'ready' || frame.type === 'app_changed' || frame.type === 'session_changed' || frame.type === 'session_settled' || frame.type === 'background_task_updated') {
         this.applyFrame(frame)
       }
       return
     }
-    // 重同步、读取会话或等待初始目录期间先暂存流式帧，完成后再按序回放。
     if (this.resyncing !== null || this.latestRead != null
       || (frame.type !== 'ready' && this.state.bootstrap === null)) {
       this.queuedFrames.push(frame)
@@ -361,7 +352,6 @@ export class SessionStore {
       ) }
     }
     this.state = { ...this.state, ...patch }
-    // 同一帧的增量合并通知；终态与连接状态变化立即通知。
     if (progress) this.notification ??= requestAnimationFrame(this.notify)
     else this.notify()
   }
@@ -372,7 +362,6 @@ export class SessionStore {
     for (const listener of this.listeners) listener()
   }
 
-  /** 切任务时 session 暂为空；只在后端确认问题结束或被替换后丢弃答案。 */
   protected retainQuestionDraft(sessionId: string, itemId?: string): void {
     const questionDrafts = retainedQuestionDrafts(this.state.questionDrafts, sessionId, itemId)
     if (questionDrafts !== this.state.questionDrafts) this.patch({ questionDrafts })
@@ -393,7 +382,7 @@ export class SessionStore {
     this.viewSave = null
     try {
       persistView(this.state)
-    } catch { /* 偏好保存失败不阻塞导航。 */ }
+    } catch {}
   }
 }
 

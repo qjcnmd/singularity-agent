@@ -43,7 +43,6 @@ class AppStore extends SessionStore {
     void this.drafts.set(id, { ...draft, images: append ? [...draft.images, ...images] : images })
   }
 
-  /** 附件按路径去重；append 为 false 时整体替换（用于移除）。 */
   setFiles(id: string, files: string[], append = false): void {
     const draft = this.drafts.get(id)
     void this.drafts.set(id, { ...draft, files: append ? [...new Set([...draft.files, ...files])] : files })
@@ -85,7 +84,6 @@ class AppStore extends SessionStore {
     void this.drafts.set(key, { ...draft, annotations: [] })
   }
 
-  /** 新任务页的上下文胶囊：只记关掉的模块；随草稿保存，发送后和草稿一起清空，下次新建任务重新全开。 */
   setModuleEnabled(id: string, enabled: boolean): void {
     const key = this.draftKey()
     if (key === null) return
@@ -326,22 +324,22 @@ class AppStore extends SessionStore {
   }
 
 
-  setMessageFontSize(value: number): void {
-    this.saveView({ messageFontSize: normalizeMessageFontSize(value) })
+  setMessageFontSize(value: number): number {
+    const messageFontSize = normalizeMessageFontSize(value)
+    this.saveView({ messageFontSize })
+    return messageFontSize
   }
 
   setTheme(theme: PersistedView['theme']): void {
     this.saveView({ theme })
   }
 
-  /** 打开文件标签；已打开时切过去并重新读取。路径按任务工作目录解析，所以同名相对路径在不同项目里是不同的标签。 */
   openFile(path: string, cwd: string, title = path.split(/[\\/]/).filter(Boolean).pop() ?? path): void {
     let target = path.trim().replace(/\\/g, '/')
     if (target.startsWith('~/') && this.state.bootstrap?.userHome) {
       target = `${this.state.bootstrap.userHome.replace(/\\/g, '/')}/${target.slice(2)}`
     }
     const directory = cwd.replace(/\\/g, '/').replace(/\/+$/, '')
-    // 文件 URL 统一相对路径和目录层级；文件名中的百分号、# 和 ? 保留原意。
     const encodePath = (value: string) => encodeURI(value).replace(/[?#]/g, encodeURIComponent)
     let id: string
     try {
@@ -362,7 +360,6 @@ class AppStore extends SessionStore {
     const index = this.state.fileTabs.findIndex(tab => tab.id === id)
     if (index < 0) return
     const fileTabs = this.state.fileTabs.filter(tab => tab.id !== id)
-    // 关掉当前标签时切到右边一个，没有就左边一个。
     const activeFileTab = this.state.activeFileTab !== id ? this.state.activeFileTab : (fileTabs[index] ?? fileTabs[index - 1])?.id ?? null
     this.patch({ fileTabs, activeFileTab })
   }
@@ -383,7 +380,6 @@ class AppStore extends SessionStore {
 
 export const appStore = new AppStore()
 
-/** 订阅指定的状态字段；默认按字段引用比较，也可传入自定义相等判断。 */
 export function useAppStore<K extends keyof AppState>(
   fields: readonly K[],
   equal?: (previous: Pick<AppState, K>, next: Pick<AppState, K>) => boolean,

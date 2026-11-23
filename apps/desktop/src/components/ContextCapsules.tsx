@@ -14,7 +14,6 @@ type ModuleQuery =
   | { status: 'ready'; modules: ContextModule[] }
   | { status: 'error'; error: Error }
 
-/** 新任务页读取当前项目的上下文胶囊；切换项目作废上一次读取，失败可重试。 */
 function useContextModules(workspaceRoot: string | null, connection: string) {
   const [query, setQuery] = useState<ModuleQuery>({ status: 'idle' })
   const [reload, setReload] = useState(0)
@@ -58,7 +57,6 @@ function sameCapsulesState(
     && sameDisabledModules(prevModules, nextModules)
 }
 
-/** 新任务页输入框上方：项目选择和上下文胶囊。胶囊决定接下来这个任务注入哪些内容，创建后固定。 */
 export const ContextCapsules = memo(function ContextCapsules() {
   const state = useAppStore(capsulesFields, sameCapsulesState)
   const { query, retry } = useContextModules(state.selectedWorkspaceRoot, state.connection)
@@ -88,7 +86,6 @@ function ModuleGroups({ modules, disabled }: { modules: ContextModule[]; disable
   </>
 }
 
-/** 胶囊里的圆圈勾和估算数字；运行状态面板用同一套外观显示已加载的模块。 */
 export function CapsuleIcon() {
   return <svg className="capsule-icon" viewBox="0 0 16 16" aria-hidden="true"><circle className="dot" cx="8" cy="8" r="2" /><circle className="ring" cx="8" cy="8" r="6.4" /><path className="tick" d="M5 8.3l2 2 3.7-4" /></svg>
 }
@@ -108,7 +105,6 @@ function Capsule({ module, on }: { module: ContextModule; on: boolean }) {
 
 type ProjectState = Pick<AppState, 'bootstrap' | 'selectedWorkspaceRoot' | 'pendingActions'>
 
-/** 项目选择：沿用消息块展开动画，菜单由 CSS 在窗口内定位。 */
 function ProjectCapsule({ state }: { state: ProjectState }) {
   const [open, setOpen] = useState(false)
   const root = useRef<HTMLDivElement>(null)

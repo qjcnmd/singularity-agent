@@ -53,7 +53,6 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
 
   useEffect(() => {
     if (busy || loading || error || reconnecting > 0) return
-    // 页面可见时持续读取后端状态；上次读取结束后再计时，不启动服务器。
     const timer = window.setTimeout(() => {
       void load()
     }, 1000)

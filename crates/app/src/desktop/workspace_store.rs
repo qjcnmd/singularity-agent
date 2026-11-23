@@ -1,5 +1,3 @@
-//! 已添加项目的列表，保存在数据目录的 `workspaces.json`。
-
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -14,7 +12,6 @@ struct RegistryFile {
     workspaces: Vec<Workspace>,
 }
 
-/// 项目登记的读取、校验与保存错误；RPC 与启动入口直接返回原因。
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum WorkspaceError {
     #[error("{0}")]
@@ -41,14 +38,12 @@ pub(crate) enum WorkspaceError {
     },
 }
 
-/// 工作区登记的写入口；只有文件更新成功后才提交内存状态。
 pub(crate) struct WorkspaceStore {
     path: PathBuf,
     state: Mutex<RegistryFile>,
 }
 
 impl WorkspaceStore {
-    /// 打开已有登记文件；文件不存在时从空登记开始，其他读取错误直接返回。
     pub(crate) fn open(home: &Path) -> Result<Self, WorkspaceError> {
         let path = home.join(WORKSPACE_REGISTRY_FILE_NAME);
         let state = match std::fs::read(&path) {
@@ -72,7 +67,6 @@ impl WorkspaceStore {
             .cloned()
     }
 
-    /// 登记一个已存在的目录；同一目录（忽略大小写）已登记时报错。
     pub(crate) fn add(&self, root: &Path) -> Result<Workspace, WorkspaceError> {
         let canonical = app_core::canonicalize_workspace(root).map_err(WorkspaceError::InvalidInput)?;
         self.update(|registry| {
@@ -89,7 +83,6 @@ impl WorkspaceStore {
         })
     }
 
-    /// 移除登记；目录中的文件及会话历史由各自所有者管理。
     pub(crate) fn remove(&self, workspace_root: &str) -> Result<(), WorkspaceError> {
         self.update(|registry| {
             let position = registry
@@ -102,7 +95,6 @@ impl WorkspaceStore {
         })
     }
 
-    // 磁盘写入成功后才更新内存中的项目列表；持锁串行更新，避免并发修改互相覆盖。
     fn update<T>(
         &self,
         edit: impl FnOnce(&mut RegistryFile) -> Result<T, WorkspaceError>,

@@ -1,5 +1,3 @@
-//! 从会话日志投影模型上下文并估算 Token（日志本身只追加不修改）。
-
 use std::fmt::Write as _;
 
 use app_core::estimate_tokens_of;
@@ -22,7 +20,6 @@ const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 const CONTENT_BLOCK_OVERHEAD_TOKENS: u64 = 4;
 const TOOL_RESULT_OVERHEAD_TOKENS: u64 = 4;
 
-/// 把日志记录转换成模型消息；未配对工具调用补一条“结果未知”。
 pub(crate) fn project_messages(entries: &[&SessionEntry]) -> Vec<Message> {
     let mut messages = Vec::new();
     let mut remaining = entries.iter().copied().peekable();
@@ -139,7 +136,6 @@ fn text_block_token_estimate(text: &str) -> u64 {
     estimate_tokens_of(text).saturating_add(CONTENT_BLOCK_OVERHEAD_TOKENS)
 }
 
-/// 本会话最近一次成功完成普通生成的模型选择（直接读取该回复记录的实际推理档位，不受运行中设置修改干扰）。
 pub(crate) fn last_routed_model(session: &SessionData) -> Option<protocol::ModelSelection> {
     session.entries().iter().rev().find_map(|entry| match entry {
         SessionEntry::Message {
@@ -247,13 +243,11 @@ impl PreparedContext {
     }
 }
 
-/// 扣除输出预留后的有效消息预算的 15%（至少 1 token）。
 pub fn retention_budget_tokens(model: ModelConfigurationSnapshot) -> u64 {
     let message_budget = model.context_window().saturating_sub(u64::from(model.max_output_tokens));
-    u64::try_from(u128::from(message_budget) * 15 / 100).unwrap_or(0).max(1)
+    (message_budget * 15 / 100).max(1)
 }
 
-/// 按工具调用/结果配对划分原子组，从末尾倒序保留至少 `retain_tokens`（即使为 0 也至少保留最后一个原子组）。
 pub(crate) fn select_compactable_split(
     active: &[&SessionEntry],
     session: &SessionData,
@@ -303,7 +297,6 @@ pub struct CompactionInput {
 }
 
 impl CompactionInput {
-    /// 前缀为空或不可能小于空检查点框定时返回 `None`。
     pub async fn select(session: &super::SessionWriter, retain_tokens: u64) -> Option<Self> {
         let session = std::sync::Arc::clone(session);
         tokio::task::spawn_blocking(move || {
@@ -340,7 +333,6 @@ fn model_message(entry: &SessionEntry) -> Message {
     }
 }
 
-/// 请求附加的一个文本块；生成与预算都按整块处理，避免多张图片分别向上取整。
 pub(crate) fn image_captions(message: &Message, directory: &std::path::Path) -> String {
     let mut captions = String::new();
     for (index, image) in message.images().enumerate() {
@@ -367,7 +359,6 @@ fn message_content_mut(message: &mut Message) -> &mut Vec<ContentBlock> {
     }
 }
 
-/// 在写者锁外读取消息引用的图片，并在消息末尾附上图片的名称、尺寸和保存位置。
 pub(crate) fn load_images(
     messages: &mut [Message],
     directory: &std::path::Path,
@@ -385,7 +376,6 @@ pub(crate) fn load_images(
     Ok(images)
 }
 
-/// 最新压缩检查点放最前，随后保留 `firstKeptEntryId` 起及之后的原始消息（跳过夹在中间的旧检查点）。
 pub(crate) fn resolve_context_entries(session: &SessionData) -> Vec<&SessionEntry> {
     let entries = session.entries();
     let latest_compact = entries.iter().rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }));

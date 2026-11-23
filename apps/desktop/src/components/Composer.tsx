@@ -70,8 +70,6 @@ function ComposerView({ accent }: { accent: string }) {
     const anchor = candidateAnchor.current
     const list = candidateList.current
     if (!showCandidateSurface || !anchor || !list) return
-    // 浮层避开顶部 52px 的标题栏与侧栏开关区，只使用输入框上方的空间；
-    // 输入高度和视口变化都重新量。
     const measure = () => {
       const available = anchor.getBoundingClientRect().top - 52
       list.style.maxHeight = `${Math.max(0, Math.min(240, available))}px`

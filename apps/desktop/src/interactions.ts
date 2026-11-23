@@ -5,10 +5,6 @@ function hasTextSelection(): boolean {
   return selection !== null && !selection.isCollapsed && selection.toString() !== ''
 }
 
-/**
- * 拖选不触发控件：按下或释放时存在文字选区就不激活。
- * 未拦截时由调用方自己决定行为；原生链接等控件不需要 activate。
- */
 export function useSelectionGuard(beforeActivate?: (element: HTMLElement) => void) {
   const selectedAtPointerDown = useRef(false)
   return (activate?: () => void) => ({
@@ -31,7 +27,6 @@ export function useSelectionGuard(beforeActivate?: (element: HTMLElement) => voi
   })
 }
 
-/** 展开正文可点击收起，同时保留文字选择和内部控件的独立操作。 */
 export function useBodyCollapse(collapse: (() => void) | undefined, beforeCollapse?: (element: HTMLElement) => void) {
   const guard = useSelectionGuard(beforeCollapse)(collapse)
   return {

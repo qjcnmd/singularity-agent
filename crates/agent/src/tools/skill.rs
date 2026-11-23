@@ -1,5 +1,3 @@
-//! `skill` 工具：按名称加载一个技能的完整指令。技能目录在 Developer 指令里，由 Skills 模块提供。
-
 use app_core::skills::SkillCatalog;
 use serde::Deserialize;
 use serde_json::json;

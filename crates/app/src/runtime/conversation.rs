@@ -1,9 +1,3 @@
-//! 单个任务的内存状态和执行调度。
-//!
-//! 同一任务同一时刻只运行一个操作（普通回合或手动压缩）。
-//!
-//! 任务持有会话写者；状态锁判断能否开始新操作，写者锁保证日志按顺序追加。
-
 mod activity;
 mod background;
 mod compaction;
@@ -55,7 +49,6 @@ pub(crate) enum ConversationError {
 }
 
 impl Conversation {
-    /// 用已打开的会话日志建立任务，后台命令直接通知这个会话。
     pub(crate) fn new(
         session: agent::session::SessionManager,
         home: std::path::PathBuf,
@@ -124,12 +117,10 @@ impl Conversation {
         self.lock_state().model.clone()
     }
 
-    /// 在同一次加锁中检查执行、后台命令和待处理输入，避免检查途中后台通知启动新回合。
     pub(crate) fn has_work(&self) -> bool {
         self.lock_state().has_work(&self.bash_tasks)
     }
 
-    /// 单次按 `view -> state` 加锁判断是否允许从内存缓存淘汰：删除中、存在未保存错误或有活可做时均不可淘汰。
     pub(crate) fn can_evict(&self) -> bool {
         let view = self.lock_view();
         let state = self.lock_state();
@@ -140,7 +131,6 @@ impl Conversation {
         self.lock_state().turn.phase()
     }
 
-    /// 排队中的图片从输入队列读取；已保存的图片从当前会话记录查找。
     pub(crate) fn image_data(&self, image_id: &str) -> Result<String, crate::runtime::CatalogError> {
         let image = {
             let state = self.lock_state();
@@ -166,7 +156,6 @@ impl Conversation {
             .map_err(|source| crate::runtime::CatalogError::Session { path, source })
     }
 
-    /// 答案只交给仍在等待的提问工具；任务已停止时拒绝。
     pub(crate) fn answer_question(
         &self,
         item_id: &str,
@@ -180,7 +169,6 @@ impl Conversation {
         }
     }
 
-    /// 停止当前回合或压缩，清空尚未消费的输入。
     pub(crate) fn abort(&self) -> Result<(), ConversationError> {
         let mut view = self.lock_view();
         let mut state = self.lock_state();
@@ -195,7 +183,6 @@ impl Conversation {
         Ok(())
     }
 
-    /// 去掉名称首尾空白后立即保存展示名称。
     pub(crate) fn rename(&self, name: &str) -> Result<(), ConversationError> {
         let name = name.trim();
         if name.is_empty() {
@@ -207,7 +194,6 @@ impl Conversation {
         Ok(())
     }
 
-    /// 保存成功后更新下一轮使用的模型选择。
     pub(crate) fn update_settings(
         &self,
         selection: &protocol::ModelSelection,
@@ -224,7 +210,7 @@ impl Conversation {
         let mut writer = lock_writer(&self.writer);
         writer.append_metadata(SessionMetadata::ThreadSettings { selection: selection.clone() })?;
         state.model = selection.clone();
-        state.last_context_window = context_window;
+        state.last_context_window = Some(context_window);
         if let Some(preview) = &state.context_preview {
             preview.cancel();
         }

@@ -1,4 +1,3 @@
-//! 用户输入、独立压缩和后台续跑共用的启动、收尾与关闭流程。
 use std::sync::Arc;
 
 use super::activity::Activity;
@@ -8,7 +7,6 @@ use agent::agent::{QueuedInput, UserInput};
 use protocol::{SessionFailure, SessionOperation, SessionPhase, StreamEvent, TurnStatus};
 
 impl Conversation {
-    // 三个入口都已在状态锁内检查允许启动；占用任务、清理上次显示状态和发布由这里一起完成。
     fn begin_operation(
         &self,
         view: &mut view::ConversationView,
@@ -59,7 +57,6 @@ impl Conversation {
         self.changed.notify_waiters();
     }
 
-    /// 接受用户输入并启动所需执行；后续回合由会话接续。
     pub(crate) fn start(self: &Arc<Self>, input: UserInput) -> Result<(), ConversationError> {
         let mut view = self.lock_view();
         let mut state = self.lock_state();
@@ -86,7 +83,6 @@ impl Conversation {
         Ok(())
     }
 
-    /// 空闲时占用任务执行独立压缩；压缩标记让运行阶段显示为“压缩中”。
     pub(crate) fn compact(self: &Arc<Self>) -> Result<(), ConversationError> {
         let mut view = self.lock_view();
         let state = self.lock_state();
@@ -118,7 +114,6 @@ impl Conversation {
         }
         Some(self.begin_operation(&mut view, state, SessionOperation::Turn))
     }
-    /// 等待前台结束，再回收所有后台进程。
     pub(crate) async fn stop(&self) -> Result<(), ConversationError> {
         self.mark_closing();
         loop {
@@ -144,7 +139,6 @@ impl Conversation {
             .inspect_err(|message| self.background_error(message.clone()))
             .map_err(ConversationError::Message)
     }
-    /// 删除期间拒绝新操作；失败时由 guard 重新开放。
     pub(crate) fn begin_delete(self: &Arc<Self>) -> Result<DeleteGuard, ConversationError> {
         let _view = self.lock_view();
         let mut state = self.lock_state();
@@ -158,12 +152,10 @@ impl Conversation {
         self.lock_state().closing
     }
 }
-/// 删除未完成时恢复任务的操作入口。
 pub(crate) struct DeleteGuard {
     conversation: Option<Arc<Conversation>>,
 }
 impl DeleteGuard {
-    /// 删除成功后保持关闭，异步收尾持有的旧对象不能再启动执行。
     pub(crate) fn complete(mut self) {
         self.conversation.take();
     }

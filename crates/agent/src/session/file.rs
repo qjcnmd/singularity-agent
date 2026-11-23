@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use super::format::{Result, SessionEntry, SessionError, SessionHeader, SessionMetadata};
 use super::manager::SessionData;
 
-/// 逐行解析会话日志；最后一行没有换行时不解析，返回它的起始位置供写者截掉。
 pub(super) fn parse_session_file(file: &Path) -> Result<(SessionData, Option<u64>)> {
     let mut entries = Vec::new();
     let (header, cwd, repair) = scan_session_file(file, |entry| entries.push(entry))?;

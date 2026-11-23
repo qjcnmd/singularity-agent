@@ -15,7 +15,6 @@ export function normalizeMessageFontSize(value: number): number {
 export interface PersistedView {
   theme: 'light' | 'dark'
   messageFontSize: number
-  /** 全局强调色，取调色盘颜色 id（bubbleColors.ts）。 */
   accentColor: string
   selectedWorkspaceRoot: string | null
   selectedSessionId: string | null

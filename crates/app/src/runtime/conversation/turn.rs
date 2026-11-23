@@ -1,7 +1,3 @@
-//! 一个回合的完整执行：准备模型和指令、运行 Agent、保存并发布最终状态。
-//! 回合开始记录（`operation_started`）先于本回合的其他内容写入日志；结束记录
-//! （`operation_finished`，含状态和错误）先写入日志再发布结束事件。
-
 use std::sync::Arc;
 
 use agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, RequestContext};
@@ -13,12 +9,6 @@ use protocol::{Turn, TurnErrorDetail, TurnEvent, TurnStatus};
 use super::{Conversation, ConversationError};
 
 impl Conversation {
-    /// 准备、执行并保存本轮结果，使用接受输入时创建的停止控制。
-    ///
-    /// 返回 Ok 时最终状态（完成、失败或中断）已经保存，结束事件也已发出，失败原因随
-    /// turn/error 事件发送。返回 Err 表示准备失败或结果没能保存，由运行快照显示原因。
-    ///
-    /// 输入由 Agent 从任务的输入队列读取并保存。
     pub(super) async fn run_single_turn(
         self: &Arc<Self>,
         controls: &Arc<crate::runtime::conversation::TurnControls>,
@@ -75,11 +65,9 @@ impl Conversation {
         };
         let cancel_accepted = controls.finish_cancel();
         let (turn_status, error) = match run_result {
-            // 停止后 Agent 仍可能正常走完：只要用户停止过，就记为中断。
             Ok(()) if cancel_accepted => (TurnStatus::Interrupted, None),
             Ok(()) => (TurnStatus::Completed, None),
             Err(AgentError::Aborted) => (TurnStatus::Interrupted, None),
-            // 写日志失败时不再尝试写结束记录；读取历史时，没有结束记录的回合显示为中断。
             Err(error) => {
                 if error.is_session_failure() {
                     return Err(error.detail());
@@ -87,12 +75,9 @@ impl Conversation {
                 (TurnStatus::Failed, Some(error.detail()))
             }
         };
-        // 所有结果按同一顺序处理：关闭停止入口、保存结束记录、发布结束事件。
-        // 保存失败时直接报错，不发布没有保存的结束状态。
         let record = LedgerRecord::OperationFinished {
             turn_id: turn_id.clone(),
             outcome: turn_status,
-            // 失败原因随结束记录一起保存，重新打开任务时直接从日志显示。
             error: error.clone(),
             user_stopped: cancel_accepted,
         };
@@ -128,7 +113,6 @@ impl Conversation {
         Ok(turn_status)
     }
 
-    /// 准备模型和项目指令，全部成功后才保存回合开始记录；任何一步失败都不写日志。
     fn prepare_turn(
         &self,
         controls: &crate::runtime::conversation::TurnControls,
@@ -137,7 +121,6 @@ impl Conversation {
         let context = self.prepare_request_context()?;
         let context_window = context.context_window();
         let agent = Agent::new(context, inbox, Arc::clone(&controls.questions), Arc::clone(&self.bash_tasks));
-        // 开始记录的 ID 就是回合 ID；输入消息由 Agent 之后单独保存，两次写入不是一个事务。
         let mut writer = lock_writer(&self.writer);
         let started_at = writer
             .append_record_with_id(controls.turn_id.clone(), LedgerRecord::OperationStarted)
@@ -145,7 +128,6 @@ impl Conversation {
         Ok((agent, started_at, context_window))
     }
 
-    /// 在生命周期锁内检查并占用上下文预览槽位；已加载、正在运行、正在关闭或已有预览时返回 `None`。
     pub(crate) fn begin_context_preview(
         self: &Arc<Self>,
         signal: &tokio_util::sync::CancellationToken,
@@ -164,8 +146,6 @@ impl Conversation {
         Some(PreviewGuard { conversation: Arc::clone(self) })
     }
 
-    /// 回合开始前查看上下文：本次启动已加载过就沿用，否则按回合开始时的规则加载一次，
-    /// 结果和回合加载时一样通过 context/loaded 发布。
     pub(crate) async fn inspect_context(
         self: &Arc<Self>,
         signal: tokio_util::sync::CancellationToken,
@@ -191,7 +171,6 @@ impl Conversation {
         drop(guard);
         result
     }
-    /// 普通回合与独立压缩共用的准备步骤；每次都重新读取模型配置和项目指令。
     pub(super) fn prepare_request_context(&self) -> Result<RequestContext, TurnErrorDetail> {
         let provider = ModelClient::new(&self.models, &self.model()).map_err(preparation_error)?;
         let instruction_home = self.home.clone();
@@ -213,7 +192,6 @@ impl Conversation {
     }
 }
 
-/// 上下文预览的占用守卫；离开作用域（含取消或提前返回）时自动释放占位并唤醒关闭等待。
 pub(crate) struct PreviewGuard {
     conversation: Arc<Conversation>,
 }

@@ -1,5 +1,3 @@
-# Supply-chain policy for the locked workspace graph.
-
 [advisories]
 db-urls = ["https://github.com/RustSec/advisory-db"]
 yanked = "deny"
@@ -11,13 +9,10 @@ ignore = [
 ]
 
 [bans]
-# The current lockfile has target/transitive duplicates and the workspace uses
-# versionless path dependencies; keep both visible in CI.
 multiple-versions = "warn"
 wildcards = "warn"
 
 [licenses]
-# Licenses not listed here, including unknown and unlicensed crates, fail closed.
 confidence-threshold = 0.93
 unused-allowed-license = "deny"
 allow = [

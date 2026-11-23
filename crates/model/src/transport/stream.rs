@@ -1,15 +1,11 @@
-//! 与协议无关的 SSE 分帧和读取循环；每个事件的处理和最终回复的生成由各协议的解码器实现。
-
 use reqwest::Response;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{ModelErrorKind, ProviderError};
 use crate::transport::http::{provider_cancelled_error, provider_future};
 
-/// 单条 SSE 帧或单行缓冲的内存上限（16 MiB），足以容纳含加密推理块的终态事件，同时防止异常 HTTP 200 正文无限增长。
 const MAX_SSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
-/// 把网络数据块切成 SSE 事件。
 #[derive(Default)]
 struct SseFrameDecoder {
     pending: Vec<u8>,
@@ -19,14 +15,12 @@ struct SseFrameDecoder {
 }
 
 impl SseFrameDecoder {
-    /// 接收一段 chunk，把其中所有完整的行写入 `complete`；没有结尾换行的部分留给下次读取。
     fn push_into(&mut self, chunk: &[u8], complete: &mut Vec<u8>) -> Result<(), &'static str> {
         complete.clear();
         self.pending.reserve(chunk.len());
         let mut last_newline = None;
         let mut line_len = self.pending.len();
         for &byte in chunk {
-            // CR 已经结束上一行；紧随其后的 LF 即使跨 chunk 到达也直接跳过，避免多切出空行。
             let follows_cr = self.previous_cr;
             self.previous_cr = byte == b'\r';
             if follows_cr && byte == b'\n' {
@@ -51,10 +45,8 @@ impl SseFrameDecoder {
         Ok(())
     }
 
-    /// 处理一行；遇到空行且已累积 `data` 时返回 `Ok(true)`，由调用方读取 `event_data()` 后清空。
     fn process_line(&mut self, line: &[u8]) -> Result<bool, &'static str> {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
-        // 第一行完整后才检查 BOM，因此它的三个字节可以分散在不同 chunk 中。
         let line = if self.first_line_processed {
             line
         } else {
@@ -64,7 +56,6 @@ impl SseFrameDecoder {
         if line.is_empty() {
             return Ok(!self.event_data.is_empty());
         }
-        // 冒号开头的行是 SSE 注释（常作保活），整行忽略。
         if line.first() == Some(&b':') {
             return Ok(false);
         }
@@ -75,7 +66,6 @@ impl SseFrameDecoder {
         } else {
             (line, &[] as &[u8])
         };
-        // Messages 和 Responses 的流事件内容都在 data 行里，忽略 event、id、retry 等其他 SSE 字段。
         if field == b"data" {
             let extra = usize::from(!self.event_data.is_empty()) + value.len();
             if self.event_data.len().saturating_add(extra) > MAX_SSE_FRAME_BYTES {
@@ -106,19 +96,14 @@ impl SseFrameDecoder {
     }
 }
 
-/// 各协议的 SSE 解码器（Messages / Responses 各实现一个）。
 pub(crate) trait SseStreamDecoder: Sized {
-    /// 构造本协议的格式错误，参数是错误原因。
     fn frame_malformed(reason: &'static str) -> ProviderError;
 
-    /// 处理一个完整的 SSE 事件。
     fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError>;
 
-    /// 是否已经收到表示结束的事件。
     fn protocol_complete(&self) -> bool;
 }
 
-/// SSE 读取循环：把网络数据块切成事件，交给解码器处理，直到结束。
 pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
     cancellation: &CancellationToken,
     mut response: Response,
@@ -129,7 +114,6 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
 
     loop {
         let chunk = provider_future(cancellation, response.chunk()).await?;
-        // 读取与取消同时就绪时若先拿到数据，仍优先按已取消退出，避免处理已取消请求的数据。
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
         }

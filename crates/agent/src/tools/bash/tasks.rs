@@ -1,5 +1,3 @@
-//! 后台命令统一从会话记录读取；运行中的输出和进程控制保留在内存中。
-
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -18,7 +16,6 @@ use super::exec::{Outcome, Process, ProcessEvent};
 use super::result::{output_text, state_text, task_result, task_summary};
 use super::spec::BashArgs;
 
-/// 已保存的开始、结束，或仅供显示的输出更新。
 #[derive(Debug)]
 pub enum BashTaskUpdate {
     Updated(BackgroundTask),
@@ -50,7 +47,6 @@ impl CompletionError {
     }
 }
 
-/// 一个会话的后台命令查询与进程所有权；成功收尾后释放内存条目，不接管历史 PID。
 pub struct BashTasks {
     entries: Mutex<BTreeMap<String, Arc<Entry>>>,
     delivered: Mutex<BTreeMap<String, OutputDelivery>>,
@@ -70,7 +66,6 @@ impl std::fmt::Debug for BashTasks {
 }
 
 impl BashTasks {
-    /// 保存复用会话写者；每次更新直接发布，发布完成后才继续执行。
     pub fn new(
         writer: crate::session::SessionWriter,
         inbox: crate::agent::SteeringInboxHandle,
@@ -85,7 +80,6 @@ impl BashTasks {
         })
     }
 
-    /// 界面和工具共用的后台列表；实时输出覆盖运行记录，历史中未结束的命令标为中断。
     pub fn list(&self) -> Vec<BackgroundTask> {
         self.project_tasks(clone_task)
     }
@@ -103,7 +97,6 @@ impl BashTasks {
         })
     }
 
-    /// 命令执行、回收或保存终态期间仍占用会话；完成通知入队后才释放。
     pub fn is_busy(&self) -> bool {
         self.entries
             .lock()
@@ -112,7 +105,6 @@ impl BashTasks {
             .any(|entry| entry.done.borrow().is_none())
     }
 
-    /// 给模型的列表只含 ID、命令、说明和状态，输出由 task_output 按需读取。
     pub(crate) fn tool_list(&self) -> ToolExecution {
         let tasks = self.project_tasks(|task, state| {
             (
@@ -133,7 +125,6 @@ impl BashTasks {
         result
     }
 
-    /// 主动查看立即返回新增输出；完成通知共用读取位置，界面查询不消费它。
     pub(crate) fn output(&self, task_id: &str, signal: &CancellationToken) -> ToolExecution {
         if signal.is_cancelled() {
             return error_result(ABORTED_MESSAGE);
@@ -141,7 +132,6 @@ impl BashTasks {
         self.take_output(task_id).unwrap_or_else(error_result)
     }
 
-    /// 准备后台完成通知但不推进游标；由调用方在消息落盘后再调用 `confirm_delivered`。
     pub(crate) fn prepare_completion_message(
         &self,
         task_id: &str,
@@ -162,7 +152,6 @@ impl BashTasks {
         Ok(Some((content, task.model_output.total_bytes, !task.state.is_running())))
     }
 
-    /// 后台完成通知成功写入日志后提交已交付水位。
     pub(crate) fn confirm_delivered(&self, task_id: &str, end: u64, terminal: bool) {
         let mut delivered = self.delivered.lock().expect("bash output delivery lock");
         let position = delivered.entry(task_id.to_owned()).or_default();
@@ -180,12 +169,10 @@ impl BashTasks {
         Ok(result)
     }
 
-    /// 取消后台命令并等待回收、保存终态。
     pub async fn stop(self: &Arc<Self>, task_id: &str) -> Result<(), String> {
         self.stop_task(task_id).await.map(|_| ())
     }
 
-    /// 取消后台命令并等待回收、保存终态；操作成功后返回模型可查看的命令结果。
     pub(crate) async fn tool_stop(self: &Arc<Self>, task_id: &str) -> ToolExecution {
         match self.stop_task(task_id).await {
             Ok(task) => task_result(&task, None, false),
@@ -211,7 +198,6 @@ impl BashTasks {
             .expect("bash task lookup completes while the runtime is running")
     }
 
-    /// 停止并等待全部活进程；只返回回收错误，已结束命令的保存失败不阻止关闭或删除。
     pub async fn shutdown(&self) -> Result<(), String> {
         let entries: Vec<_> =
             self.entries.lock().expect("bash task entries lock").values().cloned().collect();
@@ -233,7 +219,6 @@ impl BashTasks {
         }
     }
 
-    /// 执行一个真实命令；等待窗口结束后把同一进程转交给后台管理器。
     pub(crate) async fn execute<F: Future<Output = ()> + Send>(
         self: &Arc<Self>,
         args: BashArgs,
@@ -288,7 +273,6 @@ impl BashTasks {
         let started_entry = Arc::clone(&entry);
         let started = crate::session::with_writer_async(&self.writer, move |writer| {
             writer.append_record(LedgerRecord::BackgroundTaskUpdated { task: started_task })?;
-            // 查询按同一顺序锁定写者和进程表，不会把刚保存的开始记录误认为历史中断。
             manager
                 .entries
                 .lock()
@@ -301,7 +285,6 @@ impl BashTasks {
             return process.finish(Outcome::Failed(error.to_string())).await.0;
         }
         (self.on_update)(BashTaskUpdate::Updated(task));
-        // 保存开始记录期间可能已经收到停止；这时等进程回收、最终状态保存后再返回。
         if signal.is_cancelled() || entry.cancel.is_cancelled() {
             entry.cancel.cancel();
             self.clone().run_background(entry, process).await;
@@ -380,7 +363,6 @@ impl BashTasks {
         };
         match saved {
             Ok(_) => {
-                // 先把完成通知放进输入队列，再标记命令结束，避免 `has_work` 在两者之间误判为空闲。
                 if matches!(
                     task.state,
                     BackgroundTaskState::Exited { .. } | BackgroundTaskState::Failed { .. }
@@ -404,7 +386,6 @@ impl BashTasks {
                     message: format!("保存后台命令结果失败：{error}"),
                     duration_ms: result.duration_ms.expect("process duration"),
                 };
-                // 未保存的结果不能从日志读回，保留它和错误，直到本次会话关闭。
                 *entry.task.lock().expect("bash task lock") = task.clone();
                 (self.on_update)(BashTaskUpdate::Failed { task, error });
                 entry.done.send_replace(Some(completion));

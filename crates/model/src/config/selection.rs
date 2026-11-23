@@ -1,5 +1,3 @@
-//! 从 `config.json` 解析选中的提供方连接参数、模型容量与推理档位。
-
 use super::{
     ModelSelection, ProviderApiProtocol, ProviderError, UserConfigFile, UserConfigModel, configuration_error,
     validate_api_key, validate_base_url, validate_identifier, validate_reasoning_variants,

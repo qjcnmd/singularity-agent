@@ -1,5 +1,3 @@
-//! Messages 协议（Anthropic 兼容 / DeepSeek Messages）：请求编码、前缀哈希绑定与 SSE 流解码。
-
 #[cfg(test)]
 pub(crate) mod stream;
 #[cfg(not(test))]
@@ -162,7 +160,6 @@ fn encode_messages(
         if blocks.is_empty() {
             continue;
         }
-        // Messages 协议要求 user / assistant 严格交替；确认本条非空后再切换角色并合并连续同角色。
         if let Some((msg, next_digest)) = pending_user_flush {
             encoded.push(msg);
             digest = next_digest;
@@ -276,7 +273,7 @@ fn encode_image_block(data_url: &str, image_id: &str) -> Result<Value, ProviderE
 }
 
 fn chain_digest(previous: &str, value: &Value) -> String {
-    let serialized = serde_json::to_vec(value).unwrap_or_default();
+    let serialized = serde_json::to_vec(value).expect("prefix digest input is a JSON value");
     sha256_hex(&[previous.as_bytes(), b"\0", &serialized])
 }
 

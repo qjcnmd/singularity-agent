@@ -1,5 +1,3 @@
-//! 工具输出的捕获：只在内存保留末尾部分，统计行数和字节数，超出显示上限时把完整输出写到会话目录。
-
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -9,10 +7,8 @@ use uuid::Uuid;
 
 use crate::tools::registry::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
-/// 末尾缓冲的上限（100KB），输出再长也不会占满内存。
 const INTERNAL_TAIL_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;
 
-/// 输出超过显示上限时保存完整输出，文件随所属会话保留和删除。
 struct SpillWriter {
     path: PathBuf,
     file: std::fs::File,
@@ -28,9 +24,6 @@ impl SpillWriter {
     }
 }
 
-/// 累计输出的状态：内存里保留末尾部分（最多 100KB），并统计总行数和总字节数。
-/// 输出首次超过显示上限（2000 行或 50KB）时在会话目录创建文件写入已有缓冲，之后每段输出都追加进去；
-/// 写入失败时记下原因，结果里改为说明完整输出没能保存。
 pub(super) struct CaptureState {
     directory: Option<PathBuf>,
     tail: String,
@@ -41,7 +34,6 @@ pub(super) struct CaptureState {
 }
 
 impl CaptureState {
-    /// 转入后台后保留完整正文，主动回读不依赖模型的增量读取位置。
     pub(super) fn persist(&mut self) {
         if self.spill.is_none()
             && let Some(directory) = &self.directory
@@ -69,8 +61,6 @@ impl CaptureState {
         }
     }
 
-    /// 总行数：已结束的行数，加上末尾还没换行的一行（如果有）。尾部缓冲裁掉的是开头，
-    /// 所以看缓冲是否以换行结尾就能判断；这一行被裁过的完整长度无法得知，截断说明里不报。
     fn total_lines(&self) -> usize {
         let has_open_line = !self.tail.is_empty() && !self.tail.ends_with('\n');
         self.completed_lines + usize::from(has_open_line)
@@ -100,13 +90,10 @@ impl CaptureState {
         self.completed_lines + incoming_lines + 1 > DEFAULT_MAX_LINES
     }
 
-    /// 是否存在尚未推送到界面的新增输出（用于仅在节流缓冲非空时才轮询进度定时器）。
     pub(super) fn has_pending_output(&self) -> bool {
         self.total_bytes > 0 && self.last_progress.is_none_or(|(_, bytes)| bytes < self.total_bytes)
     }
 
-    /// 运行中显示的输出：第一次有输出立即返回，之后有新输出时最多每 100ms 返回一次；
-    /// 超出上限时附上完整输出文件的位置。
     pub(super) fn current_output(&mut self, spill_note: Option<&str>) -> Option<String> {
         let now = Instant::now();
         if self.total_bytes == 0
@@ -120,7 +107,6 @@ impl CaptureState {
         Some(self.display_output(spill_note))
     }
 
-    /// 无节流的当前显示输出（含截断说明与溢写路径说明）；前台转后台时用于生成一致快照。
     pub(super) fn display_output(&self, spill_note: Option<&str>) -> String {
         if self.total_bytes == 0 {
             return String::new();
@@ -132,15 +118,12 @@ impl CaptureState {
         content
     }
 
-    /// 接收一段已解码的输出；首次超出显示上限时把已有输出写入临时文件，再把内存缓冲限制在 100KB 内。
-    /// 之后每段输出都追加到文件；保存失败后记下错误。
     pub(super) fn ingest(&mut self, text: &str) {
         self.total_bytes += text.len();
         self.completed_lines += text.bytes().filter(|byte| *byte == b'\n').count();
         if let Some(Ok(spill)) = &mut self.spill
             && let Err(error) = spill.file.write_all(text.as_bytes())
         {
-            // 追加失败后临时文件内容已不完整，结果里改报保存失败原因。
             self.spill = Some(Err(error));
         }
         self.tail.push_str(text);
@@ -155,7 +138,6 @@ impl CaptureState {
         }
     }
 
-    /// 后台读取使用原始文本与绝对位置，提示文字不参与游标计算。
     pub(super) fn snapshot(&self) -> protocol::CommandOutputSnapshot {
         protocol::CommandOutputSnapshot {
             text: self.tail.clone(),
@@ -169,8 +151,6 @@ impl CaptureState {
         }
     }
 
-    /// 结束捕获，返回显示用的正文和完整输出文件的说明。
-    /// 调用方把文件说明放在命令结束原因之后。
     pub(super) fn finish(self) -> (String, Option<String>) {
         let note = self.spill_note();
         let content = if self.is_truncated() {
@@ -188,10 +168,6 @@ impl CaptureState {
         })
     }
 
-    /// 显示用的文本：没超出上限时是完整输出，超出时是末尾部分加截断说明。
-    ///
-    /// 说明只写确定知道的信息：显示了多少字节、哪些行、超出了哪个上限。单行超长时
-    /// 缓冲里只剩这一行的末尾，无法给出这一行的总长度。
     fn final_output(&self) -> String {
         if !self.is_truncated() {
             return self.tail.clone();
@@ -223,14 +199,11 @@ enum TruncatedBy {
     Bytes,
 }
 
-/// 尾部截断结果：保留后的文本、触发截断的维度与实际保留行数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Truncation {
     content: String,
     truncated_by: TruncatedBy,
-    /// 截断后实际保留下来的行数。
     output_lines: usize,
-    /// 末尾那行本身超过字节上限时，是否只保留了该行尾部。
     last_line_partial: bool,
 }
 
@@ -244,22 +217,17 @@ fn format_size(bytes: usize) -> String {
     }
 }
 
-/// 为已超出展示预算的 Bash 或 MCP 输出选择尾部，保留最后 `DEFAULT_MAX_LINES` 行且不超过 `DEFAULT_MAX_BYTES`。
-/// 调用方先判定超限；捕获缓冲裁过开头时仍大于展示预算。
-/// 末尾单行超过字节上限时，只保留该行尾部的完整 UTF-8 字符（`last_line_partial = true`）。
 fn truncate_tail(content: &str) -> Truncation {
     let lines = content.split_terminator('\n');
     let mut output: Vec<&str> = Vec::new();
     let mut output_bytes = 0usize;
-    // 截断类别由真正触发的那个边界决定：行数上限先命中就按行报告，否则按字节报告。
-    // 去掉末尾换行后正文可能恰好放得下，这种情况下超限原因仍然是字节。
     let mut truncated_by = TruncatedBy::Bytes;
     for line in lines.rev() {
         if output.len() >= DEFAULT_MAX_LINES {
             truncated_by = TruncatedBy::Lines;
             break;
         }
-        let line_bytes = line.len() + usize::from(!output.is_empty()); // 行间的换行 +1
+        let line_bytes = line.len() + usize::from(!output.is_empty());
         if output_bytes + line_bytes > DEFAULT_MAX_BYTES {
             if output.is_empty() {
                 return Truncation {
@@ -286,7 +254,6 @@ fn truncate_tail(content: &str) -> Truncation {
     }
 }
 
-/// 从行尾往前截到 max_bytes 字节以内，按 UTF-8 字符边界对齐。
 fn truncate_string_to_bytes_from_end(line: &str, max_bytes: usize) -> String {
     if line.len() <= max_bytes {
         return line.to_string();

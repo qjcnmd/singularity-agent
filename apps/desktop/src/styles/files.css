@@ -13,7 +13,6 @@
 .file-markdown { padding: 4px 20px 24px; }
 .file-code { padding: 4px 0 24px; font: 12.5px/1.6 var(--font-mono); }
 .file-code .tool-line { padding-right: 16px; }
-/* 回复里能在文件栏打开的路径 */
 .timeline-body code.file-link { cursor: pointer; text-decoration: underline dotted transparent; text-underline-offset: 3px; transition: text-decoration-color 120ms; }
 .timeline-body code.file-link:hover, .timeline-body code.file-link:focus-visible { text-decoration-color: currentColor; outline: none; }
 @media (max-width: 760px) {

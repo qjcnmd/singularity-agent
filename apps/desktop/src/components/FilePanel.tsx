@@ -5,13 +5,11 @@ import type { TextDocument } from '../protocol'
 import { CodeTokens, useCodeTokens } from '../highlight'
 import { MarkdownBody, PathBase } from '../markdown'
 
-/** 重新读取期间和读取失败时都保留上一次读到的内容，不闪“读取中”。 */
 type Loaded = { document?: TextDocument; error?: string }
 
 const extension = (path: string) => /\.([\w-]+)$/.exec(path)?.[1]?.toLowerCase() ?? ''
 const isMarkdown = (path: string) => ['md', 'markdown'].includes(extension(path))
 
-/** 右侧文件栏：每个文件一个标签页，只读；Markdown 默认排版显示，可切到源码。 */
 export function FilePanel() {
   const state = useAppStore(['fileTabs', 'activeFileTab'])
   const [documents, setDocuments] = useState<Record<string, Loaded>>({})
@@ -21,7 +19,6 @@ export function FilePanel() {
   const loaded = active ? documents[active.id] : undefined
   const shown = loaded?.document
 
-  // 文件可能已被 Agent 或编辑器改过：切到标签、再次点开同一文件或点重试时都重新读取。
   useEffect(() => {
     if (!active) return
     let current = true
@@ -76,7 +73,6 @@ const maxHighlightedLength = 200_000
 
 function CodeView({ code, language }: { code: string; language: string }) {
   const normalized = code.replace(/\r\n/g, '\n')
-  // 很大的文件逐行高亮会卡住界面，只显示纯文本。
   const tokens = useCodeTokens(normalized, normalized.length > maxHighlightedLength ? 'text' : language)
   const lines = normalized.split('\n')
   return <div className="file-code">{lines.map((line, row) => <div key={row} className="tool-line">
@@ -85,7 +81,6 @@ function CodeView({ code, language }: { code: string; language: string }) {
   </div>)}</div>
 }
 
-/** SKILL.md 这类文件开头的 YAML 头按 Markdown 排版会挤成一段文字，改成代码块显示。 */
 function frontmatterAsCode(content: string): string {
   return content.replace(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/, (_, yaml: string) => '```yaml\n' + yaml + '\n```\n\n')
 }

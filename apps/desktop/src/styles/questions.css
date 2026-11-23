@@ -5,7 +5,6 @@
 .question-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .question-title { font-size: 13.5px; font-weight: 500; color: var(--ink); line-height: 1.45; }
 .question-hint { flex: none; color: var(--ink-faint); font-size: var(--meta-font-size); }
-/* 留出 2px 给焦点描边，免得被滚动区裁掉。 */
 .question-panel-body { border: 0; margin: -2px; padding: 2px; min-width: 0; min-height: 0; max-height: min(320px, 44vh); overflow-y: auto; }
 .question-list { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--fill-subtle); }
 .question-options { display: grid; }

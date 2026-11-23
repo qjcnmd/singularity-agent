@@ -1,5 +1,3 @@
-//! 产品名称、环境变量与持久化目录等对外标识常量（内部模块不再散落硬编码）。
-
 pub const APP_NAME: &str = "Singularity";
 pub const APP_SLUG: &str = "singularity";
 pub const HOME_ENV_VAR: &str = "SINGULARITY_HOME";

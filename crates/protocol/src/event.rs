@@ -1,23 +1,17 @@
-//! 执行事件的定义。TurnEvent 序列化为 `{ method, params }`，方法名写在各个变体上；
-//! 外层的 TurnEventEnvelope 补充回合 ID 和阶段。
-
 use serde::{Deserialize, Serialize};
 
 use crate::params::Turn;
 
-/// 失败原因；message 不含密钥等认证信息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct TurnErrorDetail {
     pub message: String,
-    /// 已经显示了这次失败的条目 ID（如压缩条目），界面据此避免重复报错。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub item_id: Option<String>,
 }
 
-/// Agent 发出、工作台接收的执行事件；回合 ID 在外层 TurnEventEnvelope 上。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "method", content = "params", rename_all_fields = "camelCase")]
@@ -67,7 +61,6 @@ pub enum TurnEvent {
     },
 }
 
-/// 模型请求的实际结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAttemptStatus {

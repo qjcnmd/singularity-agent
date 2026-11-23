@@ -14,7 +14,6 @@
 .context-menu { z-index: 100; min-width: 160px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow: auto; padding: 5px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--raised); box-shadow: var(--shadow-floating); animation: menu-enter var(--spring-dur) var(--spring); }
 .context-menu button { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; text-align: left; background: transparent; color: var(--ink); border-radius: 7px; font-size: 13.5px; cursor: pointer; }
 .context-menu button:hover, .context-menu button:focus-visible { background: var(--selected); }
-/* 原生 Popover 的触发按钮就是定位锚点；8px 外边距保留窗口边缘空间。 */
 .context-menu, .protocol-dropdown {
   position: fixed;
   position-anchor: auto;
@@ -26,7 +25,6 @@
 }
 @position-try --popover-right { left: auto; right: 0; }
 .protocol-dropdown { width: anchor-size(width); }
-/* 沿用 Disclosure 的实测高度，让展开内容从原位置向下长。 */
 .content-disclosure { overflow: hidden; height: 0; transition: height var(--disclosure-duration) var(--smooth); }
 .content-disclosure.is-open { height: auto; }
 .content-disclosure > div { overflow: hidden; }

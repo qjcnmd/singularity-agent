@@ -1,5 +1,3 @@
-//! `view_image` 工具：把磁盘上的图片文件作为视觉输入返回；文本文件由 `read` 负责。
-
 use std::fs::File;
 use std::path::Path;
 

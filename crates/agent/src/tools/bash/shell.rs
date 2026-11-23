@@ -1,9 +1,5 @@
-//! bash 工具所用 shell 的发现与选择。
-
 use std::path::{Path, PathBuf};
 
-/// 可用的 Bash 路径；找不到就给出安装与 PATH 的指引。查找顺序和排除规则见
-/// [`find_bash_on_windows`]。
 pub(super) fn bash_path() -> Result<PathBuf, String> {
     find_bash_on_windows().ok_or_else(|| {
         "Git Bash is required but bash.exe was not found. Install Git for Windows from https://git-scm.com/install/windows, or add the Git bin directory containing bash.exe to PATH."
@@ -11,14 +7,7 @@ pub(super) fn bash_path() -> Result<PathBuf, String> {
     })
 }
 
-/// 判断候选路径是不是 System32 下的 bash 启动器存根。
-///
-/// System32 下的 bash.exe 是 WSL 的启动器：路径和进程行为与 Git Bash 不同，
-/// 没装发行版或服务没运行时还会没有任何输出，所以不使用它。
-///
-/// Windows 路径不区分大小写，而 `Path` 的组件比较是逐字节的，所以这里显式折叠 ASCII
-/// 大小写：PATH 里的 `C:\windows\system32` 和 `C:\Windows\System32` 一样要排除。
-/// `SystemRoot` 缺失时没法做前缀比较，就只按 `System32\bash.exe` 后缀判断。
+// System32 下的 bash.exe 是 WSL 启动器。
 fn is_system32_bash_launcher(candidate: &Path, system_root: &str) -> bool {
     if !system_root.is_empty() && !starts_with_ignore_ascii_case(candidate, Path::new(system_root)) {
         return false;
@@ -32,7 +21,6 @@ fn is_system32_bash_launcher(candidate: &Path, system_root: &str) -> bool {
     file_name.eq_ignore_ascii_case("bash.exe") && directory.eq_ignore_ascii_case("System32")
 }
 
-/// 逐级比较路径前缀，忽略 ASCII 大小写（Windows 路径不区分大小写）。
 fn starts_with_ignore_ascii_case(path: &Path, prefix: &Path) -> bool {
     let mut components = path.components();
     prefix.components().all(|expected| {
@@ -53,7 +41,6 @@ fn find_bash_on_windows() -> Option<PathBuf> {
             candidates.push(PathBuf::from(program_files).join("Git\\bin\\bash.exe"));
         }
     }
-    // SystemRoot 只读一次：所有 PATH 候选共用同一个排除基准。
     let system_root = std::env::var("SystemRoot").unwrap_or_default();
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {

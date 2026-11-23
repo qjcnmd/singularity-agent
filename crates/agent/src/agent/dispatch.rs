@@ -1,5 +1,3 @@
-//! 最多同时运行八个工具，完成一个就保存并补入下一个；提问等待其他工具结束。
-
 use super::{Agent, AgentEvent, Result, TurnEvent};
 use crate::message::tool_result_message;
 use crate::session::with_writer;
@@ -128,7 +126,6 @@ impl Agent {
                 completed = workers.join_next() => {
                     let (item_id, call_id, execution) = completed.expect("workers are running")
                         .expect("tool worker completes while the runtime is running");
-                    // 完成前发出的进度先交付，防止旧进度覆盖已完成结果。
                     while let Ok((item_id, partial_result)) = updates.try_recv() {
                         on_event(AgentEvent::Turn(TurnEvent::ToolOutput { item_id, output: partial_result }));
                     }
@@ -141,7 +138,6 @@ impl Agent {
                 }
             }
         }
-        // 写日志失败后取消并等待已启动的工具收尾，跳过还未启动的工具调用。
         save_error.map_or(Ok(()), Err)
     }
 

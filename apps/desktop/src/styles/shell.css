@@ -42,7 +42,6 @@
 @keyframes spin { to { transform: rotate(360deg); } }
 
 
-/* 浅灰侧栏，和白色主区只靠底色区分，不画分隔线；选中项用中性浅底，不随调色盘变色；会话选中背景在列表下方滑动。 */
 .app-shell { display: grid; grid-template-rows: minmax(0, 1fr); height: 100vh; transition: grid-template-columns var(--smooth-dur) var(--smooth); overflow: hidden; background: var(--canvas); --side-hover: var(--soft-fill); --side-selected: var(--soft-fill-hover); }
 .sidebar { display: flex; flex-direction: column; width: 100%; min-width: 220px; height: 100%; padding: 12px 10px 10px; overflow: hidden; font-size: 13px; border-right: 1px solid var(--line); }
 .sidebar-brand { display: flex; align-items: center; height: 34px; padding: 0 2px 0 8px; margin-bottom: 6px; }
@@ -73,7 +72,6 @@
 .session-list { position: relative; padding: 2px 0 6px 10px; margin-left: 14px; border-left: 1px solid var(--line); }
 .session-row { position: relative; z-index: 1; display: flex; align-items: center; height: 30px; border-radius: 8px; overflow: hidden; }
 .session-row:not(.is-selected):hover { background: var(--side-hover); }
-/* 选中背景由列表下方的白色卡片滑块提供。 */
 .selection-slider { position: absolute; top: 0; left: 10px; right: 0; z-index: 0; border-radius: 8px; background: var(--card); box-shadow: 0 1px 2px rgb(0 0 0 / 5%), inset 0 0 0 1px var(--line); pointer-events: none;
   transition: transform var(--smooth-dur) var(--smooth), height var(--smooth-dur) var(--smooth), opacity 140ms; }
 .session-main { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; height: 100%; padding: 0 8px; border: 0; background: transparent; cursor: pointer; text-align: left; color: var(--ink-soft); font-size: 12.5px; transition: color var(--smooth-dur) var(--smooth); }
@@ -82,7 +80,6 @@
 .session-status { flex: none; width: 6px; height: 6px; border-radius: 50%; background: transparent; }
 .session-status.status-idle, .session-status.status-stopped { display: none; }
 .session-status.status-failed { background: var(--danger); }
-/* 运行中改用和 agent 思考同款的转圈：圆弧缺口转圈 */
 .session-status.status-running { width: 10px; height: 10px; background: transparent; border: 1.5px solid var(--accent); border-top-color: transparent; border-radius: 50%; animation: spin .75s linear infinite; }
 
 .sidebar-section { flex: 1; min-height: 0; display: flex; flex-direction: column; }
@@ -95,7 +92,6 @@
 .sidebar-shell.is-collapsed .sidebar-rail { display: grid; position: fixed; top: 10px; left: 16px; width: 32px; min-width: 0; height: 32px; padding: 0; z-index: 22; }
 .app-shell:has(.resize-separator:active) { transition: none; }
 .app-shell:has(.sidebar-shell.is-collapsed) .conversation-header { padding-left: 64px; }
-/* 运行面板打开时在右侧占出一列，消息区和输入框让开，不被面板盖住；窄窗口仍浮在上面。 */
 .app-main.has-panel { --panel-space: 288px; }
 @media (max-width: 760px) { .app-main.has-panel { --panel-space: 0px; } }
 .app-main { --panel-space: 0px; position: relative; flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--canvas); grid-column: 3; min-height: 0; height: 100%; overflow: hidden; }

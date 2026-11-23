@@ -1,5 +1,3 @@
-//! 单文件批量精确替换；同一目标在整个进程内依次读改写。
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -20,8 +18,6 @@ use super::registry::{
 static FILE_EDITS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 规范化目标路径的锁键：从目标路径向上回溯并折叠 `.` / `..` 直到找到已存在且可规范化的祖先目录再拼回后缀，
-/// 确保 `edit` 与 `write` 对同一目标（含新建文件）共用同一把进程级路径锁。
 pub(super) fn file_lock_key(path: &Path) -> std::io::Result<String> {
     let mut missing = Vec::new();
     let mut skip_parents = 0usize;
@@ -66,7 +62,6 @@ pub(super) fn file_lock_key(path: &Path) -> std::io::Result<String> {
     }
 }
 
-/// 在进程级单文件路径锁下执行阻塞文件修改；等待锁期间可响应取消，持锁写入期间必须等落盘完成。
 pub(super) async fn with_file_lock<F>(key: String, signal: CancellationToken, work: F) -> ToolExecution
 where
     F: FnOnce(&CancellationToken) -> Result<ToolExecution, String> + Send + 'static,
@@ -81,7 +76,6 @@ where
         biased;
         () = signal.cancelled() => error_result(ABORTED_MESSAGE),
         guard = Arc::clone(&lock).lock_owned() => {
-            // 工作线程持有锁直到写入结束，停止不能提前放行下一个编辑。
             tokio::task::spawn_blocking(move || {
                 let _guard = guard;
                 work(&signal).unwrap_or_else(error_result)
@@ -158,7 +152,6 @@ pub(crate) async fn execute(args: EditArgs, cwd: PathBuf, signal: CancellationTo
     with_file_lock(key, signal, move |signal| execute_locked(&args, &target, signal)).await
 }
 
-/// 有界读取已打开的 UTF-8 文本文件：先通过文件句柄校验上限与前 64 KB NUL 嗅探，避免大二进制文件占满内存。
 pub(super) fn read_opened_text_file(file: File, display_path: &str) -> Result<String, String> {
     let metadata = file.metadata().map_err(|error| format!("Could not inspect {display_path}: {error}"))?;
     if !metadata.is_file() {
@@ -172,7 +165,7 @@ pub(super) fn read_opened_text_file(file: File, display_path: &str) -> Result<St
     if head.contains(&0) {
         return Err(format!("{display_path} is a binary file, not UTF-8 text"));
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).expect("file size is at most 20 MiB"));
     reader
         .take(MAX_EDIT_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -198,7 +191,6 @@ fn execute_locked(
     let content = read_opened_text_file(file, &args.path)?;
     let source = content.strip_prefix('\u{feff}').unwrap_or(&content);
     let view = source.replace("\r\n", "\n");
-    // 只记录被折叠的 CR，匹配位置映射回原字节，避免重写未修改区域的换行。
     let removed: Vec<_> = source
         .match_indices("\r\n")
         .enumerate()
@@ -262,7 +254,6 @@ fn execute_locked(
     if signal.is_cancelled() {
         return Err(ABORTED_MESSAGE.into());
     }
-    // 提交开始后报告真实写入结果，不能把已完成的修改改报为取消。
     app_core::write_bytes_atomic(target, updated.as_bytes())
         .map_err(|error| format!("Could not write {}: {error}", args.path))?;
     Ok(format_diff_result("Edited", &args.path, &view, &updated))

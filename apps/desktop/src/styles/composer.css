@@ -1,10 +1,7 @@
-/* 输入区：毛玻璃卡片、附件按钮、水球、Skill 候选与新任务上下文胶囊 */
 .composer-region { position: relative; z-index: 4; width: 100%; max-width: 840px; margin: 0 auto; padding: 0 24px 16px; }
-/* 输入区始终固定在底部，浮在消息上方，消息从玻璃后面滚过 */
 .app-main .composer-region { position: absolute; width: auto; left: 0; right: var(--panel-space); bottom: 0; padding-top: 18px; transition: right var(--smooth-dur) var(--smooth); }
 .composer-region:has(.context-capsules) { display: flex; flex-direction: column; max-height: calc(100% - 54px); }
 .composer-region:has(.context-capsules) > .composer-candidate-anchor { flex: none; }
-/* 液态玻璃卡片：半透明底色加背景模糊，消息滚到下面时透出来 */
 .composer-card { position: relative; padding: 12px 12px 10px 16px; border-radius: 24px;
   background: color-mix(in srgb, var(--glass-base) 92%, transparent); backdrop-filter: blur(30px) saturate(180%); -webkit-backdrop-filter: blur(30px) saturate(180%);
   box-shadow: 0 0 0 .5px var(--glass-ring), var(--glass-drop); transition: box-shadow 160ms; }
@@ -25,7 +22,6 @@
 .water-orb:active:not([aria-disabled="true"]) { transform: scale(.94); transition-duration: 90ms; }
 .water-orb[aria-disabled="true"] { cursor: default; }
 
-/* 候选浮层沿用轻快单行毛玻璃样式，弹性列宽适配不同长度名称。 */
 .composer-candidates { position: relative; max-height: 264px; overflow-y: auto; padding: 5px; border: 1px solid var(--line-strong); border-radius: 14px; background: color-mix(in srgb, var(--raised) 92%, transparent); backdrop-filter: blur(24px) saturate(170%); box-shadow: var(--shadow-floating); }
 .composer-candidate-anchor > .picker-disclosure > div { overflow: visible; background: none; box-shadow: none; }
 .composer-candidates [role="listbox"] { display: grid; gap: 1px; }
@@ -43,7 +39,6 @@
 .composer-candidate-anchor > .picker-disclosure { position: absolute; bottom: 8px; left: 0; right: 0; z-index: 8; }
 .composer-card textarea:focus-visible { outline: none; }
 
-/* 新任务页：项目选择和上下文胶囊。浅色填充、不描边，开关时勾画出来。 */
 .context-capsules { display: flex; flex-direction: column; min-height: 0; margin: 0 0 12px 4px; }
 .context-module-list { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 4px; margin: -4px; }
 .capsule-group { margin: 0 0 12px; }
@@ -68,7 +63,6 @@
 .capsule.is-on .tick { stroke-dashoffset: 0; transition: stroke-dashoffset 220ms ease 70ms; }
 @media (prefers-reduced-motion: reduce) { .capsule, .capsule-icon * { transition: none !important; } }
 
-/* 项目菜单优先向上展开，空间不足时向下；模块滚动不带走项目选择器。 */
 .project-capsule { position: relative; flex: none; align-self: flex-start; margin: 0 0 12px; }
 .project-trigger { color: var(--ink); anchor-name: --project-capsule; }
 .project-trigger .expand-chevron { transform: rotate(-90deg); }

@@ -38,7 +38,6 @@ export function Conversation({ state, items }: Props) {
     const node = viewport.current
     if (!node || frame.current || performance.now() < disclosurePause.current) return
     let previous = performance.now()
-    // 保留小数累计值，避免高刷新率下每帧位移被浏览器取整后停在底部前。
     let scrollPosition = node.scrollTop
     const follow = (now: number) => {
       const distance = Math.max(0, node.scrollHeight - node.clientHeight) - scrollPosition
@@ -70,7 +69,6 @@ export function Conversation({ state, items }: Props) {
       if ((anchorFrame.current && anchorRevision.current === appStore.viewportAnchorRevision) || performance.now() < disclosurePause.current) return
       if (latest.mode === 'following') {
         if (restoredSession.current === sessionId && state.session?.runtime.phase !== 'idle') { followLatest(); return }
-        // 历史图表完成排版时直接保持贴底，只有执行中的新内容才平滑跟随。
         cancelAnimationFrame(frame.current)
         frame.current = 0
         node.scrollTop = node.scrollHeight
@@ -97,7 +95,6 @@ export function Conversation({ state, items }: Props) {
     const anchorElement = element.closest<HTMLElement>('.activity-card') ?? element
     const { items, itemIndices } = currentRows.current
     const index = itemIndices.get(anchorElement.dataset.itemId ?? '') ?? -1
-    // 重试会撤回流式片段；用它之前最近的已保存条目记录位置。
     let previous = index
     while (previous >= 0 && !items[previous].stable) previous--
     let next = index + 1
@@ -184,7 +181,6 @@ export function Conversation({ state, items }: Props) {
     updateScrollState(node)
     const anchor = appStore.viewportAnchor()
     const floor = Math.max(0, node.scrollHeight - node.clientHeight)
-    // 忽略代码设置 scrollTop 或内容高度收缩导致的被动滚动，只响应用户主动滚动。
     const movedByReader = Math.abs(node.scrollTop - Math.min(observedTop.current, floor)) > 0.5
     observedTop.current = node.scrollTop
     if (!movedByReader) return
@@ -234,7 +230,6 @@ export function Conversation({ state, items }: Props) {
     onJumpAnchor: anchorForJump,
   })
 
-  // 空白新任务由外层 MainContent 处理；这里只处理已选任务的读取中与读取失败状态。
   if (state.session === null) {
     if (state.sessionLoad.status === 'error' && state.sessionLoad.error !== null) {
       return (
@@ -250,7 +245,6 @@ export function Conversation({ state, items }: Props) {
 
   return (
     <div className="conversation-surface" ref={surface}><div className="conversation-scroll" ref={viewport} tabIndex={0} aria-label="任务内容" onScroll={onScroll} onWheel={interruptFollow} onTouchStart={interruptFollow} onPointerDown={interruptFollow} onKeyDown={event => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) interruptFollow() }}>
-      {/* 切换任务时整页淡入，消息不各自弹出；任务里新出现的消息才逐条弹出。 */}
       <motion.div key={sessionId} ref={documentNode} className="conversation-document"
         initial={reduced ? false : { opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: .2, ease: 'easeOut' }}>
         <AnimatePresence initial={false}>{items.map(item => <TimelineItem key={item.key} item={item.item} itemKey={item.key} onDisclosureChange={preserveDisclosurePosition} cwd={state.session!.summary.cwd} userHome={state.bootstrap?.userHome} sessionId={sessionId ?? undefined} />)}</AnimatePresence>

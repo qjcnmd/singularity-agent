@@ -8,7 +8,6 @@ interface MenuEntry {
   onSelect: () => void
 }
 
-/** 锚定在触发按钮旁的弹出菜单，使用原生 Popover 管理关闭与层叠。 */
 export function Menu({ anchor, entries, onClose, label }: {
   anchor: RefObject<HTMLElement | null>
   entries: MenuEntry[]

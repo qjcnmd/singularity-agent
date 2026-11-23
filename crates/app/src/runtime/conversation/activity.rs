@@ -1,5 +1,3 @@
-//! 当前操作中还没保存的正文、工具进度和压缩状态；读取任务时叠加到已保存的历史上，
-//! 对应内容保存后就从这里移除。
 use protocol::{HistoryItem, HistoryMessageRole, ThreadHistory, ToolStatus, TurnEvent, TurnStatus};
 
 #[derive(Default)]
@@ -80,7 +78,6 @@ impl Activity {
             if self.turn_id.as_ref() == Some(&turn.turn_id) && turn.finished_at.is_none() {
                 turn.status = TurnStatus::Running;
                 turn.stats = None;
-                // 日志没有执行中的状态；当前回合尚无结果的调用仍在等待，运行中的进度随后覆盖它。
                 for item in &mut turn.items {
                     if let HistoryItem::Tool { status, result: None, .. } = item {
                         *status = ToolStatus::Pending;
@@ -89,7 +86,6 @@ impl Activity {
             }
             for item in &self.items {
                 match turn.items.iter_mut().find(|saved| saved.id() == item.id()) {
-                    // 保存先于完成事件；只给尚无结果的工具补运行进度，其他已保存内容优先。
                     Some(saved @ HistoryItem::Tool { result: None, .. }) => *saved = item.clone(),
                     Some(_) => {}
                     None => turn.items.push(item.clone()),

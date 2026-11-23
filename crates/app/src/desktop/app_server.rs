@@ -1,7 +1,3 @@
-//! 工作台后端的入口：项目、任务、模型设置和运行状态在这里组合到一起。
-//! 项目登记、任务列表和按项目分组在 `workspace` 子模块；单个任务的执行、快照和事件
-//! 由 runtime::Conversation 负责。本模块负责组装依赖、查找已打开的任务、处理 RPC 和发布全局事件。
-
 mod actions;
 mod workspace;
 
@@ -67,21 +63,14 @@ impl SessionCache {
     }
 }
 
-/// 提交 RPC 在消息入队后返回；后续准备、保存和执行状态通过会话事件发布。
 pub(crate) struct AppServer {
     hub: Arc<StreamHub>,
-    /// 保证完整工作台快照按构造顺序发布；不涉及任务执行和普通增量事件。
     app_publication: Mutex<()>,
-    /// 任务创建、删除和项目移除的短锁：「查找或创建任务 → 接受输入」与
-    /// 「检查是否空闲 → 修改文件 → 注销」互斥，删除不会插到任务启动的中间。
-    /// 只包住这几步，不覆盖模型请求、工具执行或整个任务。
     lifecycle: Mutex<()>,
     catalog: ThreadCatalog,
     workspaces: WorkspaceStore,
-    /// 工作台与会话共用的模型配置入口。
     models: Arc<ModelConfigManager>,
     pub(super) mcp: Arc<mcp::McpManager>,
-    /// 应用数据目录；技能列表和任务执行读取同一个目录。
     home: std::path::PathBuf,
     sessions: Mutex<SessionCache>,
 }
@@ -131,7 +120,6 @@ impl AppServer {
         self.update_models(|models| models.save_provider(provider, api_key))
     }
 
-    /// 设置页只重读模型配置，不依赖项目和会话日志。
     pub(crate) fn read_models(&self) -> protocol::ModelCatalogResult {
         let _publication = self.lock_app_publication();
         self.model_catalog_result(self.models.redacted_catalog())
@@ -153,7 +141,6 @@ impl AppServer {
         Ok(self.model_catalog_result(catalog))
     }
 
-    // 重读也取得新序号，避免此前生成的工作台快照覆盖刚读到的文件配置。
     fn model_catalog_result(&self, catalog: protocol::RedactedModelCatalog) -> protocol::ModelCatalogResult {
         protocol::ModelCatalogResult {
             catalog,
@@ -168,7 +155,6 @@ impl AppServer {
         base_url: &str,
         api_key: Option<&str>,
     ) -> Result<Vec<String>, RpcError> {
-        // 先取出本次查询用的密钥，网络请求期间不持有配置锁。
         let models = Arc::clone(&self.models);
         let provider_id = provider_id.to_owned();
         let api_key = api_key.map(str::to_owned);
@@ -181,7 +167,6 @@ impl AppServer {
         model::discover_models(base_url, &api_key, api_protocol).await.map_err(RpcError::new)
     }
 
-    /// 收到第一条消息才创建任务；空白页在后端没有任务和日志文件。
     pub(crate) fn start_session(
         &self,
         params: protocol::SessionStartParams,
@@ -214,7 +199,6 @@ impl AppServer {
         session_id: &str,
         focus_epoch: u64,
     ) -> Result<SessionReadResult, RpcError> {
-        // 只有查找或打开任务需要生命周期锁；确认存在后再按请求序号切焦点，避免无效 ID 或过期读取覆盖当前会话焦点。
         let conversation = {
             let _lifecycle = self.lock_lifecycle();
             self.open_conversation(session_id)?
@@ -224,7 +208,6 @@ impl AppServer {
     }
 
     fn open_conversation(&self, session_id: &str) -> Result<Arc<Conversation>, RpcError> {
-        // 任务表的锁只用于查找；打开日志文件在锁外进行。
         let open = self.lock_sessions().get(session_id);
         if let Some(conversation) = open {
             return Ok(conversation);
@@ -233,7 +216,6 @@ impl AppServer {
         Ok(self.insert_conversation(thread))
     }
 
-    /// 在生命周期锁内打开任务，正在删除的任务拒绝新操作；删除等待只影响该任务。
     fn open_action_conversation(&self, session_id: &str) -> Result<Arc<Conversation>, RpcError> {
         let conversation = self.open_conversation(session_id)?;
         if conversation.is_deleting() {
@@ -242,7 +224,6 @@ impl AppServer {
         Ok(conversation)
     }
 
-    /// 在生命周期锁内登记新打开的任务；已打开的任务由 open_conversation 直接返回。
     fn insert_conversation(&self, session: agent::session::SessionManager) -> Arc<Conversation> {
         let id = session.data().session_id().to_owned();
         let conversation = Conversation::new(
@@ -257,30 +238,22 @@ impl AppServer {
         conversation
     }
 
-    /// 在释放生命周期锁之后调用；在发布锁内生成并发出应用级快照，读取目录期间其他任务仍可操作。
     fn publish_app_snapshot(&self) {
         let _publication = self.lock_app_publication();
         match self.bootstrap_with_catalog(self.models.redacted_catalog()) {
             Ok(payload) => {
                 self.hub.emit(StreamEvent::AppChanged { payload });
             }
-            // 操作已经保存，RPC 照常返回结果；读取列表失败由客户端显示列表错误，
-            // 不悄悄保留旧列表。
             Err(error) => {
                 self.hub.emit(StreamEvent::AppReadFailed { error });
             }
         }
     }
 
-    /// RPC 读取和快照发布都在这把锁内生成内容并取得事件序号；否则较早生成的
-    /// 快照可能拿到比新快照更大的序号。会话事件不经过这把锁，避免与会话状态锁
-    /// 形成相反的加锁顺序。
     fn lock_app_publication(&self) -> std::sync::MutexGuard<'_, ()> {
         self.app_publication.lock().expect("app_server publication lock poisoned")
     }
 
-    /// 生命周期锁。加锁顺序是 lifecycle → publication → sessions → 会话状态；
-    /// 只在公开入口的最外层获取。
     fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
         self.lifecycle.lock().expect("app_server lifecycle lock poisoned")
     }
@@ -289,7 +262,6 @@ impl AppServer {
         self.sessions.lock().expect("app_server session map lock poisoned")
     }
 
-    /// 管道关闭时等待已接受的操作和子进程结束。
     pub(crate) async fn shutdown(&self) {
         let sessions: Vec<_> =
             self.lock_sessions().conversations().map(|(_, conv)| Arc::clone(conv)).collect();

@@ -12,7 +12,6 @@ struct CancelState {
     user_stopped: bool,
 }
 
-/// 一次操作（回合或独立压缩）的提问和停止控制；输入队列和写者由任务持有。
 pub(super) struct TurnControls {
     pub(super) turn_id: String,
     cancellation: CancellationToken,
@@ -46,7 +45,6 @@ impl TurnControls {
         &self.cancellation
     }
 
-    /// 接受停止并取消本次操作；调用方在持有会话状态锁时同时清空排队的用户输入。
     pub(super) fn accept_cancel(&self) -> Result<(), ConversationError> {
         {
             let mut state = self.cancel_state.lock().expect("cancel window lock poisoned");
@@ -59,7 +57,6 @@ impl TurnControls {
         Ok(())
     }
 
-    /// 保存最终状态前关闭停止入口，并返回用户是否停止过；已接受的停止一定计入本轮结果。
     pub(super) fn finish_cancel(&self) -> bool {
         let mut state = self.cancel_state.lock().expect("cancel window lock poisoned");
         state.accepting = false;
@@ -70,13 +67,10 @@ impl TurnControls {
 pub(super) struct ConversationState {
     pub(super) model: ModelSelection,
     pub(super) turn: TurnLifecycle,
-    /// 首条和后续消息共用的输入队列，跨回合保留。
     pub(super) steering_inbox: SteeringInboxHandle,
-    /// 当前任务模型的上下文窗口，打开任务时从配置读取，每轮开始时按实际解析结果更新。
     pub(super) last_context_window: Option<u64>,
     pub(super) auto_resume: bool,
     pub(super) closing: bool,
-    /// 尚未完成的上下文预览；关闭和新执行取消它，关闭等待其收尾。
     pub(super) context_preview: Option<CancellationToken>,
 }
 
@@ -88,7 +82,6 @@ impl ConversationState {
             || !self.steering_inbox.lock().expect("turn inbox lock poisoned").pending().is_empty()
     }
 
-    /// 回合结束和后台通知共用的继续条件；暂停或关闭时不自动处理输入。
     pub(super) fn has_pending_resume(&self) -> bool {
         self.auto_resume
             && !self.closing
@@ -96,7 +89,6 @@ impl ConversationState {
     }
 }
 
-/// 回合与独立压缩共用同一种控制；压缩标记区分两者的显示阶段。
 pub(super) enum TurnLifecycle {
     Idle,
     Running(Arc<TurnControls>),
@@ -107,7 +99,6 @@ impl TurnLifecycle {
         !matches!(self, Self::Idle)
     }
 
-    /// 运行阶段由当前操作的停止和压缩标记决定，前端直接显示。
     pub(super) fn phase(&self) -> SessionPhase {
         match self {
             Self::Idle => SessionPhase::Idle,

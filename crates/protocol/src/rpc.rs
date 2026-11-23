@@ -1,5 +1,3 @@
-//! 工作台全部 RPC 方法名、请求参数与返回类型的对应关系。
-
 #[cfg(feature = "typescript")]
 use crate::{
     AppBootstrap, ContextModule, DirectoryPickResult, McpServerState, ModelCatalogResult, SessionReadResult,
@@ -18,7 +16,6 @@ use std::fmt;
 #[serde(deny_unknown_fields)]
 pub struct EmptyParams {}
 
-/// 停止当前会话内的指定后台命令。
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -40,7 +37,6 @@ pub struct WorkspaceParams {
     pub workspace_root: String,
 }
 
-/// 读取全局指令（不带项目）或某个项目根目录下的 AGENTS.md。
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -56,7 +52,6 @@ pub struct InstructionsSaveParams {
     pub content: String,
 }
 
-/// 工作台文件栏读取的文件；`path` 可以是绝对路径、`~/` 开头或相对 `cwd`（任务的工作目录）。
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct FileReadParams {
@@ -69,7 +64,6 @@ pub struct FileReadParams {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSaveParams {
     pub provider: ProviderConfigurationInput,
-    /// 只在写入时使用的新密钥；省略表示保留已有密钥。
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub api_key: Option<String>,
 }
@@ -119,7 +113,6 @@ pub struct SessionParams {
     pub session_id: String,
 }
 
-/// 告知后端当前前端正在展示的会话；非聚焦会话的高频流式进度不再跨管道推送。
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -127,7 +120,6 @@ pub struct SessionFocusParams {
     pub session_id: Option<String>,
 }
 
-/// 首次发送时创建会话，空白页只保存在工作台草稿中。
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -136,9 +128,7 @@ pub struct SessionStartParams {
     pub selection: ModelSelection,
     pub text: String,
     pub images: Vec<ImageUpload>,
-    /// 附件文件的绝对路径。
     pub files: Vec<String>,
-    /// 创建时关闭的上下文模块 ID，任务期间不变。
     pub disabled_modules: Vec<String>,
 }
 
@@ -182,10 +172,8 @@ pub struct UpdateSettingsParams {
     pub selection: ModelSelection,
 }
 
-// 请求参数和客户端返回类型由同一份方法表声明。
 macro_rules! rpc_methods {
     ($($variant:ident => $wire:literal ($params:ty) -> $result:ty),* $(,)?) => {
-        /// 工作台请求；入口解析后，各操作直接使用自己的具体参数。
         #[derive(Debug, Deserialize)]
         #[serde(tag = "method", content = "params")]
         pub enum RpcRequest {

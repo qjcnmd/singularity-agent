@@ -1,14 +1,8 @@
-//! 后端事件发布中心：维护全局单调 `revision`、当前聚焦会话过滤与背压高水位保护。
-//!
-//! 从 `AppServer` 独立出来后，`Conversation` 直接持有 `Arc<StreamHub>` 的发布闭包，
-//! 无需反向持有 `Weak<AppServer>` 自引用环。
-
 use std::sync::{Arc, Mutex};
 
 use protocol::{StreamEnvelope, StreamEvent};
 use tokio::sync::mpsc;
 
-/// 事件流通道为关键控制与终态事件保留的最小剩余槽位；低于该水位时丢弃高频进度帧避免阻塞或 OOM。
 const STREAM_RESERVED_CONTROL_SLOTS: usize = 512;
 
 struct StreamOrder {
@@ -23,7 +17,6 @@ struct FocusState {
 
 pub(crate) struct StreamHub {
     order: Mutex<StreamOrder>,
-    /// 前端当前正在查看的会话 ID 及请求代次；非聚焦会话的高频流式进度不再跨管道推送。
     focused_session: Mutex<FocusState>,
     stream: mpsc::Sender<StreamEnvelope>,
 }
@@ -49,15 +42,12 @@ impl StreamHub {
         self.order.lock().expect("stream revision lock poisoned").revision
     }
 
-    /// 单独推进并返回新序号（用于仅返回 RPC 响应而不广播事件的模型配置读/改）。
     pub(crate) fn next_revision(&self) -> u64 {
         let mut order = self.order.lock().expect("stream revision lock poisoned");
         order.revision += 1;
         order.revision
     }
 
-    /// 发布一个事件：过滤非聚焦会话的高频进度帧与背压时的高频帧，
-    /// 仅对实际发出的事件递增全局序号并推送给前端；通道饱和时预留最后 1 个槽位发送合并后的 `Ready` 重同步信号。
     pub(crate) fn emit(&self, event: StreamEvent) -> u64 {
         let mut order = self.order.lock().expect("stream revision lock poisoned");
         if self.stream.is_closed() {
@@ -116,7 +106,6 @@ impl StreamHub {
     }
 }
 
-/// 识别可按焦点过滤、也可在背压高水位线时让路的高频进度帧，返回其所属会话 ID。
 fn high_frequency_progress_session(event: &StreamEvent) -> Option<&str> {
     match event {
         StreamEvent::TurnEvent { session_id, payload }

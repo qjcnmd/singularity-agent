@@ -97,7 +97,6 @@
 .sg-divider { height: 1px; margin: 5px 8px; background: var(--line); }
 .effort-field { padding: 0; margin: 0; border: 0; min-width: 0; }
 .effort-field:disabled { opacity: .45; }
-/* 固定宽度，打开时由 ModelPicker 按按钮中心定位；打开期间换模型、按钮变宽变窄，浮层也不移动。 */
 .sg-root > .model-popover { position: fixed; inset: auto; width: 256px; margin: 0; padding: 0; border: 0; overflow: visible; background: transparent; color: inherit; }
 .sg-menu { padding: 6px; }
 .sg-menu .candidate-message { margin: 0; padding: 8px 10px; color: var(--ink-faint); font-size: 12px; }

@@ -15,7 +15,6 @@ impl AppServer {
         self.catalog.image_data(session_id, image_id).map_err(catalog_error)
     }
 
-    /// 输入直接进入会话队列；启动和收尾期间同样接受，按顺序执行。
     pub(crate) fn submit(&self, params: protocol::SessionTextParams) -> Result<(), RpcError> {
         let (cwd, skill_expansion) = {
             let _lifecycle = self.lock_lifecycle();
@@ -54,8 +53,6 @@ impl AppServer {
         self.apply_control(session_id, |conversation| conversation.abort().map_err(conversation_error))
     }
 
-    /// 在生命周期锁内查找任务并执行一个短操作（回答问题、停止）；
-    /// 闭包里不能等待 Agent 执行。
     fn apply_control(
         &self,
         session_id: &str,
@@ -66,7 +63,6 @@ impl AppServer {
         apply(&conversation)
     }
 
-    /// 打开任务时查看下一轮会加载的指令和工具；结果通过 context/loaded 事件送达。
     pub(crate) async fn inspect_context(
         self: &Arc<Self>,
         session_id: &str,
@@ -95,19 +91,16 @@ impl AppServer {
         self.apply_control(session_id, |conversation| conversation.compact().map_err(conversation_error))
     }
 
-    /// 保存任务展示名称；活动执行继续使用当前写者。
     pub(crate) fn rename_session(&self, session_id: &str, name: &str) -> Result<(), RpcError> {
         self.apply_control(session_id, |conversation| conversation.rename(name).map_err(conversation_error))
     }
 
-    /// 停止目标任务并等它结束，再删除日志和附件；等待期间只拒绝该任务的新操作。
     pub(crate) async fn delete_session(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {
         let app = Arc::clone(self);
         let id = session_id.to_string();
         let pending = tokio::task::spawn_blocking(move || {
             let lifecycle = app.lock_lifecycle();
             let Some(conversation) = app.lock_sessions().get(&id) else {
-                // 未加载的任务直接删除；删除前保持生命周期锁，阻止新建 conversation。
                 app.catalog.delete(&id).map_err(catalog_error)?;
                 drop(lifecycle);
                 app.publish_app_snapshot();

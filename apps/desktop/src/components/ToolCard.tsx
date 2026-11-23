@@ -34,7 +34,6 @@ const fileToolSpec = (extra?: Partial<ToolPresentation>): ToolPresentation => ({
   ...extra,
 })
 
-/** 所有内置与代理工具的标题、图标、摘要与特殊渲染标记集中在此一处维护。 */
 const toolPresentations: Record<string, ToolPresentation> = {
   bash: {
     background: true,
@@ -87,7 +86,6 @@ export function toolTracksLiveTasks(name: string): boolean {
   return toolPresentations[name]?.tracksLiveTasks === true
 }
 
-/** 仅在需要追踪运行中后台命令的卡片上订阅该会话的 `backgroundTasks`，避免无关卡片重绘。 */
 export function useBackgroundTasks(sessionId: string | undefined, enabled: boolean): VisibleBackgroundTask[] | undefined {
   const { liveSessions } = useAppStore(
     ['liveSessions'],
@@ -168,7 +166,6 @@ function ToolOutput({ item: fact, spec, filePath, command }: {
 }) {
   const input = fact.args
   const background = spec?.background === true
-  // 内部关联字段不展示；命令输出原样保留，不按工具参数过滤业务数据。
   const displayJson = (key: string, value: unknown) => background && (key === 'taskId' || key === 'task_id') ? undefined : value
   const parameters = JSON.stringify(input, displayJson, 2)
   if (fact.name === 'ask_user_question' && fact.status === 'completed' && fact.result) {
@@ -177,7 +174,7 @@ function ToolOutput({ item: fact, spec, filePath, command }: {
   let output = fact.result?.output ?? ''
   if (background && fact.name !== 'bash' && output !== '') {
     try { output = JSON.stringify(JSON.parse(output), displayJson, 2) }
-    catch { /* 普通命令输出和工具错误是文本，原样显示。 */ }
+    catch {}
   }
   if (command !== null) return <CommandOutput command={command} output={output} />
   if (spec?.diffOutput && filePath !== null && fact.status === 'completed') return <EditDiff path={filePath} output={output} />
@@ -252,7 +249,6 @@ function asRecord(value: unknown): ArgRecord {
   return typeof value === 'object' && value !== null ? value as ArgRecord : {}
 }
 
-/** 为 `read` 工具输出的前 `source.lineCount` 行标注源文件行号；超出部分的截断或分页提示不标行号。 */
 function readOutputLines(text: string, source: ReadSource): Array<{ text: string; number?: number }> {
   const lines = text.replace(/\r\n/g, '\n').split('\n')
   return lines.map((line, index) => index < source.lineCount

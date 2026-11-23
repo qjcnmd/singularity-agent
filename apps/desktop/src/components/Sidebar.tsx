@@ -24,7 +24,6 @@ export const Sidebar = memo(SidebarView)
 const sidebarFields = ['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceRoot', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'page'] as const
 type SidebarState = Pick<AppState, typeof sidebarFields[number]>
 
-/** 浅比较侧栏依赖的状态，避免无关后台事件触发重渲染。 */
 function sameSidebarState(previous: SidebarState, next: SidebarState): boolean {
   return sidebarFields.every(key => {
     if (key !== 'liveSessions') return Object.is(previous[key], next[key])

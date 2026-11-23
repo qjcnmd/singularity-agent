@@ -1,10 +1,9 @@
-# Local environment and application data.
 .env
 .env.*
 .singularity/
 work/
+AGENTS.local.md
 
-# Dependencies and build outputs. Source icons and protocol.generated.ts remain tracked.
 target/
 node_modules/
 *.tsbuildinfo
@@ -16,7 +15,6 @@ node_modules/
 /apps/desktop/release-audit/
 /apps/desktop/release-ui/
 
-# Editor and operating-system files.
 *.log
 *.tmp
 *.swp
@@ -25,13 +23,11 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Local tool output and task evidence.
 .mimosa/
 .playwright-mcp/
 .qoder-cn/
 outputs/
 
-# Local agent state and isolated worktrees.
 .claude/
 .codex/
 .workbuddy/
@@ -45,9 +41,7 @@ outputs/
 # Windows can accidentally create this reserved device name as a file.
 nul
 
-# Evaluation run artifacts (evidence kept locally).
 evaluations/output/
 
-# Python bytecode caches (test runs inside task workspaces).
 __pycache__/
 *.pyc

@@ -1,12 +1,7 @@
-//! 项目目录的路径处理：文件系统调用用的原生路径和显示用的字符串在这里一起生成。
-//! 项目登记、会话的工作目录和项目指令加载都用它；它只表示路径，不限制 Agent 的访问范围。
-
 use std::path::{Path, PathBuf};
 
 use crate::display_path;
 
-/// 已规范化的项目目录路径；相等比较以规范显示路径（忽略大小写）为准，
-/// 避免 Windows 原生 `\\?\` 前缀差异导致同一目录比较不等。
 #[derive(Debug, Clone)]
 pub struct CanonicalWorkspacePath {
     native: PathBuf,
@@ -22,7 +17,6 @@ impl PartialEq for CanonicalWorkspacePath {
 impl Eq for CanonicalWorkspacePath {}
 
 impl CanonicalWorkspacePath {
-    /// 从已保存的绝对路径构造，只整理路径组件，不访问文件系统。
     pub fn from_saved(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
         if !path.is_absolute() {
@@ -40,7 +34,6 @@ impl CanonicalWorkspacePath {
         &self.native
     }
 
-    /// 界面显示和保存使用的正斜杠路径（去掉 Windows `\\?\` 前缀）。
     pub fn display(&self) -> &str {
         &self.display
     }
@@ -50,19 +43,15 @@ pub fn saved_path_key(path: &str) -> String {
     path.to_lowercase()
 }
 
-/// 原生路径转换为忽略大小写的展示路径比较键（去掉 Windows 长路径前缀）。
 pub fn workspace_key(path: &Path) -> String {
     let normalized: PathBuf = path.components().collect();
     display_path(&normalized).to_lowercase()
 }
 
-/// 已保存路径的等价比较：两边都是显示形式（正斜杠绝对路径），忽略大小写。
-/// 项目登记的查找、登记和移除判断共用；输入是保存的字符串，不访问文件系统。
 pub fn same_saved_path(left: &str, right: &str) -> bool {
     saved_path_key(left) == saved_path_key(right)
 }
 
-/// 检查并规范化已存在的本地目录为工作区路径。
 pub fn canonicalize_workspace(path: impl AsRef<Path>) -> Result<CanonicalWorkspacePath, String> {
     let requested = path.as_ref();
     let native = std::fs::canonicalize(requested)
@@ -76,7 +65,6 @@ pub fn canonicalize_workspace(path: impl AsRef<Path>) -> Result<CanonicalWorkspa
     Ok(CanonicalWorkspacePath::from_native(native))
 }
 
-/// 沿当前目录逐级向上查找项目根目录（带有 `.git` 标记），未找到时返回当前工作目录。
 pub(crate) fn project_root(cwd: &Path) -> Result<PathBuf, String> {
     for ancestor in cwd.ancestors() {
         let marker = ancestor.join(crate::PROJECT_ROOT_MARKER);

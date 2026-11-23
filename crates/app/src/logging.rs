@@ -1,6 +1,3 @@
-//! 结构化诊断日志：使用 `tracing` 写入 `~/.singularity/logs/singularity.log`，
-//! 按体积自动滚动归档（默认单文件 5 MiB，保留 3 份历史），不阻塞或中断主流程。
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -17,7 +14,6 @@ const MAX_ARCHIVES: usize = 3;
 
 const DEFAULT_FILTER: &str = "info,hyper=warn,reqwest=warn,rustls=warn,rmcp=warn";
 
-/// 初始化全局诊断日志；日志目录或文件不可写时降级静默，不影响应用启动。
 pub(crate) fn init(home: &Path) {
     let dir = home.join(LOG_DIR_NAME);
     if fs::create_dir_all(&dir).is_err() {

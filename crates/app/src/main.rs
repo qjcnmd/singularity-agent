@@ -1,5 +1,3 @@
-//! Electron 的 stdio AppServer 入口。
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,7 +11,6 @@ use crate::runtime::{SESSIONS_DIR_NAME, ThreadCatalog};
 use model::ModelConfigManager;
 
 pub(crate) const PROGRAM_NAME: &str = env!("CARGO_BIN_NAME");
-/// 后端事件流总容量；最后一段预留给控制与终态事件，高频进度在接近满载时让路。
 pub(crate) const STREAM_CHANNEL_CAPACITY: usize = 4096;
 
 fn main() {
@@ -36,7 +33,6 @@ fn run() -> Result<(), String> {
     result
 }
 
-/// 在整个进程生命周期内持有一把 OS 锁；锁文件还留在磁盘上，不代表有程序正持有它。
 fn lock_data_directory() -> Result<(PathBuf, std::fs::File), String> {
     let home = app_core::resolve_home()?;
     std::fs::create_dir_all(&home)
@@ -60,7 +56,6 @@ fn lock_data_directory() -> Result<(PathBuf, std::fs::File), String> {
     Ok((home, file))
 }
 
-/// 装配工作台共享组件，直接交给应用服务持有。
 fn prepare_desktop(
     home: &Path,
 ) -> Result<(Arc<AppServer>, tokio::sync::mpsc::Receiver<protocol::StreamEnvelope>), String> {

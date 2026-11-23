@@ -1,11 +1,5 @@
-/**
- * 代码高亮：按需加载 Shiki 语言语法并生成支持明暗双主题的 Token。
- */
 import { createElement, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 
-/**
- * 支持高亮的语言加载表；使用静态 `import()` 让打包器按语言拆包。
- */
 const LANGUAGE_LOADERS = {
   javascript: () => import('@shikijs/langs/javascript'),
   jsx: () => import('@shikijs/langs/jsx'),
@@ -62,7 +56,6 @@ function languageIdFor(language: string): LanguageId | 'text' {
 
 type Highlighter = Awaited<ReturnType<typeof import('@shikijs/core')['createHighlighterCore']>>
 
-/** 每个 Token 同时带有 `--shiki-light` 和 `--shiki-dark` CSS 变量。 */
 type HighlightedLines = ReturnType<Highlighter['codeToTokens']>['tokens']
 
 let highlighterPromise: Promise<Highlighter> | null = null
@@ -85,7 +78,6 @@ function loadHighlighter(): Promise<Highlighter> {
   return highlighterPromise
 }
 
-// 每种实际使用的语言只加载一次；普通文本不会初始化高亮引擎。
 const languagePromises = new Map<LanguageId, Promise<Highlighter>>()
 function loadLanguage(language: LanguageId): Promise<Highlighter> {
   let pending = languagePromises.get(language)
@@ -144,8 +136,6 @@ function tokenize(highlighter: Highlighter, code: string, lang: LanguageId, prev
   return { highlighter, lang, code, lines, completeEnd, grammarState, grammarEpoch }
 }
 
-/** 状态里只记录语言是否加载完成；token 每次渲染时按当前代码计算，不在 Promise 回调里写回。
- *  这样流式输出改变代码时，不会出现“高亮完成 → setState → 再次渲染”的连锁更新。 */
 export function useCodeTokens(code: string, language: string) {
   const lang = languageIdFor(language)
   const [loaded, setLoaded] = useState<{ highlighter: Highlighter; language: LanguageId } | null>(null)
@@ -155,7 +145,6 @@ export function useCodeTokens(code: string, language: string) {
     let current = true
     void loadLanguage(lang).then(
       highlighter => { if (current) setLoaded({ highlighter, language: lang }) },
-      // 语言分块加载失败时保持 null，回退为纯文本展示。
       () => {},
     )
     return () => { current = false }

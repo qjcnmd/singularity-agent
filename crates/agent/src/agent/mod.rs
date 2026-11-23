@@ -1,12 +1,3 @@
-//! Agent 的执行循环：调用模型、执行工具、处理运行中追加的输入。
-//!
-//! 压缩有三个触发点：切换模型且超出目标模型 90% 时先由旧模型预压缩；
-//! 同模型发送前达到窗口 90% 时保留最近 15% 并压缩前缀；
-//! 提供方明确返回上下文超限时，至少保留最后一个完整平衡单元并压缩其之前的前缀，再重发一次。
-//!
-//! 相关模块：组装请求在 self::request，压缩在 self::compaction，发送和重试在
-//! crate::request_execution，输入队列在 self::inbox；事件类型是 [`AgentEvent`]。
-
 mod compaction;
 pub use compaction::compaction_unneeded;
 mod dispatch;
@@ -26,7 +17,6 @@ pub use self::questions::UserQuestions;
 pub use crate::image::InputImage;
 use protocol::TurnEvent;
 
-/// Agent 发出的事件：可转发为前端 `TurnEvent`，或通知外层更新状态与累计用量。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     Turn(TurnEvent),
@@ -44,11 +34,8 @@ use model::Message;
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// 文件指令（AGENTS.md 等）的用户数据根目录。
     pub instruction_home: std::path::PathBuf,
-    /// 本轮在开始记录前读取的文件指令。
     pub initial_instructions: Vec<app_core::InstructionFile>,
-    /// 创建任务时关闭的上下文模块 ID，任务期间不变。
     pub disabled_modules: Vec<String>,
 }
 
@@ -58,7 +45,6 @@ pub enum AgentError {
     Session(#[from] SessionError),
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
-    /// 请求输入读取失败不代表日志无法追加，仍需保存本轮失败原因。
     #[error("{0}")]
     Context(#[from] std::io::Error),
     #[error("agent operation aborted")]
@@ -67,7 +53,6 @@ pub enum AgentError {
     OutputTruncated,
     #[error("{0}")]
     InvalidCompaction(String),
-    /// 压缩失败；条目本身已显示失败原因，外层据此避免重复显示同一错误。
     #[error("{source}")]
     Compaction {
         item_id: String,
@@ -76,7 +61,6 @@ pub enum AgentError {
 }
 
 impl AgentError {
-    /// 日志写入失败时不再保存结束记录；压缩内部的写入失败同样算。
     pub fn is_session_failure(&self) -> bool {
         match self {
             Self::Session(_) => true,
@@ -85,7 +69,6 @@ impl AgentError {
         }
     }
 
-    /// 压缩失败时带上条目 ID，界面据此避免重复报错。
     pub fn detail(&self) -> protocol::TurnErrorDetail {
         let item_id = match self {
             Self::Compaction { item_id, .. } => Some(item_id.clone()),
@@ -97,7 +80,6 @@ impl AgentError {
 
 pub(crate) type Result<T> = std::result::Result<T, AgentError>;
 
-/// 普通生成和独立压缩共用的模型、指令、工具定义与会话写者。
 pub struct RequestContext {
     session: SessionWriter,
     registry: ToolRegistrySnapshot,
@@ -118,7 +100,6 @@ impl std::fmt::Debug for RequestContext {
     }
 }
 impl RequestContext {
-    /// 按回合开始时的同一套规则加载指令和工具目录，只返回给工作台查看的内容，不发送请求。
     pub async fn inspect_context(
         mut self,
         cancellation: &CancellationToken,
@@ -127,7 +108,6 @@ impl RequestContext {
         Ok(context)
     }
 
-    /// 提供方和文件指令在创建时确定；技能和 MCP 工具在第一次请求前加载。
     pub fn new(
         provider: ModelClient,
         models: Arc<model::ModelConfigManager>,
@@ -155,7 +135,6 @@ impl RequestContext {
     }
 }
 
-/// 一个普通回合的执行者：消费输入队列、调用模型、执行工具。
 #[derive(Debug)]
 pub struct Agent {
     requests: RequestContext,
@@ -164,7 +143,6 @@ pub struct Agent {
     inbox: SteeringInboxHandle,
 }
 impl Agent {
-    /// 本轮加载的指令和工具定义由 `RequestContext` 持有；停止、提问和工具执行状态在这里绑定。
     pub fn new(
         requests: RequestContext,
         inbox: SteeringInboxHandle,
@@ -174,10 +152,6 @@ impl Agent {
         Self { requests, bash_tasks, questions, inbox }
     }
 
-    /// 执行一个完整回合：把输入保存为用户消息，循环调用模型和工具，直到模型不再调用
-    /// 工具且队列为空。运行中追加的输入在下一次模型请求前交给模型。
-    ///
-    /// 停止时返回 AgentError::Aborted，由会话记为中断；生成的内容已经保存并通过事件发布。
     pub async fn run(
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
@@ -194,9 +168,7 @@ impl Agent {
             let length_truncated = response.is_length_truncated();
             let assistant = response.assistant_message;
 
-            // 回复已随请求记录保存，这里只取出其中的工具调用来执行。
             let tool_calls = assistant.tool_calls().cloned().collect::<Vec<_>>();
-            // 按消息中的顺序发布所有内容；工具进度随后更新原来的条目。
             let public_items = public_items(
                 &assistant,
                 None,
@@ -223,7 +195,6 @@ impl Agent {
             if length_truncated {
                 return Err(AgentError::OutputTruncated);
             }
-            // 之后到达的输入由 Conversation 在本轮结束后接着处理。
             if !has_tool_calls && lock_inbox(&self.inbox).pending().is_empty() {
                 return Ok(());
             }
@@ -306,8 +277,6 @@ impl Agent {
         Ok(())
     }
 
-    /// 先在写者锁外保存图片，再追加引用它们的消息，使用调用方事先分配的消息 ID；
-    /// 返回日志保存时间，成功返回后调用方才发布完成事件。
     async fn append_message(
         &self,
         id: &str,

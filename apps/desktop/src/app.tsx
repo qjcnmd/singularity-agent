@@ -60,12 +60,10 @@ const MainContent = memo(function MainContent({ accent }: { accent: string }) {
   const pendingMessages = runtime?.pendingMessages
   const failureFromRuntime = failure?.source === 'turn'
   const historyRows = useMemo(() => buildHistoryRows(facts, failureFromRuntime), [facts, failureFromRuntime])
-  // 这里只依赖影响临时条目的字段；上下文用量、阶段和后台状态不改变排列。
   const items = useMemo(() => buildTimeline(historyRows, facts, runtime), [historyRows, facts, failure, pendingQuestion, pendingMessages])
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspace = state.bootstrap?.workspaces.find(workspace => workspaceKey(workspace.root) === state.selectedWorkspaceRoot)
   const workspaceSessions = appStore.sessions()
-  // 页头和侧栏用同一套标题规则；任务还不在项目列表里时，只显示用户起的名字或“新任务”。
   const sessionTitle = state.session === null ? '' : sessionTitles(workspaceSessions)(
     workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.summary,
   )
@@ -110,7 +108,6 @@ const MainContent = memo(function MainContent({ accent }: { accent: string }) {
       </main>
   )
 })
-/** 拖动或用左右方向键调宽度；reversed 用于右侧的栏，往左拖变宽。 */
 function ResizeSeparator({ label, value, onChange, reversed = false }: { label: string; value: number; onChange: (value: number) => void; reversed?: boolean }) {
   const start = useRef<{ x: number; value: number } | null>(null)
   return (

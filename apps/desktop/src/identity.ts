@@ -1,4 +1,3 @@
-/** 产品外壳与持久化命名空间常量，以及主/渲染进程共用的内部 IPC 通道名。 */
 export const APP_NAME = 'Singularity'
 export const APP_SCHEME = 'singularity'
 export const APP_ENTRY = `${APP_SCHEME}://app/`

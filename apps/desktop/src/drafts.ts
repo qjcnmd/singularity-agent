@@ -1,7 +1,6 @@
 import { DRAFTS_DB_NAME } from './identity'
 import type { ModelSelection, ImageUpload } from './protocol'
 
-/** 未发送的文本批注草稿：记录相对所属助手消息可见纯文本的偏移与前后文摘录，切任务或重开后可恢复高亮。 */
 export interface DraftAnnotation {
   id: string
   messageId: string
@@ -13,7 +12,6 @@ export interface DraftAnnotation {
   suffix: string
 }
 
-/** files 是附件文件的绝对路径，发送时只把路径交给后端；disabledModules 是新任务关闭的上下文模块 ID，只在空白页使用。 */
 export interface Draft {
   text: string
   images: File[]
@@ -60,7 +58,6 @@ export class DraftStore {
     return this.snapshot?.[sessionId] ?? emptyDraft
   }
 
-  /** 编辑立即生效；自动保存按 key 防抖并在退出或清理时立即落盘。 */
   async set(sessionId: string, draft: Draft): Promise<boolean> {
     if (this.snapshot === null) return false
     const drafts = { ...this.snapshot }
@@ -77,7 +74,6 @@ export class DraftStore {
     return true
   }
 
-  /** 发送期间继续编辑的内容仍保留；若正文或附件继续被编辑，仍按 ID/comment 清理本次已提交的批注。 */
   async clearIfUnchanged(sessionId: string, submitted: Draft): Promise<void> {
     const snapshot = this.snapshot
     if (snapshot === null) return
@@ -100,7 +96,6 @@ export class DraftStore {
     await persistDraft(sessionId, emptyDraft).catch(() => {})
   }
 
-  /** 清理失败不影响已完成的任务删除或项目移除。 */
   async remove(sessionIds: string[]): Promise<void> {
     this.cancelPending(sessionIds)
     await removeDrafts(sessionIds).catch(() => {})
@@ -134,7 +129,6 @@ export class DraftStore {
   }
 }
 
-// 每个任务的完整输入作为一条记录保存。图片不占用 localStorage 的小容量配额。
 let database: Promise<IDBDatabase> | undefined
 function openDatabase(): Promise<IDBDatabase> {
   return database ??= new Promise((resolve, reject) => {
@@ -187,7 +181,6 @@ async function loadDrafts(): Promise<Record<string, Draft>> {
   return result
 }
 
-/** 发送时才把图片编码为 Data URL；草稿阶段只存 `File` 对象，避免每次输入文字都复制大段 Base64。 */
 export function imageUpload(file: File): Promise<ImageUpload> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()

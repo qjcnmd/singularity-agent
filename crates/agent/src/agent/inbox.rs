@@ -1,16 +1,9 @@
-//! 任务的输入队列，用户消息和后台命令完成通知共用。
-//!
-//! 入队、确认已保存和清除用户输入共用一把锁；保存消息时不持锁。
-//! 请求失败时输入留在队列里。用户停止会清掉用户消息，完成通知保留到下一条用户消息时处理。
-//! 队列只在内存中；交给 Agent 时按来源保存为用户消息或内部通知。
-
 use std::{
     collections::VecDeque,
     fmt::Write as _,
     sync::{Arc, Mutex},
 };
 
-/// 控制接受用户输入时是否展开 `/skill` 引用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillExpansion {
     Enabled,
@@ -27,21 +20,16 @@ impl SkillExpansion {
     }
 }
 
-/// 文字、图片、附件路径和批注作为一个输入一起接受和交付。
 #[derive(Debug, Clone)]
 pub struct UserInput {
     pub text: String,
     pub images: Vec<crate::image::InputImage>,
-    /// 附件文件的绝对路径；只交给模型路径，由模型用读取工具查看内容。
     pub files: Vec<String>,
-    /// 用户对历史助手回复片段添加的文字批注。
     pub annotations: Vec<protocol::MessageAnnotation>,
-    /// 接受输入时读取的技能全文；原始任务文字单独保留供界面显示。
     skill_instructions: String,
 }
 
 impl UserInput {
-    /// 接受输入前完成校验、图片解码和技能读取；失败时不进入队列。
     pub fn from_uploads(
         text: String,
         images: Vec<protocol::ImageUpload>,
@@ -102,7 +90,6 @@ impl UserInput {
         })
     }
 
-    /// 模型看到的文字：批注区块（如有）在最前，接原始任务、所选技能，附件路径列在最后。
     pub(super) fn model_text(&self) -> String {
         let mut text = String::new();
         if !self.annotations.is_empty() {
@@ -150,7 +137,6 @@ impl UserInput {
     }
 }
 
-/// 转义批注正文中可能提前闭合结构区块的结束标签。
 fn escape_annotation_tags(text: &str) -> String {
     text.replace("</quote>", "<\\/quote>")
         .replace("</comment>", "<\\/comment>")
@@ -158,7 +144,6 @@ fn escape_annotation_tags(text: &str) -> String {
         .replace("</annotations>", "<\\/annotations>")
 }
 
-/// 按空白分隔的引用顺序读取技能，同一技能只加载一次，未知名称不影响原文。
 fn load_selected_skills<'a>(
     texts: impl IntoIterator<Item = &'a str>,
     cwd: &std::path::Path,
@@ -190,14 +175,12 @@ fn load_selected_skills<'a>(
     Ok(instructions)
 }
 
-/// 队列中的一项输入；消息 ID 在入队时分配，保存失败后重试仍用同一个。
 #[derive(Debug, Clone)]
 pub struct QueuedInput {
     pub(super) input: QueuedInputKind,
     pub(super) message_id: String,
 }
 
-/// 区分用户消息和后台命令完成通知；通知不会显示成用户输入。
 #[derive(Debug, Clone)]
 pub(super) enum QueuedInputKind {
     User(UserInput),
@@ -212,7 +195,6 @@ impl QueuedInput {
         }
     }
 
-    /// 队列只保存命令 ID；交给模型时从后台管理器取未读输出与终态。
     pub(crate) fn background(task_id: String) -> Self {
         Self {
             input: QueuedInputKind::Background { task_id },
@@ -220,7 +202,6 @@ impl QueuedInput {
         }
     }
 
-    /// 只有用户消息出现在待处理列表和图片查找中。
     pub fn user_input(&self) -> Option<&UserInput> {
         match &self.input {
             QueuedInputKind::User(input) => Some(input),
@@ -228,25 +209,21 @@ impl QueuedInput {
         }
     }
 
-    /// 界面条目 ID；排队时和保存后相同，界面可以原地更新。
     pub fn item_id(&self) -> String {
         crate::session::text_item_id(&self.message_id, 0)
     }
 }
 
-/// 任务的输入队列；首条和后续消息按入队顺序交给 Agent。
 #[derive(Debug, Default)]
 pub struct SteeringInbox {
     entries: VecDeque<QueuedInput>,
 }
 
 impl SteeringInbox {
-    /// 用户停止任务时清掉还没保存的用户消息，保留后台完成通知。
     pub fn cancel(&mut self) {
         self.entries.retain(|entry| entry.user_input().is_none());
     }
 
-    /// 调用方负责确认任务当前可以接受输入。
     pub fn enqueue(&mut self, request: QueuedInput) {
         self.entries.push_back(request);
     }
@@ -255,12 +232,10 @@ impl SteeringInbox {
         &self.entries
     }
 
-    /// 返回最早一项输入的副本；原项留在队列里，直到确认保存成功。
     pub(super) fn next(&self) -> Option<QueuedInput> {
         self.entries.front().cloned()
     }
 
-    /// 保存成功后移除队首；保存期间用户停止可能已经清空队列，此时什么也不做。
     pub(super) fn confirm_saved(&mut self, message_id: &str) {
         if self.entries.front().is_some_and(|entry| entry.message_id == message_id) {
             self.entries.pop_front();
@@ -268,10 +243,8 @@ impl SteeringInbox {
     }
 }
 
-/// 任务、Agent 和后台命令共用的输入队列。
 pub type SteeringInboxHandle = Arc<Mutex<SteeringInbox>>;
 
-/// 给输入队列加锁；锁中毒说明之前已经 panic，直接终止。
 pub(super) fn lock_inbox(queue: &Mutex<SteeringInbox>) -> std::sync::MutexGuard<'_, SteeringInbox> {
     queue.lock().expect("turn inbox lock poisoned")
 }

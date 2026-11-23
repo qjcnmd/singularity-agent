@@ -1,5 +1,3 @@
-//! 模型任务结果与工作台累计展示分开；游标只计算去除终端控制序列后的正文。
-
 use std::fmt::Write as _;
 
 use protocol::{BackgroundTask, BackgroundTaskState, CommandOutputSnapshot};

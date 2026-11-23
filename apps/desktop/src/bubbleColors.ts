@@ -19,7 +19,6 @@ export const palette: readonly PaletteColor[] = [
   { id: 'slate', label: '石墨灰', solid: '#52525b', ink: '#ffffff' },
 ]
 
-/** 找不到时（比如旧版保存的 neutral）回退到默认强调色。 */
 export function resolveAccentId(id: string | undefined): string {
   return palette.some(color => color.id === id) ? id! : defaultAccentColor
 }

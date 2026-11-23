@@ -1,26 +1,18 @@
-//! 从会话日志生成工作台看到的历史、任务摘要和累计用量。
-//! 历史只包含用户能看到的消息、思考、工具和压缩内容，不带原始日志行或
-//! 提供方私有字段；任务摘要直接读取最近回合的状态，完整历史才划分全部回合。
-
 use agent::session::{LedgerRecord, SessionData, SessionEntry, SessionError, SessionMetadata};
 use model::{ContentBlock, Message};
 use protocol::{
     HistoryItem, SessionModelUsage, ThreadHistory, ThreadSummary, ThreadTurn, ToolStatus, TurnStatus,
 };
 
-/// 一个回合在日志中的条目范围和最终状态；初始设置不构成回合。
 struct IndexedTurn {
     turn_id: String,
     status: TurnStatus,
     error: Option<protocol::TurnErrorDetail>,
-    /// 用户主动停止导致的中断。
     manually_stopped: bool,
     entries: std::ops::Range<usize>,
 }
 
 impl IndexedTurn {
-    /// 生成这个回合的公开历史；工具结果合并到对应的调用条目里。
-    /// usage 从本回合之前的累计值开始，随本回合条目推进。
     fn project(
         &self,
         session: &SessionData,
@@ -47,7 +39,6 @@ impl IndexedTurn {
                     Message::Developer { .. } | Message::Notification { .. } => {}
                     Message::User { .. } | Message::Assistant { .. } => {
                         let mut calls = message.tool_calls();
-                        // 收到第一个生成增量的时间 = 消息保存时间 - 生成耗时。
                         if first_token_at.is_none()
                             && matches!(message, Message::Assistant { .. })
                             && let Some(decode_ms) =
@@ -80,7 +71,6 @@ impl IndexedTurn {
                         }
                     }
                     Message::ToolResult { tool_call_id, .. } => {
-                        // 结果写回调用所在的位置，界面拿到的是完整的工具条目。
                         let position = *tool_items.get(tool_call_id).ok_or_else(|| {
                             SessionError::InvalidSession(format!(
                                 "tool result {id} refers to missing tool call {tool_call_id}"
@@ -128,13 +118,10 @@ impl IndexedTurn {
     }
 }
 
-/// 用户主动停止造成的中断；写入结束记录和读取历史共用这一判定。
 pub(crate) fn is_manually_stopped(outcome: TurnStatus, user_stopped: bool) -> bool {
     outcome == TurnStatus::Interrupted && user_stopped
 }
 
-/// 按回合开始记录划分日志，只记下范围、最终状态、错误和是否手动停止；
-/// 读取完整历史时才生成具体内容。没有结束记录的回合视为中断。
 fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
     let mut turns: Vec<IndexedTurn> = Vec::new();
     for (position, entry) in entries.iter().enumerate() {
@@ -180,7 +167,6 @@ fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
 
 const MAX_SESSION_TITLE_CHARS: usize = 8;
 
-/// 从最近一次生成请求读取实际输入用量；压缩成功或切换模型后不沿用旧读数。
 pub(crate) fn context_usage(
     entries: &[SessionEntry],
     selected: &protocol::ModelSelection,
@@ -211,8 +197,6 @@ pub(crate) fn context_usage(
     None
 }
 
-/// 默认标题：把第一条用户消息里的连续空白合并成一个空格，取前 MAX_SESSION_TITLE_CHARS
-/// 个字符；没有文字时返回 None。
 fn default_title(entry: &SessionEntry) -> Option<String> {
     let SessionEntry::Message {
         message: message @ Message::User { .. },
@@ -249,11 +233,6 @@ fn default_title(entry: &SessionEntry) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-/// 整个会话的模型用量合计，供工作台显示成本和速度。
-/// 每次请求尝试只保存一次结果；重试、后续回合和整理请求都计入合计。
-///
-/// 首 Token 耗时只统计实际测到的请求；Token 数只统计上报了用量的请求，
-/// 没有用量记录的请求不影响“缓存计数是否完整”。
 pub(crate) fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
     let mut usage = SessionModelUsage {
         cache_usage_complete: true,
@@ -267,7 +246,6 @@ pub(crate) fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
     usage
 }
 
-/// 历史读取和实时事件共用的用量累计规则；每个请求的结束记录只计一次。
 pub(crate) fn accumulate_request_usage(
     usage: &mut SessionModelUsage,
     observation: &protocol::RequestObservation,
@@ -293,7 +271,6 @@ pub(crate) fn accumulate_request_usage(
     usage.usage_present = true;
 }
 
-/// 任务列表里的一项：标题、时间和最近一个回合的状态。
 pub(crate) fn summarize_thread(session: &SessionData) -> ThreadSummary {
     let mut scan = ThreadSummaryScan::default();
     for entry in session.entries().iter().rev() {
@@ -374,7 +351,6 @@ impl ThreadSummaryScan {
     }
 }
 
-/// 从同一份会话记录生成完整历史与任务摘要。
 pub(crate) fn read_thread_history(session: &SessionData) -> Result<ThreadHistory, SessionError> {
     let summary = summarize_thread(session);
     let indexed_turns = index_turn_history(session.entries());

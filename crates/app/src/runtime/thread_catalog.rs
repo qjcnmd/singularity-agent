@@ -1,7 +1,3 @@
-//! 会话文件的创建、打开、列出、读取历史和删除。
-//!
-//! 会话内容保存在各自的 JSONL 日志文件中，本模块负责定位和读写这些文件。
-
 use std::path::{Path, PathBuf};
 
 use agent::session::{
@@ -15,7 +11,6 @@ use crate::runtime::history::ThreadSummaryScan;
 
 pub(crate) const SESSIONS_DIR_NAME: &str = "sessions";
 
-/// `sessions/` 目录下的会话文件；不持有写者，写入由打开它的 Conversation 负责。
 pub(crate) struct ThreadCatalog {
     sessions_dir: PathBuf,
 }
@@ -25,7 +20,6 @@ impl ThreadCatalog {
         Self { sessions_dir }
     }
 
-    /// 用 UUID v7 新建会话文件，写入文件头和初始模型选择；文件已存在时报错。
     pub(crate) fn create_thread(
         &self,
         cwd: &str,
@@ -43,13 +37,11 @@ impl ThreadCatalog {
         .map_err(|error| self.session_error(&thread_id, error))
     }
 
-    /// 以写入方式打开日志并截掉未写完的末尾；返回的写者交给 Conversation 长期持有。
     pub(crate) fn open_session(&self, thread_id: &str) -> Result<SessionManager, CatalogError> {
         let path = checked_session_path(&self.sessions_dir, thread_id)?;
         SessionManager::open_existing(&path, thread_id).map_err(|error| self.session_error(thread_id, error))
     }
 
-    /// 按更新时间列出当前会话；扫描期间已删除的文件不再列入。
     pub(crate) fn list_threads(&self) -> Result<Vec<ThreadSummary>, CatalogError> {
         let entries = match std::fs::read_dir(&self.sessions_dir) {
             Ok(entries) => entries,
@@ -81,16 +73,13 @@ impl ThreadCatalog {
                 Err(error) => return Err(error),
             }
         }
-        // 按最近更新时间从新到旧排列，时间相同时按任务 ID 排序。
         threads.sort_by(|left, right| {
             right.updated_at.cmp(&left.updated_at).then_with(|| left.thread_id.cmp(&right.thread_id))
         });
         Ok(threads)
     }
 
-    /// 读取未打开任务的图片，只接受日志里实际引用的图片 ID。
     pub(crate) fn image_data(&self, thread_id: &str, image_id: &str) -> Result<String, CatalogError> {
-        // 日志能打开时，后面的失败归为图片读取失败，不报告为任务不存在。
         open_thread_read_only(&self.sessions_dir, thread_id)?
             .image_data(image_id)
             .map_err(|source| CatalogError::Session {
@@ -99,7 +88,6 @@ impl ThreadCatalog {
             })
     }
 
-    /// 停止任务后删除日志和附件；附件删除失败时保留日志，便于重试。
     pub(crate) fn delete(&self, thread_id: &str) -> Result<(), CatalogError> {
         let path = checked_session_path(&self.sessions_dir, thread_id)?;
         for directory in [

@@ -203,8 +203,8 @@ pre {
 │
 ├── mcp/                                                  <span class="c"># MCP 客户端连接池（4 .rs）</span>
 │   └── src/                                              <span class="c"># MCP 连接管理（4 文件）</span>
-│       ├── lib.rs                                        <span class="c"># McpManager：ConnectionPool 代际校验、持锁重连、skip 过滤与停机排空关闭任务</span>
-│       │   ├── McpManager                                <span class="c"># 按目录复用连接：tools / discover / reconnect</span>
+│       ├── lib.rs                                        <span class="c"># 配置与连接槽位同步、禁用项过滤、锁外连接与停机回收</span>
+│       │   ├── McpManager                                <span class="c"># 持配置锁登记槽位，按目录复用连接：discover / reconnect / shutdown</span>
 │       │   ├── disconnect_directory()                    <span class="c"># 锁内取句柄、锁外等子进程关闭</span>
 │       │   └── shutdown()                                <span class="c"># 停机时并发关闭所有目录 MCP 连接</span>
 │       ├── config.rs                                     <span class="c"># mcp.json 校验、HTTP URL 凭据精确脱敏与原子读写</span>

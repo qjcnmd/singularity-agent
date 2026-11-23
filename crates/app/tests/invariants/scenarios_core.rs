@@ -1,5 +1,3 @@
-//! 核心外部契约：配置/单实例锁、双协议与跨提供方切换闭环及重启持久化、内置工具与附件契约。
-
 use std::process::Stdio;
 
 use serde_json::{Value, json};
@@ -16,7 +14,6 @@ async fn workspace_config_and_single_instance_lock() {
     let server = MockModelServer::start().await;
     server.set_models(vec!["alpha-model", "beta-model"]);
 
-    // 准备全局与项目级技能，验证同名优先级去重与目录加载契约。
     let global_skill = env.home.join("skills").join("shared-skill");
     let project_skill = env.workspace.join(".singularity").join("skills").join("shared-skill");
     std::fs::create_dir_all(&global_skill).expect("create global skill dir");
@@ -35,7 +32,6 @@ async fn workspace_config_and_single_instance_lock() {
 
     let mut client = BackendClient::spawn(&env.home).await;
 
-    // 1. 单实例锁不变量：同一 SINGULARITY_HOME 启动第二个后端进程必须立即失败退出。
     let second = Command::new(env!("CARGO_BIN_EXE_singularity"))
         .env("SINGULARITY_HOME", &env.home)
         .stdin(Stdio::null())
@@ -46,7 +42,6 @@ async fn workspace_config_and_single_instance_lock() {
         .expect("run second backend");
     assert!(!second.status.success(), "second process on same SINGULARITY_HOME must fail");
 
-    // 2. 工作区增删、指令与只读文件读取。
     let ws = env.workspace_str();
     client.rpc_ok("workspace.add", json!({ "root": ws })).await;
     client
@@ -63,7 +58,6 @@ async fn workspace_config_and_single_instance_lock() {
             .is_some_and(|c| c.contains("workspace file content"))
     );
 
-    // 3. 技能发现不变量：项目级同名技能覆盖全局同名技能，且不重复列出。
     let skills = client.rpc_ok("skills.list", json!({ "workspaceRoot": ws })).await;
     let shared: Vec<&Value> = skills
         .get("skills")
@@ -75,7 +69,6 @@ async fn workspace_config_and_single_instance_lock() {
     assert_eq!(shared.len(), 1, "duplicate skill names must deduplicate: {shared:?}");
     assert_eq!(shared[0].get("description").and_then(Value::as_str), Some("project version"));
 
-    // 4. 模型提供方保存不变量：返回结果必须脱敏、省略 apiKey 更新时保留原密钥、model.discover 能查到模型列表。
     let saved = client
         .rpc_ok(
             "model.saveProvider",
@@ -103,7 +96,6 @@ async fn workspace_config_and_single_instance_lock() {
         Some(true)
     );
 
-    // 省略 apiKey 再次保存，凭据应仍保持已配置。
     let updated = client
         .rpc_ok(
             "model.saveProvider",
@@ -158,7 +150,6 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
         let ws = env.workspace_str();
         std::fs::write(env.workspace.join("probe.txt"), "PROBE_FILE_CONTENT\n").expect("write probe file");
 
-        // 第一轮包含图片输入 + 工具调用闭环 + 思考/正文；第二轮确认同提供方续接字段（signature / encrypted_content）回传。
         if protocol == "messages" {
             server.enqueue(ScriptedResponse::sse(messages_tools_sse(
                 None,
@@ -242,7 +233,6 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
         client.submit(&session_id, "hello round 2").await;
         client.wait_settled(&session_id).await;
 
-        // 协议续接与工具闭环不变量：工具结果正确送达模型，且第二轮回传第一轮同提供方的推理续接元数据。
         let reqs = server.model_requests();
         assert_eq!(reqs.len(), 3, "{protocol}: expected 3 requests (tool call + reply + round 2)");
         assert!(
@@ -266,7 +256,6 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
         server.assert_no_protocol_violations();
         client.shutdown().await;
 
-        // 重启持久化不变量：杀掉并重启后端进程后，bootstrap 和 session.read 返回完全一致的历史与累计用量。
         let mut restarted = BackendClient::spawn(&env.home).await;
         let bootstrap = restarted.rpc_ok("app.bootstrap", json!({})).await;
         let has_session = bootstrap
@@ -291,8 +280,6 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
         restarted.shutdown().await;
     }
 
-    // 跨提供方 / 跨协议中途切换不变量（session.updateSettings）：
-    // 切换提供方后不得泄露前一个提供方的私有思考签名或加密续接字段，同时上下文与工具历史无缝衔接。
     let env = TestEnv::new("cross-provider");
     let server = MockModelServer::start().await;
     let ws = env.workspace_str();
@@ -325,7 +312,6 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
             .await;
     }
 
-    // Turn 1: msg-a (Messages) 返回带 signature 的思考 + 正文。
     server.enqueue(ScriptedResponse::sse(messages_text_sse(
         Some(("msg-a thought", "sig_private_to_msg_a")),
         "ANSWER_FROM_MSG_A",
@@ -334,7 +320,6 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
         30,
         "end_turn",
     )));
-    // Turn 2: 切到 resp-b (Responses) 后调用 read 工具并返回带 encrypted_content 的思考 + 正文。
     server.enqueue(ScriptedResponse::sse(responses_sse(
         None,
         None,
@@ -353,7 +338,6 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
         30,
         false,
     )));
-    // Turn 3: 切到 msg-c (另一个 Messages 提供方) 完成最终回复。
     server.enqueue(ScriptedResponse::sse(messages_text_sse(
         None,
         "ANSWER_FROM_MSG_C",
@@ -420,14 +404,11 @@ async fn builtin_workspace_tools_and_attachments() {
     let server = MockModelServer::start().await;
     let ws = env.workspace_str();
 
-    // 写入一个含 NUL 字节的二进制文件与一个真实文本附件。
     std::fs::write(env.workspace.join("bin.dat"), b"abc\0def").expect("write binary file");
     let attached_path = env.workspace.join("attached.txt");
     std::fs::write(&attached_path, "ATTACHED_FILE_BODY\n").expect("write attached file");
     let attached_display = format!("{ws}/attached.txt");
 
-    // 依次触发：write -> edit -> read(文本+二进制+limit=0) -> bash(含超长输出溢写) -> 结束；
-    // 第二轮验证文件附件校验与传递。
     server.enqueue(ScriptedResponse::sse(messages_tools_sse(
         None,
         vec![("call_w", "write", json!({ "path": "notes/demo.txt", "content": "line one\nline two\n" }))],
@@ -503,12 +484,10 @@ async fn builtin_workspace_tools_and_attachments() {
         .await;
     client.wait_settled(&session_id).await;
 
-    // 1. 文件真实落盘且被 edit 正确更新。
     let disk_content = std::fs::read_to_string(env.workspace.join("notes").join("demo.txt"))
         .expect("demo.txt must exist on disk");
     assert!(disk_content.contains("line TWO edited"), "unexpected file content: {disk_content}");
 
-    // 2. 验证二进制读与 limit=0 拦截作为工具错误回传，未使进程崩溃；bash 超长输出已溢写到 outputs 目录。
     let reqs = server.model_requests();
     let final_req = &reqs.last().expect("final request").body;
     let final_text = final_req.to_string();
@@ -522,7 +501,6 @@ async fn builtin_workspace_tools_and_attachments() {
         "large bash output must spill to sessions/outputs/<id>/"
     );
 
-    // 3. 用户文件附件边界校验：相对路径与不存在路径必须在入口被拒，合法绝对路径正常送达模型并持久化。
     let rel_err = client
         .rpc_err(
             "session.submit",
@@ -553,7 +531,6 @@ async fn builtin_workspace_tools_and_attachments() {
     let attach_req = server.model_requests().last().expect("attach req").body.to_string();
     assert!(attach_req.contains("attached.txt"), "attachment path must be delivered to model");
 
-    // 4. 图片与文件附件经重启后均可完整读回。
     let read_before = client.rpc_ok("session.read", json!({ "sessionId": session_id })).await;
     let image_id = read_before
         .pointer("/history/turns/0/items/0/images/0/id")

@@ -1,6 +1,3 @@
-//! 模型配置的保存、隐藏密钥的目录，以及执行时解析模型选择。文件读写在 user，
-//! 解析模型选择在 selection。
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -14,8 +11,6 @@ use super::{
     validate_identifier, write_user_config_file,
 };
 
-/// 本轮模型的上下文窗口和最大输出，每轮开始时确定，用于压缩判断和输出预算。
-/// 修改设置只影响之后的回合。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelConfigurationSnapshot {
     pub max_context_tokens: u32,
@@ -28,7 +23,6 @@ impl ModelConfigurationSnapshot {
     }
 }
 
-/// 数据目录里 `config.json` 的读写入口；读取和修改按顺序进行，不缓存文件内容。
 #[derive(Debug)]
 pub struct ModelConfigManager {
     directory: PathBuf,
@@ -36,7 +30,6 @@ pub struct ModelConfigManager {
 }
 
 impl ModelConfigManager {
-    /// 读取一次配置并解析模型选择；返回值归本轮所有，之后修改配置不影响它。
     pub(crate) fn resolve(
         &self,
         selection: &ModelSelection,
@@ -48,11 +41,8 @@ impl ModelConfigManager {
         resolve_model_selection(&config, selection)
     }
 
-    /// 检查模型选择能否解析，并顺带返回对应的上下文窗口上限（不创建 HTTP 客户端）。
-    pub fn validate_selection(&self, selection: &ModelSelection) -> Result<Option<u64>, ProviderError> {
-        self.resolve(selection).map(|(_, selected)| {
-            (selected.max_context_tokens > 0).then(|| u64::from(selected.max_context_tokens))
-        })
+    pub fn validate_selection(&self, selection: &ModelSelection) -> Result<u64, ProviderError> {
+        self.resolve(selection).map(|(_, selected)| u64::from(selected.max_context_tokens))
     }
 
     pub fn context_window(&self, selection: &ModelSelection) -> Option<u64> {
@@ -61,7 +51,6 @@ impl ModelConfigManager {
         let model = config.providers.get(&selection.provider)?.models.get(&selection.model)?;
         (model.max_context_tokens > 0).then(|| u64::from(model.max_context_tokens))
     }
-    /// 移除提供方，返回保存后的目录（不含密钥）。正在运行的回合不受影响。
     pub fn remove_provider(&self, provider_id: &str) -> Result<RedactedModelCatalog, ProviderError> {
         let _access = self.lock();
         let mut data = read_user_config_file(&self.directory)?
@@ -74,7 +63,6 @@ impl ModelConfigManager {
         Ok(catalog_from_data(&data))
     }
 
-    /// 模型发现用的密钥：优先用这次表单里填的，没有就用该提供方已保存的。
     pub fn discovery_credential(
         &self,
         provider_id: &str,
@@ -91,7 +79,6 @@ impl ModelConfigManager {
         Ok(key)
     }
 
-    /// 绑定数据目录；构造时不读取或创建配置文件。
     pub fn open(directory: PathBuf) -> Self {
         Self { directory, access: Mutex::new(()) }
     }
@@ -105,8 +92,6 @@ impl ModelConfigManager {
         }
     }
 
-    /// 保存提供方配置；传了密钥就替换，没传保留原值。
-    /// 配置和密钥一次原子写入，成功后返回保存后的目录（不含密钥）。
     pub fn save_provider(
         &self,
         input: ProviderConfigurationInput,
@@ -114,11 +99,9 @@ impl ModelConfigManager {
     ) -> Result<RedactedModelCatalog, ProviderError> {
         let _access = self.lock();
         validate_identifier(&input.provider_id, "提供方标识")?;
-        // API 根只去掉首尾空白和结尾斜杠；保留完整路径，再追加各协议的端点。
         let base_url = crate::provider::canonical_base_url(&input.base_url).to_string();
         validate_base_url(&base_url)?;
         let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
-        // 先检查全部模型与最终密钥，任何一项不通过都在写文件之前返回。
         let models = model_definitions(input.models, input.api_protocol)?;
         let key = api_key
             .map(str::to_string)
@@ -145,8 +128,6 @@ impl ModelConfigManager {
     }
 }
 
-/// 把表单提交的模型列表转换成要保存的配置，同时检查模型 ID、容量、档位和重复项；
-/// 不读写文件，调用方拿到完整结果后才写入。
 fn model_definitions(
     models: Vec<ModelConfigurationInput>,
     provider_protocol: ProviderApiProtocol,
@@ -163,7 +144,6 @@ fn model_definitions(
     Ok(definitions)
 }
 
-/// 转换单个模型并检查配置是否完整可用。
 fn model_definition(
     model: ModelConfigurationInput,
     provider_protocol: ProviderApiProtocol,
@@ -181,7 +161,6 @@ fn model_definition(
     Ok((model.model_id, configured))
 }
 
-// 已指定的模型或显式档位被移除后清空默认选择，由用户重新选择。
 fn clear_invalid_default_selection(config: &mut UserConfigFile) {
     if config
         .default_model

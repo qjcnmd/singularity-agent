@@ -19,7 +19,6 @@ interface ModelPickerProps {
 
 export function ModelPicker({ state }: ModelPickerProps) {
   const selection = appStore.modelSelection()
-  // 切换任务关闭浮层并丢弃待处理的滑块编辑；同一任务切换模型保留浮层。
   const scope = JSON.stringify([state.selectedWorkspaceRoot, state.selectedSessionId])
   return <ModelPickerControls key={scope} state={state} selection={selection} />
 }
@@ -31,7 +30,6 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
   const popupId = useId()
   const popup = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
-  // 只在打开前定位一次：水平中心对准按钮中心，底边在按钮上方 8px，左右至少离窗口边缘 8px。
   const placePopover = (node: HTMLElement) => {
     const rect = trigger.current?.getBoundingClientRect()
     if (!rect) return

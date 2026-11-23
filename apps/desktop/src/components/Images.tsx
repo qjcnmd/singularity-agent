@@ -4,8 +4,6 @@ import type { ImageAttachment } from '../protocol'
 import { appStore } from '../appStore'
 import { Dialog } from './Dialog'
 
-/** 处理粘贴、拖放和选择文件：图片加入草稿 `File` 列表（发送时再编码为 Data URL），
- * 其他文件只记下本地路径。粘贴得到的内存文件没有路径，只能作为图片使用。 */
 export function useAttachmentInput(addImages: (images: File[]) => void, addFiles: (paths: string[]) => void, disabled = false) {
   const input = useRef<HTMLInputElement>(null)
   const receive = (files: File[]) => {

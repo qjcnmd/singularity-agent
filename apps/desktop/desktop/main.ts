@@ -18,7 +18,6 @@ import type { DirectoryPickResult, RpcResponse } from '../src/protocol.generated
 
 const configuredHome = process.env[HOME_ENV_VAR]
 const home = resolve(configuredHome?.trim() ? configuredHome : join(homedir(), DATA_DIR_NAME))
-// 数据目录决定 Chromium profile：不同目录各用各的锁和视图状态。
 const userDataDir = join(app.getPath('appData'), APP_NAME, createHash('sha256').update(home.toLowerCase()).digest('hex').slice(0, 16))
 app.setPath('userData', userDataDir)
 const themeFile = join(userDataDir, 'theme')
@@ -64,7 +63,6 @@ async function start(): Promise<void> {
   })
   backend = new Backend(app.isPackaged ? join(process.resourcesPath, 'runtime', BACKEND_BINARY) : join(app.getAppPath(), 'desktop-runtime', BACKEND_BINARY))
   backend.on('failure', (error: Error) => {
-    // 窗口建立前的启动失败由 await backend.ready 统一报错退出。
     if (!window || window.isDestroyed()) return
     window.webContents.send(IPC_CHANNELS.failure)
     void dialog.showMessageBox({ type: 'error', title: APP_NAME, message: '工作台后端已停止', detail: error.message, buttons: ['退出'] }).then(() => app.quit())

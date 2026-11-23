@@ -2,7 +2,7 @@ import { useEffect, useState, type CSSProperties } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore } from '../appStore'
 import { palette } from '../bubbleColors'
 import type { RedactedProvider } from '../protocol'
-import { messageFontSize, normalizeMessageFontSize } from '../viewPersistence'
+import { messageFontSize } from '../viewPersistence'
 import { ProviderEditor } from './ProviderEditor'
 import { Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
@@ -25,13 +25,11 @@ export function Settings() {
     ['model.saveProvider', 'model.removeProvider'].some(method => key.startsWith(pendingKey(method, ''))))
   const catalog = state.bootstrap?.modelCatalog
   const providers = catalog?.providers ?? []
-  // 正在编辑的 Provider 优先显示在列表中，保存或读取失败时表单不被新数据冲掉
   const editingProvider = editor === 'new' ? null : editor
   const providerRows = editingProvider && !providers.some(provider => provider.providerId === editingProvider.providerId)
     ? [...providers, editingProvider] : providers
   const unreadable = Boolean(catalog?.error && providers.length === 0)
   function openEditor(next: Exclude<ProviderEditorState, null>) {
-    // 收起动画尚未结束就重新打开时，也从已保存配置开始编辑。
     setEditorVersion(version => version + 1)
     setEditor(next)
   }
@@ -61,9 +59,7 @@ export function Settings() {
       setFontSizeDraft(String(state.messageFontSize))
       return
     }
-    const clamped = normalizeMessageFontSize(parsed)
-    appStore.setMessageFontSize(clamped)
-    setFontSizeDraft(String(clamped))
+    setFontSizeDraft(String(appStore.setMessageFontSize(parsed)))
   }
 
   async function rereadModelConfiguration() {
@@ -118,7 +114,7 @@ export function Settings() {
                   onChange={event => setFontSizeDraft(event.target.value)}
                   onBlur={commitFontSizeDraft}
                   onKeyDown={event => {
-                    if (event.key === 'Enter') { commitFontSizeDraft(); event.currentTarget.blur() }
+                    if (event.key === 'Enter') event.currentTarget.blur()
                     else if (event.key === 'Escape') { setFontSizeDraft(String(state.messageFontSize)); event.currentTarget.blur() }
                   }}
                 />

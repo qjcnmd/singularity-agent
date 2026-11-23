@@ -1,5 +1,3 @@
-//! 属性测试（Property-based Tests）：用随机输入验证通用协议与传输不变量，不绑定具体实现细节。
-
 use std::collections::{HashMap, HashSet};
 
 use proptest::prelude::*;
@@ -17,7 +15,6 @@ use crate::types::{
 const OTHER_MSG_SIG: &str = "PRIVATE_OTHER_MESSAGES_SIG_DO_NOT_LEAK";
 const OTHER_RESP_ENC: &str = "PRIVATE_OTHER_RESPONSES_ENC_DO_NOT_LEAK";
 
-/// 按随机切分长度把字节流拆成多段 chunk（含 1 字节边界切片）。
 fn split_by_sizes<'a>(bytes: &'a [u8], sizes: &[usize]) -> Vec<&'a [u8]> {
     let mut chunks = Vec::new();
     let mut offset = 0;
@@ -77,7 +74,6 @@ fn turn_step_strategy() -> impl Strategy<Value = TurnStep> {
             0usize..=3,
         )
             .prop_map(|(text, thinking, same_provider, tool_count)| {
-                // 允许“仅含思考块”的截断助手回复进入随机测试，以验证剥离思考后仍保持严格角色交替。
                 let text = if text.is_none() && thinking.is_none() && tool_count == 0 {
                     Some("fallback reply".to_string())
                 } else {
@@ -184,7 +180,6 @@ fn build_conversation(
             }
         }
     }
-    // 保证至少有一条非 leading Developer 消息，与真实请求前提一致。
     messages.push(Message::user("final user prompt"));
     messages
 }
@@ -212,9 +207,6 @@ fn sse_line_strategy() -> impl Strategy<Value = String> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// SSE 分帧不变量：任意合法事件流（含多行 data、UTF-8、BOM、注释、CRLF/CR/LF，
-    /// 以及最后一个事件有无结尾空行直接 EOF）按任意字节粒度切分 chunk 后，
-    /// 解出的事件序列必须与原始序列完全一致。
     #[test]
     fn sse_frame_decoder_chunk_split_invariance(
         with_bom in any::<bool>(),
@@ -237,7 +229,6 @@ proptest! {
         }
         let mut expected = Vec::new();
         for (idx, lines) in events.iter().enumerate() {
-            // 穿插注释与非 data 字段，验证分帧器正确忽略。
             wire.extend_from_slice(b": keepalive");
             wire.extend_from_slice(eol);
             wire.extend_from_slice(b"event: message");
@@ -259,7 +250,6 @@ proptest! {
         prop_assert!(!has_unterminated);
     }
 
-    /// 任意随机字节流与任意 chunk 边界切分绝不能使 SSE 分帧器 panic。
     #[test]
     fn sse_frame_decoder_never_panics_on_arbitrary_bytes(
         bytes in prop::collection::vec(any::<u8>(), 0..512),
@@ -269,8 +259,6 @@ proptest! {
         let _ = decode_sse_chunks(&chunks);
     }
 
-    /// Messages 协议编码不变量：任意对话历史经编码后，角色严格交替、无空块、
-    /// tool_use/tool_result 严格 1:1 配对，且绝不泄露其他提供方的私有思考签名。
     #[test]
     fn messages_encoding_preserves_protocol_invariants(
         leading_devs in prop::collection::vec(non_empty_text(), 0..=3),
@@ -350,8 +338,6 @@ proptest! {
         prop_assert!(expected_tools.is_empty(), "dangling tool_use at end");
     }
 
-    /// Responses 协议编码不变量：任意对话历史经编码后，input 非空、
-    /// function_call/function_call_output 严格配对，且绝不泄露其他提供方的加密推理内容。
     #[test]
     fn responses_encoding_preserves_protocol_invariants(
         leading_devs in prop::collection::vec(non_empty_text(), 0..=3),
@@ -462,7 +448,6 @@ fn messages_context_window_exceeded_and_responses_refusal_contract() {
     assert!(refusal_resp.is_refusal());
     assert_eq!(refusal_resp.assistant_message.content_text(), "cannot summarize");
 
-    // Messages 前缀哈希绑定不变量：同前缀保留带签名思考；改写前缀（如压缩/改指令）仅剥离过期带签名/redacted 思考，保留未签名思考与正文。
     let endpoint = "https://example.invalid/v1/messages";
     let turn1_req = ModelTurnRequest {
         messages: vec![Message::developer("sys v1"), Message::user("first prompt")],

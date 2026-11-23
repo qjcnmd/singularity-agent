@@ -1,6 +1,3 @@
-//! 普通请求和整理请求共用的发送、重试、计时与日志写入。普通生成请求在成功、或失败/取消前已产出可见内容时
-//! 保存为助手消息（附带请求耗时和用量）；重试尝试、无输出的失败请求和整理请求只保存 `ModelRequest` 记录。失败和取消的消息不进入后续模型上下文。
-
 use crate::agent::{AgentError, AgentEvent};
 use crate::message::public_items;
 use crate::session::{LedgerRecord, SessionError, SessionWriter, with_writer_async};
@@ -13,17 +10,13 @@ use protocol::{ProviderAttemptStatus, RequestObservation, RequestPurpose, TurnEv
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// 服务端要求的等待超过此上限时直接报错，不静默挂起回合。
 const MAX_RETRY_AFTER: Duration = Duration::from_mins(1);
 
-/// 输出上限取模型上限与窗口剩余空间的最小值。
 pub(crate) fn output_budget_tokens(model: ModelConfigurationSnapshot, input_tokens: u64) -> u32 {
     let room = model.context_window().saturating_sub(input_tokens);
     model.max_output_tokens.min(u32::try_from(room).unwrap_or(u32::MAX))
 }
 
-/// 发送一次请求，可重试的错误最多尝试三次。每次尝试使用新的消息 ID，等待期间可停止。
-/// 成功返回回复、记录 ID 和日志保存时间。
 pub(crate) async fn execute_request(
     provider: &ModelClient,
     session: &SessionWriter,
@@ -96,7 +89,6 @@ pub(crate) async fn execute_request(
             ProviderAttemptStatus::Cancelled => TurnStatus::Interrupted,
             ProviderAttemptStatus::Error => TurnStatus::Failed,
         };
-        // 先用公开投影决定是否保存失败片段；时间在保存成功后补入，不重复转换正文。
         let mut items = if purpose == RequestPurpose::Generation && error.is_some() && !retry {
             public_items(
                 &response.assistant_message,

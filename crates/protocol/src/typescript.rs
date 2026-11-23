@@ -1,5 +1,3 @@
-//! 从协议类型生成前端 TypeScript 声明（`apps/desktop/src/protocol.generated.ts`）。
-
 use std::{
     any::TypeId,
     collections::{BTreeMap, HashSet},
@@ -22,7 +20,6 @@ impl Bindings {
             return;
         }
         T::visit_generics(self);
-        // 具名类型才写 export 声明，其余只递归其依赖；同名但定义冲突时直接暴露。
         if T::output_path().is_some() {
             let name = T::ident(&self.config);
             let decl = format!("export {}", T::decl(&self.config));
@@ -40,7 +37,6 @@ impl TypeVisitor for Bindings {
     }
 }
 
-/// 生成前端使用的全部 TypeScript 类型声明和 `RpcContract` 接口；64 位整数按 `number` 导出。
 pub fn client_types() -> String {
     let mut bindings = Bindings {
         config: Config::default().with_large_int("number"),

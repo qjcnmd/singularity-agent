@@ -1,6 +1,3 @@
-//! 统一延迟加载的 MCP 代理工具：`mcp_schema` 按需查询指定工具的完整参数定义，
-//! `mcp_call` 调用单个 MCP 工具并校验返回图片、截断超长文本输出。
-
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -104,8 +101,8 @@ pub(crate) fn execute_schema(tools: &[McpTool]) -> ToolExecution {
     let sections: Vec<String> = tools
         .iter()
         .map(|tool| {
-            let schema = serde_json::to_string_pretty(&tool.parameters_schema)
-                .unwrap_or_else(|_| tool.parameters_schema.to_string());
+            let schema =
+                serde_json::to_string_pretty(tool.parameters_schema.as_ref()).expect("tool schema is JSON");
             let description = if tool.description.trim().is_empty() {
                 "(no description)"
             } else {

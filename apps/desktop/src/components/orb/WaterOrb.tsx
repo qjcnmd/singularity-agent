@@ -1,7 +1,6 @@
 import { useEffect, useRef } from 'react'
 
 type WaterOrbProps = {
-  /** 上下文占用，按高度映射，0–100。 */
   percent: number
   compacting: boolean
   enabled: boolean
@@ -197,7 +196,6 @@ export function WaterOrb({ percent, compacting, enabled, size, label, color, onP
           ctx.fillStyle = body
           ctx.fill()
 
-          // 旋转时加几颗轻微上浮的气泡和液面高光线
           if (!reduced.matches && visualLevel > 0.06) {
             traceWave()
             ctx.strokeStyle = 'rgba(255, 255, 255, 0.34)'

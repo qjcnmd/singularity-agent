@@ -1,5 +1,3 @@
-//! 运行期调度不变量：MCP 延迟加载与模块开关、并行工具/提问屏障/运行中排队、后台命令续跑与进程回收。
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +16,6 @@ async fn mcp_lazy_loading_and_module_gating() {
     let ws = env.workspace_str();
     let mcp_script = write_test_mcp_script(&env.home);
 
-    // 准备一个项目技能，同时测试 skills 模块关闭不变量。
     let skill_dir = env.workspace.join(".singularity").join("skills").join("demo-skill");
     std::fs::create_dir_all(&skill_dir).expect("create skill dir");
     std::fs::write(
@@ -27,7 +24,6 @@ async fn mcp_lazy_loading_and_module_gating() {
     )
     .expect("write skill");
 
-    // 会话 1（启用 MCP）：验证延迟加载代理 mcp_schema -> mcp_call 完整走通。
     server.enqueue(ScriptedResponse::sse(messages_tools_sse(
         None,
         vec![("c_schema", "mcp_schema", json!({ "server": "probe", "tools": ["echo"] }))],
@@ -47,7 +43,6 @@ async fn mcp_lazy_loading_and_module_gating() {
         "tool_use",
     )));
     server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "mcp completed", 150, 0, 20, "end_turn")));
-    // 会话 2（禁用 mcp:probe 与 skills）：直接回复。
     server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "gated completed", 100, 0, 20, "end_turn")));
 
     let mut client = BackendClient::spawn(&env.home).await;
@@ -56,7 +51,6 @@ async fn mcp_lazy_loading_and_module_gating() {
         .await;
     client.register_test_mcp(&ws, &mcp_script).await;
 
-    // 1. 开启 MCP 时：开发者指令包含服务器说明与摘要，而原始工具名不直接塞入顶级 tools 定义，需经 mcp_schema/mcp_call 代理。
     let s1 = client
         .start_session(&ws, "local", "demo", None, "inspect and call mcp", vec![], vec![])
         .await;
@@ -82,7 +76,6 @@ async fn mcp_lazy_loading_and_module_gating() {
     );
     assert!(reqs[2].body.to_string().contains("ECHO:hello-mcp"), "mcp_call result must reach model");
 
-    // 2. 禁用 mcp:probe 与 skills 模块后，请求中既不注入 MCP 说明/代理，也不注入技能目录和 skill 工具。
     let s2 = client
         .start_session(
             &ws,
@@ -120,15 +113,12 @@ async fn tool_scheduling_question_barrier_and_queued_input() {
     let ws = env.workspace_str();
     let mcp_script = write_test_mcp_script(&env.home);
 
-    // 准备一个会在排队期间被修改的技能文件，验证排队输入快照不变量。
     let skill_dir = env.workspace.join(".singularity").join("skills").join("snap-skill");
     std::fs::create_dir_all(&skill_dir).expect("create skill dir");
     let skill_file = skill_dir.join("SKILL.md");
     std::fs::write(&skill_file, "---\nname: snap-skill\ndescription: snapshot\n---\nORIGINAL_SKILL_V1\n")
         .expect("write skill v1");
 
-    // 第 1 次模型响应：同时发 3 个 MCP 工具（含并发、失败隔离、大输出）+ 1 个 ask_user_question。
-    // 不变量：ask_user_question 必须等前面所有工具都完成后才挂起等待用户回答。
     server.enqueue(ScriptedResponse::sse(messages_tools_sse(
         None,
         vec![
@@ -164,14 +154,12 @@ async fn tool_scheduling_question_barrier_and_queued_input() {
         "tool_use",
     )));
 
-    // 第 2 次模型响应：用门闸暂停在流中，让测试确定性地在运行中排队提交新输入。
     let stream_gate = Arc::new(Notify::new());
     server.enqueue(ScriptedResponse::sse_gated(
         messages_text_sse(None, "after question", 180, 0, 20, "end_turn"),
         Arc::clone(&stream_gate),
     ));
 
-    // 第 3 次模型响应：消费排队的新用户输入后正常收尾。
     server.enqueue(ScriptedResponse::sse(messages_text_sse(
         None,
         "consumed queued input",
@@ -191,7 +179,6 @@ async fn tool_scheduling_question_barrier_and_queued_input() {
         .start_session(&ws, "local", "demo", None, "start parallel + question", vec![], vec![])
         .await;
 
-    // 等到提问挂起事件出现；此时前面的 3 个工具必须已经全部先收到 tool/finished。
     let question_frame = client
         .wait_event(DEFAULT_TIMEOUT, |frame| {
             frame.get("type").and_then(Value::as_str) == Some("session_changed")
@@ -215,7 +202,6 @@ async fn tool_scheduling_question_barrier_and_queued_input() {
         "all preceding parallel tools must finish before ask_user_question pauses"
     );
 
-    // 回答提问，继续进入第 2 次模型请求。
     client
         .rpc_ok(
             "session.answerQuestion",
@@ -227,15 +213,12 @@ async fn tool_scheduling_question_barrier_and_queued_input() {
         )
         .await;
 
-    // 等到第 2 次请求真正到达上游（并卡在门闸处），此时在运行中提交带 /snap-skill 的排队消息。
     server.wait_for_request_count(2).await;
     client.submit(&session_id, "follow up with /snap-skill").await;
 
-    // 排队期间修改磁盘上的技能文件，验证已入队输入保留发送时的快照。
     std::fs::write(&skill_file, "---\nname: snap-skill\ndescription: snapshot\n---\nMUTATED_SKILL_V2\n")
         .expect("mutate skill v2");
 
-    // 放行第 2 次响应，等待后端自动消费排队消息并跑完第 3 次请求后进入空闲。
     stream_gate.notify_one();
     client.wait_settled(&session_id).await;
 
@@ -255,7 +238,6 @@ async fn tool_scheduling_question_barrier_and_queued_input() {
         "disk mutation after enqueue must not alter queued input"
     );
 
-    // 大输出溢写文件应存在于会话输出目录。
     let outputs_dir = env.home.join("sessions").join("outputs").join(&session_id);
     assert!(outputs_dir.exists(), "large MCP tool output must spill to outputs directory");
 
@@ -268,7 +250,6 @@ async fn background_bash_resume_and_cleanup() {
     let server = MockModelServer::start().await;
     let ws = env.workspace_str();
 
-    // 场景 A：启动一个由哨兵文件门控的后台命令（yield_time_ms=0 立刻返回 task_id）-> 回合先收尾 -> 写入哨兵放行后自动唤醒续跑。
     server.enqueue(ScriptedResponse::sse(messages_tools_sse(
         None,
         vec![(
@@ -292,7 +273,6 @@ async fn background_bash_resume_and_cleanup() {
         20,
         "end_turn",
     )));
-    // 后台完成后自动续跑触发的第 3 次模型请求。
     server.enqueue(ScriptedResponse::sse(messages_text_sse(
         None,
         "observed background completion",
@@ -302,7 +282,6 @@ async fn background_bash_resume_and_cleanup() {
         "end_turn",
     )));
 
-    // 场景 B：启动一个长后台命令，用户通过 session.stopBackgroundTask 终止它。
     server.enqueue(ScriptedResponse::sse(messages_tools_sse(
         None,
         vec![(
@@ -334,7 +313,6 @@ async fn background_bash_resume_and_cleanup() {
 
     let session_id = client.start_session(&ws, "local", "demo", None, "run bg task", vec![], vec![]).await;
 
-    // 等待首次回合彻底结束，再写入哨兵文件放行后台命令，确定性触发自动续跑并结束。
     client.wait_settled(&session_id).await;
     std::fs::write(env.workspace.join("bg_go"), "go\n").expect("write background sentinel");
     client.wait_settled(&session_id).await;
@@ -346,7 +324,6 @@ async fn background_bash_resume_and_cleanup() {
         "auto-resumed turn must deliver background output to model"
     );
 
-    // 触发长后台任务，并验证可以通过 RPC 立即停止且不阻塞后端退出。
     client.submit(&session_id, "start long job").await;
     client.wait_settled(&session_id).await;
 
@@ -365,7 +342,6 @@ async fn background_bash_resume_and_cleanup() {
         .rpc_ok("session.stopBackgroundTask", json!({ "sessionId": session_id, "taskId": long_task_id }))
         .await;
 
-    // 确认后台任务已离开 running 状态，且后端可在短时间内优雅退出（无残留进程阻塞）。
     let stop_event = client
         .wait_event(Duration::from_secs(10), |frame| {
             frame.get("type").and_then(Value::as_str) == Some("background_task_updated")

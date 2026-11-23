@@ -59,7 +59,6 @@ function RunPanelBody() {
   const failure = state.session?.runtime.failure
   const attempt = useRef<string | null>(null)
   const [compactDone, setCompactDone] = useState(false)
-  // 结果条目先于空闲状态到达；按本次条目的终态反馈，不猜测事件间隔。
   useEffect(() => {
     if (attempt.current === null) return
     if (failure?.source === 'compaction') attempt.current = null

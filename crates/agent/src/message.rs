@@ -1,10 +1,7 @@
-//! 把消息转换成工作台历史条目，以及构造工具结果消息和独立展示元数据。
-
 use crate::session::MessageDisplay;
 use crate::tools::ToolExecution;
 use model::{ContentBlock, Message};
 
-/// 取出用户消息首段文本的界面展示文案：有原始输入时显示原文，模型消费含技能正文与附件路径的 `content`。
 pub fn user_text_for_display<'a>(
     display: Option<&'a MessageDisplay>,
     index: usize,
@@ -16,9 +13,6 @@ pub fn user_text_for_display<'a>(
     }
 }
 
-/// 用户和助手消息中可显示的条目，历史读取和完成事件共用。提供方私有字段不转换；
-/// 工具结果由历史读取时挂到对应调用上，这里不处理。
-/// `saved_at` 是消息写入日志的时间。助手回复的累计用量由调用方挂到最后一段正文上。
 pub fn public_items(
     message: &Message,
     display: Option<&MessageDisplay>,
@@ -91,7 +85,6 @@ pub fn public_items(
         .collect()
 }
 
-/// 把会话累计用量挂到一条助手消息的最后一段正文上；没有正文时不显示。
 pub fn attach_usage(items: &mut [protocol::HistoryItem], usage: &protocol::SessionModelUsage) {
     if let Some(protocol::HistoryItem::Message {
         stats,
@@ -130,7 +123,6 @@ pub(crate) fn tool_result_message(
     (message, display)
 }
 
-/// 实时完成和历史读取共用工具结果的显示内容。
 pub fn public_tool_result(
     message: &Message,
     display: Option<&MessageDisplay>,

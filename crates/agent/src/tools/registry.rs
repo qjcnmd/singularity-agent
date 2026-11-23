@@ -1,5 +1,3 @@
-//! 工具清单、工具定义、参数检查和执行分发。
-
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -22,31 +20,24 @@ use super::write;
 pub(crate) const DEFAULT_MAX_LINES: usize = 2000;
 pub(crate) const DEFAULT_MAX_BYTES: usize = 50 * 1024;
 
-/// 展示上限的 KB 数值，工具描述与截断提示共用。
 pub(crate) const fn default_max_kb() -> usize {
     DEFAULT_MAX_BYTES / 1024
 }
 
-/// `read` 与 `bash` 工具说明共用的上限描述。
 pub(crate) fn default_cap_summary() -> String {
     format!("{DEFAULT_MAX_LINES} lines or {}KB", default_max_kb())
 }
 
-/// 工具执行的结果。若工具执行失败（如路径不存在或命令返回非零），通过 `is_error: true` 反馈给模型。
 #[derive(Debug)]
 pub(crate) struct ToolExecution {
     pub content: String,
-    /// 本地展示信息；未设置时显示 content，不编码到模型请求。
     pub display: Option<Box<ToolDisplay>>,
     pub images: Vec<crate::image::InputImage>,
     pub is_error: bool,
-    /// 工具执行耗时（毫秒，仅供本地展示与统计）
     pub duration_ms: Option<u64>,
-    /// read 工具读到的源文件行号范围（供前端按行展示）
     pub read_source: Option<protocol::ReadSource>,
 }
 
-/// 工具结果的本地展示正文及关联的后台命令。
 #[derive(Debug)]
 pub(crate) struct ToolDisplay {
     pub output: String,
@@ -71,7 +62,6 @@ impl ToolExecution {
     }
 }
 
-/// 工具执行时需要的工作目录、会话输出目录、停止信号和后台命令管理器。
 pub(crate) struct ToolContext {
     pub cwd: std::path::PathBuf,
     pub output_directory: std::path::PathBuf,
@@ -79,7 +69,6 @@ pub(crate) struct ToolContext {
     pub bash_tasks: Arc<bash::BashTasks>,
 }
 
-/// 参数已检查并解析好的工具调用。
 pub(crate) enum PreparedTool {
     Edit(edit::EditArgs),
     Write(write::WriteArgs),
@@ -96,7 +85,6 @@ pub(crate) enum PreparedTool {
 }
 
 impl PreparedTool {
-    /// 执行工具；失败时返回 `is_error = true` 的结果，交给模型处理。
     pub(crate) async fn execute<F: Future<Output = ()> + Send>(
         self,
         context: ToolContext,
@@ -134,12 +122,10 @@ impl PreparedTool {
     }
 }
 
-/// 取消时给模型看的失败文案，各工具共用。
 pub(crate) const ABORTED_MESSAGE: &str = "Operation aborted";
 
 type ToolParser = fn(&Value) -> Result<PreparedTool, ToolExecution>;
 
-/// 一个内置工具：发给模型的定义和参数检查。
 pub(crate) type BuiltinTool = (ToolDefinition, ToolParser);
 
 pub(crate) fn bash_tool() -> BuiltinTool {
@@ -148,7 +134,6 @@ pub(crate) fn bash_tool() -> BuiltinTool {
     })
 }
 
-/// 后台命令的查看、读取输出和停止；说明里与 bash 互相引用，两者一起提供。
 pub(crate) fn task_tools() -> Vec<BuiltinTool> {
     vec![
         (bash::task_list_spec(), |args| {
@@ -185,14 +170,10 @@ pub(crate) fn question_tool() -> BuiltinTool {
     })
 }
 
-/// 本轮可用的工具：本任务开着的内置工具，以及按服务器归类、统一按工具粒度延迟加载的 MCP 工具。
-/// 发给模型的工具定义、参数检查和执行分发都在这里。
 #[derive(Default)]
 pub(crate) struct ToolRegistrySnapshot {
     tools: Vec<BuiltinTool>,
-    /// 本轮已连接且有可用工具的 MCP 服务器，统一通过 `mcp_schema` / `mcp_call` 按需访问。
     mcp_servers: BTreeMap<String, Vec<McpTool>>,
-    /// Skills 模块开着时持有本轮的技能目录，`skill` 工具按它加载。
     skills: Option<Arc<SkillCatalog>>,
 }
 
@@ -211,7 +192,6 @@ impl ToolRegistrySnapshot {
         }
     }
 
-    /// 发给模型的完整工具定义：内置工具在前；存在可用 MCP 服务器时固定附带 `mcp_schema` / `mcp_call` 代理工具。
     pub(crate) fn provider_schemas(&self) -> Vec<ToolDefinition> {
         let mcp_proxies = (!self.mcp_servers.is_empty())
             .then(|| [mcp::schema_spec(), mcp::call_spec()])
@@ -225,8 +205,6 @@ impl ToolRegistrySnapshot {
             .collect()
     }
 
-    /// 查找工具并解析参数，不执行。Agent 在执行前按模型给出的顺序逐个调用；
-    /// 未知工具和参数错误都返回给模型看的错误结果。
     pub(crate) fn preflight(&self, name: &str, args: &Value) -> Result<PreparedTool, ToolExecution> {
         if !self.mcp_servers.is_empty() {
             if name == mcp::MCP_SCHEMA_TOOL_NAME {
@@ -261,7 +239,6 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
     execution
 }
 
-/// 解析工具参数；失败时返回给模型看的错误结果，调用方直接把它当作工具结果。
 pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(args: &Value) -> Result<T, ToolExecution> {
     T::deserialize(args).map_err(|error| error_result(format!("invalid tool arguments: {error}")))
 }

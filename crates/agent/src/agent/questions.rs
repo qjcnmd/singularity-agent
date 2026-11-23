@@ -1,5 +1,3 @@
-//! 当前回合中等待用户回答的问题。等待只在内存中；问题和答案作为工具调用和工具结果写进日志。
-
 use std::sync::Mutex;
 
 use protocol::{PendingQuestion, UserQuestionAnswer};
@@ -14,7 +12,6 @@ struct WaitingQuestion {
     reply: oneshot::Sender<Vec<UserQuestionAnswer>>,
 }
 
-/// 一次最多等待一组问题；提问工具单独执行，不与其他工具并行。
 #[derive(Default)]
 pub struct UserQuestions {
     waiting: Mutex<Option<WaitingQuestion>>,
@@ -43,7 +40,6 @@ impl Drop for ClearGuard<'_> {
 }
 
 impl UserQuestions {
-    /// 刷新或切换任务时读取当前仍可回答的问题。
     pub fn pending(&self) -> Option<PendingQuestion> {
         self.waiting
             .lock()
@@ -52,7 +48,6 @@ impl UserQuestions {
             .map(|waiting| waiting.request.clone())
     }
 
-    /// 检查界面提交的答案，通过后交给等待中的工具；不通过时问题保留，用户可以修改后重交。
     pub fn answer(&self, item_id: &str, answers: Vec<UserQuestionAnswer>) -> Result<(), String> {
         let mut slot = self.waiting.lock().expect("question lock poisoned");
         let waiting = slot

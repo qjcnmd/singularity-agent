@@ -1,14 +1,9 @@
-//! 用户数据根目录的解析：优先用 `SINGULARITY_HOME`，没设置就用系统用户主目录下的
-//! `.singularity`。取值无效时如实报错，不改写到别处；错误消息点名真正出问题的变量，
-//! 默认来源出问题时不归到 `SINGULARITY_HOME` 头上。
-
 use crate::identity::{DATA_DIR_NAME, HOME_ENV_VAR};
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
 };
 
-/// 解析应用数据根目录（优先读取 `SINGULARITY_HOME` 环境变量，默认使用用户目录下的 `.singularity`）。
 pub fn resolve_home() -> Result<PathBuf, String> {
     if let Some(value) = std::env::var_os(HOME_ENV_VAR).filter(|value| !is_blank(value)) {
         let base = Path::new(&value);
@@ -28,12 +23,10 @@ pub fn resolve_home() -> Result<PathBuf, String> {
     Ok(base.join(DATA_DIR_NAME))
 }
 
-/// 空串和纯空白都按没设置处理：否则数据根会变成一个相对路径。
 fn is_blank(value: &OsStr) -> bool {
     value.to_string_lossy().trim().is_empty()
 }
 
-/// 数据根要求绝对路径；路径组件交给系统解析，不自行折叠父目录。
 fn validated_root(base: &Path) -> Result<PathBuf, String> {
     if !base.is_absolute() {
         return Err("must be an absolute path".into());

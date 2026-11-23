@@ -1,17 +1,13 @@
-//! SSE 响应构造器、图片测试夹具与极简测试用 MCP stdio 脚本生成器。
-
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-/// 1x1 像素合法 PNG 的 data URL，供图片上传与持久化测试使用。
 pub const TINY_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
 fn sse_data(payload: &Value) -> String {
     format!("data: {payload}\n\n")
 }
 
-/// 构造标准 Messages SSE 文本回复（可选思考与签名、自定义用量与停止原因）。
 pub fn messages_text_sse(
     thinking: Option<(&str, &str)>,
     text: &str,
@@ -72,7 +68,6 @@ pub fn messages_text_sse(
     events
 }
 
-/// 构造带一个或多个工具调用的 Messages SSE 响应。
 pub fn messages_tools_sse(
     preface: Option<&str>,
     calls: Vec<(&str, &str, Value)>,
@@ -124,7 +119,6 @@ pub fn messages_tools_sse(
     events
 }
 
-/// 构造标准 OpenAI Responses SSE 文本/思考/工具调用响应。
 pub fn responses_sse(
     thinking: Option<(&str, &str)>,
     text: Option<&str>,
@@ -196,7 +190,6 @@ pub fn responses_sse(
     events
 }
 
-/// 生成极简测试用 MCP stdio 服务（Node.js），把通用工具调度测试与具体内置工具解耦。
 pub fn write_test_mcp_script(dir: &Path) -> PathBuf {
     let script = dir.join("test_mcp_server.mjs");
     let source = r#"

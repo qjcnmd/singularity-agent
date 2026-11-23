@@ -1,4 +1,3 @@
-//! 工作台 RPC 的适配层：每个方法只分发一次，阻塞操作进入工作线程。
 use super::app_server::AppServer;
 use super::file_view::read_text_file;
 use protocol::{RpcError, RpcRequest};
@@ -32,8 +31,7 @@ async fn dispatch(
                     .await
                     .expect("RPC worker completes while the backend is running")?
             };
-            let inspect = async { app.mcp.reconnect(&params.server_id, &cwd).await.map_err(RpcError::new) };
-            Ok(value(unless_shutdown(shutdown, inspect).await?))
+            Ok(value(app.mcp.reconnect(&params.server_id, &cwd, shutdown).await.map_err(RpcError::new)?))
         }
         RpcRequest::ModelDiscover(params) => {
             let discover = app.discover_models(
@@ -128,7 +126,6 @@ async fn blocking<T: Serialize>(
         .expect("RPC worker completes while the backend is running")
 }
 
-/// 网络查询在退出时立即结束，不拖住关闭流程。
 async fn unless_shutdown<T>(
     shutdown: &tokio_util::sync::CancellationToken,
     work: impl Future<Output = Result<T, RpcError>>,

@@ -1,5 +1,3 @@
-//! ask_user_question 工具的参数和说明；等待回答由 Agent 的 UserQuestions 负责。
-
 use protocol::UserQuestion;
 use serde::Deserialize;
 use serde_json::json;

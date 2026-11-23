@@ -1,5 +1,3 @@
-//! 从文件系统发现技能，供 Agent 与工作台共用。
-
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -8,7 +6,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// 一个被发现出来的技能；在被调用之前只保留元数据。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
     pub name: String,
@@ -19,7 +16,6 @@ pub struct Skill {
 }
 
 impl Skill {
-    /// 用户选择或模型调用 skill 工具时完整读取入口；辅助资源仍由模型按需读取，不受工具输出截断限制。
     pub fn load_instructions(&self) -> Result<String, String> {
         let directory = self.path.parent().ok_or_else(|| {
             format!("无法加载技能 /{}（{}）：缺少父目录", self.name, crate::display_path(&self.path))
@@ -36,7 +32,6 @@ impl Skill {
     }
 }
 
-/// 无效文件如实记进 diagnostics，只在工作台展示，不进入模型提示词。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SkillCatalog {
     pub skills: Vec<Skill>,
@@ -57,7 +52,6 @@ fn enabled() -> bool {
     true
 }
 
-/// 发现阶段只读 frontmatter；正文在显式选择时加载，或由模型按需读取。
 fn discover_skill(path: &Path, file: fs::File) -> Result<Skill, String> {
     let mut lines = BufReader::new(file).lines();
     let first = lines
@@ -103,10 +97,7 @@ fn discover_skill(path: &Path, file: fs::File) -> Result<Skill, String> {
 }
 
 impl SkillCatalog {
-    /// 优先级从高到低：项目技能、应用主目录、共享的用户技能。
     pub fn discover(cwd: &Path, home: &Path) -> Self {
-        // 与项目指令共用同一套根目录规则。目录规范化或标记读不出来时不阻断技能发现：
-        // 退回可用目录，并像其他扫描失败一样把原因记进 diagnostics。
         let mut extra_diagnostics = Vec::new();
         let canonical = match crate::canonicalize_workspace(cwd) {
             Ok(canonical) => Some(canonical),
@@ -142,7 +133,6 @@ impl SkillCatalog {
         catalog
     }
 
-    /// 按 roots 的先后顺序，发现子目录中的 SKILL.md。
     fn from_roots(roots: &[PathBuf]) -> Self {
         let mut found = BTreeMap::new();
         let mut diagnostics = Vec::new();
@@ -160,8 +150,6 @@ impl SkillCatalog {
                 match entry {
                     Ok(entry) => {
                         let path = entry.path();
-                        // 子路径元数据访问失败不等于「不存在」或「不是目录」，真实原因
-                        // 写进诊断。metadata 跟随符号链接，发现范围与 is_dir() 一致。
                         match path.metadata() {
                             Ok(metadata) if metadata.is_dir() => {
                                 paths.push(path.join("SKILL.md"));
@@ -197,12 +185,10 @@ impl SkillCatalog {
         }
     }
 
-    /// 实际向模型公布的技能；请求目录和运行状态使用同一个筛选规则。
     pub fn model_skills(&self) -> impl Iterator<Item = &Skill> {
         self.skills.iter().filter(|skill| !skill.disable_model_invocation)
     }
 
-    /// 列出名称和摘要；完整指令由模型通过 skill 工具按名称加载。没有可公布的技能时为空。
     pub fn prompt(&self) -> String {
         let mut lines: Vec<_> =
             self.model_skills().map(|s| format!("- {}: {}", s.name, s.description)).collect();

@@ -5,17 +5,14 @@ import { useSelectionGuard } from '../interactions'
 import { DiagramViewer } from './DiagramViewer'
 import { Menu } from './Menu'
 
-// mermaid 体积较大，第一次遇到图时才加载，之后复用同一个实例。
 let loading: Promise<Mermaid> | null = null
 function loadMermaid(): Promise<Mermaid> {
   return loading ??= import('mermaid').then(({ default: mermaid }) => {
     mermaid.initialize({
       startOnLoad: false, suppressErrorRendering: true, securityLevel: 'strict', theme: 'base', look: 'classic', fontFamily: 'inherit',
-      // mermaid 12 默认节点文字超过 120px 就换行，节点又窄又容易把单词断开；放宽并加大内边距。
       flowchart: { wrappingWidth: 280, padding: 22, nodeSpacing: 56, rankSpacing: 56 },
       themeVariables: { fontSize: '15px' },
       // 写进图自带的样式表：mermaid 量节点尺寸时也按加粗字排版，不会量完再变宽溢出。
-      // 颜色取自容器上的 CSS 变量，明暗主题切换时自动更新；代码里 style/classDef 写的行内样式优先于这里。
       themeCSS: `.node rect, .node polygon, .node circle { fill: var(--diagram-fill); stroke: var(--diagram-border); }
         .node rect { rx: 16px; ry: 16px; }
         .nodeLabel, .node .label, .node text { color: var(--diagram-text); fill: var(--diagram-text); font-weight: 600; }
@@ -41,7 +38,6 @@ const palettes = [
   { light: ['#efe9fd', '#d4c8f6', '#5b3aa6'], dark: ['#2a223f', '#52407c', '#cfc1fb'] },
 ]
 
-/** 按内容固定挑一组颜色，同一张图每次打开颜色不变。 */
 function paletteStyle(code: string): CSSProperties {
   const hash = [...code].reduce((sum, character) => (sum * 31 + character.charCodeAt(0)) >>> 0, 7)
   const chosen = palettes[hash % palettes.length]
@@ -55,10 +51,8 @@ function paletteStyle(code: string): CSSProperties {
   } as CSSProperties
 }
 
-/** 宽图缩到气泡宽度时最多缩到原尺寸的这个比例，再宽就在图内横向滚动，避免字小得看不清。 */
 const minimumScale = .6
 
-/** 把 Mermaid 代码画成图，点击或右上角按钮打开大图；加载中或语法无法解析时显示 fallback（原来的代码块）。 */
 export function MermaidDiagram({ code, fallback }: { code: string; fallback: ReactNode }) {
   const id = `mermaid-${useId().replace(/[^\w-]/g, '')}`
   const [diagram, setDiagram] = useState<{ svg: string; width: number; height: number } | null>(null)
@@ -73,7 +67,6 @@ export function MermaidDiagram({ code, fallback }: { code: string; fallback: Rea
     setDiagram(null)
     void loadMermaid().then(async mermaid => {
       if (!active) return
-      // mermaid 改完节点尺寸会立即读回来排版；在 .mermaid-stage 里排版，避开减少动态效果样式给所有元素加的过渡（见 surfaces.css）。
       const stage = document.createElement('div')
       stage.className = 'mermaid-stage'
       document.body.append(stage)
@@ -94,7 +87,6 @@ export function MermaidDiagram({ code, fallback }: { code: string; fallback: Rea
   }, [copied])
   if (diagram === null) return fallback
   const open = () => setViewing(true)
-  // 复制失败时把代码展开，代码块自带的复制按钮会显示失败并可重试，也能手动选取。
   const copy = () => { void navigator.clipboard.writeText(code).then(() => setCopied(true), () => setShowCode(true)) }
   return <>
     <div className="mermaid-block" style={paletteStyle(code)}>

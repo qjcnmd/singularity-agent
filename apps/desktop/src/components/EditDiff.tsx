@@ -6,7 +6,6 @@ import '../styles/edit-diff.css'
 type DiffLine = { kind: 'context' | 'added' | 'deleted'; number: number; text: string }
 type DiffHunk = { lines: DiffLine[] }
 
-/** 解析后端保存的增删统计和 unified diff；行号来自补丁头，不从工具参数推测。 */
 function parseEditDiff(output: string) {
   const [summary, ...lines] = output.split('\n')
   const counts = /^\+(\d+) -(\d+)$/.exec(summary)

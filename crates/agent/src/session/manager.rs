@@ -1,5 +1,3 @@
-//! 会话日志的创建、打开和追加写入。
-
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,16 +13,12 @@ use super::format::{
     SessionMetadata,
 };
 
-/// 可写的会话日志。记录按写入顺序排列，这个顺序就是事情发生的顺序；
-/// 一个会话只有一个 SessionManager，通过 SessionWriter 共享并按顺序追加。
 #[derive(Debug)]
 pub struct SessionManager {
     pub(super) data: SessionData,
-    /// 上一次追加失败的原因；之后拒绝写入，直到重新打开日志截掉残缺的末尾。
     append_error: Option<Arc<std::io::Error>>,
 }
 
-/// 解析后的会话内容。只读打开和写者共用这套解析结果；只读打开不会修改文件。
 #[derive(Debug)]
 pub struct SessionData {
     pub(super) file: PathBuf,
@@ -35,12 +29,9 @@ pub struct SessionData {
 }
 
 impl SessionManager {
-    /// 只读访问底层已解析的会话内容。
     pub fn data(&self) -> &SessionData {
         &self.data
     }
-    /// 新建会话日志：文件名和文件头里的 ID 都用调用方给的 UUID；文件已存在时报错，
-    /// 写入失败时删除文件。
     pub fn create_with_id(
         cwd: &Path,
         sessions_dir: &Path,
@@ -97,8 +88,6 @@ impl SessionManager {
         })
     }
 
-    /// 以写入方式打开已有日志：检查文件头 ID，截掉没写完的最后一行，完整的记录不动。
-    /// 同一个日志同时只能有一个写者。
     pub fn open_existing(path: &Path, expected_id: &str) -> Result<Self> {
         let (data, repair) = parse_session_file(path)?;
         data.verify_session_id(expected_id)?;
@@ -110,13 +99,11 @@ impl SessionManager {
 }
 
 impl SessionData {
-    /// 这个任务的图片目录：`sessions/images/<任务 ID>`。
     pub(crate) fn image_directory(&self) -> PathBuf {
         let parent = self.file.parent().expect("session has a parent directory");
         super::session_images_directory(parent, &self.session_id)
     }
 
-    /// 超长工具输出随会话保留，压缩和重新打开任务不删除文件。
     pub(crate) fn output_directory(&self) -> PathBuf {
         super::session_outputs_directory(
             self.file.parent().expect("session has a parent directory"),
@@ -124,7 +111,6 @@ impl SessionData {
         )
     }
 
-    /// 只允许读取这份历史实际引用的图片，不接受任意文件路径。
     pub fn image_attachment(&self, image_id: &str) -> Result<crate::image::SavedImage> {
         let attachment = self
             .entries
@@ -142,20 +128,15 @@ impl SessionData {
         })
     }
 
-    /// 读取并编码这份历史实际引用的图片。
     pub fn image_data(&self, image_id: &str) -> Result<String> {
         Ok(self.image_attachment(image_id)?.data_url()?)
     }
 
-    /// 只读打开日志，用于预览和历史读取。
-    ///
-    /// 只读取以换行结束的完整记录，不修改文件；截掉残缺末尾由写者打开时负责。
     pub fn open(path: &Path) -> Result<Self> {
         parse_session_file(path).map(|(data, _)| data)
     }
 }
 
-/// 逐条访问完整日志记录，成功时返回规范工作目录和日志创建时间。
 pub fn scan_session_entries(
     path: &Path,
     expected_id: &str,
@@ -177,7 +158,6 @@ fn verify_session_id(actual: &str, expected: &str) -> Result<()> {
 }
 
 impl SessionManager {
-    /// 追加一条压缩记录，ID 使用压缩开始时分配给界面条目的 ID。返回保存时间。
     pub(crate) fn append_compaction_with_id(
         &mut self,
         id: &str,
@@ -190,7 +170,6 @@ impl SessionManager {
         })
     }
 
-    /// 追加一条任务设置（模型选择或名称），不进入模型上下文。返回保存时间。
     pub fn append_metadata(&mut self, metadata: SessionMetadata) -> Result<String> {
         self.append_entry(SessionEntry::Metadata {
             id: super::new_entry_id(),
@@ -199,18 +178,14 @@ impl SessionManager {
         })
     }
 
-    /// 追加一条执行记录（回合开始与结束、请求、后台命令等），用于显示和统计，
-    /// 不进入模型上下文。返回保存时间。
     pub fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
         self.append_record_with_id(super::new_entry_id(), record)
     }
 
-    /// 使用事先分配的 ID 追加执行记录，保存的内容和实时显示的条目对应同一个 ID。
     pub fn append_record_with_id(&mut self, id: String, record: LedgerRecord) -> Result<String> {
         self.append_entry(SessionEntry::Record { id, timestamp: now_iso(), record })
     }
 
-    /// 使用事先分配的 ID 追加一条消息（回复、用户输入或工具结果）。
     pub(crate) fn append_message_with_id(
         &mut self,
         id: &str,
@@ -228,7 +203,6 @@ impl SessionManager {
     }
 
     fn append_entry(&mut self, entry: SessionEntry) -> Result<String> {
-        // 上次写入失败可能留下残缺行，必须重新打开并截掉残缺末尾后才能继续追加。
         if let Some(error) = &self.append_error {
             return Err(SessionError::Io(std::io::Error::new(
                 error.kind(),
@@ -239,7 +213,6 @@ impl SessionManager {
         let mut bytes = serde_json::to_vec(&entry)?;
         bytes.push(b'\n');
         let mut handle = OpenOptions::new().append(true).open(&self.data.file)?;
-        // 记下写入错误，阻止后续追加把新记录拼在残缺行后面。
         handle.write_all(&bytes).map_err(|error| {
             let error = Arc::new(error);
             self.append_error = Some(Arc::clone(&error));
@@ -259,7 +232,6 @@ impl SessionData {
         &self.session_id
     }
 
-    /// 检查文件头里的 ID 与文件名是否一致；不一致说明文件损坏或被改名。
     pub fn verify_session_id(&self, expected: &str) -> Result<()> {
         verify_session_id(self.session_id(), expected)
     }
@@ -272,7 +244,6 @@ impl SessionData {
         &self.cwd
     }
 
-    /// 工作目录的显示形式（去掉 Windows 长路径前缀），任务信息、列表和提示词共用。
     pub fn cwd_string(&self) -> String {
         app_core::display_path(&self.cwd)
     }
@@ -281,7 +252,6 @@ impl SessionData {
         &self.entries
     }
 
-    /// 创建任务时关闭的上下文模块 ID；全开的任务没有这条记录。
     pub fn disabled_modules(&self) -> Vec<String> {
         self.entries
             .iter()

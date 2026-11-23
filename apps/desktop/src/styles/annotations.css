@@ -1,4 +1,3 @@
-/* 助手回复批注：CSS Custom Highlight、编号角标、划词浮层、输入区汇总条与气泡上方轻胶囊 */
 ::highlight(sg-annotation) { background-color: color-mix(in srgb, var(--accent) 18%, transparent); text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--accent) 62%, transparent); text-decoration-thickness: 1.5px; text-underline-offset: 2px; }
 ::highlight(sg-annotation-active) { background-color: color-mix(in srgb, var(--accent) 30%, transparent); text-decoration: underline; text-decoration-color: var(--accent); text-decoration-thickness: 2px; text-underline-offset: 2px; }
 ::highlight(sg-annotation-flash) { background-color: color-mix(in srgb, var(--accent) 36%, transparent); text-decoration: underline; text-decoration-color: var(--accent); text-decoration-thickness: 2px; text-underline-offset: 2px; }
@@ -27,7 +26,6 @@
 .annotation-confirm-button:hover { filter: brightness(1.06); }
 .annotation-confirm-button:active, .annotation-action-button:active { transform: scale(.93); transition-duration: 80ms; }
 
-/* 输入卡片顶部批注汇总条 */
 .draft-annotations { margin: -2px -4px 8px -6px; padding: 2px 4px 6px; border-bottom: 1px solid var(--line); }
 .draft-annotations-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .draft-annotations-toggle { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-soft); font-size: 12.5px; font-weight: 500; cursor: pointer; transition: background 120ms, color 120ms; }
@@ -45,7 +43,6 @@
 .draft-annotation-remove { flex: none; display: grid; place-items: center; width: 24px; height: 24px; margin-right: 4px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--ink-faint); cursor: pointer; transition: background 120ms, color 120ms; }
 .draft-annotation-remove:hover { background: var(--soft-fill-hover); color: var(--ink); }
 
-/* 用户消息气泡正上方的已发送批注轻胶囊与折叠列表 */
 .sent-annotations { display: grid; justify-items: end; max-width: 100%; margin: 0 0 6px; }
 .sent-annotations:last-child { margin-bottom: 0; }
 .sent-annotations-pill { display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--card); color: var(--ink-soft); font-size: var(--meta-font-size); font-weight: 500; cursor: pointer; transition: background 120ms, color 120ms, border-color 120ms; }

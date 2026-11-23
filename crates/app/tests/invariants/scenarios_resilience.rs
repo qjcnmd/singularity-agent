@@ -1,5 +1,3 @@
-//! 韧性与系统级不变量：流式故障自愈/收敛、上下文超窗收敛与结构保真、并发停止/删除、日志修复与焦点流控。
-
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -19,8 +17,6 @@ async fn stream_fault_recovery_and_truncation_invariants() {
     let server = MockModelServer::start().await;
     let ws = env.workspace_str();
 
-    // 子场景 1（偶发故障自愈）：先返回 HTTP 429 (retry-after-ms: 10)，再返回半截断流（含部分可见文本），最后成功。
-    // 不变量：最终成功、收到 message/discarded、历史中无半截脏文本残留。
     server.enqueue(ScriptedResponse::json_with_headers(
         429,
         vec![("retry-after-ms", "10")],
@@ -45,8 +41,6 @@ async fn stream_fault_recovery_and_truncation_invariants() {
         "end_turn",
     )));
 
-    // 子场景 2（不可重试流内报错 + 部分输出隔离）：输出半截文本后流内报错（配额耗尽，不重试）。
-    // 下一轮提交正常消息时，半截失败文本不得进入发往模型的上下文。
     server.enqueue(ScriptedResponse::sse(vec![
         format!(
             "data: {}\n\n",
@@ -63,14 +57,12 @@ async fn stream_fault_recovery_and_truncation_invariants() {
     ]));
     server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "POST_FAILURE_OK", 90, 0, 15, "end_turn")));
 
-    // 子场景 3（超长 Retry-After 不挂起）：返回 Retry-After: 120，必须快速失败而非等待两分钟。
     server.enqueue(ScriptedResponse::json_with_headers(
         429,
         vec![("retry-after", "120")],
         json!({ "error": { "code": "rate_limit_exceeded", "message": "too long wait" } }),
     ));
 
-    // 子场景 4（输出截断保护）：max_tokens 截断并带工具调用时，必须拒绝执行截断工具并记为失败。
     server.enqueue(ScriptedResponse::sse(messages_tools_sse(
         Some("cut off"),
         vec![("trunc_call", "write", json!({ "path": "should_not_exist.txt", "content": "bad" }))],
@@ -84,7 +76,6 @@ async fn stream_fault_recovery_and_truncation_invariants() {
         .setup_workspace_and_provider(&ws, "local", "messages", &server.base_url, "demo", 64000, 4096)
         .await;
 
-    // 1. 偶发故障自愈
     let session_id = client
         .start_session(&ws, "local", "demo", None, "trigger transient retry", vec![], vec![])
         .await;
@@ -105,7 +96,6 @@ async fn stream_fault_recovery_and_truncation_invariants() {
         "discarded partial output must not persist in history"
     );
 
-    // 2. 失败片段保留在历史展示中，但绝不进入下一轮模型请求上下文
     client.submit(&session_id, "trigger quota fail").await;
     let settled2 = client.wait_settled(&session_id).await;
     assert_eq!(settled2.pointer("/summary/status").and_then(Value::as_str), Some("failed"));
@@ -121,7 +111,6 @@ async fn stream_fault_recovery_and_truncation_invariants() {
         "failed partial assistant message must never enter subsequent model context"
     );
 
-    // 3. 超长 Retry-After 立即收敛失败
     let start_fast_fail = std::time::Instant::now();
     client.submit(&session_id, "trigger long retry-after").await;
     let settled4 = client.wait_settled(&session_id).await;
@@ -131,7 +120,6 @@ async fn stream_fault_recovery_and_truncation_invariants() {
         "Retry-After exceeding cap must fail promptly without sleeping"
     );
 
-    // 4. 输出长度截断不执行未完整工具调用
     client.submit(&session_id, "trigger truncated tool").await;
     let settled5 = client.wait_settled(&session_id).await;
     assert_eq!(settled5.pointer("/summary/status").and_then(Value::as_str), Some("failed"));
@@ -150,7 +138,6 @@ async fn context_pressure_and_overflow_invariants() {
     let ws = env.workspace_str();
     let mcp_script = write_test_mcp_script(&env.home);
 
-    // 策略无关的动态上游桩：请求超限时返回 context_length_exceeded，每次请求自动校验协议不变量。
     let overflow_req_len = Arc::new(AtomicUsize::new(0));
     let overflow_len_recorder = Arc::clone(&overflow_req_len);
     let recovered_req_len = Arc::new(AtomicUsize::new(0));
@@ -160,7 +147,6 @@ async fn context_pressure_and_overflow_invariants() {
     let normal_step = Arc::new(AtomicUsize::new(0));
     let step_counter = Arc::clone(&normal_step);
 
-    // 按末尾消息是否为测试用户提示识别内部压缩请求。
     let is_compaction_request = |body: &Value| -> bool {
         let Some(last_blocks) = body
             .get("messages")
@@ -198,8 +184,6 @@ async fn context_pressure_and_overflow_invariants() {
             return ScriptedResponse::sse(messages_text_sse(None, summary, 1200, 0, 60, "end_turn"));
         }
 
-        // 第 1 步先写入中等大小工具结果，确保第 1 轮在 90% 自动压缩阈值以下完成，
-        // 第 2 轮“LATEST_INTENT_MUST_SURVIVE”由上游直接触发 context_length_exceeded 溢出恢复。
         let step = step_counter.fetch_add(1, Ordering::SeqCst);
         if step == 0 {
             return ScriptedResponse::sse(messages_tools_sse(
@@ -225,7 +209,6 @@ async fn context_pressure_and_overflow_invariants() {
             ));
         }
 
-        // 第 2 轮由上游触发超窗，验证溢出恢复保留最后 1 个完整平衡单元并压缩其之前前缀。
         if serialized.contains("LATEST_INTENT_MUST_SURVIVE")
             && !serialized.contains("FIRST_CHECKPOINT_MARKER")
             && serialized.len() > 20_000
@@ -310,7 +293,6 @@ async fn context_pressure_and_overflow_invariants() {
         "recovered request must be strictly smaller than overflowed request (overflow={overflow_len}, recovered={recovered_len})"
     );
 
-    // 累积超过 15% 保留预算的多轮历史后，验证手动压缩空摘要报错不破坏上下文，随后二轮手动压缩成功且保留 15% 尾部。
     for idx in 0..5 {
         let heavy = format!("HEAVY_POST_COMPACTION_TURN_{idx}: {}", "payload_segment_".repeat(320));
         client.submit(&session_id, &heavy).await;
@@ -391,8 +373,6 @@ async fn context_pressure_and_overflow_invariants() {
         "restarted session generation must project persisted second checkpoint and retained tail"
     );
 
-    // 触发 90% 自动压缩（窗口 20_000 -> >= 18_000 且 < 20_000）且返回空摘要失败时，
-    // 回合应记录警告并直接继续发主请求完成生成，不中断当前回合。
     server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "   ", 500, 0, 5, "end_turn")));
     server.enqueue(ScriptedResponse::sse(messages_text_sse(
         None,
@@ -428,8 +408,6 @@ async fn context_pressure_and_overflow_invariants() {
         "main generation request must proceed immediately after automatic compaction failure"
     );
 
-    // 切到窗口更小的模型且当前历史达到新模型 90% 时：必须先用旧模型按新模型 15% 保留预算预压；
-    // 旧模型预压失败时明确报错且不得向新模型发送超限主请求；预压成功后才切由新模型生成。
     restarted
         .rpc_ok(
             "model.saveProvider",
@@ -468,7 +446,6 @@ async fn context_pressure_and_overflow_invariants() {
         )
         .await;
 
-    // 约 800 tokens（> small-model 15% 保留预算 746），确保旧前缀可被独立切出压缩。
     let tail_pad = "p".repeat(3_200);
     let reqs_before_switch_fail = server.model_requests().len();
     server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "   ", 500, 0, 5, "end_turn")));
@@ -542,8 +519,6 @@ async fn abort_delete_corruption_and_focus_invariants() {
         .setup_workspace_and_provider(&ws, "local", "messages", &server.base_url, "demo", 64000, 4096)
         .await;
 
-    // 1. 流式运行中停止、工具执行中停止、提问挂起时停止，随后继续对话不死锁且工具调用严格配对；
-    //    同时验证项目有运行中任务时 workspace.remove 必须被拒绝。
     let abort_gate = Arc::new(Notify::new());
     server.enqueue(ScriptedResponse::sse_gated(
         messages_text_sse(None, "partial before abort", 50, 0, 10, "end_turn"),
@@ -558,7 +533,6 @@ async fn abort_delete_corruption_and_focus_invariants() {
     assert_eq!(aborted.pointer("/summary/manuallyStopped").and_then(Value::as_bool), Some(true));
     abort_gate.notify_one();
 
-    // 1b. 工具执行中停止（慢 bash + 后续挂起提问），停止后必须及时回收进程而非阻塞 30s。
     server.enqueue(ScriptedResponse::sse(messages_tools_sse(
         None,
         vec![(
@@ -588,7 +562,6 @@ async fn abort_delete_corruption_and_focus_invariants() {
         "aborting a running bash tool must terminate promptly"
     );
 
-    // 1c. 提问挂起时停止，再发送下一条消息续聊：所有被中断的 tool_use 必须合法配对且会话正常收敛。
     server.enqueue(ScriptedResponse::sse(messages_tools_sse(
         None,
         vec![(
@@ -634,7 +607,6 @@ async fn abort_delete_corruption_and_focus_invariants() {
         "session must recover cleanly after stream/tool/question aborts"
     );
 
-    // 2. 运行中删除会话（session.delete 两段锁）：不死锁，且彻底清理 JSONL、images/ 和 outputs/。
     let delete_gate = Arc::new(Notify::new());
     server.enqueue(ScriptedResponse::sse_gated(
         messages_text_sse(None, "partial before delete", 50, 0, 10, "end_turn"),
@@ -662,7 +634,6 @@ async fn abort_delete_corruption_and_focus_invariants() {
     assert!(!del_jsonl.exists(), "deleted session JSONL must be removed");
     assert!(!del_images.exists(), "deleted session images directory must be removed");
 
-    // 3. 焦点过滤不变量：非聚焦会话不推送高频 TextDelta，但仍推送终态 SessionSettled。
     let focus_gate = Arc::new(Notify::new());
     server.enqueue(ScriptedResponse::sse_gated(
         messages_text_sse(None, "unfocused stream delta", 50, 0, 10, "end_turn"),
@@ -672,7 +643,6 @@ async fn abort_delete_corruption_and_focus_invariants() {
     let s_unfocused = client
         .start_session(&ws, "local", "demo", None, "check focus filter", vec![], vec![])
         .await;
-    // 把焦点切到另一个会话（s_abort），再放行 s_unfocused 的流式输出。
     client.rpc_ok("session.focus", json!({ "sessionId": s_abort })).await;
     let _ = client.drain_events();
     server.wait_for_request_count(expected_focus_reqs).await;
@@ -686,7 +656,6 @@ async fn abort_delete_corruption_and_focus_invariants() {
     });
     assert!(!leaked_delta, "non-focused session must suppress high-frequency TextDelta frames");
 
-    // 4. 多会话压力（超过常见会话缓存数）+ 任意重读一致性 + 项目空闲移除与重新添加恢复。
     let mut batch_ids = Vec::new();
     for i in 0..18 {
         server.enqueue(ScriptedResponse::sse(messages_text_sse(
@@ -706,7 +675,6 @@ async fn abort_delete_corruption_and_focus_invariants() {
     let first_reread = client.rpc_ok("session.read", json!({ "sessionId": batch_ids[0] })).await;
     assert!(first_reread.to_string().contains("reply_0"));
 
-    // 空闲时移除项目：从工作台隐藏但不删除磁盘日志，重新添加后历史会话重新可见。
     client.rpc_ok("workspace.remove", json!({ "workspaceRoot": ws })).await;
     let boot_removed = client.rpc_ok("app.bootstrap", json!({})).await;
     assert!(
@@ -726,12 +694,10 @@ async fn abort_delete_corruption_and_focus_invariants() {
     server.assert_no_protocol_violations();
     client.shutdown().await;
 
-    // 5. 日志崩溃尾行自愈 & 完整行损坏显式报错（对齐 docs/decisions.md）。
     let target_log = env.home.join("sessions").join(format!("{}.jsonl", batch_ids[0]));
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().append(true).open(&target_log).expect("open log");
-        // 写入末尾缺少换行的半截 JSON，模拟写盘中断。
         f.write_all(b"{\"type\":\"message\",\"truncated\":true").expect("append partial tail");
     }
 
@@ -743,7 +709,6 @@ async fn abort_delete_corruption_and_focus_invariants() {
     );
     repaired_client.shutdown().await;
 
-    // 写入带换行的完整损坏行，bootstrap 必须显式报错而非静默跳过。
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().append(true).open(&target_log).expect("open log");

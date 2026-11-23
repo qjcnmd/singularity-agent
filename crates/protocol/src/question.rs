@@ -1,5 +1,3 @@
-//! `ask_user_question` 工具的问题、选项与用户回答类型。
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,7 +24,6 @@ pub struct UserQuestion {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PendingQuestion {
-    /// 提问工具的条目 ID；用于拒绝已经结束或属于其他回合的问题的答案。
     pub item_id: String,
     pub questions: Vec<UserQuestion>,
 }

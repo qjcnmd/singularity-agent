@@ -2,24 +2,19 @@ use serde_json::Value;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-/// 提供方失败的处理类别，具体原因保存在错误文字里。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelErrorKind {
     Cancelled,
-    /// 可自动重试的网络故障、超时、限流和服务端故障。
     Temporary,
     ContextLengthExceeded,
-    /// 不重试、直接显示的失败；具体原因在错误文字里。
     Other,
 }
 
-/// 提供方失败，含错误分类、可显示的诊断信息和重试等待时间。
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderError {
     pub kind: ModelErrorKind,
     pub message: String,
-    /// 提供方要求的自动重试前最小等待时间。
     pub retry_after: Option<Duration>,
 }
 
@@ -40,7 +35,6 @@ impl ProviderError {
         }
     }
 
-    /// 构造带分类的诊断错误，把具体原因并进各入口实际显示的错误文本里。
     pub(crate) fn diagnostic(
         kind: ModelErrorKind,
         message: impl Into<String>,
@@ -59,7 +53,6 @@ impl ProviderError {
         Self::new(kind, message)
     }
 
-    /// 提供方是否明确拒绝了这次请求的上下文规模（会触发强制压缩）。
     pub fn is_context_overflow(&self) -> bool {
         self.kind == ModelErrorKind::ContextLengthExceeded
     }
@@ -69,28 +62,19 @@ impl ProviderError {
     }
 }
 
-/// 提供方响应体里表示上下文超限的错误码；只做全等匹配。
 const PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
-/// 提供方明确返回的限流错误码，允许自动重试。
 const PROVIDER_RATE_LIMIT_EXCEEDED_CODE: &str = "rate_limit_exceeded";
-/// 提供方明确返回的服务端暂时故障错误码，允许自动重试。
 const PROVIDER_SERVER_ERROR_CODE: &str = "server_error";
-/// 提供方返回的配额耗尽错误码，不自动重试。
 const PROVIDER_INSUFFICIENT_QUOTA_CODE: &str = "insufficient_quota";
-/// 附在非 2xx 错误上的提供方诊断文本长度上限（字符数）。
 pub(crate) const MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS: usize = 256;
 
-/// 从非 2xx 响应体里解析出的结构化错误字段。
 #[derive(Default)]
 pub(crate) struct ProviderErrorBodyFields {
     pub(crate) code: Option<String>,
-    /// 响应里的 error.type；在 `code` 未命中时作为兜底分类依据，并附在错误消息里便于排查。
     pub(crate) wire_type: Option<String>,
     pub(crate) message: Option<String>,
 }
 
-/// 从提供方的 error 对象（{"code": "...", "type": "...", "message": "..."}）里提取字段；
-/// 不是对象或字段类型不符时按未提供处理。SSE 错误事件、200 响应体中的内嵌错误和非 2xx 响应体共用。
 pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
     let text = |field: &str| error.get(field).and_then(Value::as_str).map(str::to_string);
     ProviderErrorBodyFields {
@@ -100,7 +84,6 @@ pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
     }
 }
 
-/// 提供方返回的错误码和类型，截断后附在错误消息里；HTTP 和 SSE 两条入口共用。
 pub(crate) fn provider_wire_facts(fields: &ProviderErrorBodyFields) -> Vec<String> {
     let mut facts = Vec::new();
     if let Some(code) = fields.code.as_deref().filter(|code| !code.is_empty()) {
@@ -112,8 +95,6 @@ pub(crate) fn provider_wire_facts(fields: &ProviderErrorBodyFields) -> Vec<Strin
     facts
 }
 
-/// 解析非 2xx 响应体中的 {"error": {"code": "...", "message": "..."}}；没有 error
-/// 或 error 不是对象时，各字段都为空。
 fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields {
     serde_json::from_slice::<Value>(body)
         .ok()
@@ -121,7 +102,6 @@ fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields {
         .unwrap_or_default()
 }
 
-/// HTTP 错误共用的有界诊断；已知错误码或类型会覆写状态码粗分类，并补充有界原因。
 pub(crate) fn apply_provider_error_body(error: &mut ProviderError, body: &[u8]) {
     let fields = parse_provider_error_body(body);
     if let Some(kind) = provider_error_kind_for_fields(&fields) {
@@ -140,7 +120,6 @@ pub(crate) fn apply_provider_error_body(error: &mut ProviderError, body: &[u8]) 
     }
 }
 
-/// 提供方错误码或类型到 `ModelErrorKind` 的映射；未命中时返回 `None`，由调用方决定分类。
 fn provider_error_kind_for_fields(fields: &ProviderErrorBodyFields) -> Option<ModelErrorKind> {
     match fields.code.as_deref() {
         Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE) => return Some(ModelErrorKind::ContextLengthExceeded),
@@ -164,7 +143,6 @@ fn provider_error_kind_for_fields(fields: &ProviderErrorBodyFields) -> Option<Mo
     }
 }
 
-/// 超时、限流和服务端故障共用重试策略，具体状态码保留在错误文字里。
 pub(crate) fn provider_error_kind_for_http_status(status: u16) -> ModelErrorKind {
     match status {
         408 | 409 | 429 => ModelErrorKind::Temporary,
@@ -173,14 +151,12 @@ pub(crate) fn provider_error_kind_for_http_status(status: u16) -> ModelErrorKind
     }
 }
 
-/// 有长度上限的单行提供方诊断：控制字符和空白都并成一个空格，再截断到上限。
 pub(crate) fn bounded_provider_error_diagnostic(text: &str) -> String {
     let mut diagnostic = String::new();
     let mut remaining = MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS;
     let mut separator_pending = false;
     for character in text.chars() {
         if character.is_control() || character.is_whitespace() {
-            // 第一个词之前的空白丢掉；之后的空白只当作下一次写入前的单个分隔符。
             separator_pending = !diagnostic.is_empty();
             continue;
         }
@@ -201,8 +177,6 @@ pub(crate) fn bounded_provider_error_diagnostic(text: &str) -> String {
     diagnostic
 }
 
-/// 构造流内事件或 200 响应体中的提供方错误：已知错误码映射到对应分类（上下文超限触发压缩、限流可重试、配额耗尽不重试），
-/// 未知错误码归为 `Other`（不自动重试），并附上提供方原文和错误码。
 pub(crate) fn provider_embedded_error(
     fields: &ProviderErrorBodyFields,
     fallback_message: &str,

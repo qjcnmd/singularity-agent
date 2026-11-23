@@ -1,5 +1,3 @@
-//! 模型调用的结果、流事件、端点拼接、续接判断与公共响应校验。
-
 use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
@@ -8,18 +6,13 @@ use crate::config::selection::SelectedModel;
 use crate::error::{ModelErrorKind, ProviderError};
 use crate::types::{Message, ModelTurnResponse, ProviderMessageMetadata};
 
-/// 流式解码过程中发给调用方的增量事件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderStreamEvent {
-    /// 工具调用名称或参数的生成增量，仅用于记录生成开始时间。
     ToolCallDelta,
-    /// 模型响应里对外可见的正文增量。
     OutputTextDelta { delta: String },
-    /// 模型公开的思考文本增量（Messages 的 thinking 增量或 Responses 的 reasoning summary 增量），不含加密推理等提供方私有字段。
     ReasoningTextDelta { delta: String },
 }
 
-/// 去掉地址首尾空白和结尾的斜杠，其余部分（包括自定义路径）保持不变。
 pub(crate) fn canonical_base_url(value: &str) -> &str {
     value.trim().trim_end_matches('/')
 }
@@ -28,7 +21,6 @@ pub(crate) fn endpoint(base_url: &str, path: &str) -> String {
     format!("{}{path}", canonical_base_url(base_url))
 }
 
-/// 拆分消息开头连续的 `Developer` 指令，供 Messages (`system`) 与 Responses (`instructions`) 共用。
 pub(crate) fn split_leading_instructions(messages: &[Message]) -> (Option<String>, &[Message]) {
     let instruction_count =
         messages.iter().take_while(|message| matches!(message, Message::Developer { .. })).count();
@@ -41,8 +33,6 @@ pub(crate) fn split_leading_instructions(messages: &[Message]) -> (Option<String
     ((!instructions.is_empty()).then_some(instructions), &messages[instruction_count..])
 }
 
-/// 消息里提供方私有的续接数据（加密思考、签名等），只有提供方、模型、协议和请求地址
-/// 都与生成时相同才发送；不同时返回 `None`，调用方只省略这部分，正文照常发送。
 pub(crate) fn message_metadata_for<'a>(
     message: &'a Message,
     selection: &SelectedModel,
@@ -88,12 +78,10 @@ pub(crate) fn parse_tool_call_arguments(value: Option<&Value>) -> Result<Value, 
     ))
 }
 
-/// 解析工具参数 JSON 字符串；不是合法 JSON 时保留原始字符串，交由工具参数检查报错。
 pub(crate) fn parse_tool_arguments(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
-/// 还原发送给提供方的参数字符串；畸形参数保留原始字符串，避免二次 JSON 转义。
 pub(crate) fn serialize_tool_call_arguments(arguments: &Value) -> String {
     match arguments {
         Value::String(raw) => raw.clone(),
@@ -105,7 +93,6 @@ pub(crate) fn provider_response_validation_error(message: &str, errors: &[impl A
     ProviderError::diagnostic(ModelErrorKind::Other, message, errors)
 }
 
-/// 校验模型响应：非截断响应须有正文或工具调用，工具调用 ID 非空且不重复、工具名非空。
 pub(crate) fn finalize_provider_response(mut response: ModelTurnResponse) -> ModelTurnResponse {
     let mut errors: Vec<&'static str> = Vec::new();
     if !response.is_length_truncated()

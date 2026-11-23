@@ -24,7 +24,6 @@ pub(crate) async fn read_responses_sse_stream(
     decoder.finish(result, config, selection, endpoint)
 }
 
-/// Responses SSE 解码器：边收边发出正文和思考增量，保留最终的 response 对象。
 struct ResponsesSseDecoder<'a> {
     terminal_response: Option<Value>,
     text: String,
@@ -50,8 +49,6 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| provider_responses_stream_malformed_error("event_type_missing"))?;
-        // completed 和 incomplete 都把 response 对象当终态：后者由 parse_openai_responses_response
-        // 判断是长度截断还是直接失败，两者只有诊断标签不同。
         let completed = payload_type == "response.completed";
         match payload_type {
             "response.function_call_arguments.delta" => {
@@ -112,14 +109,12 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                     .unwrap_or_default();
                 return Err(provider_embedded_error(&fields, "provider Responses stream failed"));
             }
-            // 其余事件不影响公开文本与终态，都忽略。
             _ => {}
         }
         Ok(())
     }
 
     fn protocol_complete(&self) -> bool {
-        // failed/error 在 dispatch 阶段就已以错误结束，不会走到这里。
         self.terminal_response.is_some()
     }
 }

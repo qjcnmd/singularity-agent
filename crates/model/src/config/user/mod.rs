@@ -1,5 +1,3 @@
-//! `config.json` 的数据结构与原子读写。
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -36,7 +34,6 @@ pub(crate) struct UserConfigProvider {
 pub(crate) struct UserConfigModel {
     pub(crate) max_context_tokens: u32,
     pub(crate) max_output_tokens: u32,
-    /// 可选的推理档位列表；省略或为空时不提供推理档位。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_variants: Option<Vec<String>>,
 }
@@ -68,8 +65,6 @@ pub(crate) fn read_user_config_file(directory: &Path) -> Result<Option<UserConfi
     Ok(Some(config))
 }
 
-/// 序列化后原子替换整个配置：被删掉的提供方、模型和推理档位随保存消失。
-/// 键按 `BTreeMap` 排序，与文件原先的书写顺序无关。
 pub(crate) fn write_user_config_file(directory: &Path, config: &UserConfigFile) -> Result<(), ProviderError> {
     let path = directory.join(USER_CONFIG_FILE_NAME);
     app_core::write_json_atomic(&path, config)

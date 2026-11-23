@@ -1,6 +1,3 @@
-//! 组装模型请求：本轮的指令和工具定义，加上从会话日志生成的对话上下文。
-//! 发送、重试和保存请求记录在 crate::request_execution，普通请求和整理请求共用。
-
 use super::compaction::PreRequestOutcome;
 use super::{Agent, AgentError, AgentEvent, RequestContext, Result, modules};
 use crate::request_execution::{execute_request, output_budget_tokens};
@@ -10,7 +7,6 @@ use model::{ModelTurnRequest, ModelTurnResponse};
 use protocol::TurnEvent;
 use tokio_util::sync::CancellationToken;
 
-/// 本轮每次请求都会带上的指令消息和工具定义。
 #[derive(Debug, Clone)]
 pub(crate) struct RequestDefinitions {
     pub(crate) messages: Vec<Message>,
@@ -19,7 +15,6 @@ pub(crate) struct RequestDefinitions {
 }
 
 impl RequestDefinitions {
-    /// 定义在本轮内不变，加载时一次计算预算，普通请求和整理请求直接复用。
     fn new(messages: Vec<Message>, tools: Vec<app_core::ToolDefinition>) -> Self {
         let instructions = messages.iter().map(context::message_token_estimate).sum::<u64>();
         let tool_tokens = app_core::estimate_tool_tokens(&tools);
@@ -32,7 +27,6 @@ impl RequestDefinitions {
 }
 
 impl RequestContext {
-    /// 本轮首次请求前加载定义，后续请求复用。
     pub(super) async fn ensure_definitions(
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
@@ -46,7 +40,6 @@ impl RequestContext {
         Ok(())
     }
 
-    /// 读取本轮技能与工具目录，按本任务开着的模块组装模型收到的定义。
     pub(super) async fn load_definitions(
         &mut self,
         cancellation: &CancellationToken,
@@ -89,7 +82,6 @@ impl RequestContext {
         self.definitions.as_ref().expect("definitions are loaded before model requests")
     }
 
-    /// 组装并发送一次普通请求；输入 Token 估算与压缩判断共用同一规则。
     async fn request_response(
         &mut self,
         prepared: Option<PreparedContext>,
@@ -163,7 +155,6 @@ impl Agent {
         }
     }
 
-    /// 切模型超目标 90% 时先用旧模型预压；同模型达 90% 留尾 15% 自动压缩；超窗留末 1 平衡单元压前缀重发一次。
     pub(super) async fn generate_response(
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),

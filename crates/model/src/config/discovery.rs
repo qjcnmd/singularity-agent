@@ -1,5 +1,3 @@
-//! 从用户配置的提供方查询可用模型 ID。
-
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -31,13 +29,11 @@ fn discovery_client() -> Result<reqwest::Client, ProviderError> {
         .user_agent(app_core::identity::USER_AGENT)
         .build()
         .map_err(|error| {
-            // 客户端构造失败和请求失败是两回事：保留底层原因方便定位。
             configuration_error(format!("模型查询客户端无法启动（{}）。", transport_error_source(error)))
         })?;
     Ok(CLIENT.get_or_init(|| client).clone())
 }
 
-/// 查询提供方的模型 ID；调用方只提供编辑器里的取值、协议类型和解析好的凭据。
 pub async fn discover(
     base_url: &str,
     api_key: &str,
@@ -57,9 +53,6 @@ pub async fn discover(
     read_listing(&body)
 }
 
-/// 分两步读取响应：先按上限分块读字节，再解析 JSON，这样网络中断、超大响应和无效 JSON 能报成不同的错误。
-/// 直接用 Response::json 时，reqwest 把读取中断也算作解码错误（is_decode() 为 true），
-/// 两者分不开。
 async fn read_response_body(mut response: reqwest::Response) -> Result<Value, ProviderError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(discovery_transport_error)? {
@@ -74,7 +67,6 @@ async fn read_response_body(mut response: reqwest::Response) -> Result<Value, Pr
     })
 }
 
-/// 发现失败保留去掉 URL、截断后的原因；目录查询由用户手动重试。
 fn discovery_transport_error(error: reqwest::Error) -> ProviderError {
     ProviderError::new(
         ModelErrorKind::Temporary,
@@ -85,7 +77,6 @@ fn discovery_transport_error(error: reqwest::Error) -> ProviderError {
 fn read_listing(body: &Value) -> Result<Vec<String>, ProviderError> {
     let mut models = BTreeSet::new();
     let mut add_model = |id: &str, entry: &Value| {
-        // 格式不对或 ID 不合法的条目直接跳过，不让整次发现失败。
         if entry.is_object() && validate_identifier(id, "model id").is_ok() {
             models.insert(id.to_string());
         }
@@ -108,7 +99,6 @@ fn read_listing(body: &Value) -> Result<Vec<String>, ProviderError> {
 
 async fn discovery_http_error(response: reqwest::Response) -> ProviderError {
     let status = response.status().as_u16();
-    // 模型发现由用户手动触发，不自动重试，仍沿用与主调用一致的错误分类规则。
     let mut error = ProviderError::new(
         provider_error_kind_for_http_status(status),
         format!("获取模型失败：HTTP {status}。"),

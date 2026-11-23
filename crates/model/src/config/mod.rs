@@ -1,5 +1,3 @@
-//! 模型配置的读写、校验、模型发现与模型选择解析。
-
 mod discovery;
 pub(crate) mod manager;
 pub(crate) mod selection;

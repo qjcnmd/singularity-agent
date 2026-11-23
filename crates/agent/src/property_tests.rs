@@ -1,5 +1,3 @@
-//! 属性测试（Property-based Tests）：用随机输入验证上下文压缩切分、投影与会话日志尾行修复的通用不变量。
-
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
@@ -207,7 +205,6 @@ fn compaction_round_strategy() -> impl Strategy<Value = CompactionRoundInput> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// 多轮压缩切分与投影不变量：工具配对、retain_tokens==0 留最后 1 原子组、旧检查点不复活。
     #[test]
     fn compaction_split_and_multi_round_projection_invariants(
         rounds in prop::collection::vec(compaction_round_strategy(), 1..=4),
@@ -268,7 +265,6 @@ proptest! {
                 "kept tail must not start with an orphaned ToolResult"
             );
             if round.retain_tokens == 0 {
-                // 即使 retain_tokens == 0 也仅保留最后 1 个完整原子单元（首条消息 + 紧随的 ToolResult）。
                 let tail_after_first_is_only_tool_results = kept[1..].iter().all(|entry| {
                     matches!(entry, SessionEntry::Message { message: Message::ToolResult { .. }, .. })
                 });
@@ -311,8 +307,6 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// 会话日志尾行自愈不变量：任意合法会话末尾追加不含换行的任意残缺字节（含非法 UTF-8 / 残缺 JSON），
-    /// 只读打开与写者修复打开都必须完整保留全部已落盘记录，修复后再次打开无残留脏字节。
     #[test]
     fn session_file_tail_repair_invariance(
         user_texts in prop::collection::vec(unicode_seed_strategy(1, 48), 0..=5),
@@ -365,7 +359,6 @@ proptest! {
         );
     }
 
-    /// 任意随机字节内容绝不能使会话日志解析器 panic。
     #[test]
     fn session_file_never_panics_on_arbitrary_bytes(
         bytes in prop::collection::vec(any::<u8>(), 0..512),

@@ -14,7 +14,6 @@ export function MarkdownBody({ text, streaming = false }: { text: string; stream
   return <Streaming.Provider value={streaming}><RenderedMarkdown text={useStreamedText(text, streaming)} /></Streaming.Provider>
 }
 
-/** 只平滑正在输出的正文；历史、替换与终态直接显示完整文本。 */
 function useStreamedText(text: string, streaming: boolean) {
   const reducedMotion = useReducedMotion()
   const [visible, setVisible] = useState(text)
@@ -31,12 +30,9 @@ function useStreamedText(text: string, streaming: boolean) {
     const started = performance.now()
     let frame: number
     const reveal = (now: number) => {
-      // 把服务端成批到达的文字摊到 80ms 里送完，不一截一截跳出。
       const progress = Math.min(1, (now - started) / 80)
-      // 节流渲染频率，避免高刷屏每帧重新解析整段 Markdown。
       if (progress === 1 || now - lastPaint.current >= 50) {
         let end = start + Math.ceil((text.length - start) * progress)
-        // 不在 UTF-16 代理对中间截断 emoji 等字符。
         const previous = text.charCodeAt(end - 1)
         if (end < text.length && previous >= 0xd800 && previous <= 0xdbff) end += 1
         shown.current = text.slice(0, end)
@@ -94,14 +90,11 @@ function MarkdownTable({ children }: { children?: ReactNode }) {
 
 function MarkdownLink({ href, children }: { href?: string; children?: ReactNode }) {
   const selectionGuard = useSelectionGuard()
-  // 打开链接仍由 Chromium 的原生行为处理（包括键盘和修饰键点击）；这里只拦下拖选文字后的误点。
   return <a href={href} target="_blank" rel="noreferrer" {...selectionGuard()}><StreamText>{children}</StreamText></a>
 }
 
-/** 行内代码里的相对路径按这个目录解析；为空时用当前任务的工作目录。文件栏里的 Markdown 用文件自己所在的目录。 */
 export const PathBase = createContext<string | null>(null)
 
-// 带目录的文件、常见扩展名或隐藏文件；支持中文和空格，可带 :行号:列号。属性访问如 state.session 不算。
 const pathLike = /^(?:(?:~|[A-Za-z]:|\.{1,2})[\\/]|[\\/]|[\p{L}\p{M}\p{N}_.@+() -]+[\\/])(?:[\p{L}\p{M}\p{N}_.@+() -]+[\\/])*(?:\.[\p{L}\p{M}\p{N}_.@+() -]+|[\p{L}\p{M}\p{N}_.@+() -]+\.[A-Za-z0-9]{1,10})(?::\d+){0,2}$/u
 const fileNameLike = /^(?:\.[\p{L}\p{M}\p{N}_.@+() -]+|[\p{L}\p{M}\p{N}_.@+() -]+\.(?:md|markdown|txt|json|jsonc|toml|ya?ml|ts|tsx|js|jsx|mjs|cjs|rs|py|go|java|c|h|cpp|css|html|sh|ps1|lock|env))(?::\d+){0,2}$/iu
 
@@ -135,7 +128,6 @@ function StreamingText({ text }: { text: string }) {
   const pending = prefix.length < text.length
   useEffect(() => {
     if (!pending) return
-    // 每批至少显示完整的渐显时长；后续文字到达不会重置这一批的计时。
     const batch = latest.current
     const timer = setTimeout(() => setSettled(batch), streamFadeMs)
     return () => clearTimeout(timer)
@@ -179,7 +171,6 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   const body = language ? <HighlightedCode code={text} language={language} /> : <pre><code><StreamText>{text}</StreamText></code></pre>
   const block = <div className="code-block"><div className="code-block-header"><span>{language || '代码'}</span><CopyButton text={text} label="复制代码" /></div>{body}</div>
   if (props?.className?.split(' ').includes('language-math')) return <MathSource>{block}</MathSource>
-  // 流式输出时代码还不完整，先显示代码，回复完成后再画图。
   return language === 'mermaid' && !streaming ? <MermaidDiagram code={text} fallback={block} /> : block
 }
 

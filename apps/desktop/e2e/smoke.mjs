@@ -1,14 +1,3 @@
-/**
- * Singularity 桌面端 Electron + Playwright 常驻 E2E 冒烟套件。
- *
- * 保留标准：只覆盖必须依赖真实 Chromium + Electron 主进程 + React 渲染与状态同步的核心用户路径；
- * 不重复验证后端状态机细节，也不绑定脆弱的内部样式类名。
- *
- * 用法：
- *   npm --prefix apps/desktop run test:e2e
- *   node apps/desktop/e2e/smoke.mjs --exe=C:/Users/.../Desktop/Singularity/Singularity.exe
- *   node apps/desktop/e2e/smoke.mjs --packaged=C:/Users/.../Desktop/Singularity/Singularity.exe
- */
 
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
@@ -51,7 +40,6 @@ function createIsolatedEnv(baseUrl) {
   mkdirSync(home, { recursive: true })
   mkdirSync(workspace, { recursive: true })
 
-  // 准备工作区示例文件与项目技能，供文件栏与管理页验证。
   writeFileSync(join(workspace, 'readme.md'), '# E2E Sample\n\nWORKSPACE_FILE_BODY\n', 'utf8')
   const skillDir = join(workspace, '.singularity', 'skills', 'e2e-skill')
   mkdirSync(skillDir, { recursive: true })
@@ -163,7 +151,6 @@ async function runPackagedSmoke(page, mock) {
 }
 
 async function runFullSmoke(page, mock) {
-  // 1. 冷启动、富文本（公式/Mermaid/工具卡片）渲染（含 reducedMotion）与刷新还原。
   console.log('  [1/4] cold start, rich rendering (KaTeX + Mermaid + tool card) & reload recovery')
   await page.emulateMedia({ reducedMotion: 'reduce' })
   mock.enqueue(
@@ -197,7 +184,6 @@ async function runFullSmoke(page, mock) {
   const mermaidBox = await page.locator('.mermaid-diagram svg').first().boundingBox()
   assert.ok(mermaidBox && mermaidBox.width > 40 && mermaidBox.height > 20, 'Mermaid SVG must have non-zero size under reducedMotion')
 
-  // 点击消息里的工作区文件链接，顺带验证右侧只读文件栏打开与关闭。
   await page.getByRole('link', { name: 'readme.md' }).first().click()
   const filePanel = page.getByRole('complementary', { name: '文件' })
   await filePanel.waitFor({ state: 'visible', timeout: 10_000 })
@@ -205,11 +191,9 @@ async function runFullSmoke(page, mock) {
   await filePanel.getByRole('button', { name: '关闭 readme.md' }).click()
   await filePanel.waitFor({ state: 'hidden', timeout: 10_000 })
 
-  // 刷新窗口（Ctrl+R 等价）后历史与渲染完整还原。
   await page.reload()
   await page.getByText('RICH_RENDER_MARKER').waitFor({ state: 'visible', timeout: 20_000 })
 
-  // 2. 多会话不串流、运行中点停止、提问面板、报错后恢复续聊与 UI 删除会话。
   console.log('  [2/4] multi-session isolation, stop, question panel, error recovery & session delete')
   const gateABeforeDelta = createGate()
   const gateAHoldAfterDelta = createGate()
@@ -228,7 +212,6 @@ async function runFullSmoke(page, mock) {
   await submitPrompt(page, 'long task on session A')
   await page.getByRole('button', { name: '停止当前回合' }).waitFor({ state: 'visible', timeout: 15_000 })
 
-  // 会话 A 运行期间新建并运行会话 B；在会话 B 聚焦期间真实推送会话 A 的文本增量，验证绝不串流。
   mock.enqueue(
     messagesTextEvents({ text: 'SESSION_B_CLEAN_REPLY' }),
     { matchText: 'quick task on session B' },
@@ -241,14 +224,12 @@ async function runFullSmoke(page, mock) {
   await page.waitForTimeout(150)
   assert.equal(await page.getByText('SESSION_A_STREAM_SHOULD_NOT_LEAK').count(), 0, 'session A text must not leak into session B')
 
-  // 切回仍在运行中的会话 A（侧栏必须显示“正在运行”状态）并点停止按钮。
   await page.getByRole('button', { name: /正在运行/ }).first().click()
   await page.getByRole('button', { name: '停止当前回合' }).waitFor({ state: 'visible', timeout: 10_000 })
   await page.getByRole('button', { name: '停止当前回合' }).click()
   gateAHoldAfterDelta.release()
   await waitForIdle(page)
 
-  // 提问面板：触发 ask_user_question -> 选择选项并提交 -> 继续完成回复。
   mock.enqueue(
     messagesToolEvents({
       calls: [
@@ -276,7 +257,6 @@ async function runFullSmoke(page, mock) {
   await questionForm.getByRole('button', { name: /提交|发送|确认/ }).click()
   await page.getByText('QUESTION_ANSWER_CONFIRMED').waitFor({ state: 'visible', timeout: 15_000 })
 
-  // 模型报错展示与恢复续聊：上游返回不可重试错误后界面展示错误并回到可发送态，续发可正常恢复。
   mock.enqueueError(400, {
     error: { code: 'insufficient_quota', message: 'E2E_SIMULATED_QUOTA_ERR' },
   })
@@ -287,7 +267,6 @@ async function runFullSmoke(page, mock) {
   await submitPrompt(page, 'recover after api error')
   await page.getByText('RECOVERED_AFTER_UI_ERROR').waitFor({ state: 'visible', timeout: 15_000 })
 
-  // UI 删除会话：右键侧栏任务 -> 删除任务 -> 确认后从侧栏消失且主区不残留。
   const sessionRows = page.locator('.session-row')
   const countBeforeDelete = await sessionRows.count()
   assert.ok(countBeforeDelete >= 2, 'expected at least 2 sessions before UI delete')
@@ -303,12 +282,10 @@ async function runFullSmoke(page, mock) {
     { timeout: 10_000 },
   )
 
-  // 3. 草稿持久化（IndexedDB）与主题视图状态刷新恢复。
   console.log('  [3/4] draft persistence & theme persistence across reload')
   await page.getByRole('button', { name: '新建任务', exact: true }).click()
   const composer = page.getByLabel('任务说明')
   await composer.fill('UNSENT_DRAFT_SURVIVES_RELOAD')
-  // 等待草稿 250ms 防抖写入 IndexedDB。
   await page.waitForTimeout(450)
   await page.locator('.session-main').first().click()
   await page.getByRole('button', { name: '新建任务', exact: true }).click()
@@ -322,7 +299,6 @@ async function runFullSmoke(page, mock) {
   assert.equal(await page.getByLabel('任务说明').inputValue(), 'UNSENT_DRAFT_SURVIVES_RELOAD')
   assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'dark')
 
-  // 4. 设置（模型编辑不泄露且保留密钥）与管理页（自定义指令 / Skills / MCP）。
   console.log('  [4/4] settings provider save & manage pages (instructions / skills / mcp)')
   await page.getByRole('button', { name: '设置' }).click()
   const settingsDialog = page.getByRole('dialog', { name: '设置' })

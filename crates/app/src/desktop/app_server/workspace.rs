@@ -1,5 +1,3 @@
-//! 项目登记、按项目分组任务，以及移除项目时释放相关资源。
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -15,7 +13,6 @@ impl AppServer {
         self.bootstrap_with_catalog(catalog)
     }
 
-    /// 调用方持有发布锁，读取配置、生成快照和取得事件序号不会与保存配置交错。
     pub(super) fn bootstrap_with_catalog(
         &self,
         model_catalog: RedactedModelCatalog,
@@ -111,7 +108,6 @@ impl AppServer {
         })
     }
 
-    /// 新建任务页的上下文胶囊：不连接 MCP 服务器，只读取指令、技能目录和已有连接的状态。
     pub(crate) fn context_preview(
         &self,
         workspace_root: &str,
@@ -124,7 +120,6 @@ impl AppServer {
         Ok(agent::agent::modules::preview(&root, instructions, skills, servers))
     }
 
-    /// 全局指令是应用数据目录下的 AGENTS.md，项目指令是项目根目录下的 AGENTS.md；文件不存在时内容为空。
     pub(crate) fn read_instructions(
         &self,
         workspace_root: Option<&str>,
@@ -141,7 +136,6 @@ impl AppServer {
         })
     }
 
-    /// 保存后在下一轮任务开始时生效；先写临时文件再替换，读取方不会看到写了一半的内容。
     pub(crate) fn save_instructions(
         &self,
         workspace_root: Option<&str>,
@@ -157,8 +151,6 @@ impl AppServer {
     }
 }
 
-/// 按会话日志里记录的工作目录把任务分到已登记的项目；项目登记不保存任务列表，
-/// 每次读取都重新分组。不属于任何项目的任务不显示。
 fn group_threads(
     workspaces: &[Workspace],
     threads: Vec<ThreadSummary>,

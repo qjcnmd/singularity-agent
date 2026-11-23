@@ -1,9 +1,3 @@
-//! 上下文模块：每个模块自带提示词片段、工具定义和估算 Token，任务创建时可以关掉其中一部分。
-//!
-//! 模块之间没有引用：基础模块不提任何可选工具，各工具的一行用法跟着工具走；
-//! 一个模块关闭，它的提示词和工具一起消失。新建任务页的胶囊、运行状态面板和每轮请求
-//! 都由 `Assembly` 一处生成，数字和实际发送的内容一致。
-
 use std::sync::Arc;
 
 use app_core::skills::SkillCatalog;
@@ -27,8 +21,6 @@ const QUESTION: &str = "ask-user-question";
 pub(super) const SKILLS_MODULE_ID: &str = "skills";
 pub(super) const MCP_PREFIX: &str = "mcp:";
 
-/// 所有 MCP 服务器统一采用按工具粒度的延迟加载：仅在 Developer 指令注入紧凑摘要，
-/// 通过固定的 `mcp_schema` / `mcp_call` 代理按需读取单个或多个目标工具的参数定义并调用。
 const MCP_SUMMARY_MAX_CHARS: usize = 120;
 
 fn mcp_proxy_tokens() -> u64 {
@@ -76,7 +68,6 @@ fn mcp_module_id(server_id: &str) -> String {
     format!("{MCP_PREFIX}{server_id}")
 }
 
-/// 组装一次请求前需要的外部输入。
 pub(crate) struct ModuleInputs<'a> {
     pub cwd: &'a str,
     pub instructions: Vec<InstructionFile>,
@@ -86,19 +77,15 @@ pub(crate) struct ModuleInputs<'a> {
     pub disabled: &'a [String],
 }
 
-/// 一轮请求的全部定义：Developer 与文件指令消息、工具、模块清单。
 pub(crate) struct Assembly {
     pub messages: Vec<Message>,
     pub registry: ToolRegistrySnapshot,
     pub modules: Vec<ContextModule>,
 }
 
-/// 收集每个模块的内容。模块清单包含关掉的模块，让页面显示完整胶囊；只有开着的模块
-/// 向请求贡献提示词和工具。
 struct Collector<'a> {
     disabled: &'a [String],
     modules: Vec<ContextModule>,
-    /// 开着的模块按顺序提供的 Developer 片段。
     developer: Vec<String>,
 }
 
@@ -137,7 +124,6 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
     let mut file_messages = Vec::new();
     let mut tool_guidelines = Vec::new();
 
-    // 指令：系统提示词在下面统一生成（要等工具用法收齐），先占位保证胶囊顺序。
     let system_index = collector.modules.len();
     collector.push(
         SYSTEM_PROMPT,
@@ -172,7 +158,6 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         }
     }
 
-    // 工具：bash 和后台命令锁定；其他内置工具各自一个模块。
     let bash = tools::bash_tool();
     let task_tools = tools::task_tools();
     collector.push(
@@ -231,7 +216,6 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         }
     }
 
-    // Skills：目录提示加 skill 工具，不依赖 read 和 bash。
     let skill_prompt = skills.prompt();
     let skill_tokens = estimate_tokens_of(&skill_prompt) + estimate_tool_tokens([&tools::skill_schema()]);
     let skill_detail = if skill_prompt.is_empty() {
@@ -252,8 +236,6 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         registry.set_skills(Arc::new(skills));
     }
 
-    // MCP：每个服务器一个独立开关模块，本任务关掉的服务器不连接；
-    // 所有已连接 MCP 统一延迟加载，仅注入精简摘要，由固定的 `mcp_schema` / `mcp_call` 按工具粒度按需访问。
     if let Some(error) = mcp.error {
         collector.developer.push(format!("Unavailable MCP configuration:\n{error}"));
     }
@@ -307,8 +289,6 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
     }
 }
 
-/// 新建任务页的胶囊清单：指令和技能按当前项目读取，工具是固定的，MCP 服务器取自
-/// 已有连接留下的状态，不连接服务器。口径与 `assemble` 相同，全部开着。
 pub fn preview(
     cwd: &str,
     instructions: Vec<InstructionFile>,
@@ -376,8 +356,6 @@ fn mcp_server_detail(error: Option<&str>, tool_names: impl Iterator<Item = impl 
     }
 }
 
-/// 生成 Developer 指令；`tool_guidelines` 是本任务开着的工具模块各自提供的一行用法，
-/// 文件指令和技能列表由请求组装代码另外添加。
 fn assemble_developer_instructions(cwd: &str, tool_guidelines: &[&str]) -> String {
     let mut guidelines = String::new();
     for line in tool_guidelines {
@@ -386,8 +364,6 @@ fn assemble_developer_instructions(cwd: &str, tool_guidelines: &[&str]) -> Strin
         guidelines.push('\n');
     }
     let app_name = app_core::identity::APP_NAME;
-    // 写明平台和 shell，否则模型可能在 Git Bash 里写 cmd 语法（如 `cd /d`、`2>nul`），
-    // 输出被重定向丢掉。
     format!(
         "You are an expert coding assistant operating inside {app_name}, a coding agent \
              harness. You help users by reading files, executing commands, editing code, and \
@@ -404,7 +380,6 @@ fn assemble_developer_instructions(cwd: &str, tool_guidelines: &[&str]) -> Strin
 }
 
 fn file_instruction_message(instructions: &str) -> Message {
-    // 转义正文里的结束标签，否则模型会以为指令在那里结束。
     let instructions = instructions.replace("</file-instructions>", "<\\/file-instructions>");
     Message::user(format!(
         "<file-instructions>\nThese global and project file instructions apply to the current workspace. More specific files take precedence. Direct user instructions take precedence over these file instructions.\n{instructions}\n</file-instructions>"

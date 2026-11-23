@@ -26,15 +26,22 @@ export function formatCapacityInput(value: number | null): string {
 
 type ReasoningConfiguration = Pick<ModelConfigurationInput, 'reasoningVariants'>
 
+export function isConfigurationIdentifier(value: string): boolean {
+  if (value === '' || /\s/.test(value)) return false
+  for (const character of value) {
+    const code = character.charCodeAt(0)
+    if (code <= 0x1f || code === 0x7f) return false
+  }
+  return true
+}
+
 function supportsThinkingToggle(protocol: ProviderApiProtocol): boolean {
   return protocol === 'messages'
 }
 
-/** 模型弹窗和提供方保存共用思考选项规则，切换协议后也能直接指出不适用的档位。 */
 export function reasoningConfigurationError(model: ReasoningConfiguration, protocol: ProviderApiProtocol): string | null {
   const declared = model.reasoningVariants ?? []
-  // oxlint-disable-next-line no-control-regex
-  if (declared.some(variant => !variant || /[\s\x00-\x1f\x7f]/.test(variant))) return '思考档位无效，请取消选择此档位。'
+  if (declared.some(variant => !isConfigurationIdentifier(variant))) return '思考档位无效，请取消选择此档位。'
   if (new Set(declared).size !== declared.length) return '思考选项不能重名。'
   if (protocol === 'responses' && declared.includes('on')) return 'Responses 须选择具体思考档位，不支持 on 开关。'
   return null
@@ -49,7 +56,6 @@ export function blankModel(): ModelConfigurationInput {
   }
 }
 
-/** 只提供能发送的开关；不适用的已选值仍显示，供用户取消并修正配置。 */
 export function reasoningOptionsFor(model: ReasoningConfiguration, protocol: ProviderApiProtocol): string[] {
   const supportsToggle = supportsThinkingToggle(protocol)
   const variants = model.reasoningVariants ?? []

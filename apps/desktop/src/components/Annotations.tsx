@@ -72,7 +72,6 @@ function computeBadgeLeft(range: Range, lead: DOMRect, docRect: DOMRect): number
   return Math.max(4, Math.min(rightEdge - docRect.left - 3, docRect.width - 20))
 }
 
-/** 会话区划词批注：两步浮层、CSS Custom Highlight 高亮、编号角标与跳转定位。 */
 export function useConversationAnnotations({ sessionId, itemIdentity, surfaceRef, viewportRef, documentRef, onJumpAnchor }: HookProps) {
   const state = useAppStore(['drafts'], (a, b) =>
     (a.drafts === null) === (b.drafts === null)
@@ -191,7 +190,6 @@ export function useConversationAnnotations({ sessionId, itemIdentity, surfaceRef
     if (editor?.mode === 'edit' && !annotations.some(item => item.id === editor.annotationId)) setEditor(null)
   }, [annotations, editor])
 
-  // 布局、Shiki 异步高亮、横向滚动与窗口尺寸变化时同步坐标。
   useEffect(() => {
     const doc = documentRef.current
     const viewport = viewportRef.current
@@ -219,7 +217,6 @@ export function useConversationAnnotations({ sessionId, itemIdentity, surfaceRef
     }
   }, [documentRef, viewportRef, sessionId, scheduleRecompute])
 
-  // 划词监听（不抢焦点）与点击已有高亮正文打开编辑。
   useEffect(() => {
     const doc = documentRef.current
     if (!doc) return
@@ -264,7 +261,6 @@ export function useConversationAnnotations({ sessionId, itemIdentity, surfaceRef
     }
   }, [documentRef, sessionId])
 
-  // 浮层挂载后按实际高度纠偏并自动聚焦（含跳转滚入视口后的延迟挂载）；外部点击或 Esc 关闭。
   const editorKey = editor ? (editor.mode === 'create' ? 'create' : editor.annotationId) : null
   const popoverMounted = popoverCoords !== null
   useLayoutEffect(() => {
@@ -292,7 +288,6 @@ export function useConversationAnnotations({ sessionId, itemIdentity, surfaceRef
     return () => { document.removeEventListener('pointerdown', onOutside, true); document.removeEventListener('keydown', onKey) }
   }, [editor])
 
-  // 响应输入区汇总条与已发批注的跳转定位请求。
   useEffect(() => subscribeAnnotationJump(target => {
     const doc = documentRef.current
     const viewport = viewportRef.current
@@ -401,7 +396,6 @@ export function useConversationAnnotations({ sessionId, itemIdentity, surfaceRef
   return { badgeLayer, floatingPopover }
 }
 
-/** 输入卡片顶部的待发送批注汇总条。 */
 export function DraftAnnotationsTray({ annotations, remove, clear }: { annotations: DraftAnnotation[]; remove: (id: string) => void; clear: () => void }) {
   const [expanded, setExpanded] = useState(false)
   useEffect(() => { if (annotations.length === 0) setExpanded(false) }, [annotations.length])
@@ -436,7 +430,6 @@ export function DraftAnnotationsTray({ annotations, remove, clear }: { annotatio
   )
 }
 
-/** 用户消息气泡正上方的已发送批注轻胶囊；有正文时默认折叠，纯批注消息默认展开。 */
 export function SentAnnotations({ annotations, defaultExpanded = false }: { annotations: MessageAnnotation[]; defaultExpanded?: boolean }) {
   const [expanded, setExpanded] = useState(defaultExpanded)
   if (annotations.length === 0) return null

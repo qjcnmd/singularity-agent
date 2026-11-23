@@ -1,9 +1,6 @@
-//! MCP 服务器配置、连接状态与设置 RPC 的参数类型。
-
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 
-/// 文件与设置接口共用的 MCP 连接配置；省略的参数、环境变量和请求头按空值处理。
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -64,7 +61,6 @@ pub struct McpServerInput {
     pub transport: McpTransportConfig,
 }
 
-/// 按项目目录读取配置和已有连接状态。
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -96,7 +92,6 @@ pub struct McpToolInfo {
     pub description: String,
 }
 
-/// 区分未启动、正在连接与失败；查看状态不会启动服务器。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -110,12 +105,10 @@ pub enum McpConnectionStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-/// 一台服务器的配置、当前连接状态和最近发现的工具。
 pub struct McpServerState {
     pub server: McpServerInput,
     pub status: McpConnectionStatus,
     pub error: Option<String>,
     pub tools: Vec<McpToolInfo>,
-    /// 最近一次发现后，这台服务器的说明或失败提示在请求里的估算 Token 数；未连接过为 0。
     pub tokens: u64,
 }

@@ -3,7 +3,7 @@ import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import { formatTokenCount } from '../copy'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import type { ProviderConfigurationInput, RedactedProvider } from '../protocol'
-import { blankModel, capacityConfigurationError, reasoningConfigurationError } from '../modelConfiguration'
+import { blankModel, capacityConfigurationError, isConfigurationIdentifier, reasoningConfigurationError } from '../modelConfiguration'
 import { ModelEditor } from './ModelEditor'
 import { Dialog } from './Dialog'
 import { ProtocolPicker } from './ProtocolPicker'
@@ -36,7 +36,6 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
     setCandidates(null)
     setFailure(null)
     if (!active) setModelEditor(null)
-    // 收起动画仍保留组件；关闭编辑器时就丢弃未返回的查询。
     return () => { discoveryRevision.current += 1 }
   }, [providerId, protocol, baseUrl, apiKey, active])
   const saveError = state.actionErrors[origin]
@@ -86,8 +85,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
     event.preventDefault()
     setFailure(null)
     appStore.clearError(origin)
-    // oxlint-disable-next-line no-control-regex
-    if (!/^[^\s\x00-\x1f\x7f]+$/.test(providerId.trim())) {
+    if (!isConfigurationIdentifier(providerId.trim())) {
       setFailure('请输入不含空白和控制字符的提供方 ID。')
       return
     }
@@ -214,6 +212,5 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
 
 function invalidModelId(models: ModelInput[], index: number | null, value: string): boolean {
   const id = value.trim()
-  // oxlint-disable-next-line no-control-regex
-  return !id || /[\s\x00-\x1f\x7f]/.test(id) || models.some((model, at) => at !== index && model.modelId.trim() === id)
+  return !isConfigurationIdentifier(id) || models.some((model, at) => at !== index && model.modelId.trim() === id)
 }

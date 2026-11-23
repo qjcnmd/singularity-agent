@@ -1,5 +1,3 @@
-//! 持有进程、作业对象和输出，前台转后台时整体转交，不重新启动命令。
-
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -60,14 +58,14 @@ pub(super) struct Process {
 
 impl Process {
     pub(super) fn persist_output(&mut self) {
-        run_blocking_in_place(|| self.model_capture.persist());
+        tokio::task::block_in_place(|| self.model_capture.persist());
     }
 
     fn ingest(&mut self, chunk: &OutputChunk) {
         self.capture.ingest(&chunk.display);
         let force_spill = self.capture.is_truncated() && !self.model_capture.has_spill();
         if force_spill || self.model_capture.will_write_disk(&chunk.model) {
-            run_blocking_in_place(|| {
+            tokio::task::block_in_place(|| {
                 self.model_capture.ingest(&chunk.model);
                 if force_spill {
                     self.model_capture.persist();
@@ -85,14 +83,7 @@ impl Process {
         let (mut child, started, timeout) = tokio::task::spawn_blocking(move || {
             let shell = bash_path()?;
             let started = Instant::now();
-            let timeout = timeout_ms
-                .map(|ms| {
-                    started
-                        .checked_add(Duration::from_millis(ms))
-                        .map(|deadline| (deadline, ms))
-                        .ok_or_else(|| format!("timeout_ms is out of range: {ms}"))
-                })
-                .transpose()?;
+            let timeout = timeout_ms.map(|ms| (started + Duration::from_millis(ms), ms));
             let mut command = Command::new(&shell);
             command
                 .args(["-c", &command_text])
@@ -137,7 +128,6 @@ impl Process {
                 ms = wait_deadline(self.timeout) => return ProcessEvent::Finished(Outcome::Failed(format!(
                     "Command timed out after {ms} ms and was terminated"
                 ))),
-                // 先等主进程；finish 再终止并等待整棵进程树。
                 status = self.child.inner_mut().wait() => return ProcessEvent::Finished(match status {
                     Ok(status) => match status.code() {
                         Some(code) => Outcome::Exited(code),
@@ -169,7 +159,6 @@ impl Process {
         self.model_capture.snapshot()
     }
 
-    /// 回收整树后才给出终态；主进程正常退出也不能遗留后代。
     pub(super) async fn finish(
         mut self,
         mut outcome: Outcome,
@@ -224,7 +213,6 @@ impl Process {
     }
 }
 
-/// 模型与界面共享结束原因和截断提示规则，只使用各自的捕获正文与同一份溢写文件说明。
 fn finished_output(
     mut content: String,
     spill_note: Option<&str>,
@@ -256,16 +244,6 @@ async fn wait_deadline(timeout: Option<(Instant, u64)>) -> u64 {
             ms
         }
         None => std::future::pending().await,
-    }
-}
-
-fn run_blocking_in_place<R>(f: impl FnOnce() -> R) -> R {
-    if tokio::runtime::Handle::try_current()
-        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-    {
-        tokio::task::block_in_place(f)
-    } else {
-        f()
     }
 }
 

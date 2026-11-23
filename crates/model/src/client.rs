@@ -1,5 +1,3 @@
-//! 协议无关的模型客户端入口：按提供方协议分发到 Messages 或 Responses 编码器与流解码器。
-
 use std::fmt::Write as _;
 
 use protocol::ProviderApiProtocol;
@@ -18,7 +16,6 @@ use crate::transport::http::{
 use crate::transport::{provider_client, provider_future, retry_after_delay};
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
 
-/// 调用方（`agent` / `app`）唯一面向的模型客户端抽象。
 pub struct ModelClient {
     config: ProviderConfig,
     selected_model: SelectedModel,
@@ -39,7 +36,6 @@ impl std::fmt::Debug for ModelClient {
 }
 
 impl ModelClient {
-    /// 读取当前模型配置并构造本轮使用的协议客户端。
     pub fn new(
         models: &ModelConfigManager,
         selection: &protocol::ModelSelection,
@@ -49,7 +45,6 @@ impl ModelClient {
         Ok(Self { config, selected_model, client })
     }
 
-    /// 本次所选模型的上下文窗口和最大输出，用于输出预算和压缩判断。
     pub fn model_configuration(&self) -> ModelConfigurationSnapshot {
         ModelConfigurationSnapshot {
             max_context_tokens: self.selected_model.max_context_tokens,
@@ -57,17 +52,14 @@ impl ModelClient {
         }
     }
 
-    /// 提供方名称，写进请求记录与诊断日志。
     pub fn provider_name(&self) -> &str {
         &self.config.provider_name
     }
 
-    /// 模型名称，写进请求记录与诊断日志。
     pub fn model_name(&self) -> &str {
         &self.selected_model.model_name
     }
 
-    /// 发送一次流式请求并返回已校验的回复和实际用量；请求记录、计时和重试由调用方负责。
     pub async fn complete_stream(
         &self,
         request: &ModelTurnRequest,
@@ -175,7 +167,6 @@ impl ModelClient {
                 return error;
             }
         };
-        // 已知错误码或错误类型比 HTTP 状态更准确，例如 400 里的上下文超限需要触发压缩。
         apply_provider_error_body(&mut error, &body);
         error
     }

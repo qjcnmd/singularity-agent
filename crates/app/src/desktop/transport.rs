@@ -1,5 +1,3 @@
-//! Electron 与后端之间的按行 JSON 管道传输，通过 `id` 关联请求与响应。
-
 use std::sync::Arc;
 
 use protocol::{RpcError, RpcRequest, StreamEvent};
@@ -40,7 +38,6 @@ pub(crate) async fn run(
 ) -> Result<(), String> {
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(STDOUT_WRITER_CAPACITY);
-    // 独立有界写任务隔离 stdout 背压，合并队列中已就绪的帧以减少无缓冲 stdout 的阻塞写次数。
     let writer = tokio::spawn(async move {
         let mut output = tokio::io::stdout();
         while let Some(mut bytes) = writer_rx.recv().await {
@@ -107,7 +104,6 @@ pub(crate) async fn run(
         Ok(())
     }
     .await;
-    // EOF 或管道故障都结束接收；先取消目录查询、收齐已接受的修改，再停止会话。
     shutdown.cancel();
     while let Some(joined) = requests.join_next().await {
         let _ = joined.expect("accepted RPC task completes before shutdown");

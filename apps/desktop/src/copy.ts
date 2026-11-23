@@ -1,6 +1,5 @@
 import type { SessionPhase, ToolStatus, TurnStatus, Workspace } from './protocol'
 
-/** 项目路径由后端统一为正斜杠；盘符根目录直接显示完整路径。 */
 export function workspaceName(workspace: Workspace): string {
   return workspace.root.slice(workspace.root.lastIndexOf('/') + 1) || workspace.root
 }

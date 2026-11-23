@@ -1,5 +1,3 @@
-//! `read` 工具：读取文本文件（支持按 `offset` 和 `limit` 分页）；图片文件由 `view_image` 负责。
-
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -122,7 +120,6 @@ fn execute_reader(
                 Err(error) => return error_result(format!("Could not read file: {path}. {error}")),
             }
         }
-        // 超出展示预算就返回，不必读取整行；额外四字节覆盖截点处的 UTF-8 字符。
         let mut line_reader = std::io::Read::take(&mut *reader, (DEFAULT_MAX_BYTES + 4) as u64);
         let line = match read_line_bytes(&mut line_reader) {
             Ok(Some(line)) => line,
@@ -135,12 +132,9 @@ fn execute_reader(
             return error_result(ABORTED_MESSAGE);
         }
         line_number += 1;
-        // 展示预算按实际发回的文本来算：非法 UTF-8 字节被替换成 U+FFFD 后会变长，
-        // 若按原始字节数计算，就可能发出超过预算的正文。
         let text = String::from_utf8_lossy(&line);
         let next_bytes = state.selected_bytes + text.len() + usize::from(!state.selected.is_empty());
         if next_bytes > DEFAULT_MAX_BYTES {
-            // 已有完整行留待下一页；首行本身超预算时展示不完整的前缀。
             if state.selected.is_empty() {
                 let prefix = &text[..text.floor_char_boundary(DEFAULT_MAX_BYTES)];
                 state.selected.push(format!("{prefix}…[truncated]"));
@@ -152,7 +146,6 @@ fn execute_reader(
         state.selected.push(text.into_owned());
         state.selected_bytes = next_bytes;
         if state.selected.len() >= user_line_limit {
-            // 收满 limit 就停：这时只需确认文件后面还有没有内容，不必一直扫到 EOF。
             state.selected_truncated = match reader.fill_buf() {
                 Ok(remaining) => !remaining.is_empty(),
                 Err(error) => return error_result(format!("Could not read file: {path}. {error}")),
@@ -174,7 +167,6 @@ fn execute_reader(
     ToolExecution::text(output_text).with_read_source(read_source(start_line_display, &state))
 }
 
-/// 读取下一行字节，剥掉换行与 CRLF 的 CR；EOF 返回 None。
 fn read_line_bytes(reader: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>> {
     let mut bytes = Vec::new();
     if reader.read_until(b'\n', &mut bytes)? == 0 {
@@ -189,7 +181,6 @@ fn read_line_bytes(reader: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>
     Ok(Some(bytes))
 }
 
-/// read 实际读到的源文件范围；起始行和正文行数在这里算好，说明文字不计入正文行数。
 fn read_source(start_line_display: usize, state: &ReadState) -> protocol::ReadSource {
     protocol::ReadSource {
         start_line: start_line_display as u64,
