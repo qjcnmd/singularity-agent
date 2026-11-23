@@ -80,15 +80,15 @@ impl ModelClient {
             ProviderApiProtocol::Messages => {
                 let endpoint = endpoint(&self.config.base_url, "/messages");
                 messages_stream_request_payload(request, selection, provider_name, &endpoint)
-                    .map(|enc| (endpoint, enc.payload, Some(enc.prefix_digest), enc.effective_reasoning))
+                    .map(|enc| (endpoint, enc.payload, Some(enc.prefix_digest)))
             }
             ProviderApiProtocol::Responses => {
                 let endpoint = endpoint(&self.config.base_url, "/responses");
                 openai_responses_stream_request_payload(request, selection, provider_name, &endpoint)
-                    .map(|payload| (endpoint, payload, None, selection.reasoning_variant.clone()))
+                    .map(|payload| (endpoint, payload, None))
             }
         };
-        let (endpoint, payload, prefix_digest, effective_reasoning) = match encoded {
+        let (endpoint, payload, prefix_digest) = match encoded {
             Ok(encoded) => encoded,
             Err(error) => {
                 return ModelTurnResponse::failed(
@@ -116,7 +116,6 @@ impl ModelClient {
                     selection,
                     &endpoint,
                     prefix_digest,
-                    effective_reasoning,
                 )
                 .await
             }

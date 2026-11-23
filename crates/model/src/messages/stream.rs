@@ -17,7 +17,6 @@ use crate::types::{
     ProviderBlockMetadata, ProviderMessageMetadata,
 };
 
-#[expect(clippy::too_many_arguments, reason = "internal Messages SSE stream adapter")]
 pub(crate) async fn read_messages_sse_stream(
     cancellation: &CancellationToken,
     response: reqwest::Response,
@@ -26,11 +25,10 @@ pub(crate) async fn read_messages_sse_stream(
     selection: &SelectedModel,
     endpoint: &str,
     prefix_digest: Option<String>,
-    effective_reasoning: Option<String>,
 ) -> ModelTurnResponse {
     let mut decoder = MessagesSseDecoder::new(on_event);
     let result = read_sse_stream(cancellation, response, &mut decoder).await;
-    decoder.finish(result, config, selection, endpoint, prefix_digest, effective_reasoning)
+    decoder.finish(result, config, selection, endpoint, prefix_digest)
 }
 
 #[cfg(test)]
@@ -50,7 +48,7 @@ pub(crate) fn decode_messages_events_for_test(
             break;
         }
     }
-    decoder.finish(result, config, selection, endpoint, None, selection.reasoning_variant.clone())
+    decoder.finish(result, config, selection, endpoint, None)
 }
 
 enum MessagesBlock {
@@ -324,7 +322,6 @@ impl<'a> MessagesSseDecoder<'a> {
         selection: &SelectedModel,
         endpoint: &str,
         prefix_digest: Option<String>,
-        effective_reasoning: Option<String>,
     ) -> ModelTurnResponse {
         let stop_reason = result.and_then(|()| {
             if !self.completed {
@@ -416,7 +413,7 @@ impl<'a> MessagesSseDecoder<'a> {
             model_name: selection.model_name.clone(),
             endpoint: endpoint.into(),
             prefix_digest,
-            reasoning: effective_reasoning,
+            reasoning: selection.reasoning_variant.clone(),
         });
         finalize_provider_response(ModelTurnResponse {
             assistant_message: Message::Assistant { content, provider_metadata },

@@ -309,34 +309,11 @@ proptest! {
         let encoded = payload.get("messages").and_then(Value::as_array).expect("messages array");
         prop_assert!(!encoded.is_empty());
 
-        if encoded.len() >= 2 {
-            let last = &encoded[encoded.len() - 1];
-            let prev = &encoded[encoded.len() - 2];
-            let trailing_tool_result = last.get("role").and_then(Value::as_str) == Some("user")
-                && last
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .is_some_and(|blocks| {
-                        blocks.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
-                    });
-            let prev_starts_with_thinking = prev.get("role").and_then(Value::as_str) == Some("assistant")
-                && prev
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .and_then(|blocks| blocks.first())
-                    .and_then(|block| block.get("type"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| matches!(kind, "thinking" | "redacted_thinking"));
-            let expected_thinking_type = if trailing_tool_result && !prev_starts_with_thinking {
-                "disabled"
-            } else {
-                "adaptive"
-            };
-            prop_assert_eq!(
-                payload.pointer("/thinking/type").and_then(Value::as_str),
-                Some(expected_thinking_type)
-            );
-        }
+        prop_assert_eq!(
+            payload.pointer("/thinking/type").and_then(Value::as_str),
+            Some("adaptive"),
+            "a high selection stays enabled across every encoded history, including tool continuations"
+        );
 
         let mut prev_role: Option<&str> = None;
         let mut expected_tools: HashSet<String> = HashSet::new();
