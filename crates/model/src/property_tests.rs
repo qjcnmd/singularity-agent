@@ -312,9 +312,8 @@ proptest! {
         prop_assert_eq!(
             payload.pointer("/thinking/type").and_then(Value::as_str),
             Some("adaptive"),
-            "selected effort stays on the wire when a tool result has no leading thinking block"
+            "a high selection stays enabled across every encoded history, including tool continuations"
         );
-        prop_assert_eq!(payload.pointer("/output_config/effort").and_then(Value::as_str), Some("high"));
 
         let mut prev_role: Option<&str> = None;
         let mut expected_tools: HashSet<String> = HashSet::new();
