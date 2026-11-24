@@ -176,7 +176,7 @@ impl CaptureState {
         let total_lines = self.total_lines();
         let start_line = total_lines.saturating_sub(tail_result.output_lines) + 1;
         let end_line = total_lines;
-        let note = if tail_result.last_line_partial {
+        let note = if tail_result.partial_line {
             format!(
                 "[Showing the last {} of output, ending at line {end_line}.]",
                 format_size(tail_result.content.len()),
@@ -204,7 +204,7 @@ struct Truncation {
     content: String,
     truncated_by: TruncatedBy,
     output_lines: usize,
-    last_line_partial: bool,
+    partial_line: bool,
 }
 
 fn format_size(bytes: usize) -> String {
@@ -234,7 +234,7 @@ fn truncate_tail(content: &str) -> Truncation {
                     content: truncate_string_to_bytes_from_end(line, DEFAULT_MAX_BYTES),
                     truncated_by: TruncatedBy::Bytes,
                     output_lines: 1,
-                    last_line_partial: true,
+                    partial_line: true,
                 };
             }
             break;
@@ -250,7 +250,7 @@ fn truncate_tail(content: &str) -> Truncation {
         content,
         truncated_by,
         output_lines: output.len(),
-        last_line_partial: false,
+        partial_line: false,
     }
 }
 
@@ -260,4 +260,70 @@ fn truncate_string_to_bytes_from_end(line: &str, max_bytes: usize) -> String {
     }
     let start = line.ceil_char_boundary(line.len() - max_bytes);
     line[start..].to_string()
+}
+
+pub(super) fn format_head_bounded(content: &str, output_directory: &Path) -> String {
+    let total_lines = content.lines().count();
+    if total_lines <= DEFAULT_MAX_LINES && content.len() <= DEFAULT_MAX_BYTES {
+        return content.to_string();
+    }
+    let head = truncate_head(content);
+    let spill_note = match SpillWriter::create(output_directory, content) {
+        Ok(spill) => format!("Full output: {}", spill.path.display()),
+        Err(error) => format!("Full output could not be saved: {error}"),
+    };
+    let summary = if head.partial_line {
+        format!(
+            "[Showing the first {} of output (line 1 of {total_lines}). Use read to inspect the full output.]",
+            format_size(head.content.len()),
+        )
+    } else if head.truncated_by == TruncatedBy::Lines {
+        format!(
+            "[Showing lines 1-{} of {total_lines}. Use read with offset={} to inspect the rest.]",
+            head.output_lines,
+            head.output_lines + 1,
+        )
+    } else {
+        format!(
+            "[Showing lines 1-{} of {total_lines} ({} limit). Use read with offset={} to inspect the rest.]",
+            head.output_lines,
+            format_size(DEFAULT_MAX_BYTES),
+            head.output_lines + 1,
+        )
+    };
+    format!("{}\n\n{summary}\n\n{spill_note}", head.content)
+}
+
+fn truncate_head(content: &str) -> Truncation {
+    let mut output: Vec<&str> = Vec::new();
+    let mut output_bytes = 0usize;
+    let mut truncated_by = TruncatedBy::Bytes;
+    for line in content.split_terminator('\n') {
+        if output.len() >= DEFAULT_MAX_LINES {
+            truncated_by = TruncatedBy::Lines;
+            break;
+        }
+        let line_bytes = line.len() + usize::from(!output.is_empty());
+        if output_bytes + line_bytes > DEFAULT_MAX_BYTES {
+            if output.is_empty() {
+                let end = line.floor_char_boundary(DEFAULT_MAX_BYTES);
+                return Truncation {
+                    content: line[..end].to_string(),
+                    truncated_by: TruncatedBy::Bytes,
+                    output_lines: 1,
+                    partial_line: true,
+                };
+            }
+            break;
+        }
+        output.push(line);
+        output_bytes += line_bytes;
+    }
+    let output_lines = output.len();
+    Truncation {
+        content: output.join("\n"),
+        truncated_by,
+        output_lines,
+        partial_line: false,
+    }
 }

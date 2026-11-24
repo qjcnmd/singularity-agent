@@ -62,7 +62,8 @@ pre {
 │       │   ├── SessionFileDiffParams (L189)              <span class="c"># 单文件合并差异查询参数</span>
 │       │   ├── SessionRewindParams (L200)                <span class="c"># 时光机回溯目标回合与是否还原文件参数</span>
 │       │   ├── ProviderSaveParams (L66)                  <span class="c"># 保存模型提供方与变体配置参数</span>
-│       │   └── DiscoverModelsParams (L91)                <span class="c"># 在线拉取提供方 /models 请求参数</span>
+│       │   ├── WebSearchSaveParams (L89)                 <span class="c"># 保存联网搜索 API 地址与脱敏密钥参数</span>
+│       │   └── DiscoverModelsParams (L109)               <span class="c"># 在线拉取提供方 /models 请求参数</span>
 │       ├── typescript.rs                                 <span class="c"># Rust → TypeScript 类型声明编译器</span>
 │       │   ├── Bindings (L7)                             <span class="c"># add &amp; visit 收集 RpcRequest 及关联 DTO</span>
 │       │   └── client_types() (L40)                      <span class="c"># 生成 DTO 声明、RpcContract、StreamEnvelope 与 RpcResponse</span>
@@ -75,7 +76,7 @@ pre {
 │       │   ├── TurnEventEnvelope (L49)                   <span class="c"># 带严格递增序号的流式事件信封</span>
 │       │   ├── SessionRuntime (L108)                     <span class="c"># 活跃回合、后台任务与挂起提问快照</span>
 │       │   ├── ContextUsage (L120)                       <span class="c"># 当前上下文 token 占用与容量比例</span>
-│       │   ├── RedactedModelCatalog (L150)               <span class="c"># 隐藏真实 api_key 后的下发模型目录</span>
+│       │   ├── RedactedModelCatalog (L159)               <span class="c"># 隐藏真实 api_key 后的下发模型目录与 RedactedWebSearchConfig</span>
 │       │   ├── RpcError (L201)                           <span class="c"># JSON-RPC 错误载荷（仅 message: String）</span>
 │       │   └── RpcResponse (L223)                        <span class="c"># 泛型 JSON-RPC 响应信封（供 transport 与前端共用）</span>
 │       ├── params.rs                                     <span class="c"># 公开历史条目、回合与累计用量口径（219 行）</span>
@@ -146,7 +147,7 @@ pre {
 │           ├── Skill                                     <span class="c"># load_instructions() 仅调用时读正文</span>
 │           └── discover_skill()                          <span class="c"># 解析 SKILL.md YAML frontmatter 元数据</span>
 │
-├── model/                                                <span class="c"># 模型配置、纯 LLM 消息类型、协议无关客户端与编解码（23 .rs）</span>
+├── model/                                                <span class="c"># 模型配置、纯 LLM 消息类型、协议无关客户端与编解码（24 .rs）</span>
 │   └── src/                                              <span class="c"># 模型层源码</span>
 │       ├── lib.rs                                        <span class="c"># 导出 ModelClient、ProviderError、模型类型与默认超时</span>
 │       ├── client.rs                                     <span class="c"># ModelClient：统一入口（provider_name/model_name），按协议分发请求</span>
@@ -161,6 +162,7 @@ pre {
 │       │   │   ├── ModelConfigManager                    <span class="c"># open / resolve / validate_selection / redacted_catalog</span>
 │       │   │   ├── context_window()                      <span class="c"># 按选中模型返回上下文窗口上限</span>
 │       │   │   ├── save_provider()                       <span class="c"># 锁内原子替换；空 key 留旧值并清失效选中</span>
+│       │   │   ├── save_web_search() / web_search_access() <span class="c"># 读写 config.json 的 web_search 段并校验凭据</span>
 │       │   │   ├── remove_provider()                     <span class="c"># 移除提供方并回退无效默认选择</span>
 │       │   │   ├── model_definitions()                   <span class="c"># 校验并转换表单模型列表</span>
 │       │   │   └── discovery_credential()                <span class="c"># 提取在线 /models 探测凭据</span>
@@ -207,6 +209,7 @@ pre {
 │       │   └── openai_responses_input()                  <span class="c"># 转 Responses input item（含加密思考项）</span>
 │       ├── responses/                                    <span class="c"># Responses SSE 流解码器</span>
 │       │   └── stream.rs                                 <span class="c"># ResponsesSseDecoder：转发增量与多段推理摘要分隔，校验终态（收包后早断判 Temporary）</span>
+│       ├── web.rs                                        <span class="c"># WebSearchAccess（DeepSeek 独立工具 POST JSON 客户端，禁重定向、8 MiB 上限）与 validate_fetch_url()</span>
 │       └── property_tests.rs                             <span class="c"># proptest 协议不变量：SSE 切帧、Messages 滚动缓存/思考护栏、Responses 编解码</span>
 │
 ├── mcp/                                                  <span class="c"># MCP 客户端连接池（4 .rs）</span>
@@ -224,7 +227,7 @@ pre {
 │           ├── McpTool / McpToolResult                   <span class="c"># 单工具 call() 入口与转换后的文本/图片结果</span>
 │           └── convert()                                 <span class="c"># 将 MCP CallToolResult 转为内部结果</span>
 │
-├── agent/                                                <span class="c"># Agent 主循环、上下文、工具、会话日志（37 .rs）</span>
+├── agent/                                                <span class="c"># Agent 主循环、上下文、工具、会话日志（38 .rs）</span>
 │   └── src/                                              <span class="c"># 顶层辅助、agent/ 循环、session/ 日志、tools/ 工具与属性测试</span>
 │       ├── lib.rs                                        <span class="c"># 导出 agent / session / tools / message 等模块</span>
 │       ├── request_execution.rs                          <span class="c"># 模型请求重试、输出预算裁剪与压缩摘要最小输出下限</span>
@@ -276,10 +279,10 @@ pre {
 │       │       ├── project_messages()                    <span class="c"># 检查点＋firstKeptEntryId 保留尾部与工具配对投影</span>
 │       │       ├── last_routed_model()                   <span class="c"># 扫描最近成功普通生成的 (provider, model) 供切模型预压判断</span>
 │       │       └── prepare_context()                     <span class="c"># 跨 OperationStarted 沿用最近同模型用量直至 Compaction，排除异源 Thinking</span>
-│       └── tools/                                        <span class="c"># 内置工具集与 Bash 进程树（10 文件 + bash/ 7 文件）</span>
+│       └── tools/                                        <span class="c"># 内置工具集与 Bash 进程树（11 文件 + bash/ 7 文件）</span>
 │           ├── mod.rs                                    <span class="c"># 导出全部内置工具模块</span>
-│           ├── registry.rs                               <span class="c"># ToolRegistrySnapshot：Schema 冻结、延迟 MCP 代理与 preflight</span>
-│           │   ├── PreparedTool                          <span class="c"># Builtin / Write / Skill / McpSchema / Mcp 变体</span>
+│           ├── registry.rs                               <span class="c"># ToolRegistrySnapshot：Schema 冻结、web 工具、延迟 MCP 代理与 preflight</span>
+│           │   ├── PreparedTool                          <span class="c"># Builtin / Write / WebSearch / WebFetch / Skill / McpSchema / Mcp 变体</span>
 │           │   └── ToolRegistrySnapshot                  <span class="c"># Schema 冻结，preflight() 调用前校验</span>
 │           ├── read.rs                                   <span class="c"># ReadArgs / execute()：分页读文本，拒 NUL 二进制与 limit=0</span>
 │           ├── edit.rs                                   <span class="c"># 按路径进程内串行锁的原子批量替换与 unified diff</span>
@@ -287,10 +290,11 @@ pre {
 │           │   └── execute_locked()                      <span class="c"># 校验 OldText 唯一不重叠、保留 BOM/换行后原子写盘</span>
 │           ├── write.rs                                  <span class="c"># 新建或覆写 UTF-8 文本文件，共用路径锁、保留 BOM/CRLF 原子写盘与 unified diff</span>
 │           ├── view_image.rs                             <span class="c"># execute()：校验图像并返回多模态视觉输入</span>
+│           ├── web.rs                                    <span class="c"># web_search / web_fetch：对接 DeepSeek /v1/tools/{search,fetch}，按开头 2000 行/50KB 截断溢写</span>
 │           ├── skill.rs                                  <span class="c"># execute()：查当前启用 model_skills() 读取 SKILL.md</span>
 │           ├── question.rs                               <span class="c"># QuestionArgs::validate()：参数校验</span>
 │           ├── mcp.rs                                    <span class="c"># mcp_schema / mcp_call 代理与 MCP 调用结果截断/转图</span>
-│           ├── output.rs                                 <span class="c"># CaptureState::will_write_disk() + 50KB/2000 行溢写（100KB 内存尾部上限）+ truncate_tail</span>
+│           ├── output.rs                                 <span class="c"># CaptureState::will_write_disk() + 50KB/2000 行溢写（truncate_tail 与 format_head_bounded）</span>
 │           └── bash/                                     <span class="c"># Windows Job Object 进程树、双流解码与后台游标（7 文件）</span>
 │               ├── mod.rs                                <span class="c"># 导出 BashTool / BashTasks</span>
 │               ├── spec.rs                               <span class="c"># BashArgs::validate()：yield 默认 10s 上限 30s</span>
@@ -419,8 +423,8 @@ pre {
     │   ├── Composer.tsx / ContextCapsules.tsx            <span class="c"># 输入区（Composer 223 行，订阅 onComposerFocus 回溯聚焦末位）、禁 skills 停 / 补全、按 disabledModules 订阅</span>
     │   ├── ModelPicker.tsx / EffortSlider.tsx            <span class="c"># 单层模型选择浮层 + Codex 风格纯 CSS 慢水流胶囊滑块</span>
     │   ├── orb/WaterOrb.tsx                              <span class="c"># 纯 Canvas 2D 玻璃水球（离屏静态壳、空载 0 RAF、compacting 气泡）</span>
-    │   ├── Settings.tsx / ProviderEditor.tsx / ModelEditor.tsx <span class="c"># 主题、强调色圆点、缓冲字号输入与协议归一化保存</span>
-    │   ├── ManagePages.tsx / McpSettings.tsx             <span class="c"># 指令（删项目回退全局）/Skills/MCP（仅存在 connecting 服务器时 1s 轮询）</span>
+    │   ├── Settings.tsx / ProviderEditor.tsx / ModelEditor.tsx <span class="c"># 居中双栏设置弹窗（外观 / 模型 / 联网搜索 / 指令 / Skills / MCP），SelectionSlider 滑块导航</span>
+    │   ├── ManagePages.tsx / McpSettings.tsx             <span class="c"># 设置内分区：指令（删项目回退全局）/ Skills（弹窗内下钻详情预览）/ MCP（仅存在 connecting 时 1s 轮询）</span>
     │   ├── MermaidDiagram.tsx / DiagramViewer.tsx        <span class="c"># 明暗 CSS 变量自适应 Mermaid 与零尺寸保护缩放层</span>
     │   ├── RunPanel.tsx / ContextPanel.tsx               <span class="c"># RunPanel（162 行：上下文压缩、改动文件卡片直达差异、后台命令）与按需扫描上下文</span>
     │   ├── FilePanel.tsx / Images.tsx                    <span class="c"># FilePanel（116 行：只读文件 + mode==='diff' 调 session.fileDiff 直渲 EditDiff）；WeakMap 草稿图片键</span>

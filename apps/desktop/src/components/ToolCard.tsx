@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
-import { CircleAlert, CircleX, LoaderCircle, FileText, SquareTerminal, Image, MessageCircleQuestion } from 'lucide-react'
+import { CircleAlert, CircleX, LoaderCircle, FileText, SquareTerminal, Image, MessageCircleQuestion, Search, Globe } from 'lucide-react'
 import { appStore, useAppStore } from '../appStore'
 import { factStatusText } from '../copy'
 import { useSelectionGuard } from '../interactions'
@@ -52,6 +52,8 @@ const toolPresentations: Record<string, ToolPresentation> = {
   edit: fileToolSpec({ diffOutput: true }),
   write: fileToolSpec({ diffOutput: true }),
   view_image: fileToolSpec({ icon: Image }),
+  web_search: { title: '联网搜索', icon: Search, argument: textField('query') },
+  web_fetch: { title: '读取网页', icon: Globe, argument: textField('url') },
   skill: { title: '读取技能', argument: textField('name') },
   ask_user_question: {
     title: '询问用户',

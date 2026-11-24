@@ -82,9 +82,11 @@ export type QuestionAnswerParams = { sessionId: string, itemId: string, answers:
 
 export type ReadSource = { startLine: number, lineCount: number, };
 
-export type RedactedModelCatalog = { error: string | null, defaultSelection: ModelSelection | null, providers: Array<RedactedProvider>, };
+export type RedactedModelCatalog = { error: string | null, defaultSelection: ModelSelection | null, providers: Array<RedactedProvider>, webSearch: RedactedWebSearchConfig, };
 
 export type RedactedProvider = { apiProtocol: ProviderApiProtocol, providerId: string, displayName: string | null, baseUrl: string, credentialConfigured: boolean, models: Array<ModelConfigurationInput>, };
+
+export type RedactedWebSearchConfig = { baseUrl: string, credentialConfigured: boolean, };
 
 export type RpcError = { message: string, };
 
@@ -168,6 +170,8 @@ export type UserQuestionOption = { label: string, description: string | null, };
 
 export type VisibleBackgroundTask = { taskId: string, command: string, description: string, output: string, state: BackgroundTaskState, };
 
+export type WebSearchSaveParams = { baseUrl: string, apiKey?: string, };
+
 export type Workspace = { root: string, };
 
 export type WorkspaceAddParams = { root: string, };
@@ -187,6 +191,7 @@ export interface RpcContract {
   "model.saveProvider": { params: ProviderSaveParams; result: ModelCatalogResult }
   "model.discover": { params: DiscoverModelsParams; result: Array<string> }
   "model.removeProvider": { params: ProviderParams; result: ModelCatalogResult }
+  "model.saveWebSearch": { params: WebSearchSaveParams; result: ModelCatalogResult }
   "mcp.list": { params: McpListParams; result: Array<McpServerState> }
   "mcp.save": { params: McpSaveParams; result: Array<McpServerState> }
   "mcp.remove": { params: McpServerParams; result: Array<McpServerState> }

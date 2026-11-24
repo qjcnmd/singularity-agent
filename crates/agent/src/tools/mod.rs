@@ -7,6 +7,7 @@ mod read;
 mod registry;
 mod skill;
 mod view_image;
+mod web;
 mod write;
 
 pub use bash::{BashTaskUpdate, BashTasks};
@@ -17,3 +18,4 @@ pub(crate) use registry::{
     view_image_tool, write_tool,
 };
 pub(crate) use skill::spec as skill_schema;
+pub(crate) use web::{fetch_spec as web_fetch_schema, search_spec as web_search_schema};

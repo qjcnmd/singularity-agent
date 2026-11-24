@@ -147,10 +147,19 @@ pub struct RedactedProvider {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
+pub struct RedactedWebSearchConfig {
+    pub base_url: String,
+    pub credential_configured: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
 pub struct RedactedModelCatalog {
     pub error: Option<String>,
     pub default_selection: Option<ModelSelection>,
     pub providers: Vec<RedactedProvider>,
+    pub web_search: RedactedWebSearchConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

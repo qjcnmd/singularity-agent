@@ -31,11 +31,6 @@ class AppStore extends SessionStore {
     for (const listener of this.composerFocusListeners) listener()
   }
 
-  setPage(page: AppState['page']): void {
-    this.selectionRequest += 1
-    this.patch({ page })
-  }
-
   setDraft(text: string): void {
     const id = this.draftKey()
     if (id === null) return
@@ -287,6 +282,15 @@ class AppStore extends SessionStore {
       })
   }
 
+  async saveWebSearch(baseUrl: string, apiKey?: string): Promise<boolean> {
+    return this.action('model.saveWebSearch', actionOrigin.inline('model.saveWebSearch', 'web'),
+      async () => {
+        const params = apiKey === undefined ? { baseUrl } : { baseUrl, apiKey }
+        const result = await this.transport.rpc('model.saveWebSearch', params)
+        this.applySync(acceptModelCatalog(this.state, result))
+      })
+  }
+
   openDirectoryPicker(): void {
     void this.action('directory.pick', actionOrigin.directoryPicker, async () => {
       const result = await this.transport.rpc('directory.pick', {})
@@ -388,6 +392,7 @@ class AppStore extends SessionStore {
     const resolved = resolveFileUrl(path, cwd, this.state.bootstrap?.userHome)
     if (!resolved) return
     const id = resolved.file.href.toLowerCase()
+    if (this.state.settingsOpen) this.patch({ settingsOpen: false })
     this.upsertFileTab({ id, path, cwd, title, mode: 'file', opened: 0 })
   }
 

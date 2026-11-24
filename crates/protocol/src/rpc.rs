@@ -88,6 +88,24 @@ pub struct ProviderParams {
 #[derive(Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
+pub struct WebSearchSaveParams {
+    pub base_url: String,
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub api_key: Option<String>,
+}
+
+impl fmt::Debug for WebSearchSaveParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebSearchSaveParams")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
 pub struct DiscoverModelsParams {
     pub provider_id: String,
     pub api_protocol: ProviderApiProtocol,
@@ -235,6 +253,7 @@ rpc_methods! {
     ModelSaveProvider => "model.saveProvider" (ProviderSaveParams) -> ModelCatalogResult,
     ModelDiscover => "model.discover" (DiscoverModelsParams) -> Vec<String>,
     ModelRemoveProvider => "model.removeProvider" (ProviderParams) -> ModelCatalogResult,
+    ModelSaveWebSearch => "model.saveWebSearch" (WebSearchSaveParams) -> ModelCatalogResult,
     McpList => "mcp.list" (McpListParams) -> Vec<McpServerState>,
     McpSave => "mcp.save" (McpSaveParams) -> Vec<McpServerState>,
     McpRemove => "mcp.remove" (McpServerParams) -> Vec<McpServerState>,
