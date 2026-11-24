@@ -66,9 +66,9 @@ function Get-GitInfo {
     if ($LASTEXITCODE -ne 0 -or -not $branch) { throw 'Failed to resolve current git branch.' }
     $head = (& git @gitOpts rev-parse HEAD 2>$null | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or -not $head) { throw 'Failed to resolve current git HEAD.' }
-    $porcelain = @(& git @gitOpts status --porcelain 2>$null | Where-Object { $_ })
+    $porcelain = @(& git @gitOpts status --porcelain --untracked-files=all 2>$null | Where-Object { $_ })
     if ($LASTEXITCODE -ne 0) { throw 'Failed to read git status.' }
-    return [pscustomobject]@{ Branch = $branch; Head = $head; Dirty = ($porcelain.Count -gt 0); Porcelain = $porcelain }
+    return [pscustomobject]@{ Branch = $branch; Head = $head; Dirty = ($porcelain.Count -gt 0) }
 }
 
 function Resolve-BaseRef([string]$RequestedBase) {
@@ -82,7 +82,7 @@ function Resolve-BaseRef([string]$RequestedBase) {
         if ($LASTEXITCODE -eq 0) { return $candidate }
     }
     $global:LASTEXITCODE = 0
-    return 'HEAD'
+    throw "Could not resolve default base ref ('origin/main' or 'main'); pass -Base <ref>."
 }
 
 function Get-ChangedFiles([string]$BaseRef) {
@@ -109,10 +109,19 @@ function Get-ChangedFiles([string]$BaseRef) {
     return [pscustomobject]@{ MergeBase = $mergeBase; Files = @($set | Sort-Object) }
 }
 
-function Assert-NoIndexWorktreeConflict([string[]]$PorcelainLines) {
-    $conflicts = @($PorcelainLines | Where-Object { $_ -match '^[MARCD][MD]\s' } | ForEach-Object { $_.Substring(3).Trim() })
+function Assert-NoIndexWorktreeConflict {
+    $staged = @(& git @gitOpts diff --cached --name-only --no-renames 2>$null | Where-Object { $_ })
+    if ($LASTEXITCODE -ne 0) { throw 'git diff --cached failed.' }
+    if ($staged.Count -eq 0) { return }
+    $unstaged = @(& git @gitOpts diff --name-only --no-renames 2>$null | Where-Object { $_ })
+    if ($LASTEXITCODE -ne 0) { throw 'git diff failed.' }
+    $untracked = @(& git @gitOpts ls-files --others --exclude-standard 2>$null | Where-Object { $_ })
+    if ($LASTEXITCODE -ne 0) { throw 'git ls-files --others failed.' }
+    $stagedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($s in $staged) { [void]$stagedSet.Add($s.Replace('\', '/')) }
+    $conflicts = @((@($unstaged) + @($untracked)) | ForEach-Object { $_.Replace('\', '/') } | Where-Object { $stagedSet.Contains($_) } | Select-Object -Unique)
     if ($conflicts.Count -gt 0) {
-        throw "Staged index differs from working tree on: $($conflicts -join ', '). Stage or restore before running gate."
+        throw "Staged index differs from working tree on: $($conflicts -join ', '). Re-stage or unstage before running gate/commit."
     }
 }
 
@@ -226,7 +235,7 @@ function Read-LedgerEntries([int]$WindowDays) {
 
 function Invoke-Gate {
     $git = Get-GitInfo
-    Assert-NoIndexWorktreeConflict $git.Porcelain
+    Assert-NoIndexWorktreeConflict
     $baseRef = Resolve-BaseRef $Base
     $changed = Get-ChangedFiles $baseRef
     $resolvedScope = if ($Scope -eq 'auto') { Resolve-AutoScope $changed.Files } else { $Scope }
@@ -279,7 +288,12 @@ function Invoke-Gate {
     $gitAfter = Get-GitInfo
     $effectiveDirty = $git.Dirty -or $gitAfter.Dirty -or ($git.Head -ne $gitAfter.Head)
     $ok = ($exitCode -eq 0)
-    $errSig = if ($ok) { $null } else { Get-ErrorSignature $outputLines }
+    $indexConflictErr = $null
+    if ($ok) {
+        try { Assert-NoIndexWorktreeConflict }
+        catch { $ok = $false; $indexConflictErr = $_.Exception.Message; $exitCode = 1 }
+    }
+    $errSig = if ($ok) { $null } elseif ($indexConflictErr) { 'git:index_worktree_mismatch' } else { Get-ErrorSignature $outputLines }
     $nowIso = [DateTimeOffset]::UtcNow.ToString('o')
 
     $stamp = [ordered]@{
@@ -297,6 +311,9 @@ function Invoke-Gate {
     if ($ok) {
         $dirtyNote = if ($effectiveDirty -and (-not $git.Dirty)) { ' (working tree modified by formatter; commit before caching)' } else { '' }
         Write-Host "Gate PASSED (scope=$resolvedScope, $([math]::Round($sw.Elapsed.TotalSeconds, 1))s, HEAD=$($gitAfter.Head.Substring(0, [Math]::Min(8, $gitAfter.Head.Length))))$dirtyNote." -ForegroundColor Green
+    } elseif ($indexConflictErr) {
+        Write-Host "Gate FAILED: $indexConflictErr" -ForegroundColor Red
+        exit 1
     } else {
         Write-Host "Gate FAILED (scope=$resolvedScope, sig=$errSig, full log: $logFile)" -ForegroundColor Red
         Write-Host '--- Last 40 lines ---' -ForegroundColor Yellow
