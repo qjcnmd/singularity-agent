@@ -14,6 +14,17 @@ pub(crate) struct UserConfigFile {
     pub(crate) default_model: Option<protocol::ModelSelection>,
     #[serde(default)]
     pub(crate) providers: BTreeMap<String, UserConfigProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) web_search: Option<UserConfigWebSearch>,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UserConfigWebSearch {
+    #[serde(default)]
+    pub(crate) base_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) api_key: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]

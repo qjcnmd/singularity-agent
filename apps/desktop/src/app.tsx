@@ -7,7 +7,6 @@ import { Conversation } from './components/Conversation'
 import { Settings } from './components/Settings'
 import { Sidebar } from './components/Sidebar'
 import { RunPanel } from './components/RunPanel'
-import { InstructionsPage, SkillsPage, McpPage } from './components/ManagePages'
 import { hasInlineActionError, useAppStore, appStore } from './appStore'
 import { buildHistoryRows, buildTimeline } from './timeline'
 import { bubbleVariables } from './bubbleColors'
@@ -52,7 +51,7 @@ export function App() {
 }
 
 const MainContent = memo(function MainContent({ accent }: { accent: string }) {
-  const state = useAppStore(['page', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'backgroundOpen', 'actionErrors', 'actionErrorOrigin'])
+  const state = useAppStore(['selectedSessionId', 'selectedWorkspaceRoot', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'backgroundOpen', 'actionErrors', 'actionErrorOrigin'])
   const facts = state.session?.facts
   const runtime = state.session?.runtime
   const failure = runtime?.failure
@@ -79,14 +78,13 @@ const MainContent = memo(function MainContent({ accent }: { accent: string }) {
   }, [visibleError, state.actionErrorOrigin])
 
   return (
-      <main className={`app-main${state.page !== 'chat' ? ' is-manage' : empty && state.bootstrapLoad.status === 'idle' ? ' is-empty' : ''}${state.page === 'chat' && state.selectedSessionId && state.backgroundOpen ? ' has-panel' : ''}`} onPointerDownCapture={() => {
+      <main className={`app-main${empty && state.bootstrapLoad.status === 'idle' ? ' is-empty' : ''}${state.selectedSessionId && state.backgroundOpen ? ' has-panel' : ''}`} onPointerDownCapture={() => {
         if (!state.sidebarCollapsed && window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
       }}>
         <header className="conversation-header">
-          {state.page === 'chat' && state.selectedSessionId && <h1>{sessionTitle}{workspace && <small>{workspaceName(workspace)}</small>}</h1>}
-          {state.page === 'chat' && state.selectedSessionId && <RunPanel key={state.selectedSessionId} />}
+          {state.selectedSessionId && <h1>{sessionTitle}{workspace && <small>{workspaceName(workspace)}</small>}</h1>}
+          {state.selectedSessionId && <RunPanel key={state.selectedSessionId} />}
         </header>
-        {state.page === 'instructions' ? <InstructionsPage /> : state.page === 'skills' ? <SkillsPage /> : state.page === 'mcp' ? <McpPage /> : <>
         {state.bootstrapLoad.status !== 'idle' ? (
           <section className="empty-state" aria-live="polite" aria-busy={state.bootstrapLoad.status === 'loading'}>
             <h2>{state.bootstrapLoad.status === 'loading' ? '正在读取项目列表' : '项目列表无法读取'}</h2>
@@ -97,7 +95,6 @@ const MainContent = memo(function MainContent({ accent }: { accent: string }) {
           </section>
         ) : !empty && <Conversation state={state} items={items} />}
         <Composer accent={accent} />
-        </>}
         <AnimatePresence>
           {visibleError !== null && <motion.div key="action-toast" className="action-toast" role="status"
             initial={{ opacity: reducedMotion ? 1 : 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}

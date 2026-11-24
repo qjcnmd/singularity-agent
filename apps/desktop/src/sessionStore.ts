@@ -48,7 +48,6 @@ export interface AppState extends PersistedView, SyncState {
   pendingActions: ReadonlySet<string>
   actionErrors: Readonly<Record<string, ActionError>>
   actionErrorOrigin: string | null
-  page: 'chat' | 'instructions' | 'skills' | 'mcp'
   settingsOpen: boolean
   fileTabs: readonly FileTab[]
   activeFileTab: string | null
@@ -68,7 +67,6 @@ export class SessionStore {
     pendingActions: new Set(),
     actionErrors: {},
     actionErrorOrigin: null,
-    page: 'chat',
     settingsOpen: false,
     fileTabs: [],
     activeFileTab: null,
@@ -125,26 +123,21 @@ export class SessionStore {
     if (workspaceRoot === undefined) return
     this.selectionRequest += 1
     if (sessionId === this.state.selectedSessionId) {
-      this.patch({ page: 'chat' })
       if (this.state.session === null) await this.readSession(sessionId)
       return
     }
-    this.patch({ page: 'chat', selectedWorkspaceRoot: workspaceRoot, selectedSessionId: sessionId, session: null,
+    this.patch({ selectedWorkspaceRoot: workspaceRoot, selectedSessionId: sessionId, session: null,
       sessionLoad: { status: 'loading', error: null } })
     this.saveSelection()
     await this.readSession(sessionId)
   }
 
   newTask(workspaceRoot = this.state.selectedWorkspaceRoot): void {
-    if (workspaceRoot === null) {
-      this.patch({ page: 'chat' })
-      return
-    }
+    if (workspaceRoot === null) return
     this.selectionRequest += 1
     this.latestRead = null
     const collapsed = this.state.sidebarView.collapsed
     this.patch({
-      page: 'chat',
       selectedWorkspaceRoot: workspaceRoot,
       selectedSessionId: null,
       session: null,

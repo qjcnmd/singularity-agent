@@ -21,7 +21,7 @@ type PendingDialog =
 
 export const Sidebar = memo(SidebarView)
 
-const sidebarFields = ['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceRoot', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'page'] as const
+const sidebarFields = ['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceRoot', 'sidebarCollapsed', 'sidebarView', 'unreadSessions'] as const
 type SidebarState = Pick<AppState, typeof sidebarFields[number]>
 
 function sameSidebarState(previous: SidebarState, next: SidebarState): boolean {
@@ -75,16 +75,11 @@ function SidebarView() {
           <SidebarToggle expanded={!state.sidebarCollapsed} controls="left-sidebar" onClick={toggleSidebar} />
         </header>
 
-        <button className={`sidebar-new-task${state.page === 'chat' && state.selectedSessionId === null ? ' is-active' : ''}`} type="button" onClick={() => appStore.newTask()}>
+        <button className={`sidebar-new-task${state.selectedSessionId === null ? ' is-active' : ''}`} type="button" onClick={() => appStore.newTask()}>
           <span className="sidebar-new-plus" aria-hidden="true">+</span>
           <span>新建任务</span>
         </button>
 
-        <nav className="side-nav">
-          {([{ page: 'skills', label: 'Skills' }, { page: 'instructions', label: '自定义指令' }, { page: 'mcp', label: 'MCP' }] as const).map(({ page, label }) =>
-            <button key={page} type="button" className={`nav-item${state.page === page ? ' is-active' : ''}`} onClick={() => appStore.setPage(page)}>{label}</button>)}
-        </nav>
-        <div className="sidebar-sep" aria-hidden="true" />
         <section className="sidebar-section">
           <div className="section-heading">
             <span>项目</span>
@@ -100,7 +95,7 @@ function SidebarView() {
               return <section key={root}>
                 <WorkspaceButton
                   workspace={item}
-                  selected={root === state.selectedWorkspaceRoot && state.selectedSessionId === null && state.page === 'chat'}
+                  selected={root === state.selectedWorkspaceRoot && state.selectedSessionId === null}
                   expanded={expanded}
                   onToggle={() => {
                     const next = new Set(collapsed)
@@ -116,9 +111,9 @@ function SidebarView() {
                   }}
                   onRemove={() => setDialog({ kind: 'remove', workspace: item })}
                 />
-                <Disclosure open={expanded}><SessionList activeKey={state.page === 'chat' ? state.selectedSessionId : null}>
+                <Disclosure open={expanded}><SessionList activeKey={state.selectedSessionId}>
                   {visible.map(session => <SessionButton key={session.threadId} session={session} title={titleOf(session)}
-                    selected={state.page === 'chat' && session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
+                    selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
                     unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })}
                     onDelete={() => setDialog({ kind: 'delete', session, title: titleOf(session) })} />)}
                   {sessions.length > 5 && (
@@ -141,7 +136,14 @@ function SidebarView() {
           </div>
         </section>
         <footer className="sidebar-footer">
-          <button type="button" className="nav-item" onClick={() => appStore.setSettingsOpen(true)}>设置</button>
+          <button
+            type="button"
+            className="nav-item"
+            onClick={() => {
+              appStore.setSettingsOpen(true)
+              if (window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
+            }}
+          >设置</button>
         </footer>
       </div></aside>
       <SidebarDialog state={dialog} onClose={() => setDialog(current => current === dialog ? { kind: 'none' } : current)} />

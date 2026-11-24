@@ -119,7 +119,8 @@ impl AppServer {
         let instructions = app_core::load_agent_instructions(cwd, &self.home).map_err(RpcError::new)?;
         let skills = app_core::skills::SkillCatalog::discover(cwd, &self.home);
         let servers = self.mcp.list(cwd).map_err(RpcError::new)?;
-        Ok(agent::agent::modules::preview(&root, instructions, skills, servers))
+        let web = self.models.web_search_access().map(std::sync::Arc::new);
+        Ok(agent::agent::modules::preview(&root, instructions, skills, servers, web))
     }
 
     pub(crate) fn read_instructions(

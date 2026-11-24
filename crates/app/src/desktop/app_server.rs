@@ -133,6 +133,14 @@ impl AppServer {
         self.update_models(|models| models.remove_provider(provider_id))
     }
 
+    pub(crate) fn save_web_search(
+        &self,
+        base_url: &str,
+        api_key: Option<&str>,
+    ) -> Result<protocol::ModelCatalogResult, RpcError> {
+        self.update_models(|models| models.save_web_search(base_url, api_key))
+    }
+
     fn update_models(
         &self,
         update: impl FnOnce(&ModelConfigManager) -> Result<protocol::RedactedModelCatalog, ProviderError>,

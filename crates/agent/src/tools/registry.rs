@@ -15,6 +15,7 @@ use super::mcp;
 use super::read;
 use super::skill;
 use super::view_image;
+use super::web;
 use super::write;
 
 pub(crate) const DEFAULT_MAX_LINES: usize = 2000;
@@ -82,6 +83,8 @@ pub(crate) enum PreparedTool {
     TaskStop(bash::TaskIdArgs),
     McpSchema(Vec<McpTool>),
     Mcp(McpTool, serde_json::Map<String, Value>),
+    WebSearch(web::WebSearchArgs, Arc<model::WebSearchAccess>),
+    WebFetch(web::WebFetchArgs, Arc<model::WebSearchAccess>),
 }
 
 impl PreparedTool {
@@ -101,6 +104,12 @@ impl PreparedTool {
             Self::Write(args) => Box::pin(write::execute(args, cwd, signal)).await,
             Self::McpSchema(tools) => mcp::execute_schema(&tools),
             Self::Mcp(tool, args) => Box::pin(mcp::execute(tool, args, output_directory, &signal)).await,
+            Self::WebSearch(args, access) => {
+                Box::pin(web::execute_search(args, access, output_directory, &signal)).await
+            }
+            Self::WebFetch(args, access) => {
+                Box::pin(web::execute_fetch(args, access, output_directory, &signal)).await
+            }
             Self::Bash(args) => {
                 Box::pin(bash_tasks.execute(args, cwd, output_directory, signal, on_update)).await
             }
@@ -175,6 +184,7 @@ pub(crate) struct ToolRegistrySnapshot {
     tools: Vec<BuiltinTool>,
     mcp_servers: BTreeMap<String, Vec<McpTool>>,
     skills: Option<Arc<SkillCatalog>>,
+    web: Option<Arc<model::WebSearchAccess>>,
 }
 
 impl ToolRegistrySnapshot {
@@ -186,6 +196,10 @@ impl ToolRegistrySnapshot {
         self.skills = Some(catalog);
     }
 
+    pub(crate) fn set_web(&mut self, access: Arc<model::WebSearchAccess>) {
+        self.web = Some(access);
+    }
+
     pub(crate) fn add_mcp_server(&mut self, server_id: String, tools: Vec<McpTool>) {
         if !tools.is_empty() {
             self.mcp_servers.insert(server_id, tools);
@@ -193,6 +207,8 @@ impl ToolRegistrySnapshot {
     }
 
     pub(crate) fn provider_schemas(&self) -> Vec<ToolDefinition> {
+        let web_tools =
+            self.web.as_ref().map(|_| [web::search_spec(), web::fetch_spec()]).into_iter().flatten();
         let mcp_proxies = (!self.mcp_servers.is_empty())
             .then(|| [mcp::schema_spec(), mcp::call_spec()])
             .into_iter()
@@ -200,6 +216,7 @@ impl ToolRegistrySnapshot {
         self.tools
             .iter()
             .map(|(schema, _)| schema.clone())
+            .chain(web_tools)
             .chain(self.skills.iter().map(|_| skill::spec()))
             .chain(mcp_proxies)
             .collect()
@@ -216,6 +233,18 @@ impl ToolRegistrySnapshot {
                 let args: mcp::McpCallArgs = deserialize_args_or_error(args)?;
                 let tool = mcp::lookup_tool(&self.mcp_servers, &args.server, &args.tool)?;
                 return Ok(PreparedTool::Mcp(tool.clone(), args.arguments));
+            }
+        }
+        if let Some(access) = &self.web {
+            if name == web::WEB_SEARCH_TOOL_NAME {
+                return deserialize_args_or_error::<web::WebSearchArgs>(args)?
+                    .validate()
+                    .map(|args| PreparedTool::WebSearch(args, Arc::clone(access)));
+            }
+            if name == web::WEB_FETCH_TOOL_NAME {
+                return deserialize_args_or_error::<web::WebFetchArgs>(args)?
+                    .validate()
+                    .map(|args| PreparedTool::WebFetch(args, Arc::clone(access)));
             }
         }
         if name == "skill"

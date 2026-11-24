@@ -63,9 +63,25 @@
 | **DeepSeek 官方** | `https://api.deepseek.com/anthropic/v1` | `messages` |
 | **OpenAI 官方** | `https://api.openai.com/v1` | `responses` |
 
+## 联网搜索
+
+可通过 **“设置 > 联网搜索”** 配置 DeepSeek 独立搜索与网页抓取服务（所有聊天模型通用，不绑定特定对话提供方），配置保存在 `~/.singularity/config.json` 的 `web_search` 字段：
+
+```json
+{
+  "web_search": {
+    "base_url": "https://api.deepseek.com",
+    "api_key": "sk-your-deepseek-api-key"
+  }
+}
+```
+
+- **默认地址**：`base_url` 留空时默认 `https://api.deepseek.com`，分别请求 `POST /v1/tools/search` 与 `POST /v1/tools/fetch`。
+- **按任务开关**：配置 API 密钥并保存后，新建任务页工具栏会出现 `web_*` 胶囊（包含 `web_search` 与 `web_fetch`），可按任务决定是否开启；未配置或清除密钥时不注入联网工具，不占用上下文 Token。
+
 ## MCP 工具
 
-通过 **侧栏的“MCP”** 可添加本地（stdio）或远程（Streamable HTTP）服务器。配置保存在 `~/.singularity/mcp.json`：
+通过 **“设置 > MCP”** 可添加本地（stdio）或远程（Streamable HTTP）服务器。配置保存在 `~/.singularity/mcp.json`：
 
 ```json
 {
@@ -132,7 +148,7 @@ description: 审查代码改动并生成专业建议
 
 | 相对路径 | 说明 |
 | --- | --- |
-| `config.json` | 模型提供方配置、API Key、模型元数据与默认模型选择 |
+| `config.json` | 模型提供方配置、API Key、模型元数据、默认模型选择与联网搜索配置（`web_search`） |
 | `mcp.json` | MCP 服务器列表、环境变量与请求头 |
 | `workspaces.json` | 已添加的项目及其目录 |
 | `sessions/<id>.jsonl` | 每个任务的完整历史（当前格式为 v1），工具结果分别保存模型正文与必要的展示字段；后台命令保存纯文本输出尾部及字节范围 |

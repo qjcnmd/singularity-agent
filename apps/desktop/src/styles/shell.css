@@ -52,12 +52,8 @@
 .sidebar-new-task:active { transform: scale(.98); transition-duration: 80ms; }
 .sidebar-new-task.is-active { border-color: color-mix(in srgb, var(--accent) 50%, var(--line-strong)); }
 .sidebar-new-plus { color: var(--accent); font-size: 16px; line-height: 1; font-weight: 400; }
-.side-nav { display: grid; gap: 1px; margin: 0; }
-.side-nav .nav-item:focus-visible { z-index: 1; }
-.side-nav .nav-item:active { transform: none; }
 .nav-item { position: relative; display: flex; align-items: center; gap: 8px; height: 31px; padding: 0 10px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-soft); font-weight: 400; cursor: pointer; text-align: left; transition: background 120ms, color 120ms, transform var(--spring-dur) var(--spring); }
 .nav-item:hover { background: var(--side-hover); color: var(--ink); }
-.sidebar-sep { flex: none; height: 1px; background: var(--line); margin: 8px 6px 4px; }
 .sidebar-footer { flex: none; display: grid; padding-top: 8px; border-top: 1px solid var(--line); }
 .nav-item:active { transform: scale(.97); transition-duration: 80ms; }
 .nav-item.is-active { background: var(--side-selected); color: var(--ink); font-weight: 500; }

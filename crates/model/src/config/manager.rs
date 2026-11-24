@@ -2,14 +2,18 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use protocol::{ModelConfigurationInput, ProviderConfigurationInput, RedactedModelCatalog, RedactedProvider};
+use protocol::{
+    ModelConfigurationInput, ProviderConfigurationInput, RedactedModelCatalog, RedactedProvider,
+    RedactedWebSearchConfig,
+};
 
 use super::{
     ModelSelection, ProviderApiProtocol, ProviderConfig, ProviderError, SelectedModel, UserConfigFile,
-    UserConfigModel, UserConfigProvider, configuration_error, read_user_config_file,
+    UserConfigModel, UserConfigProvider, UserConfigWebSearch, configuration_error, read_user_config_file,
     resolve_model_definition, resolve_model_selection, validate_api_key, validate_base_url,
     validate_identifier, write_user_config_file,
 };
+use crate::web::{DEFAULT_WEB_SEARCH_BASE_URL, WebSearchAccess};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelConfigurationSnapshot {
@@ -87,8 +91,8 @@ impl ModelConfigManager {
         let _access = self.lock();
         match read_user_config_file(&self.directory) {
             Ok(Some(data)) => catalog_from_data(&data),
-            Ok(None) => empty_catalog(None),
-            Err(error) => empty_catalog(Some(error.to_string())),
+            Ok(None) => empty_catalog(None, redacted_web_search(None)),
+            Err(error) => empty_catalog(Some(error.to_string()), redacted_web_search(None)),
         }
     }
 
@@ -121,6 +125,49 @@ impl ModelConfigManager {
         clear_invalid_default_selection(&mut config);
         write_user_config_file(&self.directory, &config)?;
         Ok(catalog_from_data(&config))
+    }
+
+    pub fn save_web_search(
+        &self,
+        base_url: &str,
+        api_key: Option<&str>,
+    ) -> Result<RedactedModelCatalog, ProviderError> {
+        let _access = self.lock();
+        let trimmed_url = base_url.trim();
+        let effective_url = if trimmed_url.is_empty() {
+            DEFAULT_WEB_SEARCH_BASE_URL
+        } else {
+            trimmed_url
+        };
+        let normalized_url = crate::provider::canonical_base_url(effective_url).to_string();
+        validate_base_url(&normalized_url)?;
+        let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
+        let key = match api_key {
+            Some(value) => value.to_string(),
+            None => config.web_search.as_ref().map(|web| web.api_key.clone()).unwrap_or_default(),
+        };
+        if !key.is_empty() {
+            validate_api_key(&key)?;
+        }
+        config.web_search = Some(UserConfigWebSearch { base_url: normalized_url, api_key: key });
+        write_user_config_file(&self.directory, &config)?;
+        Ok(catalog_from_data(&config))
+    }
+
+    pub fn web_search_access(&self) -> Option<WebSearchAccess> {
+        let _access = self.lock();
+        let web = read_user_config_file(&self.directory).ok()??.web_search?;
+        if web.api_key.is_empty() || validate_api_key(&web.api_key).is_err() {
+            return None;
+        }
+        let raw_url = if web.base_url.trim().is_empty() {
+            DEFAULT_WEB_SEARCH_BASE_URL
+        } else {
+            web.base_url.trim()
+        };
+        let base_url = crate::provider::canonical_base_url(raw_url).to_string();
+        validate_base_url(&base_url).ok()?;
+        Some(WebSearchAccess::new(base_url, web.api_key))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -171,17 +218,36 @@ fn clear_invalid_default_selection(config: &mut UserConfigFile) {
     }
 }
 
-fn empty_catalog(error: Option<String>) -> RedactedModelCatalog {
+fn redacted_web_search(web: Option<&UserConfigWebSearch>) -> RedactedWebSearchConfig {
+    match web {
+        Some(web) => RedactedWebSearchConfig {
+            base_url: if web.base_url.trim().is_empty() {
+                DEFAULT_WEB_SEARCH_BASE_URL.to_string()
+            } else {
+                web.base_url.clone()
+            },
+            credential_configured: !web.api_key.is_empty(),
+        },
+        None => RedactedWebSearchConfig {
+            base_url: DEFAULT_WEB_SEARCH_BASE_URL.to_string(),
+            credential_configured: false,
+        },
+    }
+}
+
+fn empty_catalog(error: Option<String>, web_search: RedactedWebSearchConfig) -> RedactedModelCatalog {
     RedactedModelCatalog {
         error,
         default_selection: None,
         providers: Vec::new(),
+        web_search,
     }
 }
 
 fn catalog_from_data(data: &UserConfigFile) -> RedactedModelCatalog {
+    let web_search = redacted_web_search(data.web_search.as_ref());
     if data.providers.is_empty() {
-        return empty_catalog(None);
+        return empty_catalog(None, web_search);
     }
     let selection = match data.default_model.as_ref() {
         Some(selection) => resolve_model_selection(data, selection).map(|_| ()),
@@ -213,5 +279,10 @@ fn catalog_from_data(data: &UserConfigFile) -> RedactedModelCatalog {
                 .collect(),
         })
         .collect();
-    RedactedModelCatalog { error, default_selection, providers }
+    RedactedModelCatalog {
+        error,
+        default_selection,
+        providers,
+        web_search,
+    }
 }

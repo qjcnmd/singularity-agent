@@ -31,11 +31,6 @@ class AppStore extends SessionStore {
     for (const listener of this.composerFocusListeners) listener()
   }
 
-  setPage(page: AppState['page']): void {
-    this.selectionRequest += 1
-    this.patch({ page })
-  }
-
   setDraft(text: string): void {
     const id = this.draftKey()
     if (id === null) return
@@ -283,6 +278,15 @@ class AppStore extends SessionStore {
     return this.action('model.removeProvider', actionOrigin.inline('model.removeProvider', providerId),
       async () => {
         const result = await this.transport.rpc('model.removeProvider', { providerId })
+        this.applySync(acceptModelCatalog(this.state, result))
+      })
+  }
+
+  async saveWebSearch(baseUrl: string, apiKey?: string): Promise<boolean> {
+    return this.action('model.saveWebSearch', actionOrigin.inline('model.saveWebSearch', 'web'),
+      async () => {
+        const params = apiKey === undefined ? { baseUrl } : { baseUrl, apiKey }
+        const result = await this.transport.rpc('model.saveWebSearch', params)
         this.applySync(acceptModelCatalog(this.state, result))
       })
   }

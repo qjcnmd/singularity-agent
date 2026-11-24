@@ -68,6 +68,9 @@ async fn dispatch(
         RpcRequest::ModelRemoveProvider(params) => {
             blocking(move || app.remove_provider(&params.provider_id)).await
         }
+        RpcRequest::ModelSaveWebSearch(params) => {
+            blocking(move || app.save_web_search(&params.base_url, params.api_key.as_deref())).await
+        }
         RpcRequest::McpList(params) => {
             blocking(move || {
                 let cwd = app.scope_directory(params.workspace_root.as_deref())?;

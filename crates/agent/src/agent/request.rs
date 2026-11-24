@@ -46,12 +46,14 @@ impl RequestContext {
     ) -> Result<(RequestDefinitions, protocol::InjectedContext)> {
         let home = self.config.instruction_home.clone();
         let session = std::sync::Arc::clone(&self.session);
+        let models = std::sync::Arc::clone(&self.models);
         let instructions = self.config.initial_instructions.clone();
         let disabled = &self.config.disabled_modules;
-        let (cwd, skills) = tokio::task::spawn_blocking(move || {
+        let (cwd, skills, web) = tokio::task::spawn_blocking(move || {
             let cwd = with_writer(&session, |writer| writer.data().cwd().to_path_buf());
             let skills = app_core::skills::SkillCatalog::discover(&cwd, &home);
-            (cwd, skills)
+            let web = models.web_search_access().map(std::sync::Arc::new);
+            (cwd, skills, web)
         })
         .await
         .expect("skill discovery completes while the runtime is running");
@@ -69,6 +71,7 @@ impl RequestContext {
             instructions,
             skills,
             mcp: discovered,
+            web,
             disabled,
         });
         let tools = assembly.registry.provider_schemas();

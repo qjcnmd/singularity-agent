@@ -1,27 +1,24 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { createPortal } from 'react-dom'
-import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
+import { motion, useReducedMotion } from 'motion/react'
 import { appStore, useAppStore } from '../appStore'
 import type { SkillMetadata, TextDocument } from '../protocol'
 import { workspaceName } from '../copy'
 import { workspaceKey } from '../workspace'
-import { pop, smooth } from '../motion'
 import { McpSettings } from './McpSettings'
-import { CircleCheck, ChevronRight, RefreshCw, Search } from 'lucide-react'
+import { CodeView, MarkdownDocumentView } from './FilePanel'
+import { smooth } from '../motion'
+import { ArrowLeft, CircleCheck, ChevronRight, RefreshCw, Search } from 'lucide-react'
 
-function PageFrame({ title, subtitle, actions, children }: { title?: string; subtitle?: string; actions?: ReactNode; children: ReactNode }) {
-  const reduced = useReducedMotion()
-  return <div className="manage-scroll">
-    <motion.div className="manage-page" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={reduced ? { duration: 0 } : smooth}>
-      {title && <header className="manage-header">
-        <div className="manage-heading">
-          <h2>{title}</h2>
-          {subtitle && <p className="manage-subtitle">{subtitle}</p>}
-        </div>
-        {actions && <div className="manage-actions">{actions}</div>}
-      </header>}
-      {children}
-    </motion.div>
+export function PageFrame({ title, subtitle, actions, children }: { title?: string; subtitle?: string; actions?: ReactNode; children: ReactNode }) {
+  return <div className="manage-page">
+    {title && <header className="manage-header">
+      <div className="manage-heading">
+        <h3>{title}</h3>
+        {subtitle && <p className="manage-subtitle">{subtitle}</p>}
+      </div>
+      {actions && <div className="manage-actions">{actions}</div>}
+    </header>}
+    {children}
   </div>
 }
 
@@ -95,16 +92,13 @@ export function InstructionsPage() {
         <textarea aria-label="自定义指令内容" className="input" value={text} spellCheck={false} disabled={loading || saving || !saved}
           onChange={event => setDrafts(current => ({ ...current, [key]: event.target.value }))} />
         <footer>
-          <span className="editor-status">{loading ? '读取中…' : dirty ? '有未保存修改' : saved ? '已同步磁盘' : ''}</span>
+          <span className={`editor-status${showSaved ? ' is-saved' : ''}`} role={showSaved ? 'status' : undefined}>
+            {showSaved ? <><CircleCheck size={14} aria-hidden="true" /><span>保存成功</span></> : loading ? '读取中…' : dirty ? '有未保存修改' : saved ? '已同步磁盘' : ''}
+          </span>
           <button type="button" className="primary-button small" disabled={!dirty || saving || loading} onClick={() => void save()}>{saving ? '保存中…' : '保存'}</button>
         </footer>
       </motion.section>
     </div>
-    {createPortal(<div className="instruction-save-notice" role="status" aria-live="polite" aria-atomic="true">
-      <AnimatePresence>{showSaved && <motion.div key="saved" initial={{ opacity: 0, y: -12, scale: .95 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: -8, scale: .95 }} transition={reduced ? { duration: 0 } : pop}>
-        <CircleCheck size={16} aria-hidden="true" /><span>保存成功</span>
-      </motion.div>}</AnimatePresence>
-    </div>, document.body)}
   </PageFrame>
 }
 
@@ -118,6 +112,7 @@ export function SkillsPage() {
 function SkillsList({ root }: { root: string | null }) {
   const [skills, setSkills] = useState<SkillMetadata[] | null>(root === null ? [] : null)
   const [query, setQuery] = useState('')
+  const [selected, setSelected] = useState<SkillMetadata | null>(null)
   const [loading, setLoading] = useState(root !== null)
   const [error, setError] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
@@ -136,9 +131,12 @@ function SkillsList({ root }: { root: string | null }) {
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [root, reload])
+  if (root !== null && selected !== null) {
+    return <SkillDetail key={selected.path} skill={selected} workspaceRoot={root} onBack={() => setSelected(null)} />
+  }
   const trimmed = query.trim().toLowerCase()
   const filtered = skills?.filter(skill => !trimmed || skill.name.toLowerCase().includes(trimmed) || skill.description.toLowerCase().includes(trimmed)) ?? null
-  return <PageFrame title="Skills" subtitle="输入 / 按需调用；点击列表项在右侧预览技能说明。" actions={<>
+  return <PageFrame title="Skills" subtitle="输入 / 按需调用；点击列表项查看技能说明。" actions={<>
     <span className="skills-count" role="status" aria-label={skills !== null ? `共 ${skills.length} 个技能` : '技能数量尚未读取'}>{skills !== null ? `${skills.length} 个` : '—'}</span>
     <button type="button" className="skills-refresh" aria-label="刷新 Skills 列表" title="刷新 Skills 列表" aria-busy={loading} aria-disabled={loading || root === null} onClick={refresh}>
       <RefreshCw size={15} aria-hidden="true" />
@@ -155,13 +153,69 @@ function SkillsList({ root }: { root: string | null }) {
     {!loading && !error && skills?.length === 0 && <p className="detail-empty">没有可用的 Skills</p>}
     {!loading && !error && filtered !== null && skills !== null && skills.length > 0 && filtered.length === 0 && <p className="detail-empty">没有匹配的 Skills</p>}
     {root && filtered && filtered.length > 0 && (
-      <div className="skill-list">{filtered.map(skill => <SkillCard key={`${root}:${skill.name}`} skill={skill} workspaceRoot={root} />)}</div>
+      <div className="skill-list">{filtered.map(skill => <SkillCard key={`${root}:${skill.name}`} skill={skill} onOpen={() => setSelected(skill)} />)}</div>
     )}
   </PageFrame>
 }
 
-function SkillCard({ skill, workspaceRoot }: { skill: SkillMetadata; workspaceRoot: string }) {
-  return <button type="button" className="skill-card" onClick={() => appStore.openFile(skill.path, workspaceRoot, skill.name)}>
+function SkillDetail({ skill, workspaceRoot, onBack }: { skill: SkillMetadata; workspaceRoot: string; onBack: () => void }) {
+  const [document, setDocument] = useState<TextDocument | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [showSource, setShowSource] = useState(false)
+  const [attempt, setAttempt] = useState(0)
+  const reduced = useReducedMotion()
+  useEffect(() => {
+    let active = true
+    setLoading(true)
+    setError(null)
+    void appStore.transport.rpc('file.read', { cwd: workspaceRoot, path: skill.path }).then(
+      loaded => { if (active) setDocument(loaded) },
+      reason => { if (active) setError(reason instanceof Error ? reason.message : String(reason)) },
+    ).finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [workspaceRoot, skill.path, attempt])
+
+  return (
+    <motion.div
+      className="manage-page skill-detail"
+      initial={{ opacity: 0, x: reduced ? 0 : 12 }}
+      animate={{ opacity: 1, x: 0 }}
+      transition={reduced ? { duration: 0 } : smooth}
+    >
+      <div className="skill-detail-nav">
+        <button type="button" className="quiet-button skill-detail-back" onClick={onBack}>
+          <ArrowLeft size={14} strokeWidth={1.75} aria-hidden="true" />
+          <span>返回 Skills</span>
+        </button>
+        {document && (
+          <button type="button" className="quiet-button" onClick={() => setShowSource(value => !value)}>
+            {showSource ? '预览' : '源码'}
+          </button>
+        )}
+      </div>
+      <header className="skill-detail-header">
+        <h3>{skill.name}</h3>
+        <span className="editor-path">{document?.path ?? skill.path}</span>
+      </header>
+      <div className="skill-detail-body">
+        {loading && !document && <p className="detail-empty" role="status">读取中…</p>}
+        {error && (
+          <div className="form-error" role="alert">
+            {error}{' '}
+            <button type="button" className="quiet-button" onClick={() => setAttempt(value => value + 1)}>重试</button>
+          </div>
+        )}
+        {document && (showSource
+          ? <CodeView code={document.content} language="markdown" />
+          : <MarkdownDocumentView path={document.path} content={document.content} />)}
+      </div>
+    </motion.div>
+  )
+}
+
+function SkillCard({ skill, onOpen }: { skill: SkillMetadata; onOpen: () => void }) {
+  return <button type="button" className="skill-card" onClick={onOpen}>
     <span className="skill-card-main">
       <strong>{skill.name}</strong>
       <span className="skill-description">{skill.description}</span>

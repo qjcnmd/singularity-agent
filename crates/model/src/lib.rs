@@ -12,6 +12,7 @@ mod provider;
 mod responses;
 mod transport;
 mod types;
+mod web;
 
 pub use client::ModelClient;
 pub use config::{ModelConfigManager, ModelConfigurationSnapshot, discover_models};
@@ -22,3 +23,4 @@ pub use types::{
     ContentBlock, Message, ModelToolCall, ModelTurnRequest, ModelTurnResponse, ModelUsage,
     ProviderBlockMetadata, ProviderMessageMetadata,
 };
+pub use web::{DEFAULT_WEB_SEARCH_BASE_URL, WebSearchAccess, validate_fetch_url};

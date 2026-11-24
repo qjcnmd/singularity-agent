@@ -81,7 +81,7 @@ export function FilePanel() {
       {isDiff
         ? shownDiff && <EditDiff path={shownDiff.path} output={shownDiff.output} />
         : shown && (isMarkdown(active.path) && !showSource
-          ? <PathBase.Provider value={directoryOf(shown.path)}><div className="file-markdown timeline-body message-body"><MarkdownBody text={frontmatterAsCode(shown.content)} /></div></PathBase.Provider>
+          ? <MarkdownDocumentView path={shown.path} content={shown.content} />
           : <CodeView code={shown.content} language={extension(active.path)} />)}
     </div>
   </aside>
@@ -97,7 +97,13 @@ function TabButton({ tab, selected }: { tab: FileTab; selected: boolean }) {
 
 const maxHighlightedLength = 200_000
 
-function CodeView({ code, language }: { code: string; language: string }) {
+export function MarkdownDocumentView({ path, content }: { path: string; content: string }) {
+  return <PathBase.Provider value={directoryOf(path)}>
+    <div className="file-markdown timeline-body message-body"><MarkdownBody text={frontmatterAsCode(content)} /></div>
+  </PathBase.Provider>
+}
+
+export function CodeView({ code, language }: { code: string; language: string }) {
   const normalized = code.replace(/\r\n/g, '\n')
   const tokens = useCodeTokens(normalized, normalized.length > maxHighlightedLength ? 'text' : language)
   const lines = normalized.split('\n')
