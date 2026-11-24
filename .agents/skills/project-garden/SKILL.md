@@ -2,9 +2,9 @@
 name: project-garden
 description: >-
   Incremental full-chain repository audit for Singularity: read un-audited commits since the last
-  commit recorded in docs/audit-log.md, trace end-to-end call/data chains across 5 dimensions,
-  cross-check via local Codex CLI (codex/gpt-6.2-sol high), and update docs/audit-log.md after
-  user approval.
+  commit recorded in docs/audit-log.md, trace end-to-end call/data chains across 5 dimensions with
+  on-demand specialist routing, cross-check via local Codex CLI (codex/gpt-6.2-sol high), and
+  update docs/audit-log.md after user approval.
 ---
 
 # 项目增量全链路体检
@@ -27,18 +27,29 @@ description: >-
 2. **追踪关联全链路**：
    以本次提交触及的全部文件为起点，向上下游追踪涉及的完整端到端链路（配置/持久化 → `crates/protocol` → `crates/model` / `crates/agent` → `crates/app` → `apps/desktop` → 文档与测试）。
 
-3. **5 维全面体检**：
-   核对 `docs/decisions.md` 与 `docs/architecture.md#运行边界`（表内已接受取舍与运行边界外场景不报），检查关联链路的 5 个维度：
+3. **5 维全面体检与按需专项路由**：
+   先核对 `docs/decisions.md` 与 `docs/architecture.md#运行边界`（表内已接受取舍与运行边界外场景一律不报），检查关联链路的 5 个维度：
    1. **端到端正确性与边界**：跨模块契约、状态同步、取消/超时/异常恢复、并发与单向锁序、密钥脱敏与安全边界；
-   2. **架构一致性与单一来源**：平行状态机、重复真相源、分层越界、与周边惯例冲突；
-   3. **体量、死代码与冗余抽象**：热链路死代码、未用导出、冗余包装、逼近 600 行上限的膨胀点；
+   2. **架构一致性与结构重塑**：平行状态机、重复真相源、分层越界，以及能否通过调整数据结构或归属边界让一整片特殊分支/包装层直接消失；
+   3. **体量与精简（删除 > 简化 > 重构）**：逐层追问“删掉它，用户可见行为或真实复杂度隔离会变吗”，清理死代码、单实现接口、纯转发包装、内部重复防御及逼近 600 行上限的膨胀点；
    4. **文档与架构图同步**：`architecture.html`、`directory.html`、`docs/architecture.md`、`docs/INSTALL.md`、`docs/decisions.md` 与源码一致；
    5. **不变量测试覆盖**：核心系统底线是否缺黑盒/属性不变量测试，或存在绑死内部实现的脆弱测试。
 
-4. **Codex 交叉复核（`codex/gpt-6.2-sol` `high`）**：
-   将提交范围、关联链路与初查可疑点（含文件与行号）写入临时 UTF-8 简报，按 `.agents/skills/dev-loop/SKILL.md` 第 3 节的标准 `codex exec` 命令调用一次无痕交叉复核，核对工作区未被改写并清理临时文件。
+   **按触及文件按需加载专项清单**（全局技能位于 `~/.agents/skills/`，仅当本次提交触及对应范围时读取）：
 
-5. **汇报与更新巡检进度**：
-   * **无确认问题**：汇报覆盖的提交范围与链路结论，经用户确认后将 `docs/audit-log.md` 的「已巡检至提交」更新为本次末提交并追加一行记录。
-   * **有确认问题**：按严重度输出简洁中文清单（维度、位置、风险/代价、最小改法），用提问工具请用户决定修复项；完成修复、通过 `pwsh -File scripts/check.ps1` 并提交后，再更新 `docs/audit-log.md` 至最新提交。
+   | 触及范围 | 加载技能 | 专项核查重点 |
+   | --- | --- | --- |
+   | `crates/**/*.rs` | `rust-review`（应用模式） | `unsafe`/UB、外部输入可达 panic、持锁跨 `.await`、`Eq/Hash/Ord` 契约、吞错误 |
+   | CSS 动效/过渡或滑块/弹窗交互 | `review-animations` | `transition: all`、`ease-in`、`scale(0)`、非 GPU 属性、`prefers-reduced-motion` |
+   | 密钥、网络、命令执行、Markdown 渲染或 Electron preload/IPC | `security-best-practices`（仅前端/TS） | XSS/注入、IPC 越权、敏感信息泄露 |
+
+   * **路由约束**：只取上述技能的检查标准，不执行其独立开场白、输出模板或落盘文件动作；仓库 `docs/decisions.md` 与本机单用户边界始终优先。
+   * **上报底线**：每条问题必须给出具体触发案例或维护代价（输入/场景 → 错误结果或明确冗余），无具体案例与纯风格偏好一律不报。
+
+4. **Codex 交叉复核（`codex/gpt-6.2-sol` `high`）**：
+   将提交范围、关联链路、初查可疑点（含文件与行号）写入临时 UTF-8 简报，按 `.agents/skills/dev-loop/SKILL.md` 第 3 节的标准 `codex exec` 命令调用一次无痕交叉复核，核对工作区未被改写并清理临时文件。
+
+5. **白话汇报与更新巡检进度**：
+   * **无确认问题**：汇报覆盖的提交范围、链路结论与 `未查范围`，经用户确认后将 `docs/audit-log.md` 的「已巡检至提交」更新为本次末提交并追加一行记录。
+   * **有确认问题**：按严重度分组并**全局连续编号**（方便用户回复“修 1 和 3”），每条用 4 句白话写清：**这是哪块（含文件与行号）/ 问题是什么 / 最小改法 / 不修会怎样**，末尾附 `未查范围`；用提问工具请用户拍板修复项，完成修复、通过 `pwsh -File scripts/check.ps1` 并提交后，再更新 `docs/audit-log.md` 至最新提交。
    * 中途取消或仍有已确认项未落盘时，不更新 `docs/audit-log.md`。
