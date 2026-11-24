@@ -66,11 +66,6 @@ pwsh -File scripts/check.ps1 -Scope desktop          # 含编译后端、prepare
 pwsh -File scripts/check.ps1 -Scope desktop -SkipE2E # 仅 lint + 严格构建
 pwsh -File scripts/check.ps1 -Scope size             # 仅生产源码 600 行上限与体量摘要
 pwsh -File scripts/check.ps1 -Scope all
-
-# 自动化研发流薄封装（自动挑范围 + 同 HEAD 绿票缓存 + 敏感区雷达 + 外层账本汇总，账本存 ~/.singularity-dev/ledger.jsonl）
-pwsh -File scripts/workflow.ps1 gate -Scope auto
-pwsh -File scripts/workflow.ps1 radar
-pwsh -File scripts/workflow.ps1 digest -Days 14
 ```
 
 如需分项执行，参考以下完整命令：

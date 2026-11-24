@@ -12,7 +12,9 @@ Windows 本地单用户桌面 AI 编程工作台：Electron 前端（`apps/deskt
 | [directory.html](directory.html) | 查代码分布与导出入口；增删源码文件或公开符号后 |
 | [开发指南](docs/development.md) | 构建、测试保留标准、现场验证、Windows 环境排障与打包交付 |
 | [安装与配置](docs/INSTALL.md) | 改配置文件、数据目录、指令或技能加载规则 |
-| [研发编排流程](.agents/skills/dev-loop/SKILL.md) | 改代码、提 PR、跨模型审查或做项目/系统复盘时 |
+| [研发执行流程](.agents/skills/dev-loop/SKILL.md) | 改代码、UI/UX 迭代、跨模型审查与交付时 |
+| [项目全链路体检](.agents/skills/project-garden/SKILL.md) | 手动执行增量全链路巡检时（记录在 [docs/audit-log.md](docs/audit-log.md)） |
+| [研发流程复盘](.agents/skills/workflow-retro/SKILL.md) | 手动复盘高频审查问题并提炼硬规则时 |
 | `AGENTS.local.md`（若存在） | 本机全仓检索索引、默认真实模型、本地运行包路径与构建缓存约定 |
 
 ## 决策边界
