@@ -144,7 +144,22 @@ impl ModelConfigManager {
         let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
         let key = match api_key {
             Some(value) => value.to_string(),
-            None => config.web_search.as_ref().map(|web| web.api_key.clone()).unwrap_or_default(),
+            None => match config.web_search.as_ref().filter(|web| !web.api_key.is_empty()) {
+                Some(existing) => {
+                    let prev_url = if existing.base_url.trim().is_empty() {
+                        DEFAULT_WEB_SEARCH_BASE_URL
+                    } else {
+                        existing.base_url.trim()
+                    };
+                    if !same_url_origin(prev_url, &normalized_url) {
+                        return Err(configuration_error(
+                            "更改联网搜索 API 地址时，请重新填写或清除 API 密钥。",
+                        ));
+                    }
+                    existing.api_key.clone()
+                }
+                None => String::new(),
+            },
         };
         if !key.is_empty() {
             validate_api_key(&key)?;
@@ -216,6 +231,16 @@ fn clear_invalid_default_selection(config: &mut UserConfigFile) {
     {
         config.default_model = None;
     }
+}
+
+fn same_url_origin(left: &str, right: &str) -> bool {
+    let Ok(left) = reqwest::Url::parse(left) else {
+        return false;
+    };
+    let Ok(right) = reqwest::Url::parse(right) else {
+        return false;
+    };
+    left.origin() == right.origin()
 }
 
 fn redacted_web_search(web: Option<&UserConfigWebSearch>) -> RedactedWebSearchConfig {

@@ -85,7 +85,8 @@ impl WebSearchAccess {
         };
         if !status.is_success() {
             let detail = String::from_utf8_lossy(&bytes);
-            let message = bounded_provider_error_diagnostic(detail.trim());
+            let sanitized = redact_web_diagnostic(detail.trim(), &self.api_key);
+            let message = bounded_provider_error_diagnostic(&sanitized);
             let suffix = if message.is_empty() {
                 String::new()
             } else {
@@ -126,4 +127,23 @@ fn web_client() -> Result<reqwest::Client, ProviderError> {
             )
         })?;
     Ok(CLIENT.get_or_init(|| client).clone())
+}
+
+fn redact_web_diagnostic(text: &str, api_key: &str) -> String {
+    let mut cleaned = if api_key.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(api_key, "[redacted]")
+    };
+    let lower = cleaned.to_ascii_lowercase();
+    if let Some(pos) = lower.find("bearer ") {
+        let token_start = pos + "bearer ".len();
+        let token_end = cleaned[token_start..]
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '}' | ']'))
+            .map_or(cleaned.len(), |offset| token_start + offset);
+        if token_end > token_start {
+            cleaned.replace_range(token_start..token_end, "[redacted]");
+        }
+    }
+    cleaned
 }

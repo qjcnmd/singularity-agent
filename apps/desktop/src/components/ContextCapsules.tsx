@@ -14,7 +14,7 @@ type ModuleQuery =
   | { status: 'ready'; modules: ContextModule[] }
   | { status: 'error'; error: Error }
 
-function useContextModules(workspaceRoot: string | null, connection: string, webConfigured: boolean) {
+function useContextModules(workspaceRoot: string | null, connection: string, webSignature: string) {
   const [query, setQuery] = useState<ModuleQuery>({ status: 'idle' })
   const [reload, setReload] = useState(0)
   useLayoutEffect(() => {
@@ -29,7 +29,7 @@ function useContextModules(workspaceRoot: string | null, connection: string, web
       error => { if (active) setQuery({ status: 'error', error: error instanceof Error ? error : new Error(String(error)) }) },
     )
     return () => { active = false }
-  }, [workspaceRoot, connection, webConfigured, reload])
+  }, [workspaceRoot, connection, webSignature, reload])
   return { query, retry: () => setReload(value => value + 1) }
 }
 
@@ -59,8 +59,9 @@ function sameCapsulesState(
 
 export const ContextCapsules = memo(function ContextCapsules() {
   const state = useAppStore(capsulesFields, sameCapsulesState)
-  const webConfigured = state.bootstrap?.modelCatalog.webSearch.credentialConfigured ?? false
-  const { query, retry } = useContextModules(state.selectedWorkspaceRoot, state.connection, webConfigured)
+  const webSearch = state.bootstrap?.modelCatalog.webSearch
+  const webSignature = `${webSearch?.credentialConfigured ?? false}:${webSearch?.baseUrl ?? ''}`
+  const { query, retry } = useContextModules(state.selectedWorkspaceRoot, state.connection, webSignature)
   const disabled = new Set(appStore.inputDraft().disabledModules)
   return <div className="context-capsules">
     <ProjectCapsule state={state} />

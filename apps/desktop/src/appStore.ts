@@ -392,6 +392,7 @@ class AppStore extends SessionStore {
     const resolved = resolveFileUrl(path, cwd, this.state.bootstrap?.userHome)
     if (!resolved) return
     const id = resolved.file.href.toLowerCase()
+    if (this.state.settingsOpen) this.patch({ settingsOpen: false })
     this.upsertFileTab({ id, path, cwd, title, mode: 'file', opened: 0 })
   }
 

@@ -311,9 +311,11 @@ async function runFullSmoke(page, mock) {
   assert.equal(await page.getByText('sk-e2e-secret-keep').count(), 0, 'API key must stay redacted in UI')
 
   await settingsDialog.getByRole('button', { name: '联网搜索', exact: true }).click()
-  await settingsDialog.getByLabel('API 密钥').fill('sk-e2e-web-secret')
+  const webKeyInput = settingsDialog.getByLabel('API 密钥')
+  await webKeyInput.fill('sk-e2e-web-secret')
   await settingsDialog.getByRole('button', { name: '保存配置' }).click()
   await settingsDialog.getByText('已配置密钥').waitFor({ state: 'visible', timeout: 10_000 })
+  assert.equal(await webKeyInput.inputValue(), '', 'Web search key input must clear after save')
   assert.equal(await page.getByText('sk-e2e-web-secret').count(), 0, 'Web search API key must stay redacted in UI')
 
   await settingsDialog.getByRole('button', { name: '自定义指令', exact: true }).click()
