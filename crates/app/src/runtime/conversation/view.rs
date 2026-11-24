@@ -28,6 +28,12 @@ impl ConversationView {
         self.activity = Activity::with_turn_id(turn_id);
         self.failure = None;
     }
+    pub(super) fn reset(&mut self, usage: protocol::SessionModelUsage) {
+        self.activity = Activity::default();
+        self.failure = None;
+        self.usage = usage;
+        self.context = None;
+    }
 }
 impl Conversation {
     pub(crate) fn start_result(&self) -> protocol::SessionStartResult {
@@ -64,7 +70,7 @@ impl Conversation {
             ),
             pending_question: match &state.turn {
                 TurnLifecycle::Running(controls) => controls.questions.pending(),
-                TurnLifecycle::Idle => None,
+                TurnLifecycle::Idle | TurnLifecycle::Rewinding => None,
             },
             pending_messages: state
                 .steering_inbox
@@ -87,7 +93,13 @@ impl Conversation {
     }
     pub(crate) fn read(&self) -> Result<SessionReadResult, crate::runtime::CatalogError> {
         let view = self.lock_view();
-        let runtime = self.runtime(&view);
+        self.read_locked(&view)
+    }
+    pub(super) fn read_locked(
+        &self,
+        view: &ConversationView,
+    ) -> Result<SessionReadResult, crate::runtime::CatalogError> {
+        let runtime = self.runtime(view);
         let background_tasks = self.bash_tasks.list().into_iter().map(Into::into).collect();
         let writer = lock_writer(&self.writer);
         let mut history = crate::runtime::history::read_thread_history(writer.data()).map_err(|source| {

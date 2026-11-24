@@ -7,7 +7,9 @@ import { pop } from '../motion'
 import { ContextPanel } from './ContextPanel'
 import { BackgroundTasks } from './BackgroundTasks'
 import { Disclosure } from './Disclosure'
+import { FileChangeStats } from './EditDiff'
 import { ExpandChevron } from './ExpandChevron'
+import type { ChangedFile } from '../protocol'
 import { Ellipsis, LoaderCircle } from 'lucide-react'
 
 function latestCompaction(facts: NonNullable<AppState['session']>['facts'] | undefined) {
@@ -55,6 +57,23 @@ function RunPanelBody() {
   const running = tasks.filter(task => task.state.status === 'running').length
   const phase = selectedSessionPhase(state)
   const sessionId = state.selectedSessionId
+  const cwd = state.session?.summary.cwd
+  const factsCount = state.session?.facts.length ?? 0
+  const lastTurnStatus = state.session?.facts.at(-1)?.status ?? ''
+  const summaryRevision = sessionId ? state.liveSessions[sessionId]?.summaryRevision ?? 0 : 0
+  const [changedFiles, setChangedFiles] = useState<ChangedFile[]>([])
+  useEffect(() => {
+    if (!sessionId || factsCount === 0 || state.connection !== 'ready') {
+      setChangedFiles([])
+      return
+    }
+    let active = true
+    void appStore.transport.rpc('session.changedFiles', { sessionId }).then(
+      result => { if (active) setChangedFiles(result.files) },
+      () => {},
+    )
+    return () => { active = false }
+  }, [sessionId, factsCount, lastTurnStatus, phase, summaryRevision, state.connection])
   const compaction = latestCompaction(state.session?.facts)
   const failure = state.session?.runtime.failure
   const attempt = useRef<string | null>(null)
@@ -95,6 +114,30 @@ function RunPanelBody() {
         {usage && <div className="float-usage"><span className="float-note">已用 {formatTokenCount(usage.used).toLowerCase()} / {formatTokenCount(usage.capacity).toLowerCase()} token</span></div>}
         <ContextPanel />
       </Card>
+      {changedFiles.length > 0 && cwd && sessionId && (
+        <Card title="改动文件" summary={changedFiles.length}>
+          <div className="changed-files-list">
+            {changedFiles.map(file => {
+              const name = file.path.split(/[\\/]/).filter(Boolean).pop() ?? file.path
+              return (
+                <button
+                  key={file.path}
+                  type="button"
+                  className="changed-file-row"
+                  title={file.path}
+                  onClick={() => {
+                    appStore.openFileDiff(cwd, sessionId, file.path)
+                    appStore.setBackgroundOpen(false)
+                  }}
+                >
+                  <span className="changed-file-name">{name}</span>
+                  <FileChangeStats file={file} />
+                </button>
+              )
+            })}
+          </div>
+        </Card>
+      )}
       {running > 0 && <Card title="后台命令" initiallyOpen summary={running}><BackgroundTasks /></Card>}
   </>
 }

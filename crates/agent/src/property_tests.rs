@@ -8,9 +8,9 @@ use protocol::{ModelSelection, ModelUsage, ProviderAttemptStatus, RequestObserva
 use serde_json::json;
 
 use crate::request_execution::{min_compaction_output_tokens, output_budget_tokens};
+use crate::session::compaction::{plan_compaction_step, select_compactable_split};
 use crate::session::context::{
-    frame_compacted_summary, input_tokens, message_token_estimate, plan_compaction_step, project_messages,
-    resolve_context_entries, select_compactable_split,
+    frame_compacted_summary, input_tokens, message_token_estimate, project_messages, resolve_context_entries,
 };
 use crate::session::{
     CompactionEntry, LedgerRecord, SessionData, SessionEntry, SessionManager, session_file_name,
@@ -368,7 +368,8 @@ proptest! {
             provider_metadata: Some(meta),
         };
         mgr.append_message_with_id("a1", assistant, Some(obs), None).expect("append a1");
-        mgr.append_record(LedgerRecord::OperationStarted).expect("append turn boundary");
+        mgr.append_record(LedgerRecord::OperationStarted { snapshot_tree: None })
+            .expect("append turn boundary");
         mgr.append_message_with_id("u2", Message::user(turn2_user.as_str()), None, None).expect("append u2");
         let tail = message_token_estimate(&Message::user(turn2_user.as_str()));
         let active = resolve_context_entries(mgr.data());

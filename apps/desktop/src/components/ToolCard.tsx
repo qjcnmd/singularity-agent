@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { CircleAlert, CircleX, LoaderCircle, FileText, SquareTerminal, Image, MessageCircleQuestion } from 'lucide-react'
-import { useAppStore } from '../appStore'
+import { appStore, useAppStore } from '../appStore'
 import { factStatusText } from '../copy'
 import { useSelectionGuard } from '../interactions'
 import { formatTurnDuration, toolDisplay } from '../timeline'
@@ -133,7 +133,7 @@ export function ToolCard({ item, itemKey, cwd, userHome, sessionId, onDisclosure
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
         {shown.result?.durationMs !== undefined && <div className="tool-duration">耗时 {formatTurnDuration(shown.result.durationMs)}</div>}
-        <div className="timeline-body activity-output"><ToolOutput item={shown} spec={spec} filePath={filePath} command={item.name === 'bash' ? argument : null} />{sessionId && item.result?.images && <AttachedImages sessionId={sessionId} images={item.result.images} />}</div>
+        <div className="timeline-body activity-output"><ToolOutput item={shown} spec={spec} filePath={filePath} command={item.name === 'bash' ? argument : null} cwd={cwd} sessionId={sessionId} />{sessionId && item.result?.images && <AttachedImages sessionId={sessionId} images={item.result.images} />}</div>
       </div></Disclosure>
     </article>
   )
@@ -161,8 +161,8 @@ function QuestionAnswers({ questions, output }: { questions?: UserQuestion[]; ou
   </div>
 }
 
-function ToolOutput({ item: fact, spec, filePath, command }: {
-  item: ToolItem; spec: ToolPresentation | undefined; filePath: string | null; command: string | null
+function ToolOutput({ item: fact, spec, filePath, command, cwd, sessionId }: {
+  item: ToolItem; spec: ToolPresentation | undefined; filePath: string | null; command: string | null; cwd: string; sessionId?: string
 }) {
   const input = fact.args
   const background = spec?.background === true
@@ -177,10 +177,16 @@ function ToolOutput({ item: fact, spec, filePath, command }: {
     catch {}
   }
   if (command !== null) return <CommandOutput command={command} output={output} />
-  if (spec?.diffOutput && filePath !== null && fact.status === 'completed') return <EditDiff path={filePath} output={output} />
+  if (spec?.diffOutput && filePath !== null && fact.status === 'completed') {
+    return <EditDiff path={filePath} output={output} onOpenFile={sessionId ? () => appStore.openFileDiff(cwd, sessionId, filePath) : undefined} />
+  }
   const readSource = fact.result?.readSource
   if (filePath !== null && (output !== '' || (readSource !== undefined && readSource.lineCount > 0)) && fact.status !== 'failed') return <div>
-    <div className="tool-output-header">{filePath}</div>
+    <div className="tool-output-header">
+      {fact.name === 'read'
+        ? <button type="button" className="tool-file-button" title={`在文件栏打开 ${filePath}`} onClick={() => appStore.openFile(filePath, cwd)}>{filePath}</button>
+        : filePath}
+    </div>
     {readSource
       ? <div className="tool-lines">{readOutputLines(output, readSource).map((line, index) => (
         <div key={index} className="tool-line">{line.number !== undefined && <span className="tool-line-number">{line.number}</span>}<span>{line.text}</span></div>

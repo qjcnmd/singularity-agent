@@ -1,5 +1,6 @@
 import { useMemo } from 'react'
 import { CodeTokens, useCodeTokens } from '../highlight'
+import type { ChangedFile } from '../protocol'
 import { CopyButton } from './CopyButton'
 import '../styles/edit-diff.css'
 
@@ -36,21 +37,36 @@ function parseEditDiff(output: string) {
   return { added: Number(counts[1]), deleted: Number(counts[2]), hunks, truncated }
 }
 
-export function EditDiff({ path, output }: { path: string; output: string }) {
+export function EditDiff({ path, output, onOpenFile }: { path: string; output: string; onOpenFile?: () => void }) {
   const diff = useMemo(() => parseEditDiff(output), [output])
-  const filename = path.replaceAll('\\', '/').split('/').at(-1)
+  const filename = path.replaceAll('\\', '/').split('/').at(-1) ?? path
   const language = /\.([\w-]+)$/.exec(path)?.[1] ?? 'text'
   return <div className="edit-diff">
       <div className="edit-diff-header">
-        <span className="edit-filename" title={path}>{filename}</span>
+        {onOpenFile
+          ? <button type="button" className="edit-filename edit-filename-button" title={`查看 ${path} 合并差异`} onClick={onOpenFile}>{filename}</button>
+          : <span className="edit-filename" title={path}>{filename}</span>}
         {diff && <span className="edit-counts"><span className="edit-added-count" aria-label={`新增 ${diff.added} 行`}>+{diff.added}</span><span className="edit-deleted-count" aria-label={`删除 ${diff.deleted} 行`}>-{diff.deleted}</span></span>}
-        <CopyButton text={output.split('\n').slice(1).join('\n')} label="复制差异" iconOnly />
+        {diff && <CopyButton text={output.split('\n').slice(1).join('\n')} label="复制差异" iconOnly />}
       </div>
       <div className="edit-diff-scroll" tabIndex={0} role="region" aria-label={`${filename} 的代码差异`}>
-        {diff ? diff.hunks.map((hunk, index) => <Hunk key={index} hunk={hunk} language={language} />) : <pre>{output}</pre>}
+        {diff ? diff.hunks.map((hunk, index) => <Hunk key={index} hunk={hunk} language={language} />) : <pre className="edit-diff-fallback">{output}</pre>}
       </div>
       {diff?.truncated && <p className="edit-diff-note">差异内容较长，仅显示前面的部分。文件修改已全部完成。</p>}
   </div>
+}
+
+export function FileChangeStats({ file }: { file: ChangedFile }) {
+  if (file.added > 0 || file.deleted > 0) {
+    return (
+      <span className="edit-counts">
+        {file.added > 0 && <span className="edit-added-count">+{file.added}</span>}
+        {file.deleted > 0 && <span className="edit-deleted-count">-{file.deleted}</span>}
+      </span>
+    )
+  }
+  const label = file.status === 'added' ? '新增' : file.status === 'deleted' ? '删除' : '修改'
+  return <span className={`changed-file-badge is-${file.status}`}>{label}</span>
 }
 
 function Hunk({ hunk, language }: { hunk: DiffHunk; language: string }) {

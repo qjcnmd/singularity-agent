@@ -9,10 +9,22 @@
 .file-toolbar { display: flex; flex: none; align-items: center; gap: 8px; min-height: 36px; padding: 0 10px 0 16px; color: var(--ink-faint); font-size: 12px; }
 .file-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
 .file-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.file-body:has(> .edit-diff) { display: flex; flex-direction: column; overflow: hidden; }
+.file-body > .edit-diff { display: flex; flex-direction: column; flex: 1; min-height: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; }
+.file-body > .edit-diff .edit-diff-scroll { flex: 1; min-height: 0; max-height: none; }
 .file-body > .detail-empty { padding: 16px; }
 .file-markdown { padding: 4px 20px 24px; }
 .file-code { padding: 4px 0 24px; font: 12.5px/1.6 var(--font-mono); }
 .file-code .tool-line { padding-right: 16px; }
+.changed-files-list { display: grid; gap: 1px; }
+.changed-file-row { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 30px; padding: 0 8px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-soft); font-size: 12.5px; text-align: left; cursor: pointer; transition: background 120ms, color 120ms; }
+.changed-file-row:hover { background: var(--soft-fill); color: var(--ink); }
+.changed-file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.changed-file-badge { flex: none; font-size: 11px; color: var(--ink-faint); }
+.changed-file-badge.is-added { color: #008d35; }
+.changed-file-badge.is-deleted { color: #cf222e; }
+[data-theme=dark] .changed-file-badge.is-added { color: #5ed990; }
+[data-theme=dark] .changed-file-badge.is-deleted { color: #ff938a; }
 .timeline-body code.file-link { cursor: pointer; text-decoration: underline dotted transparent; text-underline-offset: 3px; transition: text-decoration-color 120ms; }
 .timeline-body code.file-link:hover, .timeline-body code.file-link:focus-visible { text-decoration-color: currentColor; outline: none; }
 @media (max-width: 760px) {

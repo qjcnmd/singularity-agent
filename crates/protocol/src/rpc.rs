@@ -1,13 +1,14 @@
 #[cfg(feature = "typescript")]
 use crate::{
-    AppBootstrap, ContextModule, DirectoryPickResult, McpServerState, ModelCatalogResult, SessionReadResult,
-    SessionStartResult, SkillCatalog, TextDocument, Workspace,
+    AppBootstrap, ContextModule, DirectoryPickResult, McpServerState, ModelCatalogResult,
+    SessionChangedFilesResult, SessionFileDiffResult, SessionReadResult, SessionStartResult, SkillCatalog,
+    TextDocument, Workspace,
 };
 use crate::{
     ImageUpload, McpListParams, McpSaveParams, McpServerParams, ModelSelection, ProviderApiProtocol,
     ProviderConfigurationInput, QuestionAnswerParams,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +173,36 @@ pub struct UpdateSettingsParams {
     pub selection: ModelSelection,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionChangedFilesParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionFileDiffParams {
+    pub session_id: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRewindParams {
+    pub session_id: String,
+    pub turn_id: String,
+    pub restore_files: bool,
+}
+
 macro_rules! rpc_methods {
     ($($variant:ident => $wire:literal ($params:ty) -> $result:ty),* $(,)?) => {
         #[derive(Debug, Deserialize)]
@@ -222,4 +253,7 @@ rpc_methods! {
     SessionContext => "session.context" (SessionParams) -> (),
     BackgroundTaskStop => "session.stopBackgroundTask" (BackgroundTaskParams) -> (),
     SessionUpdateSettings => "session.updateSettings" (UpdateSettingsParams) -> (),
+    SessionChangedFiles => "session.changedFiles" (SessionChangedFilesParams) -> SessionChangedFilesResult,
+    SessionFileDiff => "session.fileDiff" (SessionFileDiffParams) -> SessionFileDiffResult,
+    SessionRewind => "session.rewind" (SessionRewindParams) -> SessionReadResult,
 }

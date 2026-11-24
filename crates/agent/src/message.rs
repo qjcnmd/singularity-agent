@@ -61,6 +61,8 @@ pub fn public_items(
                         images: std::mem::take(&mut images),
                         files: std::mem::take(&mut files),
                         annotations: std::mem::take(&mut annotations),
+                        turn_id: None,
+                        has_snapshot: false,
                     }
                 }
                 ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {

@@ -1,10 +1,14 @@
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use agent::agent::UserInput;
-use protocol::RpcError;
+use protocol::{RpcError, SessionChangedFilesResult, SessionFileDiffResult, SessionReadResult};
 
-use super::{AppServer, catalog_error, conversation_error};
-use crate::runtime::{ContextPreview, Conversation};
+use super::{
+    AppServer, WorkspaceRewindGuard, catalog_error, conversation_error, ensure_workspace_not_rewinding,
+    session_busy,
+};
+use crate::runtime::{ContextPreview, Conversation, SnapshotTarget};
 
 impl AppServer {
     pub(crate) fn image_data(&self, session_id: &str, image_id: &str) -> Result<String, RpcError> {
@@ -33,9 +37,10 @@ impl AppServer {
             skill_expansion,
         )
         .map_err(RpcError::new)?;
-        self.apply_control(&params.session_id, |conversation| {
-            conversation.start(input).map_err(conversation_error)
-        })
+        let lifecycle = self.lock_lifecycle();
+        let conversation = self.open_action_conversation(&params.session_id)?;
+        ensure_workspace_not_rewinding(&lifecycle, Path::new(&conversation.cwd))?;
+        conversation.start(input).map_err(conversation_error)
     }
 
     pub(crate) fn answer_question(
@@ -164,5 +169,170 @@ impl AppServer {
         .await
         .expect("background task lookup completes while the backend is running")?;
         tasks.stop(task_id).await.map_err(RpcError::new)
+    }
+
+    pub(crate) fn changed_files(
+        &self,
+        session_id: &str,
+        turn_id: Option<&str>,
+    ) -> Result<SessionChangedFilesResult, RpcError> {
+        let target = self.snapshot_target(session_id, turn_id)?;
+        let Some(base_tree) = target.base_tree else {
+            return Ok(SessionChangedFilesResult { files: Vec::new() });
+        };
+        let files = agent::session::snapshot::diff_summary(&target.snapshot_dir, &target.cwd, &base_tree)
+            .map_err(RpcError::new)?;
+        Ok(SessionChangedFilesResult { files })
+    }
+
+    pub(crate) fn file_diff(
+        &self,
+        session_id: &str,
+        path: &str,
+        turn_id: Option<&str>,
+    ) -> Result<SessionFileDiffResult, RpcError> {
+        let target = self.snapshot_target(session_id, turn_id)?;
+        let Some(base_tree) = target.base_tree else {
+            return Ok(SessionFileDiffResult {
+                path: path.to_owned(),
+                output: "当前任务暂无文件快照。".into(),
+            });
+        };
+        let rel_path = snapshot_relative_path(&target.cwd, path)?;
+        let output =
+            agent::session::snapshot::file_diff(&target.snapshot_dir, &target.cwd, &base_tree, &rel_path)
+                .map_err(RpcError::new)?;
+        Ok(SessionFileDiffResult { path: rel_path, output })
+    }
+
+    pub(crate) async fn rewind_session(
+        self: &Arc<Self>,
+        session_id: &str,
+        turn_id: &str,
+        restore_files: bool,
+    ) -> Result<SessionReadResult, RpcError> {
+        let app = Arc::clone(self);
+        let id = session_id.to_owned();
+        let target_turn_id = turn_id.to_owned();
+        let (conversation, guard, plan, _workspace_guard) = tokio::task::spawn_blocking(move || {
+            let mut lifecycle = app.lock_lifecycle();
+            let conversation = app.open_action_conversation(&id)?;
+            let cwd = Path::new(&conversation.cwd);
+            if restore_files {
+                ensure_workspace_not_rewinding(&lifecycle, cwd)?;
+                let target_key = app_core::workspace_key(cwd);
+                let sibling_busy = app.lock_sessions().conversations().any(|(other_id, other)| {
+                    other_id != id
+                        && app_core::workspace_key(Path::new(&other.cwd)) == target_key
+                        && other.has_active_execution()
+                });
+                if sibling_busy {
+                    return Err(RpcError::new(
+                        "当前项目还有其他正在运行的任务或后台命令，请等待结束后再还原文件。",
+                    ));
+                }
+            }
+            let (guard, plan) =
+                conversation.begin_rewind(&target_turn_id, restore_files).map_err(conversation_error)?;
+            let workspace_guard = plan
+                .restore_tree
+                .is_some()
+                .then(|| WorkspaceRewindGuard::register(&app, &mut lifecycle, cwd));
+            Ok::<_, RpcError>((conversation, guard, plan, workspace_guard))
+        })
+        .await
+        .expect("rewind preparation completes while the runtime is running")?;
+
+        let backup = if let Some(target_tree) = plan.restore_tree {
+            let snapshot_dir = plan.snapshot_dir.clone();
+            let cwd = plan.cwd.clone();
+            let backup = tokio::task::spawn_blocking(move || {
+                agent::session::snapshot::restore(&snapshot_dir, &cwd, &target_tree)
+            })
+            .await
+            .expect("snapshot restore completes while the runtime is running")
+            .map_err(RpcError::new)?;
+            Some(backup)
+        } else {
+            None
+        };
+
+        let target_turn_id = turn_id.to_owned();
+        let commit = tokio::task::spawn_blocking(move || conversation.commit_rewind(&target_turn_id, guard))
+            .await
+            .expect("rewind commit completes while the runtime is running");
+        match commit {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                if let Some(backup) = backup
+                    && let Err(rollback_error) = tokio::task::spawn_blocking(move || backup.rollback())
+                        .await
+                        .expect("snapshot rollback completes while the runtime is running")
+                {
+                    tracing::warn!(error = %rollback_error, "failed to roll back workspace after rewind commit failure");
+                }
+                Err(conversation_error(error))
+            }
+        }
+    }
+
+    fn snapshot_target(&self, session_id: &str, turn_id: Option<&str>) -> Result<SnapshotTarget, RpcError> {
+        let conversation = self.lock_sessions().get(session_id);
+        if let Some(conversation) = conversation {
+            if conversation.is_deleting() {
+                return Err(session_busy());
+            }
+            return Ok(conversation.snapshot_target(turn_id));
+        }
+        self.catalog.snapshot_target(session_id, turn_id).map_err(catalog_error)
+    }
+}
+
+fn snapshot_relative_path(cwd: &Path, requested: &str) -> Result<String, RpcError> {
+    let trimmed = requested.trim();
+    let target_path = Path::new(trimmed);
+    let relative = if target_path.is_absolute() {
+        let base_display = app_core::display_path(cwd);
+        let target_display = app_core::display_path(target_path);
+        let mut base_iter = Path::new(&base_display).components();
+        let mut target_iter = Path::new(&target_display).components();
+        loop {
+            match (base_iter.next(), target_iter.next()) {
+                (None, Some(first)) => {
+                    let mut rel = PathBuf::from(first.as_os_str());
+                    for rest in target_iter {
+                        rel.push(rest.as_os_str());
+                    }
+                    break rel;
+                }
+                (Some(b), Some(t)) if same_component(b, t) => {}
+                _ => return Err(RpcError::new(format!("文件不在当前项目目录内：{trimmed}"))),
+            }
+        }
+    } else {
+        target_path.to_path_buf()
+    };
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            _ => return Err(RpcError::new(format!("无效的项目内相对路径：{trimmed}"))),
+        }
+    }
+    if parts.is_empty() {
+        return Err(RpcError::new("文件路径不能为空。"));
+    }
+    Ok(parts.join("/"))
+}
+
+fn same_component(left: Component<'_>, right: Component<'_>) -> bool {
+    match (left, right) {
+        (Component::RootDir, Component::RootDir) => true,
+        (Component::Prefix(a), Component::Prefix(b)) => a.as_os_str().eq_ignore_ascii_case(b.as_os_str()),
+        (Component::Normal(a), Component::Normal(b)) => {
+            a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+        }
+        _ => false,
     }
 }

@@ -108,6 +108,12 @@ pub enum HistoryItem {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         #[cfg_attr(feature = "typescript", ts(as = "Option<Vec<MessageAnnotation>>", optional))]
         annotations: Vec<MessageAnnotation>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(optional))]
+        turn_id: Option<String>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        #[cfg_attr(feature = "typescript", ts(as = "Option<bool>", optional))]
+        has_snapshot: bool,
     },
     Thinking {
         id: String,

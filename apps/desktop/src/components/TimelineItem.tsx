@@ -2,12 +2,13 @@ import { ExpandChevron } from './ExpandChevron'
 import { APP_NAME } from '../identity'
 import { AttachedImages, FileChips } from './Images'
 import { SentAnnotations } from './Annotations'
+import { CopyButton } from './CopyButton'
 import { QuestionPanel } from './QuestionPanel'
 import { Disclosure } from './Disclosure'
 import { ToolGroupRow } from './ToolGroupRow'
 import { StepStatusIcon, ToolCard, toolTracksLiveTasks, useBackgroundTasks } from './ToolCard'
 import { memo, useEffect, useState } from 'react'
-import { CircleAlert, CircleX, LoaderCircle } from 'lucide-react'
+import { CircleAlert, CircleX, LoaderCircle, Pencil } from 'lucide-react'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { pop } from '../motion'
 import { useBodyCollapse, useSelectionGuard } from '../interactions'
@@ -19,16 +20,20 @@ import type { HistoryItem, SessionModelUsage, ToolStatus, VisibleBackgroundTask 
 const previewLineCount = 8
 export const maxTimelineEntryOffset = 36
 
+export type RewindUserMessage = Extract<HistoryItem, { type: 'message' }> & { turnId: string }
+
 interface Props {
   item: TimelineRow['item']
   itemKey: string
   cwd: string
   userHome?: string | null
   sessionId?: string
+  canRewind?: boolean
+  onRewind?: (message: RewindUserMessage) => void
   onDisclosureChange: (element: HTMLElement) => void
 }
 
-export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, userHome, sessionId, onDisclosureChange }: Props) {
+export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, userHome, sessionId, canRewind = false, onRewind, onDisclosureChange }: Props) {
   const userLines = item.type === 'message' && item.role === 'user' ? item.text.trimEnd().split('\n') : []
   const hiddenLines = Math.max(0, userLines.length - previewLineCount)
   const canCollapse = hiddenLines > 0
@@ -60,6 +65,8 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
 
   const body = canCollapse && !expanded ? userLines.slice(0, previewLineCount).join('\n') : item.text
   const annotatableId = item.role === 'assistant' && item.status !== 'running' && item.status !== 'failed' ? item.id : undefined
+  const rewindTurnId = item.role === 'user' ? item.turnId : undefined
+  const showUserMeta = item.role === 'user' && (Boolean(item.at) || item.text !== '' || Boolean(rewindTurnId && onRewind))
   const hasBubbleContent = item.role === 'assistant'
     || item.text.trim() !== ''
     || (item.images?.length ?? 0) > 0
@@ -75,7 +82,6 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
       data-item-id={itemKey}
       aria-label={`${item.role === 'user' ? '你' : APP_NAME}，${factStatusText[item.status]}`}
     >
-      {item.role === 'user' && item.at && <time className="msg-time" dateTime={item.at}>{formatClock(item.at, true)}</time>}
       {item.role === 'user' && item.annotations && <SentAnnotations annotations={item.annotations} defaultExpanded={!hasBubbleContent} />}
       {hasBubbleContent && (
         <div className={`message-bubble${item.status === 'failed' ? ' error-bubble' : ''}`}>
@@ -88,6 +94,24 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
             {expanded ? '收起' : `展开全文 · 还有 ${hiddenLines} 行`}
           </button>
         )}
+        </div>
+      )}
+      {showUserMeta && (
+        <div className="user-meta">
+          {item.at && <time className="msg-time" dateTime={item.at}>{formatClock(item.at, true)}</time>}
+          {item.text !== '' && <CopyButton text={item.text} label="复制" iconOnly />}
+          {rewindTurnId && onRewind && (
+            <button
+              type="button"
+              className="user-meta-button"
+              aria-label="编辑并回到此处"
+              title={canRewind ? '编辑并回到此处' : '当前执行中，暂不可编辑'}
+              disabled={!canRewind}
+              onClick={() => onRewind({ ...item, turnId: rewindTurnId })}
+            >
+              <Pencil size={13} strokeWidth={1.8} aria-hidden="true" />
+            </button>
+          )}
         </div>
       )}
       {item.role === 'assistant' && <MessageStatsLine stats={item.stats} at={item.at} />}
@@ -199,7 +223,7 @@ function ActivityCard({ group, itemKey, cwd, userHome, sessionId, onDisclosureCh
           <ExpandChevron expanded={!collapsed} size={14} />
         </button>
       ) : (
-        <div className={`activity-card-header is-static${headerOnly ? ' is-header-only' : ''}`}>
+        <div className="activity-card-header is-static">
           <StepStatusIcon name="activity" status={status} />
           <span className={`activity-card-title${status === 'running' ? ' activity-shimmer' : ''}`}>{label}</span>
           {meta}

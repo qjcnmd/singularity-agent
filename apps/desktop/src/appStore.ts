@@ -1,12 +1,12 @@
 import { workspaceKey } from './workspace'
-import { SessionStore, actionOrigin, type AppState, type QuestionDraft } from './sessionStore'
+import { SessionStore, actionOrigin, type AppState, type FileTab, type QuestionDraft } from './sessionStore'
 export { actionOrigin, hasInlineActionError, pendingKey } from './sessionStore'
 export type { AppState, ActionError, FileTab } from './sessionStore'
 import { selectedModel } from './modelChoices'
 import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, clampFilePanelWidth, type PersistedView } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { emptyDraft, hasDraftContent, imageUpload, type Draft, type DraftAnnotation } from './drafts'
-import type { ModelSelection, ProviderConfigurationInput, RpcMethod, RpcParams, UserQuestionAnswer, ViewportAnchor } from './protocol'
+import type { ImageAttachment, MessageAnnotation, ModelSelection, ProviderConfigurationInput, RpcMethod, RpcParams, UserQuestionAnswer, ViewportAnchor } from './protocol'
 import { selectedSessionPhase } from './sessionState'
 import { acceptModelCatalog } from './sync'
 
@@ -16,9 +16,19 @@ type SessionActionMethod = {
 
 class AppStore extends SessionStore {
   private anchorRevision = 0
+  private readonly composerFocusListeners = new Set<() => void>()
 
   get viewportAnchorRevision(): number {
     return this.anchorRevision
+  }
+
+  onComposerFocus(listener: () => void): () => void {
+    this.composerFocusListeners.add(listener)
+    return () => { this.composerFocusListeners.delete(listener) }
+  }
+
+  focusComposer(): void {
+    for (const listener of this.composerFocusListeners) listener()
   }
 
   setPage(page: AppState['page']): void {
@@ -185,9 +195,48 @@ class AppStore extends SessionStore {
   async deleteSession(sessionId: string): Promise<boolean> {
     return this.action('session.delete', actionOrigin.inline('session.delete', sessionId), async () => {
       await this.transport.rpc('session.delete', { sessionId })
+      this.closeSessionDiffTabs(new Set([sessionId]))
       this.clearSessionAnchors([sessionId])
       this.clearQuestionDrafts([sessionId])
       await this.drafts.remove([sessionId])
+    })
+  }
+
+  async rewindSession(
+    sessionId: string,
+    turnId: string,
+    restoreFiles: boolean,
+    prefill?: { text: string; images?: ImageAttachment[]; files?: string[]; annotations?: MessageAnnotation[] },
+  ): Promise<boolean> {
+    return this.action('session.rewind', actionOrigin.inline('session.rewind', sessionId), async () => {
+      const restoredImages = prefill?.images?.length
+        ? await Promise.all(prefill.images.map(async image =>
+            dataUrlToFile(await this.transport.rpc('session.imageRead', { sessionId, imageId: image.id }), image.name)))
+        : []
+      const result = await this.transport.rpc('session.rewind', { sessionId, turnId, restoreFiles })
+      if (prefill) {
+        await this.drafts.load()
+        const current = this.drafts.get(sessionId)
+        await this.drafts.set(sessionId, {
+          ...current,
+          text: prefill.text,
+          images: restoredImages,
+          files: [...(prefill.files ?? [])],
+          annotations: (prefill.annotations ?? []).map(({ messageId, quote, comment }) => ({
+            id: crypto.randomUUID(),
+            messageId,
+            quote,
+            comment,
+            startOffset: 0,
+            endOffset: 0,
+            prefix: '',
+            suffix: '',
+          })),
+        })
+      }
+      this.applyRewoundSession(result)
+      if (this.state.selectedSessionId === sessionId) this.setViewportAnchor(defaultAnchor())
+      else this.clearSessionAnchors([sessionId])
     })
   }
 
@@ -204,6 +253,7 @@ class AppStore extends SessionStore {
     const removedDrafts = sessions.map(session => session.threadId)
     return this.action('workspace.remove', actionOrigin.inline('workspace.remove', workspaceRoot), async () => {
       await this.transport.rpc('workspace.remove', { workspaceRoot })
+      this.closeSessionDiffTabs(new Set(removedDrafts))
       this.clearSessionAnchors(removedDrafts)
       this.clearQuestionDrafts(removedDrafts)
       this.saveView({ sidebarView: {
@@ -335,25 +385,29 @@ class AppStore extends SessionStore {
   }
 
   openFile(path: string, cwd: string, title = path.split(/[\\/]/).filter(Boolean).pop() ?? path): void {
-    let target = path.trim().replace(/\\/g, '/')
-    if (target.startsWith('~/') && this.state.bootstrap?.userHome) {
-      target = `${this.state.bootstrap.userHome.replace(/\\/g, '/')}/${target.slice(2)}`
-    }
-    const directory = cwd.replace(/\\/g, '/').replace(/\/+$/, '')
-    const encodePath = (value: string) => encodeURI(value).replace(/[?#]/g, encodeURIComponent)
-    let id: string
-    try {
-      id = new URL(
-        encodePath(/^[a-z]:\//i.test(target) ? `file:///${target}` : target),
-        encodePath(directory.startsWith('//') ? `file:${directory}/` : `file:///${directory}/`),
-      ).href.toLowerCase()
-    } catch {
-      return
-    }
-    const fileTabs = this.state.fileTabs.some(tab => tab.id === id)
-      ? this.state.fileTabs.map(tab => tab.id === id ? { ...tab, opened: tab.opened + 1 } : tab)
-      : [...this.state.fileTabs, { id, path, cwd, title, opened: 0 }]
-    this.patch({ fileTabs, activeFileTab: id })
+    const resolved = resolveFileUrl(path, cwd, this.state.bootstrap?.userHome)
+    if (!resolved) return
+    const id = resolved.file.href.toLowerCase()
+    this.upsertFileTab({ id, path, cwd, title, mode: 'file', opened: 0 })
+  }
+
+  openFileDiff(cwd: string, sessionId: string, path: string, title?: string): void {
+    const resolved = resolveFileUrl(path, cwd, this.state.bootstrap?.userHome)
+    if (!resolved) return
+    const rel = resolved.file.href.toLowerCase().startsWith(resolved.base.href.toLowerCase())
+      ? decodeURIComponent(resolved.file.href.slice(resolved.base.href.length))
+      : ''
+    const diffPath = rel || path.trim().replace(/\\/g, '/')
+    const tabTitle = title ?? (diffPath.split('/').filter(Boolean).pop() ?? diffPath)
+    const id = `diff:${sessionId}:${diffPath}`
+    this.upsertFileTab({ id, path: diffPath, cwd, title: tabTitle, mode: 'diff', sessionId, opened: 0 })
+  }
+
+  private upsertFileTab(tab: FileTab): void {
+    const fileTabs = this.state.fileTabs.some(item => item.id === tab.id)
+      ? this.state.fileTabs.map(item => item.id === tab.id ? { ...item, opened: item.opened + 1 } : item)
+      : [...this.state.fileTabs, tab]
+    this.patch({ fileTabs, activeFileTab: tab.id })
   }
 
   closeFile(id: string): void {
@@ -394,4 +448,32 @@ export function useAppStore<K extends keyof AppState>(
     return next
   }
   return useSyncExternalStore(appStore.subscribe, snapshot)
+}
+
+function resolveFileUrl(path: string, cwd: string, userHome?: string | null): { base: URL; file: URL } | null {
+  let target = path.trim().replace(/\\/g, '/')
+  if (target === '') return null
+  if (target.startsWith('~/') && userHome) {
+    target = `${userHome.replace(/\\/g, '/')}/${target.slice(2)}`
+  }
+  const directory = cwd.replace(/\\/g, '/').replace(/\/+$/, '')
+  const encodePath = (value: string) => encodeURI(value).replace(/[?#]/g, encodeURIComponent)
+  try {
+    const base = new URL(encodePath(directory.startsWith('//') ? `file:${directory}/` : `file:///${directory}/`))
+    const targetHref = /^[a-z]:\//i.test(target) ? `file:///${target}`
+      : target.startsWith('//') ? `file:${target}` : target
+    return { base, file: new URL(encodePath(targetHref), base) }
+  } catch {
+    return null
+  }
+}
+
+function dataUrlToFile(dataUrl: string, name: string): File {
+  const comma = dataUrl.indexOf(',')
+  const header = comma >= 0 ? dataUrl.slice(0, comma) : ''
+  const mime = /^data:([^;]+);base64$/i.exec(header)?.[1] ?? 'image/png'
+  const binary = atob(comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+  return new File([bytes], name || 'image.png', { type: mime })
 }

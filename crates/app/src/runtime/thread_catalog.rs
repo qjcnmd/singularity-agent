@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use agent::session::{
     SessionData, SessionError, SessionManager, scan_session_entries, session_images_directory,
-    session_outputs_directory,
+    session_outputs_directory, session_snapshot_directory,
 };
 use protocol::ThreadSummary;
 use uuid::Uuid;
@@ -10,6 +10,24 @@ use uuid::Uuid;
 use crate::runtime::history::ThreadSummaryScan;
 
 pub(crate) const SESSIONS_DIR_NAME: &str = "sessions";
+
+pub(crate) struct SnapshotTarget {
+    pub(crate) snapshot_dir: PathBuf,
+    pub(crate) cwd: PathBuf,
+    pub(crate) base_tree: Option<String>,
+}
+
+pub(crate) fn snapshot_target(data: &SessionData, turn_id: Option<&str>) -> SnapshotTarget {
+    let base_tree = match turn_id {
+        Some(turn_id) => data.turn_snapshot_tree(turn_id),
+        None => data.first_snapshot_tree(),
+    };
+    SnapshotTarget {
+        snapshot_dir: data.snapshot_directory(),
+        cwd: data.cwd().to_path_buf(),
+        base_tree: base_tree.map(str::to_owned),
+    }
+}
 
 pub(crate) struct ThreadCatalog {
     sessions_dir: PathBuf,
@@ -88,16 +106,24 @@ impl ThreadCatalog {
             })
     }
 
+    pub(crate) fn snapshot_target(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+    ) -> Result<SnapshotTarget, CatalogError> {
+        let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
+        Ok(snapshot_target(&session, turn_id))
+    }
+
     pub(crate) fn delete(&self, thread_id: &str) -> Result<(), CatalogError> {
         let path = checked_session_path(&self.sessions_dir, thread_id)?;
         for directory in [
             session_images_directory(&self.sessions_dir, thread_id),
             session_outputs_directory(&self.sessions_dir, thread_id),
+            session_snapshot_directory(&self.sessions_dir, thread_id),
         ] {
-            match std::fs::remove_dir_all(&directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => return Err(CatalogError::Io { path: directory, source }),
+            if let Err(source) = remove_dir_ignoring_not_found(&directory) {
+                return Err(CatalogError::Io { path: directory, source });
             }
         }
         std::fs::remove_file(&path).map_err(|error| CatalogError::session(thread_id, &path, error.into()))
@@ -105,6 +131,48 @@ impl ThreadCatalog {
 
     fn session_error(&self, thread_id: &str, source: SessionError) -> CatalogError {
         CatalogError::session(thread_id, &thread_session_path(&self.sessions_dir, thread_id), source)
+    }
+}
+
+fn remove_dir_ignoring_not_found(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // Git for Windows marks bare object files read-only, which makes remove_dir_all fail with PermissionDenied.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            clear_readonly_recursive(path);
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[expect(
+    clippy::permissions_set_readonly_false,
+    reason = "Windows shadow-git loose object files carry FILE_ATTRIBUTE_READONLY and must be cleared before removal"
+)]
+fn clear_readonly_recursive(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    if meta.permissions().readonly() {
+        let mut perms = meta.permissions();
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+    if meta.is_dir()
+        && let Ok(entries) = std::fs::read_dir(path)
+    {
+        for entry in entries.flatten() {
+            clear_readonly_recursive(&entry.path());
+        }
     }
 }
 

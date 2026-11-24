@@ -79,7 +79,10 @@ pub enum LedgerRecord {
     ModelRequest {
         observation: protocol::RequestObservation,
     },
-    OperationStarted,
+    OperationStarted {
+        #[serde(rename = "snapshotTree", default, skip_serializing_if = "Option::is_none")]
+        snapshot_tree: Option<String>,
+    },
     OperationFinished {
         #[serde(rename = "turnId")]
         turn_id: String,

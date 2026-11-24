@@ -46,6 +46,14 @@ function ComposerView({ accent }: { accent: string }) {
   useEffect(() => {
     setCaret(textarea.current?.selectionStart ?? draft.length)
   }, [draft, state.selectedSessionId, state.selectedWorkspaceRoot])
+  useEffect(() => appStore.onComposerFocus(() => {
+    const input = textarea.current
+    if (!input || input.disabled) return
+    input.focus()
+    const end = input.value.length
+    input.setSelectionRange(end, end)
+    setCaret(end)
+  }), [])
   useEffect(() => setSuggestionIndex((index) => Math.min(index, Math.max(0, suggestions.length - 1))), [suggestions.length])
   const { canSubmit, blockedReason } = appStore.submissionState()
 

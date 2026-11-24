@@ -111,6 +111,34 @@ impl SessionData {
         )
     }
 
+    pub fn snapshot_directory(&self) -> PathBuf {
+        super::session_snapshot_directory(
+            self.file.parent().expect("session has a parent directory"),
+            &self.session_id,
+        )
+    }
+
+    pub fn first_snapshot_tree(&self) -> Option<&str> {
+        self.entries.iter().find_map(|entry| match entry {
+            SessionEntry::Record {
+                record: LedgerRecord::OperationStarted { snapshot_tree: Some(tree) },
+                ..
+            } => Some(tree.as_str()),
+            _ => None,
+        })
+    }
+
+    pub fn turn_snapshot_tree(&self, turn_id: &str) -> Option<&str> {
+        self.entries.iter().find_map(|entry| match entry {
+            SessionEntry::Record {
+                id,
+                record: LedgerRecord::OperationStarted { snapshot_tree },
+                ..
+            } if id == turn_id => snapshot_tree.as_deref(),
+            _ => None,
+        })
+    }
+
     pub fn image_attachment(&self, image_id: &str) -> Result<crate::image::SavedImage> {
         let attachment = self
             .entries
@@ -157,6 +185,26 @@ fn verify_session_id(actual: &str, expected: &str) -> Result<()> {
     }
 }
 
+fn latest_settings(entries: &[SessionEntry]) -> Option<&protocol::ModelSelection> {
+    entries.iter().rev().find_map(|entry| match entry {
+        SessionEntry::Metadata {
+            metadata: SessionMetadata::ThreadSettings { selection },
+            ..
+        } => Some(selection),
+        _ => None,
+    })
+}
+
+fn latest_name(entries: &[SessionEntry]) -> Option<&str> {
+    entries.iter().rev().find_map(|entry| match entry {
+        SessionEntry::Metadata {
+            metadata: SessionMetadata::ThreadName { name },
+            ..
+        } => Some(name.as_str()),
+        _ => None,
+    })
+}
+
 impl SessionManager {
     pub(crate) fn append_compaction_with_id(
         &mut self,
@@ -184,6 +232,71 @@ impl SessionManager {
 
     pub fn append_record_with_id(&mut self, id: String, record: LedgerRecord) -> Result<String> {
         self.append_entry(SessionEntry::Record { id, timestamp: now_iso(), record })
+    }
+
+    pub fn append_operation_started(
+        &mut self,
+        turn_id: String,
+        snapshot_tree: Option<String>,
+    ) -> Result<String> {
+        self.append_record_with_id(turn_id, LedgerRecord::OperationStarted { snapshot_tree })
+    }
+
+    pub fn rewind_before_turn(&mut self, turn_id: &str) -> Result<()> {
+        let idx = self
+            .data
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Record {
+                        id,
+                        record: LedgerRecord::OperationStarted { .. },
+                        ..
+                    } if id == turn_id
+                )
+            })
+            .ok_or_else(|| SessionError::InvalidSession(format!("未找到可回溯的回合：{turn_id}")))?;
+
+        let (kept, dropped) = self.data.entries.split_at(idx);
+        let mut preserved = Vec::new();
+        if let Some(selection) = latest_settings(dropped)
+            && latest_settings(kept) != Some(selection)
+        {
+            preserved.push(SessionEntry::Metadata {
+                id: super::new_entry_id(),
+                timestamp: now_iso(),
+                metadata: SessionMetadata::ThreadSettings { selection: selection.clone() },
+            });
+        }
+        if let Some(name) = latest_name(dropped)
+            && latest_name(kept) != Some(name)
+        {
+            preserved.push(SessionEntry::Metadata {
+                id: super::new_entry_id(),
+                timestamp: now_iso(),
+                metadata: SessionMetadata::ThreadName { name: name.to_owned() },
+            });
+        }
+
+        let header = SessionHeader::new(
+            self.data.session_id.clone(),
+            self.data.cwd_string(),
+            self.data.header_timestamp.clone(),
+        );
+        let mut bytes = serde_json::to_vec(&header)?;
+        bytes.push(b'\n');
+        for entry in kept.iter().chain(&preserved) {
+            serde_json::to_writer(&mut bytes, entry)?;
+            bytes.push(b'\n');
+        }
+        app_core::write_bytes_atomic(&self.data.file, &bytes)?;
+
+        self.data.entries.truncate(idx);
+        self.data.entries.extend(preserved);
+        self.append_error = None;
+        Ok(())
     }
 
     pub(crate) fn append_message_with_id(

@@ -1,7 +1,8 @@
 mod actions;
 mod workspace;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::runtime::{CatalogError, Conversation, ConversationError, ThreadCatalog};
@@ -66,7 +67,7 @@ impl SessionCache {
 pub(crate) struct AppServer {
     hub: Arc<StreamHub>,
     app_publication: Mutex<()>,
-    lifecycle: Mutex<()>,
+    lifecycle: Mutex<HashSet<String>>,
     catalog: ThreadCatalog,
     workspaces: WorkspaceStore,
     models: Arc<ModelConfigManager>,
@@ -87,7 +88,7 @@ impl AppServer {
         Arc::new(Self {
             hub: StreamHub::new(stream),
             app_publication: Mutex::new(()),
-            lifecycle: Mutex::new(()),
+            lifecycle: Mutex::new(HashSet::new()),
             catalog,
             workspaces,
             models,
@@ -183,8 +184,9 @@ impl AppServer {
             skill_expansion,
         )
         .map_err(RpcError::new)?;
-        let _lifecycle = self.lock_lifecycle();
+        let lifecycle = self.lock_lifecycle();
         let workspace = self.workspace(&params.workspace_root)?;
+        ensure_workspace_not_rewinding(&lifecycle, Path::new(&workspace.root))?;
         let thread = self
             .catalog
             .create_thread(&workspace.root, params.selection, params.disabled_modules)
@@ -254,7 +256,7 @@ impl AppServer {
         self.app_publication.lock().expect("app_server publication lock poisoned")
     }
 
-    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
+    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
         self.lifecycle.lock().expect("app_server lifecycle lock poisoned")
     }
 
@@ -277,6 +279,35 @@ impl AppServer {
         }
         self.mcp.shutdown().await;
     }
+}
+
+pub(super) struct WorkspaceRewindGuard {
+    app: Arc<AppServer>,
+    key: String,
+}
+
+impl WorkspaceRewindGuard {
+    pub(super) fn register(app: &Arc<AppServer>, rewinding: &mut HashSet<String>, cwd: &Path) -> Self {
+        let key = app_core::workspace_key(cwd);
+        rewinding.insert(key.clone());
+        Self { app: Arc::clone(app), key }
+    }
+}
+
+impl Drop for WorkspaceRewindGuard {
+    fn drop(&mut self) {
+        self.app.lock_lifecycle().remove(&self.key);
+    }
+}
+
+pub(super) fn ensure_workspace_not_rewinding(
+    rewinding: &HashSet<String>,
+    cwd: &Path,
+) -> Result<(), RpcError> {
+    if rewinding.contains(&app_core::workspace_key(cwd)) {
+        return Err(RpcError::new("当前项目正在还原文件，请稍后再试。"));
+    }
+    Ok(())
 }
 
 pub(super) fn conversation_error(error: ConversationError) -> RpcError {

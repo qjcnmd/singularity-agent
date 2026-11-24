@@ -321,6 +321,8 @@ impl Agent {
                 annotations: input.annotations.clone(),
                 role: protocol::HistoryMessageRole::User,
                 status: protocol::TurnStatus::Completed,
+                turn_id: None,
+                has_snapshot: false,
             },
         }));
         Ok(())

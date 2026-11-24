@@ -115,6 +115,15 @@ async fn dispatch(
         RpcRequest::SessionUpdateSettings(params) => {
             blocking(move || app.update_settings(&params.session_id, &params.selection)).await
         }
+        RpcRequest::SessionChangedFiles(params) => {
+            blocking(move || app.changed_files(&params.session_id, params.turn_id.as_deref())).await
+        }
+        RpcRequest::SessionFileDiff(params) => {
+            blocking(move || app.file_diff(&params.session_id, &params.path, params.turn_id.as_deref())).await
+        }
+        RpcRequest::SessionRewind(params) => Ok(value(
+            app.rewind_session(&params.session_id, &params.turn_id, params.restore_files).await?,
+        )),
     }
 }
 

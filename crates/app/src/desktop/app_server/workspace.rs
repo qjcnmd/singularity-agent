@@ -3,7 +3,7 @@ use std::path::Path;
 
 use protocol::{AppBootstrap, RedactedModelCatalog, RpcError, ThreadSummary, Workspace};
 
-use super::{AppServer, catalog_error};
+use super::{AppServer, catalog_error, ensure_workspace_not_rewinding};
 use crate::desktop::workspace_store::WorkspaceError;
 
 impl AppServer {
@@ -51,6 +51,7 @@ impl AppServer {
         let close = tokio::task::spawn_blocking(move || {
             let lifecycle = app.lock_lifecycle();
             let workspace = app.workspace(&workspace_root)?;
+            ensure_workspace_not_rewinding(&lifecycle, Path::new(&workspace.root))?;
             let mut sessions = app.lock_sessions();
             let belongs = |conversation: &std::sync::Arc<crate::runtime::Conversation>| {
                 app_core::same_saved_path(&conversation.cwd, &workspace.root)

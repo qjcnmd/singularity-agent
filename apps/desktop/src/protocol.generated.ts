@@ -8,6 +8,10 @@ export type BackgroundTaskState = { "status": "running" } | { "status": "exited"
 
 export type BackgroundTaskUpdate = { phase: SessionPhase, task: VisibleBackgroundTask, };
 
+export type ChangedFile = { path: string, added: number, deleted: number, status: ChangedFileStatus, };
+
+export type ChangedFileStatus = "added" | "modified" | "deleted";
+
 export type ContextGroup = "instructions" | "tools" | "skills" | "mcp";
 
 export type ContextModule = { id: string, group: ContextGroup, label: string, detail: string, tokens: number, locked: boolean, enabled: boolean, };
@@ -22,7 +26,7 @@ export type EmptyParams = Record<string, never>;
 
 export type FileReadParams = { cwd: string, path: string, };
 
-export type HistoryItem = { "type": "message", id: string, status: TurnStatus, role: HistoryMessageRole, text: string, at?: string, stats?: SessionModelUsage, images?: Array<ImageAttachment>, files?: Array<string>, annotations?: Array<MessageAnnotation>, } | { "type": "thinking", id: string, status: TurnStatus, text: string, } | { "type": "tool", id: string, status: ToolStatus, name: string, args: JsonValue, result: ToolResult | null, } | { "type": "compaction", id: string, summary: string, } | { "type": "compaction_result", id: string, status: TurnStatus, message: string | null, };
+export type HistoryItem = { "type": "message", id: string, status: TurnStatus, role: HistoryMessageRole, text: string, at?: string, stats?: SessionModelUsage, images?: Array<ImageAttachment>, files?: Array<string>, annotations?: Array<MessageAnnotation>, turnId?: string, hasSnapshot?: boolean, } | { "type": "thinking", id: string, status: TurnStatus, text: string, } | { "type": "tool", id: string, status: ToolStatus, name: string, args: JsonValue, result: ToolResult | null, } | { "type": "compaction", id: string, summary: string, } | { "type": "compaction_result", id: string, status: TurnStatus, message: string | null, };
 
 export type HistoryMessageRole = "user" | "assistant";
 
@@ -86,7 +90,15 @@ export type RpcError = { message: string, };
 
 export type RpcResponse = { "type": "success", result: JsonValue, } | { "type": "error", error: RpcError, };
 
+export type SessionChangedFilesParams = { sessionId: string, turnId?: string | null, };
+
+export type SessionChangedFilesResult = { files: Array<ChangedFile>, };
+
 export type SessionFailure = { source: SessionOperation, error: TurnErrorDetail, };
+
+export type SessionFileDiffParams = { sessionId: string, path: string, turnId?: string | null, };
+
+export type SessionFileDiffResult = { path: string, output: string, };
 
 export type SessionFocusParams = { sessionId: string | null, };
 
@@ -107,6 +119,8 @@ export type SessionPhase = "idle" | "running" | "compacting" | "stopping";
 export type SessionReadResult = { revision: number, history: ThreadHistory, runtime: SessionRuntime, backgroundTasks: Array<VisibleBackgroundTask>, context: InjectedContext | null, };
 
 export type SessionRenameParams = { sessionId: string, name: string, };
+
+export type SessionRewindParams = { sessionId: string, turnId: string, restoreFiles: boolean, };
 
 export type SessionRuntime = { phase: SessionPhase, selection: ModelSelection, contextUsage: ContextUsage | null, pendingQuestion: PendingQuestion | null, pendingMessages: Array<PendingUserMessage>, failure: SessionFailure | null, };
 
@@ -191,4 +205,7 @@ export interface RpcContract {
   "session.context": { params: SessionParams; result: null }
   "session.stopBackgroundTask": { params: BackgroundTaskParams; result: null }
   "session.updateSettings": { params: UpdateSettingsParams; result: null }
+  "session.changedFiles": { params: SessionChangedFilesParams; result: SessionChangedFilesResult }
+  "session.fileDiff": { params: SessionFileDiffParams; result: SessionFileDiffResult }
+  "session.rewind": { params: SessionRewindParams; result: SessionReadResult }
 }

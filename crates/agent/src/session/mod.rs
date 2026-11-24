@@ -1,18 +1,21 @@
+pub(crate) mod compaction;
 pub(crate) mod context;
 mod file;
 mod format;
 mod manager;
+pub mod snapshot;
 
 use format::Result;
 
 pub use crate::image::SavedImage;
-pub use context::{CompactionInput, retention_budget_tokens};
+pub use compaction::{CompactionInput, retention_budget_tokens};
 pub(crate) use format::tool_item_id;
 pub use format::{
     CompactionEntry, LedgerRecord, MessageDisplay, SessionEntry, SessionError, SessionMetadata, text_item_id,
     thinking_item_id,
 };
 pub use manager::{SessionData, SessionManager, scan_session_entries};
+pub use snapshot::session_snapshot_directory;
 
 pub fn session_file_name(session_id: &str) -> String {
     format!("{session_id}.jsonl")

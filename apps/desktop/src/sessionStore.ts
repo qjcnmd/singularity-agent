@@ -1,7 +1,7 @@
 import { reduceUnread, initialSyncState, acceptSessionStart, acceptSessionRead, resetBaseline, reduceStream, pruneStaleSelection, type SyncState } from './sync'
 import { loadPersisted, persistView, type PersistedView } from './viewPersistence'
 import { RpcFailure, RpcClient } from './rpcClient'
-import type { ConnectionStatus, StreamEnvelope, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
+import type { ConnectionStatus, SessionReadResult, StreamEnvelope, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
 import { DraftStore, type DraftSnapshot } from './drafts'
 
 export const actionOrigin = {
@@ -31,6 +31,8 @@ interface SessionLoadState {
 
 export interface FileTab {
   id: string; path: string; cwd: string; title: string
+  mode: 'file' | 'diff'
+  sessionId?: string
   opened: number
 }
 
@@ -325,6 +327,30 @@ export class SessionStore {
     return { message: error instanceof Error ? error.message : '发生了未知错误。' }
   }
 
+  protected applyRewoundSession(result: SessionReadResult): void {
+    const id = result.history.summary.threadId
+    if (this.state.selectedSessionId === id) {
+      const accepted = acceptSessionRead(this.state, result)
+      if (accepted !== this.state) this.applySync(accepted)
+      else void this.readSession(id)
+    }
+    this.bumpSessionDiffTabs(id)
+  }
+
+  protected bumpSessionDiffTabs(sessionId: string): void {
+    if (!this.state.fileTabs.some(tab => tab.mode === 'diff' && tab.sessionId === sessionId)) return
+    this.patch({
+      fileTabs: this.state.fileTabs.map(tab =>
+        tab.mode === 'diff' && tab.sessionId === sessionId ? { ...tab, opened: tab.opened + 1 } : tab),
+    })
+  }
+
+  protected closeSessionDiffTabs(sessionIds: ReadonlySet<string>): void {
+    const next = filterFileTabs(this.state.fileTabs, this.state.activeFileTab,
+      tab => tab.mode !== 'diff' || tab.sessionId === undefined || !sessionIds.has(tab.sessionId))
+    if (next) this.patch(next)
+  }
+
   protected applySync(state: SyncState, progress = false): void {
     if (state === this.state) return
     const { revision, modelCatalogRevision, bootstrap, session, liveSessions } = state
@@ -341,6 +367,12 @@ export class SessionStore {
         patch.selectedWorkspaceRoot = pruned.selectedWorkspaceRoot
         patch.selectedSessionId = pruned.selectedSessionId
         patch.sessionLoad = { status: 'idle', error: null }
+      }
+      if (this.state.fileTabs.some(tab => tab.mode === 'diff')) {
+        const existingSessions = new Set(Object.values(bootstrap.sessionsByWorkspace).flat().map(item => item.threadId))
+        const retainedTabs = filterFileTabs(this.state.fileTabs, this.state.activeFileTab,
+          tab => tab.mode !== 'diff' || tab.sessionId === undefined || existingSessions.has(tab.sessionId))
+        if (retainedTabs) Object.assign(patch, retainedTabs)
       }
     }
     this.patch(patch, progress)
@@ -403,4 +435,20 @@ function retainedQuestionDrafts(drafts: AppState['questionDrafts'], sessionId: s
   const retained = { ...drafts }
   delete retained[sessionId]
   return retained
+}
+
+function filterFileTabs(
+  tabs: readonly FileTab[],
+  activeFileTab: string | null,
+  keep: (tab: FileTab) => boolean,
+): Pick<AppState, 'fileTabs' | 'activeFileTab'> | null {
+  const fileTabs = tabs.filter(keep)
+  if (fileTabs.length === tabs.length) return null
+  if (activeFileTab === null || fileTabs.some(tab => tab.id === activeFileTab)) {
+    return { fileTabs, activeFileTab }
+  }
+  const previousIndex = tabs.findIndex(tab => tab.id === activeFileTab)
+  const fallback = tabs.slice(previousIndex + 1).find(keep)
+    ?? tabs.slice(0, previousIndex).findLast(keep)
+  return { fileTabs, activeFileTab: fallback?.id ?? null }
 }

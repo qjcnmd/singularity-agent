@@ -32,12 +32,21 @@ impl Conversation {
             return Ok(compaction_unneeded(sink, controls.cancellation()));
         };
         let result = requests
-            .compact_selected(input, sink, controls.cancellation(), || !controls.finish_cancel())
+            .compact_selected(input, sink, controls.cancellation(), |is_final| {
+                if is_final {
+                    !controls.finish_cancel()
+                } else {
+                    !controls.cancellation().is_cancelled()
+                }
+            })
             .await;
-        controls.finish_cancel();
+        let cancelled = controls.finish_cancel();
         match result {
+            Ok(()) if cancelled => Ok(TurnStatus::Interrupted),
             Ok(()) => Ok(TurnStatus::Completed),
             Err(AgentError::Aborted) => Ok(TurnStatus::Interrupted),
+            Err(error) if error.is_session_failure() => Err(error.detail()),
+            Err(_) if cancelled => Ok(TurnStatus::Interrupted),
             Err(error) => Err(error.detail()),
         }
     }

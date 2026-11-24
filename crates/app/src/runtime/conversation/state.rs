@@ -82,7 +82,7 @@ impl ConversationState {
             || self.has_active_inbox()
     }
 
-    fn has_active_inbox(&self) -> bool {
+    pub(super) fn has_active_inbox(&self) -> bool {
         let inbox = self.steering_inbox.lock().expect("turn inbox lock poisoned");
         if self.auto_resume {
             !inbox.pending().is_empty()
@@ -101,6 +101,7 @@ impl ConversationState {
 pub(super) enum TurnLifecycle {
     Idle,
     Running(Arc<TurnControls>),
+    Rewinding,
 }
 
 impl TurnLifecycle {
@@ -110,7 +111,7 @@ impl TurnLifecycle {
 
     pub(super) fn phase(&self) -> SessionPhase {
         match self {
-            Self::Idle => SessionPhase::Idle,
+            Self::Idle | Self::Rewinding => SessionPhase::Idle,
             Self::Running(controls) if controls.cancellation().is_cancelled() => SessionPhase::Stopping,
             Self::Running(controls) if controls.is_compacting() => SessionPhase::Compacting,
             Self::Running(_) => SessionPhase::Running,

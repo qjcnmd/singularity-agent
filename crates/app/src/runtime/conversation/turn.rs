@@ -20,7 +20,7 @@ impl Conversation {
         let prepared = tokio::task::spawn_blocking(move || conversation.prepare_turn(&preparing))
             .await
             .expect("turn preparation completes while the runtime is running");
-        let (mut agent, started_at, context_window) = match prepared {
+        let (mut agent, started_at, context_window, has_snapshot) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 return if controls.finish_cancel() {
@@ -39,8 +39,24 @@ impl Conversation {
         sink(AgentEvent::Turn(TurnEvent::TurnStarted { turn, started_at }));
 
         let run_result = {
-            let mut on_event = |event: AgentEvent| match event {
-                AgentEvent::Turn(TurnEvent::ItemUpdated { ref item })
+            let mut pending_turn_start = Some((turn_id.clone(), has_snapshot));
+            let mut on_event = |mut event: AgentEvent| match &mut event {
+                AgentEvent::Turn(TurnEvent::ItemUpdated {
+                    item:
+                        protocol::HistoryItem::Message {
+                            role: protocol::HistoryMessageRole::User,
+                            turn_id: item_turn_id,
+                            has_snapshot: item_has_snapshot,
+                            ..
+                        },
+                }) => {
+                    if let Some((tid, snap)) = pending_turn_start.take() {
+                        *item_turn_id = Some(tid);
+                        *item_has_snapshot = snap;
+                    }
+                    sink(event);
+                }
+                AgentEvent::Turn(TurnEvent::ItemUpdated { item })
                     if matches!(
                         item,
                         protocol::HistoryItem::Compaction { .. }
@@ -60,7 +76,7 @@ impl Conversation {
                     sink(event);
                     sink(AgentEvent::SessionStateChanged);
                 }
-                event => sink(event),
+                _ => sink(event),
             };
             agent.run(&mut on_event, controls.cancellation()).await
         };
@@ -117,16 +133,38 @@ impl Conversation {
     fn prepare_turn(
         &self,
         controls: &crate::runtime::conversation::TurnControls,
-    ) -> Result<(Agent, String, u64), TurnErrorDetail> {
+    ) -> Result<(Agent, String, u64, bool), TurnErrorDetail> {
         let inbox = Arc::clone(&self.lock_state().steering_inbox);
         let context = self.prepare_request_context()?;
         let context_window = context.context_window();
         let agent = Agent::new(context, inbox, Arc::clone(&controls.questions), Arc::clone(&self.bash_tasks));
+        let (snapshot_dir, cwd) = {
+            let writer = lock_writer(&self.writer);
+            let data = writer.data();
+            (data.snapshot_directory(), data.cwd().to_path_buf())
+        };
+        let snapshot_tree = if controls.cancellation().is_cancelled() {
+            None
+        } else {
+            match agent::session::snapshot::capture(&snapshot_dir, &cwd) {
+                Ok(tree) => Some(tree),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %self.thread_id,
+                        turn_id = %controls.turn_id,
+                        error = %error,
+                        "failed to capture pre-turn snapshot"
+                    );
+                    None
+                }
+            }
+        };
+        let has_snapshot = snapshot_tree.is_some();
         let mut writer = lock_writer(&self.writer);
         let started_at = writer
-            .append_record_with_id(controls.turn_id.clone(), LedgerRecord::OperationStarted)
+            .append_operation_started(controls.turn_id.clone(), snapshot_tree)
             .map_err(preparation_error)?;
-        Ok((agent, started_at, context_window))
+        Ok((agent, started_at, context_window, has_snapshot))
     }
 
     pub(crate) fn begin_context_preview(self: &Arc<Self>, signal: &CancellationToken) -> ContextPreview {
