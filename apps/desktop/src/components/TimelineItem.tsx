@@ -121,20 +121,20 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
 
 function summarizeActivity(rows: ActivityGroup['rows'], tasks: VisibleBackgroundTask[] | undefined) {
   let stepCount = 0
+  let failedToolCount = 0
   let runningKind: ActivityRowItem['type'] | null = null
   let hasTyping = false
-  let hasFailed = false
+  let turnFailed = false
   let hasInterrupted = false
   let hasCompleted = false
   let terminalText: string | null = null
-  let terminalFailed = false
   for (const { item } of rows) {
     if (item.type === 'typing') {
       hasTyping = true
       continue
     }
     if (item.type === 'terminal') {
-      if (item.status === 'failed') terminalFailed = true
+      if (item.status === 'failed') turnFailed = true
       else { hasInterrupted = true; terminalText = item.text }
       continue
     }
@@ -143,7 +143,7 @@ function summarizeActivity(rows: ActivityGroup['rows'], tasks: VisibleBackground
       for (const sub of item.rows) {
         const status = toolDisplay(sub.item, tasks).status
         if (status === 'running') runningKind = 'tool_group'
-        else if (status === 'failed') hasFailed = true
+        else if (status === 'failed') failedToolCount += 1
         else if (status === 'interrupted') hasInterrupted = true
         else if (status === 'completed') hasCompleted = true
       }
@@ -156,16 +156,17 @@ function summarizeActivity(rows: ActivityGroup['rows'], tasks: VisibleBackground
         ? 'completed'
         : item.status
     if (status === 'running') runningKind = item.type
-    else if (status === 'failed') hasFailed = true
-    else if (status === 'interrupted') hasInterrupted = true
+    else if (status === 'failed') {
+      if (item.type === 'tool') failedToolCount += 1
+      else turnFailed = true
+    } else if (status === 'interrupted') hasInterrupted = true
     else if (status === 'completed') hasCompleted = true
   }
   const status: ToolStatus = runningKind !== null || hasTyping ? 'running'
-    : terminalFailed ? 'failed'
+    : turnFailed ? 'failed'
     : terminalText !== null ? 'interrupted'
-    : hasFailed ? 'failed'
     : hasInterrupted ? 'interrupted'
-    : hasCompleted ? 'completed'
+    : hasCompleted || failedToolCount > 0 ? 'completed'
     : 'pending'
   let label: string
   if (runningKind !== null) {
@@ -181,7 +182,11 @@ function summarizeActivity(rows: ActivityGroup['rows'], tasks: VisibleBackground
     const title = terminalText ?? '已中断'
     label = stepCount > 0 ? `${title} · ${stepCount} 个步骤` : title
   } else if (status === 'completed') {
-    label = stepCount === 1 && rows[0]?.item.type === 'thinking' ? '思考过程' : `已完成 ${stepCount} 个步骤`
+    label = failedToolCount > 0
+      ? `已完成 ${stepCount} 个步骤 · ${failedToolCount} 步失败`
+      : stepCount === 1 && rows[0]?.item.type === 'thinking'
+        ? '思考过程'
+        : `已完成 ${stepCount} 个步骤`
   } else {
     label = `等待执行 · ${stepCount} 个步骤`
   }
