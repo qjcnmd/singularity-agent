@@ -42,10 +42,10 @@ description: >-
 * **审查调用**：通过 `delegate_task(role="review", isolation="shared", mode="async")` 执行。常规/局部改动优先 `codex/gpt-6.2-sol`（`providerInstanceId: "codex"`，常规 `high` / 大改 `xhigh`）；跨多模块大重构或 `6.2-Sol` 受限时派空白上下文 `gemini-4-neon`（`thought_level: "high"`，优先 `wbxczncx` / `yyx9850`），大重构可互补双审。
 * **审查要求**：简报中注明先核对 `docs/decisions.md` 与 `docs/architecture.md#运行边界`；`blocker` 须给出本机 Windows 单用户边界内可复现失效路径或明显结构重复，`nit` 不触发返工；返回 JSON 问题清单（每项含 `id`、`severity`、`pattern`、`file`、`summary`）。
 * **核实、入账与收敛**：执行侧逐条核实源码并标记 `fixed` / `rebutted`（须附一句白话理由）/ `escalated`（`nit` 可标 `ignored`），运行 `pwsh -File scripts/workflow.ps1 record-review -InputPath <json> -Reviewer <model> -HandoffVersion v1 -Round <n>` 写入 `~/.singularity-dev/ledger.jsonl`；所有确认的 `blocker` 一次性修复并重跑完整 `gate`；最多 2 轮，未决分歧交用户拍板。
-* **一页拍板卡与合入**：
-  1. 运行 `pwsh -File scripts/workflow.ps1 radar` 获取敏感区与体量摘要；
-  2. 向用户呈现中文拍板卡：① 行为变化、实机截图与手测项；② 门禁与雷达结果（含审后净增 > 50 行提醒）；③ 审查汇总与全部 `rebutted` 条目及理由；④ PR 链接与云端 CI 状态；
-  3. 用户确认后推送分支，`pull_request_create` 开 PR 并 `watch_pull_request` 等待 `Supply-chain policy` 与 `Windows` 全绿后合入 `main`，随后 `git switch main && git pull`。
+* **PR 与一页拍板卡**：
+  1. 审查收敛并重跑完整 `gate` 后，推送分支，`pull_request_create` 开 PR 并通过 `watch_pull_request` 等待 `Supply-chain policy` 与 `Windows` 全绿；
+  2. 运行 `pwsh -File scripts/workflow.ps1 radar`，向用户呈现中文拍板卡：① 行为变化、实机截图与手测项；② 本地门禁与雷达结果（含审后净增 > 50 行提醒）；③ 审查汇总与全部 `rebutted` 条目及理由；④ PR 链接与云端 CI 状态；
+  3. 用户确认后合入 `main`，随后 `git switch main && git pull`。
 
 ## 5. 周期外环（定时与手动共用）
 

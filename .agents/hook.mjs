@@ -11,18 +11,28 @@ function readStdin() {
   }
 }
 
-function getBranch(cwd) {
-  if (!cwd) return 'unknown';
+function getGitMeta(workDir) {
+  if (!workDir) return { repo: 'unknown', branch: 'unknown' };
+  let repo = path.basename(workDir) || 'unknown';
+  let branch = 'unknown';
   try {
-    return execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
-      cwd,
+    const top = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: workDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1500,
+    }).trim();
+    if (top) repo = path.basename(top);
+  } catch { /* fallback to workDir basename */ }
+  try {
+    branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      cwd: workDir,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 1500,
     }).trim() || 'unknown';
-  } catch {
-    return 'unknown';
-  }
+  } catch { /* fallback */ }
+  return { repo, branch };
 }
 
 try {
@@ -36,6 +46,8 @@ try {
     const isFollowup = toolName.includes('t3_thread_send');
 
     if (isDelegate || isFollowup) {
+      const workDir = payload.cwd || (Array.isArray(payload.workspacePaths) ? payload.workspacePaths[0] : '') || '';
+      const { repo, branch } = getGitMeta(workDir);
       const promptText = String(isDelegate ? (args.task ?? '') : (args.message ?? ''));
       const verMatch = promptText.match(/\[handoff:(v\d+)\]/i);
       const devHome = process.env.SINGULARITY_DEV_HOME || path.join(os.homedir(), '.singularity-dev');
@@ -44,8 +56,8 @@ try {
         ts: new Date().toISOString(),
         type: 'handoff',
         tool: isDelegate ? 'delegate_task' : 't3_thread_send',
-        repo: payload.cwd ? path.basename(payload.cwd) : 'unknown',
-        branch: getBranch(payload.cwd),
+        repo,
+        branch,
         title: args.title || null,
         role: args.role || null,
         target: args.target || null,

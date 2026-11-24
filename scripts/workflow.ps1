@@ -63,16 +63,20 @@ function Append-Ledger([System.Collections.IDictionary]$Entry) {
 
 function Get-GitInfo {
     $branch = (& git @gitOpts rev-parse --abbrev-ref HEAD 2>$null | Out-String).Trim()
-    if (-not $branch) { $branch = 'unknown' }
+    if ($LASTEXITCODE -ne 0 -or -not $branch) { throw 'Failed to resolve current git branch.' }
     $head = (& git @gitOpts rev-parse HEAD 2>$null | Out-String).Trim()
-    if (-not $head) { $head = 'unknown' }
+    if ($LASTEXITCODE -ne 0 -or -not $head) { throw 'Failed to resolve current git HEAD.' }
     $porcelain = @(& git @gitOpts status --porcelain 2>$null | Where-Object { $_ })
-    $global:LASTEXITCODE = 0
-    return [pscustomobject]@{ Branch = $branch; Head = $head; Dirty = ($porcelain.Count -gt 0) }
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to read git status.' }
+    return [pscustomobject]@{ Branch = $branch; Head = $head; Dirty = ($porcelain.Count -gt 0); Porcelain = $porcelain }
 }
 
 function Resolve-BaseRef([string]$RequestedBase) {
-    if ($RequestedBase) { return $RequestedBase }
+    if ($RequestedBase) {
+        $null = & git rev-parse --verify $RequestedBase 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "Base ref '$RequestedBase' could not be resolved." }
+        return $RequestedBase
+    }
     foreach ($candidate in @('origin/main', 'main')) {
         $null = & git rev-parse --verify $candidate 2>$null
         if ($LASTEXITCODE -eq 0) { return $candidate }
@@ -83,16 +87,33 @@ function Resolve-BaseRef([string]$RequestedBase) {
 
 function Get-ChangedFiles([string]$BaseRef) {
     $mergeBase = (& git @gitOpts merge-base $BaseRef HEAD 2>$null | Out-String).Trim()
-    if (-not $mergeBase) { $mergeBase = 'HEAD' }
+    if ($LASTEXITCODE -ne 0 -or -not $mergeBase) {
+        throw "Failed to compute git merge-base between '$BaseRef' and HEAD."
+    }
     $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($f in @(& git @gitOpts diff --name-only $mergeBase 2>$null)) {
+    foreach ($diffArgs in @(
+        @('diff', '--name-only', '--no-renames', $mergeBase),
+        @('diff', '--cached', '--name-only', '--no-renames', $mergeBase)
+    )) {
+        $lines = @(& git @gitOpts @diffArgs 2>$null)
+        if ($LASTEXITCODE -ne 0) { throw "git $($diffArgs -join ' ') failed." }
+        foreach ($f in $lines) {
+            if ($f) { [void]$set.Add($f.Replace('\', '/')) }
+        }
+    }
+    $untracked = @(& git @gitOpts ls-files --others --exclude-standard 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'git ls-files --others failed.' }
+    foreach ($f in $untracked) {
         if ($f) { [void]$set.Add($f.Replace('\', '/')) }
     }
-    foreach ($f in @(& git @gitOpts ls-files --others --exclude-standard 2>$null)) {
-        if ($f) { [void]$set.Add($f.Replace('\', '/')) }
-    }
-    $global:LASTEXITCODE = 0
     return [pscustomobject]@{ MergeBase = $mergeBase; Files = @($set | Sort-Object) }
+}
+
+function Assert-NoIndexWorktreeConflict([string[]]$PorcelainLines) {
+    $conflicts = @($PorcelainLines | Where-Object { $_ -match '^[MARCD][MD]\s' } | ForEach-Object { $_.Substring(3).Trim() })
+    if ($conflicts.Count -gt 0) {
+        throw "Staged index differs from working tree on: $($conflicts -join ', '). Stage or restore before running gate."
+    }
 }
 
 function Test-ProdSourcePath([string]$RelPath) {
@@ -140,7 +161,9 @@ function Get-ErrorSignature([string[]]$Lines) {
         if ($l -match '\berror\[(E\d{4})\]') { return "rustc:$($Matches[1])" }
         if ($l -match '\berror (TS\d{4}):') { return "ts:$($Matches[1])" }
         if ($l -match 'exceed 600-line limit') { return 'size:over_600' }
-        if ($l -match 'Check failed \(\d+\): (.+)$') { return "step:$($Matches[1].Trim())" }
+    }
+    for ($i = $Lines.Count - 1; $i -ge 0; $i--) {
+        if ($Lines[$i] -match 'Check failed \(\d+\): (.+)$') { return "step:$($Matches[1].Trim())" }
     }
     $tail = ($Lines | Select-Object -Last 6) -join "`n"
     $norm = ($tail -replace '\d+', 'N' -replace '[A-Za-z]:\\[^\s:]+', '<PATH>').Trim()
@@ -157,7 +180,7 @@ function Get-BranchDelta([string]$MergeBase) {
             $ins += [int]$parts[0]; $del += [int]$parts[1]
         }
     }
-    foreach ($rel in @(& git @gitOpts diff --name-only --diff-filter=A $MergeBase 2>$null)) {
+    foreach ($rel in @(& git @gitOpts diff --name-only --no-renames --diff-filter=A $MergeBase 2>$null)) {
         if (Test-ProdSourcePath $rel) { $newProd++ }
     }
     foreach ($rel in @(& git @gitOpts ls-files --others --exclude-standard 2>$null)) {
@@ -171,6 +194,20 @@ function Get-BranchDelta([string]$MergeBase) {
     return [pscustomobject]@{ Ins = $ins; Del = $del; Net = ($ins - $del); NewProdFiles = $newProd }
 }
 
+function Parse-TimestampUtc($Value) {
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [DateTimeOffset]) { return $Value.ToUniversalTime() }
+    if ($Value -is [DateTime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Utc) { return [DateTimeOffset]::new($Value, [TimeSpan]::Zero) }
+        return [DateTimeOffset]::new($Value).ToUniversalTime()
+    }
+    return [DateTimeOffset]::Parse(
+        [string]$Value,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::RoundtripKind
+    ).ToUniversalTime()
+}
+
 function Read-LedgerEntries([int]$WindowDays) {
     if (-not (Test-Path -LiteralPath $ledgerPath)) { return @() }
     $cutoff = [DateTimeOffset]::UtcNow.AddDays(-$WindowDays)
@@ -178,9 +215,10 @@ function Read-LedgerEntries([int]$WindowDays) {
     foreach ($line in [System.IO.File]::ReadLines($ledgerPath)) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         try {
-            $obj = $line | ConvertFrom-Json
+            $obj = $line | ConvertFrom-Json -NoEnumerate
             if ($WindowDays -le 0) { $items.Add($obj); continue }
-            if ($obj.ts -and ([DateTimeOffset]::Parse($obj.ts) -ge $cutoff)) { $items.Add($obj) }
+            $parsedTs = Parse-TimestampUtc (Get-Prop $obj 'ts')
+            if ($null -ne $parsedTs -and $parsedTs -ge $cutoff) { $items.Add($obj) }
         } catch { continue }
     }
     return @($items)
@@ -188,6 +226,7 @@ function Read-LedgerEntries([int]$WindowDays) {
 
 function Invoke-Gate {
     $git = Get-GitInfo
+    Assert-NoIndexWorktreeConflict $git.Porcelain
     $baseRef = Resolve-BaseRef $Base
     $changed = Get-ChangedFiles $baseRef
     $resolvedScope = if ($Scope -eq 'auto') { Resolve-AutoScope $changed.Files } else { $Scope }
@@ -203,7 +242,7 @@ function Invoke-Gate {
         [System.IO.File]::WriteAllText($stampPath, ($stamp | ConvertTo-Json -Depth 5), $utf8NoBom)
         Append-Ledger ([ordered]@{
             ts = $stamp.ts; type = 'gate'; repo = $repoName; branch = $git.Branch; head = $git.Head
-            dirty = $git.Dirty; scope = 'docs-only'; ok = $true; cache_hit = $false; duration_ms = 0
+            dirty = $git.Dirty; scope = 'docs-only'; skip_e2e = $true; ok = $true; cache_hit = $false; duration_ms = 0
         })
         Write-Host "Gate PASSED (scope=docs-only, 0 production code changes)." -ForegroundColor Green
         return
@@ -212,12 +251,12 @@ function Invoke-Gate {
     if ((-not $Force) -and (-not $git.Dirty) -and (Test-Path -LiteralPath $stampPath)) {
         try {
             $existing = Get-Content -LiteralPath $stampPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($existing.ok -and ($existing.head -eq $git.Head) -and (-not $existing.dirty) -and
-                (Test-ScopeCovered $existing.scope ([bool]$existing.skip_e2e) $resolvedScope ([bool]$SkipE2E))) {
+            if ((Get-Prop $existing 'ok' $false) -and ((Get-Prop $existing 'head') -eq $git.Head) -and (-not [bool](Get-Prop $existing 'dirty' $true)) -and
+                (Test-ScopeCovered ([string](Get-Prop $existing 'scope' '')) ([bool](Get-Prop $existing 'skip_e2e' $false)) $resolvedScope ([bool]$SkipE2E))) {
                 Append-Ledger ([ordered]@{
                     ts = [DateTimeOffset]::UtcNow.ToString('o'); type = 'gate'; repo = $repoName
                     branch = $git.Branch; head = $git.Head; dirty = $false; scope = $resolvedScope
-                    ok = $true; cache_hit = $true; duration_ms = 0
+                    skip_e2e = [bool]$SkipE2E; ok = $true; cache_hit = $true; duration_ms = 0
                 })
                 Write-Host "Gate stamp valid (HEAD=$($git.Head.Substring(0, [Math]::Min(8, $git.Head.Length))), scope=$resolvedScope) - skipped redundant run." -ForegroundColor Green
                 return
@@ -237,24 +276,27 @@ function Invoke-Gate {
     $sw.Stop()
     [System.IO.File]::WriteAllLines($logFile, $outputLines, $utf8NoBom)
 
+    $gitAfter = Get-GitInfo
+    $effectiveDirty = $git.Dirty -or $gitAfter.Dirty -or ($git.Head -ne $gitAfter.Head)
     $ok = ($exitCode -eq 0)
     $errSig = if ($ok) { $null } else { Get-ErrorSignature $outputLines }
     $nowIso = [DateTimeOffset]::UtcNow.ToString('o')
 
     $stamp = [ordered]@{
-        repo = $repoName; branch = $git.Branch; head = $git.Head; scope = $resolvedScope
-        skip_e2e = [bool]$SkipE2E; ok = $ok; dirty = $git.Dirty; error_sig = $errSig
+        repo = $repoName; branch = $gitAfter.Branch; head = $gitAfter.Head; scope = $resolvedScope
+        skip_e2e = [bool]$SkipE2E; ok = $ok; dirty = $effectiveDirty; error_sig = $errSig
         log_path = $logFile; duration_ms = [int]$sw.ElapsedMilliseconds; ts = $nowIso
     }
     [System.IO.File]::WriteAllText($stampPath, ($stamp | ConvertTo-Json -Depth 5), $utf8NoBom)
     Append-Ledger ([ordered]@{
-        ts = $nowIso; type = 'gate'; repo = $repoName; branch = $git.Branch; head = $git.Head
-        dirty = $git.Dirty; scope = $resolvedScope; skip_e2e = [bool]$SkipE2E; ok = $ok
+        ts = $nowIso; type = 'gate'; repo = $repoName; branch = $gitAfter.Branch; head = $gitAfter.Head
+        dirty = $effectiveDirty; scope = $resolvedScope; skip_e2e = [bool]$SkipE2E; ok = $ok
         cache_hit = $false; error_sig = $errSig; duration_ms = [int]$sw.ElapsedMilliseconds; log_path = $logFile
     })
 
     if ($ok) {
-        Write-Host "Gate PASSED (scope=$resolvedScope, $([math]::Round($sw.Elapsed.TotalSeconds, 1))s, HEAD=$($git.Head.Substring(0, [Math]::Min(8, $git.Head.Length))))." -ForegroundColor Green
+        $dirtyNote = if ($effectiveDirty -and (-not $git.Dirty)) { ' (working tree modified by formatter; commit before caching)' } else { '' }
+        Write-Host "Gate PASSED (scope=$resolvedScope, $([math]::Round($sw.Elapsed.TotalSeconds, 1))s, HEAD=$($gitAfter.Head.Substring(0, [Math]::Min(8, $gitAfter.Head.Length))))$dirtyNote." -ForegroundColor Green
     } else {
         Write-Host "Gate FAILED (scope=$resolvedScope, sig=$errSig, full log: $logFile)" -ForegroundColor Red
         Write-Host '--- Last 40 lines ---' -ForegroundColor Yellow
@@ -270,11 +312,11 @@ function Invoke-Radar {
     $delta = Get-BranchDelta $changed.MergeBase
 
     $sensitive = [ordered]@{
-        tests        = @($changed.Files | Where-Object { $_ -match '(^crates/.+/tests/|property_tests\.rs$|^apps/desktop/e2e/)' })
-        dependencies = @($changed.Files | Where-Object { $_ -match '(^Cargo\.(toml|lock)$|^apps/desktop/package(-lock)?\.json$)' })
-        protocol     = @($changed.Files | Where-Object { $_ -match '^crates/protocol/' })
-        workflow_ci  = @($changed.Files | Where-Object { $_ -match '^(\.github/|scripts/|\.agents/)' })
-        ui           = @($changed.Files | Where-Object { $_ -match '^apps/desktop/src/' })
+        tests        = [object[]]@($changed.Files | Where-Object { $_ -match '(^crates/.+/tests/|property_tests\.rs$|^apps/desktop/e2e/)' })
+        dependencies = [object[]]@($changed.Files | Where-Object { $_ -match '(^Cargo\.(toml|lock)$|^apps/desktop/package(-lock)?\.json$)' })
+        protocol     = [object[]]@($changed.Files | Where-Object { $_ -match '^crates/protocol/' })
+        workflow_ci  = [object[]]@($changed.Files | Where-Object { $_ -match '^(\.github/|scripts/|\.agents/)' })
+        ui           = [object[]]@($changed.Files | Where-Object { $_ -match '^apps/desktop/src/' })
     }
 
     $priorReview = @(Read-LedgerEntries 0 | Where-Object {
@@ -287,19 +329,19 @@ function Invoke-Radar {
     $postReviewDelta = if ($priorReview) { $delta.Net - [int](Get-Prop $priorReview 'net_lines_at_review') } else { $null }
 
     $report = [ordered]@{
-        repo                     = $repoName
-        branch                   = $git.Branch
-        head                     = $git.Head
-        merge_base               = $changed.MergeBase
-        changed_files_count      = $changed.Files.Count
-        prod_ins                 = $delta.Ins
-        prod_del                 = $delta.Del
-        prod_net                 = $delta.Net
-        new_prod_files           = $delta.NewProdFiles
-        post_review_net_delta    = $postReviewDelta
-        post_review_bloat_alert  = ($null -ne $postReviewDelta -and $postReviewDelta -gt 50)
-        large_change_alert       = ($changed.Files.Count -gt 5 -or $delta.Net -gt 200)
-        sensitive_hits           = $sensitive
+        repo                    = $repoName
+        branch                  = $git.Branch
+        head                    = $git.Head
+        merge_base              = $changed.MergeBase
+        changed_files_count     = $changed.Files.Count
+        prod_ins                = $delta.Ins
+        prod_del                = $delta.Del
+        prod_net                = $delta.Net
+        new_prod_files          = $delta.NewProdFiles
+        post_review_net_delta   = $postReviewDelta
+        post_review_bloat_alert = ($null -ne $postReviewDelta -and $postReviewDelta -gt 50)
+        large_change_alert      = ($changed.Files.Count -gt 5 -or $delta.Net -gt 200)
+        sensitive_hits          = $sensitive
     }
 
     if ($Json) {
@@ -309,7 +351,7 @@ function Invoke-Radar {
 
     $netText = if ($delta.Net -gt 0) { "+$($delta.Net)" } else { "$($delta.Net)" }
     Write-Host "Radar ($($git.Branch) vs $($changed.MergeBase.Substring(0, [Math]::Min(8, $changed.MergeBase.Length)))): $($changed.Files.Count) file(s), prod +$($delta.Ins)/-$($delta.Del) (net $netText, new prod files: $($delta.NewProdFiles))" -ForegroundColor Cyan
-    $hitNames = @($sensitive.Keys | Where-Object { $sensitive[$_].Count -gt 0 })
+    $hitNames = @($sensitive.Keys | Where-Object { @($sensitive[$_]).Count -gt 0 })
     if ($hitNames.Count -gt 0) {
         Write-Host "  Sensitive areas touched: $($hitNames -join ', ')" -ForegroundColor Yellow
         foreach ($k in $hitNames) { Write-Host "    - ${k}: $($sensitive[$k] -join ', ')" }
@@ -330,14 +372,25 @@ function Invoke-RecordReview {
         throw 'record-review requires -InputPath or -JsonString.'
     }
 
-    $parsed = $raw | ConvertFrom-Json
-    $findings = if ($parsed -is [System.Array]) { @($parsed) }
-        elseif ($parsed.PSObject.Properties['findings']) { @($parsed.findings) }
-        else { throw 'Review JSON must be an array or an object with a "findings" array.' }
+    $parsed = $raw | ConvertFrom-Json -NoEnumerate
+    $findingsList = [System.Collections.Generic.List[object]]::new()
+    if ($parsed -is [System.Array]) {
+        foreach ($item in $parsed) { $findingsList.Add($item) }
+    } elseif ($parsed -is [pscustomobject] -and $parsed.PSObject.Properties['findings']) {
+        $propVal = $parsed.findings
+        if (-not ($propVal -is [System.Array])) {
+            throw 'Review JSON property "findings" must be an array.'
+        }
+        foreach ($item in $propVal) { $findingsList.Add($item) }
+    } else {
+        throw 'Review JSON must be an array or an object with a "findings" array.'
+    }
 
     $validSeverities = @('blocker', 'nit')
     $validVerdicts = @('fixed', 'rebutted', 'escalated', 'ignored')
-    foreach ($f in $findings) {
+    $rebuttedCount = 0
+    foreach ($f in $findingsList) {
+        if (-not ($f -is [pscustomobject])) { throw 'Each review finding must be a JSON object.' }
         $fid = [string](Get-Prop $f 'id' '?')
         $sev = [string](Get-Prop $f 'severity' '')
         $ver = [string](Get-Prop $f 'verdict' '')
@@ -348,13 +401,14 @@ function Invoke-RecordReview {
         if ($ver -eq 'rebutted' -and [string]::IsNullOrWhiteSpace($rea)) {
             throw "Rebutted finding '$fid' MUST include a non-empty plain-language 'reason'."
         }
+        if ($ver -eq 'rebutted') { $rebuttedCount++ }
     }
 
     $git = Get-GitInfo
     $baseRef = Resolve-BaseRef $Base
     $changed = Get-ChangedFiles $baseRef
     $delta = Get-BranchDelta $changed.MergeBase
-    $reviewerName = if ($Reviewer) { $Reviewer } else { [string](Get-Prop $parsed 'reviewer' 'unknown') }
+    $reviewerName = if ($Reviewer) { $Reviewer } elseif ($parsed -is [pscustomobject]) { [string](Get-Prop $parsed 'reviewer' 'unknown') } else { 'unknown' }
 
     Append-Ledger ([ordered]@{
         ts                  = [DateTimeOffset]::UtcNow.ToString('o')
@@ -367,34 +421,49 @@ function Invoke-RecordReview {
         handoff_version     = $HandoffVersion
         round               = $Round
         net_lines_at_review = $delta.Net
-        findings            = $findings
+        findings            = [object[]]$findingsList.ToArray()
     })
-    $rebuttedCount = @($findings | Where-Object { (Get-Prop $_ 'verdict') -eq 'rebutted' }).Count
-    Write-Host "Recorded review ($($findings.Count) finding(s), $rebuttedCount rebutted) for branch '$($git.Branch)'." -ForegroundColor Green
+    Write-Host "Recorded review ($($findingsList.Count) finding(s), $rebuttedCount rebutted) for branch '$($git.Branch)'." -ForegroundColor Green
 }
 
 function Group-ReviewPatterns($Findings, [string]$TargetVerdict) {
+    if ($null -eq $Findings -or @($Findings).Count -eq 0) { return @() }
     return @($Findings | Where-Object { $_.verdict -eq $TargetVerdict -and $_.pattern } | Group-Object pattern | ForEach-Object {
         [ordered]@{ pattern = $_.Name; count = $_.Count; distinct_branches = @($_.Group | Select-Object -ExpandProperty branch -Unique).Count }
     } | Sort-Object { $_.distinct_branches }, { $_.count } -Descending | Select-Object -First 10)
 }
 
 function Invoke-Digest {
-    $entries = Read-LedgerEntries $Days
+    $entries = @(Read-LedgerEntries $Days)
     $handoffs = @($entries | Where-Object { (Get-Prop $_ 'type') -eq 'handoff' })
     $gates = @($entries | Where-Object { (Get-Prop $_ 'type') -eq 'gate' })
     $reviews = @($entries | Where-Object { (Get-Prop $_ 'type') -eq 'review' })
 
-    $cleanRuns = @($gates | Where-Object { (-not [bool](Get-Prop $_ 'dirty' $false)) -and (-not [bool](Get-Prop $_ 'cache_hit' $false)) })
-    $redundantGroups = @($cleanRuns | Group-Object { "$(Get-Prop $_ 'head')|$(Get-Prop $_ 'scope')" } | Where-Object { $_.Count -gt 1 })
-    $redundantExtraRuns = 0; $redundantMs = 0
-    foreach ($g in $redundantGroups) {
-        $redundantExtraRuns += ($g.Count - 1)
-        foreach ($extra in ($g.Group | Select-Object -Skip 1)) { $redundantMs += [int](Get-Prop $extra 'duration_ms' 0) }
+    $cleanPassedByHead = @{}
+    $redundantExtraRuns = 0
+    $redundantMs = 0
+    foreach ($g in @($gates | Where-Object { (-not [bool](Get-Prop $_ 'dirty' $false)) -and (-not [bool](Get-Prop $_ 'cache_hit' $false)) })) {
+        $gHead = [string](Get-Prop $g 'head' '')
+        $gScope = [string](Get-Prop $g 'scope' '')
+        $gSkip = [bool](Get-Prop $g 'skip_e2e' $false)
+        $gOk = [bool](Get-Prop $g 'ok' $false)
+        if (-not $cleanPassedByHead.ContainsKey($gHead)) {
+            $cleanPassedByHead[$gHead] = [System.Collections.Generic.List[object]]::new()
+        }
+        $alreadyCovered = $false
+        foreach ($prev in $cleanPassedByHead[$gHead]) {
+            if (Test-ScopeCovered $prev.Scope $prev.SkipE2E $gScope $gSkip) { $alreadyCovered = $true; break }
+        }
+        if ($alreadyCovered) {
+            $redundantExtraRuns++
+            $redundantMs += [int](Get-Prop $g 'duration_ms' 0)
+        } elseif ($gOk) {
+            $cleanPassedByHead[$gHead].Add([pscustomobject]@{ Scope = $gScope; SkipE2E = $gSkip })
+        }
     }
 
     $failedGates = @($gates | Where-Object { (-not [bool](Get-Prop $_ 'ok' $true)) -and (Get-Prop $_ 'error_sig') })
-    $topErrors = @($failedGates | Group-Object { Get-Prop $_ 'error_sig' } | ForEach-Object {
+    $topErrors = [object[]]@($failedGates | Group-Object { Get-Prop $_ 'error_sig' } | ForEach-Object {
         [ordered]@{
             error_sig = $_.Name
             total_hits = $_.Count
@@ -405,6 +474,7 @@ function Invoke-Digest {
     $allFindings = [System.Collections.Generic.List[object]]::new()
     foreach ($r in $reviews) {
         foreach ($f in @(Get-Prop $r 'findings' @())) {
+            if ($null -eq $f) { continue }
             $allFindings.Add([pscustomobject]@{
                 branch          = [string](Get-Prop $r 'branch' 'unknown')
                 reviewer        = [string](Get-Prop $r 'reviewer' 'unknown')
@@ -418,11 +488,11 @@ function Invoke-Digest {
     $totalF = $allFindings.Count
     $rebuttedF = @($allFindings | Where-Object { $_.verdict -eq 'rebutted' }).Count
     $fpRate = if ($totalF -gt 0) { [math]::Round($rebuttedF / $totalF, 3) } else { 0.0 }
-    $topFixedPatterns = Group-ReviewPatterns $allFindings 'fixed'
-    $topRebuttedPatterns = Group-ReviewPatterns $allFindings 'rebutted'
+    $topFixedPatterns = [object[]]@(Group-ReviewPatterns $allFindings 'fixed')
+    $topRebuttedPatterns = [object[]]@(Group-ReviewPatterns $allFindings 'rebutted')
 
-    $byVersion = @($reviews | Group-Object { Get-Prop $_ 'handoff_version' 'unknown' } | ForEach-Object {
-        $verFindings = @($_.Group | ForEach-Object { @(Get-Prop $_ 'findings' @()) })
+    $byVersion = [object[]]@($reviews | Group-Object { Get-Prop $_ 'handoff_version' 'unknown' } | ForEach-Object {
+        $verFindings = @($_.Group | ForEach-Object { @(Get-Prop $_ 'findings' @()) } | Where-Object { $null -ne $_ })
         [ordered]@{
             handoff_version = $_.Name
             review_count    = $_.Count
@@ -433,17 +503,17 @@ function Invoke-Digest {
     })
 
     $summary = [ordered]@{
-        window_days           = $Days
-        ledger_path           = $ledgerPath
-        counts                = [ordered]@{ handoffs = $handoffs.Count; gates = $gates.Count; reviews = $reviews.Count }
-        redundant_gate_runs   = [ordered]@{ extra_runs = $redundantExtraRuns; wasted_ms = $redundantMs }
-        top_gate_errors       = $topErrors
-        review_metrics        = [ordered]@{
-            total_findings       = $totalF
-            rebutted             = $rebuttedF
-            false_positive_rate  = $fpRate
-            by_handoff_version   = $byVersion
-            top_fixed_patterns   = $topFixedPatterns
+        window_days         = $Days
+        ledger_path         = $ledgerPath
+        counts              = [ordered]@{ handoffs = $handoffs.Count; gates = $gates.Count; reviews = $reviews.Count }
+        redundant_gate_runs = [ordered]@{ extra_runs = $redundantExtraRuns; wasted_ms = $redundantMs }
+        top_gate_errors     = $topErrors
+        review_metrics      = [ordered]@{
+            total_findings        = $totalF
+            rebutted              = $rebuttedF
+            false_positive_rate   = $fpRate
+            by_handoff_version    = $byVersion
+            top_fixed_patterns    = $topFixedPatterns
             top_rebutted_patterns = $topRebuttedPatterns
         }
     }
@@ -454,7 +524,7 @@ function Invoke-Digest {
     }
 
     Write-Host "Digest (last $Days day(s)): $($handoffs.Count) handoffs, $($gates.Count) gates, $($reviews.Count) reviews" -ForegroundColor Cyan
-    Write-Host "  Redundant gate runs (same clean HEAD+scope): $redundantExtraRuns (wasted $([math]::Round($redundantMs / 1000.0, 1))s)"
+    Write-Host "  Redundant gate runs (covered by prior passed clean HEAD): $redundantExtraRuns (wasted $([math]::Round($redundantMs / 1000.0, 1))s)"
     Write-Host "  Review findings: $totalF total, $rebuttedF rebutted (FP rate: $([math]::Round($fpRate * 100, 1))%)"
     if ($topFixedPatterns.Count -gt 0) {
         Write-Host '  Top recurring FIXED patterns:' -ForegroundColor Yellow
