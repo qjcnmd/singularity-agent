@@ -8,21 +8,18 @@ use super::rollback::{
     remove_file_clearing_readonly,
 };
 use super::{
-    EXCLUDED_DIRS, InitPolicy, Repo, canonicalize_existing, is_dir_reparse_point, is_protected_rel, path_key,
+    EXCLUDED_DIRS, InitPolicy, Repo, canonicalize_existing, is_link_metadata, is_protected_rel, path_key,
     split_nul, validate_relative_path, validate_tree_hash,
 };
 
 struct DeleteEntry {
     path: String,
-    mode: String,
     oid: String,
 }
 
 struct WriteEntry {
     path: String,
     status: char,
-    old_mode: String,
-    new_mode: String,
     old_oid: String,
 }
 
@@ -80,29 +77,17 @@ fn prepare_restore(
     to_delete: Vec<DeleteEntry>,
     to_write: Vec<WriteEntry>,
 ) -> io::Result<RestorePlan> {
-    let needs_symlink = to_write.iter().any(|w| w.new_mode == "120000" || w.old_mode == "120000")
-        || to_delete.iter().any(|d| d.mode == "120000" && !is_protected_rel(&d.path, protected));
-    if needs_symlink {
-        ensure_symlinks_supported(repo.cwd)?;
-    }
-
     let mut delete_keys = HashSet::with_capacity(to_delete.len());
     let mut removals = Vec::with_capacity(to_delete.len());
     for del in to_delete {
         if is_protected_rel(&del.path, protected) {
             continue;
         }
-        let (readonly, is_dir_symlink) = file_restore_flags(&join_rel(repo.cwd, &del.path));
+        let readonly = is_readonly_file(&join_rel(repo.cwd, &del.path));
         delete_keys.insert(path_key(&del.path));
         removals.push(PlannedRemoval {
             path: del.path.clone(),
-            undo: BackupEntry::RestoreBlob {
-                path: del.path,
-                oid: del.oid,
-                mode: del.mode,
-                readonly,
-                is_dir_symlink,
-            },
+            undo: BackupEntry::RestoreBlob { path: del.path, oid: del.oid, readonly },
         });
     }
 
@@ -133,30 +118,33 @@ fn prepare_restore(
         let dst = join_rel(repo.cwd, &item.path);
         let undos = match item.status {
             'M' | 'T' => {
-                if !has_deleted_ancestor
-                    && let Ok(meta) = fs::symlink_metadata(&dst)
-                    && meta.is_dir()
-                {
-                    schedule_dir_removal(
-                        &dst,
-                        &item.path,
-                        protected,
-                        &delete_keys,
-                        &mut scheduled_dirs,
-                        &mut dir_removals,
-                    )?;
+                if !has_deleted_ancestor && let Ok(meta) = fs::symlink_metadata(&dst) {
+                    if is_link_metadata(&meta) {
+                        return Err(conflict(format!(
+                            "还原目标与未纳入快照的符号链接或目录联接冲突：{}",
+                            item.path
+                        )));
+                    }
+                    if meta.is_dir() {
+                        schedule_dir_removal(
+                            &dst,
+                            &item.path,
+                            protected,
+                            &delete_keys,
+                            &mut scheduled_dirs,
+                            &mut dir_removals,
+                        )?;
+                    }
                 }
-                let (readonly, is_dir_symlink) = if has_deleted_ancestor {
-                    (false, false)
+                let readonly = if has_deleted_ancestor {
+                    false
                 } else {
-                    file_restore_flags(&dst)
+                    is_readonly_file(&dst)
                 };
                 vec![BackupEntry::RestoreBlob {
                     path: item.path.clone(),
                     oid: item.old_oid,
-                    mode: item.old_mode,
                     readonly,
-                    is_dir_symlink,
                 }]
             }
             'A' if has_deleted_ancestor => vec![BackupEntry::Remove(item.path.clone())],
@@ -166,6 +154,12 @@ fn prepare_restore(
                 }
                 Ok(_) if delete_keys.contains(&path_key(&item.path)) => {
                     remove_with_existing_parent(repo.cwd, &item.path)
+                }
+                Ok(meta) if is_link_metadata(&meta) => {
+                    return Err(conflict(format!(
+                        "还原目标与未纳入快照的符号链接或目录联接冲突：{}",
+                        item.path
+                    )));
                 }
                 Ok(meta) if meta.is_dir() => {
                     schedule_dir_removal(
@@ -178,9 +172,6 @@ fn prepare_restore(
                     )?;
                     vec![BackupEntry::Remove(item.path.clone())]
                 }
-                Ok(meta) if meta.file_type().is_symlink() || is_dir_reparse_point(&meta) => {
-                    return Err(conflict(format!("还原目标与未纳入快照的符号链接冲突：{}", item.path)));
-                }
                 Ok(meta) => {
                     let oid = hash_blob(repo, &fs::read(&dst)?)?;
                     let readonly = meta.permissions().readonly();
@@ -190,13 +181,7 @@ fn prepare_restore(
                             format!("还原目标解析到工作区之外：{}", item.path),
                         )
                     })?;
-                    let blob_backup = BackupEntry::RestoreBlob {
-                        path: actual_rel.clone(),
-                        oid,
-                        mode: "100644".to_owned(),
-                        readonly,
-                        is_dir_symlink: false,
-                    };
+                    let blob_backup = BackupEntry::RestoreBlob { path: actual_rel.clone(), oid, readonly };
                     if actual_rel != item.path {
                         removals.push(PlannedRemoval { path: actual_rel, undo: blob_backup });
                         vec![BackupEntry::Remove(item.path.clone())]
@@ -229,10 +214,13 @@ fn apply_restore(
         ensure_no_link_ancestor(repo.cwd, &rem.path)?;
         let path = join_rel(repo.cwd, &rem.path);
         match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.is_file() || meta.file_type().is_symlink() => {
+            Ok(meta) if meta.is_file() => {
                 remove_file_clearing_readonly(&path)?;
                 prune_empty_parents(repo.cwd, &path);
                 applied.push(rem.undo);
+            }
+            Ok(meta) if is_link_metadata(&meta) => {
+                return Err(conflict(format!("还原目标路径类型发生变更，拒绝删除：{}", rem.path)));
             }
             Ok(_) => {}
             Err(err) if err.kind() == ErrorKind::NotFound => {}
@@ -243,7 +231,7 @@ fn apply_restore(
         ensure_no_link_ancestor(repo.cwd, &dir_rem.path)?;
         let dir = join_rel(repo.cwd, &dir_rem.path);
         match fs::symlink_metadata(&dir) {
-            Ok(meta) if meta.is_dir() && !is_dir_reparse_point(&meta) => {
+            Ok(meta) if meta.is_dir() && !is_link_metadata(&meta) => {
                 applied.extend(dir_rem.empty_dir_undos);
                 fs::remove_dir_all(&dir)?;
             }
@@ -258,6 +246,11 @@ fn apply_restore(
     }
     for write in &plan.writes {
         ensure_no_link_ancestor(repo.cwd, &write.path)?;
+        if let Ok(meta) = fs::symlink_metadata(join_rel(repo.cwd, &write.path))
+            && is_link_metadata(&meta)
+        {
+            return Err(conflict(format!("还原目标被符号链接或目录联接占用，拒绝覆盖：{}", write.path)));
+        }
     }
     let mut stdin_bytes = Vec::new();
     for write in plan.writes {
@@ -293,7 +286,7 @@ fn check_ancestor_conflicts(
         }
         let anc_path = cwd.join(&cur);
         match fs::symlink_metadata(&anc_path) {
-            Ok(meta) if !meta.is_dir() || is_dir_reparse_point(&meta) => {
+            Ok(meta) if !meta.is_dir() || is_link_metadata(&meta) => {
                 return Err(conflict(format!("还原路径的父级被未纳入快照的文件或链接占用：{anc_rel}")));
             }
             Ok(_) => {
@@ -357,7 +350,7 @@ fn deepest_existing_dir(cwd: &Path, rel: &str) -> Option<String> {
     let mut joined = String::new();
     for part in &parts[..parts.len() - 1] {
         cur.push(part);
-        if !fs::symlink_metadata(&cur).is_ok_and(|m| m.is_dir() && !is_dir_reparse_point(&m)) {
+        if !fs::symlink_metadata(&cur).is_ok_and(|m| m.is_dir() && !is_link_metadata(&m)) {
             break;
         }
         if !joined.is_empty() {
@@ -367,28 +360,6 @@ fn deepest_existing_dir(cwd: &Path, rel: &str) -> Option<String> {
         deepest = Some(joined.clone());
     }
     deepest
-}
-
-fn ensure_symlinks_supported(dir: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        let probe = dir.join(format!(".singularity-symlink-probe-{}", uuid::Uuid::now_v7()));
-        match std::os::windows::fs::symlink_file("target", &probe) {
-            Ok(()) => {
-                let _ = fs::remove_file(&probe);
-                Ok(())
-            }
-            Err(err) => Err(io::Error::new(
-                ErrorKind::PermissionDenied,
-                format!("当前环境不支持创建符号链接，已取消还原以避免损坏符号链接：{err}"),
-            )),
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = dir;
-        Ok(())
-    }
 }
 
 fn inspect_conflicting_dir(
@@ -410,11 +381,8 @@ fn inspect_conflicting_dir(
             return Err(conflict(format!("还原目标与受保护或未纳入快照的目录冲突：{child_rel}")));
         }
         let meta = fs::symlink_metadata(entry.path())?;
-        if is_dir_reparse_point(&meta) {
-            if meta.file_type().is_symlink() && delete_keys.contains(&path_key(&child_rel)) {
-                continue;
-            }
-            return Err(conflict(format!("还原目标与未纳入快照的目录联接冲突：{child_rel}")));
+        if is_link_metadata(&meta) {
+            return Err(conflict(format!("还原目标与未纳入快照的符号链接或目录联接冲突：{child_rel}")));
         }
         if meta.is_dir() {
             inspect_conflicting_dir(&entry.path(), &child_rel, protected, delete_keys, empty_dirs)?;
@@ -449,14 +417,13 @@ fn parse_raw_diff(raw: &[u8]) -> io::Result<(Vec<DeleteEntry>, Vec<WriteEntry>)>
         if old_mode == "160000" || new_mode == "160000" {
             return Err(io::Error::new(ErrorKind::InvalidInput, format!("不支持还原嵌套子模块目录：{rel}")));
         }
+        if old_mode == "120000" || new_mode == "120000" {
+            return Err(io::Error::new(ErrorKind::InvalidInput, format!("不支持还原符号链接：{rel}")));
+        }
         match status {
             'D' => {
                 validate_tree_hash(old_oid)?;
-                to_delete.push(DeleteEntry {
-                    path: rel,
-                    mode: old_mode.to_owned(),
-                    oid: old_oid.to_owned(),
-                });
+                to_delete.push(DeleteEntry { path: rel, oid: old_oid.to_owned() });
             }
             'A' | 'M' | 'T' => {
                 if status != 'A' {
@@ -465,8 +432,6 @@ fn parse_raw_diff(raw: &[u8]) -> io::Result<(Vec<DeleteEntry>, Vec<WriteEntry>)>
                 to_write.push(WriteEntry {
                     path: rel,
                     status,
-                    old_mode: old_mode.to_owned(),
-                    new_mode: new_mode.to_owned(),
                     old_oid: old_oid.to_owned(),
                 });
             }
@@ -510,9 +475,6 @@ fn actual_relative_path(cwd_canon: &Path, cwd_key: &str, dst: &Path) -> Option<S
     (!rel.is_empty()).then_some(rel)
 }
 
-fn file_restore_flags(path: &Path) -> (bool, bool) {
-    fs::symlink_metadata(path).map_or((false, false), |m| {
-        let is_sym = m.file_type().is_symlink();
-        (!is_sym && m.permissions().readonly(), is_sym && is_dir_reparse_point(&m))
-    })
+fn is_readonly_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| !is_link_metadata(&m) && m.permissions().readonly())
 }

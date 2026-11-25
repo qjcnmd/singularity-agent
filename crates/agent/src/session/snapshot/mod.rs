@@ -6,12 +6,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind, Write as _};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub use diff::{diff_summary, file_diff};
 pub use restore::restore;
 pub use rollback::RestoreBackup;
+use rollback::ensure_no_link_root;
 
 pub(super) const EXCLUDED_DIRS: &[&str] = &[
     ".git",
@@ -25,8 +26,6 @@ pub(super) const EXCLUDED_DIRS: &[&str] = &[
 const RAW_ATTRIBUTES: &str = "* -text -filter -working-tree-encoding -ident\n";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-#[cfg(any(windows, test))]
-const REPARSE_CLASSIFY_ARG_BUDGET: usize = 12_000;
 
 static GIT_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
 static SNAPSHOT_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
@@ -61,8 +60,10 @@ impl Repo<'_> {
         init: InitPolicy,
         work: impl FnOnce(String, Vec<String>) -> io::Result<T>,
     ) -> io::Result<T> {
+        ensure_no_link_root(self.cwd)?;
         let protected_rels = protected_relative_paths(self.dir, self.cwd)?;
         with_snapshot_lock(self.dir, || {
+            ensure_no_link_root(self.cwd)?;
             match init {
                 InitPolicy::CreateIfMissing => self.ensure_initialized()?,
                 InitPolicy::RequireExisting => {
@@ -71,26 +72,27 @@ impl Repo<'_> {
                     }
                 }
             }
-            // Rebuild the shadow index from disk so Windows case-only renames are detected cleanly
-            // and reparse classification runs against an empty index.
+            // Rebuild the shadow index from disk so Windows case-only renames are detected cleanly.
             if let Err(err) = fs::remove_file(self.dir.join("index"))
                 && err.kind() != ErrorKind::NotFound
             {
                 return Err(err);
             }
-            let protected = self.sync_rules(&protected_rels)?;
-            let pathspecs = build_static_exclude_pathspecs();
-            let mut ls_args = Vec::with_capacity(5 + pathspecs.len());
-            ls_args.extend(["ls-files", "--others", "--exclude-standard", "-z", "--"]);
-            ls_args.extend(pathspecs.iter().map(String::as_str));
-            let raw_files = self.git_with_stdin(true, false, &ls_args, None)?;
-            let files = filter_protected_nul_paths(&raw_files, &protected);
+            self.sync_info_files()?;
+            let mut scan = WorkspaceScan {
+                protected: protected_rels.clone(),
+                candidates: Vec::new(),
+            };
+            scan_workspace(self.cwd, self.cwd, &protected_rels, &mut scan);
+            scan.protected.sort_unstable();
+            scan.protected.dedup();
+            let files = self.filter_ignored_paths(&scan.candidates)?;
             if !files.is_empty() {
                 self.git_with_stdin(true, true, &["update-index", "--add", "-z", "--stdin"], Some(&files))?;
             }
             let raw = self.git(true, &["write-tree"])?;
             let hash = String::from_utf8(raw).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-            work(validate_tree_hash(hash.trim())?.to_owned(), protected)
+            work(validate_tree_hash(hash.trim())?.to_owned(), scan.protected)
         })
     }
 
@@ -111,56 +113,51 @@ impl Repo<'_> {
         Ok(())
     }
 
-    fn sync_rules(self, protected_rels: &[String]) -> io::Result<Vec<String>> {
-        let mut protected = protected_rels.to_vec();
-        let mut reparse_candidates = Vec::new();
-        scan_protected_paths(self.cwd, self.cwd, protected_rels, &mut protected, &mut reparse_candidates);
-        #[cfg(windows)]
-        if !reparse_candidates.is_empty() {
-            protected.extend(self.classify_junction_candidates(&reparse_candidates)?);
-        }
-        protected.sort_unstable();
-        protected.dedup();
-        let mut exclude_content = String::new();
-        for dir in EXCLUDED_DIRS {
-            exclude_content.push_str(dir);
-            exclude_content.push_str("/\n");
-        }
-        for rel in &protected {
-            exclude_content.push('/');
-            for ch in rel.chars() {
-                if matches!(ch, '\\' | '*' | '?' | '[' | ']') {
-                    exclude_content.push('\\');
-                }
-                exclude_content.push(ch);
-            }
-            exclude_content.push_str("/\n");
-        }
+    fn sync_info_files(self) -> io::Result<()> {
         let info = self.dir.join("info");
-        write_if_changed(&info.join("exclude"), &exclude_content)?;
-        write_if_changed(&info.join("attributes"), RAW_ATTRIBUTES)?;
-        Ok(protected)
+        // Clear any stale exclude rules from earlier versions; protected/excluded paths are skipped in Rust.
+        write_if_changed(&info.join("exclude"), "")?;
+        write_if_changed(&info.join("attributes"), RAW_ATTRIBUTES)
     }
 
-    #[cfg(windows)]
-    fn classify_junction_candidates(self, candidates: &[String]) -> io::Result<Vec<String>> {
-        // Git for Windows treats directory symlinks (mklink /D) as 120000 symlinks (no trailing '/')
-        // and NTFS junctions (mklink /J) as directories (trailing '/'). Query Git in small batches
-        // so directory symlinks remain snapshotted while junctions stay excluded.
-        let mut git_symlinks = HashSet::new();
-        for chunk in batch_by_arg_budget(candidates, REPARSE_CLASSIFY_ARG_BUDGET) {
-            let mut args = Vec::with_capacity(5 + chunk.len());
-            args.extend(["ls-files", "--others", "--directory", "-z", "--"]);
-            args.extend(chunk.iter().map(String::as_str));
-            let out = self.git(true, &args)?;
-            for entry in split_nul(&out) {
-                let text = String::from_utf8_lossy(entry);
-                if !text.ends_with('/') {
-                    git_symlinks.insert(path_key(&text));
-                }
-            }
+    fn filter_ignored_paths(self, candidates: &[String]) -> io::Result<Vec<u8>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(candidates.iter().filter(|rel| !git_symlinks.contains(&path_key(rel))).cloned().collect())
+        let mut stdin_bytes = Vec::new();
+        for rel in candidates {
+            stdin_bytes.extend_from_slice(rel.as_bytes());
+            stdin_bytes.push(0);
+        }
+        let (output, write_res) = self.spawn_git(
+            true,
+            false,
+            &["check-ignore", "--no-index", "-z", "--stdin"],
+            Some(&stdin_bytes),
+        )?;
+        // git check-ignore exits 0 when one or more paths are ignored, and 1 when none are ignored.
+        match output.status.code() {
+            Some(0) => {
+                write_res?;
+                let ignored: HashSet<&[u8]> = split_nul(&output.stdout).collect();
+                let mut kept = Vec::with_capacity(stdin_bytes.len());
+                for rel in candidates {
+                    if !ignored.contains(rel.as_bytes()) {
+                        kept.extend_from_slice(rel.as_bytes());
+                        kept.push(0);
+                    }
+                }
+                Ok(kept)
+            }
+            Some(1) => {
+                write_res?;
+                Ok(stdin_bytes)
+            }
+            _ => Err(io::Error::other(format!(
+                "git check-ignore failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+        }
     }
 
     pub(super) fn diff(self, base: &str, live: &str, flags: &[&str], tail: &[&str]) -> io::Result<Vec<u8>> {
@@ -183,10 +180,27 @@ impl Repo<'_> {
         args: &[&str],
         input: Option<&[u8]>,
     ) -> io::Result<Vec<u8>> {
+        let (output, write_res) = self.spawn_git(with_work_tree, literal_pathspecs, args, input)?;
+        if !output.status.success() {
+            let sub = args.first().copied().unwrap_or_default();
+            return Err(io::Error::other(format!(
+                "git {sub} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        write_res?;
+        Ok(output.stdout)
+    }
+
+    fn spawn_git(
+        self,
+        with_work_tree: bool,
+        literal_pathspecs: bool,
+        args: &[&str],
+        input: Option<&[u8]>,
+    ) -> io::Result<(Output, io::Result<()>)> {
         let mut cmd = Command::new(git_binary()?);
-        // Force core.symlinks=true so checkout-index never silently degrades 120000 symlinks
-        // into plain text files on Windows bare repos where git init defaults core.symlinks=false.
-        cmd.args(["-c", "core.ignorecase=false", "-c", "core.symlinks=true"])
+        cmd.args(["-c", "core.ignorecase=false"])
             .args(args)
             .stdin(if input.is_some() {
                 Stdio::piped()
@@ -215,7 +229,7 @@ impl Repo<'_> {
             use std::os::windows::process::CommandExt as _;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        let output = if let Some(bytes) = input {
+        if let Some(bytes) = input {
             let mut child = cmd.spawn()?;
             let mut pipe = child.stdin.take();
             let (write_res, wait_res) = std::thread::scope(|scope| {
@@ -232,22 +246,10 @@ impl Repo<'_> {
                 let write_res = writer.join().expect("git stdin writer thread panicked");
                 (write_res, wait_res)
             });
-            let output = wait_res?;
-            if output.status.success() {
-                write_res?;
-            }
-            output
+            Ok((wait_res?, write_res))
         } else {
-            cmd.output()?
-        };
-        if !output.status.success() {
-            let sub = args.first().copied().unwrap_or_default();
-            return Err(io::Error::other(format!(
-                "git {sub} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
+            Ok((cmd.output()?, Ok(())))
         }
-        Ok(output.stdout)
     }
 }
 
@@ -270,46 +272,6 @@ pub(super) fn with_snapshot_lock<T>(
     drop(lock);
     locks.lock().expect("snapshot lock table poisoned").retain(|_, e| e.strong_count() > 0);
     result
-}
-
-fn build_static_exclude_pathspecs() -> Vec<String> {
-    let icase = if cfg!(windows) { "icase," } else { "" };
-    let mut out = Vec::with_capacity(1 + EXCLUDED_DIRS.len() * 2);
-    out.push(".".to_owned());
-    for ex in EXCLUDED_DIRS {
-        out.push(format!(":(top,literal,{icase}exclude){ex}"));
-        out.push(format!(":(glob,{icase}exclude)**/{ex}/**"));
-    }
-    out
-}
-
-fn filter_protected_nul_paths(raw: &[u8], protected: &[String]) -> Vec<u8> {
-    if protected.is_empty() || raw.is_empty() {
-        return raw.to_vec();
-    }
-    let protected_set: HashSet<String> = protected.iter().map(|p| path_key(p)).collect();
-    let mut out = Vec::with_capacity(raw.len());
-    for entry in split_nul(raw) {
-        let rel = String::from_utf8_lossy(entry);
-        if !has_protected_prefix(&rel, &protected_set) {
-            out.extend_from_slice(entry);
-            out.push(0);
-        }
-    }
-    out
-}
-
-fn has_protected_prefix(rel: &str, protected_set: &HashSet<String>) -> bool {
-    let key = path_key(rel);
-    if protected_set.contains(&key) {
-        return true;
-    }
-    for (idx, byte) in key.bytes().enumerate() {
-        if byte == b'/' && protected_set.contains(&key[..idx]) {
-            return true;
-        }
-    }
-    false
 }
 
 fn write_if_changed(path: &Path, content: &str) -> io::Result<()> {
@@ -401,13 +363,12 @@ pub(super) fn is_protected_rel(rel: &str, protected_rels: &[String]) -> bool {
     matches_prefix(".git") || protected_rels.iter().any(|p| matches_prefix(p))
 }
 
-fn scan_protected_paths(
-    root: &Path,
-    dir: &Path,
-    protected_rels: &[String],
-    out: &mut Vec<String>,
-    reparse_candidates: &mut Vec<String>,
-) {
+struct WorkspaceScan {
+    protected: Vec<String>,
+    candidates: Vec<String>,
+}
+
+fn scan_workspace(root: &Path, dir: &Path, protected_rels: &[String], scan: &mut WorkspaceScan) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -416,50 +377,58 @@ fn scan_protected_paths(
             continue;
         };
         let path = entry.path();
-        let is_reparse = fs::symlink_metadata(&path).is_ok_and(|meta| is_dir_reparse_point(&meta));
-        if !is_reparse && (!ft.is_dir() || ft.is_symlink()) {
+        let is_symlink = ft.is_symlink();
+        let is_link = is_symlink
+            || (!ft.is_file() && fs::symlink_metadata(&path).is_ok_and(|meta| is_link_metadata(&meta)));
+        let Some(joined) = relative_slash_path(root, &path) else {
+            continue;
+        };
+        if is_protected_rel(&joined, protected_rels) {
             continue;
         }
-        if entry
+        let is_excluded_name = entry
             .file_name()
             .to_str()
-            .is_some_and(|name| EXCLUDED_DIRS.iter().any(|ex| name.eq_ignore_ascii_case(ex)))
-        {
+            .is_some_and(|name| EXCLUDED_DIRS.iter().any(|ex| name.eq_ignore_ascii_case(ex)));
+        if is_link {
+            scan.protected.push(joined);
             continue;
         }
-        let rel = path.strip_prefix(root).ok().map(|r| {
-            r.components()
-                .filter_map(|c| match c {
-                    Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("/")
-        });
-        if let Some(joined) = rel.as_deref()
-            && is_protected_rel(joined, protected_rels)
-        {
+        if ft.is_file() {
+            if !(dir == root && is_excluded_name) {
+                scan.candidates.push(joined);
+            }
             continue;
         }
-        if is_reparse {
-            if let Some(joined) = rel
-                && !joined.is_empty()
-            {
-                reparse_candidates.push(joined);
-            }
-        } else if fs::symlink_metadata(path.join(".git")).is_ok() {
-            if let Some(joined) = rel
-                && !joined.is_empty()
-            {
-                out.push(joined);
-            }
+        if !ft.is_dir() || is_excluded_name {
+            continue;
+        }
+        if fs::symlink_metadata(path.join(".git")).is_ok() {
+            scan.protected.push(joined);
         } else {
-            scan_protected_paths(root, &path, protected_rels, out, reparse_candidates);
+            scan_workspace(root, &path, protected_rels, scan);
         }
     }
 }
 
-pub(super) fn is_dir_reparse_point(meta: &fs::Metadata) -> bool {
+fn relative_slash_path(root: &Path, path: &Path) -> Option<String> {
+    let rel = path
+        .strip_prefix(root)
+        .ok()?
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    (!rel.is_empty()).then_some(rel)
+}
+
+pub(super) fn is_link_metadata(meta: &fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
@@ -470,7 +439,6 @@ pub(super) fn is_dir_reparse_point(meta: &fs::Metadata) -> bool {
     }
     #[cfg(not(windows))]
     {
-        let _ = meta;
         false
     }
 }
@@ -530,43 +498,4 @@ pub(super) fn validate_relative_path(rel_path: &str) -> io::Result<String> {
 
 pub(super) fn split_nul(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     bytes.strip_suffix(b"\0").unwrap_or(bytes).split(|b| *b == 0).filter(|s| !s.is_empty())
-}
-
-#[cfg(any(windows, test))]
-fn batch_by_arg_budget(items: &[String], budget: usize) -> Vec<&[String]> {
-    let mut batches = Vec::new();
-    let mut start = 0usize;
-    while start < items.len() {
-        let mut end = start;
-        let mut used = 0usize;
-        while end < items.len() {
-            let cost = items[end].encode_utf16().count() + 4;
-            if end > start && used + cost > budget {
-                break;
-            }
-            used += cost;
-            end += 1;
-        }
-        batches.push(&items[start..end]);
-        start = end;
-    }
-    batches
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{REPARSE_CLASSIFY_ARG_BUDGET, batch_by_arg_budget};
-
-    #[test]
-    fn batch_by_arg_budget_splits_long_paths_under_windows_argv_limit() {
-        let long_paths: Vec<String> = (0..100).map(|i| format!("{}/{i:04}", "a".repeat(550))).collect();
-        let batches = batch_by_arg_budget(&long_paths, REPARSE_CLASSIFY_ARG_BUDGET);
-        assert!(batches.len() >= 5, "expected multiple batches, got {}", batches.len());
-        let total: usize = batches.iter().map(|b| b.len()).sum();
-        assert_eq!(total, long_paths.len());
-        for batch in batches {
-            let cost: usize = batch.iter().map(|p| p.encode_utf16().count() + 4).sum();
-            assert!(cost <= REPARSE_CLASSIFY_ARG_BUDGET || batch.len() == 1);
-        }
-    }
 }

@@ -1,8 +1,8 @@
 use std::fs;
 use std::io::{self, ErrorKind};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use super::{Repo, is_dir_reparse_point, with_snapshot_lock};
+use super::{Repo, is_link_metadata, with_snapshot_lock};
 
 #[derive(Debug)]
 pub struct RestoreBackup {
@@ -18,9 +18,7 @@ pub(super) enum BackupEntry {
     RestoreBlob {
         path: String,
         oid: String,
-        mode: String,
         readonly: bool,
-        is_dir_symlink: bool,
     },
 }
 
@@ -32,7 +30,10 @@ impl RestoreBackup {
     pub fn rollback(self) -> io::Result<()> {
         let dir = self.snapshot_dir.clone();
         let cwd = self.cwd.clone();
-        with_snapshot_lock(&dir, || self.rollback_locked(Repo { dir: &dir, cwd: &cwd }))
+        with_snapshot_lock(&dir, || {
+            ensure_no_link_root(&cwd)?;
+            self.rollback_locked(Repo { dir: &dir, cwd: &cwd })
+        })
     }
 
     pub(super) fn rollback_locked(self, repo: Repo<'_>) -> io::Result<()> {
@@ -53,42 +54,44 @@ impl RestoreBackup {
             }
         }
         for entry in &self.entries {
-            if let BackupEntry::RestoreBlob {
-                path,
-                oid,
-                mode,
-                readonly,
-                is_dir_symlink,
-            } = entry
-                && mode != "120000"
-            {
-                record(restore_blob(repo, path, oid, mode, *readonly, *is_dir_symlink));
-            }
-        }
-        for entry in &self.entries {
-            if let BackupEntry::RestoreBlob {
-                path,
-                oid,
-                mode,
-                readonly,
-                is_dir_symlink,
-            } = entry
-                && mode == "120000"
-            {
-                record(restore_blob(repo, path, oid, mode, *readonly, *is_dir_symlink));
+            if let BackupEntry::RestoreBlob { path, oid, readonly } = entry {
+                record(restore_blob(repo, path, oid, *readonly));
             }
         }
         first_err.map_or(Ok(()), Err)
     }
 }
 
+pub(super) fn ensure_no_link_root(cwd: &Path) -> io::Result<()> {
+    let mut cur = PathBuf::new();
+    for component in cwd.components() {
+        cur.push(component.as_os_str());
+        if !matches!(component, Component::Normal(_)) {
+            continue;
+        }
+        match fs::symlink_metadata(&cur) {
+            Ok(meta) if is_link_metadata(&meta) => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("拒绝穿越符号链接或目录联接操作工作区：{}", cur.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn ensure_no_link_ancestor(cwd: &Path, rel: &str) -> io::Result<()> {
+    ensure_no_link_root(cwd)?;
     let mut cur = cwd.to_path_buf();
     let parts: Vec<&str> = rel.split('/').collect();
     for part in parts.iter().take(parts.len().saturating_sub(1)) {
         cur.push(part);
         match fs::symlink_metadata(&cur) {
-            Ok(meta) if meta.file_type().is_symlink() || is_dir_reparse_point(&meta) => {
+            Ok(meta) if is_link_metadata(&meta) => {
                 return Err(io::Error::new(
                     ErrorKind::InvalidInput,
                     format!("拒绝穿越符号链接或目录联接操作路径：{rel}"),
@@ -114,7 +117,7 @@ pub(super) fn prune_empty_parents(cwd: &Path, path: &Path) {
         if dir == cwd || !dir.starts_with(cwd) {
             break;
         }
-        let is_real_dir = fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && !is_dir_reparse_point(&m));
+        let is_real_dir = fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && !is_link_metadata(&m));
         if !is_real_dir || fs::remove_dir(dir).is_err() {
             break;
         }
@@ -136,57 +139,37 @@ fn remove_backed_up_file(cwd: &Path, rel: &str) -> io::Result<()> {
 
 fn restore_backed_up_dir(cwd: &Path, rel: &str) -> io::Result<()> {
     ensure_no_link_ancestor(cwd, rel)?;
-    fs::create_dir_all(join_rel(cwd, rel))
+    let dst = join_rel(cwd, rel);
+    if let Ok(meta) = fs::symlink_metadata(&dst)
+        && is_link_metadata(&meta)
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("拒绝穿越符号链接或目录联接创建目录：{rel}"),
+        ));
+    }
+    fs::create_dir_all(&dst)
 }
 
 #[expect(
     clippy::permissions_set_readonly_false,
     reason = "Windows files carrying FILE_ATTRIBUTE_READONLY require clearing readonly before overwriting"
 )]
-fn restore_blob(
-    repo: Repo<'_>,
-    rel: &str,
-    oid: &str,
-    mode: &str,
-    readonly: bool,
-    is_dir_symlink: bool,
-) -> io::Result<()> {
+fn restore_blob(repo: Repo<'_>, rel: &str, oid: &str, readonly: bool) -> io::Result<()> {
     ensure_no_link_ancestor(repo.cwd, rel)?;
+    let bytes = repo.git(false, &["cat-file", "blob", oid])?;
     let dst = join_rel(repo.cwd, rel);
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
-    if mode == "120000" {
-        if let Err(err) = remove_file_clearing_readonly(&dst)
-            && err.kind() != ErrorKind::NotFound
-        {
-            return Err(err);
-        }
-        #[cfg(windows)]
-        {
-            let bytes = repo.git(false, &["cat-file", "blob", oid])?;
-            let target = parse_windows_symlink_target(&bytes)?;
-            if is_dir_symlink {
-                std::os::windows::fs::symlink_dir(&target, &dst)?;
-            } else {
-                std::os::windows::fs::symlink_file(&target, &dst)?;
-            }
-            return Ok(());
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = is_dir_symlink;
-            let cacheinfo = format!("{mode},{oid},{rel}");
-            repo.git(true, &["update-index", "--add", "--replace", "--cacheinfo", &cacheinfo])?;
-            repo.git(true, &["checkout-index", "-f", "--", rel])?;
-            return Ok(());
-        }
-    }
-    let bytes = repo.git(false, &["cat-file", "blob", oid])?;
     if let Ok(meta) = fs::symlink_metadata(&dst) {
-        if meta.file_type().is_symlink() {
-            remove_file_clearing_readonly(&dst)?;
-        } else if meta.permissions().readonly() {
+        if is_link_metadata(&meta) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("拒绝覆盖符号链接或目录联接：{rel}"),
+            ));
+        }
+        if meta.permissions().readonly() {
             let mut perms = meta.permissions();
             perms.set_readonly(false);
             fs::set_permissions(&dst, perms)?;
@@ -208,12 +191,11 @@ fn restore_blob(
 )]
 pub(super) fn remove_file_clearing_readonly(path: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() {
-        return if is_dir_reparse_point(&meta) {
-            fs::remove_dir(path)
-        } else {
-            fs::remove_file(path)
-        };
+    if is_link_metadata(&meta) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("拒绝删除符号链接或目录联接：{}", path.display()),
+        ));
     }
     match fs::remove_file(path) {
         Err(err) if err.kind() == ErrorKind::PermissionDenied && meta.permissions().readonly() => {
@@ -251,7 +233,7 @@ fn clear_readonly_recursive(path: &Path) {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return;
     };
-    if meta.file_type().is_symlink() || is_dir_reparse_point(&meta) {
+    if is_link_metadata(&meta) {
         return;
     }
     if meta.permissions().readonly() {
@@ -265,27 +247,5 @@ fn clear_readonly_recursive(path: &Path) {
         for entry in entries.flatten() {
             clear_readonly_recursive(&entry.path());
         }
-    }
-}
-
-#[cfg(any(windows, test))]
-fn parse_windows_symlink_target(bytes: &[u8]) -> io::Result<String> {
-    let raw = std::str::from_utf8(bytes).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    if raw.is_empty() || raw.contains('\0') {
-        return Err(io::Error::new(ErrorKind::InvalidData, "invalid symlink target blob"));
-    }
-    Ok(raw.replace('/', "\\"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_windows_symlink_target;
-
-    #[test]
-    fn parse_windows_symlink_target_normalizes_separators_and_rejects_invalid() {
-        assert_eq!(parse_windows_symlink_target(b"sub/target").expect("valid"), r"sub\target");
-        assert!(parse_windows_symlink_target(b"").is_err());
-        assert!(parse_windows_symlink_target(b"bad\0target").is_err());
-        assert!(parse_windows_symlink_target(&[0xff]).is_err());
     }
 }

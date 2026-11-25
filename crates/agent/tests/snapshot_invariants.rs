@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::Command;
 
 use agent::session::snapshot;
@@ -145,93 +146,19 @@ fn snapshot_rollback_reports_errors_instead_of_swallowing() {
     fs::write(ws.join("a.txt"), "v2").expect("write v2");
     let backup = snapshot::restore(&snap, &ws, &tree1).expect("restore");
 
-    // Deleting the bare repo makes rollback's `git cat-file` fail.
+    let target = ws.join("a.txt");
+    let mut perms = fs::metadata(&target).expect("meta").permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&target, perms).expect("set readonly before failed rollback");
+
+    // Deleting the bare repo makes rollback's `git cat-file` fail; readonly bit must stay intact.
     snapshot::remove(&snap).expect("delete snapshot repo");
     let err = backup.rollback().expect_err("rollback must surface git/io error");
     assert!(!err.to_string().is_empty());
-}
-
-#[test]
-fn snapshot_symlink_120000_never_degrades_to_plain_file() {
-    let tmp = TempDir::new("symlink-120000");
-    let ws = tmp.0.join("ws");
-    let snap = tmp.0.join("home").join("sessions").join("snapshots").join("sym.git");
-    fs::create_dir_all(&ws).expect("create ws");
-    fs::write(ws.join("keep.txt"), "v1").expect("write keep");
-
-    let _initial = snapshot::capture(&snap, &ws).expect("init bare repo");
-
-    // Craft a target tree containing a 120000 symlink entry and a modified regular file
-    // directly in Git's object store so this test runs regardless of OS symlink privileges.
-    let git = |args: &[&str]| -> String {
-        let out = Command::new("git")
-            .args(args)
-            .env("GIT_DIR", app_core::display_path(&snap))
-            .env("GIT_INDEX_FILE", app_core::display_path(&snap.join("test-index")))
-            .output()
-            .expect("run git");
-        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
-    };
-    let target_oid = {
-        let mut child = Command::new("git")
-            .args(["hash-object", "-w", "--stdin"])
-            .env("GIT_DIR", app_core::display_path(&snap))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn hash-object");
-        use std::io::Write as _;
-        child.stdin.as_mut().expect("stdin").write_all(b"keep.txt").expect("write");
-        let out = child.wait_with_output().expect("wait");
-        assert!(out.status.success());
-        String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
-    };
-    let keep_oid = {
-        let mut child = Command::new("git")
-            .args(["hash-object", "-w", "--stdin"])
-            .env("GIT_DIR", app_core::display_path(&snap))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn hash-object");
-        use std::io::Write as _;
-        child.stdin.as_mut().expect("stdin").write_all(b"v2").expect("write");
-        let out = child.wait_with_output().expect("wait");
-        assert!(out.status.success());
-        String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
-    };
-    git(&[
-        "update-index",
-        "--add",
-        "--cacheinfo",
-        &format!("100644,{keep_oid},keep.txt"),
-    ]);
-    git(&[
-        "update-index",
-        "--add",
-        "--cacheinfo",
-        &format!("120000,{target_oid},link.txt"),
-    ]);
-    let target_tree = git(&["write-tree"]);
-
-    match snapshot::restore(&snap, &ws, &target_tree) {
-        Ok(backup) => {
-            let meta = fs::symlink_metadata(ws.join("link.txt")).expect("link exists");
-            assert!(meta.file_type().is_symlink(), "120000 entry must be materialized as real symlink");
-            backup.rollback().expect("rollback symlink");
-            assert!(!ws.join("link.txt").exists());
-            assert_eq!(fs::read_to_string(ws.join("keep.txt")).expect("keep"), "v1");
-        }
-        Err(_) => {
-            assert!(!ws.join("link.txt").exists(), "failed symlink restore must not leave plain text file");
-            assert_eq!(
-                fs::read_to_string(ws.join("keep.txt")).expect("keep"),
-                "v1",
-                "failed symlink check must abort before mutating workspace"
-            );
-        }
-    }
+    assert!(
+        fs::metadata(&target).expect("meta after failed rollback").permissions().readonly(),
+        "failed rollback must not clear target file readonly attribute"
+    );
 }
 
 #[cfg(windows)]
@@ -244,8 +171,10 @@ fn snapshot_excludes_windows_directory_junction_and_protects_external_target() {
     fs::create_dir_all(&ws).expect("create ws");
     fs::create_dir_all(&external).expect("create external");
     fs::create_dir_all(ws.join("node_modules")).expect("create node_modules");
-    fs::write(ws.join(".gitignore"), "node_modules/\n!ext-link/\n!ext-link/**\n").expect("write gitignore");
+    fs::write(ws.join(".gitignore"), "node_modules/\n*.tmp\n!/ext-link/\n!ext-link/\n!ext-link/**\n")
+        .expect("write gitignore");
     fs::write(ws.join("node_modules").join("dep.js"), "ignored").expect("write dep");
+    fs::write(ws.join("skip.tmp"), "ignored-tmp").expect("write tmp");
     fs::write(ws.join("inside.txt"), "inside").expect("write inside");
     fs::write(external.join("secret.txt"), "external-secret").expect("write external");
 
@@ -295,8 +224,52 @@ fn snapshot_excludes_windows_directory_junction_and_protects_external_target() {
         "changed-external"
     );
 
-    // Clean up junction before TempDir drop so external dir isn't touched by anything else.
-    let _ = fs::remove_dir(&junction);
+    // Restoring a tree that tries to write a file at the exact junction path must also be rejected.
+    fs::remove_dir(&junction).expect("remove junction for file capture");
+    fs::write(&junction, "regular-file-data").expect("write regular file");
+    let real_file_tree = snapshot::capture(&snap, &ws).expect("capture regular file");
+    fs::remove_file(&junction).expect("remove regular file");
+    let status3 = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&external)
+        .status()
+        .expect("recreate mklink /J again");
+    assert!(status3.success());
+    let exact_conflict = snapshot::restore(&snap, &ws, &real_file_tree)
+        .expect_err("restore file over junction path must be rejected");
+    assert_eq!(exact_conflict.kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        fs::read_to_string(external.join("secret.txt")).expect("external still untouched"),
+        "changed-external"
+    );
+
+    // Replacing the workspace root itself with a junction must reject both restore and rollback.
+    fs::remove_dir(&junction).expect("remove inner junction before root swap");
+    fs::write(external.join("inside.txt"), "external-inside").expect("write external inside");
+    fs::write(ws.join("inside.txt"), "inside-before-swap").expect("write inside before swap");
+    let rollback_backup = snapshot::restore(&snap, &ws, &tree1).expect("restore before root swap");
+    let ws_moved = tmp.0.join("ws-moved");
+    fs::rename(&ws, &ws_moved).expect("move real ws away");
+    let status4 = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&ws)
+        .arg(&external)
+        .status()
+        .expect("create root junction");
+    assert!(status4.success());
+    let root_restore_err = snapshot::restore(&snap, &ws, &tree1)
+        .expect_err("restore must reject workspace root replaced by junction");
+    assert_eq!(root_restore_err.kind(), ErrorKind::InvalidInput);
+    let root_rollback_err = rollback_backup
+        .rollback()
+        .expect_err("rollback must reject workspace root replaced by junction");
+    assert_eq!(root_rollback_err.kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        fs::read_to_string(external.join("inside.txt")).expect("external inside untouched"),
+        "external-inside"
+    );
+    let _ = fs::remove_dir(&ws);
 }
 
 #[test]
@@ -393,72 +366,4 @@ fn snapshot_case_only_parent_dir_conflict_with_ignored_file_fails_before_mutatin
     backup.rollback().expect("rollback case dir rename");
     assert!(dir_entry_names(&ws).contains(&"lower".to_owned()));
     assert!(ws.join("lower").join("empty").is_dir());
-}
-
-#[cfg(windows)]
-#[test]
-fn snapshot_dir_symlink_df_conflict_restore_and_rollback_when_supported() {
-    let tmp = TempDir::new("dir-symlink-df");
-    let ws = tmp.0.join("ws");
-    let target_dir = tmp.0.join("target-dir");
-    let snap = tmp.0.join("home").join("sessions").join("snapshots").join("dsym.git");
-    fs::create_dir_all(&ws).expect("create ws");
-    fs::create_dir_all(&target_dir).expect("create target dir");
-    fs::write(target_dir.join("outside.txt"), "keep-outside").expect("write outside");
-
-    // Capture a tree where `shape` is a real directory with a child file.
-    fs::create_dir_all(ws.join("shape")).expect("create shape dir");
-    fs::write(ws.join("shape").join("child.txt"), "dir-child").expect("write child");
-    let dir_tree = snapshot::capture(&snap, &ws).expect("capture dir tree");
-
-    // If the host supports creating Windows directory symlinks, test full capture/restore/rollback
-    // across D/F conflicts, alphabetically-earlier dir symlinks, dangling dir symlinks, and
-    // snapshotted dir symlinks inside a conflicting directory scheduled for deletion.
-    fs::remove_dir_all(ws.join("shape")).expect("rm shape dir");
-    if std::os::windows::fs::symlink_dir(&target_dir, ws.join("shape")).is_ok() {
-        let backup = snapshot::restore(&snap, &ws, &dir_tree).expect("restore dir over dir symlink");
-        assert!(ws.join("shape").join("child.txt").is_file());
-        assert_eq!(
-            fs::read_to_string(target_dir.join("outside.txt")).expect("target intact"),
-            "keep-outside"
-        );
-        backup.rollback().expect("rollback 120000 dir symlink over dir index entry");
-        let meta = fs::symlink_metadata(ws.join("shape")).expect("symlink restored");
-        assert!(meta.file_type().is_symlink(), "shape must be restored as symlink");
-        assert_eq!(
-            fs::read_to_string(ws.join("shape").join("outside.txt")).expect("dir symlink works"),
-            "keep-outside"
-        );
-        let _ = fs::remove_dir(ws.join("shape"));
-
-        // R3-#1 & R3-#2: alphabetical dir symlink `a-link -> z-target`, dangling dir symlink,
-        // and snapshotted `dir_with_link/link` replaced by file `dir_with_link`.
-        fs::write(ws.join("dir_with_link"), "file-version").expect("write file version");
-        let file_tree = snapshot::capture(&snap, &ws).expect("capture file version");
-        fs::remove_file(ws.join("dir_with_link")).expect("rm file");
-        fs::create_dir_all(ws.join("dir_with_link")).expect("create dir");
-        fs::create_dir_all(ws.join("z-target")).expect("create z-target");
-        fs::write(ws.join("z-target").join("f.txt"), "z-data").expect("write z-data");
-        std::os::windows::fs::symlink_dir(&target_dir, ws.join("dir_with_link").join("link"))
-            .expect("create nested dir symlink");
-        std::os::windows::fs::symlink_dir("z-target", ws.join("a-link")).expect("create a-link");
-        std::os::windows::fs::symlink_dir("no-such-dir", ws.join("dangling-link"))
-            .expect("create dangling-link");
-
-        let backup2 = snapshot::restore(&snap, &ws, &file_tree).expect("restore file over dir with symlink");
-        assert!(ws.join("dir_with_link").is_file());
-        backup2.rollback().expect("rollback restores dir symlinks with exact type");
-        assert_eq!(fs::read_to_string(ws.join("a-link").join("f.txt")).expect("a-link works"), "z-data");
-        use std::os::windows::fs::MetadataExt as _;
-        let dangling_meta = fs::symlink_metadata(ws.join("dangling-link")).expect("dangling exists");
-        assert_ne!(dangling_meta.file_attributes() & 0x0010, 0, "dangling dir symlink kept dir type");
-        assert_eq!(
-            fs::read_to_string(ws.join("dir_with_link").join("link").join("outside.txt"))
-                .expect("nested dir symlink works"),
-            "keep-outside"
-        );
-        let _ = fs::remove_dir(ws.join("a-link"));
-        let _ = fs::remove_dir(ws.join("dangling-link"));
-        let _ = fs::remove_dir(ws.join("dir_with_link").join("link"));
-    }
 }

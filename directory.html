@@ -273,10 +273,10 @@ pre {
 │   │   │   │   ├── SessionManager                        <span class="c"># 唯一写者：create / open_existing / data / append / append_operation_started / rewind_before_turn</span>
 │   │   │   │   └── SessionData                           <span class="c"># open() 只读；内存追踪 last_reply_definition_tokens；image_attachment() / snapshot_directory / *_snapshot_tree</span>
 │   │   │   ├── snapshot/                                 <span class="c"># Shadow Git 每回合检查点、差异查询、安全还原与回滚引擎（4 文件）</span>
-│   │   │   │   ├── mod.rs                                <span class="c"># 仓库管理、snapshot::remove、InitPolicy、scan_protected_paths（批查区分 120000 符号链接与 NTFS 联接、拦截 SINGULARITY_HOME 嵌套）与定长 argv ls-files + 哈希集后过滤采集</span>
+│   │   │   │   ├── mod.rs                                <span class="c"># 仓库管理、snapshot::remove、InitPolicy、scan_workspace（单遍排除嵌套 .git、符号链接与目录重解析点，拦截 SINGULARITY_HOME 嵌套）与 check-ignore --stdin + update-index 采集</span>
 │   │   │   │   ├── diff.rs                               <span class="c"># diff_summary / file_diff（RequireExisting 防重建已删仓库、unified diff 格式化与 Windows 大小写回退）</span>
-│   │   │   │   ├── restore.rs                            <span class="c"># 安全还原（--raw --no-abbrev -z、ensure_symlinks_supported、大小写父目录冲突校验、空目录备份与内部回滚失败合并上报）</span>
-│   │   │   │   └── rollback.rs                           <span class="c"># RestoreBackup / BackupEntry / rollback()、ensure_no_link_ancestor 防穿透链接与 Windows 只读清理辅助</span>
+│   │   │   │   ├── restore.rs                            <span class="c"># 安全还原（--raw --no-abbrev -z 拒收 160000/120000、受保护路径与大小写父目录冲突校验、空目录备份与内部回滚失败合并上报）</span>
+│   │   │   │   └── rollback.rs                           <span class="c"># RestoreBackup / BackupEntry / rollback()、ensure_no_link_root/ancestor 防穿透与拒绝覆盖/删除链接及 Windows 只读清理辅助</span>
 │   │   │   ├── compaction.rs                             <span class="c"># 15% 平衡切分、分段压缩规划（compaction_input_limit 限幅防大定义压死前缀）与 fold_oversized_messages 超限折叠</span>
 │   │   │   └── context.rs                                <span class="c"># 日志投影、跨回合用量校准（支持定义增减有符号差值与重开基线补偿）与异源思考排除</span>
 │   │   │       ├── project_messages()                    <span class="c"># 检查点＋firstKeptEntryId 保留尾部与工具配对投影</span>
@@ -311,7 +311,7 @@ pre {
 │   │           │   └── output() / prepare_completion_message() / confirm_delivered() <span class="c"># 维护输出游标并在落盘后确认交付</span>
 │   │           └── result.rs                             <span class="c"># output_text / task_result：16 KiB 增量切片</span>
 │   └── tests/                                            <span class="c"># Agent 不变量集成测试（1 文件）</span>
-│       └── snapshot_invariants.rs                        <span class="c"># 11 项 Shadow Git 不变量：大小写改名/父目录冲突、只读、空目录回滚、大批量嵌套 .git、SINGULARITY_HOME、NotFound、remove、回滚错误、120000 符号链接与 NTFS 联接</span>
+│       └── snapshot_invariants.rs                        <span class="c"># 10 项 Shadow Git 不变量：大小写改名/父目录冲突、只读、空目录回滚、大批量嵌套 .git、SINGULARITY_HOME、NotFound、remove、回滚错误与 NTFS 联接防穿透/拒收</span>
 │
 └── app/                                                  <span class="c"># 桌面后端组装层（Singularity.exe 入口，31 .rs：src 22 + tests 9）</span>
     ├── src/                                              <span class="c"># 主入口、诊断日志、desktop 网关与 runtime 状态机（22 文件）</span>
