@@ -2,10 +2,11 @@
 
 ## 全链路巡检进度
 
-- **已巡检至提交**：`暂无`
+- **已巡检至提交**：`d365a982`
 
 | 日期 | 覆盖提交范围 | 涉及主要链路 | 结论与处理 |
 | --- | --- | --- | --- |
+| 2026-11-25 | `f4b8aec3..d365a982` | protocol/model/mcp/agent(snapshot,context)/app/desktop/docs/CI | 确认修复 22 项巡检问题 + 3 轮 Codex 复核 17 项，PR #35 已合入 |
 
 ## 审查问题记录（供体检提炼硬规则）
 
@@ -13,8 +14,8 @@
 
 | 日期 | 提交/任务 | 问题类目 | 一句话摘要 | 状态 |
 | --- | --- | --- | --- | --- |
-| 2026-11-25 | fix/project-garden-audit-remediation | 快照回滚 | 删除冲突目录时未先登记并恢复空子目录，局部删除失败或回滚后空目录永久丢失 | 待观察 |
-| 2026-11-25 | fix/project-garden-audit-remediation | Windows 命令行上限 | 动态排除/长路径分批传参至 `git ls-files` 易超 Windows 32KB 参数上限（error 206） | 待观察 |
-| 2026-11-25 | fix/project-garden-audit-remediation | Windows 大小写改名 | 仅大小写改名目录含忽略文件时未在写盘前拦截冲突，导致还原返回成功但留脏差异 | 待观察 |
-| 2026-11-25 | fix/project-garden-audit-remediation | Git 索引冲突 | 符号链接回滚 `update-index --cacheinfo` 缺 `--replace`，遇目录/文件索引冲突必败 | 待观察 |
-| 2026-11-25 | fix/project-garden-audit-remediation | Windows 符号链接 | 回滚未区分目录/文件符号链接且未延后创建，导致目录符号链接静默退化为文件符号链接 | 待观察 |
+| 2026-11-25 | PR #35 / `d365a982` | 快照回滚 | 删除冲突目录时未先登记并恢复空子目录，局部删除失败或回滚后空目录永久丢失 | 待观察 |
+| 2026-11-25 | PR #35 / `d365a982` | Windows 命令行上限 | 动态排除/长路径分批传参至 `git ls-files` 易超 Windows 32KB 参数上限（error 206） | 待观察 |
+| 2026-11-25 | PR #35 / `d365a982` | Windows 大小写改名 | 仅大小写改名目录含忽略文件时未在写盘前拦截冲突，导致还原返回成功但留脏差异 | 待观察 |
+| 2026-11-25 | PR #35 / `d365a982` | Git 索引冲突 | 符号链接回滚 `update-index --cacheinfo` 缺 `--replace`，遇目录/文件索引冲突必败 | 待观察 |
+| 2026-11-25 | PR #35 / `d365a982` | Windows 符号链接 | 回滚未区分目录/文件符号链接且未延后创建，导致目录符号链接静默退化为文件符号链接 | 待观察 |
