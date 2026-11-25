@@ -220,15 +220,13 @@ impl Conversation {
         ))
     }
 
-    pub(crate) fn commit_rewind(
-        &self,
-        turn_id: &str,
-        guard: RewindGuard,
-    ) -> Result<protocol::SessionReadResult, ConversationError> {
+    pub(crate) fn commit_rewind(&self, turn_id: &str, guard: &mut RewindGuard) -> RewindCommit {
         if self.is_deleting() {
-            return Err(ConversationError::Busy);
+            return RewindCommit::PreCommitError(ConversationError::Busy);
         }
-        lock_writer(&self.writer).rewind_before_turn(turn_id)?;
+        if let Err(error) = lock_writer(&self.writer).rewind_before_turn(turn_id) {
+            return RewindCommit::PreCommitError(error.into());
+        }
         let result = {
             let mut view = self.lock_view();
             {
@@ -240,6 +238,7 @@ impl Conversation {
                 state.auto_resume = false;
                 state.turn = TurnLifecycle::Idle;
             }
+            guard.disarm();
             let payload = self.runtime(&view);
             self.publish(
                 &mut view,
@@ -249,11 +248,18 @@ impl Conversation {
                     summary: self.summary(),
                 },
             );
-            self.read_locked(&view).map_err(|error| ConversationError::Message(error.to_string()))?
+            self.read_locked(&view)
+                .map(Box::new)
+                .map_err(|error| ConversationError::Message(error.to_string()))
         };
-        guard.finish();
-        Ok(result)
+        self.changed.notify_waiters();
+        RewindCommit::Committed(result)
     }
+}
+
+pub(crate) enum RewindCommit {
+    Committed(Result<Box<protocol::SessionReadResult>, ConversationError>),
+    PreCommitError(ConversationError),
 }
 
 pub(crate) struct RewindPlan {
@@ -267,10 +273,8 @@ pub(crate) struct RewindGuard {
 }
 
 impl RewindGuard {
-    fn finish(mut self) {
-        if let Some(conversation) = self.conversation.take() {
-            conversation.changed.notify_waiters();
-        }
+    fn disarm(&mut self) {
+        self.conversation = None;
     }
 }
 

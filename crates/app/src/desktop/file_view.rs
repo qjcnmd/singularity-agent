@@ -5,13 +5,12 @@ use protocol::{RpcError, TextDocument};
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
-pub(crate) fn read_text_file(cwd: &str, path: &str) -> Result<TextDocument, RpcError> {
-    let resolved = resolve(cwd, path.trim());
-    let shown = app_core::display_path(&resolved);
-    let file = std::fs::File::open(&resolved).map_err(|error| match error.kind() {
+pub(crate) fn read_text_file(resolved: &Path) -> Result<TextDocument, RpcError> {
+    let shown = app_core::display_path(resolved);
+    let file = std::fs::File::open(resolved).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => RpcError::new(format!("文件不存在：{shown}")),
         std::io::ErrorKind::PermissionDenied
-            if std::fs::metadata(&resolved).is_ok_and(|metadata| !metadata.is_file()) =>
+            if std::fs::metadata(resolved).is_ok_and(|metadata| !metadata.is_file()) =>
         {
             RpcError::new(format!("不是文件：{shown}"))
         }
@@ -38,7 +37,8 @@ pub(crate) fn read_text_file(cwd: &str, path: &str) -> Result<TextDocument, RpcE
     Ok(TextDocument { path: shown, content })
 }
 
-fn resolve(cwd: &str, path: &str) -> PathBuf {
+pub(crate) fn resolve_path(cwd: &str, path: &str) -> PathBuf {
+    let path = path.trim();
     if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"))
         && let Some(home) = std::env::home_dir()
     {

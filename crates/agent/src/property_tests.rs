@@ -13,8 +13,10 @@ use crate::session::context::{
     frame_compacted_summary, input_tokens, message_token_estimate, project_messages, resolve_context_entries,
 };
 use crate::session::{
-    CompactionEntry, LedgerRecord, SessionData, SessionEntry, SessionManager, session_file_name,
+    CompactionEntry, LedgerRecord, SessionData, SessionEntry, SessionManager, SessionMetadata,
+    session_file_name,
 };
+use crate::tools::format_head_bounded;
 
 struct TempDir(PathBuf);
 
@@ -436,4 +438,217 @@ proptest! {
         std::fs::write(&path, &bytes).expect("write random bytes");
         let _ = SessionData::open(&path);
     }
+
+    #[test]
+    fn format_head_bounded_preserves_utf8_and_spills_exact_content(
+        seed in unicode_seed_strategy(4, 32),
+        repeat in 1usize..=2_500,
+        single_line in any::<bool>(),
+    ) {
+        let tmp = TempDir::new("head-bounded");
+        let content = if single_line {
+            seed.replace('\n', "x").repeat(repeat)
+        } else {
+            let line = seed.replace('\n', " ");
+            (0..repeat).map(|i| format!("{i}:{line}")).collect::<Vec<_>>().join("\n")
+        };
+        let out = format_head_bounded(&content, &tmp.0);
+        let needs_truncation = content.lines().count() > 2_000 || content.len() > 50 * 1024;
+        if !needs_truncation {
+            prop_assert_eq!(out, content);
+        } else {
+            prop_assert!(out.contains("Full output: "), "missing spill note");
+            let path_str = out
+                .rsplit("Full output: ")
+                .next()
+                .expect("spill path")
+                .trim();
+            let spilled = std::fs::read_to_string(path_str).expect("read spilled output");
+            prop_assert_eq!(spilled, content);
+            let head_body = out.split("\n\n[Showing ").next().expect("head body");
+            prop_assert!(head_body.len() <= 50 * 1024, "head body exceeded byte cap");
+            prop_assert!(head_body.lines().count() <= 2_000, "head body exceeded line cap");
+        }
+    }
+
+    #[test]
+    fn rewind_before_turn_preserves_latest_settings_and_name(
+        turns in 2usize..=5,
+        rewind_to in 0usize..5,
+        rename_after in any::<bool>(),
+        reselect_after in any::<bool>(),
+    ) {
+        let rewind_idx = rewind_to % turns;
+        let (_tmp, sessions, sid, mut mgr) = new_test_session("rewind-meta", "p0", "m0");
+        let mut turn_ids = Vec::new();
+        for t in 0..turns {
+            let tid = format!("turn_{t}");
+            mgr.append_operation_started(tid.clone(), None).expect("start turn");
+            mgr.append_message_with_id(&format!("u_{t}"), Message::user(format!("msg {t}")), None, None)
+                .expect("user msg");
+            if t == turns - 1 && reselect_after {
+                mgr.append_metadata(SessionMetadata::ThreadSettings {
+                    selection: ModelSelection {
+                        provider: "p_latest".into(),
+                        model: "m_latest".into(),
+                        reasoning: Some("high".into()),
+                    },
+                })
+                .expect("append latest settings");
+            }
+            if t == turns - 1 && rename_after {
+                mgr.append_metadata(SessionMetadata::ThreadName { name: "Renamed Title".into() })
+                    .expect("append latest name");
+            }
+            turn_ids.push(tid);
+        }
+
+        mgr.rewind_before_turn(&turn_ids[rewind_idx]).expect("rewind succeeds");
+        let reloaded = SessionData::open(&sessions.join(session_file_name(&sid))).expect("reopen after rewind");
+
+        let has_rewound_turn = reloaded.entries().iter().any(|e| e.id() == turn_ids[rewind_idx]);
+        prop_assert!(!has_rewound_turn, "rewound turn must be removed");
+
+        let latest_sel = reloaded.entries().iter().rev().find_map(|e| match e {
+            SessionEntry::Metadata { metadata: SessionMetadata::ThreadSettings { selection }, .. } => {
+                Some(selection)
+            }
+            _ => None,
+        });
+        let expected_provider = if reselect_after { "p_latest" } else { "p0" };
+        prop_assert_eq!(latest_sel.map(|s| s.provider.as_str()), Some(expected_provider));
+
+        let latest_name = reloaded.entries().iter().rev().find_map(|e| match e {
+            SessionEntry::Metadata { metadata: SessionMetadata::ThreadName { name }, .. } => {
+                Some(name.as_str())
+            }
+            _ => None,
+        });
+        let expected_name = rename_after.then_some("Renamed Title");
+        prop_assert_eq!(latest_name, expected_name);
+    }
+}
+
+#[test]
+fn overflow_compaction_recovers_after_definition_growth() {
+    let (_tmp, sessions, sid, mut mgr) = new_test_session("def-growth", "p", "m");
+    let big_user = "x".repeat(40_000); // ~10_000 estimated tokens
+    mgr.append_message_with_id("u1", Message::user(big_user), None, None).expect("u1");
+    let obs = RequestObservation {
+        purpose: RequestPurpose::Generation,
+        provider: "p".into(),
+        model: "m".into(),
+        status: ProviderAttemptStatus::Ok,
+        ttft_ms: None,
+        decode_ms: None,
+        usage: Some(ModelUsage {
+            input_tokens: 11_000,
+            output_tokens: 200,
+            total_tokens: 11_200,
+            cached_input_tokens: None,
+        }),
+    };
+    mgr.append_message_with_id(
+        "a1",
+        Message::assistant("ok".into(), String::new(), Vec::new(), None),
+        Some(obs),
+        None,
+    )
+    .expect("a1");
+    mgr.record_reply_definition_tokens("a1".into(), 1_000);
+    mgr.append_record(LedgerRecord::OperationStarted { snapshot_tree: None }).expect("turn 2");
+    mgr.append_message_with_id("u2", Message::user("next"), None, None).expect("u2");
+
+    let model = ModelConfigurationSnapshot {
+        max_context_tokens: 100_000,
+        max_output_tokens: 4_096,
+    };
+    let grown_defs = 85_000u64;
+    let active = resolve_context_entries(mgr.data());
+
+    // In-session exact delta: 11_200 + (85_000 - 1_000) + tail > grown_defs + 300
+    let in_session_tokens = input_tokens(mgr.data(), &active, ("p", "m"), grown_defs);
+    assert!(in_session_tokens > grown_defs + 10_000, "got {in_session_tokens}");
+    let step =
+        plan_compaction_step(mgr.data(), "u2", ("p", "m"), grown_defs, 300, model, Some(in_session_tokens))
+            .expect("in-session overflow compaction must not falsely abort")
+            .expect("compactable prefix exists");
+    assert!(step.estimated_request_input < in_session_tokens);
+
+    // Reopened session from disk (no in-memory prev_def): both huge growth (85k > 11k)
+    // and moderate growth (10_500 + prev_input/4 > 11k) must invalidate stale baseline.
+    let reopened = SessionData::open(&sessions.join(session_file_name(&sid))).expect("reopen");
+    let reopened_active = resolve_context_entries(&reopened);
+    for defs in [85_000u64, 10_500u64] {
+        let reopened_tokens = input_tokens(&reopened, &reopened_active, ("p", "m"), defs);
+        assert!(reopened_tokens > defs + 9_000, "defs={defs} got {reopened_tokens}");
+        let step = plan_compaction_step(&reopened, "u2", ("p", "m"), defs, 300, model, Some(reopened_tokens))
+            .expect("reopened overflow compaction must not falsely abort")
+            .expect("compactable prefix exists");
+        assert!(step.estimated_request_input < reopened_tokens);
+    }
+
+    // In-session shrink applies signed delta while keeping calibrated history.
+    mgr.record_reply_definition_tokens("a1".into(), 20_000);
+    let tail_est = message_token_estimate(&Message::user("next"));
+    let active_shrunk = resolve_context_entries(mgr.data());
+    let shrunk = input_tokens(mgr.data(), &active_shrunk, ("p", "m"), 5_000);
+    assert_eq!(shrunk, 5_000 + tail_est, "clamped shrink floor");
+    let big_usage_obs = RequestObservation {
+        purpose: RequestPurpose::Generation,
+        provider: "p".into(),
+        model: "m".into(),
+        status: ProviderAttemptStatus::Ok,
+        ttft_ms: None,
+        decode_ms: None,
+        usage: Some(ModelUsage {
+            input_tokens: 59_000,
+            output_tokens: 1_000,
+            total_tokens: 60_000,
+            cached_input_tokens: None,
+        }),
+    };
+    mgr.append_message_with_id(
+        "a2",
+        Message::assistant("ok2".into(), String::new(), Vec::new(), None),
+        Some(big_usage_obs),
+        None,
+    )
+    .expect("a2");
+    mgr.record_reply_definition_tokens("a2".into(), 20_000);
+    mgr.append_message_with_id("u3", Message::user("next"), None, None).expect("u3");
+    let active2 = resolve_context_entries(mgr.data());
+    assert_eq!(input_tokens(mgr.data(), &active2, ("p", "m"), 5_000), 45_000 + tail_est);
+
+    // Reopened session with moderate definition growth (prev_input=30k, usage.input=33k, new_def=21k)
+    // must account for the +18k growth instead of underestimating as ~34k.
+    let (_tmp2, sessions2, sid2, mut mgr2) = new_test_session("def-growth-reopen", "p", "m");
+    mgr2.append_message_with_id("u1", Message::user("x".repeat(120_000)), None, None)
+        .expect("u1");
+    let obs2 = RequestObservation {
+        purpose: RequestPurpose::Generation,
+        provider: "p".into(),
+        model: "m".into(),
+        status: ProviderAttemptStatus::Ok,
+        ttft_ms: None,
+        decode_ms: None,
+        usage: Some(ModelUsage {
+            input_tokens: 33_000,
+            output_tokens: 1_000,
+            total_tokens: 34_000,
+            cached_input_tokens: None,
+        }),
+    };
+    mgr2.append_message_with_id(
+        "a1",
+        Message::assistant("ok".into(), String::new(), Vec::new(), None),
+        Some(obs2),
+        None,
+    )
+    .expect("a1");
+    mgr2.append_message_with_id("u2", Message::user("next"), None, None).expect("u2");
+    let reopened2 = SessionData::open(&sessions2.join(session_file_name(&sid2))).expect("reopen2");
+    let active_r2 = resolve_context_entries(&reopened2);
+    let est_r2 = input_tokens(&reopened2, &active_r2, ("p", "m"), 21_000);
+    assert!(est_r2 >= 51_000, "reopened moderate growth must not underestimate: got {est_r2}");
 }

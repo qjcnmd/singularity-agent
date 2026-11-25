@@ -9,7 +9,7 @@ description: >-
 
 # 项目增量全链路体检
 
-默认只读排查，确认清单经用户拍板后再修改代码或更新 [docs/audit-log.md](file:///C:/Users/Lenovo/Desktop/Harness/docs/audit-log.md)。
+默认只读排查，确认清单经用户拍板后再修改代码或更新 `docs/audit-log.md`。
 
 ## 执行步骤
 

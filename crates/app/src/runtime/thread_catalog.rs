@@ -120,11 +120,14 @@ impl ThreadCatalog {
         for directory in [
             session_images_directory(&self.sessions_dir, thread_id),
             session_outputs_directory(&self.sessions_dir, thread_id),
-            session_snapshot_directory(&self.sessions_dir, thread_id),
         ] {
             if let Err(source) = remove_dir_ignoring_not_found(&directory) {
                 return Err(CatalogError::Io { path: directory, source });
             }
+        }
+        let snapshot_dir = session_snapshot_directory(&self.sessions_dir, thread_id);
+        if let Err(source) = agent::session::snapshot::remove(&snapshot_dir) {
+            return Err(CatalogError::Io { path: snapshot_dir, source });
         }
         std::fs::remove_file(&path).map_err(|error| CatalogError::session(thread_id, &path, error.into()))
     }
@@ -138,41 +141,7 @@ fn remove_dir_ignoring_not_found(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        // Git for Windows marks bare object files read-only, which makes remove_dir_all fail with PermissionDenied.
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            clear_readonly_recursive(path);
-            match std::fs::remove_dir_all(path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error),
-            }
-        }
         Err(error) => Err(error),
-    }
-}
-
-#[expect(
-    clippy::permissions_set_readonly_false,
-    reason = "Windows shadow-git loose object files carry FILE_ATTRIBUTE_READONLY and must be cleared before removal"
-)]
-fn clear_readonly_recursive(path: &Path) {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.file_type().is_symlink() {
-        return;
-    }
-    if meta.permissions().readonly() {
-        let mut perms = meta.permissions();
-        perms.set_readonly(false);
-        let _ = std::fs::set_permissions(path, perms);
-    }
-    if meta.is_dir()
-        && let Ok(entries) = std::fs::read_dir(path)
-    {
-        for entry in entries.flatten() {
-            clear_readonly_recursive(&entry.path());
-        }
     }
 }
 

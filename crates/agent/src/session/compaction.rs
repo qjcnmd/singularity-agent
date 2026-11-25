@@ -111,8 +111,11 @@ pub(crate) fn compaction_input_limit(
     let window_limit = model.context_window().saturating_sub(min_out);
     let limit = match overflow_input_tokens {
         Some(overflow) if overflow <= min_req.saturating_add(1) => return None,
-        Some(overflow) => window_limit
-            .min(overflow.saturating_sub(min_out.max(overflow / 5)).max(min_req + 1).min(overflow - 1)),
+        Some(overflow) => {
+            let headroom = overflow - min_req;
+            let shrink = min_out.max(overflow / 5).min(headroom / 2).max(1);
+            window_limit.min(overflow - shrink)
+        }
         None => window_limit,
     };
     (limit > min_req).then_some(limit)
@@ -145,7 +148,7 @@ pub(crate) fn plan_compaction_step(
         .ok_or(NO_HEADROOM)?;
     let full_est =
         definition_tokens.saturating_add(context_token_estimate_for(&active, data, Some(identity)));
-    let calibrated = latest_reply_usage(data, &active)
+    let calibrated = latest_reply_usage(data, &active, definition_tokens)
         .filter(|&(p, m, real)| (p, m) == identity && real > 0 && full_est > 0)
         .map(|(_, _, real)| real);
     let max_base = limit.saturating_sub(instruction_tokens);

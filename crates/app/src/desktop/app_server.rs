@@ -64,10 +64,28 @@ impl SessionCache {
     }
 }
 
+#[derive(Default)]
+pub(super) struct LifecycleState {
+    rewinding_workspaces: HashSet<String>,
+    deleting_sessions: HashSet<String>,
+}
+
+impl LifecycleState {
+    pub(super) fn is_deleting(&self, session_id: &str) -> bool {
+        self.deleting_sessions.contains(session_id)
+    }
+
+    fn has_overlapping_rewind(&self, target_key: &str) -> bool {
+        self.rewinding_workspaces
+            .iter()
+            .any(|key| app_core::workspace_keys_overlap(key, target_key))
+    }
+}
+
 pub(crate) struct AppServer {
     hub: Arc<StreamHub>,
     app_publication: Mutex<()>,
-    lifecycle: Mutex<HashSet<String>>,
+    lifecycle: Mutex<LifecycleState>,
     catalog: ThreadCatalog,
     workspaces: WorkspaceStore,
     models: Arc<ModelConfigManager>,
@@ -88,7 +106,7 @@ impl AppServer {
         Arc::new(Self {
             hub: StreamHub::new(stream),
             app_publication: Mutex::new(()),
-            lifecycle: Mutex::new(HashSet::new()),
+            lifecycle: Mutex::new(LifecycleState::default()),
             catalog,
             workspaces,
             models,
@@ -111,6 +129,11 @@ impl AppServer {
             || Ok(self.home.clone()),
             |id| self.workspace(id).map(|workspace| workspace.root.into()),
         )
+    }
+
+    pub(crate) fn ensure_workspace_not_rewinding(&self, cwd: &Path) -> Result<(), RpcError> {
+        let lifecycle = self.lock_lifecycle();
+        ensure_workspace_not_rewinding(&lifecycle, cwd)
     }
 
     pub(crate) fn save_provider(
@@ -210,14 +233,21 @@ impl AppServer {
         focus_epoch: u64,
     ) -> Result<SessionReadResult, RpcError> {
         let conversation = {
-            let _lifecycle = self.lock_lifecycle();
-            self.open_conversation(session_id)?
+            let lifecycle = self.lock_lifecycle();
+            self.open_conversation(&lifecycle, session_id)?
         };
         self.set_focused_session(focus_epoch, Some(session_id.to_owned()));
         conversation.read().map_err(catalog_error)
     }
 
-    fn open_conversation(&self, session_id: &str) -> Result<Arc<Conversation>, RpcError> {
+    fn open_conversation(
+        &self,
+        lifecycle: &LifecycleState,
+        session_id: &str,
+    ) -> Result<Arc<Conversation>, RpcError> {
+        if lifecycle.is_deleting(session_id) {
+            return Err(session_busy());
+        }
         let open = self.lock_sessions().get(session_id);
         if let Some(conversation) = open {
             return Ok(conversation);
@@ -226,8 +256,12 @@ impl AppServer {
         Ok(self.insert_conversation(thread))
     }
 
-    fn open_action_conversation(&self, session_id: &str) -> Result<Arc<Conversation>, RpcError> {
-        let conversation = self.open_conversation(session_id)?;
+    fn open_action_conversation(
+        &self,
+        lifecycle: &LifecycleState,
+        session_id: &str,
+    ) -> Result<Arc<Conversation>, RpcError> {
+        let conversation = self.open_conversation(lifecycle, session_id)?;
         if conversation.is_deleting() {
             return Err(session_busy());
         }
@@ -264,7 +298,7 @@ impl AppServer {
         self.app_publication.lock().expect("app_server publication lock poisoned")
     }
 
-    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, LifecycleState> {
         self.lifecycle.lock().expect("app_server lifecycle lock poisoned")
     }
 
@@ -295,24 +329,57 @@ pub(super) struct WorkspaceRewindGuard {
 }
 
 impl WorkspaceRewindGuard {
-    pub(super) fn register(app: &Arc<AppServer>, rewinding: &mut HashSet<String>, cwd: &Path) -> Self {
+    pub(super) fn register(app: &Arc<AppServer>, lifecycle: &mut LifecycleState, cwd: &Path) -> Self {
         let key = app_core::workspace_key(cwd);
-        rewinding.insert(key.clone());
+        lifecycle.rewinding_workspaces.insert(key.clone());
         Self { app: Arc::clone(app), key }
     }
 }
 
 impl Drop for WorkspaceRewindGuard {
     fn drop(&mut self) {
-        self.app.lock_lifecycle().remove(&self.key);
+        self.app.lock_lifecycle().rewinding_workspaces.remove(&self.key);
     }
 }
 
-pub(super) fn ensure_workspace_not_rewinding(
-    rewinding: &HashSet<String>,
-    cwd: &Path,
-) -> Result<(), RpcError> {
-    if rewinding.contains(&app_core::workspace_key(cwd)) {
+pub(super) struct SessionDeleteGuard {
+    app: Arc<AppServer>,
+    session_id: Option<String>,
+}
+
+impl SessionDeleteGuard {
+    pub(super) fn reserve(
+        app: &Arc<AppServer>,
+        lifecycle: &mut LifecycleState,
+        session_id: &str,
+    ) -> Result<Self, RpcError> {
+        if !lifecycle.deleting_sessions.insert(session_id.to_owned()) {
+            return Err(session_busy());
+        }
+        Ok(Self {
+            app: Arc::clone(app),
+            session_id: Some(session_id.to_owned()),
+        })
+    }
+
+    pub(super) fn release_locked(mut self, lifecycle: &mut LifecycleState) {
+        if let Some(session_id) = self.session_id.take() {
+            lifecycle.deleting_sessions.remove(&session_id);
+        }
+    }
+}
+
+impl Drop for SessionDeleteGuard {
+    fn drop(&mut self) {
+        if let Some(session_id) = self.session_id.take() {
+            self.app.lock_lifecycle().deleting_sessions.remove(&session_id);
+        }
+    }
+}
+
+pub(super) fn ensure_workspace_not_rewinding(lifecycle: &LifecycleState, cwd: &Path) -> Result<(), RpcError> {
+    let target_key = app_core::workspace_key(cwd);
+    if lifecycle.has_overlapping_rewind(&target_key) {
         return Err(RpcError::new("当前项目正在还原文件，请稍后再试。"));
     }
     Ok(())

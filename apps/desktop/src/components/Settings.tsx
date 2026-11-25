@@ -170,12 +170,33 @@ function AppearanceSection() {
   )
 }
 
+function ModelConfigErrorAlert({ title, error }: { title: string; error: string }) {
+  const [refreshing, setRefreshing] = useState(false)
+  async function reread() {
+    if (refreshing) return
+    setRefreshing(true)
+    try { await appStore.refreshModels() }
+    finally { setRefreshing(false) }
+  }
+  return (
+    <div className="sg-model-config-error" role="alert">
+      <strong>{title}</strong>
+      <details>
+        <summary>查看错误详情</summary>
+        <pre>{error}</pre>
+      </details>
+      <button type="button" className="secondary-button" disabled={refreshing} onClick={() => void reread()}>
+        {refreshing ? '读取中…' : '重新读取'}
+      </button>
+    </div>
+  )
+}
+
 function ModelsSection() {
   const state = useAppStore(['bootstrap', 'actionErrors', 'pendingActions'])
   const [editor, setEditor] = useState<ProviderEditorState>(null)
   const [editorVersion, setEditorVersion] = useState(0)
   const [removing, setRemoving] = useState<RedactedProvider | null>(null)
-  const [refreshing, setRefreshing] = useState(false)
   const busy = [...state.pendingActions].some(key =>
     ['model.saveProvider', 'model.removeProvider'].some(method => key.startsWith(pendingKey(method, ''))))
   const catalog = state.bootstrap?.modelCatalog
@@ -202,24 +223,10 @@ function ModelsSection() {
     }
   }
 
-  async function rereadModelConfiguration() {
-    if (refreshing) return
-    setRefreshing(true)
-    try { await appStore.refreshModels() }
-    finally { setRefreshing(false) }
-  }
-
   return (
     <PageFrame title="模型" subtitle="管理模型提供方、协议类型与可用模型列表。">
       {catalog?.error && editor === null && removing === null && (
-        <div className="sg-model-config-error" role="alert">
-          <strong>{unreadable ? '无法读取模型配置' : '默认模型不可用'}</strong>
-          <details>
-            <summary>查看错误详情</summary>
-            <pre>{catalog.error}</pre>
-          </details>
-          <button type="button" className="secondary-button" disabled={refreshing} onClick={() => void rereadModelConfiguration()}>{refreshing ? '读取中…' : '重新读取'}</button>
-        </div>
+        <ModelConfigErrorAlert title={unreadable ? '无法读取模型配置' : '默认模型不可用'} error={catalog.error} />
       )}
       <div className="settings-group">
         {providerRows.map(provider => {
@@ -278,7 +285,7 @@ function WebSearchSection() {
   const saved = catalog?.webSearch
   const savedUrl = saved?.baseUrl || DEFAULT_WEB_SEARCH_URL
   const credentialConfigured = saved?.credentialConfigured ?? false
-  const unreadable = Boolean(catalog?.error && (catalog.providers.length === 0))
+  const unreadable = Boolean(catalog?.error && catalog.providers.length === 0)
   const [baseUrl, setBaseUrl] = useState(savedUrl)
   const [apiKey, setApiKey] = useState('')
   const [clearKey, setClearKey] = useState(false)
@@ -287,6 +294,8 @@ function WebSearchSection() {
   const origin = actionOrigin.inline('model.saveWebSearch', 'web')
   const busy = state.pendingActions.has(pendingKey('model.saveWebSearch', origin))
   const saveError = state.actionErrors[origin]
+
+  useEffect(() => () => appStore.clearError(origin), [origin])
 
   useEffect(() => {
     setBaseUrl(savedUrl)
@@ -327,6 +336,9 @@ function WebSearchSection() {
 
   return (
     <PageFrame title="联网搜索" subtitle="配置 DeepSeek 独立搜索与网页抓取服务，所有聊天模型通用。">
+      {unreadable && catalog?.error && (
+        <ModelConfigErrorAlert title="无法读取模型配置" error={catalog.error} />
+      )}
       <div className="settings-group">
         <form className="sg-editor web-search-form" onSubmit={event => void submit(event)} noValidate>
           <fieldset disabled={busy || unreadable} className="provider-fields">

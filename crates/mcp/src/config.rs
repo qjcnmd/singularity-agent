@@ -160,8 +160,9 @@ fn collect_parsed_url_secrets(parsed: &reqwest::Url, values: &mut Vec<Cow<'_, st
     if let Some(query) = parsed.query() {
         for pair in query.split('&') {
             if let Some((key, value)) = pair.split_once('=')
-                && is_secret_name(key)
                 && !value.is_empty()
+                && (is_secret_name(key)
+                    || percent_decode(&key.replace('+', " ")).as_deref().is_some_and(is_secret_name))
             {
                 values.push(Cow::Owned(value.to_owned()));
             }
@@ -178,31 +179,37 @@ fn collect_arg_secrets<'a>(args: &'a [String], values: &mut Vec<Cow<'a, str>>) {
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
+        if let Some(parsed) = parse_url_candidate(arg) {
+            collect_parsed_url_secrets(&parsed, values);
+            index += 1;
+            continue;
+        }
         let url_candidate = if let Some((key, value)) = arg.split_once('=') {
             let name = key.trim_start_matches('-');
             if !name.is_empty() && is_secret_name(name) {
                 collect_secret_value(value, values);
-                None
-            } else {
-                Some(value)
             }
+            Some(value)
         } else if arg.starts_with('-') && is_secret_name(arg.trim_start_matches('-')) {
             if let Some(next) = args.get(index + 1).filter(|v| !v.is_empty() && !v.starts_with('-')) {
-                collect_secret_value(next, values);
+                collect_secret_value(next.as_str(), values);
                 index += 1;
+                Some(next.as_str())
+            } else {
+                None
             }
-            None
         } else {
-            Some(arg)
+            None
         };
-        if let Some(candidate) = url_candidate
-            && candidate.contains("://")
-            && let Ok(parsed) = reqwest::Url::parse(candidate)
-        {
+        if let Some(parsed) = url_candidate.and_then(parse_url_candidate) {
             collect_parsed_url_secrets(&parsed, values);
         }
         index += 1;
     }
+}
+
+fn parse_url_candidate(candidate: &str) -> Option<reqwest::Url> {
+    candidate.contains("://").then(|| reqwest::Url::parse(candidate).ok()).flatten()
 }
 
 fn replace_non_overlapping(error: String, mut values: Vec<Cow<'_, str>>) -> String {
@@ -352,4 +359,86 @@ pub(crate) fn read(home: &Path) -> Result<Configuration, McpError> {
 pub(crate) fn write(home: &Path, config: &Configuration) -> Result<(), McpError> {
     app_core::write_json_atomic(&home.join("mcp.json"), config)
         .map_err(|source| McpError::io("无法保存 mcp.json", source))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConfig;
+    use protocol::McpTransportConfig;
+    use std::collections::BTreeMap;
+
+    fn stdio_config(args: Vec<&str>, env: Vec<(&str, &str)>) -> ServerConfig {
+        ServerConfig {
+            startup_timeout_sec: 30,
+            tool_timeout_sec: 120,
+            transport: McpTransportConfig::Stdio {
+                command: "demo".into(),
+                args: args.into_iter().map(str::to_owned).collect(),
+                cwd: None,
+                env: env.into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn redact_handles_bare_url_args_with_query_strings_and_userinfo() {
+        let cfg = stdio_config(
+            vec![
+                "https://alice:s3cr3tPass@example.com/sse?mode=fast&token=tok_xyz_99&api_key=k%2F123&tok%65n=sec%2Fret",
+                "--endpoint=https://bob:p%40ss@example.org/mcp?auth=bearer_val&api%5Fkey=v%40l",
+            ],
+            vec![],
+        );
+        let msg = "failed connecting to https://alice:s3cr3tPass@example.com/sse?mode=fast&token=tok_xyz_99&api_key=k%2F123&tok%65n=sec%2Fret and sec/ret bob p@ss bearer_val v%40l v@l";
+        let redacted = cfg.redact(msg.into());
+        for leaked in [
+            "alice",
+            "s3cr3tPass",
+            "tok_xyz_99",
+            "k%2F123",
+            "sec%2Fret",
+            "sec/ret",
+            "bob",
+            "p@ss",
+            "bearer_val",
+            "v%40l",
+            "v@l",
+        ] {
+            assert!(!redacted.contains(leaked), "leaked `{leaked}` in `{redacted}`");
+        }
+        assert!(redacted.contains("mode=fast"), "non-secret query param should stay visible: {redacted}");
+    }
+
+    #[test]
+    fn redact_is_single_pass_non_overlapping_and_never_corrupts_redacted_marker() {
+        let cfg = stdio_config(
+            vec!["--api-key", "Bearer super_secret_token", "--token=redacted"],
+            vec![("AUTH_TOKEN", "super_secret"), ("SHORT_KEY", "ed")],
+        );
+        let msg = "error: Bearer super_secret_token and super_secret and redacted";
+        let redacted = cfg.redact(msg.into());
+        assert!(!redacted.contains("super_secret"));
+        assert!(!redacted.contains("[[redacted]]"));
+        assert_eq!(redacted, "error: [redacted] and [redacted] and [redacted]");
+    }
+
+    #[test]
+    fn redact_http_config_covers_query_userinfo_and_secret_headers() {
+        let cfg = ServerConfig {
+            startup_timeout_sec: 30,
+            tool_timeout_sec: 120,
+            transport: McpTransportConfig::Http {
+                url: "https://u1:p1@mcp.example.com/v1?token=abc999".into(),
+                headers: BTreeMap::from([
+                    ("Authorization".into(), "Bearer hdr_secret_42".into()),
+                    ("X-Custom".into(), "public_val".into()),
+                ]),
+            },
+        };
+        let redacted = cfg.redact("err u1 p1 token=abc999 hdr_secret_42 public_val".into());
+        for leaked in ["u1", "p1", "abc999", "hdr_secret_42"] {
+            assert!(!redacted.contains(leaked), "leaked `{leaked}` in `{redacted}`");
+        }
+        assert!(redacted.contains("public_val"));
+    }
 }

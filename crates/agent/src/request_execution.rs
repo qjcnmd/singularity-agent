@@ -30,6 +30,7 @@ pub(crate) async fn execute_request(
     provider: &ModelClient,
     session: &SessionWriter,
     request: &ModelTurnRequest,
+    definition_tokens: Option<u64>,
     on_event: &mut (dyn FnMut(AgentEvent) + Send),
     cancellation: &CancellationToken,
     purpose: RequestPurpose,
@@ -115,8 +116,17 @@ pub(crate) async fn execute_request(
                 .then(|| response.assistant_message.clone());
         let persisted = observation.clone();
         let entry_id = id.clone();
+        let record_defs = (error.is_none() && purpose == RequestPurpose::Generation)
+            .then_some(definition_tokens)
+            .flatten();
         let saved = with_writer_async(session, move |writer| match message {
-            Some(message) => writer.append_message_with_id(&entry_id, message, Some(persisted), None),
+            Some(message) => {
+                let saved = writer.append_message_with_id(&entry_id, message, Some(persisted), None)?;
+                if let Some(tokens) = record_defs {
+                    writer.record_reply_definition_tokens(entry_id, tokens);
+                }
+                Ok(saved)
+            }
             None => {
                 writer.append_record_with_id(entry_id, LedgerRecord::ModelRequest { observation: persisted })
             }

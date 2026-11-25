@@ -40,10 +40,7 @@ dialog.sg-settings-modal { background: var(--canvas); width: min(880px, calc(100
   .settings-nav-item.is-selected { background: var(--card); box-shadow: 0 1px 2px rgb(0 0 0 / 6%), inset 0 0 0 1px var(--line); }
   .settings-close { top: 10px; right: 12px; }
   .settings-pane-inner { padding: 18px 18px 24px; }
-  .settings-pane-inner .manage-header { padding-right: 0; }
 }
-.settings-section + .settings-section { margin-top: 20px; }
-.settings-section > h3 { margin: 0 0 8px 4px; color: var(--ink-faint); font-size: 12px; font-weight: 500; }
 .settings-group { border-radius: 14px; background: var(--card); border: 1px solid var(--line); overflow: hidden; }
 .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; min-height: 48px; padding: 8px 14px; border: 0; background: none; color: inherit; font: inherit; text-align: left; }
 .settings-group > * + * { border-top: 1px solid var(--line); }
@@ -96,7 +93,7 @@ dialog.mcp-editor-modal .mcp-editor-scroll { max-height: calc(100vh - 220px); }
 .model-reasoning-options { margin: 0; padding: 0; border: 0; }
 .model-reasoning-options legend { margin-bottom: 6px; color: var(--ink-soft); font-size: 12.5px; font-weight: 400; }
 .reasoning-options-grid { display: flex; flex-wrap: wrap; gap: 6px; }
-.reasoning-option { height: 30px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--card); cursor: pointer; font-size: 13px; transition: all 140ms, transform var(--spring-dur) var(--spring); }
+.reasoning-option { height: 30px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--card); cursor: pointer; font-size: 13px; transition: border-color 140ms, background 140ms, color 140ms, transform var(--spring-dur) var(--spring); }
 .reasoning-option:active { transform: scale(.94); transition-duration: 80ms; }
 .reasoning-option[aria-pressed="true"] { border-color: var(--accent); background: var(--accent); color: var(--ink-on-accent); }
 .candidate-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 14px; cursor: pointer; transition: border-color 120ms, background 120ms; }

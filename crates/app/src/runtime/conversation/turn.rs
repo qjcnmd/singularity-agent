@@ -20,8 +20,17 @@ impl Conversation {
         let prepared = tokio::task::spawn_blocking(move || conversation.prepare_turn(&preparing))
             .await
             .expect("turn preparation completes while the runtime is running");
-        let (mut agent, started_at, context_window, has_snapshot) = match prepared {
-            Ok(prepared) => prepared,
+        let ReadyTurn {
+            mut agent,
+            started_at,
+            context_window,
+            has_snapshot,
+        } = match prepared {
+            Ok(PreparedTurn::Ready(ready)) => *ready,
+            Ok(PreparedTurn::Cancelled) => {
+                controls.finish_cancel();
+                return Ok(TurnStatus::Interrupted);
+            }
             Err(error) => {
                 return if controls.finish_cancel() {
                     Ok(TurnStatus::Interrupted)
@@ -133,38 +142,48 @@ impl Conversation {
     fn prepare_turn(
         &self,
         controls: &crate::runtime::conversation::TurnControls,
-    ) -> Result<(Agent, String, u64, bool), TurnErrorDetail> {
+    ) -> Result<PreparedTurn, TurnErrorDetail> {
+        if controls.cancellation().is_cancelled() {
+            return Ok(PreparedTurn::Cancelled);
+        }
         let inbox = Arc::clone(&self.lock_state().steering_inbox);
         let context = self.prepare_request_context()?;
         let context_window = context.context_window();
         let agent = Agent::new(context, inbox, Arc::clone(&controls.questions), Arc::clone(&self.bash_tasks));
+        if controls.cancellation().is_cancelled() {
+            return Ok(PreparedTurn::Cancelled);
+        }
         let (snapshot_dir, cwd) = {
             let writer = lock_writer(&self.writer);
             let data = writer.data();
             (data.snapshot_directory(), data.cwd().to_path_buf())
         };
-        let snapshot_tree = if controls.cancellation().is_cancelled() {
-            None
-        } else {
-            match agent::session::snapshot::capture(&snapshot_dir, &cwd) {
-                Ok(tree) => Some(tree),
-                Err(error) => {
-                    tracing::warn!(
-                        session_id = %self.thread_id,
-                        turn_id = %controls.turn_id,
-                        error = %error,
-                        "failed to capture pre-turn snapshot"
-                    );
-                    None
-                }
+        let snapshot_tree = match agent::session::snapshot::capture(&snapshot_dir, &cwd) {
+            Ok(tree) => Some(tree),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %self.thread_id,
+                    turn_id = %controls.turn_id,
+                    error = %error,
+                    "failed to capture pre-turn snapshot"
+                );
+                None
             }
         };
+        if controls.cancellation().is_cancelled() {
+            return Ok(PreparedTurn::Cancelled);
+        }
         let has_snapshot = snapshot_tree.is_some();
         let mut writer = lock_writer(&self.writer);
         let started_at = writer
             .append_operation_started(controls.turn_id.clone(), snapshot_tree)
             .map_err(preparation_error)?;
-        Ok((agent, started_at, context_window, has_snapshot))
+        Ok(PreparedTurn::Ready(Box::new(ReadyTurn {
+            agent,
+            started_at,
+            context_window,
+            has_snapshot,
+        })))
     }
 
     pub(crate) fn begin_context_preview(self: &Arc<Self>, signal: &CancellationToken) -> ContextPreview {
@@ -241,6 +260,18 @@ impl Conversation {
             Arc::clone(&self.mcp),
         ))
     }
+}
+
+struct ReadyTurn {
+    agent: Agent,
+    started_at: String,
+    context_window: u64,
+    has_snapshot: bool,
+}
+
+enum PreparedTurn {
+    Ready(Box<ReadyTurn>),
+    Cancelled,
 }
 
 pub(crate) enum ContextPreview {

@@ -1,30 +1,32 @@
+mod diff;
 mod restore;
+mod rollback;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use protocol::{ChangedFile, ChangedFileStatus};
-
-pub use restore::{RestoreBackup, restore};
+pub use diff::{diff_summary, file_diff};
+pub use restore::restore;
+pub use rollback::RestoreBackup;
 
 pub(super) const EXCLUDED_DIRS: &[&str] = &[
     ".git",
     "node_modules",
     "target",
     "dist",
-    "dist-desktop",
+    "desktop-dist",
     ".venv",
     "__pycache__",
 ];
 const RAW_ATTRIBUTES: &str = "* -text -filter -working-tree-encoding -ident\n";
-const MAX_DIFF_BYTES: usize = 200 * 1024;
-const MAX_DIFF_LINES: usize = 2_000;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(any(windows, test))]
+const REPARSE_CLASSIFY_ARG_BUDGET: usize = 12_000;
 
 static GIT_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
 static SNAPSHOT_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
@@ -33,39 +35,18 @@ pub fn session_snapshot_directory(sessions_dir: &Path, session_id: &str) -> Path
     sessions_dir.join("snapshots").join(format!("{session_id}.git"))
 }
 
+pub fn remove(snapshot_dir: &Path) -> io::Result<()> {
+    with_snapshot_lock(snapshot_dir, || rollback::remove_dir_clearing_readonly(snapshot_dir))
+}
+
 pub fn capture(snapshot_dir: &Path, cwd: &Path) -> io::Result<String> {
-    Repo { dir: snapshot_dir, cwd }.with_live_tree(|live, _| Ok(live))
+    Repo { dir: snapshot_dir, cwd }.with_live_tree(InitPolicy::CreateIfMissing, |live, _| Ok(live))
 }
 
-pub fn diff_summary(snapshot_dir: &Path, cwd: &Path, base_tree: &str) -> io::Result<Vec<ChangedFile>> {
-    let base = validate_tree_hash(base_tree)?;
-    let repo = Repo { dir: snapshot_dir, cwd };
-    repo.with_live_tree(|live, _| {
-        let status = repo.diff(base, &live, &["--name-status", "-z"], &[])?;
-        let numstat = repo.diff(base, &live, &["--numstat", "-z"], &[])?;
-        Ok(parse_diff_summary(&status, &numstat))
-    })
-}
-
-pub fn file_diff(snapshot_dir: &Path, cwd: &Path, base_tree: &str, rel_path: &str) -> io::Result<String> {
-    let base = validate_tree_hash(base_tree)?;
-    let rel = validate_relative_path(rel_path)?;
-    let repo = Repo { dir: snapshot_dir, cwd };
-    repo.with_live_tree(|live, _| {
-        let flags = &["--no-color", "-U3", "--no-textconv"];
-        let mut out = repo.diff(base, &live, flags, &["--", &rel])?;
-        #[cfg(windows)]
-        if out.is_empty() {
-            let names = repo.diff(base, &live, &["--name-only", "-z"], &[])?;
-            let target = rel.to_lowercase();
-            if let Some(matched) =
-                split_nul(&names).map(|p| String::from_utf8_lossy(p)).find(|p| p.to_lowercase() == target)
-            {
-                out = repo.diff(base, &live, flags, &["--", &matched])?;
-            }
-        }
-        Ok(format_git_diff(&String::from_utf8_lossy(&out)))
-    })
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum InitPolicy {
+    CreateIfMissing,
+    RequireExisting,
 }
 
 #[derive(Clone, Copy)]
@@ -77,25 +58,36 @@ pub(super) struct Repo<'a> {
 impl Repo<'_> {
     pub(super) fn with_live_tree<T>(
         self,
+        init: InitPolicy,
         work: impl FnOnce(String, Vec<String>) -> io::Result<T>,
     ) -> io::Result<T> {
         let protected_rels = protected_relative_paths(self.dir, self.cwd)?;
         with_snapshot_lock(self.dir, || {
-            self.ensure_initialized()?;
-            let protected = self.sync_rules(&protected_rels)?;
-            // Rebuild the shadow index from disk so Windows case-only renames are detected cleanly.
+            match init {
+                InitPolicy::CreateIfMissing => self.ensure_initialized()?,
+                InitPolicy::RequireExisting => {
+                    if !self.dir.join("HEAD").exists() {
+                        return Err(io::Error::new(ErrorKind::NotFound, "工作区快照不存在。"));
+                    }
+                }
+            }
+            // Rebuild the shadow index from disk so Windows case-only renames are detected cleanly
+            // and reparse classification runs against an empty index.
             if let Err(err) = fs::remove_file(self.dir.join("index"))
                 && err.kind() != ErrorKind::NotFound
             {
                 return Err(err);
             }
-            let pathspecs = build_add_pathspecs(&protected);
-            self.git_with_stdin(
-                true,
-                false,
-                &["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
-                Some(&pathspecs),
-            )?;
+            let protected = self.sync_rules(&protected_rels)?;
+            let pathspecs = build_static_exclude_pathspecs();
+            let mut ls_args = Vec::with_capacity(5 + pathspecs.len());
+            ls_args.extend(["ls-files", "--others", "--exclude-standard", "-z", "--"]);
+            ls_args.extend(pathspecs.iter().map(String::as_str));
+            let raw_files = self.git_with_stdin(true, false, &ls_args, None)?;
+            let files = filter_protected_nul_paths(&raw_files, &protected);
+            if !files.is_empty() {
+                self.git_with_stdin(true, true, &["update-index", "--add", "-z", "--stdin"], Some(&files))?;
+            }
             let raw = self.git(true, &["write-tree"])?;
             let hash = String::from_utf8(raw).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
             work(validate_tree_hash(hash.trim())?.to_owned(), protected)
@@ -121,7 +113,12 @@ impl Repo<'_> {
 
     fn sync_rules(self, protected_rels: &[String]) -> io::Result<Vec<String>> {
         let mut protected = protected_rels.to_vec();
-        collect_nested_git_dirs(self.cwd, self.cwd, protected_rels, &mut protected);
+        let mut reparse_candidates = Vec::new();
+        scan_protected_paths(self.cwd, self.cwd, protected_rels, &mut protected, &mut reparse_candidates);
+        #[cfg(windows)]
+        if !reparse_candidates.is_empty() {
+            protected.extend(self.classify_junction_candidates(&reparse_candidates)?);
+        }
         protected.sort_unstable();
         protected.dedup();
         let mut exclude_content = String::new();
@@ -145,6 +142,27 @@ impl Repo<'_> {
         Ok(protected)
     }
 
+    #[cfg(windows)]
+    fn classify_junction_candidates(self, candidates: &[String]) -> io::Result<Vec<String>> {
+        // Git for Windows treats directory symlinks (mklink /D) as 120000 symlinks (no trailing '/')
+        // and NTFS junctions (mklink /J) as directories (trailing '/'). Query Git in small batches
+        // so directory symlinks remain snapshotted while junctions stay excluded.
+        let mut git_symlinks = HashSet::new();
+        for chunk in batch_by_arg_budget(candidates, REPARSE_CLASSIFY_ARG_BUDGET) {
+            let mut args = Vec::with_capacity(5 + chunk.len());
+            args.extend(["ls-files", "--others", "--directory", "-z", "--"]);
+            args.extend(chunk.iter().map(String::as_str));
+            let out = self.git(true, &args)?;
+            for entry in split_nul(&out) {
+                let text = String::from_utf8_lossy(entry);
+                if !text.ends_with('/') {
+                    git_symlinks.insert(path_key(&text));
+                }
+            }
+        }
+        Ok(candidates.iter().filter(|rel| !git_symlinks.contains(&path_key(rel))).cloned().collect())
+    }
+
     pub(super) fn diff(self, base: &str, live: &str, flags: &[&str], tail: &[&str]) -> io::Result<Vec<u8>> {
         let mut args = Vec::with_capacity(5 + flags.len() + tail.len());
         args.extend(["diff", "--no-renames", "--no-ext-diff"]);
@@ -166,7 +184,9 @@ impl Repo<'_> {
         input: Option<&[u8]>,
     ) -> io::Result<Vec<u8>> {
         let mut cmd = Command::new(git_binary()?);
-        cmd.args(["-c", "core.ignorecase=false"])
+        // Force core.symlinks=true so checkout-index never silently degrades 120000 symlinks
+        // into plain text files on Windows bare repos where git init defaults core.symlinks=false.
+        cmd.args(["-c", "core.ignorecase=false", "-c", "core.symlinks=true"])
             .args(args)
             .stdin(if input.is_some() {
                 Stdio::piped()
@@ -252,22 +272,44 @@ pub(super) fn with_snapshot_lock<T>(
     result
 }
 
-fn build_add_pathspecs(protected: &[String]) -> Vec<u8> {
+fn build_static_exclude_pathspecs() -> Vec<String> {
     let icase = if cfg!(windows) { "icase," } else { "" };
-    let mut out = Vec::from(b".\0" as &[u8]);
-    let mut push = |spec: &str| {
-        out.extend_from_slice(spec.as_bytes());
-        out.push(0);
-    };
-    push(&format!(":(top,literal,{icase}exclude).git"));
-    for rel in protected {
-        push(&format!(":(top,literal,{icase}exclude){rel}"));
-    }
+    let mut out = Vec::with_capacity(1 + EXCLUDED_DIRS.len() * 2);
+    out.push(".".to_owned());
     for ex in EXCLUDED_DIRS {
-        push(&format!(":(top,literal,{icase}exclude){ex}"));
-        push(&format!(":(glob,{icase}exclude)**/{ex}/**"));
+        out.push(format!(":(top,literal,{icase}exclude){ex}"));
+        out.push(format!(":(glob,{icase}exclude)**/{ex}/**"));
     }
     out
+}
+
+fn filter_protected_nul_paths(raw: &[u8], protected: &[String]) -> Vec<u8> {
+    if protected.is_empty() || raw.is_empty() {
+        return raw.to_vec();
+    }
+    let protected_set: HashSet<String> = protected.iter().map(|p| path_key(p)).collect();
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in split_nul(raw) {
+        let rel = String::from_utf8_lossy(entry);
+        if !has_protected_prefix(&rel, &protected_set) {
+            out.extend_from_slice(entry);
+            out.push(0);
+        }
+    }
+    out
+}
+
+fn has_protected_prefix(rel: &str, protected_set: &HashSet<String>) -> bool {
+    let key = path_key(rel);
+    if protected_set.contains(&key) {
+        return true;
+    }
+    for (idx, byte) in key.bytes().enumerate() {
+        if byte == b'/' && protected_set.contains(&key[..idx]) {
+            return true;
+        }
+    }
+    false
 }
 
 fn write_if_changed(path: &Path, content: &str) -> io::Result<()> {
@@ -319,12 +361,13 @@ fn protected_relative_paths(snapshot_dir: &Path, cwd: &Path) -> io::Result<Vec<S
     for dir in dirs {
         let dir_canon = canonicalize_existing(&dir);
         let dir_key = app_core::workspace_key(&dir_canon);
-        if dir_key == cwd_key {
-            return Err(io::Error::new(ErrorKind::InvalidInput, "不能对应用数据目录自身生成或还原快照。"));
+        if app_core::workspace_key_contains(&dir_key, &cwd_key) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "不能对应用数据目录或其子目录生成或还原快照。",
+            ));
         }
-        let is_child = dir_key.strip_prefix(&cwd_key).is_some_and(|rest| rest.starts_with('/'))
-            || (cwd_key.ends_with('/') && dir_key.starts_with(&cwd_key));
-        if is_child {
+        if app_core::workspace_key_contains(&cwd_key, &dir_key) {
             let rel = dir_canon
                 .components()
                 .skip(cwd_count)
@@ -358,7 +401,13 @@ pub(super) fn is_protected_rel(rel: &str, protected_rels: &[String]) -> bool {
     matches_prefix(".git") || protected_rels.iter().any(|p| matches_prefix(p))
 }
 
-fn collect_nested_git_dirs(root: &Path, dir: &Path, protected_rels: &[String], out: &mut Vec<String>) {
+fn scan_protected_paths(
+    root: &Path,
+    dir: &Path,
+    protected_rels: &[String],
+    out: &mut Vec<String>,
+    reparse_candidates: &mut Vec<String>,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -366,7 +415,9 @@ fn collect_nested_git_dirs(root: &Path, dir: &Path, protected_rels: &[String], o
         let Ok(ft) = entry.file_type() else {
             continue;
         };
-        if !ft.is_dir() {
+        let path = entry.path();
+        let is_reparse = fs::symlink_metadata(&path).is_ok_and(|meta| is_dir_reparse_point(&meta));
+        if !is_reparse && (!ft.is_dir() || ft.is_symlink()) {
             continue;
         }
         if entry
@@ -376,7 +427,6 @@ fn collect_nested_git_dirs(root: &Path, dir: &Path, protected_rels: &[String], o
         {
             continue;
         }
-        let path = entry.path();
         let rel = path.strip_prefix(root).ok().map(|r| {
             r.components()
                 .filter_map(|c| match c {
@@ -391,37 +441,45 @@ fn collect_nested_git_dirs(root: &Path, dir: &Path, protected_rels: &[String], o
         {
             continue;
         }
-        if fs::symlink_metadata(path.join(".git")).is_ok() {
+        if is_reparse {
+            if let Some(joined) = rel
+                && !joined.is_empty()
+            {
+                reparse_candidates.push(joined);
+            }
+        } else if fs::symlink_metadata(path.join(".git")).is_ok() {
             if let Some(joined) = rel
                 && !joined.is_empty()
             {
                 out.push(joined);
             }
         } else {
-            collect_nested_git_dirs(root, &path, protected_rels, out);
+            scan_protected_paths(root, &path, protected_rels, out, reparse_candidates);
         }
     }
 }
 
-#[expect(
-    clippy::permissions_set_readonly_false,
-    reason = "Windows files carrying FILE_ATTRIBUTE_READONLY require clearing readonly before removal"
-)]
-pub(super) fn remove_file_clearing_readonly(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-            if let Ok(meta) = fs::symlink_metadata(path)
-                && !meta.file_type().is_symlink()
-                && meta.permissions().readonly()
-            {
-                let mut perms = meta.permissions();
-                perms.set_readonly(false);
-                let _ = fs::set_permissions(path, perms);
-                return fs::remove_file(path);
-            }
-            Err(err)
-        }
-        other => other,
+pub(super) fn is_dir_reparse_point(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        let attrs = meta.file_attributes();
+        (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+pub(super) fn path_key(rel: &str) -> String {
+    if cfg!(windows) {
+        rel.to_lowercase()
+    } else {
+        rel.to_owned()
     }
 }
 
@@ -474,59 +532,41 @@ pub(super) fn split_nul(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     bytes.strip_suffix(b"\0").unwrap_or(bytes).split(|b| *b == 0).filter(|s| !s.is_empty())
 }
 
-fn parse_diff_summary(status_out: &[u8], numstat_out: &[u8]) -> Vec<ChangedFile> {
-    let mut files = BTreeMap::new();
-    let mut fields = split_nul(status_out);
-    while let (Some(status_raw), Some(path_raw)) = (fields.next(), fields.next()) {
-        let status = match status_raw.first().copied() {
-            Some(b'A') => ChangedFileStatus::Added,
-            Some(b'D') => ChangedFileStatus::Deleted,
-            _ => ChangedFileStatus::Modified,
-        };
-        let path = String::from_utf8_lossy(path_raw).into_owned();
-        files.insert(path.clone(), ChangedFile { path, added: 0, deleted: 0, status });
-    }
-    let parse_count = |s: &str| s.parse::<u64>().ok().map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
-    for entry in split_nul(numstat_out) {
-        let text = String::from_utf8_lossy(entry);
-        let mut parts = text.splitn(3, '\t');
-        if let (Some(added), Some(deleted), Some(path)) = (parts.next(), parts.next(), parts.next())
-            && let Some(file) = files.get_mut(path)
-        {
-            file.added = parse_count(added);
-            file.deleted = parse_count(deleted);
+#[cfg(any(windows, test))]
+fn batch_by_arg_budget(items: &[String], budget: usize) -> Vec<&[String]> {
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    while start < items.len() {
+        let mut end = start;
+        let mut used = 0usize;
+        while end < items.len() {
+            let cost = items[end].encode_utf16().count() + 4;
+            if end > start && used + cost > budget {
+                break;
+            }
+            used += cost;
+            end += 1;
         }
+        batches.push(&items[start..end]);
+        start = end;
     }
-    files.into_values().collect()
+    batches
 }
 
-fn format_git_diff(raw: &str) -> String {
-    if raw.trim().is_empty() {
-        return "该文件当前无改动。".to_owned();
-    }
-    let lines: Vec<&str> = raw.lines().collect();
-    let first_hunk = lines.iter().position(|line| line.starts_with("@@ "));
-    let header = &lines[..first_hunk.unwrap_or(lines.len())];
-    if header
-        .iter()
-        .any(|l| (l.starts_with("Binary files ") && l.ends_with(" differ")) || *l == "GIT binary patch")
-    {
-        return "二进制文件已变更，暂不支持文本差异对比。".to_owned();
-    }
-    let Some(start) = first_hunk else {
-        return "无文本内容差异（空文件或文件模式变更）。".to_owned();
-    };
-    let hunks = &lines[start..];
-    let added = u32::try_from(hunks.iter().filter(|l| l.starts_with('+')).count()).unwrap_or(u32::MAX);
-    let deleted = u32::try_from(hunks.iter().filter(|l| l.starts_with('-')).count()).unwrap_or(u32::MAX);
-    let mut output = format!("+{added} -{deleted}\n");
-    for (index, line) in hunks.iter().enumerate() {
-        if index >= MAX_DIFF_LINES || output.len() + line.len() + 1 > MAX_DIFF_BYTES {
-            output.push_str("[Diff truncated]\n");
-            break;
+#[cfg(test)]
+mod tests {
+    use super::{REPARSE_CLASSIFY_ARG_BUDGET, batch_by_arg_budget};
+
+    #[test]
+    fn batch_by_arg_budget_splits_long_paths_under_windows_argv_limit() {
+        let long_paths: Vec<String> = (0..100).map(|i| format!("{}/{i:04}", "a".repeat(550))).collect();
+        let batches = batch_by_arg_budget(&long_paths, REPARSE_CLASSIFY_ARG_BUDGET);
+        assert!(batches.len() >= 5, "expected multiple batches, got {}", batches.len());
+        let total: usize = batches.iter().map(|b| b.len()).sum();
+        assert_eq!(total, long_paths.len());
+        for batch in batches {
+            let cost: usize = batch.iter().map(|p| p.encode_utf16().count() + 4).sum();
+            assert!(cost <= REPARSE_CLASSIFY_ARG_BUDGET || batch.len() == 1);
         }
-        output.push_str(line);
-        output.push('\n');
     }
-    output
 }

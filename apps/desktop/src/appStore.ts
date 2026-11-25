@@ -304,6 +304,10 @@ class AppStore extends SessionStore {
     this.patch({ settingsOpen })
   }
 
+  invalidateContextPreview(): void {
+    this.patch({ contextPreviewVersion: this.state.contextPreviewVersion + 1 })
+  }
+
   setSidebarWidth(sidebarWidth: number): void {
     this.saveView({ sidebarWidth: clampSidebarWidth(sidebarWidth) }, true)
   }

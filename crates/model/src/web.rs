@@ -129,21 +129,57 @@ fn web_client() -> Result<reqwest::Client, ProviderError> {
     Ok(CLIENT.get_or_init(|| client).clone())
 }
 
-fn redact_web_diagnostic(text: &str, api_key: &str) -> String {
-    let mut cleaned = if api_key.is_empty() {
-        text.to_string()
-    } else {
-        text.replace(api_key, "[redacted]")
-    };
-    let lower = cleaned.to_ascii_lowercase();
-    if let Some(pos) = lower.find("bearer ") {
-        let token_start = pos + "bearer ".len();
-        let token_end = cleaned[token_start..]
-            .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '}' | ']'))
-            .map_or(cleaned.len(), |offset| token_start + offset);
-        if token_end > token_start {
-            cleaned.replace_range(token_start..token_end, "[redacted]");
+pub(crate) fn redact_web_diagnostic(text: &str, api_key: &str) -> String {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    if !api_key.is_empty() {
+        for (start, _) in text.match_indices(api_key) {
+            spans.push((start, start + api_key.len()));
         }
     }
-    cleaned
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i + 6 < bytes.len() {
+        if bytes[i..i + 6].eq_ignore_ascii_case(b"bearer") && bytes[i + 6].is_ascii_whitespace() {
+            let word_start =
+                text[..i].chars().next_back().is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+            if word_start {
+                let mut token_start = i + 6;
+                while token_start < bytes.len() && bytes[token_start].is_ascii_whitespace() {
+                    token_start += 1;
+                }
+                let token_end = text[token_start..]
+                    .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '}' | ']' | ';'))
+                    .map_or(text.len(), |offset| token_start + offset);
+                if token_end > token_start {
+                    spans.push((token_start, token_end));
+                    i = token_end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    spans.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        if let Some((_, prev_end)) = merged.last_mut()
+            && start < *prev_end
+        {
+            *prev_end = (*prev_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end) in merged {
+        out.push_str(&text[cursor..start]);
+        out.push_str("[redacted]");
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
 }

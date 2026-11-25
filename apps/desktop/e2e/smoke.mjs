@@ -300,6 +300,9 @@ async function runFullSmoke(page, mock) {
   assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'dark')
 
   console.log('  [4/4] settings provider / web search / instructions / skills / mcp')
+  const globalInstructionsCapsule = page.getByRole('switch', { name: /全局指令/ })
+  await globalInstructionsCapsule.waitFor({ state: 'visible', timeout: 10_000 })
+  assert.equal(await globalInstructionsCapsule.locator('.capsule-tokens').count(), 0, 'global instructions should start with 0 tokens')
   await page.getByRole('button', { name: '设置' }).click()
   const settingsDialog = page.getByRole('dialog', { name: '设置' })
   await settingsDialog.getByRole('button', { name: '模型', exact: true }).click()
@@ -335,6 +338,8 @@ async function runFullSmoke(page, mock) {
   await settingsDialog.getByRole('heading', { name: /MCP/ }).first().waitFor({ state: 'visible', timeout: 10_000 })
   await settingsDialog.getByRole('button', { name: '关闭设置' }).click()
   await page.getByRole('switch', { name: /web_\*/ }).waitFor({ state: 'visible', timeout: 10_000 })
+  await globalInstructionsCapsule.locator('.capsule-tokens').waitFor({ state: 'visible', timeout: 10_000 })
+  assert.match(await globalInstructionsCapsule.getAttribute('title') ?? '', /AGENTS\.md/i)
 }
 
 async function main() {

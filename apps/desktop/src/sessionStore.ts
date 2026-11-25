@@ -49,6 +49,7 @@ export interface AppState extends PersistedView, SyncState {
   actionErrors: Readonly<Record<string, ActionError>>
   actionErrorOrigin: string | null
   settingsOpen: boolean
+  contextPreviewVersion: number
   fileTabs: readonly FileTab[]
   activeFileTab: string | null
 }
@@ -68,6 +69,7 @@ export class SessionStore {
     actionErrors: {},
     actionErrorOrigin: null,
     settingsOpen: false,
+    contextPreviewVersion: 0,
     fileTabs: [],
     activeFileTab: null,
   }
@@ -350,6 +352,11 @@ export class SessionStore {
     const patch: Partial<AppState> = { revision, modelCatalogRevision, bootstrap, session, liveSessions }
     let selectionDropped = false
     if (bootstrap !== null && bootstrap !== this.state.bootstrap) {
+      const prevWeb = this.state.bootstrap?.modelCatalog.webSearch
+      const nextWeb = bootstrap.modelCatalog.webSearch
+      if (prevWeb && (prevWeb.credentialConfigured !== nextWeb.credentialConfigured || prevWeb.baseUrl !== nextWeb.baseUrl)) {
+        patch.contextPreviewVersion = this.state.contextPreviewVersion + 1
+      }
       const pruned = pruneStaleSelection(bootstrap, { ...this.state, session, liveSessions })
       patch.liveSessions = pruned.liveSessions
       patch.session = pruned.session

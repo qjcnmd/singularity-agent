@@ -6,6 +6,7 @@ mod state;
 mod turn;
 mod view;
 
+pub(crate) use self::lifecycle::RewindCommit;
 use self::state::{ConversationState, TurnControls, TurnLifecycle};
 pub(crate) use self::turn::ContextPreview;
 

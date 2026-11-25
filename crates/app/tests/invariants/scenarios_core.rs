@@ -139,6 +139,84 @@ async fn workspace_config_and_single_instance_lock() {
         .collect();
     assert_eq!(ids, vec!["alpha-model", "beta-model"]);
 
+    let preview_before = client.rpc_ok("context.preview", json!({ "workspaceRoot": ws })).await;
+    assert!(
+        !preview_before
+            .as_array()
+            .expect("preview modules")
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_str) == Some("web")),
+        "unconfigured web search must not expose web module"
+    );
+
+    let saved_web = client
+        .rpc_ok(
+            "model.saveWebSearch",
+            json!({
+                "baseUrl": "https://search.example.com/v1",
+                "apiKey": "ws-super-secret-value"
+            }),
+        )
+        .await;
+    assert!(
+        !saved_web.to_string().contains("ws-super-secret-value"),
+        "model.saveWebSearch response must never leak apiKey"
+    );
+    assert_eq!(
+        saved_web.pointer("/catalog/webSearch/credentialConfigured").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        saved_web.pointer("/catalog/webSearch/baseUrl").and_then(Value::as_str),
+        Some("https://search.example.com/v1")
+    );
+
+    let same_origin_web = client
+        .rpc_ok("model.saveWebSearch", json!({ "baseUrl": "https://search.example.com/v2" }))
+        .await;
+    assert_eq!(
+        same_origin_web
+            .pointer("/catalog/webSearch/credentialConfigured")
+            .and_then(Value::as_bool),
+        Some(true),
+        "same-origin URL update must preserve stored web search credential"
+    );
+
+    let cross_origin_err = client
+        .rpc_err("model.saveWebSearch", json!({ "baseUrl": "https://other.example.com/v1" }))
+        .await;
+    assert!(
+        !cross_origin_err.is_empty(),
+        "changing web search origin without providing a new apiKey must be rejected"
+    );
+
+    let preview_after = client.rpc_ok("context.preview", json!({ "workspaceRoot": ws })).await;
+    assert!(
+        preview_after
+            .as_array()
+            .expect("preview modules")
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_str) == Some("web")),
+        "configured web search must expose web module in context preview"
+    );
+
+    let cleared_web = client
+        .rpc_ok("model.saveWebSearch", json!({ "baseUrl": "https://search.example.com/v2", "apiKey": "" }))
+        .await;
+    assert_eq!(
+        cleared_web.pointer("/catalog/webSearch/credentialConfigured").and_then(Value::as_bool),
+        Some(false)
+    );
+    let preview_cleared = client.rpc_ok("context.preview", json!({ "workspaceRoot": ws })).await;
+    assert!(
+        !preview_cleared
+            .as_array()
+            .expect("preview modules")
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_str) == Some("web")),
+        "clearing web search credential must hide web module"
+    );
+
     client.shutdown().await;
 }
 

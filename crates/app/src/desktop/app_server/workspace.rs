@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use protocol::{AppBootstrap, RedactedModelCatalog, RpcError, ThreadSummary, Workspace};
 
@@ -94,7 +94,9 @@ impl AppServer {
 
     pub(crate) fn skills(&self, workspace_root: &str) -> Result<protocol::SkillCatalog, RpcError> {
         let root = self.workspace(workspace_root)?.root;
-        let catalog = app_core::skills::SkillCatalog::discover(Path::new(&root), &self.home);
+        let cwd = Path::new(&root);
+        self.ensure_workspace_not_rewinding(cwd)?;
+        let catalog = app_core::skills::SkillCatalog::discover(cwd, &self.home);
         Ok(protocol::SkillCatalog {
             skills: catalog
                 .skills
@@ -116,6 +118,7 @@ impl AppServer {
     ) -> Result<Vec<protocol::ContextModule>, RpcError> {
         let root = self.workspace(workspace_root)?.root;
         let cwd = Path::new(&root);
+        self.ensure_workspace_not_rewinding(cwd)?;
         let instructions = app_core::load_agent_instructions(cwd, &self.home).map_err(RpcError::new)?;
         let skills = app_core::skills::SkillCatalog::discover(cwd, &self.home);
         let servers = self.mcp.list(cwd).map_err(RpcError::new)?;
@@ -127,7 +130,11 @@ impl AppServer {
         &self,
         workspace_root: Option<&str>,
     ) -> Result<protocol::TextDocument, RpcError> {
-        let path = self.scope_directory(workspace_root)?.join("AGENTS.md");
+        let dir = self.scope_directory(workspace_root)?;
+        if workspace_root.is_some() {
+            self.ensure_workspace_not_rewinding(&dir)?;
+        }
+        let path = dir.join("AGENTS.md");
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -144,7 +151,16 @@ impl AppServer {
         workspace_root: Option<&str>,
         content: &str,
     ) -> Result<protocol::TextDocument, RpcError> {
-        let path = self.scope_directory(workspace_root)?.join("AGENTS.md");
+        let (_lifecycle, dir) = match workspace_root {
+            Some(workspace_root) => {
+                let lifecycle = self.lock_lifecycle();
+                let dir = PathBuf::from(self.workspace(workspace_root)?.root);
+                ensure_workspace_not_rewinding(&lifecycle, &dir)?;
+                (Some(lifecycle), dir)
+            }
+            None => (None, self.home.clone()),
+        };
+        let path = dir.join("AGENTS.md");
         app_core::write_bytes_atomic(&path, content.as_bytes())
             .map_err(|error| RpcError::new(format!("{}: {error}", path.display())))?;
         Ok(protocol::TextDocument {
@@ -152,6 +168,37 @@ impl AppServer {
             content: content.to_owned(),
         })
     }
+
+    pub(crate) fn read_text_file(&self, cwd: &str, path: &str) -> Result<protocol::TextDocument, RpcError> {
+        let resolved = crate::desktop::file_view::resolve_path(cwd, path);
+        let lifecycle = self.lock_lifecycle();
+        ensure_workspace_not_rewinding(&lifecycle, Path::new(cwd))?;
+        ensure_workspace_not_rewinding(&lifecycle, &resolved)?;
+        let canonical = std::fs::canonicalize(&resolved).ok();
+        let target = if let Some(canonical) = canonical.as_deref() {
+            ensure_workspace_not_rewinding(&lifecycle, canonical)?;
+            canonical
+        } else {
+            if let Some(hint) = canonical_ancestor_hint(&resolved) {
+                ensure_workspace_not_rewinding(&lifecycle, &hint)?;
+            }
+            &resolved
+        };
+        let mut document = crate::desktop::file_view::read_text_file(target)?;
+        document.path = app_core::display_path(&resolved);
+        Ok(document)
+    }
+}
+
+fn canonical_ancestor_hint(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors().skip(1) {
+        if let Ok(canonical) = std::fs::canonicalize(ancestor)
+            && let Ok(tail) = path.strip_prefix(ancestor)
+        {
+            return Some(canonical.join(tail));
+        }
+    }
+    None
 }
 
 fn group_threads(

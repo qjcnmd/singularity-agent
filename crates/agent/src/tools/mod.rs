@@ -12,6 +12,8 @@ mod write;
 
 pub use bash::{BashTaskUpdate, BashTasks};
 pub(crate) use mcp::{call_spec as mcp_call_schema, schema_spec as mcp_schema_schema};
+#[cfg(test)]
+pub(crate) use output::format_head_bounded;
 pub(crate) use registry::{ABORTED_MESSAGE, ToolContext, ToolExecution, error_result};
 pub(crate) use registry::{
     PreparedTool, ToolRegistrySnapshot, bash_tool, edit_tool, question_tool, read_tool, task_tools,

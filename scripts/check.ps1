@@ -100,11 +100,24 @@ try {
     }
 
     if ($Scope -in @('protocol', 'all')) {
+        $generatedPath = Join-Path $repoRoot 'apps/desktop/src/protocol.generated.ts'
+        $before = if (Test-Path -LiteralPath $generatedPath) {
+            [System.IO.File]::ReadAllText($generatedPath).Replace("`r`n", "`n")
+        } else {
+            $null
+        }
         Invoke-Step 'Export TypeScript protocol bindings' {
             cargo run -p protocol --features typescript --example export_types --locked
         }
         Invoke-Step 'Verify protocol.generated.ts has no drift' {
-            git diff --ignore-cr-at-eol --exit-code -- apps/desktop/src/protocol.generated.ts
+            $after = if (Test-Path -LiteralPath $generatedPath) {
+                [System.IO.File]::ReadAllText($generatedPath).Replace("`r`n", "`n")
+            } else {
+                $null
+            }
+            if ($before -cne $after) {
+                throw 'apps/desktop/src/protocol.generated.ts drifted from crates/protocol and was updated; re-run after reviewing or updating callers.'
+            }
         }
     }
 

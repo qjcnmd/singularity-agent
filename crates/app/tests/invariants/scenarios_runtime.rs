@@ -50,6 +50,12 @@ async fn mcp_lazy_loading_and_module_gating() {
         .setup_workspace_and_provider(&ws, "local", "messages", &server.base_url, "demo", 64000, 4096)
         .await;
     client.register_test_mcp(&ws, &mcp_script).await;
+    client
+        .rpc_ok(
+            "model.saveWebSearch",
+            json!({ "baseUrl": "https://search.example.com/v1", "apiKey": "ws-test-key" }),
+        )
+        .await;
 
     let s1 = client
         .start_session(&ws, "local", "demo", None, "inspect and call mcp", vec![], vec![])
@@ -71,6 +77,10 @@ async fn mcp_lazy_loading_and_module_gating() {
         .collect();
     assert!(tool_names.contains(&"mcp_schema") && tool_names.contains(&"mcp_call"));
     assert!(
+        tool_names.contains(&"web_search") && tool_names.contains(&"web_fetch"),
+        "configured web search must expose web_search and web_fetch tools when enabled"
+    );
+    assert!(
         reqs[1].body.to_string().contains("delay_ms"),
         "mcp_schema must return full parameter schema"
     );
@@ -84,7 +94,7 @@ async fn mcp_lazy_loading_and_module_gating() {
             None,
             "run without mcp and skills",
             vec![],
-            vec!["mcp:probe", "skills"],
+            vec!["mcp:probe", "skills", "web"],
         )
         .await;
     client.wait_settled(&s2).await;
@@ -102,6 +112,10 @@ async fn mcp_lazy_loading_and_module_gating() {
     assert!(!gated_system.contains("demo-skill"));
     assert!(!gated_tools.contains(&"mcp_call"));
     assert!(!gated_tools.contains(&"skill"));
+    assert!(
+        !gated_tools.contains(&"web_search") && !gated_tools.contains(&"web_fetch"),
+        "disabling web module must hide web_search and web_fetch tools"
+    );
 
     client.shutdown().await;
 }

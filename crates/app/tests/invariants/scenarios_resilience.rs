@@ -635,12 +635,15 @@ async fn abort_delete_corruption_and_focus_invariants() {
     server.wait_for_request_count(expected_del_reqs).await;
     let del_jsonl = env.home.join("sessions").join(format!("{s_del}.jsonl"));
     let del_images = env.home.join("sessions").join("images").join(&s_del);
+    let del_snapshot = env.home.join("sessions").join("snapshots").join(format!("{s_del}.git"));
     assert!(del_jsonl.exists(), "session log must exist before delete");
+    assert!(del_snapshot.exists(), "session snapshot directory must exist before delete");
 
     client.rpc_ok("session.delete", json!({ "sessionId": s_del })).await;
     delete_gate.notify_one();
     assert!(!del_jsonl.exists(), "deleted session JSONL must be removed");
     assert!(!del_images.exists(), "deleted session images directory must be removed");
+    assert!(!del_snapshot.exists(), "deleted session snapshot directory must be removed");
 
     let focus_gate = Arc::new(Notify::new());
     server.enqueue(ScriptedResponse::sse_gated(
@@ -726,4 +729,137 @@ async fn abort_delete_corruption_and_focus_invariants() {
     let err = corrupt_client.rpc_err("app.bootstrap", json!({})).await;
     assert!(!err.is_empty(), "corrupt complete session line must surface explicit error");
     corrupt_client.shutdown().await;
+}
+
+#[tokio::test]
+async fn rewind_and_nested_workspace_isolation_invariants() {
+    let env = TestEnv::new("rewind-invariants");
+    let server = MockModelServer::start().await;
+    let ws = env.workspace_str();
+    let child_dir = env.workspace.join("child");
+    std::fs::create_dir_all(&child_dir).expect("create child workspace");
+    let tracked = child_dir.join("tracked.txt");
+    let extra = child_dir.join("extra.txt");
+    std::fs::write(&tracked, "v1\n").expect("write tracked baseline");
+    let child_ws = format!("{ws}/child");
+
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "TURN_1_BASELINE", 60, 0, 15, "end_turn")));
+    server.enqueue(ScriptedResponse::sse(messages_tools_sse(
+        None,
+        vec![
+            ("w_tracked", "write", json!({ "path": "child/tracked.txt", "content": "v2\n" })),
+            ("w_extra", "write", json!({ "path": "child/extra.txt", "content": "extra\n" })),
+        ],
+        80,
+        30,
+        "tool_use",
+    )));
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "TURN_2_MUTATED", 100, 0, 15, "end_turn")));
+
+    let mut client = BackendClient::spawn(&env.home).await;
+    client
+        .setup_workspace_and_provider(&ws, "local", "messages", &server.base_url, "demo", 64000, 4096)
+        .await;
+    client.rpc_ok("workspace.add", json!({ "root": child_ws })).await;
+
+    let s_parent = client.start_session(&ws, "local", "demo", None, "baseline turn", vec![], vec![]).await;
+    client.wait_settled(&s_parent).await;
+
+    client.submit(&s_parent, "mutate tracked files").await;
+    client.wait_settled(&s_parent).await;
+    assert_eq!(std::fs::read_to_string(&tracked).expect("read mutated file"), "v2\n");
+    assert!(extra.exists(), "extra.txt must exist after turn 2");
+
+    let before_rewind = client.rpc_ok("session.read", json!({ "sessionId": s_parent })).await;
+    let turns = before_rewind.pointer("/history/turns").and_then(Value::as_array).expect("turns");
+    assert_eq!(turns.len(), 2);
+    let turn2_id = turns[1].get("turnId").and_then(Value::as_str).expect("turn 2 id").to_string();
+    assert_eq!(turns[1].pointer("/items/0/hasSnapshot").and_then(Value::as_bool), Some(true));
+
+    let changed = client
+        .rpc_ok("session.changedFiles", json!({ "sessionId": s_parent, "turnId": turn2_id }))
+        .await;
+    let changed_paths: Vec<&str> = changed
+        .get("files")
+        .and_then(Value::as_array)
+        .expect("changed files")
+        .iter()
+        .filter_map(|f| f.get("path").and_then(Value::as_str))
+        .collect();
+    assert!(changed_paths.contains(&"child/tracked.txt"), "changedFiles: {changed_paths:?}");
+    assert!(changed_paths.contains(&"child/extra.txt"), "changedFiles: {changed_paths:?}");
+
+    let diff = client
+        .rpc_ok(
+            "session.fileDiff",
+            json!({ "sessionId": s_parent, "path": "child/tracked.txt", "turnId": turn2_id }),
+        )
+        .await;
+    let diff_out = diff.get("output").and_then(Value::as_str).unwrap_or_default();
+    assert!(diff_out.contains("-v1") && diff_out.contains("+v2"), "unexpected diff: {diff_out}");
+
+    let child_gate = Arc::new(Notify::new());
+    server.enqueue(ScriptedResponse::sse_gated(
+        messages_text_sse(None, "CHILD_DONE", 50, 0, 10, "end_turn"),
+        Arc::clone(&child_gate),
+    ));
+    let expected_reqs = server.model_requests().len() + 1;
+    let s_child = client
+        .start_session(&child_ws, "local", "demo", None, "child active work", vec![], vec![])
+        .await;
+    server.wait_for_request_count(expected_reqs).await;
+
+    let nested_busy_err = client
+        .rpc_err(
+            "session.rewind",
+            json!({ "sessionId": s_parent, "turnId": turn2_id, "restoreFiles": true }),
+        )
+        .await;
+    assert!(
+        !nested_busy_err.is_empty(),
+        "rewinding parent workspace files must be rejected while a nested child workspace session is active"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tracked).expect("read tracked after rejected rewind"),
+        "v2\n",
+        "rejected rewind must not touch workspace files"
+    );
+
+    child_gate.notify_one();
+    client.wait_settled(&s_child).await;
+
+    let rewound = client
+        .rpc_ok(
+            "session.rewind",
+            json!({ "sessionId": s_parent, "turnId": turn2_id, "restoreFiles": true }),
+        )
+        .await;
+    let rewound_turns = rewound.pointer("/history/turns").and_then(Value::as_array).expect("rewound turns");
+    assert_eq!(rewound_turns.len(), 1, "rewind must truncate turn 2 from history");
+    assert!(!rewound.to_string().contains("TURN_2_MUTATED"));
+    assert_eq!(
+        std::fs::read_to_string(&tracked).expect("read restored tracked file"),
+        "v1\n",
+        "rewind must restore modified file contents"
+    );
+    assert!(!extra.exists(), "rewind must remove files added after the target turn");
+
+    server.assert_no_protocol_violations();
+    client.shutdown().await;
+
+    let mut restarted = BackendClient::spawn(&env.home).await;
+    let after_restart = restarted.rpc_ok("session.read", json!({ "sessionId": s_parent })).await;
+    assert_eq!(
+        rewound.pointer("/history/turns"),
+        after_restart.pointer("/history/turns"),
+        "rewound session history must persist identically across restart"
+    );
+
+    let child_jsonl = env.home.join("sessions").join(format!("{s_child}.jsonl"));
+    let child_snapshot = env.home.join("sessions").join("snapshots").join(format!("{s_child}.git"));
+    assert!(child_jsonl.exists() && child_snapshot.exists(), "unopened child session files must exist");
+    restarted.rpc_ok("session.delete", json!({ "sessionId": s_child })).await;
+    assert!(!child_jsonl.exists(), "deleting unopened session must remove JSONL");
+    assert!(!child_snapshot.exists(), "deleting unopened session must remove snapshot directory");
+    restarted.shutdown().await;
 }

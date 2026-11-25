@@ -3,6 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { flushSync } from 'react-dom'
 import { ArrowDown, X } from 'lucide-react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
+import { hasDraftContent } from '../drafts'
 import type { ChangedFile } from '../protocol'
 import { type TimelineRow } from '../timeline'
 import { maxTimelineEntryOffset, TimelineItem, type RewindUserMessage } from './TimelineItem'
@@ -296,9 +297,11 @@ function RewindDialog({ sessionId, message, onClose }: {
   onClose: () => void
 }) {
   const origin = actionOrigin.inline('session.rewind', sessionId)
-  const { actionErrors, pendingActions } = useAppStore(['actionErrors', 'pendingActions'])
+  const { actionErrors, pendingActions, drafts } = useAppStore(['actionErrors', 'pendingActions', 'drafts'])
   const busy = pendingActions.has(pendingKey('session.rewind', origin))
   const failure = actionErrors[origin]
+  const currentDraft = drafts?.[sessionId]
+  const hasUnsavedDraft = currentDraft !== undefined && hasDraftContent(currentDraft)
   const [restoreFiles, setRestoreFiles] = useState(true)
   const [showFiles, setShowFiles] = useState(false)
   const [filesState, setFilesState] = useState<ChangedFilesLoad>(() =>
@@ -349,6 +352,7 @@ function RewindDialog({ sessionId, message, onClose }: {
       </header>
       <div className="confirm-body">
         <p>将撤回这条消息及之后的对话，并把原话填入底部输入框。</p>
+        {hasUnsavedDraft && <p className="rewind-note">当前输入框中未发送的草稿将被覆盖。</p>}
         {filesState.status === 'loading' && <p className="rewind-status" role="status">正在检查文件改动…</p>}
         {filesState.status === 'error' && <p className="rewind-note" role="status">无法检查文件改动（{filesState.message}），本次仅撤回对话。</p>}
         {changedFiles.length > 0 && (
