@@ -70,6 +70,7 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
       ? { ...state, status: 'connecting', error: null, tools: [] } : state))
     try {
       const result = await appStore.transport.rpc('mcp.reconnect', { serverId, workspaceRoot })
+      appStore.invalidateContextPreview()
       if (ep === epoch.current && reconnectRevisions.current.get(serverId) === version) {
         setServers(current => current.map(state => state.server.serverId === serverId ? result : state))
       }
@@ -91,6 +92,7 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
     loadRevision.current += 1
     try {
       const servers = await action()
+      appStore.invalidateContextPreview()
       if (startEpoch !== epoch.current) return false
       epoch.current += 1
       loadRevision.current += 1

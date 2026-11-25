@@ -11,6 +11,7 @@ use crate::transport::stream::decode_sse_chunks;
 use crate::types::{
     ContentBlock, Message, ModelToolCall, ModelTurnRequest, ProviderBlockMetadata, ProviderMessageMetadata,
 };
+use crate::web::redact_web_diagnostic;
 
 const OTHER_MSG_SIG: &str = "PRIVATE_OTHER_MESSAGES_SIG_DO_NOT_LEAK";
 const OTHER_RESP_ENC: &str = "PRIVATE_OTHER_RESPONSES_ENC_DO_NOT_LEAK";
@@ -439,6 +440,34 @@ proptest! {
             }
         }
         prop_assert_eq!(calls, outputs, "function_call/output mismatch");
+    }
+
+    #[test]
+    fn redact_web_diagnostic_redacts_all_bearer_tokens_and_preserves_word_boundaries(
+        tokens in prop::collection::vec("[a-zA-Z0-9._-]{6,20}", 1..=4),
+        seps in prop::collection::vec(prop_oneof![Just(" "), Just("   "), Just("\t"), Just(" \t ")], 1..=4),
+        cases in prop::collection::vec(prop_oneof![Just("Bearer"), Just("bearer"), Just("BEARER"), Just("BeArEr")], 1..=4),
+    ) {
+        let mut parts = Vec::new();
+        for i in 0..tokens.len() {
+            let kw = cases[i % cases.len()];
+            let sep = seps[i % seps.len()];
+            parts.push(format!("header=\"{kw}{sep}{}\"", tokens[i]));
+        }
+        let body = format!(
+            "standardbearer keep_me Bearer {}-suffix Bearer pre-{} {}",
+            tokens[0],
+            tokens[0],
+            parts.join(", ")
+        );
+        let redacted = redact_web_diagnostic(&body, &tokens[0]);
+        for tok in &tokens {
+            prop_assert!(!redacted.contains(tok), "leaked bearer token `{tok}` in `{redacted}`");
+        }
+        prop_assert!(!redacted.contains("-suffix"), "leaked bearer suffix in `{redacted}`");
+        prop_assert!(!redacted.contains("pre-"), "leaked bearer prefix in `{redacted}`");
+        prop_assert!(redacted.contains("standardbearer keep_me"), "word boundary broken: {redacted}");
+        prop_assert!(!redacted.contains("[redacted]]"), "double bracket corruption: {redacted}");
     }
 }
 

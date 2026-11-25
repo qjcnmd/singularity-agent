@@ -192,6 +192,7 @@ pub(crate) fn last_routed_model(session: &SessionData) -> Option<protocol::Model
 pub(super) fn latest_reply_usage<'a>(
     session: &'a SessionData,
     entries: &[&SessionEntry],
+    definition_tokens: u64,
 ) -> Option<(&'a str, &'a str, u64)> {
     let latest = session
         .entries()
@@ -203,10 +204,26 @@ pub(super) fn latest_reply_usage<'a>(
         return None;
     };
     let usage = obs.usage.as_ref()?;
-    let after = entries.iter().position(|e| e.id() == id).expect("latest assistant in active context") + 1;
+    let reply_pos = entries.iter().position(|e| e.id() == id).expect("latest assistant in active context");
     let id_pair = (obs.provider.as_str(), obs.model.as_str());
-    let tail = context_token_estimate_for(&entries[after..], session, Some(id_pair));
-    Some((id_pair.0, id_pair.1, usage.total_tokens.saturating_add(tail)))
+    let tail = context_token_estimate_for(&entries[reply_pos + 1..], session, Some(id_pair));
+    let calibrated = match session.last_reply_definition_tokens.as_ref() {
+        Some((recorded_id, prev_def)) if recorded_id == id => {
+            let adjusted = if definition_tokens >= *prev_def {
+                usage.total_tokens.saturating_add(definition_tokens - *prev_def)
+            } else {
+                usage.total_tokens.saturating_sub(*prev_def - definition_tokens).max(definition_tokens)
+            };
+            adjusted.saturating_add(tail)
+        }
+        _ => {
+            let est_prev_input = context_token_estimate_for(&entries[..reply_pos], session, Some(id_pair))
+                .saturating_add(definition_tokens);
+            let def_growth = est_prev_input.saturating_sub(usage.input_tokens);
+            usage.total_tokens.saturating_add(def_growth).saturating_add(tail)
+        }
+    };
+    Some((id_pair.0, id_pair.1, calibrated))
 }
 
 pub(crate) fn input_tokens(
@@ -215,7 +232,7 @@ pub(crate) fn input_tokens(
     identity: (&str, &str),
     definition_tokens: u64,
 ) -> u64 {
-    if let Some((provider, model, total)) = latest_reply_usage(session, entries)
+    if let Some((provider, model, total)) = latest_reply_usage(session, entries, definition_tokens)
         && (provider, model) == identity
     {
         return total;

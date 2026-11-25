@@ -35,7 +35,6 @@
 .background-task:last-child { margin-bottom: 0; }
 .background-task-head { display: flex; align-items: center; min-width: 0; padding-left: 10px; border-radius: 8px; transition: background 120ms; }
 .background-task-head:has(.activity-toggle:hover) { background: var(--soft-fill); }
-.background-task-head .activity-toggle:hover { background: none; }
 .background-task-head .activity-toggle { flex: 1; padding: 0 10px 0 3px; }
 .task-stop { display: grid; place-items: center; flex: none; width: 24px; height: 30px; padding: 0; border: 0; background: none; color: var(--ink-soft); cursor: pointer; }
 .task-stop:hover:not(:disabled) { color: var(--danger); }

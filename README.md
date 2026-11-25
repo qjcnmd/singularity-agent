@@ -10,98 +10,19 @@
 
 > Agent 继承 `Singularity.exe` 的本机权限，可以读写任意文件和运行命令；项目只用来提供上下文和分组，不限制访问范围。应用不监听网络端口，只连接你配置的模型和 MCP 服务。
 
-## crates/ 结构
+## 仓库结构
 
-单向依赖 `app → agent → {model, mcp} → {core, protocol}`。
+Rust 后端采用单向依赖 `app → agent → {model, mcp} → {app_core, protocol}`，桌面前端位于 `apps/desktop/`。完整文件清单与符号入口见[源码索引](directory.html)（单一真相源）。
 
-```
-crates/
-├── protocol/                    # RPC 契约：前后端共享的类型定义
-│   └── src/
-│       ├── lib.rs  rpc.rs  params.rs       # 方法分发与参数类型
-│       ├── app.rs                          # 会话/工作台 DTO
-│       ├── event.rs                        # 推送到前端的事件
-│       ├── background.rs  question.rs      # 后台任务、提问 DTO
-│       ├── image.rs  mcp.rs  inspection.rs # 图片、MCP、上下文检查
-│       ├── typescript.rs                   # TS 类型导出器
-│       └── examples/export_types.rs        # → protocol.generated.ts
-│
-├── core/                        # 基础设施：数据目录与项目资源
-│   └── src/
-│       ├── lib.rs                          # 原子写文件与通用工具函数
-│       ├── tool.rs                         # ToolDefinition 与 Token 估算
-│       ├── user_home.rs                    # ~/.singularity 定位
-│       ├── project_instructions.rs         # AGENTS.md 加载
-│       ├── skills.rs                       # SKILL.md 发现与全文读取
-│       └── workspace.rs                    # 项目目录规范化
-│
-├── model/                       # 模型配置与请求
-│   └── src/
-│       ├── client.rs                       # ModelClient 协议分发与 HTTP 鉴权
-│       ├── config/
-│       │   ├── manager.rs                  # config.json 读改写（隐藏密钥）
-│       │   ├── schema.rs  selection.rs     # 配置结构、ModelSelection
-│       │   ├── discovery.rs                # 模型列表查询
-│       │   └── user/mod.rs                 # 文件读写入口
-│       ├── types/                          # Message/Tool/Request/Response/reasoning
-│       ├── messages.rs + messages/stream.rs        # Messages（Anthropic 兼容 / DeepSeek）编解码
-│       ├── responses.rs + responses/stream.rs      # OpenAI Responses 编解码
-│       ├── provider.rs                     # 端点拼接、续接判断、参数解析与响应校验
-│       └── transport/                      # HTTP 客户端 + SSE 切帧器
-│
-├── mcp/                         # MCP 客户端
-│   └── src/
-│       ├── lib.rs                          # McpManager：按项目目录复用连接
-│       ├── client.rs  config.rs  result.rs
-│
-├── agent/                       # Agent 循环：上下文、工具、会话日志
-│   └── src/
-│       ├── agent/
-│       │   ├── mod.rs                      # 主循环（模型↔工具）
-│       │   ├── request.rs                  # RequestContext：每轮指令+工具定义
-│       │   ├── modules.rs                  # 上下文模块组装与预览
-│       │   ├── dispatch.rs                 # 工具并发调度（≤8）
-│       │   ├── inbox.rs                    # SteeringInbox 输入队列
-│       │   ├── questions.rs                # 提问工具
-│       │   └── compaction.rs             # 上下文压缩
-│       ├── request_execution.rs            # 模型请求执行、重试、保存
-│       ├── message.rs  image.rs
-│       ├── session/
-│       │   ├── manager.rs                  # SessionManager：日志追加写
-│       │   ├── format.rs  file.rs          # 日志格式、末尾修复
-│       │   └── context.rs                  # 从日志生成模型上下文、Token 估算
-│       └── tools/
-│           ├── mod.rs  registry.rs         # 工具注册表、参数校验
-│           ├── read.rs  edit.rs  view_image.rs
-│           ├── output.rs  question.rs  skill.rs  mcp.rs
-│           └── bash/
-│               ├── mod.rs  spec.rs         # 参数与定义
-│               ├── exec.rs  pump.rs        # 前台执行、stdout/stderr 异步泵
-│               ├── shell.rs  result.rs     # Job Object 进程树、结果构造
-│               └── tasks.rs                # BashTasks：后台任务状态
-│
-└── app/                         # 桌面后端组装层（main.rs 为 Singularity.exe 入口）
-    └── src/
-        ├── desktop.rs
-        ├── desktop/
-        │   ├── app_server.rs               # AppServer：会话生命周期
-        │   ├── app_server/{actions,workspace}.rs
-        │   ├── rpc.rs                      # 方法匹配表分发
-        │   ├── transport.rs                # stdio 帧读写
-        │   ├── workspace_store.rs          # 项目路径存储
-        │   └── file_view.rs                # 文件栏读取
-        └── runtime/
-            ├── mod.rs  history.rs          # 历史投影、用量累计
-            ├── thread_catalog.rs           # 任务列表/摘要
-            ├── conversation.rs             # Conversation：任务执行体
-            └── conversation/
-                ├── turn.rs                 # TurnControls：停止/提问
-                ├── lifecycle.rs            # 启动条件检查与执行编排
-                ├── view.rs                 # 历史读取与事件发布
-                ├── state.rs  activity.rs
-                ├── compaction.rs         # 独立压缩
-                └── background.rs           # 后台命令完成→唤醒回合
-```
+| 路径 | 职责 |
+| --- | --- |
+| `crates/protocol/` | 前后端共享 JSON-RPC 契约、事件/DTO 与 `examples/export_types.rs` TypeScript 导出器 |
+| `crates/core/` (`app_core`) | 产品身份常量、数据根目录定位、工作区路径规范化/重叠判断、分层 `AGENTS.md` 与 `SKILL.md` 加载、原子写盘与 Token 估算 |
+| `crates/model/` | `config.json` 读写脱敏、独立联网工具客户端（`web.rs`）、协议无关 `ModelClient`、SSE 切帧与 Messages / Responses 双协议编解码 |
+| `crates/mcp/` | `mcp.json` 校验与多路径凭据脱敏、按 `(directory, server)` 复用的 `McpManager` 连接池与 rmcp 客户端 |
+| `crates/agent/` | Agent 主循环、模块化上下文组装、并发工具调度、JSONL v1 会话日志、Shadow Git 每回合快照与回滚引擎、分段压缩与内置工具集（含 `bash`/`read`/`edit`/`write`/`view_image`/`web_*`/`skill`/`ask_user_question`/`mcp_*`） |
+| `crates/app/` | `Singularity.exe` 入口、滚动诊断日志、stdio JSON-RPC 传输与 `StreamHub` 事件中心、`AppServer` 会话与工作区协调、`Conversation` 状态机与后端黑盒不变量测试 |
+| `apps/desktop/` | Electron 主进程/预加载桥接、React 桌面工作台界面与 Playwright 端到端冒烟套件 |
 
 ## 文档
 
@@ -110,6 +31,7 @@ crates/
 | [安装与配置](docs/INSTALL.md) | 安装、模型和 MCP 配置、项目指令与技能、数据目录 |
 | [开发指南](docs/development.md) | 源码构建、调试、检查和打包 |
 | [架构说明](docs/architecture.md) | 运行边界、模块职责、状态由谁维护、源码导航 |
+| [源码索引](directory.html) | 完整目录树、文件职责与公开符号入口 |
 | [架构图](architecture.html) | 完整运行流程、执行顺序与分支 |
 | [已确认的取舍](docs/decisions.md) | 讨论后决定保留的设计和接受的限制 |
 

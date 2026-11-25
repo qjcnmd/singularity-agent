@@ -350,6 +350,7 @@ impl RequestContext {
                     client,
                     &self.session,
                     &request,
+                    None,
                     on_event,
                     cancellation,
                     protocol::RequestPurpose::Compaction,

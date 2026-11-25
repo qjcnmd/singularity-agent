@@ -125,6 +125,7 @@ impl RequestContext {
             &self.provider,
             &self.session,
             &request,
+            Some(overhead_tokens),
             on_event,
             cancellation,
             protocol::RequestPurpose::Generation,

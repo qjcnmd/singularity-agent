@@ -15,6 +15,7 @@ pub(super) fn parse_session_file(file: &Path) -> Result<(SessionData, Option<u64
             entries,
             session_id: header.id,
             header_timestamp: header.timestamp,
+            last_reply_definition_tokens: None,
         },
         repair,
     ))

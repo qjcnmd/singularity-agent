@@ -262,7 +262,7 @@ fn truncate_string_to_bytes_from_end(line: &str, max_bytes: usize) -> String {
     line[start..].to_string()
 }
 
-pub(super) fn format_head_bounded(content: &str, output_directory: &Path) -> String {
+pub(crate) fn format_head_bounded(content: &str, output_directory: &Path) -> String {
     let total_lines = content.lines().count();
     if total_lines <= DEFAULT_MAX_LINES && content.len() <= DEFAULT_MAX_BYTES {
         return content.to_string();

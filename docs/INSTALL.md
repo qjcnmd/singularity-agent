@@ -154,11 +154,12 @@ description: 审查代码改动并生成专业建议
 | `sessions/<id>.jsonl` | 每个任务的完整历史（当前格式为 v1），工具结果分别保存模型正文与必要的展示字段；后台命令保存纯文本输出尾部及字节范围 |
 | `sessions/images/<id>/` | 各任务中发送或读取的图片文件 |
 | `sessions/outputs/<id>/` | 各任务的完整超长工具输出 |
+| `sessions/snapshots/<id>.git/` | 各任务的 Shadow Git 裸仓库快照（用于改动文件查看、合并差异与时光机回溯） |
 | `logs/singularity.log` | 后端结构化诊断日志（单文件 5 MiB 自动滚动保留 3 份，可用 `SINGULARITY_LOG` / `RUST_LOG` 调整级别） |
 | `AGENTS.md` | 用户全局指令（可选） |
 | `skills/` | 用户级全局技能脚本与说明 |
 
-Bash 或 MCP 工具输出超限时，完整文本保存到 `sessions/outputs/<id>/`。Bash 的原始彩色输出与模型纯文本分别保存，历史记录保留路径；短输出直接保存在会话中。图片和完整输出在压缩、停止、重新打开任务后仍保留，删除任务时一并清理。备份会话时应一起复制 JSONL、图片目录和输出目录。
+Bash、MCP 或联网工具（`web_search` / `web_fetch`）输出超限时，完整文本保存到 `sessions/outputs/<id>/`。Bash 的原始彩色输出与模型纯文本分别保存，历史记录保留路径；短输出直接保存在会话中。图片、完整输出与 Shadow Git 快照在压缩、停止、重新打开任务后仍保留，删除任务时一并清理。分项备份单个会话时应一起复制 JSONL、图片目录、输出目录与快照目录（`sessions/snapshots/<id>.git/`）。
 
 ### 数据备份与升级
 - **备份**：退出所有 Singularity 进程后，直接复制整份 `.singularity` 目录即可完成备份。

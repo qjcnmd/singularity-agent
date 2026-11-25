@@ -5,10 +5,10 @@ use agent::agent::UserInput;
 use protocol::{RpcError, SessionChangedFilesResult, SessionFileDiffResult, SessionReadResult};
 
 use super::{
-    AppServer, WorkspaceRewindGuard, catalog_error, conversation_error, ensure_workspace_not_rewinding,
-    session_busy,
+    AppServer, SessionDeleteGuard, WorkspaceRewindGuard, catalog_error, conversation_error,
+    ensure_workspace_not_rewinding, session_busy,
 };
-use crate::runtime::{ContextPreview, Conversation, SnapshotTarget};
+use crate::runtime::{ContextPreview, Conversation, RewindCommit, SnapshotTarget};
 
 impl AppServer {
     pub(crate) fn image_data(&self, session_id: &str, image_id: &str) -> Result<String, RpcError> {
@@ -21,8 +21,8 @@ impl AppServer {
 
     pub(crate) fn submit(&self, params: protocol::SessionTextParams) -> Result<(), RpcError> {
         let (cwd, skill_expansion) = {
-            let _lifecycle = self.lock_lifecycle();
-            let conversation = self.open_action_conversation(&params.session_id)?;
+            let lifecycle = self.lock_lifecycle();
+            let conversation = self.open_action_conversation(&lifecycle, &params.session_id)?;
             let skill_expansion =
                 agent::agent::SkillExpansion::from_disabled_modules(&conversation.disabled_modules);
             (conversation.cwd.clone(), skill_expansion)
@@ -38,7 +38,7 @@ impl AppServer {
         )
         .map_err(RpcError::new)?;
         let lifecycle = self.lock_lifecycle();
-        let conversation = self.open_action_conversation(&params.session_id)?;
+        let conversation = self.open_action_conversation(&lifecycle, &params.session_id)?;
         ensure_workspace_not_rewinding(&lifecycle, Path::new(&conversation.cwd))?;
         conversation.start(input).map_err(conversation_error)
     }
@@ -63,8 +63,8 @@ impl AppServer {
         session_id: &str,
         apply: impl FnOnce(&Arc<Conversation>) -> Result<(), RpcError>,
     ) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
-        let conversation = self.open_action_conversation(session_id)?;
+        let lifecycle = self.lock_lifecycle();
+        let conversation = self.open_action_conversation(&lifecycle, session_id)?;
         apply(&conversation)
     }
 
@@ -82,8 +82,9 @@ impl AppServer {
             let id = session_id.to_string();
             let preview_signal = signal.clone();
             let (conversation, attempt) = tokio::task::spawn_blocking(move || {
-                let _lifecycle = app.lock_lifecycle();
-                let conversation = app.open_action_conversation(&id)?;
+                let lifecycle = app.lock_lifecycle();
+                let conversation = app.open_action_conversation(&lifecycle, &id)?;
+                ensure_workspace_not_rewinding(&lifecycle, Path::new(&conversation.cwd))?;
                 let attempt = conversation.begin_context_preview(&preview_signal);
                 Ok::<_, RpcError>((conversation, attempt))
             })
@@ -100,7 +101,10 @@ impl AppServer {
     }
 
     pub(crate) fn compact(&self, session_id: &str) -> Result<(), RpcError> {
-        self.apply_control(session_id, |conversation| conversation.compact().map_err(conversation_error))
+        let lifecycle = self.lock_lifecycle();
+        let conversation = self.open_action_conversation(&lifecycle, session_id)?;
+        ensure_workspace_not_rewinding(&lifecycle, Path::new(&conversation.cwd))?;
+        conversation.compact().map_err(conversation_error)
     }
 
     pub(crate) fn rename_session(&self, session_id: &str, name: &str) -> Result<(), RpcError> {
@@ -110,33 +114,37 @@ impl AppServer {
     pub(crate) async fn delete_session(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {
         let app = Arc::clone(self);
         let id = session_id.to_string();
-        let pending = tokio::task::spawn_blocking(move || {
-            let lifecycle = app.lock_lifecycle();
-            let Some(conversation) = app.lock_sessions().get(&id) else {
-                app.catalog.delete(&id).map_err(catalog_error)?;
-                app.hub.remove_session(&id);
-                drop(lifecycle);
-                app.publish_app_snapshot();
-                return Ok(None);
+        let (open_session, reservation) = tokio::task::spawn_blocking(move || {
+            let mut lifecycle = app.lock_lifecycle();
+            if lifecycle.is_deleting(&id) {
+                return Err(session_busy());
+            }
+            let open_session = if let Some(conversation) = app.lock_sessions().get(&id) {
+                let deletion = conversation.begin_delete().map_err(conversation_error)?;
+                Some((conversation, deletion))
+            } else {
+                None
             };
-            let deletion = conversation.begin_delete().map_err(conversation_error)?;
-            Ok(Some((conversation, deletion)))
+            let reservation = SessionDeleteGuard::reserve(&app, &mut lifecycle, &id)?;
+            Ok((open_session, reservation))
         })
         .await
         .expect("delete preparation completes while the backend is running")?;
-        let Some((conversation, deletion)) = pending else {
-            return Ok(());
-        };
-        conversation.stop().await.map_err(conversation_error)?;
+        if let Some((conversation, _)) = &open_session {
+            conversation.stop().await.map_err(conversation_error)?;
+        }
         let app = Arc::clone(self);
         let id = session_id.to_string();
         tokio::task::spawn_blocking(move || {
+            app.catalog.delete(&id).map_err(catalog_error)?;
             {
-                let _lifecycle = app.lock_lifecycle();
-                app.catalog.delete(&id).map_err(catalog_error)?;
-                app.lock_sessions().remove(&id);
+                let mut lifecycle = app.lock_lifecycle();
+                if let Some((_, deletion)) = open_session {
+                    app.lock_sessions().remove(&id);
+                    deletion.complete();
+                }
                 app.hub.remove_session(&id);
-                deletion.complete();
+                reservation.release_locked(&mut lifecycle);
             }
             app.publish_app_snapshot();
             Ok(())
@@ -163,8 +171,8 @@ impl AppServer {
         let app = Arc::clone(self);
         let id = session_id.to_owned();
         let tasks = tokio::task::spawn_blocking(move || {
-            let _lifecycle = app.lock_lifecycle();
-            Ok::<_, RpcError>(Arc::clone(app.open_action_conversation(&id)?.bash_tasks()))
+            let lifecycle = app.lock_lifecycle();
+            Ok::<_, RpcError>(Arc::clone(app.open_action_conversation(&lifecycle, &id)?.bash_tasks()))
         })
         .await
         .expect("background task lookup completes while the backend is running")?;
@@ -214,16 +222,19 @@ impl AppServer {
         let app = Arc::clone(self);
         let id = session_id.to_owned();
         let target_turn_id = turn_id.to_owned();
-        let (conversation, guard, plan, _workspace_guard) = tokio::task::spawn_blocking(move || {
+        let (conversation, workspace_guard, mut guard, plan) = tokio::task::spawn_blocking(move || {
             let mut lifecycle = app.lock_lifecycle();
-            let conversation = app.open_action_conversation(&id)?;
+            let conversation = app.open_action_conversation(&lifecycle, &id)?;
             let cwd = Path::new(&conversation.cwd);
             if restore_files {
                 ensure_workspace_not_rewinding(&lifecycle, cwd)?;
                 let target_key = app_core::workspace_key(cwd);
                 let sibling_busy = app.lock_sessions().conversations().any(|(other_id, other)| {
                     other_id != id
-                        && app_core::workspace_key(Path::new(&other.cwd)) == target_key
+                        && app_core::workspace_keys_overlap(
+                            &app_core::workspace_key(Path::new(&other.cwd)),
+                            &target_key,
+                        )
                         && other.has_active_execution()
                 });
                 if sibling_busy {
@@ -238,7 +249,7 @@ impl AppServer {
                 .restore_tree
                 .is_some()
                 .then(|| WorkspaceRewindGuard::register(&app, &mut lifecycle, cwd));
-            Ok::<_, RpcError>((conversation, guard, plan, workspace_guard))
+            Ok::<_, RpcError>((conversation, workspace_guard, guard, plan))
         })
         .await
         .expect("rewind preparation completes while the runtime is running")?;
@@ -258,33 +269,57 @@ impl AppServer {
         };
 
         let target_turn_id = turn_id.to_owned();
-        let commit = tokio::task::spawn_blocking(move || conversation.commit_rewind(&target_turn_id, guard))
-            .await
-            .expect("rewind commit completes while the runtime is running");
-        match commit {
-            Ok(result) => Ok(result),
-            Err(error) => {
+        let (guard, workspace_guard, commit) = tokio::task::spawn_blocking(move || {
+            let commit = conversation.commit_rewind(&target_turn_id, &mut guard);
+            if matches!(commit, RewindCommit::Committed(_)) {
+                drop(guard);
+                drop(workspace_guard);
+                return (None, None, commit);
+            }
+            (Some(guard), workspace_guard, commit)
+        })
+        .await
+        .expect("rewind commit completes while the runtime is running");
+        let result = match commit {
+            RewindCommit::Committed(result) => result.map(|read| *read).map_err(conversation_error),
+            RewindCommit::PreCommitError(error) => {
+                let original = conversation_error(error);
                 if let Some(backup) = backup
                     && let Err(rollback_error) = tokio::task::spawn_blocking(move || backup.rollback())
                         .await
                         .expect("snapshot rollback completes while the runtime is running")
                 {
-                    tracing::warn!(error = %rollback_error, "failed to roll back workspace after rewind commit failure");
+                    tracing::warn!(
+                        error = %rollback_error,
+                        "failed to roll back workspace after rewind commit failure"
+                    );
+                    Err(RpcError::new(format!("{original}；且回滚工作区文件失败：{rollback_error}")))
+                } else {
+                    Err(original)
                 }
-                Err(conversation_error(error))
             }
-        }
+        };
+        drop(guard);
+        drop(workspace_guard);
+        result
     }
 
     fn snapshot_target(&self, session_id: &str, turn_id: Option<&str>) -> Result<SnapshotTarget, RpcError> {
-        let conversation = self.lock_sessions().get(session_id);
-        if let Some(conversation) = conversation {
+        let lifecycle = self.lock_lifecycle();
+        if lifecycle.is_deleting(session_id) {
+            return Err(session_busy());
+        }
+        if let Some(conversation) = self.lock_sessions().get(session_id) {
             if conversation.is_deleting() {
                 return Err(session_busy());
             }
+            ensure_workspace_not_rewinding(&lifecycle, Path::new(&conversation.cwd))?;
             return Ok(conversation.snapshot_target(turn_id));
         }
-        self.catalog.snapshot_target(session_id, turn_id).map_err(catalog_error)
+        drop(lifecycle);
+        let target = self.catalog.snapshot_target(session_id, turn_id).map_err(catalog_error)?;
+        self.ensure_workspace_not_rewinding(&target.cwd)?;
+        Ok(target)
     }
 }
 

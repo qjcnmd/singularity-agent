@@ -36,7 +36,7 @@
 .activity-row-time { flex: none; margin-left: auto; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
 .activity-card .content-disclosure > div { opacity: 0; transition: opacity 160ms ease; }
 .activity-card .content-disclosure.is-open > div { opacity: 1; transition: opacity 200ms ease 40ms; }
-.activity-step, .reasoning-row { display: grid; width: fit-content; max-width: min(640px, 100%); margin: 10px 0 0 -8px; border-radius: 12px; overflow: hidden; transition: background var(--disclosure-duration) var(--smooth), width var(--disclosure-duration) var(--smooth); }
+.activity-step, .reasoning-row { display: grid; width: fit-content; max-width: min(640px, 100%); margin: 10px 0 0 -8px; border-radius: 12px; overflow: hidden; }
 .tool-group-items > .activity-step:first-child { margin-top: 2px; }
 .activity-toggle { display: flex; align-items: center; gap: 7px; min-width: 0; width: 100%; min-height: 28px; padding: 0 8px; border: 0; border-radius: 8px; background: none; color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.6; text-align: left; cursor: pointer; }
 .activity-toggle[aria-disabled=true] { cursor: default; }

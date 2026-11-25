@@ -14,7 +14,7 @@ type ModuleQuery =
   | { status: 'ready'; modules: ContextModule[] }
   | { status: 'error'; error: Error }
 
-function useContextModules(workspaceRoot: string | null, connection: string, webSignature: string) {
+function useContextModules(workspaceRoot: string | null, connection: string, previewVersion: number) {
   const [query, setQuery] = useState<ModuleQuery>({ status: 'idle' })
   const [reload, setReload] = useState(0)
   useLayoutEffect(() => {
@@ -29,14 +29,14 @@ function useContextModules(workspaceRoot: string | null, connection: string, web
       error => { if (active) setQuery({ status: 'error', error: error instanceof Error ? error : new Error(String(error)) }) },
     )
     return () => { active = false }
-  }, [workspaceRoot, connection, webSignature, reload])
+  }, [workspaceRoot, connection, previewVersion, reload])
   return { query, retry: () => setReload(value => value + 1) }
 }
 
 const groupTitles: Record<ContextGroup, string> = { instructions: '指令', tools: '工具', skills: '技能', mcp: 'MCP' }
 const groupOrder: ContextGroup[] = ['instructions', 'tools', 'skills', 'mcp']
 
-const capsulesFields = ['drafts', 'bootstrap', 'connection', 'selectedWorkspaceRoot', 'pendingActions'] as const
+const capsulesFields = ['drafts', 'bootstrap', 'connection', 'selectedWorkspaceRoot', 'pendingActions', 'contextPreviewVersion'] as const
 
 function sameDisabledModules(previous: string[] | undefined, next: string[] | undefined): boolean {
   const left = previous ?? []
@@ -54,14 +54,13 @@ function sameCapsulesState(
     && Object.is(previous.bootstrap, next.bootstrap)
     && Object.is(previous.connection, next.connection)
     && Object.is(previous.pendingActions, next.pendingActions)
+    && previous.contextPreviewVersion === next.contextPreviewVersion
     && sameDisabledModules(prevModules, nextModules)
 }
 
 export const ContextCapsules = memo(function ContextCapsules() {
   const state = useAppStore(capsulesFields, sameCapsulesState)
-  const webSearch = state.bootstrap?.modelCatalog.webSearch
-  const webSignature = `${webSearch?.credentialConfigured ?? false}:${webSearch?.baseUrl ?? ''}`
-  const { query, retry } = useContextModules(state.selectedWorkspaceRoot, state.connection, webSignature)
+  const { query, retry } = useContextModules(state.selectedWorkspaceRoot, state.connection, state.contextPreviewVersion)
   const disabled = new Set(appStore.inputDraft().disabledModules)
   return <div className="context-capsules">
     <ProjectCapsule state={state} />

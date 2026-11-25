@@ -1,5 +1,4 @@
 use super::app_server::AppServer;
-use super::file_view::read_text_file;
 use protocol::{RpcError, RpcRequest};
 use serde::Serialize;
 use serde_json::value::{RawValue, to_raw_value};
@@ -27,9 +26,15 @@ async fn dispatch(
             let cwd = {
                 let app = Arc::clone(&app);
                 let workspace_root = params.workspace_root;
-                tokio::task::spawn_blocking(move || app.scope_directory(workspace_root.as_deref()))
-                    .await
-                    .expect("RPC worker completes while the backend is running")?
+                tokio::task::spawn_blocking(move || {
+                    let cwd = app.scope_directory(workspace_root.as_deref())?;
+                    if workspace_root.is_some() {
+                        app.ensure_workspace_not_rewinding(&cwd)?;
+                    }
+                    Ok::<_, RpcError>(cwd)
+                })
+                .await
+                .expect("RPC worker completes while the backend is running")?
             };
             Ok(value(app.mcp.reconnect(&params.server_id, &cwd, shutdown).await.map_err(RpcError::new)?))
         }
@@ -59,7 +64,7 @@ async fn dispatch(
         RpcRequest::InstructionsSave(params) => {
             blocking(move || app.save_instructions(params.workspace_root.as_deref(), &params.content)).await
         }
-        RpcRequest::FileRead(params) => blocking(move || read_text_file(&params.cwd, &params.path)).await,
+        RpcRequest::FileRead(params) => blocking(move || app.read_text_file(&params.cwd, &params.path)).await,
         RpcRequest::WorkspaceAdd(params) => blocking(move || app.add_workspace(&params.root)).await,
         RpcRequest::ModelRead(_) => blocking(move || Ok(app.read_models())).await,
         RpcRequest::ModelSaveProvider(params) => {

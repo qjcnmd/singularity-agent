@@ -26,6 +26,7 @@ pub struct SessionData {
     pub(super) entries: Vec<SessionEntry>,
     pub(super) session_id: String,
     pub(super) header_timestamp: String,
+    pub(super) last_reply_definition_tokens: Option<(String, u64)>,
 }
 
 impl SessionManager {
@@ -83,6 +84,7 @@ impl SessionManager {
                 entries,
                 session_id: header.id,
                 header_timestamp: header.timestamp,
+                last_reply_definition_tokens: None,
             },
             append_error: None,
         })
@@ -295,8 +297,13 @@ impl SessionManager {
 
         self.data.entries.truncate(idx);
         self.data.entries.extend(preserved);
+        self.data.last_reply_definition_tokens = None;
         self.append_error = None;
         Ok(())
+    }
+
+    pub(crate) fn record_reply_definition_tokens(&mut self, entry_id: String, definition_tokens: u64) {
+        self.data.last_reply_definition_tokens = Some((entry_id, definition_tokens));
     }
 
     pub(crate) fn append_message_with_id(
