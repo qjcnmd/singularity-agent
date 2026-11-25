@@ -29,7 +29,7 @@ description: >-
    4. **文档与规则最后**：仅用于机器无法判定的取舍或流程盲区（写入 `AGENTS.md`、`.agents/skills/dev-loop/SKILL.md` 或 `docs/decisions.md`）；若某条旧文字规则已被前三级彻底封死，一并提议删除。
 
 3. **Codex 交叉复核（`codex/gpt-6.2-sol` `high`）**：
-   将筛出的高频模式、证据提交与拟选层级写入临时 UTF-8 简报，按 `.agents/skills/dev-loop/SKILL.md` 第 3 节的标准 `codex exec` 命令调用一次无痕交叉复核，核对工作区未被改写并清理临时文件。
+   将筛出的高频模式、证据提交与拟选层级写入临时 UTF-8 简报 `$promptFile`，运行 `pwsh -File scripts/codex-review.ps1 -PromptFile $promptFile -DeletePrompt` 执行一次默认禁用 Codex 内置联网搜索的无痕交叉复核。
 
 4. **汇报拍板与验证落地（最多 2 条建议）**：
    * 用白话呈现每条建议（出现次数与来源提交、所选层级及理由、实施效果与维护代价），通过提问工具请用户决定采纳项。
