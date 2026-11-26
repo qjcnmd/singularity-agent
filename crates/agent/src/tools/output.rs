@@ -268,6 +268,9 @@ pub(crate) fn format_head_bounded(content: &str, output_directory: &Path) -> Str
         return content.to_string();
     }
     let head = truncate_head(content);
+    if !head.partial_line && head.output_lines >= total_lines {
+        return head.content;
+    }
     let spill_note = match SpillWriter::create(output_directory, content) {
         Ok(spill) => format!("Full output: {}", spill.path.display()),
         Err(error) => format!("Full output could not be saved: {error}"),

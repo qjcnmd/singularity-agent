@@ -113,34 +113,6 @@ impl SessionData {
         )
     }
 
-    pub fn snapshot_directory(&self) -> PathBuf {
-        super::session_snapshot_directory(
-            self.file.parent().expect("session has a parent directory"),
-            &self.session_id,
-        )
-    }
-
-    pub fn first_snapshot_tree(&self) -> Option<&str> {
-        self.entries.iter().find_map(|entry| match entry {
-            SessionEntry::Record {
-                record: LedgerRecord::OperationStarted { snapshot_tree: Some(tree) },
-                ..
-            } => Some(tree.as_str()),
-            _ => None,
-        })
-    }
-
-    pub fn turn_snapshot_tree(&self, turn_id: &str) -> Option<&str> {
-        self.entries.iter().find_map(|entry| match entry {
-            SessionEntry::Record {
-                id,
-                record: LedgerRecord::OperationStarted { snapshot_tree },
-                ..
-            } if id == turn_id => snapshot_tree.as_deref(),
-            _ => None,
-        })
-    }
-
     pub fn image_attachment(&self, image_id: &str) -> Result<crate::image::SavedImage> {
         let attachment = self
             .entries
@@ -232,37 +204,82 @@ impl SessionManager {
         self.append_record_with_id(super::new_entry_id(), record)
     }
 
-    pub fn append_record_with_id(&mut self, id: String, record: LedgerRecord) -> Result<String> {
+    pub(crate) fn append_record_with_id(&mut self, id: String, record: LedgerRecord) -> Result<String> {
         self.append_entry(SessionEntry::Record { id, timestamp: now_iso(), record })
     }
 
-    pub fn append_operation_started(
-        &mut self,
-        turn_id: String,
-        snapshot_tree: Option<String>,
-    ) -> Result<String> {
-        self.append_record_with_id(turn_id, LedgerRecord::OperationStarted { snapshot_tree })
+    pub fn append_operation_started(&mut self, turn_id: String) -> Result<String> {
+        self.append_record_with_id(turn_id, LedgerRecord::OperationStarted)
     }
 
-    pub fn rewind_before_turn(&mut self, turn_id: &str) -> Result<()> {
-        let idx = self
+    pub fn rewind_before_message(&mut self, message_id: &str) -> Result<()> {
+        let target_entry_id = message_id.strip_suffix(":text:0").unwrap_or(message_id);
+        let msg_idx = self
             .data
             .entries
             .iter()
             .position(|entry| {
                 matches!(
                     entry,
-                    SessionEntry::Record {
+                    SessionEntry::Message {
                         id,
-                        record: LedgerRecord::OperationStarted { .. },
+                        message: Message::User { .. },
                         ..
-                    } if id == turn_id
+                    } if id == target_entry_id
                 )
             })
-            .ok_or_else(|| SessionError::InvalidSession(format!("未找到可回溯的回合：{turn_id}")))?;
+            .ok_or_else(|| SessionError::InvalidSession(format!("未找到目标消息：{message_id}")))?;
 
-        let (kept, dropped) = self.data.entries.split_at(idx);
+        let open_turn_start = self.data.entries[..msg_idx]
+            .iter()
+            .rposition(|entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Record {
+                        record: LedgerRecord::OperationStarted | LedgerRecord::OperationFinished { .. },
+                        ..
+                    }
+                )
+            })
+            .filter(|&pos| {
+                matches!(
+                    self.data.entries[pos],
+                    SessionEntry::Record {
+                        record: LedgerRecord::OperationStarted,
+                        ..
+                    }
+                )
+            });
+
+        let (cut_idx, close_turn_id) = match open_turn_start {
+            Some(start) => {
+                let has_prior_content = self.data.entries[start + 1..msg_idx].iter().any(|entry| {
+                    matches!(entry, SessionEntry::Message { .. } | SessionEntry::Compaction { .. })
+                });
+                if has_prior_content {
+                    (msg_idx, Some(self.data.entries[start].id().to_owned()))
+                } else {
+                    (start, None)
+                }
+            }
+            None => (msg_idx, None),
+        };
+
+        let (kept, dropped) = self.data.entries.split_at(cut_idx);
         let mut preserved = Vec::new();
+        if let Some(turn_id) = close_turn_id {
+            let timestamp = kept.last().map_or_else(now_iso, |entry| entry.timestamp().to_owned());
+            preserved.push(SessionEntry::Record {
+                id: super::new_entry_id(),
+                timestamp,
+                record: LedgerRecord::OperationFinished {
+                    turn_id,
+                    outcome: protocol::TurnStatus::Completed,
+                    error: None,
+                    user_stopped: false,
+                },
+            });
+        }
         if let Some(selection) = latest_settings(dropped)
             && latest_settings(kept) != Some(selection)
         {
@@ -295,7 +312,7 @@ impl SessionManager {
         }
         app_core::write_bytes_atomic(&self.data.file, &bytes)?;
 
-        self.data.entries.truncate(idx);
+        self.data.entries.truncate(cut_idx);
         self.data.entries.extend(preserved);
         self.data.last_reply_definition_tokens = None;
         self.append_error = None;

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use protocol::{AppBootstrap, RedactedModelCatalog, RpcError, ThreadSummary, Workspace};
 
-use super::{AppServer, catalog_error, ensure_workspace_not_rewinding};
+use super::{AppServer, catalog_error};
 use crate::desktop::workspace_store::WorkspaceError;
 
 impl AppServer {
@@ -51,14 +51,14 @@ impl AppServer {
         let close = tokio::task::spawn_blocking(move || {
             let lifecycle = app.lock_lifecycle();
             let workspace = app.workspace(&workspace_root)?;
-            ensure_workspace_not_rewinding(&lifecycle, Path::new(&workspace.root))?;
             let mut sessions = app.lock_sessions();
             let belongs = |conversation: &std::sync::Arc<crate::runtime::Conversation>| {
                 app_core::same_saved_path(&conversation.cwd, &workspace.root)
             };
-            if sessions.conversations().any(|(_, conversation)| {
-                belongs(conversation) && (conversation.has_work() || conversation.is_deleting())
-            }) {
+            if sessions
+                .conversations()
+                .any(|(_, conversation)| belongs(conversation) && conversation.has_active_work())
+            {
                 return Err(RpcError::new(format!(
                     "项目 {} 仍有运行中的任务、后台命令或待处理输入。",
                     workspace.root
@@ -95,7 +95,6 @@ impl AppServer {
     pub(crate) fn skills(&self, workspace_root: &str) -> Result<protocol::SkillCatalog, RpcError> {
         let root = self.workspace(workspace_root)?.root;
         let cwd = Path::new(&root);
-        self.ensure_workspace_not_rewinding(cwd)?;
         let catalog = app_core::skills::SkillCatalog::discover(cwd, &self.home);
         Ok(protocol::SkillCatalog {
             skills: catalog
@@ -118,7 +117,6 @@ impl AppServer {
     ) -> Result<Vec<protocol::ContextModule>, RpcError> {
         let root = self.workspace(workspace_root)?.root;
         let cwd = Path::new(&root);
-        self.ensure_workspace_not_rewinding(cwd)?;
         let instructions = app_core::load_agent_instructions(cwd, &self.home).map_err(RpcError::new)?;
         let skills = app_core::skills::SkillCatalog::discover(cwd, &self.home);
         let servers = self.mcp.list(cwd).map_err(RpcError::new)?;
@@ -131,9 +129,6 @@ impl AppServer {
         workspace_root: Option<&str>,
     ) -> Result<protocol::TextDocument, RpcError> {
         let dir = self.scope_directory(workspace_root)?;
-        if workspace_root.is_some() {
-            self.ensure_workspace_not_rewinding(&dir)?;
-        }
         let path = dir.join("AGENTS.md");
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
@@ -151,14 +146,9 @@ impl AppServer {
         workspace_root: Option<&str>,
         content: &str,
     ) -> Result<protocol::TextDocument, RpcError> {
-        let (_lifecycle, dir) = match workspace_root {
-            Some(workspace_root) => {
-                let lifecycle = self.lock_lifecycle();
-                let dir = PathBuf::from(self.workspace(workspace_root)?.root);
-                ensure_workspace_not_rewinding(&lifecycle, &dir)?;
-                (Some(lifecycle), dir)
-            }
-            None => (None, self.home.clone()),
+        let dir = match workspace_root {
+            Some(workspace_root) => PathBuf::from(self.workspace(workspace_root)?.root),
+            None => self.home.clone(),
         };
         let path = dir.join("AGENTS.md");
         app_core::write_bytes_atomic(&path, content.as_bytes())
@@ -171,34 +161,10 @@ impl AppServer {
 
     pub(crate) fn read_text_file(&self, cwd: &str, path: &str) -> Result<protocol::TextDocument, RpcError> {
         let resolved = crate::desktop::file_view::resolve_path(cwd, path);
-        let lifecycle = self.lock_lifecycle();
-        ensure_workspace_not_rewinding(&lifecycle, Path::new(cwd))?;
-        ensure_workspace_not_rewinding(&lifecycle, &resolved)?;
-        let canonical = std::fs::canonicalize(&resolved).ok();
-        let target = if let Some(canonical) = canonical.as_deref() {
-            ensure_workspace_not_rewinding(&lifecycle, canonical)?;
-            canonical
-        } else {
-            if let Some(hint) = canonical_ancestor_hint(&resolved) {
-                ensure_workspace_not_rewinding(&lifecycle, &hint)?;
-            }
-            &resolved
-        };
-        let mut document = crate::desktop::file_view::read_text_file(target)?;
+        let mut document = crate::desktop::file_view::read_text_file(&resolved)?;
         document.path = app_core::display_path(&resolved);
         Ok(document)
     }
-}
-
-fn canonical_ancestor_hint(path: &Path) -> Option<PathBuf> {
-    for ancestor in path.ancestors().skip(1) {
-        if let Ok(canonical) = std::fs::canonicalize(ancestor)
-            && let Ok(tail) = path.strip_prefix(ancestor)
-        {
-            return Some(canonical.join(tail));
-        }
-    }
-    None
 }
 
 fn group_threads(

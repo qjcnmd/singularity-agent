@@ -88,5 +88,7 @@ fn execute_locked(
     app_core::write_bytes_atomic(target, content.as_bytes())
         .map_err(|error| format!("Could not write {}: {error}", args.path))?;
     let verb = if existed { "Wrote" } else { "Created" };
-    Ok(format_diff_result(verb, &args.path, &before, &content))
+    let mut execution = format_diff_result(verb, &args.path, &before, &content);
+    execution.file_created = Some(!existed);
+    Ok(execution)
 }

@@ -67,6 +67,8 @@ pub enum MessageDisplay {
         duration_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         read_source: Option<protocol::ReadSource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_created: Option<bool>,
     },
 }
 
@@ -79,10 +81,7 @@ pub enum LedgerRecord {
     ModelRequest {
         observation: protocol::RequestObservation,
     },
-    OperationStarted {
-        #[serde(rename = "snapshotTree", default, skip_serializing_if = "Option::is_none")]
-        snapshot_tree: Option<String>,
-    },
+    OperationStarted,
     OperationFinished {
         #[serde(rename = "turnId")]
         turn_id: String,

@@ -26,15 +26,9 @@ async fn dispatch(
             let cwd = {
                 let app = Arc::clone(&app);
                 let workspace_root = params.workspace_root;
-                tokio::task::spawn_blocking(move || {
-                    let cwd = app.scope_directory(workspace_root.as_deref())?;
-                    if workspace_root.is_some() {
-                        app.ensure_workspace_not_rewinding(&cwd)?;
-                    }
-                    Ok::<_, RpcError>(cwd)
-                })
-                .await
-                .expect("RPC worker completes while the backend is running")?
+                tokio::task::spawn_blocking(move || app.scope_directory(workspace_root.as_deref()))
+                    .await
+                    .expect("RPC worker completes while the backend is running")?
             };
             Ok(value(app.mcp.reconnect(&params.server_id, &cwd, shutdown).await.map_err(RpcError::new)?))
         }
@@ -123,15 +117,9 @@ async fn dispatch(
         RpcRequest::SessionUpdateSettings(params) => {
             blocking(move || app.update_settings(&params.session_id, &params.selection)).await
         }
-        RpcRequest::SessionChangedFiles(params) => {
-            blocking(move || app.changed_files(&params.session_id, params.turn_id.as_deref())).await
-        }
-        RpcRequest::SessionFileDiff(params) => {
-            blocking(move || app.file_diff(&params.session_id, &params.path, params.turn_id.as_deref())).await
-        }
-        RpcRequest::SessionRewind(params) => Ok(value(
-            app.rewind_session(&params.session_id, &params.turn_id, params.restore_files).await?,
-        )),
+        RpcRequest::SessionChangedFiles(params) => blocking(move || app.changed_files(params)).await,
+        RpcRequest::SessionFileDiff(params) => blocking(move || app.file_diff(params)).await,
+        RpcRequest::SessionRewind(params) => blocking(move || app.rewind_session(params)).await,
     }
 }
 

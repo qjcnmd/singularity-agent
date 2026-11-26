@@ -279,8 +279,9 @@ async fn connect_http(
         .map(|(name, value)| {
             let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|error| McpError::new(format!("MCP 请求头名称无效（{name}）：{error}")))?;
-            let header_value = reqwest::header::HeaderValue::from_str(value)
+            let mut header_value = reqwest::header::HeaderValue::from_str(value)
                 .map_err(|error| McpError::new(format!("MCP 请求头值无效（{name}）：{error}")))?;
+            header_value.set_sensitive(true);
             Ok((header_name, header_value))
         })
         .collect::<Result<_, McpError>>()?;

@@ -1,8 +1,8 @@
-import { useEffect, useId, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { useEffect, useId, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from 'react'
 import type { Mermaid } from 'mermaid'
 import { Check, Ellipsis, Maximize2 } from 'lucide-react'
 import { useSelectionGuard } from '../interactions'
-import { DiagramViewer } from './DiagramViewer'
+import { DiagramViewer, interceptSvgLinkClick } from './DiagramViewer'
 import { Menu } from './Menu'
 
 let loading: Promise<Mermaid> | null = null
@@ -98,6 +98,7 @@ export function MermaidDiagram({ code, fallback }: { code: string; fallback: Rea
       {/* securityLevel: 'strict' 已经清理过 SVG 里的脚本和事件属性。 */}
       <div className="mermaid-diagram" role="button" tabIndex={0} aria-label="放大查看图"
         style={{ '--diagram-min-width': `${Math.round(diagram.width * minimumScale)}px` } as CSSProperties}
+        onClickCapture={(event: MouseEvent<HTMLDivElement>) => interceptSvgLinkClick(event)}
         {...selectionGuard(open)}
         onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open() } }}
         dangerouslySetInnerHTML={{ __html: diagram.svg }} />

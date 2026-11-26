@@ -101,7 +101,6 @@ impl ConversationState {
 pub(super) enum TurnLifecycle {
     Idle,
     Running(Arc<TurnControls>),
-    Rewinding,
 }
 
 impl TurnLifecycle {
@@ -111,7 +110,7 @@ impl TurnLifecycle {
 
     pub(super) fn phase(&self) -> SessionPhase {
         match self {
-            Self::Idle | Self::Rewinding => SessionPhase::Idle,
+            Self::Idle => SessionPhase::Idle,
             Self::Running(controls) if controls.cancellation().is_cancelled() => SessionPhase::Stopping,
             Self::Running(controls) if controls.is_compacting() => SessionPhase::Compacting,
             Self::Running(_) => SessionPhase::Running,

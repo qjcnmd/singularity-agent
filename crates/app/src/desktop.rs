@@ -1,5 +1,6 @@
 mod app_server;
 mod file_view;
+mod git_diff;
 mod rpc;
 pub(crate) mod stream_hub;
 mod transport;

@@ -28,7 +28,7 @@ pub(crate) async fn read_messages_sse_stream(
     endpoint: &str,
     prefix_digest: Option<String>,
 ) -> ModelTurnResponse {
-    let mut decoder = MessagesSseDecoder::new(on_event);
+    let mut decoder = MessagesSseDecoder::new(on_event, &config.api_key);
     let result = read_sse_stream(cancellation, response, &mut decoder).await;
     decoder.finish(result, config, selection, endpoint, prefix_digest)
 }
@@ -41,7 +41,7 @@ pub(crate) fn decode_messages_events_for_test(
     endpoint: &str,
 ) -> ModelTurnResponse {
     let mut noop = |_| {};
-    let mut decoder = MessagesSseDecoder::new(&mut noop);
+    let mut decoder = MessagesSseDecoder::new(&mut noop, &config.api_key);
     let mut result = Ok(());
     for event in events {
         let bytes = serde_json::to_vec(event).expect("serialize test sse event");
@@ -121,6 +121,7 @@ struct MessagesSseDecoder<'a> {
     stop_reason: Option<String>,
     completed: bool,
     received_event: bool,
+    api_key: &'a str,
     on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send),
 }
 
@@ -178,7 +179,11 @@ impl SseStreamDecoder for MessagesSseDecoder<'_> {
                 let fields = provider_error_fields(
                     payload.get("error").filter(|error| error.is_object()).unwrap_or(&payload),
                 );
-                return Err(provider_embedded_error(&fields, "provider Messages stream returned an error"));
+                return Err(provider_embedded_error(
+                    &fields,
+                    "provider Messages stream returned an error",
+                    self.api_key,
+                ));
             }
             _ => {}
         }
@@ -192,13 +197,14 @@ impl SseStreamDecoder for MessagesSseDecoder<'_> {
 }
 
 impl<'a> MessagesSseDecoder<'a> {
-    fn new(on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send)) -> Self {
+    fn new(on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send), api_key: &'a str) -> Self {
         Self {
             blocks: BTreeMap::new(),
             usage: MessagesUsageAccumulator::default(),
             stop_reason: None,
             completed: false,
             received_event: false,
+            api_key,
             on_event,
         }
     }

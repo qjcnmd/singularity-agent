@@ -3,7 +3,6 @@ pub(crate) mod context;
 mod file;
 mod format;
 mod manager;
-pub mod snapshot;
 
 use format::Result;
 
@@ -15,7 +14,6 @@ pub use format::{
     thinking_item_id,
 };
 pub use manager::{SessionData, SessionManager, scan_session_entries};
-pub use snapshot::session_snapshot_directory;
 
 pub fn session_file_name(session_id: &str) -> String {
     format!("{session_id}.jsonl")

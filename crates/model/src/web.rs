@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{ModelErrorKind, ProviderError, bounded_provider_error_diagnostic};
+use crate::error::{ModelErrorKind, ProviderError, bounded_redacted_diagnostic};
 use crate::transport::http::{
     BoundedBodyReadError, client_builder, provider_cancelled_error, provider_future,
     provider_transport_error, read_bounded_body, transport_error_source,
@@ -85,8 +85,7 @@ impl WebSearchAccess {
         };
         if !status.is_success() {
             let detail = String::from_utf8_lossy(&bytes);
-            let sanitized = redact_web_diagnostic(detail.trim(), &self.api_key);
-            let message = bounded_provider_error_diagnostic(&sanitized);
+            let message = bounded_redacted_diagnostic(detail.trim(), &self.api_key);
             let suffix = if message.is_empty() {
                 String::new()
             } else {
@@ -127,59 +126,4 @@ fn web_client() -> Result<reqwest::Client, ProviderError> {
             )
         })?;
     Ok(CLIENT.get_or_init(|| client).clone())
-}
-
-pub(crate) fn redact_web_diagnostic(text: &str, api_key: &str) -> String {
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    if !api_key.is_empty() {
-        for (start, _) in text.match_indices(api_key) {
-            spans.push((start, start + api_key.len()));
-        }
-    }
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i + 6 < bytes.len() {
-        if bytes[i..i + 6].eq_ignore_ascii_case(b"bearer") && bytes[i + 6].is_ascii_whitespace() {
-            let word_start =
-                text[..i].chars().next_back().is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
-            if word_start {
-                let mut token_start = i + 6;
-                while token_start < bytes.len() && bytes[token_start].is_ascii_whitespace() {
-                    token_start += 1;
-                }
-                let token_end = text[token_start..]
-                    .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '}' | ']' | ';'))
-                    .map_or(text.len(), |offset| token_start + offset);
-                if token_end > token_start {
-                    spans.push((token_start, token_end));
-                    i = token_end;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-    if spans.is_empty() {
-        return text.to_string();
-    }
-    spans.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
-    for (start, end) in spans {
-        if let Some((_, prev_end)) = merged.last_mut()
-            && start < *prev_end
-        {
-            *prev_end = (*prev_end).max(end);
-        } else {
-            merged.push((start, end));
-        }
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0usize;
-    for (start, end) in merged {
-        out.push_str(&text[cursor..start]);
-        out.push_str("[redacted]");
-        cursor = end;
-    }
-    out.push_str(&text[cursor..]);
-    out
 }

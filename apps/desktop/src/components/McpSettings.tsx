@@ -16,7 +16,8 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
   const [reconnecting, setReconnecting] = useState(0)
   const [servers, setServers] = useState<McpServerState[]>([])
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [mutationError, setMutationError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<string | null>(null)
   const [editor, setEditor] = useState<McpServerInput | 'new' | null>(null)
   const [removing, setRemoving] = useState<McpServerInput | null>(null)
@@ -29,10 +30,13 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
     const version = ++loadRevision.current
     try {
       const servers = await appStore.transport.rpc('mcp.list', { workspaceRoot })
-      if (ep === epoch.current && version === loadRevision.current) setServers(servers)
+      if (ep === epoch.current && version === loadRevision.current) {
+        setLoadError(null)
+        setServers(servers)
+      }
     } catch (error) {
       if (ep === epoch.current && version === loadRevision.current) {
-        setError(error instanceof Error ? error.message : '读取 MCP 配置失败。')
+        setLoadError(error instanceof Error ? error.message : '读取 MCP 配置失败。')
       }
     } finally {
       if (ep === epoch.current && version === loadRevision.current) setLoading(false)
@@ -41,7 +45,8 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
 
   useEffect(() => {
     setLoading(true)
-    setError(null)
+    setLoadError(null)
+    setMutationError(null)
     void load()
     const revisions = reconnectRevisions.current
     return () => {
@@ -53,12 +58,12 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
 
   const hasConnecting = servers.some(server => server.status === 'connecting')
   useEffect(() => {
-    if (busy || loading || error || reconnecting > 0 || !hasConnecting) return
+    if (busy || loading || loadError || reconnecting > 0 || !hasConnecting) return
     const timer = window.setTimeout(() => {
       void load()
     }, 1000)
     return () => window.clearTimeout(timer)
-  }, [busy, loading, error, reconnecting, hasConnecting, servers, load])
+  }, [busy, loading, loadError, reconnecting, hasConnecting, servers, load])
 
   async function reconnect(serverId: string) {
     const ep = epoch.current
@@ -87,7 +92,7 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
   async function mutate(action: () => Promise<McpServerState[]>) {
     if (busy) return false
     setBusy(true)
-    setError(null)
+    setMutationError(null)
     const startEpoch = epoch.current
     loadRevision.current += 1
     try {
@@ -97,12 +102,13 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
       epoch.current += 1
       loadRevision.current += 1
       reconnectRevisions.current.clear()
+      setLoadError(null)
       setServers(servers)
       setLoading(false)
       return true
     }
     catch (error) {
-      if (startEpoch === epoch.current) setError(error instanceof Error ? error.message : '保存 MCP 配置失败。')
+      if (startEpoch === epoch.current) setMutationError(error instanceof Error ? error.message : '保存 MCP 配置失败。')
       return false
     }
     finally { setBusy(false) }
@@ -112,14 +118,17 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
     if (busy) return
     setBusy(true)
     setLoading(true)
-    setError(null)
+    setLoadError(null)
     try {
       await load()
     } finally { setBusy(false) }
   }
 
+  const closeEditor = () => { if (!busy) { setMutationError(null); setEditor(null) } }
+  const closeRemoving = () => { if (!busy) { setMutationError(null); setRemoving(null) } }
+
   return <section aria-label="MCP" aria-busy={loading}>
-    {error && editor === null && removing === null && <p role="alert" className="form-error">{error} <button type="button" className="quiet-button" disabled={busy || loading} onClick={() => void retryLoad()}>重新读取</button></p>}
+    {loadError && <p role="alert" className="form-error">{loadError} <button type="button" className="quiet-button" disabled={busy || loading} onClick={() => void retryLoad()}>重新读取</button></p>}
     <div className="sg-provider-list">
       {servers.map(result => {
         const server = result.server
@@ -140,8 +149,8 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
               <ExpandChevron expanded={open} size={15} />
             </button>
             <span className="sg-row-actions">
-              <button type="button" className="icon-button small" disabled={busy || loading} aria-label={`编辑 MCP ${server.serverId}`} title="编辑" onClick={() => { setError(null); setEditor(server) }}><Pencil size={14} strokeWidth={1.6} aria-hidden="true" /></button>
-              <button type="button" className="icon-button small danger" disabled={busy || loading} aria-label={`删除 MCP ${server.serverId}`} title="删除" onClick={() => { setError(null); setRemoving(server) }}><Trash2 size={14} strokeWidth={1.6} aria-hidden="true" /></button>
+              <button type="button" className="icon-button small" disabled={busy || loading} aria-label={`编辑 MCP ${server.serverId}`} title="编辑" onClick={() => { setMutationError(null); setEditor(server) }}><Pencil size={14} strokeWidth={1.6} aria-hidden="true" /></button>
+              <button type="button" className="icon-button small danger" disabled={busy || loading} aria-label={`删除 MCP ${server.serverId}`} title="删除" onClick={() => { setMutationError(null); setRemoving(server) }}><Trash2 size={14} strokeWidth={1.6} aria-hidden="true" /></button>
             </span>
           </div>
           <Disclosure open={open}><div id={`mcp-tools-${server.serverId}`} className="mcp-tools">
@@ -153,22 +162,25 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
           </div></Disclosure>
         </div>
       })}
-      {!loading && !error && servers.length === 0 && <p className="sg-provider-empty">尚未配置 MCP 服务器。</p>}
+      {!loading && !loadError && servers.length === 0 && <p className="sg-provider-empty">尚未配置 MCP 服务器。</p>}
     </div>
-    <button type="button" className="sg-add-card-btn" disabled={busy || loading} onClick={() => { setError(null); setEditor('new') }}><Plus size={15} strokeWidth={1.7} aria-hidden="true" />添加 MCP</button>
-    <Dialog open={editor !== null} onClose={() => { if (!busy) setEditor(null) }} labelledBy="mcp-editor-title" className="mcp-editor-modal">
-      <header className="modal-header"><h2 id="mcp-editor-title">{editor === 'new' ? '添加 MCP' : '编辑 MCP'}</h2><button type="button" className="icon-button" aria-label="关闭" disabled={busy} onClick={() => setEditor(null)}><X size={18} /></button></header>
-      {editor !== null && <McpEditor key={editor === 'new' ? 'new' : editor.serverId} server={editor === 'new' ? undefined : editor} onCancel={() => setEditor(null)} busy={busy} error={error} onSave={async server => {
+    <button type="button" className="sg-add-card-btn" disabled={busy || loading} onClick={() => { setMutationError(null); setEditor('new') }}><Plus size={15} strokeWidth={1.7} aria-hidden="true" />添加 MCP</button>
+    <Dialog open={editor !== null} onClose={closeEditor} labelledBy="mcp-editor-title" className="mcp-editor-modal">
+      <header className="modal-header"><h2 id="mcp-editor-title">{editor === 'new' ? '添加 MCP' : '编辑 MCP'}</h2><button type="button" className="icon-button" aria-label="关闭" disabled={busy} onClick={closeEditor}><X size={18} /></button></header>
+      {editor !== null && <McpEditor key={editor === 'new' ? 'new' : editor.serverId} server={editor === 'new' ? undefined : editor} onCancel={closeEditor} busy={busy} error={mutationError} onSave={async server => {
         if (editor === 'new' && servers.some(current => current.server.serverId === server.serverId)) throw new Error('该 MCP 名称已存在，请编辑已有服务器。')
-        if (await mutate(() => appStore.transport.rpc('mcp.save', { server, workspaceRoot }))) setEditor(null)
+        if (await mutate(() => appStore.transport.rpc('mcp.save', { server, workspaceRoot }))) {
+          setMutationError(null)
+          setEditor(null)
+        }
       }} />}
     </Dialog>
-    <Dialog open={removing !== null} onClose={() => { if (!busy) setRemoving(null) }} labelledBy="mcp-remove-title" className="confirm-modal">
+    <Dialog open={removing !== null} onClose={closeRemoving} labelledBy="mcp-remove-title" className="confirm-modal">
       <header className="modal-header"><h2 id="mcp-remove-title">删除 MCP</h2></header>
-      <div className="confirm-body"><p>删除“{removing?.serverId}”的配置？</p>{error && <p role="alert" className="form-error">{error}</p>}<footer>
-        <button type="button" className="secondary-button" disabled={busy} onClick={() => setRemoving(null)}>取消</button>
+      <div className="confirm-body"><p>删除“{removing?.serverId}”的配置？</p>{mutationError && <p role="alert" className="form-error">{mutationError}</p>}<footer>
+        <button type="button" className="secondary-button" disabled={busy} onClick={closeRemoving}>取消</button>
         <button type="button" className="danger-button" disabled={busy} onClick={() => {
-          if (removing) void mutate(() => appStore.transport.rpc('mcp.remove', { serverId: removing.serverId, workspaceRoot })).then(saved => { if (saved) setRemoving(null) })
+          if (removing) void mutate(() => appStore.transport.rpc('mcp.remove', { serverId: removing.serverId, workspaceRoot })).then(saved => { if (saved) { setMutationError(null); setRemoving(null) } })
         }}>删除</button>
       </footer></div>
     </Dialog>

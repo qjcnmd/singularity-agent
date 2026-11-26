@@ -16,19 +16,9 @@ type SessionActionMethod = {
 
 class AppStore extends SessionStore {
   private anchorRevision = 0
-  private readonly composerFocusListeners = new Set<() => void>()
 
   get viewportAnchorRevision(): number {
     return this.anchorRevision
-  }
-
-  onComposerFocus(listener: () => void): () => void {
-    this.composerFocusListeners.add(listener)
-    return () => { this.composerFocusListeners.delete(listener) }
-  }
-
-  focusComposer(): void {
-    for (const listener of this.composerFocusListeners) listener()
   }
 
   setDraft(text: string): void {
@@ -197,39 +187,31 @@ class AppStore extends SessionStore {
     })
   }
 
-  async rewindSession(
+  async editMessage(
     sessionId: string,
-    turnId: string,
-    restoreFiles: boolean,
-    prefill?: { text: string; images?: ImageAttachment[]; files?: string[]; annotations?: MessageAnnotation[] },
+    message: { id: string; images?: ImageAttachment[]; files?: string[]; annotations?: MessageAnnotation[] },
+    nextText: string,
   ): Promise<boolean> {
+    const hasNonText = (message.images?.length ?? 0) > 0
+      || (message.files?.length ?? 0) > 0
+      || (message.annotations?.length ?? 0) > 0
+    if (nextText.trim() === '' && !hasNonText) return false
     return this.action('session.rewind', actionOrigin.inline('session.rewind', sessionId), async () => {
-      const restoredImages = prefill?.images?.length
-        ? await Promise.all(prefill.images.map(async image =>
-            dataUrlToFile(await this.transport.rpc('session.imageRead', { sessionId, imageId: image.id }), image.name)))
+      if (!this.modelAvailable()) throw new Error('请选择模型')
+      const images = message.images?.length
+        ? await Promise.all(message.images.map(async image => ({
+            name: image.name,
+            dataUrl: await this.transport.rpc('session.imageRead', { sessionId, imageId: image.id }),
+          })))
         : []
-      const result = await this.transport.rpc('session.rewind', { sessionId, turnId, restoreFiles })
-      if (prefill) {
-        await this.drafts.load()
-        const current = this.drafts.get(sessionId)
-        await this.drafts.set(sessionId, {
-          ...current,
-          text: prefill.text,
-          images: restoredImages,
-          files: [...(prefill.files ?? [])],
-          annotations: (prefill.annotations ?? []).map(({ messageId, quote, comment }) => ({
-            id: crypto.randomUUID(),
-            messageId,
-            quote,
-            comment,
-            startOffset: 0,
-            endOffset: 0,
-            prefix: '',
-            suffix: '',
-          })),
-        })
-      }
-      this.applyRewoundSession(result)
+      const files = [...(message.files ?? [])]
+      const annotations = (message.annotations ?? []).map(({ messageId, quote, comment }) => ({ messageId, quote, comment }))
+      const rewound = await this.transport.rpc('session.rewind', {
+        sessionId,
+        messageId: message.id,
+        resubmit: { text: nextText, images, files, annotations },
+      })
+      this.applyRewoundSession(rewound)
       if (this.state.selectedSessionId === sessionId) this.setViewportAnchor(defaultAnchor())
       else this.clearSessionAnchors([sessionId])
     })
@@ -248,7 +230,7 @@ class AppStore extends SessionStore {
     const removedDrafts = sessions.map(session => session.threadId)
     return this.action('workspace.remove', actionOrigin.inline('workspace.remove', workspaceRoot), async () => {
       await this.transport.rpc('workspace.remove', { workspaceRoot })
-      this.closeSessionDiffTabs(new Set(removedDrafts))
+      this.closeWorkspaceTabs(workspaceRoot, new Set(removedDrafts))
       this.clearSessionAnchors(removedDrafts)
       this.clearQuestionDrafts(removedDrafts)
       this.saveView({ sidebarView: {
@@ -409,12 +391,21 @@ class AppStore extends SessionStore {
     const diffPath = rel || path.trim().replace(/\\/g, '/')
     const tabTitle = title ?? (diffPath.split('/').filter(Boolean).pop() ?? diffPath)
     const id = `diff:${sessionId}:${diffPath}`
+    if (this.state.settingsOpen) this.patch({ settingsOpen: false })
     this.upsertFileTab({ id, path: diffPath, cwd, title: tabTitle, mode: 'diff', sessionId, opened: 0 })
+  }
+
+  openChangedFiles(cwd: string, focusPath?: string): void {
+    if (this.state.settingsOpen) this.patch({ settingsOpen: false })
+    const id = `changes:${workspaceKey(cwd)}`
+    this.upsertFileTab({ id, path: cwd, cwd, title: '改动文件', mode: 'changes', focusPath, opened: 0 })
   }
 
   private upsertFileTab(tab: FileTab): void {
     const fileTabs = this.state.fileTabs.some(item => item.id === tab.id)
-      ? this.state.fileTabs.map(item => item.id === tab.id ? { ...item, opened: item.opened + 1 } : item)
+      ? this.state.fileTabs.map(item => item.id === tab.id
+        ? { ...item, sessionId: tab.sessionId ?? item.sessionId, focusPath: tab.focusPath, opened: item.opened + 1 }
+        : item)
       : [...this.state.fileTabs, tab]
     this.patch({ fileTabs, activeFileTab: tab.id })
   }
@@ -475,14 +466,4 @@ function resolveFileUrl(path: string, cwd: string, userHome?: string | null): { 
   } catch {
     return null
   }
-}
-
-function dataUrlToFile(dataUrl: string, name: string): File {
-  const comma = dataUrl.indexOf(',')
-  const header = comma >= 0 ? dataUrl.slice(0, comma) : ''
-  const mime = /^data:([^;]+);base64$/i.exec(header)?.[1] ?? 'image/png'
-  const binary = atob(comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl)
-  const bytes = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
-  return new File([bytes], name || 'image.png', { type: mime })
 }

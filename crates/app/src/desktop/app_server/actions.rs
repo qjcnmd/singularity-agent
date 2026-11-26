@@ -4,11 +4,9 @@ use std::sync::Arc;
 use agent::agent::UserInput;
 use protocol::{RpcError, SessionChangedFilesResult, SessionFileDiffResult, SessionReadResult};
 
-use super::{
-    AppServer, SessionDeleteGuard, WorkspaceRewindGuard, catalog_error, conversation_error,
-    ensure_workspace_not_rewinding, session_busy,
-};
-use crate::runtime::{ContextPreview, Conversation, RewindCommit, SnapshotTarget};
+use super::{AppServer, SessionDeleteGuard, catalog_error, conversation_error, session_busy};
+use crate::desktop::git_diff;
+use crate::runtime::{ContextPreview, Conversation};
 
 impl AppServer {
     pub(crate) fn image_data(&self, session_id: &str, image_id: &str) -> Result<String, RpcError> {
@@ -22,7 +20,7 @@ impl AppServer {
     pub(crate) fn submit(&self, params: protocol::SessionTextParams) -> Result<(), RpcError> {
         let (cwd, skill_expansion) = {
             let lifecycle = self.lock_lifecycle();
-            let conversation = self.open_action_conversation(&lifecycle, &params.session_id)?;
+            let conversation = self.open_workspace_conversation(&lifecycle, &params.session_id)?;
             let skill_expansion =
                 agent::agent::SkillExpansion::from_disabled_modules(&conversation.disabled_modules);
             (conversation.cwd.clone(), skill_expansion)
@@ -38,8 +36,7 @@ impl AppServer {
         )
         .map_err(RpcError::new)?;
         let lifecycle = self.lock_lifecycle();
-        let conversation = self.open_action_conversation(&lifecycle, &params.session_id)?;
-        ensure_workspace_not_rewinding(&lifecycle, Path::new(&conversation.cwd))?;
+        let conversation = self.open_workspace_conversation(&lifecycle, &params.session_id)?;
         conversation.start(input).map_err(conversation_error)
     }
 
@@ -83,8 +80,7 @@ impl AppServer {
             let preview_signal = signal.clone();
             let (conversation, attempt) = tokio::task::spawn_blocking(move || {
                 let lifecycle = app.lock_lifecycle();
-                let conversation = app.open_action_conversation(&lifecycle, &id)?;
-                ensure_workspace_not_rewinding(&lifecycle, Path::new(&conversation.cwd))?;
+                let conversation = app.open_workspace_conversation(&lifecycle, &id)?;
                 let attempt = conversation.begin_context_preview(&preview_signal);
                 Ok::<_, RpcError>((conversation, attempt))
             })
@@ -102,8 +98,7 @@ impl AppServer {
 
     pub(crate) fn compact(&self, session_id: &str) -> Result<(), RpcError> {
         let lifecycle = self.lock_lifecycle();
-        let conversation = self.open_action_conversation(&lifecycle, session_id)?;
-        ensure_workspace_not_rewinding(&lifecycle, Path::new(&conversation.cwd))?;
+        let conversation = self.open_workspace_conversation(&lifecycle, session_id)?;
         conversation.compact().map_err(conversation_error)
     }
 
@@ -181,130 +176,72 @@ impl AppServer {
 
     pub(crate) fn changed_files(
         &self,
-        session_id: &str,
-        turn_id: Option<&str>,
+        params: protocol::SessionChangedFilesParams,
     ) -> Result<SessionChangedFilesResult, RpcError> {
-        let target = self.snapshot_target(session_id, turn_id)?;
-        let Some(base_tree) = target.base_tree else {
-            return Ok(SessionChangedFilesResult { files: Vec::new() });
-        };
-        let files = agent::session::snapshot::diff_summary(&target.snapshot_dir, &target.cwd, &base_tree)
-            .map_err(RpcError::new)?;
+        let cwd = self.resolve_diff_cwd(params.session_id.as_deref(), params.workspace_root.as_deref())?;
+        let files = git_diff::changed_files(&cwd, params.include_diffs).map_err(RpcError::new)?;
         Ok(SessionChangedFilesResult { files })
     }
 
     pub(crate) fn file_diff(
         &self,
-        session_id: &str,
-        path: &str,
-        turn_id: Option<&str>,
+        params: protocol::SessionFileDiffParams,
     ) -> Result<SessionFileDiffResult, RpcError> {
-        let target = self.snapshot_target(session_id, turn_id)?;
-        let Some(base_tree) = target.base_tree else {
-            return Ok(SessionFileDiffResult {
-                path: path.to_owned(),
-                output: "当前任务暂无文件快照。".into(),
-            });
-        };
-        let rel_path = snapshot_relative_path(&target.cwd, path)?;
-        let output =
-            agent::session::snapshot::file_diff(&target.snapshot_dir, &target.cwd, &base_tree, &rel_path)
-                .map_err(RpcError::new)?;
+        let cwd = self.resolve_diff_cwd(params.session_id.as_deref(), params.workspace_root.as_deref())?;
+        let rel_path = workspace_relative_path(&cwd, &params.path)?;
+        let output = git_diff::file_diff(&cwd, &rel_path).map_err(RpcError::new)?;
         Ok(SessionFileDiffResult { path: rel_path, output })
     }
 
-    pub(crate) async fn rewind_session(
-        self: &Arc<Self>,
-        session_id: &str,
-        turn_id: &str,
-        restore_files: bool,
+    pub(crate) fn rewind_session(
+        &self,
+        params: protocol::SessionRewindParams,
     ) -> Result<SessionReadResult, RpcError> {
-        let app = Arc::clone(self);
-        let id = session_id.to_owned();
-        let target_turn_id = turn_id.to_owned();
-        let (conversation, workspace_guard, mut guard, plan) = tokio::task::spawn_blocking(move || {
-            let mut lifecycle = app.lock_lifecycle();
-            let conversation = app.open_action_conversation(&lifecycle, &id)?;
-            let cwd = Path::new(&conversation.cwd);
-            if restore_files {
-                ensure_workspace_not_rewinding(&lifecycle, cwd)?;
-                let target_key = app_core::workspace_key(cwd);
-                let sibling_busy = app.lock_sessions().conversations().any(|(other_id, other)| {
-                    other_id != id
-                        && app_core::workspace_keys_overlap(
-                            &app_core::workspace_key(Path::new(&other.cwd)),
-                            &target_key,
-                        )
-                        && other.has_active_execution()
-                });
-                if sibling_busy {
-                    return Err(RpcError::new(
-                        "当前项目还有其他正在运行的任务或后台命令，请等待结束后再还原文件。",
-                    ));
-                }
-            }
-            let (guard, plan) =
-                conversation.begin_rewind(&target_turn_id, restore_files).map_err(conversation_error)?;
-            let workspace_guard = plan
-                .restore_tree
-                .is_some()
-                .then(|| WorkspaceRewindGuard::register(&app, &mut lifecycle, cwd));
-            Ok::<_, RpcError>((conversation, workspace_guard, guard, plan))
-        })
-        .await
-        .expect("rewind preparation completes while the runtime is running")?;
-
-        let backup = if let Some(target_tree) = plan.restore_tree {
-            let snapshot_dir = plan.snapshot_dir.clone();
-            let cwd = plan.cwd.clone();
-            let backup = tokio::task::spawn_blocking(move || {
-                agent::session::snapshot::restore(&snapshot_dir, &cwd, &target_tree)
-            })
-            .await
-            .expect("snapshot restore completes while the runtime is running")
+        let resubmit = if let Some(input) = params.resubmit {
+            let conversation = {
+                let lifecycle = self.lock_lifecycle();
+                self.open_workspace_conversation(&lifecycle, &params.session_id)?
+            };
+            let skill_expansion =
+                agent::agent::SkillExpansion::from_disabled_modules(&conversation.disabled_modules);
+            let parsed_input = UserInput::from_uploads(
+                input.text,
+                input.images,
+                input.files,
+                input.annotations,
+                Path::new(&conversation.cwd),
+                &self.home,
+                skill_expansion,
+            )
             .map_err(RpcError::new)?;
-            Some(backup)
+            let (selection, context) = conversation.prepare_resubmit_context().map_err(conversation_error)?;
+            Some((parsed_input, selection, context))
         } else {
             None
         };
-
-        let target_turn_id = turn_id.to_owned();
-        let (guard, workspace_guard, commit) = tokio::task::spawn_blocking(move || {
-            let commit = conversation.commit_rewind(&target_turn_id, &mut guard);
-            if matches!(commit, RewindCommit::Committed(_)) {
-                drop(guard);
-                drop(workspace_guard);
-                return (None, None, commit);
-            }
-            (Some(guard), workspace_guard, commit)
-        })
-        .await
-        .expect("rewind commit completes while the runtime is running");
-        let result = match commit {
-            RewindCommit::Committed(result) => result.map(|read| *read).map_err(conversation_error),
-            RewindCommit::PreCommitError(error) => {
-                let original = conversation_error(error);
-                if let Some(backup) = backup
-                    && let Err(rollback_error) = tokio::task::spawn_blocking(move || backup.rollback())
-                        .await
-                        .expect("snapshot rollback completes while the runtime is running")
-                {
-                    tracing::warn!(
-                        error = %rollback_error,
-                        "failed to roll back workspace after rewind commit failure"
-                    );
-                    Err(RpcError::new(format!("{original}；且回滚工作区文件失败：{rollback_error}")))
-                } else {
-                    Err(original)
-                }
-            }
-        };
-        drop(guard);
-        drop(workspace_guard);
-        result
+        let lifecycle = self.lock_lifecycle();
+        let conversation = self.open_workspace_conversation(&lifecycle, &params.session_id)?;
+        conversation
+            .rewind(&params.message_id, resubmit)
+            .map(|read| *read)
+            .map_err(conversation_error)
     }
 
-    fn snapshot_target(&self, session_id: &str, turn_id: Option<&str>) -> Result<SnapshotTarget, RpcError> {
+    fn resolve_diff_cwd(
+        &self,
+        session_id: Option<&str>,
+        workspace_root: Option<&str>,
+    ) -> Result<PathBuf, RpcError> {
+        if let Some(root) = workspace_root {
+            return Ok(PathBuf::from(self.workspace(root)?.root));
+        }
+        if let Some(id) = session_id {
+            return self.session_cwd(id);
+        }
+        Err(RpcError::new("缺少项目路径或会话标识。"))
+    }
+
+    fn session_cwd(&self, session_id: &str) -> Result<PathBuf, RpcError> {
         let lifecycle = self.lock_lifecycle();
         if lifecycle.is_deleting(session_id) {
             return Err(session_busy());
@@ -313,17 +250,14 @@ impl AppServer {
             if conversation.is_deleting() {
                 return Err(session_busy());
             }
-            ensure_workspace_not_rewinding(&lifecycle, Path::new(&conversation.cwd))?;
-            return Ok(conversation.snapshot_target(turn_id));
+            return Ok(PathBuf::from(&conversation.cwd));
         }
         drop(lifecycle);
-        let target = self.catalog.snapshot_target(session_id, turn_id).map_err(catalog_error)?;
-        self.ensure_workspace_not_rewinding(&target.cwd)?;
-        Ok(target)
+        self.catalog.session_cwd(session_id).map_err(catalog_error)
     }
 }
 
-fn snapshot_relative_path(cwd: &Path, requested: &str) -> Result<String, RpcError> {
+fn workspace_relative_path(cwd: &Path, requested: &str) -> Result<String, RpcError> {
     let trimmed = requested.trim();
     let target_path = Path::new(trimmed);
     let relative = if target_path.is_absolute() {

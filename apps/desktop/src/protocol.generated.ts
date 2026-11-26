@@ -8,7 +8,7 @@ export type BackgroundTaskState = { "status": "running" } | { "status": "exited"
 
 export type BackgroundTaskUpdate = { phase: SessionPhase, task: VisibleBackgroundTask, };
 
-export type ChangedFile = { path: string, added: number, deleted: number, status: ChangedFileStatus, };
+export type ChangedFile = { path: string, added: number, deleted: number, status: ChangedFileStatus, diff?: string, };
 
 export type ChangedFileStatus = "added" | "modified" | "deleted";
 
@@ -26,7 +26,7 @@ export type EmptyParams = Record<string, never>;
 
 export type FileReadParams = { cwd: string, path: string, };
 
-export type HistoryItem = { "type": "message", id: string, status: TurnStatus, role: HistoryMessageRole, text: string, at?: string, stats?: SessionModelUsage, images?: Array<ImageAttachment>, files?: Array<string>, annotations?: Array<MessageAnnotation>, turnId?: string, hasSnapshot?: boolean, } | { "type": "thinking", id: string, status: TurnStatus, text: string, } | { "type": "tool", id: string, status: ToolStatus, name: string, args: JsonValue, result: ToolResult | null, } | { "type": "compaction", id: string, summary: string, } | { "type": "compaction_result", id: string, status: TurnStatus, message: string | null, };
+export type HistoryItem = { "type": "message", id: string, status: TurnStatus, role: HistoryMessageRole, text: string, at?: string, stats?: SessionModelUsage, images?: Array<ImageAttachment>, files?: Array<string>, annotations?: Array<MessageAnnotation>, } | { "type": "thinking", id: string, status: TurnStatus, text: string, } | { "type": "tool", id: string, status: ToolStatus, name: string, args: JsonValue, result: ToolResult | null, } | { "type": "compaction", id: string, summary: string, } | { "type": "compaction_result", id: string, status: TurnStatus, message: string | null, };
 
 export type HistoryMessageRole = "user" | "assistant";
 
@@ -92,13 +92,13 @@ export type RpcError = { message: string, };
 
 export type RpcResponse = { "type": "success", result: JsonValue, } | { "type": "error", error: RpcError, };
 
-export type SessionChangedFilesParams = { sessionId: string, turnId?: string | null, };
+export type SessionChangedFilesParams = { sessionId?: string, workspaceRoot?: string, includeDiffs?: boolean, };
 
 export type SessionChangedFilesResult = { files: Array<ChangedFile>, };
 
 export type SessionFailure = { source: SessionOperation, error: TurnErrorDetail, };
 
-export type SessionFileDiffParams = { sessionId: string, path: string, turnId?: string | null, };
+export type SessionFileDiffParams = { sessionId?: string, workspaceRoot?: string, path: string, };
 
 export type SessionFileDiffResult = { path: string, output: string, };
 
@@ -122,7 +122,9 @@ export type SessionReadResult = { revision: number, history: ThreadHistory, runt
 
 export type SessionRenameParams = { sessionId: string, name: string, };
 
-export type SessionRewindParams = { sessionId: string, turnId: string, restoreFiles: boolean, };
+export type SessionRewindInput = { text: string, images: Array<ImageUpload>, files: Array<string>, annotations?: Array<MessageAnnotation>, };
+
+export type SessionRewindParams = { sessionId: string, messageId: string, resubmit?: SessionRewindInput, };
 
 export type SessionRuntime = { phase: SessionPhase, selection: ModelSelection, contextUsage: ContextUsage | null, pendingQuestion: PendingQuestion | null, pendingMessages: Array<PendingUserMessage>, failure: SessionFailure | null, };
 
@@ -148,7 +150,7 @@ export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, 
 
 export type ThreadTurn = { startedAt: string, finishedAt?: string, firstTokenAt?: string, turnId: string, status: TurnStatus, manuallyStopped: boolean, error?: TurnErrorDetail, items: Array<HistoryItem>, stats?: SessionModelUsage, };
 
-export type ToolResult = { output: string, backgroundTaskId?: string, images?: Array<ImageAttachment>, readSource?: ReadSource, isError: boolean, durationMs?: number, };
+export type ToolResult = { output: string, backgroundTaskId?: string, images?: Array<ImageAttachment>, readSource?: ReadSource, fileCreated?: boolean, isError: boolean, durationMs?: number, };
 
 export type ToolStatus = "pending" | "running" | "completed" | "failed" | "interrupted";
 

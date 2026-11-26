@@ -43,7 +43,11 @@ pub fn public_items(
             Some(match block {
                 ContentBlock::Text { text, .. } => {
                     let text = user_text_for_display(display, index, text);
-                    if text.is_empty()
+                    let empty = match role {
+                        protocol::HistoryMessageRole::Assistant => text.trim().is_empty(),
+                        protocol::HistoryMessageRole::User => text.is_empty(),
+                    };
+                    if empty
                         && (text_index != 0
                             || (images.is_empty() && files.is_empty() && annotations.is_empty()))
                     {
@@ -61,8 +65,6 @@ pub fn public_items(
                         images: std::mem::take(&mut images),
                         files: std::mem::take(&mut files),
                         annotations: std::mem::take(&mut annotations),
-                        turn_id: None,
-                        has_snapshot: false,
                     }
                 }
                 ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
@@ -110,12 +112,14 @@ pub(crate) fn tool_result_message(
     let display = (output.is_some()
         || background_task_id.is_some()
         || execution.duration_ms.is_some()
-        || execution.read_source.is_some())
+        || execution.read_source.is_some()
+        || execution.file_created.is_some())
     .then_some(MessageDisplay::Tool {
         output,
         background_task_id,
         duration_ms: execution.duration_ms,
         read_source: execution.read_source,
+        file_created: execution.file_created,
     });
     let message = Message::ToolResult {
         content,
@@ -132,19 +136,21 @@ pub fn public_tool_result(
     let Message::ToolResult { is_error, .. } = message else {
         return None;
     };
-    let (output, background_task_id, duration_ms, read_source) = match display {
+    let (output, background_task_id, duration_ms, read_source, file_created) = match display {
         Some(MessageDisplay::Tool {
             output,
             background_task_id,
             duration_ms,
             read_source,
+            file_created,
         }) => (
             output.clone().unwrap_or_else(|| message.content_text()),
             background_task_id.clone(),
             *duration_ms,
             *read_source,
+            *file_created,
         ),
-        _ => (message.content_text(), None, None, None),
+        _ => (message.content_text(), None, None, None, None),
     };
     Some(protocol::ToolResult {
         output,
@@ -153,5 +159,6 @@ pub fn public_tool_result(
         is_error: *is_error,
         duration_ms,
         read_source,
+        file_created,
     })
 }

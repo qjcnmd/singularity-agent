@@ -7,7 +7,9 @@ export type ToolGroup = { type: 'tool_group'; name: string; rows: Array<{ key: s
 type TurnDurationInfo = { startedAt: string; firstTokenAt?: string; finishedAt?: string }
 type TerminalItem = { type: 'terminal'; status: 'failed' | 'interrupted'; text: string; at?: string }
 type TypingItem = { type: 'typing' }
-type TurnStatsItem = { type: 'stats'; stats: SessionModelUsage; at?: string }
+type TurnStatsItem = { type: 'stats'; stats?: SessionModelUsage; at?: string }
+export type TurnFileEdit = { path: string; added: number; deleted: number; created: boolean }
+export type TurnChangesItem = { type: 'turn_changes'; edits: TurnFileEdit[] }
 export type ActivityRowItem =
   | Extract<HistoryItem, { type: 'thinking' | 'tool' | 'compaction' | 'compaction_result' }>
   | ToolGroup
@@ -23,6 +25,7 @@ type TimelineContent = HistoryItem | ToolGroup | ActivityGroup
   | ({ type: 'duration' } & TurnDurationInfo)
   | TerminalItem
   | TypingItem
+  | TurnChangesItem
   | TurnStatsItem
   | { type: 'question'; request: PendingQuestion; duration?: TurnDurationInfo }
 
@@ -149,16 +152,55 @@ function hasModelStats(stats: SessionModelUsage | undefined): stats is SessionMo
   return stats !== undefined && (stats.ttftRequests > 0 || stats.decodeMs > 0 || stats.usagePresent)
 }
 
+function extractTurnEdits(items: HistoryItem[]): TurnFileEdit[] {
+  const edits: TurnFileEdit[] = []
+  for (const item of items) {
+    if (item.type !== 'tool' || (item.name !== 'edit' && item.name !== 'write')) continue
+    if (item.status !== 'completed' || item.result?.isError) continue
+    const args = item.args
+    const rawPath = typeof args === 'object' && args !== null && !Array.isArray(args) && typeof args.path === 'string'
+      ? args.path.trim()
+      : ''
+    if (!rawPath) continue
+    const output = item.result?.output ?? ''
+    const firstNewline = output.indexOf('\n')
+    const summaryLine = firstNewline >= 0 ? output.slice(0, firstNewline) : output
+    const counts = /^\+(\d+) -(\d+)$/.exec(summaryLine)
+    const added = counts ? Number(counts[1]) : 0
+    const deleted = counts ? Number(counts[2]) : 0
+    const body = firstNewline >= 0 ? output.slice(firstNewline + 1) : ''
+    const fileCreated = item.result?.fileCreated
+    const created = fileCreated === true
+      || (fileCreated === undefined && item.name === 'write' && deleted === 0 && body.startsWith('@@ -0,0 +'))
+    if (!created && added === 0 && deleted === 0) continue
+    edits.push({ path: rawPath, added, deleted, created })
+  }
+  return edits
+}
+
 function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): RawTimelineRow[] {
-  const items = mergeAdjacentThinking(turn.items)
+  const items = mergeAdjacentThinking(turn.items).filter(item =>
+    !(item.type === 'message'
+      && item.role === 'assistant'
+      && item.text.trim() === ''
+      && !item.images?.length
+      && !item.files?.length
+      && item.status !== 'failed'),
+  )
+  const turnEdits = turn.status !== 'running' ? extractTurnEdits(turn.items) : []
+  const hasTurnChanges = turnEdits.length > 0
   const lastStepIndex = items.findLastIndex(item => item.type !== 'compaction' && item.type !== 'compaction_result')
   const lastStep = lastStepIndex >= 0 ? items[lastStepIndex] : undefined
-  const hasFinalAssistantStats = lastStep?.type === 'message' && lastStep.role === 'assistant' && hasModelStats(lastStep.stats)
+  const lastAssistant = lastStep?.type === 'message' && lastStep.role === 'assistant' ? lastStep : undefined
+  const keepAssistantStatsInline = !hasTurnChanges && hasModelStats(lastAssistant?.stats)
   const result: RawTimelineRow[] = items.map((item, index) => ({
     key: item.type === 'compaction' || item.type === 'compaction_result'
       ? `compaction:${item.id}` : `content:${turn.turnId}:${item.id}`,
     stable: !('status' in item) || item.status !== 'running' || item.type === 'tool',
-    item: item.type === 'message' && item.role === 'assistant' && index < lastStepIndex && (item.stats !== undefined || item.at !== undefined)
+    item: item.type === 'message'
+      && item.role === 'assistant'
+      && (index < lastStepIndex || hasTurnChanges)
+      && (item.stats !== undefined || item.at !== undefined)
       ? { ...item, stats: undefined, at: undefined } : item,
   }))
   if (turn.finishedAt || (turn.status === 'running' && turn.firstTokenAt)) {
@@ -178,10 +220,18 @@ function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): RawTimelineRow
     result.push({ key: `content:${turn.turnId}:terminal`, stable: true,
       item: { type: 'terminal', status: 'failed', text: turn.error?.message ?? '执行失败', at: turn.finishedAt } })
   }
-  if (turn.status !== 'running' && !hasFinalAssistantStats && hasModelStats(turn.stats)) {
+  if (hasTurnChanges) {
+    result.push({
+      key: `content:${turn.turnId}:changes`, stable: true,
+      item: { type: 'turn_changes', edits: turnEdits },
+    })
+  }
+  const trailingStats = hasModelStats(lastAssistant?.stats) ? lastAssistant.stats : hasModelStats(turn.stats) ? turn.stats : undefined
+  const trailingAt = lastAssistant?.at ?? turn.finishedAt
+  if (turn.status !== 'running' && !keepAssistantStatsInline && (trailingStats !== undefined || (hasTurnChanges && trailingAt !== undefined))) {
     result.push({
       key: `content:${turn.turnId}:stats`, stable: true,
-      item: { type: 'stats', stats: turn.stats, at: turn.finishedAt },
+      item: { type: 'stats', stats: trailingStats, at: trailingAt },
     })
   }
   return groupAdjacentTools(result)

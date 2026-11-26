@@ -27,7 +27,10 @@ impl Conversation {
             }
         };
         let retain_tokens = retention_budget_tokens(requests.model_configuration());
-        let Some(input) = CompactionInput::select(&self.writer, retain_tokens).await else {
+        let identity = requests.model_identity();
+        let Some(input) =
+            CompactionInput::select(&self.writer, retain_tokens, identity.clone(), identity).await
+        else {
             controls.finish_cancel();
             return Ok(compaction_unneeded(sink, controls.cancellation()));
         };

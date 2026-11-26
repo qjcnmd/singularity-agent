@@ -6,7 +6,6 @@ mod state;
 mod turn;
 mod view;
 
-pub(crate) use self::lifecycle::RewindCommit;
 use self::state::{ConversationState, TurnControls, TurnLifecycle};
 pub(crate) use self::turn::ContextPreview;
 
@@ -36,6 +35,7 @@ pub(crate) struct Conversation {
 struct Operation {
     source: protocol::SessionOperation,
     controls: Arc<TurnControls>,
+    prepared_context: Option<Box<agent::agent::RequestContext>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -119,13 +119,9 @@ impl Conversation {
         self.lock_state().model.clone()
     }
 
-    pub(crate) fn has_work(&self) -> bool {
-        self.lock_state().has_work(&self.bash_tasks)
-    }
-
-    pub(crate) fn has_active_execution(&self) -> bool {
+    pub(crate) fn has_active_work(&self) -> bool {
         let state = self.lock_state();
-        state.closing || state.turn.is_busy() || self.bash_tasks.is_busy() || state.has_active_inbox()
+        state.closing || state.has_work(&self.bash_tasks)
     }
 
     pub(crate) fn can_evict(&self) -> bool {
@@ -190,20 +186,12 @@ impl Conversation {
         Ok(())
     }
 
-    pub(crate) fn snapshot_target(&self, turn_id: Option<&str>) -> crate::runtime::SnapshotTarget {
-        let writer = lock_writer(&self.writer);
-        crate::runtime::snapshot_target(writer.data(), turn_id)
-    }
-
     pub(crate) fn rename(&self, name: &str) -> Result<(), ConversationError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(ConversationError::Message("任务名称不能为空。".into()));
         }
         let mut view = self.lock_view();
-        if matches!(self.lock_state().turn, TurnLifecycle::Rewinding) {
-            return Err(ConversationError::Busy);
-        }
         lock_writer(&self.writer).append_metadata(SessionMetadata::ThreadName { name: name.to_string() })?;
         self.publish_summary(&mut view);
         Ok(())
@@ -219,9 +207,6 @@ impl Conversation {
             .map_err(|error| ConversationError::Message(format!("invalid model selection: {error}")))?;
         let mut view = self.lock_view();
         let mut state = self.lock_state();
-        if matches!(state.turn, TurnLifecycle::Rewinding) {
-            return Err(ConversationError::Busy);
-        }
         if &state.model == selection {
             return Ok(());
         }

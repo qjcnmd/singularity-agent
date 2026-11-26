@@ -27,7 +27,7 @@ impl fmt::Debug for McpTransportConfig {
             Self::Stdio { command, args, cwd, env } => f
                 .debug_struct("Stdio")
                 .field("command", command)
-                .field("args", args)
+                .field("args_count", &args.len())
                 .field("cwd", cwd)
                 .field("env_keys", &env.keys().collect::<Vec<_>>())
                 .finish(),

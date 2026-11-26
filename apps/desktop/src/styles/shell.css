@@ -68,7 +68,7 @@
 .session-row { position: relative; z-index: 1; display: flex; align-items: center; height: 30px; border-radius: 8px; overflow: hidden; }
 .session-row:not(.is-selected):hover { background: var(--side-hover); }
 .selection-slider { position: absolute; top: 0; left: 10px; right: 0; z-index: 0; border-radius: 8px; background: var(--card); box-shadow: 0 1px 2px rgb(0 0 0 / 5%), inset 0 0 0 1px var(--line); pointer-events: none;
-  transition: transform var(--smooth-dur) var(--smooth), height var(--smooth-dur) var(--smooth), opacity 140ms; }
+  transition: transform var(--smooth-dur) var(--smooth), opacity 140ms; }
 .session-main { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; height: 100%; padding: 0 8px; border: 0; background: transparent; cursor: pointer; text-align: left; color: var(--ink-soft); font-size: 12.5px; transition: color var(--smooth-dur) var(--smooth); }
 .session-row.is-selected .session-main { color: var(--ink); font-weight: 500; }
 .session-main time { flex: none; color: var(--ink-faint); font-size: 11px; font-weight: 400; transition: opacity 120ms; }

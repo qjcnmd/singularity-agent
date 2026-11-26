@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use agent::session::{
     SessionData, SessionError, SessionManager, scan_session_entries, session_images_directory,
-    session_outputs_directory, session_snapshot_directory,
+    session_outputs_directory,
 };
 use protocol::ThreadSummary;
 use uuid::Uuid;
@@ -10,24 +10,6 @@ use uuid::Uuid;
 use crate::runtime::history::ThreadSummaryScan;
 
 pub(crate) const SESSIONS_DIR_NAME: &str = "sessions";
-
-pub(crate) struct SnapshotTarget {
-    pub(crate) snapshot_dir: PathBuf,
-    pub(crate) cwd: PathBuf,
-    pub(crate) base_tree: Option<String>,
-}
-
-pub(crate) fn snapshot_target(data: &SessionData, turn_id: Option<&str>) -> SnapshotTarget {
-    let base_tree = match turn_id {
-        Some(turn_id) => data.turn_snapshot_tree(turn_id),
-        None => data.first_snapshot_tree(),
-    };
-    SnapshotTarget {
-        snapshot_dir: data.snapshot_directory(),
-        cwd: data.cwd().to_path_buf(),
-        base_tree: base_tree.map(str::to_owned),
-    }
-}
 
 pub(crate) struct ThreadCatalog {
     sessions_dir: PathBuf,
@@ -106,13 +88,8 @@ impl ThreadCatalog {
             })
     }
 
-    pub(crate) fn snapshot_target(
-        &self,
-        thread_id: &str,
-        turn_id: Option<&str>,
-    ) -> Result<SnapshotTarget, CatalogError> {
-        let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
-        Ok(snapshot_target(&session, turn_id))
+    pub(crate) fn session_cwd(&self, thread_id: &str) -> Result<PathBuf, CatalogError> {
+        Ok(open_thread_read_only(&self.sessions_dir, thread_id)?.cwd().to_path_buf())
     }
 
     pub(crate) fn delete(&self, thread_id: &str) -> Result<(), CatalogError> {
@@ -124,10 +101,6 @@ impl ThreadCatalog {
             if let Err(source) = remove_dir_ignoring_not_found(&directory) {
                 return Err(CatalogError::Io { path: directory, source });
             }
-        }
-        let snapshot_dir = session_snapshot_directory(&self.sessions_dir, thread_id);
-        if let Err(source) = agent::session::snapshot::remove(&snapshot_dir) {
-            return Err(CatalogError::Io { path: snapshot_dir, source });
         }
         std::fs::remove_file(&path).map_err(|error| CatalogError::session(thread_id, &path, error.into()))
     }

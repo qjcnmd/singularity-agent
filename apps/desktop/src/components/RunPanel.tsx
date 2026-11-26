@@ -7,7 +7,6 @@ import { pop } from '../motion'
 import { ContextPanel } from './ContextPanel'
 import { BackgroundTasks } from './BackgroundTasks'
 import { Disclosure } from './Disclosure'
-import { FileChangeStats } from './EditDiff'
 import { ExpandChevron } from './ExpandChevron'
 import type { ChangedFile } from '../protocol'
 import { Ellipsis, LoaderCircle } from 'lucide-react'
@@ -43,7 +42,7 @@ export function RunPanel() {
       aria-expanded={backgroundOpen} aria-controls="run-panel"
       onClick={() => appStore.setBackgroundOpen(!backgroundOpen)}><Ellipsis size={18} /></button>
     <AnimatePresence>{backgroundOpen && <motion.aside id="run-panel" className="float-panel" aria-label="运行状态"
-      initial={{ opacity: 0, scale: .94, y: -6 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: .96, y: -4 }} transition={reduced ? { duration: 0 } : pop}>
+      initial={reduced ? false : { opacity: 0, scale: .94, y: -6 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={reduced ? { opacity: 0 } : { opacity: 0, scale: .96, y: -4 }} transition={reduced ? { duration: 0 } : pop}>
       <RunPanelBody />
     </motion.aside>}</AnimatePresence>
   </div>
@@ -63,17 +62,17 @@ function RunPanelBody() {
   const summaryRevision = sessionId ? state.liveSessions[sessionId]?.summaryRevision ?? 0 : 0
   const [changedFiles, setChangedFiles] = useState<ChangedFile[]>([])
   useEffect(() => {
-    if (!sessionId || factsCount === 0 || state.connection !== 'ready') {
+    if (!cwd || !sessionId || factsCount === 0 || state.connection !== 'ready') {
       setChangedFiles([])
       return
     }
     let active = true
-    void appStore.transport.rpc('session.changedFiles', { sessionId }).then(
+    void appStore.transport.rpc('session.changedFiles', { workspaceRoot: cwd }).then(
       result => { if (active) setChangedFiles(result.files) },
-      () => {},
+      () => { if (active) setChangedFiles([]) },
     )
     return () => { active = false }
-  }, [sessionId, factsCount, lastTurnStatus, phase, summaryRevision, state.connection])
+  }, [cwd, sessionId, factsCount, lastTurnStatus, phase, summaryRevision, state.connection])
   const compaction = latestCompaction(state.session?.facts)
   const failure = state.session?.runtime.failure
   const attempt = useRef<string | null>(null)
@@ -99,6 +98,8 @@ function RunPanelBody() {
     attempt.current = compaction?.id ?? ''
     void appStore.compact().then(accepted => { if (!accepted) attempt.current = null })
   }
+  const totalAdded = changedFiles.reduce((sum, file) => sum + file.added, 0)
+  const totalDeleted = changedFiles.reduce((sum, file) => sum + file.deleted, 0)
   return <>
       <Card title="上下文" summary={<span className="compact-slot" style={{ width: `calc(${String(percent).length + 1}ch + 37px)` }}>
         <button type="button" className={`status-chip compact-capsule${compacting || compactDone ? ' is-circle' : ''}`} disabled={compactDisabled} onClick={startCompact}
@@ -114,29 +115,29 @@ function RunPanelBody() {
         {usage && <div className="float-usage"><span className="float-note">已用 {formatTokenCount(usage.used).toLowerCase()} / {formatTokenCount(usage.capacity).toLowerCase()} token</span></div>}
         <ContextPanel />
       </Card>
-      {changedFiles.length > 0 && cwd && sessionId && (
-        <Card title="改动文件" summary={changedFiles.length}>
-          <div className="changed-files-list">
-            {changedFiles.map(file => {
-              const name = file.path.split(/[\\/]/).filter(Boolean).pop() ?? file.path
-              return (
-                <button
-                  key={file.path}
-                  type="button"
-                  className="changed-file-row"
-                  title={file.path}
-                  onClick={() => {
-                    appStore.openFileDiff(cwd, sessionId, file.path)
-                    appStore.setBackgroundOpen(false)
-                  }}
-                >
-                  <span className="changed-file-name">{name}</span>
-                  <FileChangeStats file={file} />
-                </button>
-              )
-            })}
-          </div>
-        </Card>
+      {changedFiles.length > 0 && cwd && (
+        <section className="float-card">
+          <button
+            type="button"
+            className="float-card-head float-card-action"
+            onClick={() => {
+              appStore.openChangedFiles(cwd)
+              appStore.setBackgroundOpen(false)
+            }}
+          >
+            <strong>改动文件</strong>
+            <span className="float-card-summary">
+              <span>{changedFiles.length}</span>
+              {(totalAdded > 0 || totalDeleted > 0) && (
+                <span className="edit-counts">
+                  {totalAdded > 0 && <span className="edit-added-count">+{totalAdded}</span>}
+                  {totalDeleted > 0 && <span className="edit-deleted-count">-{totalDeleted}</span>}
+                </span>
+              )}
+              <ExpandChevron expanded={false} size={13} />
+            </span>
+          </button>
+        </section>
       )}
       {running > 0 && <Card title="后台命令" initiallyOpen summary={running}><BackgroundTasks /></Card>}
   </>

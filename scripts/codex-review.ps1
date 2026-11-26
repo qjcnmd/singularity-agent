@@ -1,20 +1,6 @@
 <#
 .SYNOPSIS
-    Run an ephemeral local Codex CLI review with suspended Job-Object launch, file redirection, and stall recovery.
-.PARAMETER PromptFile
-    Path to the UTF-8 review brief file passed to codex exec via stdin.
-.PARAMETER Images
-    Optional image paths attached via repeated -i arguments (invoke with `& ./scripts/codex-review.ps1 ... -Images @(...)`).
-.PARAMETER Model
-    Codex model slug (default: codex/gpt-6.2-sol).
-.PARAMETER Effort
-    Reasoning effort override (default: high).
-.PARAMETER AllowWebSearch
-    Allow Codex built-in web search (disabled by default for local repository reviews).
-.PARAMETER DeletePrompt
-    Delete PromptFile in finally cleanup after the run finishes.
-.PARAMETER StallSeconds
-    Abort if stderr log shows no progress for this many seconds (default: 480).
+    Run an ephemeral local Codex CLI review with file redirection, hang/stall recovery, and .reviews/ archiving.
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -23,16 +9,22 @@ param(
 
     [string[]]$Images = @(),
 
-    [string]$Model = 'codex/gpt-6.2-sol',
+    [string]$Model = '',
 
-    [string]$Effort = 'high',
+    [string]$Effort = '',
 
     [switch]$AllowWebSearch,
 
     [switch]$DeletePrompt,
 
     [ValidateRange(30, 3600)]
-    [int]$StallSeconds = 480
+    [int]$StallSeconds = 480,
+
+    [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9._-]{0,31}\z')]
+    [string]$Kind = 'review',
+
+    [ValidateRange(0, 99)]
+    [int]$Round = 0
 )
 
 Set-StrictMode -Version Latest
@@ -40,202 +32,6 @@ $ErrorActionPreference = 'Stop'
 
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 try { [Console]::OutputEncoding = $utf8 } catch {}
-
-if (-not ('SingularityReviewProcess' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using System.Text;
-
-public sealed class SingularityReviewProcess : IDisposable {
-    [StructLayout(LayoutKind.Sequential)]
-    struct SECURITY_ATTRIBUTES {
-        public int nLength;
-        public IntPtr lpSecurityDescriptor;
-        public bool bInheritHandle;
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    struct STARTUPINFO {
-        public int cb;
-        public string lpReserved, lpDesktop, lpTitle;
-        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
-        public short wShowWindow, cbReserved2;
-        public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct PROCESS_INFORMATION {
-        public IntPtr hProcess, hThread;
-        public uint dwProcessId, dwThreadId;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
-        public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
-        public uint LimitFlags;
-        public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
-        public uint ActiveProcessLimit;
-        public UIntPtr Affinity;
-        public uint PriorityClass, SchedulingClass;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct IO_COUNTERS {
-        public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
-        public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
-        public IO_COUNTERS IoInfo;
-        public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
-    }
-
-    static readonly IntPtr INVALID_HANDLE = new IntPtr(-1);
-    const uint GENERIC_READ = 0x80000000u, GENERIC_WRITE = 0x40000000u;
-    const uint SHARE_ALL = 0x7u; // READ | WRITE | DELETE
-    const uint OPEN_EXISTING = 3u, CREATE_ALWAYS = 2u;
-    const int STARTF_USESTDHANDLES = 0x00000100;
-    const uint CREATE_SUSPENDED = 0x00000004u, CREATE_NO_WINDOW = 0x08000000u;
-    const uint JOB_KILL_ON_CLOSE = 0x2000u;
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    static extern IntPtr CreateFileW(string name, uint access, uint share, ref SECURITY_ATTRIBUTES sa, uint disp, uint flags, IntPtr tmpl);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    static extern bool CreateProcessW(string app, StringBuilder cmdLine, IntPtr procAttr, IntPtr threadAttr, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    static extern IntPtr CreateJobObjectW(IntPtr attrs, string name);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, uint len);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr proc);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern uint ResumeThread(IntPtr thread);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern uint WaitForSingleObject(IntPtr handle, uint ms);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool GetExitCodeProcess(IntPtr proc, out uint code);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool TerminateJobObject(IntPtr job, uint code);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool TerminateProcess(IntPtr proc, uint code);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool CloseHandle(IntPtr handle);
-
-    IntPtr _job = IntPtr.Zero;
-    IntPtr _proc = IntPtr.Zero;
-
-    public uint ProcessId { get; private set; }
-
-    public static SingularityReviewProcess StartInJob(string exePath, string commandLine, string workDir, string stdinPath, string stdoutPath, string stderrPath) {
-        IntPtr job = CreateJobObjectW(IntPtr.Zero, null);
-        if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateJobObjectW failed");
-
-        var limit = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
-        limit.BasicLimitInformation.LimitFlags = JOB_KILL_ON_CLOSE;
-        if (!SetInformationJobObject(job, 9, ref limit, (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)))) {
-            int err = Marshal.GetLastWin32Error();
-            CloseHandle(job);
-            throw new Win32Exception(err, "SetInformationJobObject failed");
-        }
-
-        var sa = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), bInheritHandle = true };
-        IntPtr hIn = INVALID_HANDLE, hOut = INVALID_HANDLE, hErr = INVALID_HANDLE;
-        var pi = new PROCESS_INFORMATION();
-        bool started = false;
-        try {
-            hIn = CreateFileW(stdinPath, GENERIC_READ, SHARE_ALL, ref sa, OPEN_EXISTING, 0, IntPtr.Zero);
-            if (hIn == INVALID_HANDLE) throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to open stdin file");
-            hOut = CreateFileW(stdoutPath, GENERIC_WRITE, SHARE_ALL, ref sa, CREATE_ALWAYS, 0, IntPtr.Zero);
-            if (hOut == INVALID_HANDLE) throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to create stdout file");
-            hErr = CreateFileW(stderrPath, GENERIC_WRITE, SHARE_ALL, ref sa, CREATE_ALWAYS, 0, IntPtr.Zero);
-            if (hErr == INVALID_HANDLE) throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to create stderr file");
-
-            var si = new STARTUPINFO {
-                cb = Marshal.SizeOf(typeof(STARTUPINFO)),
-                dwFlags = STARTF_USESTDHANDLES,
-                hStdInput = hIn,
-                hStdOutput = hOut,
-                hStdError = hErr
-            };
-            var sb = new StringBuilder(commandLine);
-            if (!CreateProcessW(exePath, sb, IntPtr.Zero, IntPtr.Zero, true, CREATE_SUSPENDED | CREATE_NO_WINDOW, IntPtr.Zero, workDir, ref si, out pi)) {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateProcessW failed");
-            }
-            started = true;
-
-            if (!AssignProcessToJobObject(job, pi.hProcess)) {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "AssignProcessToJobObject failed");
-            }
-            if (ResumeThread(pi.hThread) == uint.MaxValue) {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread failed");
-            }
-            CloseHandle(pi.hThread);
-            pi.hThread = IntPtr.Zero;
-
-            var runner = new SingularityReviewProcess { _job = job, _proc = pi.hProcess, ProcessId = pi.dwProcessId };
-            job = IntPtr.Zero;
-            pi.hProcess = IntPtr.Zero;
-            return runner;
-        } catch {
-            if (started && pi.hProcess != IntPtr.Zero) TerminateProcess(pi.hProcess, 1);
-            if (pi.hThread != IntPtr.Zero) CloseHandle(pi.hThread);
-            if (pi.hProcess != IntPtr.Zero) CloseHandle(pi.hProcess);
-            if (job != IntPtr.Zero) { TerminateJobObject(job, 1); CloseHandle(job); }
-            throw;
-        } finally {
-            if (hIn != INVALID_HANDLE) CloseHandle(hIn);
-            if (hOut != INVALID_HANDLE) CloseHandle(hOut);
-            if (hErr != INVALID_HANDLE) CloseHandle(hErr);
-        }
-    }
-
-    public bool HasExited { get { return _proc == IntPtr.Zero || WaitForSingleObject(_proc, 0) == 0; } }
-
-    public bool WaitForExit(uint timeoutMs) {
-        return _proc == IntPtr.Zero || WaitForSingleObject(_proc, timeoutMs) == 0;
-    }
-
-    public int GetExitCode() {
-        uint code;
-        if (_proc == IntPtr.Zero || !GetExitCodeProcess(_proc, out code)) return -1;
-        return unchecked((int)code);
-    }
-
-    public void TerminateTree() {
-        if (_job != IntPtr.Zero) {
-            TerminateJobObject(_job, 1);
-            CloseHandle(_job);
-            _job = IntPtr.Zero;
-        }
-        if (_proc != IntPtr.Zero) {
-            WaitForSingleObject(_proc, 3000);
-        }
-    }
-
-    public void Dispose() {
-        TerminateTree();
-        if (_proc != IntPtr.Zero) {
-            CloseHandle(_proc);
-            _proc = IntPtr.Zero;
-        }
-    }
-}
-'@
-}
 
 function Format-CliArg([string]$Value) {
     if ($Value.Length -eq 0 -or $Value -match '[\s"]') {
@@ -246,265 +42,244 @@ function Format-CliArg([string]$Value) {
     return $Value
 }
 
+function Format-YamlScalar($Value) {
+    if ($null -eq $Value) { return 'null' }
+    $json = [string]$Value | ConvertTo-Json -Compress
+    return [regex]::Replace($json, '[\x7F-\x9F]', { param($m) '\u{0:X4}' -f [int][char]$m.Value[0] })
+}
+
 function Resolve-CodexInvocation {
     $exe = Get-Command codex.exe -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($exe) { return @{ FilePath = $exe.Source; PrefixArgs = @() } }
 
     $cmd = Get-Command codex.cmd -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $cmd) {
-        throw 'codex executable (codex.exe / npm codex.cmd) not found in PATH.'
-    }
+    if (-not $cmd) { throw 'codex executable (codex.exe / codex.cmd) not found in PATH.' }
 
-    # Resolve native codex.exe (or node.exe + codex.js) and never fall back to cmd.exe, which expands %VAR% in paths.
+    # Bypass cmd.exe (which expands %VAR% in paths) by invoking node.exe + codex.js directly.
     $shimDir = Split-Path -Parent $cmd.Source
-    $archPkg = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'codex-win32-arm64' } else { 'codex-win32-x64' }
-    $triple = if ($archPkg -eq 'codex-win32-arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
-    $vendorCandidates = @(
-        (Join-Path $shimDir "node_modules\@openai\$archPkg\vendor\$triple\bin\codex.exe"),
-        (Join-Path $shimDir "node_modules\@openai\codex\node_modules\@openai\$archPkg\vendor\$triple\bin\codex.exe"),
-        (Join-Path $shimDir "node_modules\@openai\codex\vendor\$triple\bin\codex.exe")
-    )
-    foreach ($candidate in $vendorCandidates) {
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            return @{ FilePath = $candidate; PrefixArgs = @() }
-        }
-    }
-
     $codexJs = Join-Path $shimDir 'node_modules\@openai\codex\bin\codex.js'
     if (Test-Path -LiteralPath $codexJs -PathType Leaf) {
         $localNode = Join-Path $shimDir 'node.exe'
         $nodeExe = if (Test-Path -LiteralPath $localNode -PathType Leaf) {
             $localNode
         } else {
-            (Get-Command node.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+            $nodeCmd = Get-Command node.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($nodeCmd) { $nodeCmd.Source } else { $null }
         }
-        if ($nodeExe) {
-            return @{ FilePath = $nodeExe; PrefixArgs = @($codexJs) }
-        }
+        if ($nodeExe) { return @{ FilePath = $nodeExe; PrefixArgs = @($codexJs) } }
     }
 
-    throw "Found $($cmd.Source) but could not locate native codex.exe or node.exe + codex.js (refusing cmd.exe fallback)."
+    throw "Found $($cmd.Source) but could not locate node.exe + codex.js (refusing cmd.exe fallback)."
 }
 
-function Invoke-GitRaw([string]$WorkDir, [string[]]$GitArgs) {
-    $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = (Get-Command git.exe, git -ErrorAction Stop | Select-Object -First 1).Source
-    $psi.Arguments = (@($GitArgs | ForEach-Object { Format-CliArg $_ }) -join ' ')
-    $psi.WorkingDirectory = $WorkDir
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $p = [System.Diagnostics.Process]::Start($psi)
+function Invoke-GitQuiet([string[]]$GitArgs) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
-        $errTask = $p.StandardError.ReadToEndAsync()
-        $ms = [System.IO.MemoryStream]::new()
-        $p.StandardOutput.BaseStream.CopyTo($ms)
-        $errText = $errTask.GetAwaiter().GetResult()
-        $p.WaitForExit()
-        # Wrap byte[] in hashtable so PowerShell never unrolls an empty byte[0] into $null.
-        return @{ Ok = ($p.ExitCode -eq 0); Bytes = $ms.ToArray(); Error = $errText.Trim() }
+        $global:LASTEXITCODE = 0
+        $out = @(& git @GitArgs 2>$null)
+        return @{ Ok = ($LASTEXITCODE -eq 0); Lines = $out }
     } finally {
-        $p.Dispose()
+        $ErrorActionPreference = $prev
+        $global:LASTEXITCODE = 0
     }
 }
 
-function Get-WorkspaceFingerprint {
-    if (-not (Get-Command git.exe, git -ErrorAction SilentlyContinue)) {
-        return @{ InRepo = $false; Ok = $true; Hash = $null; Error = $null }
+function Get-RepoRoot {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $null }
+    $r = Invoke-GitQuiet @('rev-parse', '--show-toplevel')
+    if (-not $r.Ok -or $r.Lines.Count -eq 0 -or -not $r.Lines[0]) { return $null }
+    return [System.IO.Path]::GetFullPath($r.Lines[0].Trim())
+}
+
+function Get-WorkspaceSnapshot([string]$RepoRoot) {
+    if (-not $RepoRoot) {
+        return @{ Head = $null; ShortHead = 'nogit'; Branch = $null; Dirty = $null; Status = ''; Sig = $null }
     }
-    $cwd = (Get-Location).ProviderPath
-    $top = Invoke-GitRaw $cwd @('rev-parse', '--show-toplevel')
-    if (-not $top.Ok) {
-        return @{ InRepo = $false; Ok = $true; Hash = $null; Error = $null }
+    $h = Invoke-GitQuiet @('-C', $RepoRoot, 'rev-parse', '--verify', 'HEAD')
+    $head = if ($h.Ok -and $h.Lines.Count -gt 0 -and $h.Lines[0]) { $h.Lines[0].Trim() } else { $null }
+    $b = Invoke-GitQuiet @('-C', $RepoRoot, 'symbolic-ref', '--short', 'HEAD')
+    $branch = if ($b.Ok -and $b.Lines.Count -gt 0 -and $b.Lines[0]) { $b.Lines[0].Trim() } elseif ($head) { 'HEAD' } else { $null }
+    $status = (Invoke-GitQuiet @('-C', $RepoRoot, '-c', 'core.quotepath=false', 'status', '--porcelain', '--untracked-files=all')).Lines -join "`n"
+    $workDiff = (Invoke-GitQuiet @('-C', $RepoRoot, '-c', 'core.quotepath=false', 'diff', '--no-ext-diff')).Lines -join "`n"
+    $indexDiff = (Invoke-GitQuiet @('-C', $RepoRoot, '-c', 'core.quotepath=false', 'diff', '--cached', '--no-ext-diff')).Lines -join "`n"
+    return @{
+        Head = $head
+        ShortHead = if ($head) { $head.Substring(0, [Math]::Min(8, $head.Length)) } else { 'nohead' }
+        Branch = $branch
+        Dirty = ($status.Length -gt 0)
+        Status = $status
+        Sig = "$(if ($head) { $head } else { '<UNBORN>' })`n$status`n---`n$workDiff`n---`n$indexDiff"
     }
-    $repoRoot = $utf8.GetString($top.Bytes).Trim()
-    if (-not $repoRoot) {
-        return @{ InRepo = $false; Ok = $true; Hash = $null; Error = $null }
+}
+
+function Write-ReviewArchive([hashtable]$Meta, [string]$PromptText, [string]$ReportText, [string]$StderrTail) {
+    $archiveDir = Join-Path $Meta.ArchiveBase '.reviews'
+    [void][System.IO.Directory]::CreateDirectory($archiveDir)
+
+    $stamp = $Meta.StartedAt.ToString('yyyy-MM-dd_HHmmss')
+    $roundPart = if ($Meta.Round -gt 0) { "_r$($Meta.Round)" } else { '' }
+    $baseName = "${stamp}_$($Meta.Kind)${roundPart}_$($Meta.ShortHead)"
+    $archivePath = Join-Path $archiveDir "$baseName.md"
+    if (Test-Path -LiteralPath $archivePath) {
+        $archivePath = Join-Path $archiveDir "${baseName}_$($Meta.RunId.Substring(0, 6)).md"
     }
 
-    $statusRes = Invoke-GitRaw $repoRoot @('-c', 'core.quotepath=false', 'status', '--porcelain', '--untracked-files=all', '-z')
-    $workDiff = Invoke-GitRaw $repoRoot @('-c', 'core.quotepath=false', 'diff', '--binary', '--no-ext-diff')
-    $indexDiff = Invoke-GitRaw $repoRoot @('-c', 'core.quotepath=false', 'diff', '--cached', '--binary', '--no-ext-diff')
-    $untrackedRes = Invoke-GitRaw $repoRoot @('-c', 'core.quotepath=false', 'ls-files', '--others', '--exclude-standard', '-z')
-    foreach ($res in @($statusRes, $workDiff, $indexDiff, $untrackedRes)) {
-        if (-not $res.Ok) {
-            return @{ InRepo = $true; Ok = $false; Hash = $null; Error = "git snapshot failed: $($res.Error)" }
-        }
+    $fmtBool = { param($v) if ($null -eq $v) { 'null' } elseif ($v) { 'true' } else { 'false' } }
+    $normPrompt = $PromptText.Replace("`r`n", "`n").Replace("`r", "`n").TrimEnd()
+    $normReport = if ([string]::IsNullOrWhiteSpace($ReportText)) { '_(empty)_' } else { $ReportText.Replace("`r`n", "`n").Replace("`r", "`n").TrimEnd() }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.AddRange([string[]]@(
+        '---',
+        "ts: $(Format-YamlScalar $Meta.StartedAt.ToString('yyyy-MM-ddTHH:mm:ssK'))",
+        'reviewer: "codex"',
+        "model: $(Format-YamlScalar $(if ($Meta.Model) { $Meta.Model } else { 'default' }))",
+        "effort: $(Format-YamlScalar $(if ($Meta.Effort) { $Meta.Effort } else { 'default' }))",
+        "kind: $(Format-YamlScalar $Meta.Kind)",
+        "round: $(if ($Meta.Round -gt 0) { $Meta.Round } else { 'null' })",
+        "branch: $(Format-YamlScalar $Meta.Branch)",
+        "head: $(Format-YamlScalar $Meta.Head)",
+        "dirty: $(& $fmtBool $Meta.Dirty)",
+        "duration_ms: $($Meta.DurationMs)",
+        "exit_code: $(if ($null -eq $Meta.ExitCode) { 'null' } else { $Meta.ExitCode })",
+        "recovered: $(& $fmtBool $Meta.Recovered)",
+        "stalled: $(& $fmtBool $Meta.Stalled)",
+        "workspace_changed: $(& $fmtBool $Meta.WorkspaceChanged)",
+        "error: $(Format-YamlScalar $Meta.Error)",
+        '---', '', '# Review Brief', '', $normPrompt, '', '---', '', '# Review Report', '', $normReport
+    ))
+    if ($Meta.Error -and -not [string]::IsNullOrWhiteSpace($StderrTail)) {
+        $normTail = $StderrTail.Replace("`r`n", "`n").Replace("`r", "`n").TrimEnd()
+        $lines.AddRange([string[]]@('', '---', '', '# Stderr Tail', '', '~~~~~~text', $normTail, '~~~~~~'))
     }
-
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $sep = [byte[]]@(0, 255, 0)
-        foreach ($chunk in @($statusRes.Bytes, $sep, $workDiff.Bytes, $sep, $indexDiff.Bytes, $sep)) {
-            if ($chunk.Length -gt 0) {
-                [void]$sha.TransformBlock($chunk, 0, $chunk.Length, $null, 0)
-            }
-        }
-        if ($untrackedRes.Bytes.Length -gt 0) {
-            $relPaths = $utf8.GetString($untrackedRes.Bytes).Split([char]0, [System.StringSplitOptions]::RemoveEmptyEntries)
-            foreach ($rel in $relPaths) {
-                $nameBytes = $utf8.GetBytes($rel)
-                [void]$sha.TransformBlock($nameBytes, 0, $nameBytes.Length, $null, 0)
-                [void]$sha.TransformBlock($sep, 0, $sep.Length, $null, 0)
-                $full = Join-Path $repoRoot $rel
-                if (Test-Path -LiteralPath $full -PathType Leaf) {
-                    $fileBytes = [System.IO.File]::ReadAllBytes($full)
-                    if ($fileBytes.Length -gt 0) {
-                        [void]$sha.TransformBlock($fileBytes, 0, $fileBytes.Length, $null, 0)
-                    }
-                }
-                [void]$sha.TransformBlock($sep, 0, $sep.Length, $null, 0)
-            }
-        }
-        [void]$sha.TransformFinalBlock([byte[]]@(), 0, 0)
-        return @{ InRepo = $true; Ok = $true; Hash = ([BitConverter]::ToString($sha.Hash).Replace('-', '')); Error = $null }
-    } finally {
-        $sha.Dispose()
-    }
+    [System.IO.File]::WriteAllText($archivePath, ($lines -join "`n") + "`n", $utf8)
+    return $archivePath
 }
 
 if (-not (Test-Path -LiteralPath $PromptFile -PathType Leaf)) {
     throw "PromptFile must be an existing file: $PromptFile"
 }
 $resolvedPrompt = (Resolve-Path -LiteralPath $PromptFile).ProviderPath
+$promptText = [System.IO.File]::ReadAllText($resolvedPrompt, $utf8)
 $runId = [guid]::NewGuid().ToString('N')
 $outFile = Join-Path $env:TEMP "codex-review-$runId.md"
 $stdoutFile = Join-Path $env:TEMP "codex-review-$runId.out"
 $logFile = Join-Path $env:TEMP "codex-review-$runId.log"
 
-$beforeFp = $null
-$runner = $null
+$repoRoot = Get-RepoRoot
+$archiveBase = if ($repoRoot) { $repoRoot } else { (Get-Location).ProviderPath }
+$before = Get-WorkspaceSnapshot $repoRoot
+$proc = $null; $stopwatch = $null; $startedAt = $null; $attempted = $false
+$exitCode = $null; $recovered = $false; $stalled = $false; $workspaceChanged = $null
+$report = ''; $runError = $null
+
 try {
-    try {
-        $resolvedImages = @($Images | ForEach-Object {
-            if (-not (Test-Path -LiteralPath $_ -PathType Leaf)) {
-                throw "Image path must be an existing file: $_"
-            }
-            (Resolve-Path -LiteralPath $_).ProviderPath
-        })
-        $invocation = Resolve-CodexInvocation
+    $resolvedImages = @($Images | ForEach-Object {
+        if (-not (Test-Path -LiteralPath $_ -PathType Leaf)) { throw "Image path must be an existing file: $_" }
+        (Resolve-Path -LiteralPath $_).ProviderPath
+    })
+    $inv = Resolve-CodexInvocation
 
-        $rawArgs = [System.Collections.Generic.List[string]]::new()
-        $rawArgs.Add($invocation.FilePath)
-        foreach ($prefix in $invocation.PrefixArgs) { $rawArgs.Add($prefix) }
-        $rawArgs.AddRange([string[]]@(
-            'exec',
-            '-m', $Model,
-            '-c', "model_reasoning_effort=$Effort",
-            '-c', 'notify=[]',
-            '-c', 'features.memories=false'
-        ))
-        if (-not $AllowWebSearch) {
-            $rawArgs.AddRange([string[]]@('-c', 'web_search=disabled'))
+    $cliArgs = [System.Collections.Generic.List[string]]::new()
+    foreach ($prefix in $inv.PrefixArgs) { $cliArgs.Add($prefix) }
+    $cliArgs.AddRange([string[]]@('exec', '-c', 'notify=[]', '-c', 'features.memories=false'))
+    if ($Model) { $cliArgs.AddRange([string[]]@('-m', $Model)) }
+    if ($Effort) { $cliArgs.AddRange([string[]]@('-c', "model_reasoning_effort=$Effort")) }
+    if (-not $AllowWebSearch) { $cliArgs.AddRange([string[]]@('-c', 'web_search=disabled')) }
+    $cliArgs.AddRange([string[]]@('--ephemeral', '--skip-git-repo-check', '-o', $outFile))
+    foreach ($img in $resolvedImages) { $cliArgs.AddRange([string[]]@('-i', $img)) }
+    $cliArgs.AddRange([string[]]@('--', '-'))
+    $argLine = (@($cliArgs | ForEach-Object { Format-CliArg $_ }) -join ' ')
+
+    $startedAt = Get-Date
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $attempted = $true
+    $proc = Start-Process -FilePath $inv.FilePath -ArgumentList $argLine `
+        -WorkingDirectory (Get-Location).ProviderPath `
+        -RedirectStandardInput $resolvedPrompt -RedirectStandardOutput $stdoutFile -RedirectStandardError $logFile `
+        -NoNewWindow -PassThru
+    $null = $proc.Handle # Ensure ExitCode stays populated on Windows PowerShell 5.1.
+
+    Write-Host "OUT_FILE=$outFile"
+    Write-Host "LOG_FILE=$logFile"
+
+    $stableSince = $null; $lastOutSig = ''; $lastLogSig = ''; $lastActivity = Get-Date
+    while (-not $proc.HasExited) {
+        Start-Sleep -Seconds 1
+        if (Test-Path -LiteralPath $logFile) {
+            $li = Get-Item -LiteralPath $logFile
+            $logSig = "$($li.Length)|$($li.LastWriteTimeUtc.Ticks)"
+            if ($logSig -ne $lastLogSig) { $lastLogSig = $logSig; $lastActivity = Get-Date }
         }
-        $rawArgs.AddRange([string[]]@('--ephemeral', '--skip-git-repo-check', '-o', $outFile))
-        foreach ($img in $resolvedImages) {
-            $rawArgs.AddRange([string[]]@('-i', $img))
-        }
-        $rawArgs.AddRange([string[]]@('--', '-'))
-        $cmdLine = (@($rawArgs | ForEach-Object { Format-CliArg $_ }) -join ' ')
-
-        try {
-            $beforeFp = Get-WorkspaceFingerprint
-            if ($beforeFp.InRepo -and -not $beforeFp.Ok) {
-                Write-Warning "Failed to capture pre-review workspace fingerprint: $($beforeFp.Error)"
-            }
-        } catch {
-            Write-Warning "Failed to capture pre-review workspace fingerprint: $_"
-        }
-
-        $runner = [SingularityReviewProcess]::StartInJob(
-            $invocation.FilePath,
-            $cmdLine,
-            (Get-Location).ProviderPath,
-            $resolvedPrompt,
-            $stdoutFile,
-            $logFile
-        )
-
-        Write-Host "OUT_FILE=$outFile"
-        Write-Host "LOG_FILE=$logFile"
-
-        $stableSince = $null
-        $lastOutSig = ''
-        $lastLogSig = ''
-        $lastActivity = Get-Date
-        $recovered = $false
-        $stalled = $false
-
-        while (-not $runner.HasExited) {
-            Start-Sleep -Seconds 1
-            if (Test-Path -LiteralPath $logFile) {
-                $li = Get-Item -LiteralPath $logFile
-                $logSig = "$($li.Length)|$($li.LastWriteTimeUtc.Ticks)"
-                if ($logSig -ne $lastLogSig) {
-                    $lastLogSig = $logSig
-                    $lastActivity = Get-Date
-                }
-            }
-            if ((Test-Path -LiteralPath $outFile) -and ($fi = Get-Item -LiteralPath $outFile).Length -gt 0) {
-                $outSig = "$($fi.Length)|$($fi.LastWriteTimeUtc.Ticks)"
-                if ($outSig -ne $lastOutSig) {
-                    $lastOutSig = $outSig
-                    $stableSince = Get-Date
-                } elseif (((Get-Date) - $stableSince).TotalSeconds -ge 15) {
-                    $recovered = $true
-                    break
-                }
-            } elseif (((Get-Date) - $lastActivity).TotalSeconds -ge $StallSeconds) {
-                $stalled = $true
-                break
-            }
-        }
-
-        if ($recovered -or $stalled) {
-            $runner.TerminateTree()
-        } else {
-            $null = $runner.WaitForExit(3000)
-        }
-
-        $exitCode = if ($recovered) { 0 } else { $runner.GetExitCode() }
-        $runner.Dispose()
-        $runner = $null
-
-        $report = if (Test-Path -LiteralPath $outFile) { [System.IO.File]::ReadAllText($outFile, $utf8) } else { '' }
-
-        if ($stalled) {
-            Get-Content -LiteralPath $logFile -Tail 60 -Encoding UTF8 -ErrorAction SilentlyContinue | Write-Host
-            throw "codex exec stalled (no stderr progress for ${StallSeconds}s)."
-        }
-        if ($exitCode -ne 0 -or [string]::IsNullOrWhiteSpace($report)) {
-            Get-Content -LiteralPath $logFile -Tail 60 -Encoding UTF8 -ErrorAction SilentlyContinue | Write-Host
-            throw "codex exec failed (exit=$exitCode)."
-        }
-
-        Write-Output $report
-    } finally {
-        if ($null -ne $runner) {
-            $runner.Dispose()
-            $runner = $null
-        }
-        if ($null -ne $beforeFp -and $beforeFp.InRepo -and $beforeFp.Ok) {
-            try {
-                $afterFp = Get-WorkspaceFingerprint
-                if (-not $afterFp.Ok) {
-                    Write-Warning "Failed to verify post-review workspace fingerprint: $($afterFp.Error)"
-                } elseif ($beforeFp.Hash -cne $afterFp.Hash) {
-                    $statusSummary = (& git -c core.quotepath=false status --porcelain --untracked-files=all 2>$null) -join "`n"
-                    Write-Warning "Workspace changed during review.`n$statusSummary"
-                }
-            } catch {
-                Write-Warning "Failed to verify post-review workspace fingerprint: $_"
-            }
+        if ((Test-Path -LiteralPath $outFile) -and ($fi = Get-Item -LiteralPath $outFile).Length -gt 0) {
+            $outSig = "$($fi.Length)|$($fi.LastWriteTimeUtc.Ticks)"
+            if ($outSig -ne $lastOutSig) { $lastOutSig = $outSig; $stableSince = Get-Date }
+            elseif (((Get-Date) - $stableSince).TotalSeconds -ge 15) { $recovered = $true; break }
+        } elseif (((Get-Date) - $lastActivity).TotalSeconds -ge $StallSeconds) {
+            $stalled = $true; break
         }
     }
+
+    if ($recovered -or $stalled) {
+        & taskkill /PID $proc.Id /T /F 2>$null | Out-Null
+    }
+    $null = $proc.WaitForExit(3000)
+    $exitCode = if ($recovered) { 0 } elseif ($proc.HasExited) { $proc.ExitCode } else { -1 }
+
+    $report = if (Test-Path -LiteralPath $outFile -PathType Leaf) { [System.IO.File]::ReadAllText($outFile, $utf8) } else { '' }
+    if ($stalled) {
+        Get-Content -LiteralPath $logFile -Tail 60 -Encoding UTF8 -ErrorAction SilentlyContinue | Write-Host
+        throw "codex exec stalled (no stderr progress for ${StallSeconds}s)."
+    }
+    if ($exitCode -ne 0 -or [string]::IsNullOrWhiteSpace($report)) {
+        Get-Content -LiteralPath $logFile -Tail 60 -Encoding UTF8 -ErrorAction SilentlyContinue | Write-Host
+        throw "codex exec failed (exit=$exitCode)."
+    }
+    Write-Output $report
+} catch {
+    $runError = $_.Exception.Message
+    throw
 } finally {
+    if ($null -ne $proc) {
+        if (-not $proc.HasExited) { & taskkill /PID $proc.Id /T /F 2>$null | Out-Null }
+        $proc.Dispose()
+    }
+    if ($null -ne $stopwatch) { $stopwatch.Stop() }
+
+    if ($repoRoot -and $null -ne $before.Sig) {
+        $after = Get-WorkspaceSnapshot $repoRoot
+        if ($before.Sig -cne $after.Sig) {
+            $workspaceChanged = $true
+            $headNote = if ($before.Head -cne $after.Head) { "HEAD: $($before.Head) -> $($after.Head)`n" } else { '' }
+            Write-Warning "Workspace changed during review.`n$headNote$($after.Status)"
+        } else {
+            $workspaceChanged = $false
+        }
+    }
+
+    if ($attempted) {
+        try {
+            if ($null -eq $exitCode -and $null -eq $runError) { $runError = 'review interrupted before completion' }
+            $stderrTail = if ($runError -and (Test-Path -LiteralPath $logFile -PathType Leaf)) {
+                (Get-Content -LiteralPath $logFile -Tail 60 -Encoding UTF8 -ErrorAction SilentlyContinue) -join "`n"
+            } else { '' }
+            $archivePath = Write-ReviewArchive @{
+                ArchiveBase = $archiveBase; StartedAt = $startedAt; RunId = $runId
+                Kind = $Kind; Round = $Round; Branch = $before.Branch; Head = $before.Head
+                ShortHead = $before.ShortHead; Dirty = $before.Dirty; Model = $Model; Effort = $Effort
+                DurationMs = if ($stopwatch) { [long]$stopwatch.ElapsedMilliseconds } else { 0L }
+                ExitCode = $exitCode; Recovered = $recovered; Stalled = $stalled
+                WorkspaceChanged = $workspaceChanged; Error = $runError
+            } $promptText $report $stderrTail
+            Write-Host "ARCHIVE_FILE=$archivePath"
+        } catch {
+            Write-Warning "Failed to write review archive: $_"
+        }
+    }
+
     $cleanup = @($outFile, $stdoutFile, $logFile)
     if ($DeletePrompt) { $cleanup += $resolvedPrompt }
-    for ($attempt = 0; $attempt -lt 5; $attempt++) {
-        $remaining = @($cleanup | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
-        if ($remaining.Count -eq 0) { break }
-        Remove-Item -LiteralPath $remaining -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 150
+    foreach ($f in $cleanup) {
+        if (Test-Path -LiteralPath $f -PathType Leaf) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
     }
 }

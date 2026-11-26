@@ -92,13 +92,13 @@ pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
     }
 }
 
-pub(crate) fn provider_wire_facts(fields: &ProviderErrorBodyFields) -> Vec<String> {
+pub(crate) fn provider_wire_facts(fields: &ProviderErrorBodyFields, api_key: &str) -> Vec<String> {
     let mut facts = Vec::new();
     if let Some(code) = fields.code.as_deref().filter(|code| !code.is_empty()) {
-        facts.push(format!("provider_error_code={}", bounded_provider_error_diagnostic(code)));
+        facts.push(format!("provider_error_code={}", bounded_redacted_diagnostic(code, api_key)));
     }
     if let Some(wire_type) = fields.wire_type.as_deref().filter(|wire_type| !wire_type.is_empty()) {
-        facts.push(format!("provider_error_type={}", bounded_provider_error_diagnostic(wire_type)));
+        facts.push(format!("provider_error_type={}", bounded_redacted_diagnostic(wire_type, api_key)));
     }
     facts
 }
@@ -110,18 +110,18 @@ fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields {
         .unwrap_or_default()
 }
 
-pub(crate) fn apply_provider_error_body(error: &mut ProviderError, body: &[u8]) {
+pub(crate) fn apply_provider_error_body(error: &mut ProviderError, body: &[u8], api_key: &str) {
     let fields = parse_provider_error_body(body);
     if let Some(kind) = provider_error_kind_for_fields(&fields) {
         error.kind = kind;
     }
-    let facts = provider_wire_facts(&fields);
+    let facts = provider_wire_facts(&fields, api_key);
     if !facts.is_empty() {
         let _ = write!(error.message, " ({})", facts.join(", "));
     }
     let diagnostic = match fields.message.as_deref() {
-        Some(message) => bounded_provider_error_diagnostic(message),
-        None => bounded_provider_error_diagnostic(&String::from_utf8_lossy(body)),
+        Some(message) => bounded_redacted_diagnostic(message, api_key),
+        None => bounded_redacted_diagnostic(&String::from_utf8_lossy(body), api_key),
     };
     if !diagnostic.is_empty() {
         let _ = write!(error.message, " Provider diagnostic: {diagnostic}");
@@ -187,17 +187,78 @@ pub(crate) fn bounded_provider_error_diagnostic(text: &str) -> String {
     diagnostic
 }
 
+pub(crate) fn redact_diagnostic(text: &str, api_key: &str) -> String {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    if !api_key.is_empty() {
+        for (start, _) in text.match_indices(api_key) {
+            spans.push((start, start + api_key.len()));
+        }
+    }
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i + 6 < bytes.len() {
+        if bytes[i..i + 6].eq_ignore_ascii_case(b"bearer") && bytes[i + 6].is_ascii_whitespace() {
+            let word_start =
+                text[..i].chars().next_back().is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+            if word_start {
+                let mut token_start = i + 6;
+                while token_start < bytes.len() && bytes[token_start].is_ascii_whitespace() {
+                    token_start += 1;
+                }
+                let token_end = text[token_start..]
+                    .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '}' | ']' | ';'))
+                    .map_or(text.len(), |offset| token_start + offset);
+                if token_end > token_start {
+                    spans.push((token_start, token_end));
+                    i = token_end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    spans.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        if let Some((_, prev_end)) = merged.last_mut()
+            && start < *prev_end
+        {
+            *prev_end = (*prev_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end) in merged {
+        out.push_str(&text[cursor..start]);
+        out.push_str("[redacted]");
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+pub(crate) fn bounded_redacted_diagnostic(text: &str, api_key: &str) -> String {
+    let redacted = redact_diagnostic(text, api_key);
+    bounded_provider_error_diagnostic(&redacted)
+}
+
 pub(crate) fn provider_embedded_error(
     fields: &ProviderErrorBodyFields,
     fallback_message: &str,
+    api_key: &str,
 ) -> ProviderError {
     let kind = provider_error_kind_for_fields(fields).unwrap_or(ModelErrorKind::Other);
     let message = fields
         .message
         .as_deref()
-        .map(bounded_provider_error_diagnostic)
+        .map(|text| bounded_redacted_diagnostic(text, api_key))
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| fallback_message.to_string());
-    let details = provider_wire_facts(fields);
+    let details = provider_wire_facts(fields, api_key);
     ProviderError::diagnostic(kind, message, &details)
 }

@@ -1,17 +1,10 @@
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { flushSync } from 'react-dom'
-import { ArrowDown, X } from 'lucide-react'
-import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
-import { hasDraftContent } from '../drafts'
-import type { ChangedFile } from '../protocol'
+import { ArrowDown } from 'lucide-react'
+import { appStore, useAppStore, type AppState } from '../appStore'
 import { type TimelineRow } from '../timeline'
-import { maxTimelineEntryOffset, TimelineItem, type RewindUserMessage } from './TimelineItem'
+import { maxTimelineEntryOffset, TimelineItem } from './TimelineItem'
 import { useConversationAnnotations } from './Annotations'
-import { Dialog } from './Dialog'
-import { Disclosure } from './Disclosure'
-import { FileChangeStats } from './EditDiff'
-import { ExpandChevron } from './ExpandChevron'
 import { defaultAnchor } from '../viewPersistence'
 
 interface Props {
@@ -238,13 +231,14 @@ export function Conversation({ state, items }: Props) {
     (previous, next) => previous.connection === next.connection
       && hasRunningBackgroundTask(previous.liveSessions, sessionId) === hasRunningBackgroundTask(next.liveSessions, sessionId),
   )
-  const canRewind = connection === 'ready'
+  const canEdit = connection === 'ready'
     && state.session?.runtime.phase === 'idle'
     && !hasRunningBackgroundTask(liveSessions, sessionId)
-  const [rewindTarget, setRewindTarget] = useState<RewindUserMessage | null>(null)
-  useEffect(() => { setRewindTarget(null) }, [sessionId])
-  const openRewind = useCallback((message: RewindUserMessage) => { setRewindTarget(message) }, [])
-  const closeRewind = useCallback(() => { setRewindTarget(null) }, [])
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
+  useEffect(() => { setEditingMessageId(null) }, [sessionId])
+  useEffect(() => { if (!canEdit) setEditingMessageId(null) }, [canEdit])
+  const startEdit = useCallback((messageId: string) => { setEditingMessageId(messageId) }, [])
+  const cancelEdit = useCallback(() => { setEditingMessageId(null) }, [])
 
   const { badgeLayer, floatingPopover } = useConversationAnnotations({
     sessionId: state.session ? sessionId : null,
@@ -272,7 +266,21 @@ export function Conversation({ state, items }: Props) {
     <div className="conversation-surface" ref={surface}><div className="conversation-scroll" ref={viewport} tabIndex={0} aria-label="任务内容" onScroll={onScroll} onWheel={interruptFollow} onTouchStart={interruptFollow} onPointerDown={interruptFollow} onKeyDown={event => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) interruptFollow() }}>
       <motion.div key={sessionId} ref={documentNode} className="conversation-document"
         initial={reduced ? false : { opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: .2, ease: 'easeOut' }}>
-        <AnimatePresence initial={false}>{items.map(item => <TimelineItem key={item.key} item={item.item} itemKey={item.key} onDisclosureChange={preserveDisclosurePosition} cwd={state.session!.summary.cwd} userHome={state.bootstrap?.userHome} sessionId={sessionId ?? undefined} canRewind={canRewind} onRewind={openRewind} />)}</AnimatePresence>
+        <AnimatePresence initial={false}>{items.map(item => (
+          <TimelineItem
+            key={item.key}
+            item={item.item}
+            itemKey={item.key}
+            onDisclosureChange={preserveDisclosurePosition}
+            cwd={state.session!.summary.cwd}
+            userHome={state.bootstrap?.userHome}
+            sessionId={sessionId ?? undefined}
+            canEdit={canEdit && !item.key.startsWith('pending:')}
+            editing={item.item.type === 'message' && item.item.role === 'user' && editingMessageId === item.item.id}
+            onEditStart={startEdit}
+            onEditCancel={cancelEdit}
+          />
+        ))}</AnimatePresence>
         {badgeLayer}
       </motion.div>
 
@@ -281,113 +289,6 @@ export function Conversation({ state, items }: Props) {
       {awayFromLatest && <button type="button" className="return-to-latest" aria-label="回到最新消息" onClick={returnToLatest}>
         <ArrowDown size={16} aria-hidden="true" />
       </button>}
-      {rewindTarget && sessionId && <RewindDialog sessionId={sessionId} message={rewindTarget} onClose={closeRewind} />}
     </div>
-  )
-}
-
-type ChangedFilesLoad =
-  | { status: 'loading' }
-  | { status: 'ready'; files: ChangedFile[] }
-  | { status: 'error'; message: string }
-
-function RewindDialog({ sessionId, message, onClose }: {
-  sessionId: string
-  message: RewindUserMessage
-  onClose: () => void
-}) {
-  const origin = actionOrigin.inline('session.rewind', sessionId)
-  const { actionErrors, pendingActions, drafts } = useAppStore(['actionErrors', 'pendingActions', 'drafts'])
-  const busy = pendingActions.has(pendingKey('session.rewind', origin))
-  const failure = actionErrors[origin]
-  const currentDraft = drafts?.[sessionId]
-  const hasUnsavedDraft = currentDraft !== undefined && hasDraftContent(currentDraft)
-  const [restoreFiles, setRestoreFiles] = useState(true)
-  const [showFiles, setShowFiles] = useState(false)
-  const [filesState, setFilesState] = useState<ChangedFilesLoad>(() =>
-    message.hasSnapshot ? { status: 'loading' } : { status: 'ready', files: [] })
-
-  useEffect(() => {
-    appStore.clearError(origin)
-    return () => appStore.clearError(origin)
-  }, [origin, message.turnId])
-
-  useEffect(() => {
-    setRestoreFiles(true)
-    setShowFiles(false)
-    if (!message.hasSnapshot) {
-      setFilesState({ status: 'ready', files: [] })
-      return
-    }
-    let active = true
-    setFilesState({ status: 'loading' })
-    void appStore.transport.rpc('session.changedFiles', { sessionId, turnId: message.turnId }).then(
-      result => { if (active) setFilesState({ status: 'ready', files: result.files }) },
-      error => { if (active) setFilesState({ status: 'error', message: error instanceof Error ? error.message : String(error) }) },
-    )
-    return () => { active = false }
-  }, [sessionId, message.turnId, message.hasSnapshot])
-
-  const changedFiles = filesState.status === 'ready' ? filesState.files : []
-  const shouldRestore = changedFiles.length > 0 && restoreFiles
-  const close = () => { if (!busy) onClose() }
-  const confirm = async () => {
-    const accepted = await appStore.rewindSession(sessionId, message.turnId, shouldRestore, {
-      text: message.text,
-      images: message.images,
-      files: message.files,
-      annotations: message.annotations,
-    })
-    if (accepted) {
-      flushSync(onClose)
-      appStore.focusComposer()
-    }
-  }
-
-  return (
-    <Dialog open onClose={close} labelledBy="rewind-title" className="confirm-modal">
-      <header className="modal-header">
-        <h2 id="rewind-title">回到这条消息之前？</h2>
-        <button type="button" className="icon-button" disabled={busy} onClick={close} aria-label="关闭"><X size={18} /></button>
-      </header>
-      <div className="confirm-body">
-        <p>将撤回这条消息及之后的对话，并把原话填入底部输入框。</p>
-        {hasUnsavedDraft && <p className="rewind-note">当前输入框中未发送的草稿将被覆盖。</p>}
-        {filesState.status === 'loading' && <p className="rewind-status" role="status">正在检查文件改动…</p>}
-        {filesState.status === 'error' && <p className="rewind-note" role="status">无法检查文件改动（{filesState.message}），本次仅撤回对话。</p>}
-        {changedFiles.length > 0 && (
-          <div className="rewind-files-block">
-            <div className="rewind-checkbox-row">
-              <label className="rewind-checkbox">
-                <input type="checkbox" checked={restoreFiles} disabled={busy} onChange={event => setRestoreFiles(event.target.checked)} />
-                <span>同时还原这之后改动的 {changedFiles.length} 个文件</span>
-              </label>
-              <button type="button" className="quiet-button rewind-files-toggle" aria-expanded={showFiles} onClick={() => setShowFiles(value => !value)}>
-                <span>查看文件</span>
-                <ExpandChevron expanded={showFiles} size={12} />
-              </button>
-            </div>
-            <Disclosure open={showFiles}>
-              <ul className="rewind-files-list">
-                {changedFiles.map(file => (
-                  <li key={file.path} className="rewind-file-item" title={file.path}>
-                    <span className="rewind-file-path">{file.path}</span>
-                    <FileChangeStats file={file} />
-                  </li>
-                ))}
-              </ul>
-            </Disclosure>
-            <p className="rewind-note">还原会覆盖这之后的手动修改，git push 等外部操作不可撤销。</p>
-          </div>
-        )}
-        {failure && <p className="form-error" role="alert">{failure.message}</p>}
-        <footer>
-          <button type="button" className="secondary-button" data-autofocus disabled={busy} onClick={close}>取消</button>
-          <button type="button" className="primary-button" disabled={busy || filesState.status === 'loading'} onClick={() => void confirm()}>
-            {busy ? '处理中…' : '确认'}
-          </button>
-        </footer>
-      </div>
-    </Dialog>
   )
 }
