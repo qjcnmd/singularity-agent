@@ -635,15 +635,12 @@ async fn abort_delete_corruption_and_focus_invariants() {
     server.wait_for_request_count(expected_del_reqs).await;
     let del_jsonl = env.home.join("sessions").join(format!("{s_del}.jsonl"));
     let del_images = env.home.join("sessions").join("images").join(&s_del);
-    let del_snapshot = env.home.join("sessions").join("snapshots").join(format!("{s_del}.git"));
     assert!(del_jsonl.exists(), "session log must exist before delete");
-    assert!(del_snapshot.exists(), "session snapshot directory must exist before delete");
 
     client.rpc_ok("session.delete", json!({ "sessionId": s_del })).await;
     delete_gate.notify_one();
     assert!(!del_jsonl.exists(), "deleted session JSONL must be removed");
     assert!(!del_images.exists(), "deleted session images directory must be removed");
-    assert!(!del_snapshot.exists(), "deleted session snapshot directory must be removed");
 
     let focus_gate = Arc::new(Notify::new());
     server.enqueue(ScriptedResponse::sse_gated(
@@ -732,23 +729,52 @@ async fn abort_delete_corruption_and_focus_invariants() {
 }
 
 #[tokio::test]
-async fn rewind_and_nested_workspace_isolation_invariants() {
+async fn git_diff_and_pure_rewind_invariants() {
     let env = TestEnv::new("rewind-invariants");
     let server = MockModelServer::start().await;
     let ws = env.workspace_str();
-    let child_dir = env.workspace.join("child");
-    std::fs::create_dir_all(&child_dir).expect("create child workspace");
-    let tracked = child_dir.join("tracked.txt");
-    let extra = child_dir.join("extra.txt");
-    std::fs::write(&tracked, "v1\n").expect("write tracked baseline");
-    let child_ws = format!("{ws}/child");
+    let plain_dir = env.home.join("non-git-workspace");
+    std::fs::create_dir_all(&plain_dir).expect("create non-git workspace");
+    let plain_ws = app_core::display_path(&plain_dir);
 
+    let tracked = env.workspace.join("tracked.txt");
+    let extra = env.workspace.join("extra.txt");
+    let mv_old = env.workspace.join("mv_old.txt");
+    let mv_new = env.workspace.join("mv_new.txt");
+    let bracket_file = env.workspace.join("src").join("[id]").join("page.ts");
+    let plain_i_file = env.workspace.join("src").join("i").join("page.ts");
+    std::fs::create_dir_all(bracket_file.parent().expect("bracket parent")).expect("mkdir [id]");
+    std::fs::create_dir_all(plain_i_file.parent().expect("i parent")).expect("mkdir i");
+    std::fs::write(&tracked, "v1\n").expect("write tracked baseline");
+    std::fs::write(&mv_old, "old1\nold2\nold3\nold4\n").expect("write mv_old baseline");
+    std::fs::write(&bracket_file, "export const id = 1\n").expect("write [id] baseline");
+    std::fs::write(&plain_i_file, "export const i = 1\n").expect("write i baseline");
+    let run_git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(&env.workspace)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    run_git(&["init", "-q"]);
+    run_git(&["config", "user.email", "test@example.invalid"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["add", "-A"]);
+    run_git(&["commit", "-q", "-m", "baseline"]);
+    // Hostile user git config must not break batch diff parsing or path matching.
+    run_git(&["config", "diff.noprefix", "true"]);
+    run_git(&["config", "diff.mnemonicPrefix", "true"]);
+    run_git(&["config", "diff.relative", "true"]);
+
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "NON_GIT_OK", 40, 0, 10, "end_turn")));
     server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "TURN_1_BASELINE", 60, 0, 15, "end_turn")));
     server.enqueue(ScriptedResponse::sse(messages_tools_sse(
         None,
         vec![
-            ("w_tracked", "write", json!({ "path": "child/tracked.txt", "content": "v2\n" })),
-            ("w_extra", "write", json!({ "path": "child/extra.txt", "content": "extra\n" })),
+            ("w_tracked", "write", json!({ "path": "tracked.txt", "content": "v2\n" })),
+            ("w_extra", "write", json!({ "path": "extra.txt", "content": "extra\n" })),
+            ("w_noop", "write", json!({ "path": "tracked.txt", "content": "v2\n" })),
         ],
         80,
         30,
@@ -760,106 +786,269 @@ async fn rewind_and_nested_workspace_isolation_invariants() {
     client
         .setup_workspace_and_provider(&ws, "local", "messages", &server.base_url, "demo", 64000, 4096)
         .await;
-    client.rpc_ok("workspace.add", json!({ "root": child_ws })).await;
+    client.rpc_ok("workspace.add", json!({ "root": plain_ws })).await;
 
-    let s_parent = client.start_session(&ws, "local", "demo", None, "baseline turn", vec![], vec![]).await;
-    client.wait_settled(&s_parent).await;
+    // Non-git workspace returns empty changedFiles cleanly without creating any snapshot dir.
+    let s_plain = client.start_session(&plain_ws, "local", "demo", None, "plain turn", vec![], vec![]).await;
+    client.wait_settled(&s_plain).await;
+    let plain_changed = client.rpc_ok("session.changedFiles", json!({ "sessionId": s_plain })).await;
+    assert_eq!(plain_changed.get("files").and_then(Value::as_array).map(Vec::len), Some(0));
+    assert!(
+        !env.home.join("sessions").join("snapshots").exists(),
+        "Shadow Git snapshots dir must not exist"
+    );
 
-    client.submit(&s_parent, "mutate tracked files").await;
-    client.wait_settled(&s_parent).await;
+    let s_git = client.start_session(&ws, "local", "demo", None, "baseline turn", vec![], vec![]).await;
+    client.wait_settled(&s_git).await;
+
+    client.submit(&s_git, "mutate tracked files").await;
+    client.wait_settled(&s_git).await;
     assert_eq!(std::fs::read_to_string(&tracked).expect("read mutated file"), "v2\n");
     assert!(extra.exists(), "extra.txt must exist after turn 2");
 
-    let before_rewind = client.rpc_ok("session.read", json!({ "sessionId": s_parent })).await;
+    // Rename after turn 2 to verify pure rewind preserves ThreadName and ThreadSettings.
+    client.rpc_ok("session.rename", json!({ "sessionId": s_git, "name": "Keep Title" })).await;
+
+    let before_rewind = client.rpc_ok("session.read", json!({ "sessionId": s_git })).await;
     let turns = before_rewind.pointer("/history/turns").and_then(Value::as_array).expect("turns");
     assert_eq!(turns.len(), 2);
-    let turn2_id = turns[1].get("turnId").and_then(Value::as_str).expect("turn 2 id").to_string();
-    assert_eq!(turns[1].pointer("/items/0/hasSnapshot").and_then(Value::as_bool), Some(true));
+    let turn2_items = turns[1].get("items").and_then(Value::as_array).expect("turn 2 items");
+    let created_flags: Vec<(&str, Option<bool>)> = turn2_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("tool"))
+        .map(|item| {
+            (
+                item.pointer("/args/path").and_then(Value::as_str).unwrap_or_default(),
+                item.pointer("/result/fileCreated").and_then(Value::as_bool),
+            )
+        })
+        .collect();
+    assert_eq!(
+        created_flags,
+        vec![
+            ("tracked.txt", Some(false)),
+            ("extra.txt", Some(true)),
+            ("tracked.txt", Some(false))
+        ],
+        "write tool must accurately report fileCreated for new vs overwritten/no-op files"
+    );
+    let turn2_user_msg_id = turn2_items
+        .iter()
+        .find(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("user")
+        })
+        .and_then(|item| item.get("id").and_then(Value::as_str))
+        .expect("turn 2 user message id")
+        .to_string();
 
-    let changed = client
-        .rpc_ok("session.changedFiles", json!({ "sessionId": s_parent, "turnId": turn2_id }))
+    // Exercise git mv + full rewrite and glob-like bracket filenames under hostile diff config.
+    run_git(&["mv", "mv_old.txt", "mv_new.txt"]);
+    std::fs::write(&mv_new, "completely\ndifferent\nrewritten\nbody\nnow\n").expect("rewrite mv_new");
+    std::fs::write(&bracket_file, "export const id = 2\n").expect("modify [id]");
+    std::fs::write(&plain_i_file, "export const i = 2\n").expect("modify i");
+
+    let changed = client.rpc_ok("session.changedFiles", json!({ "workspaceRoot": ws })).await;
+    let changed_items = changed.get("files").and_then(Value::as_array).expect("changed files");
+    let changed_paths: Vec<&str> =
+        changed_items.iter().filter_map(|f| f.get("path").and_then(Value::as_str)).collect();
+    assert!(changed_paths.contains(&"tracked.txt"), "changedFiles: {changed_paths:?}");
+    assert!(changed_paths.contains(&"extra.txt"), "changedFiles: {changed_paths:?}");
+    assert!(changed_paths.contains(&"mv_old.txt"), "split mv must include deletion: {changed_paths:?}");
+    assert!(changed_paths.contains(&"mv_new.txt"), "split mv must include addition: {changed_paths:?}");
+    assert!(
+        changed_items.iter().all(|f| f.get("diff").is_none()),
+        "lightweight changedFiles must omit inline diffs: {changed_items:?}"
+    );
+
+    let changed_with_diffs = client
+        .rpc_ok("session.changedFiles", json!({ "workspaceRoot": ws, "includeDiffs": true }))
         .await;
-    let changed_paths: Vec<&str> = changed
+    let diff_items = changed_with_diffs
         .get("files")
         .and_then(Value::as_array)
-        .expect("changed files")
+        .expect("changed files with diffs");
+    let tracked_batch = diff_items
         .iter()
-        .filter_map(|f| f.get("path").and_then(Value::as_str))
-        .collect();
-    assert!(changed_paths.contains(&"child/tracked.txt"), "changedFiles: {changed_paths:?}");
-    assert!(changed_paths.contains(&"child/extra.txt"), "changedFiles: {changed_paths:?}");
+        .find(|f| f.get("path").and_then(Value::as_str) == Some("tracked.txt"))
+        .and_then(|f| f.get("diff").and_then(Value::as_str))
+        .unwrap_or_default();
+    assert!(
+        tracked_batch.contains("-v1") && tracked_batch.contains("+v2"),
+        "batch tracked diff mismatch under diff.noprefix/relative: {tracked_batch}"
+    );
+    let extra_batch = diff_items
+        .iter()
+        .find(|f| f.get("path").and_then(Value::as_str) == Some("extra.txt"))
+        .and_then(|f| f.get("diff").and_then(Value::as_str))
+        .unwrap_or_default();
+    assert!(extra_batch.contains("+extra"), "batch untracked diff mismatch: {extra_batch}");
+    let mv_old_entry = diff_items
+        .iter()
+        .find(|f| f.get("path").and_then(Value::as_str) == Some("mv_old.txt"))
+        .expect("mv_old.txt batch entry");
+    assert_eq!(mv_old_entry.get("status").and_then(Value::as_str), Some("deleted"));
+    assert!(mv_old_entry.get("diff").and_then(Value::as_str).unwrap_or_default().contains("-old1"));
+
+    let bracket_diff = client
+        .rpc_ok("session.fileDiff", json!({ "workspaceRoot": ws, "path": "src/[id]/page.ts" }))
+        .await;
+    let bracket_out = bracket_diff.get("output").and_then(Value::as_str).unwrap_or_default();
+    assert!(
+        bracket_out.contains("+export const id = 2") && !bracket_out.contains("export const i = 2"),
+        "literal pathspec must not glob src/i/page.ts: {bracket_out}"
+    );
+
+    // Unborn git repo (no HEAD yet): staged-then-edited file (AM) must diff working tree against empty tree.
+    let unborn_dir = env.home.join("unborn_git");
+    std::fs::create_dir_all(&unborn_dir).expect("mkdir unborn");
+    let unborn_ws = app_core::display_path(&unborn_dir);
+    let run_unborn_git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(&unborn_dir)
+            .args(args)
+            .status()
+            .expect("run unborn git");
+        assert!(status.success(), "unborn git {args:?} failed");
+    };
+    run_unborn_git(&["init", "-q"]);
+    std::fs::write(unborn_dir.join("am.txt"), "staged\n").expect("write staged am.txt");
+    run_unborn_git(&["add", "am.txt"]);
+    std::fs::write(unborn_dir.join("am.txt"), "staged\nworktree\n").expect("edit am.txt");
+    client.rpc_ok("workspace.add", json!({ "root": unborn_ws })).await;
+    let unborn_changed = client
+        .rpc_ok("session.changedFiles", json!({ "workspaceRoot": unborn_ws, "includeDiffs": true }))
+        .await;
+    let am_diff = unborn_changed
+        .get("files")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.iter().find(|f| f.get("path").and_then(Value::as_str) == Some("am.txt")))
+        .and_then(|f| f.get("diff").and_then(Value::as_str))
+        .unwrap_or_default();
+    assert!(
+        am_diff.contains("+staged") && am_diff.contains("+worktree"),
+        "unborn AM file must reflect working tree content: {am_diff}"
+    );
 
     let diff = client
-        .rpc_ok(
-            "session.fileDiff",
-            json!({ "sessionId": s_parent, "path": "child/tracked.txt", "turnId": turn2_id }),
-        )
+        .rpc_ok("session.fileDiff", json!({ "sessionId": s_git, "path": "tracked.txt" }))
         .await;
     let diff_out = diff.get("output").and_then(Value::as_str).unwrap_or_default();
     assert!(diff_out.contains("-v1") && diff_out.contains("+v2"), "unexpected diff: {diff_out}");
 
-    let child_gate = Arc::new(Notify::new());
-    server.enqueue(ScriptedResponse::sse_gated(
-        messages_text_sse(None, "CHILD_DONE", 50, 0, 10, "end_turn"),
-        Arc::clone(&child_gate),
-    ));
-    let expected_reqs = server.model_requests().len() + 1;
-    let s_child = client
-        .start_session(&child_ws, "local", "demo", None, "child active work", vec![], vec![])
+    let untracked_diff = client
+        .rpc_ok("session.fileDiff", json!({ "sessionId": s_git, "path": "extra.txt" }))
         .await;
-    server.wait_for_request_count(expected_reqs).await;
+    let untracked_out = untracked_diff.get("output").and_then(Value::as_str).unwrap_or_default();
+    assert!(untracked_out.contains("+extra"), "unexpected untracked diff: {untracked_out}");
 
-    let nested_busy_err = client
+    // Failed turn with a queued steering input clears unconsumed input so rewind & workspace.remove work.
+    let fail_gate = Arc::new(Notify::new());
+    server.enqueue(ScriptedResponse::sse_gated(
+        vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fail\",\"usage\":{\"input_tokens\":20}}}\n\n".into(),
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad prompt\"}}\n\n".into(),
+        ],
+        Arc::clone(&fail_gate),
+    ));
+    let reqs_before_fail = server.model_requests().len();
+    client.submit(&s_git, "will fail").await;
+    server.wait_for_request_count(reqs_before_fail + 1).await;
+    client.submit(&s_git, "stale steering input").await;
+    fail_gate.notify_one();
+    client.wait_settled(&s_git).await;
+    let after_fail = client.rpc_ok("session.read", json!({ "sessionId": s_git })).await;
+    assert_eq!(
+        after_fail.pointer("/runtime/pendingMessages").and_then(Value::as_array).map(Vec::len),
+        Some(0),
+        "failed turn must clear unconsumed steering input"
+    );
+
+    // Atomic rewind with invalid resubmit input (missing file attachment) must fail WITHOUT truncating history.
+    let missing_file = app_core::display_path(&env.workspace.join("missing_file.txt"));
+    let invalid_err = client
         .rpc_err(
             "session.rewind",
-            json!({ "sessionId": s_parent, "turnId": turn2_id, "restoreFiles": true }),
+            json!({
+                "sessionId": s_git,
+                "messageId": turn2_user_msg_id,
+                "resubmit": { "text": "edited text", "files": [missing_file] }
+            }),
         )
         .await;
-    assert!(
-        !nested_busy_err.is_empty(),
-        "rewinding parent workspace files must be rejected while a nested child workspace session is active"
-    );
+    assert!(!invalid_err.is_empty(), "missing attachment must fail rewind before truncation");
+    let untouched = client.rpc_ok("session.read", json!({ "sessionId": s_git })).await;
     assert_eq!(
-        std::fs::read_to_string(&tracked).expect("read tracked after rejected rewind"),
-        "v2\n",
-        "rejected rewind must not touch workspace files"
+        untouched.pointer("/history/turns").and_then(Value::as_array).map(Vec::len),
+        Some(3),
+        "failed atomic rewind must leave session history intact"
     );
 
-    child_gate.notify_one();
-    client.wait_settled(&s_child).await;
-
-    let rewound = client
+    // Atomic rewind with valid resubmit truncates and immediately starts the edited turn.
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "TURN_2_EDITED_OK", 70, 0, 15, "end_turn")));
+    let tracked_abs = app_core::display_path(&tracked);
+    let atomic_resubmit = client
         .rpc_ok(
             "session.rewind",
-            json!({ "sessionId": s_parent, "turnId": turn2_id, "restoreFiles": true }),
+            json!({
+                "sessionId": s_git,
+                "messageId": turn2_user_msg_id,
+                "resubmit": { "text": "edited prompt", "files": [tracked_abs] }
+            }),
         )
         .await;
-    let rewound_turns = rewound.pointer("/history/turns").and_then(Value::as_array).expect("rewound turns");
-    assert_eq!(rewound_turns.len(), 1, "rewind must truncate turn 2 from history");
-    assert!(!rewound.to_string().contains("TURN_2_MUTATED"));
     assert_eq!(
-        std::fs::read_to_string(&tracked).expect("read restored tracked file"),
-        "v1\n",
-        "rewind must restore modified file contents"
+        atomic_resubmit.pointer("/runtime/phase").and_then(Value::as_str),
+        Some("running"),
+        "atomic rewind+resubmit must start the edited turn immediately"
     );
-    assert!(!extra.exists(), "rewind must remove files added after the target turn");
+    client.wait_settled(&s_git).await;
+    let after_edit = client.rpc_ok("session.read", json!({ "sessionId": s_git })).await;
+    assert!(after_edit.to_string().contains("TURN_2_EDITED_OK"));
+    assert!(!after_edit.to_string().contains("TURN_2_MUTATED"));
+    let edited_turn2_user_msg_id = after_edit
+        .pointer("/history/turns/1/items")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("message")
+                        && item.get("role").and_then(Value::as_str) == Some("user")
+                })
+                .and_then(|item| item.get("id").and_then(Value::as_str))
+        })
+        .expect("edited turn 2 user message id")
+        .to_string();
+
+    // Pure rewind truncates history from turn 2 user message while keeping workspace files, ThreadName, and settings intact.
+    let rewound = client
+        .rpc_ok("session.rewind", json!({ "sessionId": s_git, "messageId": edited_turn2_user_msg_id }))
+        .await;
+    let rewound_turns = rewound.pointer("/history/turns").and_then(Value::as_array).expect("rewound turns");
+    assert_eq!(rewound_turns.len(), 1, "rewind must truncate turn 2 and failed turn from history");
+    assert!(!rewound.to_string().contains("TURN_2_MUTATED"));
+    assert_eq!(rewound.pointer("/history/summary/title").and_then(Value::as_str), Some("Keep Title"));
+    assert_eq!(
+        std::fs::read_to_string(&tracked).expect("read tracked after pure rewind"),
+        "v2\n",
+        "pure rewind must leave workspace files untouched"
+    );
+    assert!(extra.exists(), "pure rewind must leave extra.txt untouched");
 
     server.assert_no_protocol_violations();
     client.shutdown().await;
 
     let mut restarted = BackendClient::spawn(&env.home).await;
-    let after_restart = restarted.rpc_ok("session.read", json!({ "sessionId": s_parent })).await;
+    let after_restart = restarted.rpc_ok("session.read", json!({ "sessionId": s_git })).await;
     assert_eq!(
         rewound.pointer("/history/turns"),
         after_restart.pointer("/history/turns"),
         "rewound session history must persist identically across restart"
     );
-
-    let child_jsonl = env.home.join("sessions").join(format!("{s_child}.jsonl"));
-    let child_snapshot = env.home.join("sessions").join("snapshots").join(format!("{s_child}.git"));
-    assert!(child_jsonl.exists() && child_snapshot.exists(), "unopened child session files must exist");
-    restarted.rpc_ok("session.delete", json!({ "sessionId": s_child })).await;
-    assert!(!child_jsonl.exists(), "deleting unopened session must remove JSONL");
-    assert!(!child_snapshot.exists(), "deleting unopened session must remove snapshot directory");
+    assert_eq!(
+        after_restart.pointer("/history/summary/title").and_then(Value::as_str),
+        Some("Keep Title")
+    );
     restarted.shutdown().await;
 }

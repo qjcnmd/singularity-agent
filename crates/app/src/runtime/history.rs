@@ -6,7 +6,6 @@ use protocol::{
 
 struct IndexedTurn {
     turn_id: String,
-    has_snapshot: bool,
     status: TurnStatus,
     error: Option<protocol::TurnErrorDetail>,
     manually_stopped: bool,
@@ -24,7 +23,6 @@ impl IndexedTurn {
         let mut finished_at = None;
         let mut first_token_at = None;
         let mut tool_items = std::collections::HashMap::new();
-        let mut pending_turn_start = Some((self.turn_id.clone(), self.has_snapshot));
         for entry in &session.entries()[self.entries.clone()] {
             if let Some(observation) = entry.request_observation() {
                 accumulate_request_usage(usage, observation);
@@ -64,18 +62,7 @@ impl IndexedTurn {
                         if observation.is_some() {
                             agent::message::attach_usage(&mut public, usage);
                         }
-                        for mut item in public {
-                            if let HistoryItem::Message {
-                                role: protocol::HistoryMessageRole::User,
-                                turn_id,
-                                has_snapshot,
-                                ..
-                            } = &mut item
-                                && let Some((tid, snap)) = pending_turn_start.take()
-                            {
-                                *turn_id = Some(tid);
-                                *has_snapshot = snap;
-                            }
+                        for item in public {
                             if matches!(item, HistoryItem::Tool { .. }) {
                                 let call = calls.next().expect("public tools follow message order");
                                 tool_items.insert(call.tool_call_id.clone(), items.len());
@@ -140,7 +127,7 @@ fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
     for (position, entry) in entries.iter().enumerate() {
         if let SessionEntry::Record {
             id: turn_id,
-            record: LedgerRecord::OperationStarted { snapshot_tree },
+            record: LedgerRecord::OperationStarted,
             ..
         } = entry
         {
@@ -149,7 +136,6 @@ fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
             }
             turns.push(IndexedTurn {
                 turn_id: turn_id.clone(),
-                has_snapshot: snapshot_tree.is_some(),
                 status: TurnStatus::Interrupted,
                 error: None,
                 manually_stopped: false,
@@ -333,8 +319,7 @@ impl ThreadSummaryScan {
         }
         match entry {
             SessionEntry::Record {
-                record: LedgerRecord::OperationStarted { .. },
-                ..
+                record: LedgerRecord::OperationStarted, ..
             } => {
                 self.last_turn = Some((TurnStatus::Interrupted, false));
             }

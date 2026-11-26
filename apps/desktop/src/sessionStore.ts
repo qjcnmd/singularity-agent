@@ -3,6 +3,7 @@ import { loadPersisted, persistView, type PersistedView } from './viewPersistenc
 import { RpcFailure, RpcClient } from './rpcClient'
 import type { ConnectionStatus, SessionReadResult, StreamEnvelope, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
 import { DraftStore, type DraftSnapshot } from './drafts'
+import { workspaceKey } from './workspace'
 
 export const actionOrigin = {
   session: (id: string | null) => `session:${id}`,
@@ -31,8 +32,9 @@ interface SessionLoadState {
 
 export interface FileTab {
   id: string; path: string; cwd: string; title: string
-  mode: 'file' | 'diff'
+  mode: 'file' | 'diff' | 'changes'
   sessionId?: string
+  focusPath?: string
   opened: number
 }
 
@@ -230,7 +232,9 @@ export class SessionStore {
     } else if (recoveredBootstrap) {
       this.patch({ bootstrapLoad: { status: 'idle', error: null } })
     }
-    const state = reduceStream(this.state, frame)
+    const state = recoveredBootstrap
+      ? resetBaseline({ ...this.state, revision: Math.max(this.state.revision, frame.revision) }, frame.payload)
+      : reduceStream(this.state, frame)
     this.applySync(state, (frame.type === 'background_task_updated' && frame.payload.task.state.status === 'running')
       || (frame.type === 'turn_event' && (
         frame.payload.method === 'item/textDelta'
@@ -329,20 +333,32 @@ export class SessionStore {
       if (accepted !== this.state) this.applySync(accepted)
       else void this.readSession(id)
     }
-    this.bumpSessionDiffTabs(id)
+    this.bumpSessionDiffTabs(id, result.history.summary.cwd)
   }
 
-  protected bumpSessionDiffTabs(sessionId: string): void {
-    if (!this.state.fileTabs.some(tab => tab.mode === 'diff' && tab.sessionId === sessionId)) return
+  protected bumpSessionDiffTabs(sessionId: string, cwd: string): void {
+    const wsKey = workspaceKey(cwd)
+    const matches = (tab: FileTab) => (tab.mode === 'diff' && tab.sessionId === sessionId)
+      || (tab.mode === 'changes' && workspaceKey(tab.cwd) === wsKey)
+    if (!this.state.fileTabs.some(matches)) return
     this.patch({
-      fileTabs: this.state.fileTabs.map(tab =>
-        tab.mode === 'diff' && tab.sessionId === sessionId ? { ...tab, opened: tab.opened + 1 } : tab),
+      fileTabs: this.state.fileTabs.map(tab => matches(tab) ? { ...tab, opened: tab.opened + 1 } : tab),
     })
   }
 
   protected closeSessionDiffTabs(sessionIds: ReadonlySet<string>): void {
     const next = filterFileTabs(this.state.fileTabs, this.state.activeFileTab,
       tab => tab.mode !== 'diff' || tab.sessionId === undefined || !sessionIds.has(tab.sessionId))
+    if (next) this.patch(next)
+  }
+
+  protected closeWorkspaceTabs(workspaceRoot: string, sessionIds: ReadonlySet<string>): void {
+    const wsKey = workspaceKey(workspaceRoot)
+    const next = filterFileTabs(this.state.fileTabs, this.state.activeFileTab, tab => {
+      if (tab.mode === 'changes') return workspaceKey(tab.cwd) !== wsKey
+      if (tab.mode === 'diff') return tab.sessionId === undefined || !sessionIds.has(tab.sessionId)
+      return true
+    })
     if (next) this.patch(next)
   }
 
@@ -368,10 +384,14 @@ export class SessionStore {
         patch.selectedSessionId = pruned.selectedSessionId
         patch.sessionLoad = { status: 'idle', error: null }
       }
-      if (this.state.fileTabs.some(tab => tab.mode === 'diff')) {
+      if (this.state.fileTabs.some(tab => tab.mode === 'diff' || tab.mode === 'changes')) {
         const existingSessions = new Set(Object.values(bootstrap.sessionsByWorkspace).flat().map(item => item.threadId))
-        const retainedTabs = filterFileTabs(this.state.fileTabs, this.state.activeFileTab,
-          tab => tab.mode !== 'diff' || tab.sessionId === undefined || existingSessions.has(tab.sessionId))
+        const existingWorkspaces = new Set(bootstrap.workspaces.map(item => workspaceKey(item.root)))
+        const retainedTabs = filterFileTabs(this.state.fileTabs, this.state.activeFileTab, tab => {
+          if (tab.mode === 'changes') return existingWorkspaces.has(workspaceKey(tab.cwd))
+          if (tab.mode === 'diff') return tab.sessionId === undefined || existingSessions.has(tab.sessionId)
+          return true
+        })
         if (retainedTabs) Object.assign(patch, retainedTabs)
       }
     }

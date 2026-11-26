@@ -84,6 +84,7 @@ pub(crate) fn parse_openai_responses_response(
         return Err(provider_embedded_error(
             &provider_error_fields(error),
             "provider Responses payload contained an error",
+            &config.api_key,
         ));
     }
     let status = payload.get("status").and_then(Value::as_str);

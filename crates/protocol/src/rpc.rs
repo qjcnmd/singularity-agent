@@ -195,30 +195,56 @@ pub struct UpdateSettingsParams {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionChangedFilesParams {
-    pub session_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
-    pub turn_id: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub workspace_root: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(as = "Option<bool>", optional))]
+    pub include_diffs: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionFileDiffParams {
-    pub session_id: String,
+    #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub workspace_root: Option<String>,
     pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
-    pub turn_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRewindInput {
+    pub text: String,
+    #[serde(default)]
+    pub images: Vec<ImageUpload>,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    #[cfg_attr(
+        feature = "typescript",
+        ts(as = "Option<Vec<crate::MessageAnnotation>>", optional)
+    )]
+    pub annotations: Vec<crate::MessageAnnotation>,
+}
+
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRewindParams {
     pub session_id: String,
-    pub turn_id: String,
-    pub restore_files: bool,
+    pub message_id: String,
+    #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub resubmit: Option<SessionRewindInput>,
 }
 
 macro_rules! rpc_methods {

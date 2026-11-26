@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::display_path;
@@ -53,46 +52,6 @@ pub fn same_saved_path(left: &str, right: &str) -> bool {
     saved_path_key(left) == saved_path_key(right)
 }
 
-pub fn workspace_key_contains(ancestor_key: &str, candidate_key: &str) -> bool {
-    let ancestor_norm = normalize_workspace_key(ancestor_key);
-    let candidate_norm = normalize_workspace_key(candidate_key);
-    let ancestor = trim_trailing_slashes(&ancestor_norm);
-    let candidate = trim_trailing_slashes(&candidate_norm);
-    if ancestor.is_empty() || candidate.is_empty() {
-        return false;
-    }
-    if ancestor == candidate {
-        return true;
-    }
-    let Some(rest) = candidate.strip_prefix(ancestor) else {
-        return false;
-    };
-    ancestor.ends_with('/') || rest.starts_with('/')
-}
-
-pub fn workspace_keys_overlap(left_key: &str, right_key: &str) -> bool {
-    workspace_key_contains(left_key, right_key) || workspace_key_contains(right_key, left_key)
-}
-
-fn normalize_workspace_key(key: &str) -> Cow<'_, str> {
-    if key.bytes().any(|b| b == b'\\' || b.is_ascii_uppercase()) || !key.is_ascii() {
-        Cow::Owned(key.replace('\\', "/").to_lowercase())
-    } else {
-        Cow::Borrowed(key)
-    }
-}
-
-fn trim_trailing_slashes(key: &str) -> &str {
-    let trimmed = key.trim_end_matches('/');
-    if trimmed.is_empty() {
-        if key.is_empty() { "" } else { "/" }
-    } else if trimmed.ends_with(':') && key.len() > trimmed.len() {
-        &key[..trimmed.len() + 1]
-    } else {
-        trimmed
-    }
-}
-
 pub fn canonicalize_workspace(path: impl AsRef<Path>) -> Result<CanonicalWorkspacePath, String> {
     let requested = path.as_ref();
     let native = std::fs::canonicalize(requested)
@@ -118,36 +77,4 @@ pub(crate) fn project_root(cwd: &Path) -> Result<PathBuf, String> {
         }
     }
     Ok(cwd.to_path_buf())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{workspace_key_contains, workspace_keys_overlap};
-
-    #[test]
-    fn workspace_key_containment_handles_roots_case_separators_and_prefix_traps() {
-        assert!(workspace_key_contains("c:/repo", "c:/repo"));
-        assert!(workspace_key_contains("C:/Repo", "c:/repo/sub/dir"));
-        assert!(workspace_key_contains(r"C:\Repo\", "c:/repo"));
-        assert!(workspace_key_contains(r"c:\", r"C:\Users\dev"));
-        assert!(workspace_key_contains("c:/", "c:/project"));
-        assert!(workspace_key_contains("/", "/var/tmp"));
-        assert!(workspace_key_contains("//server/share/", "//server/share/sub"));
-
-        assert!(!workspace_key_contains("c:/foo", "c:/foobar"));
-        assert!(!workspace_key_contains("/foo", "/foobar"));
-        assert!(!workspace_key_contains("//server/share", "//server/share2"));
-        assert!(!workspace_key_contains("c:/", "d:/project"));
-        assert!(!workspace_key_contains("", "c:/repo"));
-        assert!(!workspace_key_contains("c:/repo", ""));
-    }
-
-    #[test]
-    fn workspace_keys_overlap_is_symmetric_and_rejects_siblings() {
-        assert!(workspace_keys_overlap("c:/repo", "c:/repo/child"));
-        assert!(workspace_keys_overlap("c:/repo/child", "C:\\Repo"));
-        assert!(workspace_keys_overlap("c:/", "c:/a/b"));
-        assert!(!workspace_keys_overlap("c:/repo", "c:/repo-other"));
-        assert!(!workspace_keys_overlap("c:/a", "c:/b"));
-    }
 }

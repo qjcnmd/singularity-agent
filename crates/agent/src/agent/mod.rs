@@ -137,6 +137,10 @@ impl RequestContext {
     pub fn model_configuration(&self) -> model::ModelConfigurationSnapshot {
         self.provider.model_configuration()
     }
+
+    pub fn model_identity(&self) -> (String, String) {
+        (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned())
+    }
 }
 
 #[derive(Debug)]
@@ -321,8 +325,6 @@ impl Agent {
                 annotations: input.annotations.clone(),
                 role: protocol::HistoryMessageRole::User,
                 status: protocol::TurnStatus::Completed,
-                turn_id: None,
-                has_snapshot: false,
             },
         }));
         Ok(())

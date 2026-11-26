@@ -21,7 +21,7 @@ pub(crate) async fn read_responses_sse_stream(
     selection: &SelectedModel,
     endpoint: &str,
 ) -> ModelTurnResponse {
-    let mut decoder = ResponsesSseDecoder::new(on_event);
+    let mut decoder = ResponsesSseDecoder::new(on_event, &config.api_key);
     let result = read_sse_stream(cancellation, response, &mut decoder).await;
     decoder.finish(result, config, selection, endpoint)
 }
@@ -33,6 +33,7 @@ struct ResponsesSseDecoder<'a> {
     last_summary_index: Option<u64>,
     pending_reasoning_separator: bool,
     received_event: bool,
+    api_key: &'a str,
     on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send),
 }
 
@@ -134,7 +135,11 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                 let fields = provider_error_fields(
                     payload.get("error").filter(|error| error.is_object()).unwrap_or(&payload),
                 );
-                return Err(provider_embedded_error(&fields, "provider Responses stream returned an error"));
+                return Err(provider_embedded_error(
+                    &fields,
+                    "provider Responses stream returned an error",
+                    self.api_key,
+                ));
             }
             "response.failed" => {
                 let fields = payload
@@ -142,7 +147,11 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                     .and_then(|response| response.get("error"))
                     .map(provider_error_fields)
                     .unwrap_or_default();
-                return Err(provider_embedded_error(&fields, "provider Responses stream failed"));
+                return Err(provider_embedded_error(
+                    &fields,
+                    "provider Responses stream failed",
+                    self.api_key,
+                ));
             }
             _ => {}
         }
@@ -156,7 +165,7 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
 }
 
 impl<'a> ResponsesSseDecoder<'a> {
-    fn new(on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send)) -> Self {
+    fn new(on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send), api_key: &'a str) -> Self {
         Self {
             terminal_response: None,
             text: String::new(),
@@ -164,6 +173,7 @@ impl<'a> ResponsesSseDecoder<'a> {
             last_summary_index: None,
             pending_reasoning_separator: false,
             received_event: false,
+            api_key,
             on_event,
         }
     }

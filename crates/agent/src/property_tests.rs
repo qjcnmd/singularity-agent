@@ -253,7 +253,7 @@ proptest! {
             let data = manager.data();
             let active_before = resolve_context_entries(data);
             let Some((split_idx, first_kept_id)) =
-                select_compactable_split(&active_before, data, round.retain_tokens)
+                select_compactable_split(&active_before, data, round.retain_tokens, ("p", "m"))
             else {
                 continue;
             };
@@ -370,7 +370,7 @@ proptest! {
             provider_metadata: Some(meta),
         };
         mgr.append_message_with_id("a1", assistant, Some(obs), None).expect("append a1");
-        mgr.append_record(LedgerRecord::OperationStarted { snapshot_tree: None })
+        mgr.append_record(LedgerRecord::OperationStarted)
             .expect("append turn boundary");
         mgr.append_message_with_id("u2", Message::user(turn2_user.as_str()), None, None).expect("append u2");
         let tail = message_token_estimate(&Message::user(turn2_user.as_str()));
@@ -472,20 +472,40 @@ proptest! {
     }
 
     #[test]
-    fn rewind_before_turn_preserves_latest_settings_and_name(
+    fn rewind_before_message_preserves_latest_settings_and_name(
         turns in 2usize..=5,
         rewind_to in 0usize..5,
+        mid_turn in any::<bool>(),
         rename_after in any::<bool>(),
         reselect_after in any::<bool>(),
     ) {
         let rewind_idx = rewind_to % turns;
         let (_tmp, sessions, sid, mut mgr) = new_test_session("rewind-meta", "p0", "m0");
-        let mut turn_ids = Vec::new();
+        let mut target_id = String::new();
+        let mut target_turn_id = String::new();
         for t in 0..turns {
             let tid = format!("turn_{t}");
-            mgr.append_operation_started(tid.clone(), None).expect("start turn");
-            mgr.append_message_with_id(&format!("u_{t}"), Message::user(format!("msg {t}")), None, None)
+            mgr.append_operation_started(tid.clone()).expect("start turn");
+            let uid = format!("u_{t}");
+            mgr.append_message_with_id(&uid, Message::user(format!("msg {t}")), None, None)
                 .expect("user msg");
+            mgr.append_message_with_id(
+                &format!("a_{t}"),
+                Message::assistant(format!("reply {t}"), String::new(), Vec::new(), None),
+                None,
+                None,
+            )
+            .expect("assistant msg");
+            let mid_uid = format!("u_mid_{t}");
+            if mid_turn && t == rewind_idx {
+                mgr.append_message_with_id(&mid_uid, Message::user("steer"), None, None)
+                    .expect("mid-turn user msg");
+                target_id = format!("{mid_uid}:text:0");
+                target_turn_id = tid.clone();
+            } else if t == rewind_idx {
+                target_id = format!("{uid}:text:0");
+                target_turn_id = tid.clone();
+            }
             if t == turns - 1 && reselect_after {
                 mgr.append_metadata(SessionMetadata::ThreadSettings {
                     selection: ModelSelection {
@@ -500,14 +520,41 @@ proptest! {
                 mgr.append_metadata(SessionMetadata::ThreadName { name: "Renamed Title".into() })
                     .expect("append latest name");
             }
-            turn_ids.push(tid);
+            mgr.append_record(LedgerRecord::OperationFinished {
+                turn_id: tid,
+                outcome: protocol::TurnStatus::Completed,
+                error: None,
+                user_stopped: false,
+            })
+            .expect("finish turn");
         }
 
-        mgr.rewind_before_turn(&turn_ids[rewind_idx]).expect("rewind succeeds");
+        mgr.rewind_before_message(&target_id).expect("rewind succeeds");
         let reloaded = SessionData::open(&sessions.join(session_file_name(&sid))).expect("reopen after rewind");
 
-        let has_rewound_turn = reloaded.entries().iter().any(|e| e.id() == turn_ids[rewind_idx]);
-        prop_assert!(!has_rewound_turn, "rewound turn must be removed");
+        let raw_target = target_id.strip_suffix(":text:0").unwrap_or(&target_id);
+        prop_assert!(!reloaded.entries().iter().any(|e| e.id() == raw_target), "rewound message must be removed");
+        if mid_turn {
+            prop_assert!(
+                reloaded.entries().iter().any(|e| matches!(
+                    e,
+                    SessionEntry::Record {
+                        record: LedgerRecord::OperationFinished {
+                            turn_id,
+                            outcome: protocol::TurnStatus::Completed,
+                            ..
+                        },
+                        ..
+                    } if turn_id == &target_turn_id
+                )),
+                "mid-turn rewind must cleanly close the preceding turn"
+            );
+        } else {
+            prop_assert!(
+                !reloaded.entries().iter().any(|e| e.id() == target_turn_id),
+                "turn-start rewind must remove OperationStarted"
+            );
+        }
 
         let latest_sel = reloaded.entries().iter().rev().find_map(|e| match e {
             SessionEntry::Metadata { metadata: SessionMetadata::ThreadSettings { selection }, .. } => {
@@ -556,7 +603,7 @@ fn overflow_compaction_recovers_after_definition_growth() {
     )
     .expect("a1");
     mgr.record_reply_definition_tokens("a1".into(), 1_000);
-    mgr.append_record(LedgerRecord::OperationStarted { snapshot_tree: None }).expect("turn 2");
+    mgr.append_record(LedgerRecord::OperationStarted).expect("turn 2");
     mgr.append_message_with_id("u2", Message::user("next"), None, None).expect("u2");
 
     let model = ModelConfigurationSnapshot {

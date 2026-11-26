@@ -58,6 +58,7 @@ impl Conversation {
     pub(super) fn pause_background_resume(&self) {
         let mut state = self.lock_state();
         state.auto_resume = false;
+        state.steering_inbox.lock().expect("turn inbox lock poisoned").cancel();
         if let TurnLifecycle::Running(controls) = &state.turn {
             controls.cancellation().cancel();
         }

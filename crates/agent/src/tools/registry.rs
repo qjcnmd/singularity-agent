@@ -37,6 +37,7 @@ pub(crate) struct ToolExecution {
     pub is_error: bool,
     pub duration_ms: Option<u64>,
     pub read_source: Option<protocol::ReadSource>,
+    pub file_created: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -54,6 +55,7 @@ impl ToolExecution {
             is_error: false,
             duration_ms: None,
             read_source: None,
+            file_created: None,
         }
     }
 

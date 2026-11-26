@@ -1,6 +1,16 @@
-import { useLayoutEffect, useRef, useState, type CSSProperties, type PointerEvent, type WheelEvent } from 'react'
+import { useLayoutEffect, useRef, useState, type CSSProperties, type MouseEvent, type PointerEvent, type WheelEvent } from 'react'
 import { X } from 'lucide-react'
 import { Dialog } from './Dialog'
+
+export function interceptSvgLinkClick(event: MouseEvent<HTMLElement>, suppressOpen = false): void {
+  const link = event.target instanceof Element ? event.target.closest('a[href], a[xlink\\:href]') : null
+  if (!link) return
+  event.preventDefault()
+  event.stopPropagation()
+  if (suppressOpen) return
+  const href = link.getAttribute('href') ?? link.getAttribute('xlink:href') ?? ''
+  if (/^https?:\/\//.test(href)) window.open(href, '_blank', 'noopener')
+}
 
 type View = { x: number; y: number; scale: number }
 
@@ -16,6 +26,7 @@ export function DiagramViewer({ svg, width, height, style, onClose }: { svg: str
   const [view, setView] = useState<View | null>(null)
   const [stageHeight, setStageHeight] = useState<number>()
   const drag = useRef<{ startX: number; startY: number; view: View; moved: boolean } | null>(null)
+  const lastDragged = useRef(false)
 
   useLayoutEffect(() => {
     const { clientWidth } = stage.current!
@@ -41,6 +52,7 @@ export function DiagramViewer({ svg, width, height, style, onClose }: { svg: str
   }
   const press = (event: PointerEvent<HTMLDivElement>) => {
     if (!view || event.button !== 0) return
+    lastDragged.current = false
     event.currentTarget.setPointerCapture(event.pointerId)
     drag.current = { startX: event.clientX, startY: event.clientY, view, moved: false }
   }
@@ -54,6 +66,7 @@ export function DiagramViewer({ svg, width, height, style, onClose }: { svg: str
   const release = (event: PointerEvent<HTMLDivElement>) => {
     const current = drag.current
     drag.current = null
+    lastDragged.current = Boolean(current?.moved)
     if (current && !current.moved && !document.elementFromPoint(event.clientX, event.clientY)?.closest('.diagram-viewer-canvas svg > g')) onClose()
   }
 
@@ -63,6 +76,7 @@ export function DiagramViewer({ svg, width, height, style, onClose }: { svg: str
     <div ref={stage} className="diagram-viewer-stage" style={{ height: stageHeight }}
       onWheel={zoom} onPointerDown={press} onPointerMove={move} onPointerUp={release} onPointerCancel={() => { drag.current = null }}>
       {view && <div className="diagram-viewer-canvas" style={{ ...style, width, height, transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }}
+        onClickCapture={(event: MouseEvent<HTMLDivElement>) => { interceptSvgLinkClick(event, lastDragged.current); lastDragged.current = false }}
         dangerouslySetInnerHTML={{ __html: svg }} />}
     </div>
   </Dialog>

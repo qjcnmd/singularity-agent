@@ -13,19 +13,16 @@ impl Conversation {
     pub(super) async fn run_single_turn(
         self: &Arc<Self>,
         controls: &Arc<crate::runtime::conversation::TurnControls>,
+        prepared_context: Option<Box<RequestContext>>,
         sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<TurnStatus, TurnErrorDetail> {
         let conversation = Arc::clone(self);
         let preparing = Arc::clone(controls);
-        let prepared = tokio::task::spawn_blocking(move || conversation.prepare_turn(&preparing))
-            .await
-            .expect("turn preparation completes while the runtime is running");
-        let ReadyTurn {
-            mut agent,
-            started_at,
-            context_window,
-            has_snapshot,
-        } = match prepared {
+        let prepared =
+            tokio::task::spawn_blocking(move || conversation.prepare_turn(&preparing, prepared_context))
+                .await
+                .expect("turn preparation completes while the runtime is running");
+        let ReadyTurn { mut agent, started_at, context_window } = match prepared {
             Ok(PreparedTurn::Ready(ready)) => *ready,
             Ok(PreparedTurn::Cancelled) => {
                 controls.finish_cancel();
@@ -48,23 +45,7 @@ impl Conversation {
         sink(AgentEvent::Turn(TurnEvent::TurnStarted { turn, started_at }));
 
         let run_result = {
-            let mut pending_turn_start = Some((turn_id.clone(), has_snapshot));
-            let mut on_event = |mut event: AgentEvent| match &mut event {
-                AgentEvent::Turn(TurnEvent::ItemUpdated {
-                    item:
-                        protocol::HistoryItem::Message {
-                            role: protocol::HistoryMessageRole::User,
-                            turn_id: item_turn_id,
-                            has_snapshot: item_has_snapshot,
-                            ..
-                        },
-                }) => {
-                    if let Some((tid, snap)) = pending_turn_start.take() {
-                        *item_turn_id = Some(tid);
-                        *item_has_snapshot = snap;
-                    }
-                    sink(event);
-                }
+            let mut on_event = |event: AgentEvent| match &event {
                 AgentEvent::Turn(TurnEvent::ItemUpdated { item })
                     if matches!(
                         item,
@@ -142,48 +123,25 @@ impl Conversation {
     fn prepare_turn(
         &self,
         controls: &crate::runtime::conversation::TurnControls,
+        prepared_context: Option<Box<RequestContext>>,
     ) -> Result<PreparedTurn, TurnErrorDetail> {
         if controls.cancellation().is_cancelled() {
             return Ok(PreparedTurn::Cancelled);
         }
         let inbox = Arc::clone(&self.lock_state().steering_inbox);
-        let context = self.prepare_request_context()?;
+        let context = match prepared_context {
+            Some(context) => *context,
+            None => self.prepare_request_context()?,
+        };
         let context_window = context.context_window();
         let agent = Agent::new(context, inbox, Arc::clone(&controls.questions), Arc::clone(&self.bash_tasks));
         if controls.cancellation().is_cancelled() {
             return Ok(PreparedTurn::Cancelled);
         }
-        let (snapshot_dir, cwd) = {
-            let writer = lock_writer(&self.writer);
-            let data = writer.data();
-            (data.snapshot_directory(), data.cwd().to_path_buf())
-        };
-        let snapshot_tree = match agent::session::snapshot::capture(&snapshot_dir, &cwd) {
-            Ok(tree) => Some(tree),
-            Err(error) => {
-                tracing::warn!(
-                    session_id = %self.thread_id,
-                    turn_id = %controls.turn_id,
-                    error = %error,
-                    "failed to capture pre-turn snapshot"
-                );
-                None
-            }
-        };
-        if controls.cancellation().is_cancelled() {
-            return Ok(PreparedTurn::Cancelled);
-        }
-        let has_snapshot = snapshot_tree.is_some();
         let mut writer = lock_writer(&self.writer);
-        let started_at = writer
-            .append_operation_started(controls.turn_id.clone(), snapshot_tree)
-            .map_err(preparation_error)?;
-        Ok(PreparedTurn::Ready(Box::new(ReadyTurn {
-            agent,
-            started_at,
-            context_window,
-            has_snapshot,
-        })))
+        let started_at =
+            writer.append_operation_started(controls.turn_id.clone()).map_err(preparation_error)?;
+        Ok(PreparedTurn::Ready(Box::new(ReadyTurn { agent, started_at, context_window })))
     }
 
     pub(crate) fn begin_context_preview(self: &Arc<Self>, signal: &CancellationToken) -> ContextPreview {
@@ -241,8 +199,25 @@ impl Conversation {
         result
     }
 
+    pub(crate) fn prepare_resubmit_context(
+        &self,
+    ) -> Result<(protocol::ModelSelection, agent::agent::RequestContext), ConversationError> {
+        let selection = self.model();
+        let context = self
+            .prepare_request_context_for(&selection)
+            .map_err(|error| ConversationError::Message(error.message))?;
+        Ok((selection, context))
+    }
+
     pub(super) fn prepare_request_context(&self) -> Result<RequestContext, TurnErrorDetail> {
-        let provider = ModelClient::new(&self.models, &self.model()).map_err(preparation_error)?;
+        self.prepare_request_context_for(&self.model())
+    }
+
+    fn prepare_request_context_for(
+        &self,
+        selection: &protocol::ModelSelection,
+    ) -> Result<RequestContext, TurnErrorDetail> {
+        let provider = ModelClient::new(&self.models, selection).map_err(preparation_error)?;
         let instruction_home = self.home.clone();
         let initial_instructions =
             app_core::load_agent_instructions(std::path::Path::new(&self.cwd), &instruction_home)
@@ -266,7 +241,6 @@ struct ReadyTurn {
     agent: Agent,
     started_at: String,
     context_window: u64,
-    has_snapshot: bool,
 }
 
 enum PreparedTurn {

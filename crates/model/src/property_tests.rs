@@ -5,13 +5,13 @@ use protocol::ProviderApiProtocol;
 use serde_json::{Map, Value, json};
 
 use crate::config::selection::{ProviderConfig, SelectedModel};
+use crate::error::redact_diagnostic;
 use crate::messages::{messages_stream_request_payload, stream::decode_messages_events_for_test};
 use crate::responses::{openai_responses_stream_request_payload, parse_openai_responses_response};
 use crate::transport::stream::decode_sse_chunks;
 use crate::types::{
     ContentBlock, Message, ModelToolCall, ModelTurnRequest, ProviderBlockMetadata, ProviderMessageMetadata,
 };
-use crate::web::redact_web_diagnostic;
 
 const OTHER_MSG_SIG: &str = "PRIVATE_OTHER_MESSAGES_SIG_DO_NOT_LEAK";
 const OTHER_RESP_ENC: &str = "PRIVATE_OTHER_RESPONSES_ENC_DO_NOT_LEAK";
@@ -460,7 +460,7 @@ proptest! {
             tokens[0],
             parts.join(", ")
         );
-        let redacted = redact_web_diagnostic(&body, &tokens[0]);
+        let redacted = redact_diagnostic(&body, &tokens[0]);
         for tok in &tokens {
             prop_assert!(!redacted.contains(tok), "leaked bearer token `{tok}` in `{redacted}`");
         }

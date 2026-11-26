@@ -146,7 +146,7 @@ function SidebarView() {
           >设置</button>
         </footer>
       </div></aside>
-      <SidebarDialog state={dialog} onClose={() => setDialog(current => current === dialog ? { kind: 'none' } : current)} />
+      {dialog.kind !== 'none' && <SidebarDialog state={dialog} onClose={() => setDialog(current => current === dialog ? { kind: 'none' } : current)} />}
     </>
   )
 }
@@ -210,24 +210,21 @@ function SessionButton({
   )
 }
 
-function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () => void }) {
+function SidebarDialog({ state, onClose }: { state: Exclude<PendingDialog, { kind: 'none' }>; onClose: () => void }) {
   const [name, setName] = useState('')
   const { actionErrors, pendingActions } = useAppStore(['actionErrors', 'pendingActions'])
   const method = state.kind === 'rename' ? 'session.rename' : state.kind === 'delete' ? 'session.delete' : 'workspace.remove'
-  const origin = state.kind === 'none'
-    ? null
-    : state.kind === 'remove'
-      ? actionOrigin.inline(method, workspaceKey(state.workspace.root))
-      : actionOrigin.inline(method, state.session.threadId)
-  const busy = origin !== null && pendingActions.has(pendingKey(method, origin))
+  const origin = state.kind === 'remove'
+    ? actionOrigin.inline(method, workspaceKey(state.workspace.root))
+    : actionOrigin.inline(method, state.session.threadId)
+  const busy = pendingActions.has(pendingKey(method, origin))
   const close = () => { if (!busy) onClose() }
   const initialName = state.kind === 'rename' ? state.session.title ?? '' : ''
   useEffect(() => {
     setName(initialName)
-    if (origin !== null) appStore.clearError(origin)
+    appStore.clearError(origin)
   }, [initialName, origin])
-  const failure = origin === null ? undefined : actionErrors[origin]
-  if (state.kind === 'none') return null
+  const failure = actionErrors[origin]
   if (state.kind === 'rename') {
     const submit = async () => {
       if (name.trim() === '') return

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { animate, motion, useMotionValue, useMotionValueEvent, useReducedMotion, useTransform } from 'motion/react'
 
 const thumbSize = 24
@@ -7,7 +7,6 @@ const edge = thumbSize / 2 + thumbInset
 const sliderSpring = { type: 'spring', stiffness: 420, damping: 30, mass: 0.8 } as const
 const clamp = (value: number) => Math.min(1, Math.max(0, value))
 const along = (ratio: number) => `calc((100% - ${edge * 2}px) * ${ratio} + ${edge}px)`
-const filled = (ratio: number) => `calc((100% - ${edge * 2}px) * ${ratio} + ${edge * 2}px)`
 
 export function EffortSlider({ variants, selectedIndex, onCommit }: {
   variants: string[]
@@ -20,16 +19,27 @@ export function EffortSlider({ variants, selectedIndex, onCommit }: {
   const track = useRef<HTMLDivElement>(null)
   const drag = useRef<{ grabOffset: number } | null>(null)
   const ratio = useMotionValue(selectedIndex / last)
+  const travel = useMotionValue(0)
   const [liveIndex, setLiveIndex] = useState(selectedIndex)
   const [pressed, setPressed] = useState(false)
+
+  useLayoutEffect(() => {
+    const node = track.current
+    if (!node) return
+    const syncTravel = () => travel.set(Math.max(0, node.clientWidth - edge * 2))
+    syncTravel()
+    const observer = new ResizeObserver(syncTravel)
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [travel])
 
   useMotionValueEvent(ratio, 'change', value => setLiveIndex(Math.round(clamp(value) * last)))
   useEffect(() => {
     if (!drag.current) animate(ratio, selectedIndex / last, transition)
   }, [selectedIndex, last, ratio, reduced])
 
-  const fillWidth = useTransform(ratio, filled)
-  const thumbLeft = useTransform(ratio, along)
+  const fillX = useTransform([ratio, travel], ([r, t]: number[]) => (r - 1) * t)
+  const thumbX = useTransform([ratio, travel], ([r, t]: number[]) => r * t)
 
   const ratioAt = (clientX: number, grabOffset: number) => {
     const rect = track.current!.getBoundingClientRect()
@@ -77,7 +87,9 @@ export function EffortSlider({ variants, selectedIndex, onCommit }: {
     <div className="effort">
       <div className="effort-head">{variants[liveIndex]}</div>
       <div ref={track} className="track" onPointerDown={press} onPointerMove={move} onPointerUp={release} onPointerCancel={release}>
-        <motion.div className="track-fill" style={{ width: fillWidth }} />
+        <div className="track-clip" aria-hidden="true">
+          <motion.div className="track-fill" style={{ x: fillX }} />
+        </div>
         <div className="track-stops" aria-hidden="true">
           {variants.map((variant, index) => (
             <span
@@ -88,7 +100,7 @@ export function EffortSlider({ variants, selectedIndex, onCommit }: {
             />
           ))}
         </div>
-        <motion.div className="track-thumb" style={{ left: thumbLeft }} data-pressed={pressed} />
+        <motion.div className="track-thumb" style={{ x: thumbX }} data-pressed={pressed} />
         <input
           type="range"
           min={0}

@@ -47,7 +47,7 @@ pub async fn discover(
         apply_provider_auth(client.get(crate::provider::endpoint(base_url, "/models")), protocol, api_key)?;
     let response = request.send().await.map_err(discovery_transport_error)?;
     if !response.status().is_success() {
-        return Err(discovery_http_error(response).await);
+        return Err(discovery_http_error(response, api_key).await);
     }
     let body: Value = read_response_body(response).await?;
     read_listing(&body)
@@ -97,14 +97,14 @@ fn read_listing(body: &Value) -> Result<Vec<String>, ProviderError> {
     Ok(models.into_iter().collect())
 }
 
-async fn discovery_http_error(response: reqwest::Response) -> ProviderError {
+async fn discovery_http_error(response: reqwest::Response, api_key: &str) -> ProviderError {
     let status = response.status().as_u16();
     let mut error = ProviderError::new(
         provider_error_kind_for_http_status(status),
         format!("获取模型失败：HTTP {status}。"),
     );
     match read_bounded_body(response, MAX_HTTP_ERROR_BODY_BYTES, None).await {
-        Ok(body) => apply_provider_error_body(&mut error, &body),
+        Ok(body) => apply_provider_error_body(&mut error, &body, api_key),
         Err(BoundedBodyReadError::Transport(read_error)) => {
             let _ =
                 write!(error.message, " 无法读取提供方错误响应（{}）。", transport_error_source(read_error));

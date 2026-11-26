@@ -35,15 +35,16 @@ function Invoke-Step {
 function Test-ProdSourcePath([string]$RelPath) {
     if (-not $RelPath) { return $false }
     $p = $RelPath.Replace('\', '/')
-    if ($p -match '(^|/)(tests|e2e|node_modules|dist|dist-desktop)(/|$)') { return $false }
+    if ($p -match '(^|/)(tests|e2e|node_modules|dist)(/|$)') { return $false }
     ($p -match '^crates/[^/]+/src/.+\.rs$' -and $p -notmatch '(^|/)property_tests\.rs$') -or
         ($p -match '^apps/desktop/desktop/.+\.(ts|tsx|cts)$') -or
-        ($p -match '^apps/desktop/src/.+\.(ts|tsx)$' -and $p -ne 'apps/desktop/src/protocol.generated.ts')
+        ($p -match '^apps/desktop/src/.+\.(ts|tsx)$' -and $p -ne 'apps/desktop/src/protocol.generated.ts') -or
+        ($p -match '^scripts/.+\.ps1$')
 }
 
 function Invoke-SizeCheck {
     $maxLines = 600
-    $roots = @('crates', 'apps/desktop/desktop', 'apps/desktop/src')
+    $roots = @('crates', 'apps/desktop/desktop', 'apps/desktop/src', 'scripts')
     $files = @(Get-ChildItem -Path $roots -Recurse -File | ForEach-Object {
         $rel = [System.IO.Path]::GetRelativePath($repoRoot, $_.FullName).Replace('\', '/')
         if (Test-ProdSourcePath $rel) {

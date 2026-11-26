@@ -3,7 +3,7 @@ import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import { formatTokenCount } from '../copy'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import type { ProviderConfigurationInput, RedactedProvider } from '../protocol'
-import { blankModel, capacityConfigurationError, isConfigurationIdentifier, reasoningConfigurationError } from '../modelConfiguration'
+import { apiBaseUrlError, blankModel, capacityConfigurationError, isConfigurationIdentifier, reasoningConfigurationError } from '../modelConfiguration'
 import { ModelEditor } from './ModelEditor'
 import { Dialog } from './Dialog'
 import { ProtocolPicker } from './ProtocolPicker'
@@ -93,15 +93,10 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
       setFailure('该提供方 ID 已存在，请编辑已有提供方。')
       return
     }
-    let url: URL
-    try {
-      url = new URL(baseUrl)
-    } catch {
-      setFailure('请输入完整的 API 地址。')
-      return
-    }
-    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
-      setFailure('API 地址必须为 http 或 https 地址，不含凭据、查询或片段。')
+    const trimmedUrl = baseUrl.trim()
+    const urlError = apiBaseUrlError(trimmedUrl)
+    if (urlError !== null) {
+      setFailure(urlError)
       return
     }
     const submitted: ModelInput[] = []
@@ -124,7 +119,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
       }
       submitted.push(normalized)
     }
-    const result = await appStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl, apiProtocol: protocol, models: submitted }, apiKey.trim())
+    const result = await appStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl: trimmedUrl, apiProtocol: protocol, models: submitted }, apiKey.trim())
     if (result) {
       setApiKey('')
       onDone()

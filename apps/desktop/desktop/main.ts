@@ -45,8 +45,12 @@ function show(): void {
   window.focus()
 }
 
+function isAppEntry(url: string): boolean {
+  return url.split('#', 1)[0] === APP_ENTRY
+}
+
 function trusted(event: Electron.IpcMainInvokeEvent): void {
-  if (event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || event.senderFrame.url !== APP_ENTRY) {
+  if (event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || !isAppEntry(event.senderFrame.url)) {
     throw new Error('Untrusted desktop IPC sender')
   }
 }
@@ -74,7 +78,7 @@ async function start(): Promise<void> {
     webPreferences: { preload: join(fileURLToPath(new URL('.', import.meta.url)), 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
   })
   Menu.setApplicationMenu(Menu.buildFromTemplate([{ label: APP_NAME, submenu: [
-    { label: '刷新工作台', accelerator: 'CmdOrCtrl+R', click: () => window.reload() },
+    { label: '刷新工作台', accelerator: 'CmdOrCtrl+R', click: () => { void window.loadURL(APP_ENTRY) } },
     { role: 'toggleDevTools' }, { type: 'separator' }, { label: '退出', click: () => app.quit() },
   ] }, { role: 'editMenu' }]))
   window.setMenuBarVisibility(false)
@@ -85,7 +89,7 @@ async function start(): Promise<void> {
   window.webContents.on('will-navigate', (event, url) => { if (url !== APP_ENTRY) event.preventDefault() })
   window.webContents.on('did-start-loading', () => { subscribed = false })
   window.webContents.session.setPermissionRequestHandler((contents, permission, callback) => {
-    callback(contents === window.webContents && contents.getURL() === APP_ENTRY && permission === 'clipboard-sanitized-write')
+    callback(contents === window.webContents && isAppEntry(contents.getURL()) && permission === 'clipboard-sanitized-write')
   })
   backend.on('frame', frame => { if (subscribed && !window.isDestroyed()) window.webContents.send(IPC_CHANNELS.frame, frame) })
   ipcMain.handle(IPC_CHANNELS.connect, async event => {

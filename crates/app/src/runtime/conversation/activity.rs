@@ -39,8 +39,6 @@ impl Activity {
                             files: Vec::new(),
                             annotations: Vec::new(),
                             status: TurnStatus::Running,
-                            turn_id: None,
-                            has_snapshot: false,
                         }
                     });
                 }
@@ -67,6 +65,7 @@ impl Activity {
                         background_task_id: None,
                         images: Vec::new(),
                         read_source: None,
+                        file_created: None,
                         is_error: false,
                         duration_ms: None,
                     });

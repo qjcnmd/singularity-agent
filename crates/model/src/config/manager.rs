@@ -70,14 +70,26 @@ impl ModelConfigManager {
     pub fn discovery_credential(
         &self,
         provider_id: &str,
+        base_url: &str,
         api_key: Option<&str>,
     ) -> Result<String, ProviderError> {
         let _access = self.lock();
+        let normalized_url = crate::provider::canonical_base_url(base_url);
+        validate_base_url(normalized_url)?;
         let key = match api_key {
             Some(key) => key.to_string(),
-            None => read_user_config_file(&self.directory)?
-                .and_then(|config| config.providers.get(provider_id).map(|provider| provider.api_key.clone()))
-                .unwrap_or_default(),
+            None => match read_user_config_file(&self.directory)?
+                .and_then(|mut config| config.providers.remove(provider_id))
+                .filter(|provider| !provider.api_key.is_empty())
+            {
+                Some(existing) => {
+                    if !same_url_origin(&existing.base_url, normalized_url) {
+                        return Err(configuration_error("更改提供方 API 地址时，请重新填写 API 密钥。"));
+                    }
+                    existing.api_key
+                }
+                None => String::new(),
+            },
         };
         validate_api_key(&key)?;
         Ok(key)
@@ -107,10 +119,21 @@ impl ModelConfigManager {
         validate_base_url(&base_url)?;
         let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
         let models = model_definitions(input.models, input.api_protocol)?;
-        let key = api_key
-            .map(str::to_string)
-            .or_else(|| config.providers.get(&input.provider_id).map(|provider| provider.api_key.clone()))
-            .unwrap_or_default();
+        let key = match api_key {
+            Some(value) => value.to_string(),
+            None => {
+                match config.providers.get(&input.provider_id).filter(|provider| !provider.api_key.is_empty())
+                {
+                    Some(existing) => {
+                        if !same_url_origin(&existing.base_url, &base_url) {
+                            return Err(configuration_error("更改提供方 API 地址时，请重新填写 API 密钥。"));
+                        }
+                        existing.api_key.clone()
+                    }
+                    None => String::new(),
+                }
+            }
+        };
         validate_api_key(&key)?;
         config.providers.insert(
             input.provider_id,

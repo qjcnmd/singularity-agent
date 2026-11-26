@@ -14,6 +14,21 @@ function isValidCapacity(value: number): boolean {
 
 export function capacityConfigurationError(context: number | null, output: number | null): string | null {
   if (context === null || output === null || !isValidCapacity(context) || !isValidCapacity(output)) return '上下文窗口和最大输出 Token 应为正整数，可使用 K / M。'
+  if (output >= context) return '最大输出 Token 必须小于上下文窗口。'
+  return null
+}
+
+export function apiBaseUrlError(raw: string): string | null {
+  const trimmed = raw.trim()
+  let parsed: URL
+  try {
+    parsed = new URL(trimmed)
+  } catch {
+    return '请输入完整的 API 地址。'
+  }
+  if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash || /[?#]/.test(trimmed)) {
+    return 'API 地址必须为 http 或 https 地址，不含凭据、查询或片段。'
+  }
   return null
 }
 

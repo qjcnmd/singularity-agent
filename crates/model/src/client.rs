@@ -167,7 +167,7 @@ impl ModelClient {
                 return error;
             }
         };
-        apply_provider_error_body(&mut error, &body);
+        apply_provider_error_body(&mut error, &body, &self.config.api_key);
         error
     }
 }

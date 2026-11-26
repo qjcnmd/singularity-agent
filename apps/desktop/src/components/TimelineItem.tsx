@@ -5,11 +5,13 @@ import { SentAnnotations } from './Annotations'
 import { CopyButton } from './CopyButton'
 import { QuestionPanel } from './QuestionPanel'
 import { Disclosure } from './Disclosure'
+import { TurnChangesCard } from './EditDiff'
 import { ToolGroupRow } from './ToolGroupRow'
 import { StepStatusIcon, ToolCard, toolTracksLiveTasks, useBackgroundTasks } from './ToolCard'
-import { memo, useEffect, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { CircleAlert, CircleX, LoaderCircle, Pencil } from 'lucide-react'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
+import { actionOrigin, appStore, pendingKey, useAppStore } from '../appStore'
 import { pop } from '../motion'
 import { useBodyCollapse, useSelectionGuard } from '../interactions'
 import { MarkdownBody } from '../markdown'
@@ -20,7 +22,7 @@ import type { HistoryItem, SessionModelUsage, ToolStatus, VisibleBackgroundTask 
 const previewLineCount = 8
 export const maxTimelineEntryOffset = 36
 
-export type RewindUserMessage = Extract<HistoryItem, { type: 'message' }> & { turnId: string }
+type EditableUserMessage = Extract<HistoryItem, { type: 'message' }>
 
 interface Props {
   item: TimelineRow['item']
@@ -28,12 +30,14 @@ interface Props {
   cwd: string
   userHome?: string | null
   sessionId?: string
-  canRewind?: boolean
-  onRewind?: (message: RewindUserMessage) => void
+  canEdit?: boolean
+  editing?: boolean
+  onEditStart?: (messageId: string) => void
+  onEditCancel?: () => void
   onDisclosureChange: (element: HTMLElement) => void
 }
 
-export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, userHome, sessionId, canRewind = false, onRewind, onDisclosureChange }: Props) {
+export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, userHome, sessionId, canEdit = false, editing = false, onEditStart, onEditCancel, onDisclosureChange }: Props) {
   const userLines = item.type === 'message' && item.role === 'user' ? item.text.trimEnd().split('\n') : []
   const hiddenLines = Math.max(0, userLines.length - previewLineCount)
   const canCollapse = hiddenLines > 0
@@ -45,6 +49,18 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
     return <ActivityCard group={item} itemKey={itemKey} cwd={cwd} userHome={userHome} sessionId={sessionId} onDisclosureChange={onDisclosureChange} />
   }
   if (item.type === 'duration') return <TurnDuration itemKey={itemKey} {...item} />
+  if (item.type === 'turn_changes') {
+    return (
+      <TurnChangesCard
+        edits={item.edits}
+        cwd={cwd}
+        itemKey={itemKey}
+        onOpenChanges={focusPath => appStore.openChangedFiles(cwd, focusPath)}
+        onOpenFile={path => appStore.openFile(path, cwd)}
+        onDisclosureChange={onDisclosureChange}
+      />
+    )
+  }
   if (item.type === 'stats') return <MessageStatsLine itemKey={itemKey} stats={item.stats} at={item.at} />
   if (item.type === 'question') return (
     <motion.section
@@ -65,8 +81,9 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
 
   const body = canCollapse && !expanded ? userLines.slice(0, previewLineCount).join('\n') : item.text
   const annotatableId = item.role === 'assistant' && item.status !== 'running' && item.status !== 'failed' ? item.id : undefined
-  const rewindTurnId = item.role === 'user' ? item.turnId : undefined
-  const showUserMeta = item.role === 'user' && (Boolean(item.at) || item.text !== '' || Boolean(rewindTurnId && onRewind))
+  const editable = Boolean(canEdit && sessionId && item.role === 'user' && onEditStart)
+  const isEditing = Boolean(editing && sessionId && item.role === 'user' && onEditCancel)
+  const showUserMeta = !isEditing && item.role === 'user' && (Boolean(item.at) || item.text !== '' || editable)
   const hasBubbleContent = item.role === 'assistant'
     || item.text.trim() !== ''
     || (item.images?.length ?? 0) > 0
@@ -77,13 +94,20 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
     {item.files && <FileChips files={item.files} />}
   </>
   return (
-    <motion.article initial={{ opacity: 0, y: item.role === 'user' ? maxTimelineEntryOffset : 10, scale: item.role === 'user' ? .84 : .9 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={reduced ? { duration: 0 } : { ...pop, opacity: { duration: .16 } }} style={{ originX: item.role === 'user' ? 1 : 0, originY: 1 }}
-      className={`timeline-item message-item timeline-${item.role}`}
+    <motion.article initial={reduced ? false : { opacity: 0, y: item.role === 'user' ? maxTimelineEntryOffset : 10, scale: item.role === 'user' ? .84 : .9 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={reduced ? { duration: 0 } : { ...pop, opacity: { duration: .16 } }} style={{ originX: item.role === 'user' ? 1 : 0, originY: 1 }}
+      className={`timeline-item message-item timeline-${item.role}${isEditing ? ' is-editing' : ''}`}
       data-item-id={itemKey}
       aria-label={`${item.role === 'user' ? '你' : APP_NAME}，${factStatusText[item.status]}`}
     >
       {item.role === 'user' && item.annotations && <SentAnnotations annotations={item.annotations} defaultExpanded={!hasBubbleContent} />}
-      {hasBubbleContent && (
+      {isEditing && sessionId && onEditCancel ? (
+        <InlineMessageEditor
+          sessionId={sessionId}
+          message={item}
+          attachments={attachments}
+          onCancel={onEditCancel}
+        />
+      ) : hasBubbleContent && (
         <div className={`message-bubble${item.status === 'failed' ? ' error-bubble' : ''}`}>
         {item.status === 'failed' && <CircleAlert size={15} className="error-icon" aria-hidden="true" />}
         {item.role === 'user' && attachments}
@@ -100,14 +124,13 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
         <div className="user-meta">
           {item.at && <time className="msg-time" dateTime={item.at}>{formatClock(item.at, true)}</time>}
           {item.text !== '' && <CopyButton text={item.text} label="复制" iconOnly />}
-          {rewindTurnId && onRewind && (
+          {editable && (
             <button
               type="button"
               className="user-meta-button"
-              aria-label="编辑并回到此处"
-              title={canRewind ? '编辑并回到此处' : '当前执行中，暂不可编辑'}
-              disabled={!canRewind}
-              onClick={() => onRewind({ ...item, turnId: rewindTurnId })}
+              aria-label="编辑消息"
+              title="编辑消息"
+              onClick={() => onEditStart!(item.id)}
             >
               <Pencil size={13} strokeWidth={1.8} aria-hidden="true" />
             </button>
@@ -118,6 +141,82 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
     </motion.article>
   )
 })
+
+function InlineMessageEditor({ sessionId, message, attachments, onCancel }: {
+  sessionId: string
+  message: EditableUserMessage
+  attachments: React.ReactNode
+  onCancel: () => void
+}) {
+  const [draft, setDraft] = useState(message.text)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const origin = actionOrigin.inline('session.rewind', sessionId)
+  const { actionErrors, pendingActions } = useAppStore(['actionErrors', 'pendingActions'])
+  const busy = pendingActions.has(pendingKey('session.rewind', origin))
+  const failure = actionErrors[origin]
+  const hasNonText = (message.images?.length ?? 0) > 0 || (message.files?.length ?? 0) > 0 || (message.annotations?.length ?? 0) > 0
+  const canSend = !busy && (draft.trim() !== '' || hasNonText)
+
+  useEffect(() => {
+    appStore.clearError(origin)
+    return () => appStore.clearError(origin)
+  }, [origin])
+
+  useLayoutEffect(() => {
+    const node = inputRef.current
+    if (!node) return
+    node.focus()
+    const end = node.value.length
+    node.setSelectionRange(end, end)
+  }, [])
+
+  useLayoutEffect(() => {
+    const node = inputRef.current
+    if (!node) return
+    node.style.height = 'auto'
+    node.style.height = `${Math.min(320, node.scrollHeight)}px`
+  }, [draft])
+
+  const submit = async () => {
+    if (!canSend) return
+    const ok = await appStore.editMessage(sessionId, message, draft)
+    if (ok) onCancel()
+  }
+
+  return (
+    <div className="inline-edit-bubble">
+      {attachments}
+      <textarea
+        ref={inputRef}
+        className="inline-edit-input"
+        aria-label="编辑消息内容"
+        disabled={busy}
+        rows={1}
+        value={draft}
+        onChange={event => setDraft(event.target.value)}
+        onKeyDown={event => {
+          if (event.nativeEvent.isComposing) return
+          if (event.key === 'Escape') {
+            event.preventDefault()
+            if (!busy) onCancel()
+            return
+          }
+          if (event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault()
+            if (!event.repeat) void submit()
+          }
+        }}
+      />
+      {failure && <p className="form-error inline-edit-error" role="alert">{failure.message}</p>}
+      <div className="inline-edit-actions">
+        <button type="button" className="secondary-button small" disabled={busy} onClick={onCancel}>取消</button>
+        <button type="button" className="primary-button small" disabled={!canSend} onClick={() => void submit()}>
+          {busy ? '发送中…' : '发送'}
+        </button>
+      </div>
+    </div>
+  )
+}
 
 function summarizeActivity(rows: ActivityGroup['rows'], tasks: VisibleBackgroundTask[] | undefined) {
   let stepCount = 0

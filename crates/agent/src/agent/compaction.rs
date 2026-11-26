@@ -178,7 +178,13 @@ impl RequestContext {
             return Err(AgentError::Aborted);
         }
         let retain_tokens = compaction::retention_budget_tokens(self.provider.model_configuration());
-        let input = CompactionInput::select(&self.session, retain_tokens).await;
+        let input = CompactionInput::select(
+            &self.session,
+            retain_tokens,
+            self.model_identity(),
+            (prev_provider.clone(), prev_model.clone()),
+        )
+        .await;
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
@@ -227,7 +233,8 @@ impl RequestContext {
         } else {
             compaction::retention_budget_tokens(self.provider.model_configuration())
         };
-        let input = CompactionInput::select(&self.session, retain_tokens).await;
+        let identity = self.model_identity();
+        let input = CompactionInput::select(&self.session, retain_tokens, identity.clone(), identity).await;
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }

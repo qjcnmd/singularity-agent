@@ -70,7 +70,7 @@ impl Conversation {
             ),
             pending_question: match &state.turn {
                 TurnLifecycle::Running(controls) => controls.questions.pending(),
-                TurnLifecycle::Idle | TurnLifecycle::Rewinding => None,
+                TurnLifecycle::Idle => None,
             },
             pending_messages: state
                 .steering_inbox

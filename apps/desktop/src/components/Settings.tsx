@@ -5,6 +5,7 @@ import { actionOrigin, appStore, pendingKey, useAppStore } from '../appStore'
 import { palette } from '../bubbleColors'
 import { smooth } from '../motion'
 import type { RedactedProvider } from '../protocol'
+import { apiBaseUrlError } from '../modelConfiguration'
 import { messageFontSize } from '../viewPersistence'
 import { ProviderEditor } from './ProviderEditor'
 import { Dialog } from './Dialog'
@@ -69,7 +70,7 @@ export function Settings() {
             <motion.div
               key={tab}
               className="settings-pane-inner"
-              initial={{ opacity: 0, y: 6 }}
+              initial={reduced ? false : { opacity: 0, y: 6 }}
               animate={{ opacity: 1, y: 0 }}
               transition={reduced ? { duration: 0 } : smooth}
             >
@@ -314,15 +315,9 @@ function WebSearchSection() {
     setSavedNotice(false)
     appStore.clearError(origin)
     const trimmedUrl = baseUrl.trim() || DEFAULT_WEB_SEARCH_URL
-    let parsed: URL
-    try {
-      parsed = new URL(trimmedUrl)
-    } catch {
-      setFailure('请输入完整的 API 地址。')
-      return
-    }
-    if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
-      setFailure('API 地址必须为 http 或 https 地址，不含凭据、查询或片段。')
+    const urlError = apiBaseUrlError(trimmedUrl)
+    if (urlError !== null) {
+      setFailure(urlError)
       return
     }
     const nextKey = clearKey ? '' : apiKey.trim() !== '' ? apiKey.trim() : undefined

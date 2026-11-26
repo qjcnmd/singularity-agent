@@ -35,6 +35,7 @@ pub(crate) fn select_compactable_split(
     active: &[&SessionEntry],
     session: &SessionData,
     retain_tokens: u64,
+    retain_target: (&str, &str),
 ) -> Option<(usize, String)> {
     let units = balanced_units(active);
     if units.is_empty() {
@@ -44,7 +45,7 @@ pub(crate) fn select_compactable_split(
     let mut accumulated = 0u64;
     let mut keep_unit = units.len();
     for (idx, range) in units.iter().enumerate().rev() {
-        let unit_tokens = context_token_estimate_for(&active[range.clone()], session, None);
+        let unit_tokens = context_token_estimate_for(&active[range.clone()], session, Some(retain_target));
         accumulated = accumulated.saturating_add(unit_tokens);
         keep_unit = idx;
         if accumulated >= retain_tokens {
@@ -64,15 +65,28 @@ pub struct CompactionInput {
 }
 
 impl CompactionInput {
-    pub async fn select(session: &super::SessionWriter, retain_tokens: u64) -> Option<Self> {
+    pub async fn select(
+        session: &super::SessionWriter,
+        retain_tokens: u64,
+        retain_target: (String, String),
+        prefix_target: (String, String),
+    ) -> Option<Self> {
         let session = std::sync::Arc::clone(session);
         tokio::task::spawn_blocking(move || {
             super::with_writer(&session, |session| {
                 let data = session.data();
                 let active = resolve_context_entries(data);
-                let (split_idx, first_kept_entry_id) =
-                    select_compactable_split(&active, data, retain_tokens)?;
-                let prefix_estimated_tokens = context_token_estimate_for(&active[..split_idx], data, None);
+                let (split_idx, first_kept_entry_id) = select_compactable_split(
+                    &active,
+                    data,
+                    retain_tokens,
+                    (&retain_target.0, &retain_target.1),
+                )?;
+                let prefix_estimated_tokens = context_token_estimate_for(
+                    &active[..split_idx],
+                    data,
+                    Some((&prefix_target.0, &prefix_target.1)),
+                );
                 if prefix_estimated_tokens <= message_token_estimate(&frame_compacted_summary("")) {
                     return None;
                 }

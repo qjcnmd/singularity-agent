@@ -36,12 +36,12 @@
 .activity-row-time { flex: none; margin-left: auto; color: var(--ink-faint); font-size: var(--meta-font-size); font-variant-numeric: tabular-nums; }
 .activity-card .content-disclosure > div { opacity: 0; transition: opacity 160ms ease; }
 .activity-card .content-disclosure.is-open > div { opacity: 1; transition: opacity 200ms ease 40ms; }
-.activity-step, .reasoning-row { display: grid; width: fit-content; max-width: min(640px, 100%); margin: 10px 0 0 -8px; border-radius: 12px; overflow: hidden; }
+.activity-step, .reasoning-row { display: grid; overflow: hidden; }
 .tool-group-items > .activity-step:first-child { margin-top: 2px; }
 .activity-toggle { display: flex; align-items: center; gap: 7px; min-width: 0; width: 100%; min-height: 28px; padding: 0 8px; border: 0; border-radius: 8px; background: none; color: var(--ink-soft); font-size: var(--block-font-size); line-height: 1.6; text-align: left; cursor: pointer; }
 .activity-toggle[aria-disabled=true] { cursor: default; }
-.tool-group { margin: 10px 0 0 -8px; min-width: 0; max-width: 100%; }
-.tool-group-toggle { width: fit-content; max-width: calc(100% - 24px); flex-wrap: wrap; height: auto; }
+.tool-group { min-width: 0; }
+.tool-group-toggle { flex-wrap: wrap; height: auto; }
 .tool-group-items { display: grid; padding-left: 12px; }
 .activity-card :is(.activity-step, .reasoning-row, .tool-group) { width: 100%; max-width: 100%; margin: 0; border-radius: 0; background: transparent; }
 .activity-card .activity-toggle { min-height: 32px; padding: 5px 9px; border-radius: 10px; }
@@ -202,14 +202,8 @@
 .expand-button { border: 0; border-radius: 6px; color: inherit; background: none; font-size: var(--block-font-size); padding: 0; margin-top: 4px; opacity: .8; cursor: pointer; }
 .tool-file-button { max-width: 100%; padding: 2px 6px; margin-left: -6px; border: 0; border-radius: 6px; background: transparent; color: var(--ink-soft); font: inherit; text-align: left; overflow-wrap: anywhere; cursor: pointer; transition: background 120ms, color 120ms; }
 .tool-file-button:hover { background: var(--soft-fill); color: var(--ink); }
-.confirm-body .rewind-status { color: var(--ink-faint); font-size: 12.5px; }
-.rewind-files-block { display: grid; gap: 8px; }
-.rewind-checkbox-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.confirm-body .rewind-checkbox { display: inline-flex; align-items: center; gap: 8px; min-width: 0; color: var(--ink); font-size: 13.5px; cursor: pointer; }
-.confirm-body .rewind-checkbox input[type="checkbox"] { width: 15px; height: 15px; min-height: 0; margin: 0; padding: 0; border: 0; border-radius: 4px; background: transparent; accent-color: var(--accent); flex: none; cursor: pointer; }
-.confirm-body .rewind-checkbox:has(input:disabled) { opacity: .5; cursor: default; }
-.rewind-files-toggle { display: inline-flex; align-items: center; gap: 4px; flex: none; height: 26px; padding: 0 8px; font-size: 12px; color: var(--ink-faint); }
-.rewind-files-list { list-style: none; margin: 0; padding: 6px 8px; max-height: 160px; overflow-y: auto; display: grid; gap: 2px; border: 1px solid var(--line); border-radius: 10px; background: var(--fill-subtle); }
-.rewind-file-item { display: flex; align-items: center; gap: 8px; min-height: 24px; font-size: 12px; color: var(--ink-soft); }
-.rewind-file-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); font-size: 11.5px; }
-.confirm-body .rewind-note { margin: 0; color: var(--ink-faint); font-size: 12px; line-height: 1.5; }
+.timeline-user.is-editing { width: min(82%, 560px); max-width: min(82%, 560px); }
+.inline-edit-bubble { width: 100%; display: grid; gap: 8px; padding: 10px 12px; border-radius: 16px; border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line-strong)); background: var(--card); color: var(--ink); box-shadow: var(--shadow-soft); }
+.inline-edit-input { width: 100%; min-height: 24px; max-height: 320px; padding: 2px 2px; border: 0; outline: none; resize: none; background: transparent; color: var(--message-ink); font-family: var(--font-sans); font-size: var(--message-font-size); line-height: 1.65; overflow-y: auto; }
+.inline-edit-error { margin: 0; font-size: 12.5px; }
+.inline-edit-actions { display: flex; justify-content: flex-end; gap: 6px; }
