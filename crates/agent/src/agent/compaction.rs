@@ -54,7 +54,7 @@ pub(super) enum CompactionMode {
     Manual,
 }
 
-pub(crate) fn precheck_manual_compaction(
+fn precheck_manual_compaction(
     writer: &mut crate::session::SessionManager,
     retain_tokens: u64,
     identity: (&str, &str),

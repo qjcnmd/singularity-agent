@@ -226,6 +226,11 @@ const tools = [
     name: 'ping',
     description: 'Zero-arg ping tool',
     inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'echo_image',
+    description: 'Returns text plus a tiny PNG image',
+    inputSchema: { type: 'object', properties: {} }
   }
 ];
 
@@ -269,6 +274,21 @@ rl.on('line', async (line) => {
       send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: chunk.repeat(kb) }] } });
     } else if (name === 'ping') {
       send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'PONG' }] } });
+    } else if (name === 'echo_image') {
+      send({
+        jsonrpc: '2.0',
+        id,
+        result: {
+          content: [
+            { type: 'text', text: 'MCP_IMAGE_TOOL_TEXT' },
+            {
+              type: 'image',
+              data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+              mimeType: 'image/png'
+            }
+          ]
+        }
+      });
     } else {
       send({ jsonrpc: '2.0', id, error: { code: -32601, message: `Unknown tool ${name}` } });
     }

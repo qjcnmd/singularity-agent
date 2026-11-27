@@ -8,6 +8,28 @@ use crate::harness::{
     messages_tools_sse, responses_sse,
 };
 
+fn provider_config_json(
+    provider_id: &str,
+    protocol: &str,
+    display_name: &str,
+    base_url: &str,
+    model_id: &str,
+    max_context_tokens: u32,
+) -> Value {
+    json!({
+        "apiProtocol": protocol,
+        "providerId": provider_id,
+        "displayName": display_name,
+        "baseUrl": base_url,
+        "models": [{
+            "modelId": model_id,
+            "maxContextTokens": max_context_tokens,
+            "maxOutputTokens": 4096,
+            "reasoningVariants": ["off", "high"]
+        }]
+    })
+}
+
 #[tokio::test]
 async fn workspace_config_and_single_instance_lock() {
     let env = TestEnv::new("core-config");
@@ -73,24 +95,15 @@ async fn workspace_config_and_single_instance_lock() {
         .rpc_ok(
             "model.saveProvider",
             json!({
-                "provider": {
-                    "apiProtocol": "messages",
-                    "providerId": "local",
-                    "displayName": "Local",
-                    "baseUrl": server.base_url,
-                    "models": [{
-                        "modelId": "alpha-model",
-                        "maxContextTokens": 32000,
-                        "maxOutputTokens": 4096,
-                        "reasoningVariants": ["off", "high"]
-                    }]
-                },
+                "provider": provider_config_json("local", "messages", "Local", &server.base_url, "alpha-model", 32000),
                 "apiKey": "sk-super-secret-value"
             }),
         )
         .await;
-    let saved_json = saved.to_string();
-    assert!(!saved_json.contains("sk-super-secret-value"), "RPC response must never leak apiKey");
+    assert!(
+        !saved.to_string().contains("sk-super-secret-value"),
+        "RPC response must never leak apiKey"
+    );
     assert_eq!(
         saved.pointer("/catalog/providers/0/credentialConfigured").and_then(Value::as_bool),
         Some(true)
@@ -100,18 +113,7 @@ async fn workspace_config_and_single_instance_lock() {
         .rpc_ok(
             "model.saveProvider",
             json!({
-                "provider": {
-                    "apiProtocol": "messages",
-                    "providerId": "local",
-                    "displayName": "Local Renamed",
-                    "baseUrl": server.base_url,
-                    "models": [{
-                        "modelId": "alpha-model",
-                        "maxContextTokens": 64000,
-                        "maxOutputTokens": 4096,
-                        "reasoningVariants": ["off", "high"]
-                    }]
-                }
+                "provider": provider_config_json("local", "messages", "Local Renamed", &server.base_url, "alpha-model", 64000)
             }),
         )
         .await;
@@ -123,21 +125,35 @@ async fn workspace_config_and_single_instance_lock() {
     let discovered = client
         .rpc_ok(
             "model.discover",
-            json!({
-                "providerId": "local",
-                "apiProtocol": "messages",
-                "baseUrl": server.base_url,
-                "apiKey": null
-            }),
+            json!({ "providerId": "local", "apiProtocol": "messages", "baseUrl": server.base_url, "apiKey": null }),
         )
         .await;
-    let ids: Vec<&str> = discovered
-        .as_array()
-        .expect("discovered array")
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
+    let ids: Vec<&str> =
+        discovered.as_array().expect("discovered").iter().filter_map(Value::as_str).collect();
     assert_eq!(ids, vec!["alpha-model", "beta-model"]);
+
+    for cross_origin in [
+        "https://other-provider.example.invalid/v1",
+        "http://127.0.0.1:1/v1",
+    ] {
+        let save_cross_err = client
+            .rpc_err(
+                "model.saveProvider",
+                json!({
+                    "provider": provider_config_json("local", "messages", "Local Cross Origin", cross_origin, "alpha-model", 64000)
+                }),
+            )
+            .await;
+        assert!(!save_cross_err.is_empty(), "saveProvider must reject cross-origin reuse: {cross_origin}");
+
+        let discover_cross_err = client
+            .rpc_err(
+                "model.discover",
+                json!({ "providerId": "local", "apiProtocol": "messages", "baseUrl": cross_origin, "apiKey": null }),
+            )
+            .await;
+        assert!(!discover_cross_err.is_empty(), "discover must reject cross-origin reuse: {cross_origin}");
+    }
 
     let preview_before = client.rpc_ok("context.preview", json!({ "workspaceRoot": ws })).await;
     assert!(
@@ -382,18 +398,7 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
             .rpc_ok(
                 "model.saveProvider",
                 json!({
-                    "provider": {
-                        "apiProtocol": protocol,
-                        "providerId": id,
-                        "displayName": id,
-                        "baseUrl": server.base_url,
-                        "models": [{
-                            "modelId": model,
-                            "maxContextTokens": 64000,
-                            "maxOutputTokens": 4096,
-                            "reasoningVariants": ["off", "high"]
-                        }]
-                    },
+                    "provider": provider_config_json(id, protocol, id, &server.base_url, model, 64000),
                     "apiKey": "test-secret-key"
                 }),
             )
@@ -486,13 +491,39 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
     client.shutdown().await;
 }
 
+fn find_tool_result<'a>(body: &'a Value, call_id: &str) -> &'a Value {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .expect("messages array")
+        .iter()
+        .filter_map(|msg| msg.get("content").and_then(Value::as_array))
+        .flatten()
+        .find(|block| {
+            block.get("type").and_then(Value::as_str) == Some("tool_result")
+                && block.get("tool_use_id").and_then(Value::as_str) == Some(call_id)
+        })
+        .unwrap_or_else(|| panic!("missing tool_result for {call_id}"))
+}
+
 #[tokio::test]
 async fn builtin_workspace_tools_and_attachments() {
     let env = TestEnv::new("builtin-tools");
     let server = MockModelServer::start().await;
     let ws = env.workspace_str();
 
-    std::fs::write(env.workspace.join("bin.dat"), b"abc\0def").expect("write binary file");
+    std::fs::create_dir_all(env.workspace.join(".git")).expect("create .git dir");
+    std::fs::create_dir_all(env.workspace.join("ignored_dir")).expect("create ignored_dir");
+    std::fs::create_dir_all(env.workspace.join("src")).expect("create src dir");
+    std::fs::write(env.workspace.join(".gitignore"), "ignored_dir/\n").expect("write .gitignore");
+    std::fs::write(env.workspace.join(".git/config"), "NEEDLE_TOKEN in git\n").expect("write .git/config");
+    std::fs::write(env.workspace.join("ignored_dir/skip.rs"), "NEEDLE_TOKEN ignored\n")
+        .expect("write ignored file");
+    std::fs::write(env.workspace.join("src/match.rs"), "fn visible() { /* NEEDLE_TOKEN */ }\n")
+        .expect("write src/match.rs");
+    std::fs::write(env.workspace.join("src/crlf.txt"), "pre\r\nANCHOR_CRLF_LINE\r\npost\r\n")
+        .expect("write src/crlf.txt");
+    std::fs::write(env.workspace.join("bin.dat"), b"NEEDLE_TOKEN\0binary_payload")
+        .expect("write binary file");
     let attached_path = env.workspace.join("attached.txt");
     std::fs::write(&attached_path, "ATTACHED_FILE_BODY\n").expect("write attached file");
     let attached_display = format!("{ws}/attached.txt");
@@ -524,6 +555,13 @@ async fn builtin_workspace_tools_and_attachments() {
             ("call_r_ok", "read", json!({ "path": "notes/demo.txt" })),
             ("call_r_bin", "read", json!({ "path": "bin.dat" })),
             ("call_r_zero", "read", json!({ "path": "notes/demo.txt", "limit": 0 })),
+            ("call_grep_dir", "grep", json!({ "pattern": "NEEDLE_TOKEN" })),
+            (
+                "call_grep_crlf",
+                "grep",
+                json!({ "pattern": "^ANCHOR_CRLF_LINE$", "path": "src/crlf.txt" }),
+            ),
+            ("call_glob_rs", "glob", json!({ "pattern": "*.rs" })),
             (
                 "call_todo",
                 "todo",
@@ -563,6 +601,14 @@ async fn builtin_workspace_tools_and_attachments() {
         20,
         "end_turn",
     )));
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(
+        None,
+        "search modules disabled",
+        100,
+        0,
+        15,
+        "end_turn",
+    )));
 
     let mut client = BackendClient::spawn(&env.home).await;
     client
@@ -593,10 +639,35 @@ async fn builtin_workspace_tools_and_attachments() {
     assert!(final_text.contains("BASH_OK"), "head+tail bash truncation must preserve opening output");
     assert!(final_text.contains("call_r_bin"), "binary read result must be paired");
     assert!(final_text.contains("call_r_zero"), "limit=0 read result must be paired");
+
+    let todo_res = find_tool_result(final_req, "call_todo");
+    assert_ne!(todo_res.get("is_error").and_then(Value::as_bool), Some(true), "todo tool must succeed");
+    assert!(!todo_res.to_string().is_empty(), "todo tool result must reach model");
+
+    let grep_dir_res = find_tool_result(final_req, "call_grep_dir");
+    assert_ne!(grep_dir_res.get("is_error").and_then(Value::as_bool), Some(true));
+    let grep_dir_text = grep_dir_res.to_string();
+    assert!(grep_dir_text.contains("src/match.rs"), "grep must find visible file: {grep_dir_text}");
+    assert!(!grep_dir_text.contains("ignored_dir"), "grep must respect .gitignore: {grep_dir_text}");
+    assert!(!grep_dir_text.contains(".git/config"), "grep must skip .git: {grep_dir_text}");
+    assert!(!grep_dir_text.contains("bin.dat"), "grep must skip binary file: {grep_dir_text}");
+
+    let grep_crlf_res = find_tool_result(final_req, "call_grep_crlf");
+    assert_ne!(grep_crlf_res.get("is_error").and_then(Value::as_bool), Some(true));
     assert!(
-        final_text.contains("Updated todo list (0/2 completed, 1 in progress)."),
-        "todo tool result must reach model"
+        grep_crlf_res.to_string().contains("ANCHOR_CRLF_LINE"),
+        "grep ^...$ must match CRLF lines: {grep_crlf_res}"
     );
+
+    let glob_rs_res = find_tool_result(final_req, "call_glob_rs");
+    assert_ne!(glob_rs_res.get("is_error").and_then(Value::as_bool), Some(true));
+    let glob_rs_text = glob_rs_res.to_string();
+    assert!(
+        glob_rs_text.contains("src/match.rs"),
+        "glob must match workspace .rs files: {glob_rs_text}"
+    );
+    assert!(!glob_rs_text.contains("ignored_dir"), "glob must respect .gitignore: {glob_rs_text}");
+    assert!(!glob_rs_text.contains(".git"), "glob must skip .git: {glob_rs_text}");
 
     let outputs_dir = env.home.join("sessions").join("outputs").join(&session_id);
     assert!(
@@ -635,11 +706,52 @@ async fn builtin_workspace_tools_and_attachments() {
     assert!(attach_req.contains("attached.txt"), "attachment path must be delivered to model");
 
     let read_before = client.rpc_ok("session.read", json!({ "sessionId": session_id })).await;
+    let has_valid_todo = read_before
+        .pointer("/history/turns/0/items")
+        .and_then(Value::as_array)
+        .expect("turn 0 items")
+        .iter()
+        .any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("tool")
+                && item.get("name").and_then(Value::as_str) == Some("todo")
+                && item.get("status").and_then(Value::as_str) == Some("completed")
+                && item.pointer("/result/isError").and_then(Value::as_bool) == Some(false)
+        });
+    assert!(has_valid_todo, "persisted history must contain completed non-error todo tool call");
     let image_id = read_before
         .pointer("/history/turns/0/items/0/images/0/id")
         .and_then(Value::as_str)
         .expect("uploaded image id")
         .to_string();
+
+    let s_disabled = client
+        .start_session(
+            &ws,
+            "local",
+            "demo",
+            None,
+            "check disabled search tools",
+            vec![],
+            vec!["grep", "glob"],
+        )
+        .await;
+    client.wait_settled(&s_disabled).await;
+    let disabled_reqs = server.model_requests();
+    let disabled_tools: Vec<&str> = disabled_reqs
+        .last()
+        .expect("disabled search request")
+        .body
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
+        .collect();
+    assert!(
+        !disabled_tools.contains(&"grep") && !disabled_tools.contains(&"glob"),
+        "disabledModules must hide grep and glob tools from model: {disabled_tools:?}"
+    );
+
     server.assert_no_protocol_violations();
     client.shutdown().await;
 

@@ -259,34 +259,6 @@ fn search_file(
     searcher.search_reader(matcher, CancellableReader { inner: file, signal }, sink)
 }
 
-#[cfg(test)]
-pub(crate) fn search_reader_with_cancel_for_test(
-    reader: impl io::Read,
-    pattern: &str,
-    signal: &CancellationToken,
-) -> io::Result<()> {
-    let matcher = RegexMatcherBuilder::new()
-        .multi_line(true)
-        .crlf(true)
-        .line_terminator(None)
-        .build(pattern)
-        .map_err(io::Error::other)?;
-    let mut searcher = SearcherBuilder::new()
-        .binary_detection(BinaryDetection::quit(b'\x00'))
-        .line_number(true)
-        .build();
-    let mut state = SearchState {
-        output: String::new(),
-        match_count: 0,
-        has_output: false,
-        hit_match_limit: false,
-        hit_byte_limit: false,
-        cancelled: false,
-    };
-    let mut sink = state.sink("stream", signal, 0, DEFAULT_GREP_LIMIT);
-    searcher.search_reader(&matcher, CancellableReader { inner: reader, signal }, &mut sink)
-}
-
 struct SearchState {
     output: String,
     match_count: usize,

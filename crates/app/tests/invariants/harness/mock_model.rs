@@ -12,6 +12,7 @@ use super::protocol_checks::{check_messages_request_invariants, check_responses_
 #[derive(Debug, Clone)]
 pub struct CapturedRequest {
     pub path: String,
+    pub authorization: Option<String>,
     pub body: Value,
 }
 
@@ -114,6 +115,10 @@ impl MockModelServer {
         }
     }
 
+    pub fn origin_url(&self) -> String {
+        self.base_url.trim_end_matches("/v1").to_string()
+    }
+
     pub fn set_models(&self, models: Vec<&str>) {
         self.state.lock().expect("state lock").models = models.into_iter().map(str::to_string).collect();
     }
@@ -127,6 +132,10 @@ impl MockModelServer {
         responder: impl Fn(&CapturedRequest, usize) -> ScriptedResponse + Send + Sync + 'static,
     ) {
         self.state.lock().expect("state lock").fallback = Some(Arc::new(responder));
+    }
+
+    pub fn all_requests(&self) -> Vec<CapturedRequest> {
+        self.state.lock().expect("state lock").requests.clone()
     }
 
     pub fn model_requests(&self) -> Vec<CapturedRequest> {
@@ -213,12 +222,15 @@ async fn handle_http_connection(
     let path = parts.next().unwrap_or_default().to_string();
 
     let mut content_length = 0usize;
+    let mut authorization = None;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim().to_ascii_lowercase();
             let val = v.trim();
             if key == "content-length" {
                 content_length = val.parse().unwrap_or(0);
+            } else if key == "authorization" {
+                authorization = Some(val.to_string());
             }
         }
     }
@@ -238,7 +250,7 @@ async fn handle_http_connection(
         serde_json::from_slice(body_bytes).expect("valid JSON request body from backend")
     };
 
-    let captured = CapturedRequest { path: path.clone(), body };
+    let captured = CapturedRequest { path: path.clone(), authorization, body };
 
     let violation = if path.ends_with("/messages") {
         check_messages_request_invariants(&captured.body).err()

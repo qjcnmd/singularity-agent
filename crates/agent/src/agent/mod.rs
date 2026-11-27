@@ -11,8 +11,6 @@ use model::{ModelClient, ProviderError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
-pub(crate) use self::compaction::precheck_manual_compaction;
 pub use self::inbox::{QueuedInput, SkillExpansion, SteeringInbox, SteeringInboxHandle, UserInput};
 pub use self::questions::UserQuestions;
 pub use crate::image::InputImage;
