@@ -7,8 +7,8 @@ use std::sync::{
 use serde_json::{Value, json};
 
 use crate::harness::{
-    BackendClient, MockModelServer, ScriptedResponse, TINY_PNG_DATA_URL, TestEnv, messages_text_sse,
-    messages_tools_sse, write_test_mcp_script,
+    BackendClient, DEFAULT_TIMEOUT, MockModelServer, ScriptedResponse, TINY_PNG_DATA_URL, TestEnv,
+    messages_text_sse, messages_tools_sse, write_test_mcp_script,
 };
 
 const COMPACT_CONTEXT_WINDOW: u32 = 20_000;
@@ -296,14 +296,12 @@ async fn context_pressure_and_overflow_invariants() {
 
     let _ = restarted.drain_events();
     restarted.rpc_ok("session.context", json!({ "sessionId": session_id })).await;
-    let context_events = restarted.drain_events();
-    assert!(
-        context_events.iter().any(|frame| {
+    restarted
+        .wait_event(DEFAULT_TIMEOUT, |frame| {
             frame.get("sessionId").and_then(Value::as_str) == Some(session_id.as_str())
                 && frame.pointer("/payload/method").and_then(Value::as_str) == Some("context/loaded")
-        }),
-        "session.context must emit context/loaded turn event"
-    );
+        })
+        .await;
     let after_context = restarted.rpc_ok("session.read", json!({ "sessionId": session_id })).await;
     let modules = after_context.get("context").and_then(Value::as_array).expect("loaded context modules");
     assert!(!modules.is_empty(), "session.context must populate context modules");
