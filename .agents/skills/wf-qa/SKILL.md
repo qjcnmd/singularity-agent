@@ -14,16 +14,15 @@ description: Singularity 真实模型探索式实机 QA：派独立空白上下�
 ## 2. 隔离启动与清理（零污染真实数据）
 
 1. **搭建临时环境**：在 `$env:TEMP\singularity-qa-<id>` 下建 `home/` 与 `workspace/`；在 `workspace/` 初始化极简 Git 仓库（放 1～2 个含可测小缺陷的示例文件）；**仅复制** `~/.singularity/config.json` 到 `$qaHome\config.json`；写入 `$qaHome\workspaces.json`（`{"workspaces":[{"root":"<斜杠路径>"}]}`）以直接载入项目、避开系统文件夹弹窗。
-2. **记录清理信息**：计算 Electron 派生目录 `$userDataDir = "$env:APPDATA\Singularity\<sha256(FullPath(qaHome).ToLower()).Substring(0,16)>"`，将 `{ pid, port, qaRoot, qaHome, qaWs, userDataDir }` 写入 `$env:TEMP\singularity-qa-state.json`。
-3. **后台常驻拉起 Electron**：清除 `ELECTRON_RUN_AS_NODE`，设 `SINGULARITY_HOME=$qaHome`，在 `run_command` 中设 **`IsDaemon: true`** 启动 `electron.exe "$desktopDir" --remote-debugging-port=<随机空闲端口>` 并 `Wait-Process`（Windows 非常驻命令退出会自动杀子进程，且隔离 `SINGULARITY_HOME` 会派生独立单实例锁，无需关闭用户正在使用的 Singularity）。轮询 `http://127.0.0.1:<port>/json/list` 直到出现 `singularity://app/` 页面。
-4. **收尾必做（完成判据）**：清理前先用 `read_file` 看完关键截图；随后用 `manage_task(kill)` 结束 Electron 常驻任务，强制删除 `$qaRoot`、`$userDataDir` 与 `singularity-qa-state.json`，最后检查仓库 `git status -s` 无 `.playwright-cli` 或临时残留。
+2. **后台常驻拉起 Electron 并落盘状态**：清除 `ELECTRON_RUN_AS_NODE`，设 `SINGULARITY_HOME=$qaHome`，在 `run_command` 中设 **`IsDaemon: true`** 启动 `apps/desktop/node_modules/electron/dist/electron.exe "$desktopDir" --remote-debugging-port=<随机空闲端口>`（Windows 非常驻命令退出会自动杀子进程；隔离 `SINGULARITY_HOME` 会派生独立单实例锁，无需关闭用户日常实例）。轮询 `http://127.0.0.1:<port>/json/list` 确认出现 `singularity://app/` 页面后，将 `{ pid, port, qaRoot, qaHome, qaWs, userDataDir }` 写入 `$env:TEMP\singularity-qa-state.json`（`$userDataDir = "$env:APPDATA\Singularity\<sha256(FullPath(qaHome).ToLower()).Substring(0,16)>"`），再 `Wait-Process`。
+3. **收尾必做（完成判据）**：清理前先用 `read_file` 看完关键截图；随后用 `manage_task(kill)` 结束 Electron 常驻任务，强制删除 `$qaRoot`、`$userDataDir` 与 `singularity-qa-state.json`，最后检查仓库 `git status -s` 无 `.playwright-cli` 或临时残留。
 
 ## 3. 实时界面探索（泛化不写死选择器）
 
-* **操作纪律**：每次执行 `playwright-cli` 前先 `Set-Location $qaRoot`，让 `.playwright-cli\` 快照落在临时目录内；每批命令开头执行 `playwright-cli -s=qa attach --cdp="http://127.0.0.1:$port"`，通过 `--raw snapshot` 实时发现界面元素与新增入口（同名按钮加 `exact: true`，切换类控件先看 `[expanded]` 状态，保留输出不静默吞错）。
+* **操作纪律**：每次执行 `playwright-cli` 前先 `Set-Location $qaRoot`，让 `.playwright-cli\` 快照落在临时目录内。Windows 上非 daemon 的 `run_command` 退出时会顺带结束 `playwright-cli` 守护进程，因此**每批命令开头都先执行** `playwright-cli -s=qa attach --cdp="http://127.0.0.1:$port"`，再按 `--raw snapshot` 实时发现控件与新入口（同名按钮加 `exact: true`，切换类控件先看 `[expanded]`，保留输出不吞错）。PowerShell 下执行多行或含引号的 `run-code` 时，将脚本写入 `$qaRoot\*.js` 用 `run-code --filename=...` 调用，并用 `return` 返回结果（`console.log` 不回显）。
 * **真实模型与等待**：在模型选择器选中 `AGENTS.local.md` 指定的真实模型（默认 `codearts/deepseek-v4.1-flash-1017 high`）；等待模型回复结束一律以停止按钮出现后消失（`getByRole('button', { name: /停止/ })`）为准，不写死固定睡眠。
 * **模式 A（`wf-dev` 自动验收）**：围绕本次用户可见改动与受影响的关联老流程，像挑刺的真实用户一样覆盖正常操作、取消/中断、重复点击、异常边界与 `playwright-cli reload` 刷新持久化。
-* **模式 B（手动 `/wf-qa` 全应用摸底）**：按真实使用旅程逐项探索——新建任务与模型/推理档位切换 → 真实工具读写改文件与 `Changes` diff → `RunPanel`（Context 展开、`Compact → Confirm` 取消或压缩）→ 编辑历史消息回退并核对磁盘与对话同步 → `设置` 面板 → 刷新恢复、窄窗（`760x600`）与默认窗口（`1440x960`）布局，以及快照中新出现的所有可见入口（用户指定重点时优先深挖该区）。
+* **模式 B（手动 `/wf-qa` 全应用摸底）**：按真实使用旅程逐项探索——新建任务与模型/推理档位切换 → 真实工具读写改文件与 `Changes` diff → `RunPanel`（Context 展开、`Compact → Confirm` 取消及短对话触发“无需压缩”提示，无需人工灌长上下文）→ 编辑历史消息回退并核对磁盘与对话同步 → `设置` 面板 → 刷新恢复、窄窗（`760x600`）与默认窗口（`1440x960`）布局，以及快照中新出现的所有可见入口（用户指定重点时优先深挖该区）。
 
 ## 4. 实证核查与收口
 
