@@ -13,6 +13,7 @@ Windows 本地单用户桌面 AI 编程工作台：Electron 前端（`apps/deskt
 | [开发指南](docs/development.md) | 构建、测试保留标准、现场验证、Windows 环境排障与打包交付 |
 | [安装与配置](docs/INSTALL.md) | 改配置文件、数据目录、指令或技能加载规则 |
 | [研发执行流程](.agents/skills/wf-dev/SKILL.md) | 改代码（含调研转编码）、UI/UX 迭代、独立审查与交付时 |
+| [真实模型探索 QA](.agents/skills/wf-qa/SKILL.md) | 用户可见功能交付前自动实机验收，或手动 `/wf-qa` 全应用真实模型摸底时 |
 | [项目体检与修剪](.agents/skills/wf-audit/SKILL.md) | 手动执行周期体检、代码瘦身与跨模块排查时 |
 | [研发流程复盘](.agents/skills/wf-retro/SKILL.md) | 手动复盘 `.reviews/` 审查档案与返工记录、硬化检查或优化工作流时 |
 | `AGENTS.local.md`（若存在） | 本机检索索引、默认真实模型、本地运行包路径与构建缓存约定 |
@@ -26,7 +27,7 @@ Windows 本地单用户桌面 AI 编程工作台：Electron 前端（`apps/deskt
   * **测试、结构大改与取舍**：常驻套件新增独立场景或新测试依赖、大块删改/重写既有机制，或引入新状态机/配置项/抽象层前先说明代价；用户接受限制时询问是否写入 `docs/decisions.md`。
 * **直接执行**：
   * **版本固定**：包版本固定 `0.1.0`，会话日志格式固定 `1`；改日志格式后直接退出应用并清空 `~/.singularity/sessions/`（含附件），不写旧格式迁移。
-  * **验收准备**：真机验收前直接退出占锁的 Singularity 实例；需要时直接调用真实模型。
+  * **验收准备**：实机 QA 按 `wf-qa` 隔离 `SINGULARITY_HOME` 并直接调用真实模型（无需关闭用户日常实例）；仅更新桌面运行包或改日志格式时先退出占锁实例。
 
 ## 工程约定与改动后同步
 
@@ -45,4 +46,4 @@ Windows 本地单用户桌面 AI 编程工作台：Electron 前端（`apps/deskt
 * **分级验收**（通过即止，不反复重跑）：
   * **纯文档 / 配置**：核对与源码事实一致。
   * **代码 / 脚本**：按影响面跑 `pwsh -File scripts/check.ps1 -Scope <rust|protocol|desktop|size|all>`（`rust` / `desktop` / `all` 均含生产源码 ~600 行提醒 / 800 行硬上限及测试增量、巨批/混装黄灯预警；本地 `rust` 自动执行 `cargo fmt`，详情见[开发指南 §2](docs/development.md#2-质量检查与代码格式化)）。
-  * **用户可见功能**：按[开发指南 §4–§5](docs/development.md#4-现场验证)及 `AGENTS.local.md` 用 Playwright 验收受影响路径（布局与动效观感写明手测步骤交用户看）；整批功能最终收口或用户要求时更新本地运行包并按需清理构建缓存。
+  * **用户可见功能**：门禁全绿后按 [wf-qa](.agents/skills/wf-qa/SKILL.md) 派独立 QA 子代理做真实模型隔离探索验收（布局与动效观感写明手测步骤交用户看）；整批功能最终收口或用户要求时按[开发指南 §5](docs/development.md#5-打包构建与发布)及 `AGENTS.local.md` 更新本地运行包并按需清理构建缓存。

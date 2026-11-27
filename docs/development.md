@@ -130,7 +130,7 @@ cargo run -p protocol --features typescript --example export_types --locked
 
 ### 数据目录与测试桩边界
 - **自动化测试隔离**：常驻自动化测试一律使用临时隔离的 `SINGULARITY_HOME`（测试结束自动清理临时目录及派生的 Electron `userData`），不碰用户日常数据。
-- **真实模型验收**：生产代码与功能现场验收只用真实的提供方和模型，不写模拟提供方。针对真实模型的现场验收直接使用用户的 `~/.singularity`，启动工作台前退出占用它的实例（单实例锁）；验证结束后清理本次创建的项目、任务及附件，保留用户原有数据。
+- **真实模型验收**：生产代码与功能现场验收只用真实的提供方和模型，不写模拟提供方。统一按 [wf-qa](../.agents/skills/wf-qa/SKILL.md) 隔离临时 `SINGULARITY_HOME`（仅复制 `~/.singularity/config.json`）并派独立 QA 子代理探索验证，不碰用户日常 `~/.singularity/sessions/`，也不必关闭正在运行的桌面实例；验证结束后清理临时目录与派生 `userData`。
 - **测试桩范围**：仅在测试目录内（`crates/app/tests/`、`apps/desktop/e2e/`）允许使用本地 HTTP SSE 回放/故障注入桩与测试用 MCP stdio 脚本，进程内部不做 Mock。
 - **临时文件**：一次性验证脚本、调查脚本、不符合保留标准的临时测试和临时数据用完即删，不留在仓库。
 
@@ -139,7 +139,7 @@ cargo run -p protocol --features typescript --example export_types --locked
 - **清理 `ELECTRON_RUN_AS_NODE`**：从 Electron 宿主进程（如部分自动化代理）启动打包产物前，先清除环境变量 `ELECTRON_RUN_AS_NODE`；否则宿主注入的该变量会让 exe 以 Node 模式静默退出（退出码 0），表现为“启动不了”。真实用户双击运行不受影响。
 
 ### 验收范围与专项检查
-- 功能完成后，在构建后的 production 版 Electron 工作台中用 Playwright 实际操作本次改动涉及的功能，按影响检查结果、出错、停止、重复操作和重读历史后的表现，只测受影响部分。
+- 功能完成后，按 [wf-qa](../.agents/skills/wf-qa/SKILL.md) 模式 A 在隔离的 Electron 工作台中由独立 QA 子代理用真实模型实际操作本次改动与关联主流程，核查控制台、`logs/singularity.log` 与关键截图；需要全应用摸底时手动触发 `/wf-qa`（模式 B）。
 - 布局和动效的观感由用户判断：交付时说明要看哪个界面、怎么操作、看什么。
 - 公式渲染和样式共用 `apps/desktop/package.json` 中指定的 KaTeX 版本（`overrides` 同时约束 Markdown 插件的传递依赖），更新时检查行内公式、独立公式、矩阵和错误公式；Mermaid 图同样固定版本，更新时检查流程图、时序图、语法错误的图和横向很宽的图；同时在系统“减少动态效果”开启时检查一次（Playwright 默认按未开启模拟，需设 `reducedMotion: 'reduce'`），这时全局过渡样式会让刚改的尺寸读回旧值。
 
