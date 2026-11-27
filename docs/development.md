@@ -64,7 +64,7 @@ pwsh -File scripts/check.ps1 -Scope rust
 pwsh -File scripts/check.ps1 -Scope protocol
 pwsh -File scripts/check.ps1 -Scope desktop          # 含编译后端、prepare:runtime 与 E2E
 pwsh -File scripts/check.ps1 -Scope desktop -SkipE2E # 仅 lint + 严格构建
-pwsh -File scripts/check.ps1 -Scope size             # 仅生产源码行数（目标 ~600 行提醒，硬上限 800 行）与体量摘要
+pwsh -File scripts/check.ps1 -Scope size             # 仅生产源码行数（600 提醒 / 800 硬上限）、测试增量与巨批/混装预警
 pwsh -File scripts/check.ps1 -Scope all
 ```
 

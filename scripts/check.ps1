@@ -42,12 +42,49 @@ function Test-ProdSourcePath([string]$RelPath) {
         ($p -match '^scripts/.+\.ps1$')
 }
 
+function Test-TestSourcePath([string]$RelPath) {
+    if (-not $RelPath) { return $false }
+    $p = $RelPath.Replace('\', '/')
+    if ($p -match '(^|/)(node_modules|dist)(/|$)') { return $false }
+    ($p -match '^crates/[^/]+/src/(?:.+/)?property_tests\.rs$') -or
+        ($p -match '^crates/[^/]+/tests/.+\.rs$') -or
+        ($p -match '^apps/desktop/e2e/.+\.(mjs|js|ts)$')
+}
+
+function Test-WorkflowPath([string]$RelPath) {
+    if (-not $RelPath) { return $false }
+    $p = $RelPath.Replace('\', '/')
+    ($p -eq 'AGENTS.md') -or
+        ($p -match '^scripts/.+\.ps1$') -or
+        ($p -match '^\.agents/.+') -or
+        ($p -match '^\.github/workflows/.+')
+}
+
+function Test-BusinessPath([string]$RelPath) {
+    if (-not $RelPath) { return $false }
+    $p = $RelPath.Replace('\', '/')
+    $p -match '^(crates|apps/desktop)/'
+}
+
+function Get-RepoRelativePath([string]$BaseDir, [string]$FullPath) {
+    $prefix = $BaseDir.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    if ($FullPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $FullPath.Substring($prefix.Length).Replace('\', '/')
+    }
+    return $FullPath.Replace('\', '/')
+}
+
 function Invoke-SizeCheck {
     $warnLines = 600
     $maxLines = 800
+    $testFileWarnLines = 800
+    $testDeltaWarnLines = 150
+    $batchFileWarnCount = 20
+    $batchNetWarnLines = 500
+
     $roots = @('crates', 'apps/desktop/desktop', 'apps/desktop/src', 'scripts')
     $files = @(Get-ChildItem -Path $roots -Recurse -File | ForEach-Object {
-        $rel = [System.IO.Path]::GetRelativePath($repoRoot, $_.FullName).Replace('\', '/')
+        $rel = Get-RepoRelativePath $repoRoot $_.FullName
         if (Test-ProdSourcePath $rel) {
             [pscustomobject]@{ Path = $rel; Lines = [System.IO.File]::ReadAllLines($_.FullName).Length }
         }
@@ -57,29 +94,67 @@ function Invoke-SizeCheck {
     $largestText = if ($largest) { "$($largest.Path): $($largest.Lines)/$maxLines" } else { 'none' }
     Write-Host "  Production source: $($files.Count) files, $totalLines lines (largest: $largestText)"
 
+    $testRoots = @(@('crates', 'apps/desktop/e2e') | Where-Object { Test-Path -LiteralPath $_ })
+    $testFiles = @(if ($testRoots.Count -gt 0) {
+        Get-ChildItem -Path $testRoots -Recurse -File | ForEach-Object {
+            $rel = Get-RepoRelativePath $repoRoot $_.FullName
+            if (Test-TestSourcePath $rel) {
+                [pscustomobject]@{ Path = $rel; Lines = [System.IO.File]::ReadAllLines($_.FullName).Length }
+            }
+        }
+    })
+    $totalTestLines = if ($testFiles.Count -gt 0) { [int]($testFiles | Measure-Object -Property Lines -Sum).Sum } else { 0 }
+    $largestTest = $testFiles | Sort-Object Lines -Descending | Select-Object -First 1
+    $largestTestText = if ($largestTest) { "$($largestTest.Path): $($largestTest.Lines)/$testFileWarnLines" } else { 'none' }
+    Write-Host "  Test source: $($testFiles.Count) files, $totalTestLines lines (largest: $largestTestText)"
+
+    $net = 0; $testNet = 0; $changedProdFiles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $hasBusinessChange = $false; $hasWorkflowChange = $false
+
     if (Get-Command git -ErrorAction SilentlyContinue) {
         $null = & git rev-parse --verify HEAD 2>$null
         if ($LASTEXITCODE -eq 0) {
             $gitOpts = @('-c', 'core.quotepath=false', '-c', 'core.safecrlf=false')
             $ins = 0; $del = 0; $newFiles = 0
-            foreach ($line in @(& git @gitOpts diff --numstat --no-renames HEAD -- @roots)) {
+            $testIns = 0; $testDel = 0; $newTestFiles = 0
+            foreach ($line in @(& git @gitOpts diff --numstat --no-renames HEAD)) {
                 $parts = $line -split "`t", 3
-                if ($parts.Count -eq 3 -and $parts[0] -match '^\d+$' -and (Test-ProdSourcePath $parts[2])) {
-                    $ins += [int]$parts[0]; $del += [int]$parts[1]
+                if ($parts.Count -ne 3) { continue }
+                $rel = $parts[2]
+                if (Test-BusinessPath $rel) { $hasBusinessChange = $true }
+                if (Test-WorkflowPath $rel) { $hasWorkflowChange = $true }
+                if ($parts[0] -match '^\d+$') {
+                    if (Test-ProdSourcePath $rel) {
+                        $ins += [int]$parts[0]; $del += [int]$parts[1]
+                        $null = $changedProdFiles.Add($rel)
+                    } elseif (Test-TestSourcePath $rel) {
+                        $testIns += [int]$parts[0]; $testDel += [int]$parts[1]
+                    }
                 }
             }
-            foreach ($rel in @(& git @gitOpts diff --name-only --diff-filter=A HEAD -- @roots)) {
-                if (Test-ProdSourcePath $rel) { $newFiles++ }
+            foreach ($rel in @(& git @gitOpts diff --name-only --diff-filter=A HEAD)) {
+                if (Test-ProdSourcePath $rel) { $newFiles++; $null = $changedProdFiles.Add($rel) }
+                elseif (Test-TestSourcePath $rel) { $newTestFiles++ }
             }
-            foreach ($rel in @(& git @gitOpts ls-files --others --exclude-standard -- @roots)) {
+            foreach ($rel in @(& git @gitOpts ls-files --others --exclude-standard)) {
+                if (Test-BusinessPath $rel) { $hasBusinessChange = $true }
+                if (Test-WorkflowPath $rel) { $hasWorkflowChange = $true }
                 if (Test-ProdSourcePath $rel) {
                     $newFiles++
+                    $null = $changedProdFiles.Add($rel)
                     $ins += [System.IO.File]::ReadAllLines((Join-Path $repoRoot $rel)).Length
+                } elseif (Test-TestSourcePath $rel) {
+                    $newTestFiles++
+                    $testIns += [System.IO.File]::ReadAllLines((Join-Path $repoRoot $rel)).Length
                 }
             }
             $net = $ins - $del
             $netText = if ($net -gt 0) { "+$net" } else { "$net" }
-            Write-Host "  Working-tree delta vs HEAD: +$ins / -$del (net $netText), new files: $newFiles"
+            Write-Host "  Working-tree delta vs HEAD: +$ins / -$del (net $netText), touched prod files: $($changedProdFiles.Count), new files: $newFiles"
+
+            $testNet = $testIns - $testDel
+            $testNetText = if ($testNet -gt 0) { "+$testNet" } else { "$testNet" }
+            Write-Host "  Test delta vs HEAD: +$testIns / -$testDel (net $testNetText), new test files: $newTestFiles"
         }
         $global:LASTEXITCODE = 0
     }
@@ -90,6 +165,26 @@ function Invoke-SizeCheck {
         foreach ($item in $overWarn) {
             Write-Host "    $($item.Path) ($($item.Lines) > $warnLines)" -ForegroundColor Yellow
         }
+    }
+
+    $overTestWarn = @($testFiles | Where-Object { $_.Lines -gt $testFileWarnLines } | Sort-Object Lines -Descending)
+    if ($overTestWarn.Count -gt 0) {
+        Write-Host "  Warning: $($overTestWarn.Count) test file(s) exceed $testFileWarnLines-line review threshold (check docs/development.md test retention standard):" -ForegroundColor Yellow
+        foreach ($item in $overTestWarn) {
+            Write-Host "    $($item.Path) ($($item.Lines) > $testFileWarnLines)" -ForegroundColor Yellow
+        }
+    }
+
+    if ($testNet -gt $testDeltaWarnLines) {
+        Write-Host "  Warning: Test net delta (+$testNet > +$testDeltaWarnLines lines); verify user confirmation and docs/development.md test retention standard." -ForegroundColor Yellow
+    }
+
+    if ($changedProdFiles.Count -gt $batchFileWarnCount -or $net -gt $batchNetWarnLines) {
+        Write-Host "  Warning: Large working-tree batch ($($changedProdFiles.Count) prod files, net $netText lines; threshold: >$batchFileWarnCount files or >+$batchNetWarnLines lines). Consider splitting by topic." -ForegroundColor Yellow
+    }
+
+    if ($hasBusinessChange -and $hasWorkflowChange) {
+        Write-Host "  Warning: Mixed business code and workflow/rule changes (AGENTS.md / scripts / .agents / .github/workflows); keep single-topic commits separate." -ForegroundColor Yellow
     }
 
     $overLimit = @($files | Where-Object { $_.Lines -gt $maxLines } | Sort-Object Lines -Descending)

@@ -12,7 +12,7 @@ Windows 本地单用户桌面 AI 编程工作台：Electron 前端（`apps/deskt
 | [directory.html](directory.html) | 查代码分布与导出入口；增删源码文件或公开符号后 |
 | [开发指南](docs/development.md) | 构建、测试保留标准、现场验证、Windows 环境排障与打包交付 |
 | [安装与配置](docs/INSTALL.md) | 改配置文件、数据目录、指令或技能加载规则 |
-| [研发执行流程](.agents/skills/wf-dev/SKILL.md) | 改代码、UI/UX 迭代、独立审查与交付时 |
+| [研发执行流程](.agents/skills/wf-dev/SKILL.md) | 改代码（含调研转编码）、UI/UX 迭代、独立审查与交付时 |
 | [项目体检与修剪](.agents/skills/wf-audit/SKILL.md) | 手动执行周期体检、代码瘦身与跨模块排查时 |
 | [研发流程复盘](.agents/skills/wf-retro/SKILL.md) | 手动复盘 `.reviews/` 审查档案与返工记录、硬化检查或优化工作流时 |
 | `AGENTS.local.md`（若存在） | 本机检索索引、默认真实模型、本地运行包路径与构建缓存约定 |
@@ -36,7 +36,7 @@ Windows 本地单用户桌面 AI 编程工作台：Electron 前端（`apps/deskt
 | --- | --- |
 | `crates/protocol/src/` 中的 DTO 或 RPC | 运行 `pwsh -File scripts/check.ps1 -Scope protocol`（导出 `apps/desktop/src/protocol.generated.ts` 并确认无漂移），更新前端调用方 |
 | 执行顺序、条件分支、模块关系、失败或停止处理 | 在 `architecture.html` 原图局部更新对应节点、连线和说明；调过布局则看渲染图确认清晰 |
-| 模块职责、状态归属、源码入口 | 同步 `docs/architecture.md`、`directory.html` |
+| 模块职责、状态归属、源码入口 | 同步 `docs/architecture.md`（仅记架构边界、数据流与锁序，不写实现与 UI 细节流水账）、`directory.html` |
 | 命令或启动步骤 | 同步 `docs/development.md` |
 
 ## 检查与交付
@@ -44,5 +44,5 @@ Windows 本地单用户桌面 AI 编程工作台：Electron 前端（`apps/deskt
 * **红线**：生产代码与功能验收只用真实提供方和模型，进程内不做 Mock；常驻测试隔离 `SINGULARITY_HOME`；增删测试先读[测试保留与清理标准](docs/development.md#测试保留与清理标准)，临时测试与脚本验证后即删。
 * **分级验收**（通过即止，不反复重跑）：
   * **纯文档 / 配置**：核对与源码事实一致。
-  * **代码 / 脚本**：按影响面跑 `pwsh -File scripts/check.ps1 -Scope <rust|protocol|desktop|size|all>`（`rust` / `desktop` / `all` 均含目标 ~600 行（超 600 行提醒）、硬上限 800 行检查；本地 `rust` 自动执行 `cargo fmt`，详情见[开发指南 §2](docs/development.md#2-质量检查与代码格式化)）。
+  * **代码 / 脚本**：按影响面跑 `pwsh -File scripts/check.ps1 -Scope <rust|protocol|desktop|size|all>`（`rust` / `desktop` / `all` 均含生产源码 ~600 行提醒 / 800 行硬上限及测试增量、巨批/混装黄灯预警；本地 `rust` 自动执行 `cargo fmt`，详情见[开发指南 §2](docs/development.md#2-质量检查与代码格式化)）。
   * **用户可见功能**：按[开发指南 §4–§5](docs/development.md#4-现场验证)及 `AGENTS.local.md` 用 Playwright 验收受影响路径（布局与动效观感写明手测步骤交用户看）；整批功能最终收口或用户要求时更新本地运行包并按需清理构建缓存。

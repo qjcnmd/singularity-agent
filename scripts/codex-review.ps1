@@ -11,7 +11,7 @@ param(
 
     [string]$Model = '',
 
-    [string]$Effort = '',
+    [string]$Effort = 'high',
 
     [switch]$AllowWebSearch,
 
@@ -113,6 +113,32 @@ function Get-WorkspaceSnapshot([string]$RepoRoot) {
     }
 }
 
+function Resolve-ReviewMetadata([string]$LogFile, [string]$ExplicitModel, [string]$ExplicitEffort) {
+    $model = $ExplicitModel
+    $effort = $ExplicitEffort
+    if ($LogFile -and (Test-Path -LiteralPath $LogFile -PathType Leaf)) {
+        foreach ($line in @(Get-Content -LiteralPath $LogFile -TotalCount 40 -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+            if (-not $model -and $line -match '^model:\s*(.+?)\s*$') { $model = $Matches[1] }
+            if ($line -match '^reasoning effort:\s*(.+?)\s*$') { $effort = $Matches[1] }
+        }
+    }
+    if (-not $model -or -not $effort) {
+        $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+        $cfgPath = Join-Path $codexHome 'config.toml'
+        if (Test-Path -LiteralPath $cfgPath -PathType Leaf) {
+            foreach ($line in @(Get-Content -LiteralPath $cfgPath -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+                if ($line -match '^\s*\[') { break }
+                if (-not $model -and $line -match '^\s*model\s*=\s*["'']([^"'']+)["'']') { $model = $Matches[1] }
+                if (-not $effort -and $line -match '^\s*model_reasoning_effort\s*=\s*["'']([^"'']+)["'']') { $effort = $Matches[1] }
+            }
+        }
+    }
+    return @{
+        Model = if ($model) { $model } else { 'unknown' }
+        Effort = if ($effort) { $effort } else { 'default' }
+    }
+}
+
 function Write-ReviewArchive([hashtable]$Meta, [string]$PromptText, [string]$ReportText, [string]$StderrTail) {
     $archiveDir = Join-Path $Meta.ArchiveBase '.reviews'
     [void][System.IO.Directory]::CreateDirectory($archiveDir)
@@ -182,7 +208,7 @@ try {
 
     $cliArgs = [System.Collections.Generic.List[string]]::new()
     foreach ($prefix in $inv.PrefixArgs) { $cliArgs.Add($prefix) }
-    $cliArgs.AddRange([string[]]@('exec', '-c', 'notify=[]', '-c', 'features.memories=false'))
+    $cliArgs.AddRange([string[]]@('exec', '-c', 'notify=[]', '-c', 'features.memories=false', '-c', 'features.hooks=false'))
     if ($Model) { $cliArgs.AddRange([string[]]@('-m', $Model)) }
     if ($Effort) { $cliArgs.AddRange([string[]]@('-c', "model_reasoning_effort=$Effort")) }
     if (-not $AllowWebSearch) { $cliArgs.AddRange([string[]]@('-c', 'web_search=disabled')) }
@@ -263,10 +289,11 @@ try {
             $stderrTail = if ($runError -and (Test-Path -LiteralPath $logFile -PathType Leaf)) {
                 (Get-Content -LiteralPath $logFile -Tail 60 -Encoding UTF8 -ErrorAction SilentlyContinue) -join "`n"
             } else { '' }
+            $resolvedMeta = Resolve-ReviewMetadata $logFile $Model $Effort
             $archivePath = Write-ReviewArchive @{
                 ArchiveBase = $archiveBase; StartedAt = $startedAt; RunId = $runId
                 Kind = $Kind; Round = $Round; Branch = $before.Branch; Head = $before.Head
-                ShortHead = $before.ShortHead; Dirty = $before.Dirty; Model = $Model; Effort = $Effort
+                ShortHead = $before.ShortHead; Dirty = $before.Dirty; Model = $resolvedMeta.Model; Effort = $resolvedMeta.Effort
                 DurationMs = if ($stopwatch) { [long]$stopwatch.ElapsedMilliseconds } else { 0L }
                 ExitCode = $exitCode; Recovered = $recovered; Stalled = $stalled
                 WorkspaceChanged = $workspaceChanged; Error = $runError
