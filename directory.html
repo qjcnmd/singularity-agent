@@ -235,7 +235,7 @@ pre {
 │   │   │   └── min_compaction_output_tokens()            <span class="c"># 计算压缩请求预留的最小摘要输出预算</span>
 │   │   ├── image.rs                                      <span class="c"># InputImage：20 MiB/16384px 上限、魔数识图、转 DataURL 与落盘</span>
 │   │   ├── message.rs                                    <span class="c"># Message 投影为公开 HistoryItem / ToolResult</span>
-│   │   ├── property_tests.rs                             <span class="c"># proptest 不变量：压缩切分与单轮规划、冷缓存清理与投影、跨回合用量校准与异源思考、尾行修复、rewind_before_message、输出截断、edit 容错、grep/glob 边界与 todo 校验开关</span>
+│   │   ├── property_tests.rs                             <span class="c"># 纯 proptest 不变量：压缩切分与单轮规划、跨回合用量校准与异源思考、尾行修复、rewind_before_message、输出截断与 edit 容错</span>
 │   │   ├── agent/                                        <span class="c"># 主循环、模块拼装、并发调度、队列与压缩（7 文件）</span>
 │   │   │   ├── mod.rs                                    <span class="c"># Agent &amp; RequestContext：模型↔工具主循环</span>
 │   │   │   │   ├── AgentError                            <span class="c"># is_session_failure() 区分持久化故障</span>
@@ -308,7 +308,7 @@ pre {
 │   │           │   └── output() / prepare_completion_message() / confirm_delivered() <span class="c"># 维护输出游标并在落盘后确认交付</span>
 │   │           └── result.rs                             <span class="c"># output_text / task_result：24 KiB / 400 行 Head+Tail 增量切片（超尾缓冲时从溢写文件补读头部）</span>
 │
-└── app/                                                  <span class="c"># 桌面后端组装层（Singularity.exe 入口，33 .rs：src 24 + tests 9）</span>
+└── app/                                                  <span class="c"># 桌面后端组装层（Singularity.exe 入口，34 .rs：src 24 + tests 10）</span>
     ├── src/                                              <span class="c"># 主入口、诊断日志、desktop 网关与 runtime 状态机（24 文件）</span>
     │   ├── main.rs                                       <span class="c"># main / run（shutdown_background 防 stdin 阻塞）/ lock_data_directory / prepare_desktop</span>
     │   ├── logging.rs                                    <span class="c"># tracing 结构化诊断日志（~/.singularity/logs 按 5 MiB 滚动）</span>
@@ -374,13 +374,14 @@ pre {
     │           │   ├── publish_changed()                 <span class="c"># 通知列表或快照变更通知</span>
     │           │   └── publish_event()                   <span class="c"># 发射带单调序号 TurnEventEnvelope</span>
     │           └── activity.rs                           <span class="c"># Activity / apply / merge：暂存瞬态增量</span>
-    └── tests/                                            <span class="c"># 后端不变量集成测试套件（9 文件）</span>
+    └── tests/                                            <span class="c"># 后端不变量集成测试套件（10 文件）</span>
         ├── invariants.rs                                 <span class="c"># 集成测试入口</span>
-        └── invariants/                                   <span class="c"># 隔离 SINGULARITY_HOME 的端到端黑盒场景与桩（8 文件）</span>
+        └── invariants/                                   <span class="c"># 隔离 SINGULARITY_HOME 的端到端黑盒场景与桩（9 文件）</span>
             ├── harness/                                  <span class="c"># mod / client / fixtures / mock_model / protocol_checks（5 文件）</span>
-            ├── scenarios_core.rs                         <span class="c"># 核心工具、会话与协议场景</span>
-            ├── scenarios_runtime.rs                      <span class="c"># 运行时调度、焦点过滤、MCP 延迟加载与脱敏及后台任务场景</span>
-            └── scenarios_resilience.rs                   <span class="c"># 重试、单轮压缩折叠、恢复与异常韧性场景</span></pre>
+            ├── scenarios_compaction.rs                   <span class="c"># 上下文压力、超窗与手动压缩、session.context 与空闲冷缓存清理场景</span>
+            ├── scenarios_core.rs                         <span class="c"># 核心工具（含 grep/glob/todo）、跨源凭据拒收、会话与协议场景</span>
+            ├── scenarios_runtime.rs                      <span class="c"># 运行时调度、MCP 延迟加载与脱敏、Web HTTP 边界脱敏及后台任务场景</span>
+            └── scenarios_resilience.rs                   <span class="c"># 流故障重试、停/删/聚焦/坏文件、Git diff 与回溯重发场景</span></pre>
   <h2 style="margin-top:32px">apps/desktop/ 结构</h2>
   <pre>apps/desktop/
 ├── index.html                                            <span class="c"># 应用入口 HTML 与 CSP（无 wasm-unsafe-eval）</span>

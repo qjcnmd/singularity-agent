@@ -63,11 +63,6 @@ impl CaptureState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn buffer_bytes(&self) -> (usize, usize) {
-        (self.head.len(), self.tail.len())
-    }
-
     fn total_lines(&self) -> usize {
         let has_open_line = !self.tail.is_empty() && !self.tail.ends_with('\n');
         self.completed_lines + usize::from(has_open_line)

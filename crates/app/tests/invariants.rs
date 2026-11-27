@@ -1,5 +1,7 @@
 #[path = "invariants/harness/mod.rs"]
 mod harness;
+#[path = "invariants/scenarios_compaction.rs"]
+mod scenarios_compaction;
 #[path = "invariants/scenarios_core.rs"]
 mod scenarios_core;
 #[path = "invariants/scenarios_resilience.rs"]

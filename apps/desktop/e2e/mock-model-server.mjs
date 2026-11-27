@@ -50,11 +50,21 @@ export function createGate() {
 
 export async function startMockModelServer() {
   const queue = []
+  const captured = []
 
   const server = createServer(async (req, res) => {
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
     const serialized = Buffer.concat(chunks).toString('utf8')
+    let body = null
+    if (serialized) {
+      try {
+        body = JSON.parse(serialized)
+      } catch {
+        body = null
+      }
+    }
+    captured.push({ method: req.method, url: req.url, raw: serialized, body })
 
     let entryIdx = queue.findIndex(item => item.matchText && serialized.includes(item.matchText))
     if (entryIdx < 0) entryIdx = queue.findIndex(item => !item.matchText)
@@ -78,7 +88,7 @@ export async function startMockModelServer() {
     const gates = entry.gates ?? []
     for (let i = 0; i < entry.events.length; i += 1) {
       if (res.writableEnded || res.destroyed) break
-      res.write(entry.events[i])
+      await new Promise(resolve => res.write(entry.events[i], resolve))
       for (const step of gates) {
         if (step.afterIndex === i) {
           step.onReached?.()
@@ -98,6 +108,14 @@ export async function startMockModelServer() {
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
     enqueue(events, options = {}) { queue.push({ events, ...options }) },
     enqueueError(status, jsonError, options = {}) { queue.push({ status, jsonError, ...options }) },
+    requests() { return [...captured] },
+    pendingCount() { return queue.length },
+    assertQueueDrained() {
+      if (queue.length > 0) {
+        const summary = queue.map((item, idx) => `#${idx}:${item.matchText ?? (item.jsonError ? `err:${item.status}` : 'sse')}`)
+        throw new Error(`mock model server still has ${queue.length} unconsumed response(s): ${summary.join(', ')}`)
+      }
+    },
     async close() {
       server.closeAllConnections?.()
       await new Promise(resolve => server.close(resolve))

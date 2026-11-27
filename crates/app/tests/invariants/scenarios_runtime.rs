@@ -439,3 +439,143 @@ async fn background_bash_resume_and_cleanup() {
 
     client.shutdown().await;
 }
+
+#[tokio::test]
+async fn web_tools_http_boundary_invariants() {
+    let env = TestEnv::new("web-http-boundary");
+    let model_server = MockModelServer::start().await;
+    let web_server = MockModelServer::start().await;
+    let ws = env.workspace_str();
+    let web_secret = "ws-bearer-secret-99";
+
+    web_server.set_fallback(move |req, _| {
+        if req.path == "/v1/tools/search" {
+            return match req.body.get("query").and_then(Value::as_str) {
+                Some("ok-search") => ScriptedResponse::json(
+                    200,
+                    json!({
+                        "results": [{
+                            "title": "Singularity Docs",
+                            "url": "https://docs.example.test/ok",
+                            "summary": "WEB_SEARCH_RESULT_MARKER"
+                        }]
+                    }),
+                ),
+                _ => ScriptedResponse::json(
+                    401,
+                    json!({ "error": format!("auth rejected Bearer {web_secret} raw={web_secret}") }),
+                ),
+            };
+        }
+        if req.path == "/v1/tools/fetch" {
+            return match req.body.get("url").and_then(Value::as_str) {
+                Some("https://docs.example.test/ok") => ScriptedResponse::json(
+                    200,
+                    json!({ "title": "Guide Page", "content": "WEB_FETCH_CONTENT_MARKER" }),
+                ),
+                _ => ScriptedResponse::json_with_headers(
+                    302,
+                    vec![("Location", "https://redirected.example.test/target")],
+                    json!({ "message": "moved" }),
+                ),
+            };
+        }
+        ScriptedResponse::json(404, json!({ "error": "unexpected path" }))
+    });
+
+    model_server.enqueue(ScriptedResponse::sse(messages_tools_sse(
+        None,
+        vec![
+            ("c_search_ok", "web_search", json!({ "query": "ok-search", "count": 3 })),
+            ("c_fetch_ok", "web_fetch", json!({ "url": "https://docs.example.test/ok" })),
+            ("c_fetch_redir", "web_fetch", json!({ "url": "https://docs.example.test/redir" })),
+            ("c_search_err", "web_search", json!({ "query": "err-search" })),
+        ],
+        120,
+        50,
+        "tool_use",
+    )));
+    model_server.enqueue(ScriptedResponse::sse(messages_text_sse(
+        None,
+        "web boundary verified",
+        200,
+        0,
+        20,
+        "end_turn",
+    )));
+
+    let mut client = BackendClient::spawn(&env.home).await;
+    client
+        .setup_workspace_and_provider(&ws, "local", "messages", &model_server.base_url, "demo", 64000, 4096)
+        .await;
+    client
+        .rpc_ok("model.saveWebSearch", json!({ "baseUrl": web_server.origin_url(), "apiKey": web_secret }))
+        .await;
+
+    let session_id = client
+        .start_session(&ws, "local", "demo", None, "exercise web search and fetch", vec![], vec![])
+        .await;
+    let settled = client.wait_settled(&session_id).await;
+    assert_eq!(settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+
+    let web_reqs = web_server.all_requests();
+    assert_eq!(web_reqs.len(), 4, "expected 4 direct web tool HTTP calls without following redirects");
+    let expected_auth = format!("Bearer {web_secret}");
+    assert!(
+        web_reqs.iter().all(|req| req.authorization.as_deref() == Some(expected_auth.as_str())),
+        "all web tool requests must send Bearer authorization header"
+    );
+
+    let model_reqs = model_server.model_requests();
+    let final_req = &model_reqs.last().expect("final model req").body;
+    let find_result = |call_id: &str| {
+        final_req
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages")
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_array))
+            .flatten()
+            .find(|b| {
+                b.get("type").and_then(Value::as_str) == Some("tool_result")
+                    && b.get("tool_use_id").and_then(Value::as_str) == Some(call_id)
+            })
+            .unwrap_or_else(|| panic!("missing tool_result {call_id}"))
+    };
+
+    let search_ok = find_result("c_search_ok");
+    assert_ne!(search_ok.get("is_error").and_then(Value::as_bool), Some(true));
+    assert!(search_ok.to_string().contains("WEB_SEARCH_RESULT_MARKER"));
+
+    let fetch_ok = find_result("c_fetch_ok");
+    assert_ne!(fetch_ok.get("is_error").and_then(Value::as_bool), Some(true));
+    assert!(fetch_ok.to_string().contains("WEB_FETCH_CONTENT_MARKER"));
+
+    let fetch_redir = find_result("c_fetch_redir");
+    assert_eq!(fetch_redir.get("is_error").and_then(Value::as_bool), Some(true));
+    assert!(
+        fetch_redir.to_string().contains("302"),
+        "302 redirect must be rejected as an error without following: {fetch_redir}"
+    );
+
+    let search_err = find_result("c_search_err");
+    assert_eq!(search_err.get("is_error").and_then(Value::as_bool), Some(true));
+    let err_text = search_err.to_string();
+    assert!(
+        !err_text.contains(web_secret),
+        "HTTP error response must redact web Bearer credential: {err_text}"
+    );
+    assert!(
+        err_text.contains("[redacted]"),
+        "redaction marker expected in error diagnostic: {err_text}"
+    );
+
+    let history = client.rpc_ok("session.read", json!({ "sessionId": session_id })).await;
+    assert!(
+        !history.to_string().contains(web_secret),
+        "persisted session history must never contain web search secret"
+    );
+
+    model_server.assert_no_protocol_violations();
+    client.shutdown().await;
+}

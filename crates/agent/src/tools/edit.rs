@@ -204,22 +204,6 @@ fn execute_locked(
     Ok(format_diff_result("Edited", &args.path, &view, &updated, output_directory))
 }
 
-#[cfg(test)]
-pub(crate) fn apply_edits_for_test(
-    content: &str,
-    path: &str,
-    edits: &[(&str, &str)],
-) -> Result<String, String> {
-    let items: Vec<_> = edits
-        .iter()
-        .map(|(old_text, new_text)| Replacement {
-            old_text: (*old_text).into(),
-            new_text: (*new_text).into(),
-        })
-        .collect();
-    apply_edits(content, path, &items).map(|(_, updated)| updated)
-}
-
 fn apply_edits(content: &str, display_path: &str, edits: &[Replacement]) -> Result<(String, String), String> {
     let source = content.strip_prefix('\u{feff}').unwrap_or(content);
     let view = source.replace("\r\n", "\n");
