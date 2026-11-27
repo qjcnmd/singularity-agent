@@ -109,6 +109,7 @@ pub struct SessionRuntime {
     pub phase: SessionPhase,
     pub selection: ModelSelection,
     pub context_usage: Option<ContextUsage>,
+    pub model_usage: Option<crate::SessionModelUsage>,
     pub pending_question: Option<crate::PendingQuestion>,
     pub pending_messages: Vec<PendingUserMessage>,
     pub failure: Option<SessionFailure>,

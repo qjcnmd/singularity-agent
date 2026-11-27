@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use app_core::estimate_tokens_of;
 use model::{ContentBlock, Message, ModelConfigurationSnapshot};
 
 use super::context::{
-    ContextEntry, context_entry, context_token_estimate_for, frame_compacted_summary, latest_reply_usage,
-    message_content_mut, message_token_estimate, message_with_captions_tokens, project_messages,
-    resolve_context_entries,
+    ContextEntry, cleared_tool_result_ids, context_entry, context_token_estimate_for,
+    frame_compacted_summary, latest_reply_usage, message_content_mut, message_token_estimate,
+    message_with_captions_tokens, project_messages, resolve_context_entries,
 };
 use super::format::SessionEntry;
 use super::manager::SessionData;
@@ -36,6 +36,7 @@ pub(crate) fn select_compactable_split(
     session: &SessionData,
     retain_tokens: u64,
     target: (&str, &str),
+    cleared: &HashSet<&str>,
 ) -> Option<(usize, String)> {
     let units = balanced_units(active);
     if units.is_empty() {
@@ -45,7 +46,7 @@ pub(crate) fn select_compactable_split(
     let mut accumulated = 0u64;
     let mut keep_unit = units.len();
     for (idx, range) in units.iter().enumerate().rev() {
-        let unit_tokens = context_token_estimate_for(&active[range.clone()], session, Some(target));
+        let unit_tokens = context_token_estimate_for(&active[range.clone()], session, Some(target), cleared);
         accumulated = accumulated.saturating_add(unit_tokens);
         keep_unit = idx;
         if accumulated >= retain_tokens {
@@ -64,9 +65,11 @@ fn compactable_prefix_split(
     data: &SessionData,
     retain_tokens: u64,
     identity: (&str, &str),
+    cleared: &HashSet<&str>,
 ) -> Option<(usize, String, u64)> {
-    let (split_idx, first_kept_entry_id) = select_compactable_split(active, data, retain_tokens, identity)?;
-    let raw_prefix_tokens = context_token_estimate_for(&active[..split_idx], data, Some(identity));
+    let (split_idx, first_kept_entry_id) =
+        select_compactable_split(active, data, retain_tokens, identity, cleared)?;
+    let raw_prefix_tokens = context_token_estimate_for(&active[..split_idx], data, Some(identity), cleared);
     if raw_prefix_tokens <= message_token_estimate(&frame_compacted_summary("")) {
         return None;
     }
@@ -75,7 +78,8 @@ fn compactable_prefix_split(
 
 pub(crate) fn has_compactable_prefix(data: &SessionData, retain_tokens: u64, identity: (&str, &str)) -> bool {
     let active = resolve_context_entries(data);
-    compactable_prefix_split(&active, data, retain_tokens, identity).is_some()
+    let cleared = cleared_tool_result_ids(data);
+    compactable_prefix_split(&active, data, retain_tokens, identity, &cleared).is_some()
 }
 
 #[derive(Debug)]
@@ -125,8 +129,9 @@ pub(crate) fn plan_compaction_step(
 ) -> Result<Option<PlannedCompactionStep>, &'static str> {
     const NO_HEADROOM: &str = "当前指令与工具定义已占满模型上下文窗口，无法留出压缩摘要空间。";
     let active = resolve_context_entries(data);
+    let cleared = cleared_tool_result_ids(data);
     let Some((split_idx, first_kept_entry_id, raw_prefix_tokens)) =
-        compactable_prefix_split(&active, data, retain_tokens, identity)
+        compactable_prefix_split(&active, data, retain_tokens, identity, &cleared)
     else {
         return Ok(None);
     };
@@ -134,8 +139,8 @@ pub(crate) fn plan_compaction_step(
     let limit = compaction_input_limit(model, definition_tokens, instruction_tokens, overflow_input_tokens)
         .ok_or(NO_HEADROOM)?;
     let full_est =
-        definition_tokens.saturating_add(context_token_estimate_for(&active, data, Some(identity)));
-    let calibrated = latest_reply_usage(data, &active, definition_tokens)
+        definition_tokens.saturating_add(context_token_estimate_for(&active, data, Some(identity), &cleared));
+    let calibrated = latest_reply_usage(data, &active, definition_tokens, &cleared)
         .filter(|&(p, m, real)| (p, m) == identity && real > 0 && full_est > 0)
         .map(|(_, _, real)| real);
     let max_base = limit.saturating_sub(instruction_tokens);
@@ -147,7 +152,7 @@ pub(crate) fn plan_compaction_step(
     }
 
     let image_directory = data.image_directory();
-    let mut messages = project_messages(&active[..split_idx]);
+    let mut messages = project_messages(&active[..split_idx], &cleared);
     let mut projected: u64 = messages
         .iter()
         .map(|m| message_with_captions_tokens(m, &image_directory, Some(identity)))

@@ -11,7 +11,6 @@ textarea.input { resize: vertical; line-height: 1.5; font-family: var(--font-san
 .manage-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 18px; }
 .manage-heading { min-width: 0; }
 .manage-page h3 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -.015em; }
-.manage-subtitle { margin: 3px 0 0; color: var(--ink-faint); font-size: 12.5px; }
 .manage-actions { display: flex; align-items: center; gap: 8px; flex: none; }
 .skills-count { color: var(--ink-faint); font-size: 12.5px; font-variant-numeric: tabular-nums; }
 .skills-refresh { display: grid; place-items: center; flex: none; width: 32px; height: 32px; padding: 0; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--card); color: var(--ink-soft); cursor: pointer; transition: background 120ms, color 120ms, border-color 120ms; }

@@ -1,10 +1,10 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { Plus } from 'lucide-react'
+import { ArrowUp, LoaderCircle, Plus } from 'lucide-react'
 import { actionOrigin, appStore, useAppStore, pendingKey } from '../appStore'
+import { formatTokenCount } from '../copy'
 import { hasDraftContent } from '../drafts'
 import { ModelPicker } from './ModelPicker'
 import { ContextCapsules } from './ContextCapsules'
-import { WaterOrb } from './orb/WaterOrb'
 import { motion, useReducedMotion } from 'motion/react'
 import { inputTrigger, useSkillCandidates } from '../inputCandidates'
 import { smooth } from '../motion'
@@ -14,7 +14,7 @@ import { selectedSessionPhase } from '../sessionState'
 
 export const Composer = memo(ComposerView)
 
-function ComposerView({ accent }: { accent: string }) {
+function ComposerView() {
   const reducedMotion = useReducedMotion()
   const state = useAppStore(['drafts', 'pendingActions', 'bootstrap', 'bootstrapLoad', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'liveSessions', 'sessionLoad'])
   const { text: draft, images: imageDraft, files: fileDraft, annotations: annotationDraft, disabledModules } = appStore.inputDraft()
@@ -94,10 +94,46 @@ function ComposerView({ accent }: { accent: string }) {
     return () => { observer.disconnect(); main.style.removeProperty('--composer-height') }
   }, [])
   const showsStop = busy && (pendingQuestion || !hasDraftContent({ text: draft, images: imageDraft, files: fileDraft, annotations: annotationDraft }))
-  const orb = <WaterOrb size={40} color={accent} percent={percent} compacting={phase === 'compacting'}
-    enabled={showsStop ? phase !== 'stopping' && !state.pendingActions.has(pendingKey('session.abort', sessionOrigin)) : canSubmit}
-    label={showsStop ? phase === 'stopping' ? '正在停止当前回合' : '停止当前回合' : blockedReason ?? '发送消息'}
-    onPress={() => { if (showsStop) void appStore.stopActive(); else void appStore.submitDraft() }} />
+  const stopping = phase === 'stopping' || state.pendingActions.has(pendingKey('session.abort', sessionOrigin))
+  const compacting = phase === 'compacting'
+  const actionEnabled = showsStop ? !stopping : canSubmit
+  const actionLabel = showsStop ? phase === 'stopping' ? '正在停止当前回合' : '停止当前回合' : blockedReason ?? '发送消息'
+  const usageTip = contextUsage
+    ? `上下文用量 ${percent}% (${formatTokenCount(contextUsage.used).toLowerCase()} / ${formatTokenCount(contextUsage.capacity).toLowerCase()})`
+    : null
+  const actionTitle = usageTip ? `${actionLabel} · ${usageTip}` : actionLabel
+  const sendMode = !showsStop && actionEnabled ? 'send' : compacting || stopping ? 'busy' : showsStop && actionEnabled ? 'stop' : 'idle'
+  const ringTone = percent >= 90 ? 'danger' : percent >= 75 ? 'warning' : ''
+  const sendButton = (
+    <button
+      type="button"
+      className={`send-button is-${sendMode}`}
+      aria-label={actionLabel}
+      aria-disabled={!actionEnabled}
+      title={actionTitle}
+      onClick={() => { if (actionEnabled) { if (showsStop) void appStore.stopActive(); else void appStore.submitDraft() } }}
+    >
+      <svg className="send-ring" width="40" height="40" viewBox="0 0 40 40" aria-hidden="true">
+        <circle className={`send-ring-track${percent === 0 ? ' is-empty' : ''}`} cx="20" cy="20" r="18.2" />
+        <circle
+          className={`send-ring-arc${ringTone ? ` is-${ringTone}` : ''}${percent === 0 ? ' is-empty' : ''}`}
+          cx="20"
+          cy="20"
+          r="18.2"
+          pathLength={100}
+          strokeDasharray={`${percent} 100`}
+          transform="rotate(-90 20 20)"
+        />
+      </svg>
+      <span className="send-button-core" aria-hidden="true">
+        {sendMode === 'busy'
+          ? <LoaderCircle size={15} strokeWidth={2} className="spinner" />
+          : sendMode === 'stop'
+            ? <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect width="10" height="10" rx="2.5" fill="currentColor" /></svg>
+            : <ArrowUp size={16} strokeWidth={2.2} />}
+      </span>
+    </button>
+  )
   return (
     <motion.section ref={region} className="composer-region" aria-label="任务输入区"
       layout={reducedMotion ? false : 'position'}
@@ -207,7 +243,7 @@ function ComposerView({ accent }: { accent: string }) {
               <Plus size={16} strokeWidth={1.8} aria-hidden="true" />
             </button>
           </div>
-          <div className="composer-actions"><ModelPicker state={state} />{orb}</div>
+          <div className="composer-actions"><ModelPicker state={state} />{sendButton}</div>
         </div>
       </div>
     </motion.section>

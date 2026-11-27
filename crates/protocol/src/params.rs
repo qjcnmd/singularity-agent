@@ -186,6 +186,12 @@ pub struct SessionModelUsage {
     pub usage_present: bool,
 }
 
+impl SessionModelUsage {
+    pub fn has_metrics(&self) -> bool {
+        self.ttft_requests > 0 || self.decode_ms > 0 || self.usage_present
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]

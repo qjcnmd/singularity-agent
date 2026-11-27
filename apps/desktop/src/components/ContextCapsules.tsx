@@ -86,11 +86,11 @@ function ModuleGroups({ modules, disabled }: { modules: ContextModule[]; disable
   </>
 }
 
-export function CapsuleIcon() {
+function CapsuleIcon() {
   return <svg className="capsule-icon" viewBox="0 0 16 16" aria-hidden="true"><circle className="dot" cx="8" cy="8" r="2" /><circle className="ring" cx="8" cy="8" r="6.4" /><path className="tick" d="M5 8.3l2 2 3.7-4" /></svg>
 }
 
-export function CapsuleTokens({ tokens }: { tokens: number }) {
+function CapsuleTokens({ tokens }: { tokens: number }) {
   return tokens > 0 ? <span className="capsule-tokens">∼ {formatTokenCount(tokens).toLowerCase()}</span> : null
 }
 

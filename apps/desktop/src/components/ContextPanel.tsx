@@ -1,6 +1,21 @@
 import { memo, useEffect, useState } from 'react'
 import { appStore, useAppStore } from '../appStore'
-import { CapsuleIcon, CapsuleTokens } from './ContextCapsules'
+import { formatTokenCount } from '../copy'
+import type { ContextGroup, ContextModule } from '../protocol'
+import { Disclosure } from './Disclosure'
+import { ExpandChevron } from './ExpandChevron'
+
+const groupOrder: ContextGroup[] = ['instructions', 'tools', 'skills', 'mcp']
+const groupLabels: Record<ContextGroup, string> = {
+  instructions: 'Instructions',
+  tools: 'Tools',
+  skills: 'Skills',
+  mcp: 'MCP',
+}
+
+function formatApproxTokens(tokens: number): string {
+  return tokens > 0 ? `~${formatTokenCount(tokens).toLowerCase()}` : ''
+}
 
 export const ContextPanel = memo(function ContextPanel() {
   const state = useAppStore(['selectedSessionId', 'session'], (a, b) =>
@@ -28,18 +43,55 @@ export const ContextPanel = memo(function ContextPanel() {
     void appStore.transport.rpc('session.context', { sessionId }).catch(error => {
       if (!cancelled) setFailure({ sessionId, message: error instanceof Error ? error.message : String(error) })
     })
-    return () => { cancelled = true }
+    return () => { cancelled = false }
   }, [missing, sessionId, phase, selection?.provider, selection?.model, selection?.reasoning, attempt])
   if (!context) {
     if (failure?.sessionId === sessionId) return <p className="detail-empty form-error" role="alert">{failure.message}
       <button type="button" className="quiet-button" onClick={() => setAttempt(value => value + 1)}>重试</button></p>
     return <p className="detail-empty" role="status">读取中…</p>
   }
+  const enabled = context.filter(module => module.enabled)
   return <div className="context-panel" key={state.selectedSessionId}>
-    <div className="capsules">
-      {context.filter(module => module.enabled).map(module => <span key={module.id} className="capsule capsule-static is-on" title={module.detail}>
-        <CapsuleIcon /><span className="capsule-name">{module.label}</span><CapsuleTokens tokens={module.tokens} />
-      </span>)}
-    </div>
+    {groupOrder.map(group => {
+      const members = enabled.filter(module => module.group === group)
+      return members.length > 0 ? <ContextGroupRow key={group} group={group} members={members} /> : null
+    })}
   </div>
 })
+
+function ContextGroupRow({ group, members }: { group: ContextGroup; members: ContextModule[] }) {
+  const [open, setOpen] = useState(false)
+  const title = groupLabels[group]
+  const totalTokens = members.reduce((sum, module) => sum + module.tokens, 0)
+  if (members.length === 1) {
+    const solo = members[0]
+    const sublabel = solo.label.toLowerCase() === title.toLowerCase() ? null : solo.label
+    return <div className="context-group">
+      <div className="context-group-row is-static" title={solo.detail}>
+        <span className="context-group-name">
+          <span>{title}</span>
+          {sublabel && <span className="context-group-sub">{sublabel}</span>}
+        </span>
+        <span className="context-group-tokens">{formatApproxTokens(totalTokens)}</span>
+      </div>
+    </div>
+  }
+  return <div className="context-group">
+    <button type="button" className="context-group-row" aria-expanded={open} onClick={() => setOpen(value => !value)}>
+      <span className="context-group-name">
+        <span>{title}</span>
+        <span className="context-group-count">{members.length}</span>
+        <ExpandChevron expanded={open} size={12} />
+      </span>
+      <span className="context-group-tokens">{formatApproxTokens(totalTokens)}</span>
+    </button>
+    <Disclosure open={open}>
+      <ul className="context-group-items">
+        {members.map(module => <li key={module.id} className="context-item-row" title={module.detail}>
+          <span className="context-item-name">{module.label}</span>
+          <span className="context-item-tokens">{formatApproxTokens(module.tokens)}</span>
+        </li>)}
+      </ul>
+    </Disclosure>
+  </div>
+}

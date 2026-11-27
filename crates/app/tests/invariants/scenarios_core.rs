@@ -353,6 +353,16 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
             after_restart.pointer("/history/turns"),
             "{protocol}: persisted history must match across restart"
         );
+        assert_eq!(
+            before_restart.pointer("/runtime/modelUsage"),
+            after_restart.pointer("/runtime/modelUsage"),
+            "{protocol}: runtime modelUsage must match across restart"
+        );
+        assert_eq!(
+            after_restart.pointer("/runtime/modelUsage/usagePresent").and_then(Value::as_bool),
+            Some(true),
+            "{protocol}: settled session must report runtime modelUsage"
+        );
         let turns = after_restart.pointer("/history/turns").and_then(Value::as_array).expect("turns array");
         assert_eq!(turns.len(), 2, "{protocol}: should persist 2 turns");
         restarted.shutdown().await;
@@ -515,6 +525,16 @@ async fn builtin_workspace_tools_and_attachments() {
             ("call_r_bin", "read", json!({ "path": "bin.dat" })),
             ("call_r_zero", "read", json!({ "path": "notes/demo.txt", "limit": 0 })),
             (
+                "call_todo",
+                "todo",
+                json!({
+                    "todos": [
+                        { "content": "verify tools", "status": "in_progress" },
+                        { "content": "wrap up", "status": "pending" }
+                    ]
+                }),
+            ),
+            (
                 "call_bash",
                 "bash",
                 json!({
@@ -570,8 +590,13 @@ async fn builtin_workspace_tools_and_attachments() {
     let final_req = &reqs.last().expect("final request").body;
     let final_text = final_req.to_string();
     assert!(final_text.contains("line TWO edited"), "read result must reach model");
+    assert!(final_text.contains("BASH_OK"), "head+tail bash truncation must preserve opening output");
     assert!(final_text.contains("call_r_bin"), "binary read result must be paired");
     assert!(final_text.contains("call_r_zero"), "limit=0 read result must be paired");
+    assert!(
+        final_text.contains("Updated todo list (0/2 completed, 1 in progress)."),
+        "todo tool result must reach model"
+    );
 
     let outputs_dir = env.home.join("sessions").join("outputs").join(&session_id);
     assert!(

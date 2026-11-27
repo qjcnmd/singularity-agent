@@ -224,7 +224,7 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
       {type === 'stdio' ? <>
         <label className="sg-field"><span>命令</span><input className="input" aria-label="MCP 命令" required value={command} onChange={event => setCommand(event.target.value)} /></label>
         <label className="sg-field"><span>参数（JSON 数组）</span><textarea className="input" aria-label="MCP 参数" rows={3} value={args} onChange={event => setArgs(event.target.value)} /></label>
-        <label className="sg-field"><span>工作目录（留空使用任务的项目目录）</span><input className="input" aria-label="MCP 工作目录" value={cwd} onChange={event => setCwd(event.target.value)} /></label>
+        <label className="sg-field"><span>工作目录</span><input className="input" aria-label="MCP 工作目录" placeholder="默认使用项目目录" value={cwd} onChange={event => setCwd(event.target.value)} /></label>
         <label className="sg-field"><span>环境变量（JSON 对象）</span><textarea className="input" aria-label="MCP 环境变量" rows={3} spellCheck={false} value={env} onChange={event => setEnv(event.target.value)} /></label>
       </> : <>
         <label className="sg-field"><span>服务地址</span><input className="input" aria-label="MCP 服务地址" type="url" required value={url} onChange={event => setUrl(event.target.value)} /></label>

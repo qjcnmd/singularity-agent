@@ -266,6 +266,16 @@ async fn tool_scheduling_question_barrier_and_queued_input() {
         .and_then(Value::as_str)
         .expect("question item id")
         .to_string();
+    assert_eq!(
+        question_frame.pointer("/payload/modelUsage/usagePresent").and_then(Value::as_bool),
+        Some(true),
+        "running session runtime must push live modelUsage after tool-only model step: {question_frame}"
+    );
+    assert_eq!(
+        question_frame.pointer("/payload/modelUsage/totalTokens").and_then(Value::as_u64),
+        Some(150),
+        "running session runtime must accumulate tokens from prior model step: {question_frame}"
+    );
 
     let events_before_question = client.take_buffered_events();
     let finished_tool_count = events_before_question

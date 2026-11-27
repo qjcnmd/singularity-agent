@@ -14,9 +14,12 @@ const PROJECT_INSTRUCTIONS: &str = "project-instructions";
 const BASH: &str = "bash";
 const TASKS: &str = "tasks";
 const READ: &str = "read";
+const GREP: &str = "grep";
+const GLOB: &str = "glob";
 const EDIT: &str = "edit";
 const WRITE: &str = "write";
 const VIEW_IMAGE: &str = "view-image";
+const TODO: &str = "todo";
 const QUESTION: &str = "ask-user-question";
 const WEB: &str = "web";
 pub(super) const SKILLS_MODULE_ID: &str = "skills";
@@ -208,6 +211,8 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
             Some("Use write to create new text files or replace an entire file."),
         ),
         (READ, "read", "读取文本文件", tools::read_tool(), Some("Use read for text files.")),
+        (GREP, "grep", "在工作区搜索文件内容", tools::grep_tool(), None),
+        (GLOB, "glob", "按通配符查找工作区文件", tools::glob_tool(), None),
         (
             VIEW_IMAGE,
             "view_image",
@@ -215,15 +220,32 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
             tools::view_image_tool(),
             Some("Use view_image for image files."),
         ),
+        (
+            TODO,
+            "todo",
+            "管理多步骤任务待办清单",
+            tools::todo_tool(),
+            Some(
+                "Use todo to track progress on complex multi-step tasks (3+ steps); skip it for simple tasks.",
+            ),
+        ),
         (QUESTION, "ask_user_question", "向用户提问", tools::question_tool(), None),
     ];
+    let mut grep_enabled = false;
+    let mut glob_enabled = false;
     for (id, label, detail, tool, guideline) in optional_tools {
         let tokens = estimate_tool_tokens([&tool.0]);
         if collector.push(id, ContextGroup::Tools, label, detail.into(), tokens, false) {
+            if id == GREP {
+                grep_enabled = true;
+            } else if id == GLOB {
+                glob_enabled = true;
+            }
             registry.add_builtin([tool]);
             tool_guidelines.extend(guideline);
         }
     }
+    tool_guidelines.push(search_guideline(grep_enabled, glob_enabled));
 
     if let Some(access) = web {
         let search_schema = tools::web_search_schema();
@@ -366,6 +388,23 @@ fn mcp_server_detail(error: Option<&str>, tool_names: impl Iterator<Item = impl 
     }
 }
 
+fn search_guideline(grep_enabled: bool, glob_enabled: bool) -> &'static str {
+    match (grep_enabled, glob_enabled) {
+        (true, true) => {
+            "Use grep for content searches and glob for file discovery; use bash (Python or other commands) for byte ranges and structured processing."
+        }
+        (true, false) => {
+            "Use grep for content searches; use bash with rg --files for file discovery, and Python or other commands for byte ranges and structured processing."
+        }
+        (false, true) => {
+            "Use glob for file discovery; use bash with rg for content searches, and Python or other commands for byte ranges and structured processing."
+        }
+        (false, false) => {
+            "Use bash with rg for content searches and rg --files for file discovery; use Python or other commands for byte ranges and structured processing."
+        }
+    }
+}
+
 fn assemble_developer_instructions(cwd: &str, tool_guidelines: &[&str]) -> String {
     let mut guidelines = String::new();
     for line in tool_guidelines {
@@ -380,7 +419,6 @@ fn assemble_developer_instructions(cwd: &str, tool_guidelines: &[&str]) -> Strin
              writing new files.\n\n\
              Guidelines:\n\
              {guidelines}\
-             - Use bash with rg for content searches and rg --files for file discovery; use Python or other commands for byte ranges and structured processing.\n\
              - Be concise in your responses\n\
              - Show file paths clearly when working with files\n\n\
              Environment:\n- Platform: windows\n\

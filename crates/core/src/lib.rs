@@ -34,6 +34,12 @@ pub fn iso_minus_millis(timestamp: &str, millis: u64) -> Option<String> {
     shifted.format(ISO_FORMAT).ok()
 }
 
+pub fn iso_elapsed_secs(earlier: &str, later: &str) -> Option<i64> {
+    let start = time::PrimitiveDateTime::parse(earlier, ISO_FORMAT).ok()?.assume_utc();
+    let end = time::PrimitiveDateTime::parse(later, ISO_FORMAT).ok()?.assume_utc();
+    Some((end - start).whole_seconds())
+}
+
 pub fn display_path(path: &std::path::Path) -> String {
     let text = path.to_string_lossy().replace('\\', "/");
     if text.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("//?/UNC/")) {

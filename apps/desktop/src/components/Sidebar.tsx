@@ -1,8 +1,7 @@
 import { SelectionSlider } from './SelectionSlider'
-import { APP_NAME } from '../identity'
 import { workspaceKey } from '../workspace'
 import { X, Minus, Plus, PanelLeft } from 'lucide-react'
-import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { memo, useEffect, useRef, useState, type ReactNode } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
 import type { ThreadSummary, Workspace } from '../protocol'
 import { sessionTitles } from '../sessionTitle'
@@ -36,24 +35,6 @@ function sameSidebarState(previous: SidebarState, next: SidebarState): boolean {
 
 function SidebarView() {
   const state = useAppStore(sidebarFields, sameSidebarState)
-  const sidebar = useRef<HTMLElement>(null)
-  const sidebarFocus = useRef<string | null>(null)
-  const focusSidebar = () => {
-    const target = sidebarFocus.current && sidebar.current?.querySelector<HTMLButtonElement>(sidebarFocus.current)
-    if (!target) return
-    target.focus()
-    if (document.activeElement === target) sidebarFocus.current = null
-  }
-  const toggleSidebar = () => {
-    sidebarFocus.current = state.sidebarCollapsed ? '.sidebar-expanded .sidebar-brand button' : '.sidebar-rail button'
-    appStore.toggleSidebar()
-  }
-  useLayoutEffect(() => {
-    const target = sidebarFocus.current
-    if (!target) return
-    const frame = requestAnimationFrame(focusSidebar)
-    return () => cancelAnimationFrame(frame)
-  }, [state.sidebarCollapsed])
   const [dialog, setDialog] = useState<PendingDialog>({ kind: 'none' })
   const [, setTimeTick] = useState(0)
   useEffect(() => {
@@ -64,88 +45,85 @@ function SidebarView() {
   const [showAll, setShowAll] = useState<Set<string>>(new Set())
   return (
     <>
-            <aside ref={sidebar} className={`sidebar-shell${state.sidebarCollapsed ? ' is-collapsed' : ''}`} aria-label="项目与任务导航" onTransitionEnd={focusSidebar}>
-      <div className="sidebar sidebar-rail" inert={!state.sidebarCollapsed} aria-hidden={!state.sidebarCollapsed}>
-        <SidebarToggle expanded={!state.sidebarCollapsed} controls="left-sidebar" onClick={toggleSidebar} />
+      <aside className={`sidebar-shell${state.sidebarCollapsed ? ' is-collapsed' : ''}`} aria-label="项目与任务导航">
+        <div id="left-sidebar" className="sidebar sidebar-expanded" inert={state.sidebarCollapsed} aria-hidden={state.sidebarCollapsed}>
+          <div className="sidebar-topbar" />
+          <div className="sidebar-body">
+            <header className="sidebar-brand">
+              <button className={`sidebar-new-task${state.selectedSessionId === null ? ' is-active' : ''}`} type="button" onClick={() => appStore.newTask()}>
+                <span className="sidebar-new-plus" aria-hidden="true">+</span>
+                <span>新建任务</span>
+              </button>
+            </header>
 
-      </div>
-      <div id="left-sidebar" className="sidebar sidebar-expanded" inert={state.sidebarCollapsed} aria-hidden={state.sidebarCollapsed}>
-        <header className="sidebar-brand">
-          <span className="sidebar-wordmark">{APP_NAME}</span>
-          <SidebarToggle expanded={!state.sidebarCollapsed} controls="left-sidebar" onClick={toggleSidebar} />
-        </header>
-
-        <button className={`sidebar-new-task${state.selectedSessionId === null ? ' is-active' : ''}`} type="button" onClick={() => appStore.newTask()}>
-          <span className="sidebar-new-plus" aria-hidden="true">+</span>
-          <span>新建任务</span>
-        </button>
-
-        <section className="sidebar-section">
-          <div className="section-heading">
-            <span>项目</span>
-            <button type="button" className="icon-button small" onClick={() => appStore.openDirectoryPicker()} aria-label="添加项目"><Plus size={14} strokeWidth={1.7} /></button>
+            <section className="sidebar-section">
+              <div className="section-heading">
+                <span>项目</span>
+                <button type="button" className="icon-button small" onClick={() => appStore.openDirectoryPicker()} aria-label="添加项目"><Plus size={14} strokeWidth={1.7} /></button>
+              </div>
+              <div className="workspace-list">
+                {state.bootstrap?.workspaces.map((item) => {
+                  const root = workspaceKey(item.root)
+                  const sessions = state.bootstrap?.sessionsByWorkspace[root] ?? []
+                  const titleOf = sessionTitles(sessions)
+                  const expanded = !collapsed.has(root)
+                  const visible = showAll.has(root) ? sessions : sessions.slice(0, 5)
+                  return <section key={root}>
+                    <WorkspaceButton
+                      workspace={item}
+                      selected={root === state.selectedWorkspaceRoot && state.selectedSessionId === null}
+                      expanded={expanded}
+                      onToggle={() => {
+                        const next = new Set(collapsed)
+                        if (next.has(root)) {
+                          next.delete(root)
+                          setShowAll(previous => {
+                            const reset = new Set(previous)
+                            reset.delete(root)
+                            return reset
+                          })
+                        } else next.add(root)
+                        appStore.setSidebarView({ collapsed: [...next] })
+                      }}
+                      onRemove={() => setDialog({ kind: 'remove', workspace: item })}
+                    />
+                    <Disclosure open={expanded}><SessionList activeKey={state.selectedSessionId}>
+                      {visible.map(session => <SessionButton key={session.threadId} session={session} title={titleOf(session)}
+                        selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
+                        unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })}
+                        onDelete={() => setDialog({ kind: 'delete', session, title: titleOf(session) })} />)}
+                      {sessions.length > 5 && (
+                        <button
+                          type="button"
+                          className="quiet-button"
+                          onClick={() => setShowAll(previous => {
+                            const next = new Set(previous)
+                            if (next.has(root)) next.delete(root)
+                            else next.add(root)
+                            return next
+                          })}
+                        >
+                          {showAll.has(root) ? '收起' : `显示更多 (${sessions.length - 5})`}
+                        </button>
+                      )}
+                    </SessionList></Disclosure>
+                  </section>
+                })}
+              </div>
+            </section>
+            <footer className="sidebar-footer">
+              <button
+                type="button"
+                className="nav-item"
+                onClick={() => {
+                  appStore.setSettingsOpen(true)
+                  if (window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
+                }}
+              >设置</button>
+            </footer>
           </div>
-          <div className="workspace-list">
-            {state.bootstrap?.workspaces.map((item) => {
-              const root = workspaceKey(item.root)
-              const sessions = state.bootstrap?.sessionsByWorkspace[root] ?? []
-              const titleOf = sessionTitles(sessions)
-              const expanded = !collapsed.has(root)
-              const visible = showAll.has(root) ? sessions : sessions.slice(0, 5)
-              return <section key={root}>
-                <WorkspaceButton
-                  workspace={item}
-                  selected={root === state.selectedWorkspaceRoot && state.selectedSessionId === null}
-                  expanded={expanded}
-                  onToggle={() => {
-                    const next = new Set(collapsed)
-                    if (next.has(root)) {
-                      next.delete(root)
-                      setShowAll(previous => {
-                        const reset = new Set(previous)
-                        reset.delete(root)
-                        return reset
-                      })
-                    } else next.add(root)
-                    appStore.setSidebarView({ collapsed: [...next] })
-                  }}
-                  onRemove={() => setDialog({ kind: 'remove', workspace: item })}
-                />
-                <Disclosure open={expanded}><SessionList activeKey={state.selectedSessionId}>
-                  {visible.map(session => <SessionButton key={session.threadId} session={session} title={titleOf(session)}
-                    selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
-                    unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })}
-                    onDelete={() => setDialog({ kind: 'delete', session, title: titleOf(session) })} />)}
-                  {sessions.length > 5 && (
-                    <button
-                      type="button"
-                      className="quiet-button"
-                      onClick={() => setShowAll(previous => {
-                        const next = new Set(previous)
-                        if (next.has(root)) next.delete(root)
-                        else next.add(root)
-                        return next
-                      })}
-                    >
-                      {showAll.has(root) ? '收起' : `显示更多 (${sessions.length - 5})`}
-                    </button>
-                  )}
-                </SessionList></Disclosure>
-              </section>
-            })}
-          </div>
-        </section>
-        <footer className="sidebar-footer">
-          <button
-            type="button"
-            className="nav-item"
-            onClick={() => {
-              appStore.setSettingsOpen(true)
-              if (window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
-            }}
-          >设置</button>
-        </footer>
-      </div></aside>
+        </div>
+      </aside>
       {dialog.kind !== 'none' && <SidebarDialog state={dialog} onClose={() => setDialog(current => current === dialog ? { kind: 'none' } : current)} />}
     </>
   )
@@ -277,13 +255,14 @@ function relativeTime(value: string): string {
   return days < 7 ? `${days}天` : new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric' }).format(then)
 }
 
-function SidebarToggle({ expanded, controls, onClick }: {
+export function SidebarToggle({ expanded, controls, className, onClick }: {
   expanded: boolean
   controls: string
+  className?: string
   onClick: () => void
 }) {
-  return <button type="button" className="icon-button" aria-label={expanded ? '收起侧栏' : '展开侧栏'} aria-expanded={expanded} aria-controls={controls} onClick={onClick}>
-    <PanelLeft size={18} aria-hidden="true" />
+  return <button type="button" className={`icon-button topbar-icon-button${className ? ` ${className}` : ''}`} aria-label={expanded ? '收起侧栏' : '展开侧栏'} aria-expanded={expanded} aria-controls={controls} onClick={onClick}>
+    <PanelLeft size={16} strokeWidth={1.75} aria-hidden="true" />
   </button>
 }
 

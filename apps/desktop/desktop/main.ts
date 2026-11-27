@@ -29,6 +29,14 @@ function readSavedTheme(): 'light' | 'dark' {
     return 'light'
   }
 }
+
+function titleBarOverlay(theme: 'light' | 'dark'): Electron.TitleBarOverlayOptions {
+  return {
+    color: '#00000000',
+    symbolColor: theme === 'dark' ? '#ededed' : '#141413',
+    height: 30,
+  }
+}
 protocol.registerSchemesAsPrivileged([{ scheme: APP_SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: true } }])
 let window: BrowserWindow
 let tray: Tray
@@ -71,9 +79,12 @@ async function start(): Promise<void> {
     void dialog.showMessageBox({ type: 'error', title: APP_NAME, message: '工作台后端已停止', detail: error.message, buttons: ['退出'] }).then(() => app.quit())
   })
   await backend.ready
+  const initialTheme = readSavedTheme()
   window = new BrowserWindow({
     title: APP_NAME, width: 1440, height: 960, minWidth: 720, minHeight: 480,
-    show: false, backgroundColor: readSavedTheme() === 'dark' ? '#202020' : '#ffffff', icon,
+    show: false, backgroundColor: initialTheme === 'dark' ? '#181818' : '#f6f6f8', icon,
+    titleBarStyle: 'hidden',
+    titleBarOverlay: titleBarOverlay(initialTheme),
     webPreferences: { preload: join(fileURLToPath(new URL('.', import.meta.url)), 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
   })
   Menu.setApplicationMenu(Menu.buildFromTemplate([{ label: APP_NAME, submenu: [
@@ -104,7 +115,8 @@ async function start(): Promise<void> {
       mkdirSync(userDataDir, { recursive: true })
       writeFileSync(themeFile, next, 'utf8')
     } catch {}
-    window.setBackgroundColor(next === 'dark' ? '#202020' : '#ffffff')
+    window.setBackgroundColor(next === 'dark' ? '#181818' : '#f6f6f8')
+    window.setTitleBarOverlay(titleBarOverlay(next))
   })
   ipcMain.handle(IPC_CHANNELS.rpc, async (event, request): Promise<RpcResponse> => {
     trusted(event)

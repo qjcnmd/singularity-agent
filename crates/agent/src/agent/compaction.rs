@@ -54,6 +54,15 @@ pub(super) enum CompactionMode {
     Manual,
 }
 
+pub(crate) fn precheck_manual_compaction(
+    writer: &mut crate::session::SessionManager,
+    retain_tokens: u64,
+    identity: (&str, &str),
+) -> Result<bool> {
+    context::clear_idle_tool_results(writer)?;
+    Ok(compaction::has_compactable_prefix(writer.data(), retain_tokens, identity))
+}
+
 impl RequestContext {
     fn trigger_tokens(&self) -> u64 {
         self.context_window() * AUTO_COMPACTION_TRIGGER_PERCENT / 100
@@ -72,19 +81,20 @@ impl RequestContext {
         let overhead_tokens = self.request_definitions().estimated_tokens;
         let session = std::sync::Arc::clone(&self.session);
         let trigger = self.trigger_tokens();
-        let prepared = tokio::task::spawn_blocking(move || {
+        let prepared = tokio::task::spawn_blocking(move || -> Result<Option<context::PreparedContext>> {
             with_writer(&session, |writer| {
+                context::clear_idle_tool_results(writer)?;
                 let data = writer.data();
                 let entries = context::resolve_context_entries(data);
                 let tokens = context::input_tokens(data, &entries, (&target.0, &target.1), overhead_tokens);
                 if allow_auto_compact && tokens >= trigger {
-                    return None;
+                    return Ok(None);
                 }
-                Some(context::PreparedContext::new(data, &entries, tokens))
+                Ok(Some(context::PreparedContext::new(data, &entries, tokens)))
             })
         })
         .await
-        .expect("pre-request context pressure inspection completes while the runtime is running");
+        .expect("pre-request context pressure inspection completes while the runtime is running")?;
 
         match prepared {
             Some(context) => Ok(PreRequestOutcome::Ready(context)),
@@ -108,13 +118,13 @@ impl RequestContext {
         let retain_tokens = compaction::retention_budget_tokens(self.provider.model_configuration());
         let identity = self.model_identity();
         let session = std::sync::Arc::clone(&self.session);
-        let has_prefix = tokio::task::spawn_blocking(move || {
+        let has_prefix = tokio::task::spawn_blocking(move || -> Result<bool> {
             with_writer(&session, |writer| {
-                compaction::has_compactable_prefix(writer.data(), retain_tokens, (&identity.0, &identity.1))
+                precheck_manual_compaction(writer, retain_tokens, (&identity.0, &identity.1))
             })
         })
         .await
-        .expect("compaction precheck completes while the runtime is running");
+        .expect("compaction precheck completes while the runtime is running")?;
         if !has_prefix {
             compaction_unneeded(on_event, cancellation);
             return Ok(());
