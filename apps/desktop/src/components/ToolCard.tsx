@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
-import { CircleAlert, CircleX, LoaderCircle, FileText, SquareTerminal, Image, MessageCircleQuestion, Search, Globe } from 'lucide-react'
+import { CircleAlert, CircleX, LoaderCircle, FileText, FolderSearch, SquareTerminal, Image, ListTodo, MessageCircleQuestion, Search, Globe } from 'lucide-react'
 import { appStore, useAppStore } from '../appStore'
 import { factStatusText } from '../copy'
 import { useSelectionGuard } from '../interactions'
@@ -11,6 +11,7 @@ import { Disclosure } from './Disclosure'
 import { EditDiff } from './EditDiff'
 import { ExpandChevron } from './ExpandChevron'
 import { AttachedImages } from './Images'
+import { parseTodos, TodoList, todoSummary } from './TodoList'
 
 type ToolItem = Extract<HistoryItem, { type: 'tool' }>
 type ArgRecord = Record<string, unknown>
@@ -50,12 +51,41 @@ const toolPresentations: Record<string, ToolPresentation> = {
   task_output: { background: true, summary: () => '查看后台命令输出' },
   task_stop: { background: true, summary: () => '停止后台命令' },
   read: fileToolSpec(),
+  grep: {
+    icon: Search,
+    argument: input => {
+      const pattern = typeof input.pattern === 'string' ? input.pattern.trim() : ''
+      const scope = [input.path, input.glob]
+        .filter((value): value is string => typeof value === 'string' && value.trim() !== '')
+        .map(value => value.trim())
+        .join(' · ')
+      if (pattern && scope) return `${pattern} (${scope})`
+      return pattern || scope || null
+    },
+  },
+  glob: {
+    icon: FolderSearch,
+    argument: input => {
+      const pattern = typeof input.pattern === 'string' ? input.pattern.trim() : ''
+      const path = typeof input.path === 'string' ? input.path.trim() : ''
+      if (pattern && path) return `${pattern} (${path})`
+      return pattern || path || null
+    },
+  },
   edit: fileToolSpec({ diffOutput: true }),
   write: fileToolSpec({ diffOutput: true }),
   view_image: fileToolSpec({ icon: Image }),
   web_search: { title: '联网搜索', icon: Search, argument: textField('query') },
   web_fetch: { title: '读取网页', icon: Globe, argument: textField('url') },
   skill: { title: '读取技能', argument: textField('name') },
+  todo: {
+    title: '待办',
+    icon: ListTodo,
+    summary: input => {
+      const todos = parseTodos(input)
+      return todos !== null ? todoSummary(todos) : ''
+    },
+  },
   ask_user_question: {
     title: '询问用户',
     icon: MessageCircleQuestion,
@@ -173,6 +203,10 @@ function ToolOutput({ item: fact, spec, filePath, command, cwd }: {
   const parameters = JSON.stringify(input, displayJson, 2)
   if (fact.name === 'ask_user_question' && fact.status === 'completed' && fact.result) {
     return <QuestionAnswers questions={(input as { questions?: UserQuestion[] })?.questions} output={fact.result.output} />
+  }
+  if (fact.name === 'todo' && fact.status !== 'failed') {
+    const todos = parseTodos(input)
+    if (todos !== null) return <TodoList todos={todos} />
   }
   let output = fact.result?.output ?? ''
   if (background && fact.name !== 'bash' && output !== '') {

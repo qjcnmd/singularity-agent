@@ -86,7 +86,7 @@ export function Settings() {
 }
 
 function AppearanceSection() {
-  const state = useAppStore(['theme', 'accentColor', 'messageFontSize'])
+  const state = useAppStore(['theme', 'accentColor', 'messageFontSize', 'stepsDefaultExpanded'])
   const [fontSizeDraft, setFontSizeDraft] = useState(() => String(state.messageFontSize))
   const skipBlurCommitRef = useRef(false)
   useEffect(() => {
@@ -108,7 +108,7 @@ function AppearanceSection() {
   }
 
   return (
-    <PageFrame title="外观" subtitle="调整界面主题、强调色与消息字号。">
+    <PageFrame title="外观">
       <div className="settings-group">
         <div className="settings-row"><span>主题</span>
           <div className="segmented" role="radiogroup" aria-label="主题">
@@ -161,6 +161,13 @@ function AppearanceSection() {
             />
             <span>px</span>
             <button type="button" className="icon-button small" aria-label="增大字号" disabled={state.messageFontSize >= messageFontSize.max} onClick={() => appStore.setMessageFontSize(state.messageFontSize + .5)}>+</button>
+          </div>
+        </div>
+        <div className="settings-row"><span>执行步骤</span>
+          <div className="segmented" role="radiogroup" aria-label="执行步骤默认状态">
+            {([[true, '默认展开'], [false, '默认收起']] as const).map(([expanded, label]) => (
+              <button key={label} type="button" role="radio" aria-checked={state.stepsDefaultExpanded === expanded} onClick={() => appStore.setStepsDefaultExpanded(expanded)}>{label}</button>
+            ))}
           </div>
         </div>
       </div>
@@ -222,7 +229,7 @@ function ModelsSection() {
   }
 
   return (
-    <PageFrame title="模型" subtitle="管理模型提供方、协议类型与可用模型列表。">
+    <PageFrame title="模型">
       {catalog?.error && editor === null && removing === null && (
         <ModelConfigErrorAlert title={unreadable ? '无法读取模型配置' : '默认模型不可用'} error={catalog.error} />
       )}
@@ -319,7 +326,7 @@ function WebSearchSection() {
   }
 
   return (
-    <PageFrame title="联网搜索" subtitle="配置 DeepSeek 独立搜索与网页抓取服务，所有聊天模型通用。">
+    <PageFrame title="联网搜索">
       {unreadable && catalog?.error && (
         <ModelConfigErrorAlert title="无法读取模型配置" error={catalog.error} />
       )}
@@ -340,7 +347,6 @@ function WebSearchSection() {
                 placeholder={saved?.baseUrl}
                 onChange={event => { setBaseUrl(event.target.value); setSavedNotice(false) }}
               />
-              <small className="field-hint">将请求 /v1/tools/search 与 /v1/tools/fetch</small>
             </label>
             <div className="sg-field">
               <label htmlFor="web-search-api-key">API 密钥</label>
@@ -372,7 +378,6 @@ function WebSearchSection() {
           </fieldset>
         </form>
       </div>
-      <p className="web-search-footnote">配置 API 密钥后，新建任务页工具栏将出现联网搜索胶囊（web_*），可在每个任务中按需开关；未配置密钥时不注入工具，不占用上下文 Token。</p>
     </PageFrame>
   )
 }

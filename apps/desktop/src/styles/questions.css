@@ -1,3 +1,7 @@
+.activity-card.question-card { margin: 10px 0 0; border-radius: 16px; background: var(--card); border: 1px solid var(--line-strong); box-shadow: 0 1px 2px rgb(0 0 0 / 3.5%), 0 6px 20px -12px rgb(0 0 0 / 10%); overflow: hidden; }
+[data-theme=dark] .activity-card.question-card { border-color: var(--line); box-shadow: 0 2px 10px -3px rgb(0 0 0 / 45%); }
+.question-card .activity-card-header { display: flex; width: 100%; max-width: none; min-height: 36px; margin: 0; padding: 6px 12px; border-radius: 0; }
+.question-card .activity-card-title { flex: 1; }
 .question-waiting-dot { width: 8px; height: 8px; margin: 3px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); flex: none; }
 .question-badge { flex: none; padding: 1px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 500; }
 .question-panel { display: grid; gap: 8px; padding: 10px 12px 10px; overflow: hidden; font-size: var(--block-font-size); }

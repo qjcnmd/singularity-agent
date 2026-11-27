@@ -1,7 +1,7 @@
 import { reduceUnread, initialSyncState, acceptSessionStart, acceptSessionRead, resetBaseline, reduceStream, pruneStaleSelection, type SyncState } from './sync'
 import { loadPersisted, persistView, type PersistedView } from './viewPersistence'
 import { RpcClient } from './rpcClient'
-import type { SessionReadResult, StreamEnvelope, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
+import type { ChangedFile, SessionReadResult, StreamEnvelope, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
 import { DraftStore, type DraftSnapshot } from './drafts'
 import { workspaceKey } from './workspace'
 
@@ -34,6 +34,7 @@ export interface FileTab {
   id: string; path: string; cwd: string; title: string
   mode: 'file' | 'changes'
   focusPath?: string
+  initialChanges?: ChangedFile[]
   opened: number
 }
 

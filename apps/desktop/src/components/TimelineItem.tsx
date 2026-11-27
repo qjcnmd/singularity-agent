@@ -15,9 +15,9 @@ import { actionOrigin, appStore, pendingKey, useAppStore } from '../appStore'
 import { pop } from '../motion'
 import { useBodyCollapse, useSelectionGuard } from '../interactions'
 import { MarkdownBody } from '../markdown'
-import { compactionText, factStatusText, formatTokenCount } from '../copy'
+import { compactionText, factStatusText } from '../copy'
 import { formatClock, compactionResultText, formatTurnDuration, toolDisplay, type ActivityGroup, type ActivityRowItem, type TimelineRow } from '../timeline'
-import type { HistoryItem, SessionModelUsage, ToolStatus, VisibleBackgroundTask } from '../protocol'
+import type { HistoryItem, ToolStatus, VisibleBackgroundTask } from '../protocol'
 
 const previewLineCount = 8
 
@@ -60,13 +60,13 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
       />
     )
   }
-  if (item.type === 'stats') return <MessageStatsLine itemKey={itemKey} stats={item.stats} at={item.at} />
+  if (item.type === 'stats') return <TurnEndTime itemKey={itemKey} at={item.at} />
   if (item.type === 'question') return (
     <motion.section
       initial={reduced ? false : { opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       transition={reduced ? { duration: 0 } : { duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
-      className="timeline-item activity-card"
+      className="timeline-item activity-card question-card"
       data-item-id={itemKey}
       aria-label="询问用户"
     >
@@ -92,8 +92,13 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
     {sessionId && item.images && <AttachedImages sessionId={sessionId} images={item.images} />}
     {item.files && <FileChips files={item.files} />}
   </>
+  const isUser = item.role === 'user'
   return (
-    <motion.article initial={reduced ? false : { opacity: 0, y: item.role === 'user' ? 36 : 10, scale: item.role === 'user' ? .84 : .9 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={reduced ? { duration: 0 } : { ...pop, opacity: { duration: .16 } }} style={{ originX: item.role === 'user' ? 1 : 0, originY: 1 }}
+    <motion.article
+      initial={reduced ? false : isUser ? { opacity: 0, y: 36, scale: .84 } : { opacity: 0, y: 4 }}
+      animate={isUser ? { opacity: 1, y: 0, scale: 1 } : { opacity: 1, y: 0 }}
+      transition={reduced ? { duration: 0 } : isUser ? { ...pop, opacity: { duration: .16 } } : { duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+      style={isUser ? { originX: 1, originY: 1 } : undefined}
       className={`timeline-item message-item timeline-${item.role}${isEditing ? ' is-editing' : ''}`}
       data-item-id={itemKey}
       aria-label={`${item.role === 'user' ? '你' : APP_NAME}，${factStatusText[item.status]}`}
@@ -136,7 +141,7 @@ export const TimelineItem = memo(function TimelineItem({ item, itemKey, cwd, use
           )}
         </div>
       )}
-      {item.role === 'assistant' && <MessageStatsLine stats={item.stats} at={item.at} />}
+      {item.role === 'assistant' && <TurnEndTime at={item.at} />}
     </motion.article>
   )
 })
@@ -293,7 +298,11 @@ function summarizeActivity(rows: ActivityGroup['rows'], tasks: VisibleBackground
 
 function ActivityCard({ group, itemKey, cwd, userHome, sessionId, onDisclosureChange }: Omit<Props, 'item'> & { group: ActivityGroup }) {
   const reduced = useReducedMotion()
-  const [collapsed, setCollapsed] = useState(false)
+  const { stepsDefaultExpanded } = useAppStore(['stepsDefaultExpanded'])
+  const [collapsed, setCollapsed] = useState(!stepsDefaultExpanded)
+  useEffect(() => {
+    setCollapsed(!stepsDefaultExpanded)
+  }, [stepsDefaultExpanded])
   const guard = useSelectionGuard(onDisclosureChange)
   const tracksLiveTasks = group.rows.some(({ item }) =>
     (item.type === 'tool' || item.type === 'tool_group') && toolTracksLiveTasks(item.name),
@@ -318,20 +327,22 @@ function ActivityCard({ group, itemKey, cwd, userHome, sessionId, onDisclosureCh
       data-item-id={itemKey}
       aria-label={label}
     >
-      {collapsible ? (
-        <button type="button" className="activity-card-header" aria-expanded={!collapsed} {...guard(() => setCollapsed(value => !value))}>
-          <StepStatusIcon name="activity" status={status} />
-          <span className={`activity-card-title${status === 'running' ? ' activity-shimmer' : ''}`}>{label}</span>
-          {meta}
-          <ExpandChevron expanded={!collapsed} size={14} />
-        </button>
-      ) : (
-        <div className="activity-card-header is-static">
-          <StepStatusIcon name="activity" status={status} />
-          <span className={`activity-card-title${status === 'running' ? ' activity-shimmer' : ''}`}>{label}</span>
-          {meta}
-        </div>
-      )}
+      <div className="activity-card-head">
+        {collapsible ? (
+          <button type="button" className="activity-card-header" aria-expanded={!collapsed} {...guard(() => setCollapsed(value => !value))}>
+            <StepStatusIcon name="activity" status={status} />
+            <span className={`activity-card-title${status === 'running' ? ' activity-shimmer' : ''}`}>{label}</span>
+            {meta}
+            <ExpandChevron expanded={!collapsed} size={14} />
+          </button>
+        ) : (
+          <div className="activity-card-header is-static">
+            <StepStatusIcon name="activity" status={status} />
+            <span className={`activity-card-title${status === 'running' ? ' activity-shimmer' : ''}`}>{label}</span>
+            {meta}
+          </div>
+        )}
+      </div>
       {!headerOnly && (
         <div className={`content-disclosure${!collapsed || !collapsible ? ' is-open' : ''}`} inert={collapsible && collapsed} aria-hidden={collapsible && collapsed}>
           <div className="activity-card-body">
@@ -342,7 +353,7 @@ function ActivityCard({ group, itemKey, cwd, userHome, sessionId, onDisclosureCh
                   className="activity-card-row"
                   initial={reduced ? false : { opacity: 0, height: 0 }}
                   animate={{ opacity: 1, height: 'auto' }}
-                  exit={reduced ? undefined : { opacity: 0, height: 0 }}
+                  exit={reduced || row.item.type === 'typing' ? undefined : { opacity: 0, height: 0 }}
                   transition={reduced ? { duration: 0 } : {
                     height: { duration: 0.24, ease: [0.22, 1, 0.36, 1] },
                     opacity: { duration: 0.18, ease: 'easeOut', delay: 0.04 },
@@ -396,7 +407,9 @@ const ActivityStepRow = memo(function ActivityStepRow({ item, itemKey, cwd, user
   return <ToolCard item={item} itemKey={itemKey} cwd={cwd} userHome={userHome} sessionId={sessionId} onDisclosureChange={onDisclosureChange} />
 })
 
-function TurnDuration({ itemKey, startedAt, firstTokenAt, finishedAt, inline = false }: { itemKey?: string; startedAt: string; firstTokenAt?: string; finishedAt?: string; inline?: boolean }) {
+function TurnDuration({ itemKey, startedAt, finishedAt, inline = false }: {
+  itemKey?: string; startedAt: string; finishedAt?: string; inline?: boolean
+}) {
   const [now, setNow] = useState(Date.now)
   useEffect(() => {
     if (finishedAt) return
@@ -406,14 +419,20 @@ function TurnDuration({ itemKey, startedAt, firstTokenAt, finishedAt, inline = f
   const elapsed = (finishedAt ? Date.parse(finishedAt) : now) - Date.parse(startedAt)
   if (inline) {
     return (
-      <span className="activity-card-meta" role={finishedAt ? undefined : 'timer'} aria-label="本轮执行时间">
-        {firstTokenAt && <time dateTime={firstTokenAt}>{formatClock(firstTokenAt)}</time>}
-        {firstTokenAt && ' · '}
-        <span>{formatTurnDuration(elapsed)}</span>
+      <span className="activity-card-meta" role={finishedAt ? undefined : 'timer'} aria-label="本轮开始时间与耗时">
+        <time dateTime={startedAt} title="开始时间">{formatClock(startedAt, true)}</time>
+        {' · '}
+        <span title="耗时">{formatTurnDuration(elapsed)}</span>
       </span>
     )
   }
-  return <div className="turn-duration" data-item-id={itemKey} role={finishedAt ? undefined : 'timer'} aria-label="本轮执行时间">{firstTokenAt && <time dateTime={firstTokenAt}>{formatClock(firstTokenAt)}</time>}<span>{formatTurnDuration(elapsed)}</span></div>
+  return (
+    <div className="timeline-item turn-duration" data-item-id={itemKey} role={finishedAt ? undefined : 'timer'} aria-label="本轮开始时间与耗时">
+      <time dateTime={startedAt} title="开始时间">{formatClock(startedAt, true)}</time>
+      <span aria-hidden="true">·</span>
+      <span title="耗时">{formatTurnDuration(elapsed)}</span>
+    </div>
+  )
 }
 
 function ReasoningRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemKey' | 'onDisclosureChange'> & { item: Extract<HistoryItem, { type: 'thinking' }> }) {
@@ -455,12 +474,11 @@ function CompactionRow({ item, itemKey, onDisclosureChange }: Pick<Props, 'itemK
   </article>
 }
 
-function MessageStatsLine({ itemKey, stats, at }: { itemKey?: string; stats?: SessionModelUsage; at?: string }) {
-  const parts: string[] = []
-  if (stats && stats.ttftRequests > 0) parts.push(`TTFT ${(stats.ttftMs / stats.ttftRequests / 1000).toFixed(1)}s`)
-  if (stats && stats.decodeMs > 0) parts.push(`${Math.round(stats.decodeTokens * 1000 / stats.decodeMs)} tok/s`)
-  if (stats?.usagePresent) parts.push(`${formatTokenCount(stats.totalTokens)} tokens`)
-  if (stats?.usagePresent && stats.cacheUsageComplete && stats.inputTokens > 0) parts.push(`${Math.floor(stats.cachedInputTokens / stats.inputTokens * 100)}%`)
-  if (at) parts.push(formatClock(at))
-  return parts.length ? <p className={itemKey ? 'timeline-item turn-stats' : 'turn-stats'} data-item-id={itemKey} title="平均首 token 时间 · 平均输出速度 · 会话总用量 · 缓存命中率 · 时间">{parts.join(' · ')}</p> : null
+function TurnEndTime({ itemKey, at }: { itemKey?: string; at?: string }) {
+  if (!at) return null
+  return (
+    <p className={itemKey ? 'timeline-item turn-stats' : 'turn-stats'} data-item-id={itemKey} title="结束时间">
+      <time dateTime={at}>{formatClock(at, true)}</time>
+    </p>
+  )
 }

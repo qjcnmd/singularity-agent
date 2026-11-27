@@ -11,6 +11,8 @@ use model::{ModelClient, ProviderError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+pub(crate) use self::compaction::precheck_manual_compaction;
 pub use self::inbox::{QueuedInput, SkillExpansion, SteeringInbox, SteeringInboxHandle, UserInput};
 pub use self::questions::UserQuestions;
 pub use crate::image::InputImage;
@@ -31,8 +33,6 @@ use crate::session::{MessageDisplay, SessionError, SessionWriter, with_writer};
 use crate::tools::ToolRegistrySnapshot;
 use model::Message;
 
-const DOOM_LOOP_THRESHOLD: usize = 3;
-
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub instruction_home: std::path::PathBuf,
@@ -52,8 +52,6 @@ pub enum AgentError {
     Aborted,
     #[error("模型回复达到输出上限，内容未完成。请发送消息继续。")]
     OutputTruncated,
-    #[error("工具 {0} 使用相同参数连续失败 3 次，已自动停止。请检查错误信息或补充说明后继续。")]
-    RepeatedToolFailure(String),
     #[error("{0}")]
     InvalidCompaction(String),
     #[error("{source}")]
@@ -144,7 +142,6 @@ pub struct Agent {
     bash_tasks: Arc<crate::tools::BashTasks>,
     questions: Arc<UserQuestions>,
     inbox: SteeringInboxHandle,
-    last_failed: Option<(Vec<(String, serde_json::Value)>, usize)>,
 }
 impl Agent {
     pub fn new(
@@ -153,13 +150,7 @@ impl Agent {
         questions: Arc<UserQuestions>,
         bash_tasks: Arc<crate::tools::BashTasks>,
     ) -> Self {
-        Self {
-            requests,
-            bash_tasks,
-            questions,
-            inbox,
-            last_failed: None,
-        }
+        Self { requests, bash_tasks, questions, inbox }
     }
 
     pub async fn run(
@@ -192,12 +183,7 @@ impl Agent {
                 items: public_items,
             }));
             let has_tool_calls = !tool_calls.is_empty();
-            let step_calls: Vec<_> = tool_calls
-                .iter()
-                .filter(|_| !length_truncated)
-                .map(|call| (call.tool_name.clone(), call.arguments.clone()))
-                .collect();
-            let all_failed = if has_tool_calls {
+            if has_tool_calls {
                 self.dispatch_tools(
                     tool_calls,
                     &assistant_result_entry_id,
@@ -205,42 +191,13 @@ impl Agent {
                     cancellation,
                     on_event,
                 )
-                .await?
-            } else {
-                false
-            };
+                .await?;
+            }
             if length_truncated {
                 return Err(AgentError::OutputTruncated);
             }
             if cancellation.is_cancelled() {
                 return Err(AgentError::Aborted);
-            }
-            if !all_failed || step_calls.is_empty() {
-                self.last_failed = None;
-            } else {
-                let count = match &mut self.last_failed {
-                    Some((prev, count)) if *prev == step_calls => {
-                        *count += 1;
-                        *count
-                    }
-                    slot => {
-                        *slot = Some((step_calls, 1));
-                        1
-                    }
-                };
-                let has_user_steering =
-                    lock_inbox(&self.inbox).pending().iter().any(|entry| entry.user_input().is_some());
-                if count >= DOOM_LOOP_THRESHOLD && !has_user_steering {
-                    let mut names = Vec::new();
-                    if let Some((calls, _)) = &self.last_failed {
-                        for (name, _) in calls {
-                            if !names.contains(&name.as_str()) {
-                                names.push(name.as_str());
-                            }
-                        }
-                    }
-                    return Err(AgentError::RepeatedToolFailure(names.join("、")));
-                }
             }
             if !has_tool_calls && lock_inbox(&self.inbox).pending().is_empty() {
                 return Ok(());
@@ -308,7 +265,6 @@ impl Agent {
         let message = Message::User { content };
         let saved_at = self.append_message(&request.message_id, message, display, &input.images).await?;
         lock_inbox(&self.inbox).confirm_saved(&request.message_id);
-        self.last_failed = None;
         on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
             item: protocol::HistoryItem::Message {
                 id: request.item_id(),

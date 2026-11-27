@@ -25,6 +25,10 @@ base64 = "0.22"
 vte = { version = "0.15", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 similar = "3.2.1"
+globset.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+ignore.workspace = true
 process-wrap.workspace = true
 windows.workspace = true
 

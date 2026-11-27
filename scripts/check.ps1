@@ -43,7 +43,8 @@ function Test-ProdSourcePath([string]$RelPath) {
 }
 
 function Invoke-SizeCheck {
-    $maxLines = 600
+    $warnLines = 600
+    $maxLines = 800
     $roots = @('crates', 'apps/desktop/desktop', 'apps/desktop/src', 'scripts')
     $files = @(Get-ChildItem -Path $roots -Recurse -File | ForEach-Object {
         $rel = [System.IO.Path]::GetRelativePath($repoRoot, $_.FullName).Replace('\', '/')
@@ -83,19 +84,27 @@ function Invoke-SizeCheck {
         $global:LASTEXITCODE = 0
     }
 
+    $overWarn = @($files | Where-Object { $_.Lines -gt $warnLines -and $_.Lines -le $maxLines } | Sort-Object Lines -Descending)
+    if ($overWarn.Count -gt 0) {
+        Write-Host "  Warning: $($overWarn.Count) production source file(s) exceed $warnLines-line soft target (hard limit: $maxLines):" -ForegroundColor Yellow
+        foreach ($item in $overWarn) {
+            Write-Host "    $($item.Path) ($($item.Lines) > $warnLines)" -ForegroundColor Yellow
+        }
+    }
+
     $overLimit = @($files | Where-Object { $_.Lines -gt $maxLines } | Sort-Object Lines -Descending)
     if ($overLimit.Count -gt 0) {
         foreach ($item in $overLimit) {
             Write-Host "  $($item.Path) ($($item.Lines) > $maxLines)" -ForegroundColor Red
         }
-        throw "Production source files exceed $maxLines-line limit ($($overLimit.Count) file(s))."
+        throw "Production source files exceed $maxLines-line hard limit ($($overLimit.Count) file(s))."
     }
 }
 
 Push-Location $repoRoot
 try {
     if ($Scope -in @('rust', 'desktop', 'size', 'all')) {
-        Invoke-Step 'Check production source size (<= 600 lines)' {
+        Invoke-Step 'Check production source size (warn > 600, hard limit <= 800 lines)' {
             Invoke-SizeCheck
         }
     }

@@ -68,6 +68,7 @@ impl Conversation {
                 &state.model,
                 state.last_context_window,
             ),
+            model_usage: view.usage.has_metrics().then(|| view.usage.clone()),
             pending_question: match &state.turn {
                 TurnLifecycle::Running(controls) => controls.questions.pending(),
                 TurnLifecycle::Idle => None,

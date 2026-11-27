@@ -23,6 +23,7 @@ export interface PersistedView {
   sidebarCollapsed: boolean
   sidebarView: { collapsed: string[] }
   backgroundOpen: boolean
+  stepsDefaultExpanded: boolean
   viewportAnchors: Record<string, ViewportAnchor>
 }
 
@@ -38,20 +39,26 @@ export function loadPersisted(): PersistedView {
     sidebarCollapsed: false,
     sidebarView: { collapsed: [] },
     backgroundOpen: false,
+    stepsDefaultExpanded: true,
     viewportAnchors: {},
   }
   try {
     const stored = JSON.parse(localStorage.getItem(VIEW_STORAGE_KEY) ?? 'null') as Partial<PersistedView> | null
     if (!stored) return fallback
-    return { ...fallback, ...stored, accentColor: resolveAccentId(stored.accentColor) }
+    return {
+      ...fallback,
+      ...stored,
+      accentColor: resolveAccentId(stored.accentColor),
+      stepsDefaultExpanded: typeof stored.stepsDefaultExpanded === 'boolean' ? stored.stepsDefaultExpanded : fallback.stepsDefaultExpanded,
+    }
   } catch {
     return fallback
   }
 }
 
 export function persistView(value: PersistedView): void {
-  const { theme, messageFontSize, accentColor, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, viewportAnchors } = value
-  const view: PersistedView = { theme, messageFontSize, accentColor, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, viewportAnchors }
+  const { theme, messageFontSize, accentColor, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, stepsDefaultExpanded, viewportAnchors } = value
+  const view: PersistedView = { theme, messageFontSize, accentColor, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, stepsDefaultExpanded, viewportAnchors }
   localStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify(view))
 }
 

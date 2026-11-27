@@ -30,7 +30,12 @@ pub(crate) fn spec() -> app_core::ToolDefinition {
     }
 }
 
-pub(crate) async fn execute(args: WriteArgs, cwd: PathBuf, signal: CancellationToken) -> ToolExecution {
+pub(crate) async fn execute(
+    args: WriteArgs,
+    cwd: PathBuf,
+    output_directory: PathBuf,
+    signal: CancellationToken,
+) -> ToolExecution {
     if signal.is_cancelled() {
         return error_result(ABORTED_MESSAGE);
     }
@@ -49,12 +54,13 @@ pub(crate) async fn execute(args: WriteArgs, cwd: PathBuf, signal: CancellationT
         Ok(key) => key,
         Err(error) => return error_result(format!("Could not write {}: {error}", args.path)),
     };
-    with_file_lock(key, signal, move |signal| execute_locked(&args, &target, signal)).await
+    with_file_lock(key, signal, move |signal| execute_locked(&args, &target, &output_directory, signal)).await
 }
 
 fn execute_locked(
     args: &WriteArgs,
     target: &Path,
+    output_directory: &Path,
     signal: &CancellationToken,
 ) -> Result<ToolExecution, String> {
     if signal.is_cancelled() {
@@ -88,7 +94,7 @@ fn execute_locked(
     app_core::write_bytes_atomic(target, content.as_bytes())
         .map_err(|error| format!("Could not write {}: {error}", args.path))?;
     let verb = if existed { "Wrote" } else { "Created" };
-    let mut execution = format_diff_result(verb, &args.path, &before, &content);
+    let mut execution = format_diff_result(verb, &args.path, &before, &content, output_directory);
     execution.file_created = Some(!existed);
     Ok(execution)
 }

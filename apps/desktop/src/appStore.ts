@@ -6,7 +6,7 @@ import { selectedModel } from './modelChoices'
 import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, clampFilePanelWidth, type PersistedView } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { emptyDraft, hasDraftContent, imageUpload, type Draft, type DraftAnnotation } from './drafts'
-import type { ImageAttachment, MessageAnnotation, ModelSelection, ProviderConfigurationInput, RpcMethod, RpcParams, UserQuestionAnswer, ViewportAnchor } from './protocol'
+import type { ChangedFile, ImageAttachment, MessageAnnotation, ModelSelection, ProviderConfigurationInput, RpcMethod, RpcParams, UserQuestionAnswer, ViewportAnchor } from './protocol'
 import { selectedSessionPhase } from './sessionState'
 import { acceptModelCatalog } from './sync'
 
@@ -375,6 +375,10 @@ class AppStore extends SessionStore {
     this.saveView({ theme })
   }
 
+  setStepsDefaultExpanded(stepsDefaultExpanded: boolean): void {
+    this.saveView({ stepsDefaultExpanded })
+  }
+
   openFile(path: string, cwd: string, title = path.split(/[\\/]/).filter(Boolean).pop() ?? path): void {
     const resolved = resolveFileUrl(path, cwd, this.state.bootstrap?.userHome)
     if (!resolved) return
@@ -383,16 +387,16 @@ class AppStore extends SessionStore {
     this.upsertFileTab({ id, path, cwd, title, mode: 'file', opened: 0 })
   }
 
-  openChangedFiles(cwd: string, focusPath?: string): void {
+  openChangedFiles(cwd: string, focusPath?: string, initialFiles?: ChangedFile[]): void {
     if (this.state.settingsOpen) this.patch({ settingsOpen: false })
     const id = `changes:${workspaceKey(cwd)}`
-    this.upsertFileTab({ id, path: cwd, cwd, title: '改动文件', mode: 'changes', focusPath, opened: 0 })
+    this.upsertFileTab({ id, path: cwd, cwd, title: 'Changes', mode: 'changes', focusPath, initialChanges: initialFiles, opened: 0 })
   }
 
   private upsertFileTab(tab: FileTab): void {
     const fileTabs = this.state.fileTabs.some(item => item.id === tab.id)
       ? this.state.fileTabs.map(item => item.id === tab.id
-        ? { ...item, focusPath: tab.focusPath, opened: item.opened + 1 }
+        ? { ...item, focusPath: tab.focusPath, initialChanges: item.initialChanges ?? tab.initialChanges, opened: item.opened + 1 }
         : item)
       : [...this.state.fileTabs, tab]
     this.patch({ fileTabs, activeFileTab: tab.id })

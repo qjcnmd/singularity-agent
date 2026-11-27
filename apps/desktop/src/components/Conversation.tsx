@@ -45,7 +45,7 @@ export function Conversation({ state, items }: Props) {
     let scrollPosition = node.scrollTop
     const follow = (now: number) => {
       const distance = Math.max(0, node.scrollHeight - node.clientHeight) - scrollPosition
-      scrollPosition += reduced || Math.abs(distance) < .5 ? distance : distance * (1 - Math.exp(-(now - previous) / 90))
+      scrollPosition += reduced || Math.abs(distance) < .5 ? distance : distance * (1 - Math.exp(-(now - previous) / 55))
       node.scrollTop = scrollPosition
       observedTop.current = node.scrollTop
       previous = now
@@ -71,7 +71,7 @@ export function Conversation({ state, items }: Props) {
       const latest = appStore.viewportAnchor()
       if ((anchorFrame.current && anchorRevision.current === appStore.viewportAnchorRevision) || performance.now() < disclosurePause.current) return
       if (latest.mode === 'following') {
-        if (restoredSession.current === sessionId && state.session?.runtime.phase !== 'idle') { followLatest(); return }
+        if (restoredSession.current === sessionId) { followLatest(); return }
         cancelAnimationFrame(frame.current)
         frame.current = 0
         node.scrollTop = node.scrollHeight

@@ -174,7 +174,14 @@ pub(crate) fn context_usage(
 ) -> Option<protocol::ContextUsage> {
     let capacity = capacity.filter(|capacity| *capacity > 0)?;
     for entry in entries.iter().rev() {
-        if matches!(entry, SessionEntry::Compaction { .. }) {
+        if matches!(
+            entry,
+            SessionEntry::Compaction { .. }
+                | SessionEntry::Record {
+                    record: LedgerRecord::ToolResultsCleared { .. },
+                    ..
+                }
+        ) {
             return None;
         }
         let Some(request) = entry.request_observation() else {

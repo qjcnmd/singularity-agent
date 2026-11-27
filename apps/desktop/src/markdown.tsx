@@ -17,33 +17,64 @@ export function MarkdownBody({ text, streaming = false }: { text: string; stream
 function useStreamedText(text: string, streaming: boolean) {
   const reducedMotion = useReducedMotion()
   const [visible, setVisible] = useState(text)
-  const shown = useRef(text)
-  const lastPaint = useRef(0)
+  const targetRef = useRef(text)
+  const shownRef = useRef(text)
+  const frameRef = useRef(0)
+  const lastPaintRef = useRef(0)
+  targetRef.current = text
+
   useLayoutEffect(() => {
-    if (!streaming || reducedMotion || !text.startsWith(shown.current)) {
-      shown.current = text
+    const cancel = () => {
+      if (frameRef.current) {
+        cancelAnimationFrame(frameRef.current)
+        frameRef.current = 0
+      }
+    }
+    if (!streaming || reducedMotion || !text.startsWith(shownRef.current)) {
+      cancel()
+      shownRef.current = text
       setVisible(text)
       return
     }
-    const start = shown.current.length
-    if (start === text.length) return
-    const started = performance.now()
-    let frame: number
+    if (shownRef.current.length >= text.length || frameRef.current) return
+    lastPaintRef.current = performance.now()
     const reveal = (now: number) => {
-      const progress = Math.min(1, (now - started) / 80)
-      if (progress === 1 || now - lastPaint.current >= 50) {
-        let end = start + Math.ceil((text.length - start) * progress)
-        const previous = text.charCodeAt(end - 1)
-        if (end < text.length && previous >= 0xd800 && previous <= 0xdbff) end += 1
-        shown.current = text.slice(0, end)
-        lastPaint.current = now
-        setVisible(shown.current)
+      const target = targetRef.current
+      if (!target.startsWith(shownRef.current)) {
+        frameRef.current = 0
+        shownRef.current = target
+        setVisible(target)
+        return
       }
-      if (progress < 1) frame = requestAnimationFrame(reveal)
+      const remaining = target.length - shownRef.current.length
+      if (remaining <= 0) {
+        frameRef.current = 0
+        return
+      }
+      const dt = now - lastPaintRef.current
+      const minInterval = Math.min(64, 14 + Math.floor(target.length / 400))
+      if (dt >= minInterval || remaining <= 2) {
+        const step = remaining <= 2 ? remaining : Math.max(1, Math.ceil(remaining * (1 - Math.exp(-Math.min(dt, 96) / 45))))
+        let end = Math.min(target.length, shownRef.current.length + step)
+        const previous = target.charCodeAt(end - 1)
+        if (end < target.length && previous >= 0xd800 && previous <= 0xdbff) end += 1
+        shownRef.current = target.slice(0, end)
+        lastPaintRef.current = now
+        setVisible(shownRef.current)
+      }
+      if (shownRef.current.length < target.length) frameRef.current = requestAnimationFrame(reveal)
+      else frameRef.current = 0
     }
-    frame = requestAnimationFrame(reveal)
-    return () => cancelAnimationFrame(frame)
+    frameRef.current = requestAnimationFrame(reveal)
   }, [text, streaming, reducedMotion])
+
+  useEffect(() => () => {
+    if (frameRef.current) {
+      cancelAnimationFrame(frameRef.current)
+      frameRef.current = 0
+    }
+  }, [])
+
   return !streaming || reducedMotion || !text.startsWith(visible) ? text : visible
 }
 
@@ -117,24 +148,60 @@ function InlineCode({ children, className }: { children?: ReactNode; className?:
 }
 
 const Streaming = createContext(false)
-const streamFadeMs = 420
-const streamCharacterStyle = { animationDuration: `${streamFadeMs}ms` }
+const streamFadeMs = 180
+const streamChunkStyle = { animationDuration: `${streamFadeMs}ms` }
+
+type StreamChunk = { id: number; text: string; expiresAt: number }
+type StreamChunkState = { settled: string; chunks: StreamChunk[]; seen: string; nextId: number }
 
 function StreamingText({ text }: { text: string }) {
-  const latest = useRef(text)
-  latest.current = text
-  const [settled, setSettled] = useState('')
-  const prefix = text.startsWith(settled) ? settled : ''
-  const pending = prefix.length < text.length
+  const [state, setState] = useState<StreamChunkState>(() => ({
+    settled: '',
+    chunks: text ? [{ id: 0, text, expiresAt: performance.now() + streamFadeMs }] : [],
+    seen: text,
+    nextId: 1,
+  }))
+  useLayoutEffect(() => {
+    setState(prev => {
+      if (text === prev.seen) return prev
+      const expiresAt = performance.now() + streamFadeMs
+      if (text.startsWith(prev.seen)) {
+        const delta = text.slice(prev.seen.length)
+        return {
+          settled: prev.settled,
+          chunks: [...prev.chunks, { id: prev.nextId, text: delta, expiresAt }],
+          seen: text,
+          nextId: prev.nextId + 1,
+        }
+      }
+      return {
+        settled: '',
+        chunks: text ? [{ id: prev.nextId, text, expiresAt }] : [],
+        seen: text,
+        nextId: prev.nextId + 1,
+      }
+    })
+  }, [text])
+  const nextExpiry = state.chunks[0]?.expiresAt
   useEffect(() => {
-    if (!pending) return
-    const batch = latest.current
-    const timer = setTimeout(() => setSettled(batch), streamFadeMs)
+    if (nextExpiry === undefined) return
+    const delay = Math.max(0, nextExpiry - performance.now())
+    const timer = setTimeout(() => {
+      const now = performance.now() + 8
+      setState(prev => {
+        if (prev.chunks.length === 0) return prev
+        let split = 0
+        while (split < prev.chunks.length && prev.chunks[split].expiresAt <= now) split += 1
+        if (split === 0) return prev
+        let settled = prev.settled
+        for (let i = 0; i < split; i += 1) settled += prev.chunks[i].text
+        return { ...prev, settled, chunks: prev.chunks.slice(split) }
+      })
+    }, delay)
     return () => clearTimeout(timer)
-  }, [settled, pending])
-  const offset = Array.from(prefix).length
-  return <>{prefix}{Array.from(text.slice(prefix.length)).map((character, index) =>
-    <span className="stream-char" style={streamCharacterStyle} key={offset + index}>{character}</span>)}</>
+  }, [nextExpiry])
+  return <>{state.settled}{state.chunks.map(chunk =>
+    <span className="stream-char" style={streamChunkStyle} key={chunk.id}>{chunk.text}</span>)}</>
 }
 
 function StreamText({ children }: { children?: ReactNode }) {

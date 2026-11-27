@@ -120,7 +120,7 @@ export type SessionRenameParams = { sessionId: string, name: string, };
 
 export type SessionRewindParams = { sessionId: string, messageId: string, text: string, images?: Array<ImageUpload>, files?: Array<string>, annotations?: Array<MessageAnnotation>, };
 
-export type SessionRuntime = { phase: SessionPhase, selection: ModelSelection, contextUsage: ContextUsage | null, pendingQuestion: PendingQuestion | null, pendingMessages: Array<PendingUserMessage>, failure: SessionFailure | null, };
+export type SessionRuntime = { phase: SessionPhase, selection: ModelSelection, contextUsage: ContextUsage | null, modelUsage: SessionModelUsage | null, pendingQuestion: PendingQuestion | null, pendingMessages: Array<PendingUserMessage>, failure: SessionFailure | null, };
 
 export type SessionStartParams = { workspaceRoot: string, selection: ModelSelection, text: string, images: Array<ImageUpload>, files: Array<string>, disabledModules: Array<string>, };
 

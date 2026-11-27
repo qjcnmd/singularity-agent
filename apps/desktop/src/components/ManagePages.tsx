@@ -9,12 +9,11 @@ import { CodeView, MarkdownDocumentView } from './FilePanel'
 import { smooth } from '../motion'
 import { ArrowLeft, CircleCheck, ChevronRight, RefreshCw, Search } from 'lucide-react'
 
-export function PageFrame({ title, subtitle, actions, children }: { title?: string; subtitle?: string; actions?: ReactNode; children: ReactNode }) {
+export function PageFrame({ title, actions, children }: { title?: string; actions?: ReactNode; children: ReactNode }) {
   return <div className="manage-page">
     {title && <header className="manage-header">
       <div className="manage-heading">
         <h3>{title}</h3>
-        {subtitle && <p className="manage-subtitle">{subtitle}</p>}
       </div>
       {actions && <div className="manage-actions">{actions}</div>}
     </header>}
@@ -73,7 +72,7 @@ export function InstructionsPage() {
     } catch (error) { setError(error instanceof Error ? error.message : String(error)) }
     finally { setSaving(false) }
   }
-  return <PageFrame title="自定义指令" subtitle="为全局或指定项目配置默认规则（AGENTS.md）。">
+  return <PageFrame title="自定义指令">
     <div className="instructions-layout">
       <nav className="instruction-targets" aria-label="指令范围" role="tablist">
         <button type="button" role="tab" disabled={saving} aria-selected={effectiveTarget === null} onClick={() => setTarget(null)}>全局</button>
@@ -94,7 +93,7 @@ export function InstructionsPage() {
           onChange={event => setDrafts(current => ({ ...current, [key]: event.target.value }))} />
         <footer>
           <span className={`editor-status${showSaved ? ' is-saved' : ''}`} role={showSaved ? 'status' : undefined}>
-            {showSaved ? <><CircleCheck size={14} aria-hidden="true" /><span>保存成功</span></> : loading ? '读取中…' : dirty ? '有未保存修改' : saved ? '已同步磁盘' : ''}
+            {showSaved ? <><CircleCheck size={14} aria-hidden="true" /><span>保存成功</span></> : loading ? '读取中…' : dirty ? '有未保存修改' : ''}
           </span>
           <button type="button" className="primary-button small" disabled={!dirty || saving || loading} onClick={() => void save()}>{saving ? '保存中…' : '保存'}</button>
         </footer>
@@ -138,7 +137,7 @@ function SkillsList({ root }: { root: string | null }) {
   }
   const trimmed = query.trim().toLowerCase()
   const filtered = skills?.filter(skill => !trimmed || skill.name.toLowerCase().includes(trimmed) || skill.description.toLowerCase().includes(trimmed)) ?? null
-  return <PageFrame title="Skills" subtitle="输入 / 按需调用；点击列表项查看技能说明。" actions={<>
+  return <PageFrame title="Skills" actions={<>
     <span className="skills-count" role="status" aria-label={skills !== null ? `共 ${skills.length} 个技能` : '技能数量尚未读取'}>{skills !== null ? `${skills.length} 个` : '—'}</span>
     <button type="button" className="skills-refresh" aria-label="刷新 Skills 列表" title="刷新 Skills 列表" aria-busy={loading} aria-disabled={loading || root === null} onClick={refresh}>
       <RefreshCw size={15} aria-hidden="true" />
@@ -228,5 +227,5 @@ function SkillCard({ skill, onOpen }: { skill: SkillMetadata; onOpen: () => void
 
 export function McpPage() {
   const { selectedWorkspaceRoot } = useAppStore(['selectedWorkspaceRoot'])
-  return <PageFrame title="MCP" subtitle="管理外部工具服务，点击卡片展开可用工具列表。"><McpSettings workspaceRoot={selectedWorkspaceRoot} /></PageFrame>
+  return <PageFrame title="MCP"><McpSettings workspaceRoot={selectedWorkspaceRoot} /></PageFrame>
 }

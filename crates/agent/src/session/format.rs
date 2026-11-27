@@ -91,6 +91,10 @@ pub enum LedgerRecord {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         user_stopped: bool,
     },
+    #[serde(rename_all = "camelCase")]
+    ToolResultsCleared {
+        entry_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -11,15 +11,22 @@ use tokio_util::sync::CancellationToken;
 
 use super::bash;
 use super::edit;
+use super::glob;
+use super::grep;
 use super::mcp;
 use super::read;
 use super::skill;
+use super::todo;
 use super::view_image;
 use super::web;
 use super::write;
 
 pub(crate) const DEFAULT_MAX_LINES: usize = 2000;
 pub(crate) const DEFAULT_MAX_BYTES: usize = 50 * 1024;
+pub(crate) const COMMAND_MAX_LINES: usize = 400;
+pub(crate) const COMMAND_MAX_BYTES: usize = 24 * 1024;
+pub(crate) const WEB_MAX_LINES: usize = 800;
+pub(crate) const WEB_MAX_BYTES: usize = 32 * 1024;
 
 pub(crate) const fn default_max_kb() -> usize {
     DEFAULT_MAX_BYTES / 1024
@@ -27,6 +34,10 @@ pub(crate) const fn default_max_kb() -> usize {
 
 pub(crate) fn default_cap_summary() -> String {
     format!("{DEFAULT_MAX_LINES} lines or {}KB", default_max_kb())
+}
+
+pub(crate) fn command_cap_summary() -> String {
+    format!("{COMMAND_MAX_LINES} lines or {}KB", COMMAND_MAX_BYTES / 1024)
 }
 
 #[derive(Debug)]
@@ -76,8 +87,11 @@ pub(crate) enum PreparedTool {
     Edit(edit::EditArgs),
     Write(write::WriteArgs),
     Read(read::ReadArgs),
+    Grep(grep::GrepArgs),
+    Glob(glob::GlobArgs),
     ViewImage(view_image::ViewImageArgs),
     Skill(skill::SkillArgs, Arc<SkillCatalog>),
+    Todo(todo::TodoArgs),
     Question(super::question::QuestionArgs),
     Bash(bash::BashArgs),
     TaskList,
@@ -102,8 +116,9 @@ impl PreparedTool {
             bash_tasks,
         } = context;
         match self {
-            Self::Edit(args) => Box::pin(edit::execute(args, cwd, signal)).await,
-            Self::Write(args) => Box::pin(write::execute(args, cwd, signal)).await,
+            Self::Edit(args) => Box::pin(edit::execute(args, cwd, output_directory, signal)).await,
+            Self::Write(args) => Box::pin(write::execute(args, cwd, output_directory, signal)).await,
+            Self::Todo(args) => todo::execute(&args),
             Self::McpSchema(tools) => mcp::execute_schema(&tools),
             Self::Mcp(tool, args) => Box::pin(mcp::execute(tool, args, output_directory, &signal)).await,
             Self::WebSearch(args, access) => {
@@ -116,18 +131,24 @@ impl PreparedTool {
                 Box::pin(bash_tasks.execute(args, cwd, output_directory, signal, on_update)).await
             }
             Self::TaskStop(args) => Box::pin(bash_tasks.tool_stop(&args.task_id)).await,
-            Self::TaskList | Self::TaskOutput(_) | Self::Read(_) | Self::ViewImage(_) | Self::Skill(_, _) => {
-                tokio::task::spawn_blocking(move || match self {
-                    Self::TaskList => bash_tasks.tool_list(),
-                    Self::TaskOutput(args) => bash_tasks.output(&args.task_id, &signal),
-                    Self::Read(args) => read::execute(&args, &cwd, &signal),
-                    Self::ViewImage(args) => view_image::execute(&args, &cwd, &signal),
-                    Self::Skill(args, catalog) => skill::execute(&args, &catalog),
-                    _ => unreachable!("non-blocking tool handled above"),
-                })
-                .await
-                .expect("tool worker completes while the runtime is running")
-            }
+            Self::TaskList
+            | Self::TaskOutput(_)
+            | Self::Read(_)
+            | Self::Grep(_)
+            | Self::Glob(_)
+            | Self::ViewImage(_)
+            | Self::Skill(_, _) => tokio::task::spawn_blocking(move || match self {
+                Self::TaskList => bash_tasks.tool_list(),
+                Self::TaskOutput(args) => bash_tasks.output(&args.task_id, &signal),
+                Self::Read(args) => read::execute(&args, &cwd, &signal),
+                Self::Grep(args) => grep::execute(&args, &cwd, &signal),
+                Self::Glob(args) => glob::execute(&args, &cwd, &signal),
+                Self::ViewImage(args) => view_image::execute(&args, &cwd, &signal),
+                Self::Skill(args, catalog) => skill::execute(&args, &catalog),
+                _ => unreachable!("non-blocking tool handled above"),
+            })
+            .await
+            .expect("tool worker completes while the runtime is running"),
             Self::Question(_) => unreachable!("questions execute on the turn control plane"),
         }
     }
@@ -161,6 +182,18 @@ pub(crate) fn read_tool() -> BuiltinTool {
     (read::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Read))
 }
 
+pub(crate) fn grep_tool() -> BuiltinTool {
+    (grep::spec(), |args| {
+        deserialize_args_or_error::<grep::GrepArgs>(args)?.validate().map(PreparedTool::Grep)
+    })
+}
+
+pub(crate) fn glob_tool() -> BuiltinTool {
+    (glob::spec(), |args| {
+        deserialize_args_or_error::<glob::GlobArgs>(args)?.validate().map(PreparedTool::Glob)
+    })
+}
+
 pub(crate) fn edit_tool() -> BuiltinTool {
     (edit::spec(), |args| deserialize_args_or_error(args).map(PreparedTool::Edit))
 }
@@ -178,6 +211,12 @@ pub(crate) fn question_tool() -> BuiltinTool {
         deserialize_args_or_error::<super::question::QuestionArgs>(args)?
             .validate()
             .map(PreparedTool::Question)
+    })
+}
+
+pub(crate) fn todo_tool() -> BuiltinTool {
+    (todo::spec(), |args| {
+        deserialize_args_or_error::<todo::TodoArgs>(args)?.validate().map(PreparedTool::Todo)
     })
 }
 

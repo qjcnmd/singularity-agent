@@ -57,7 +57,7 @@ export function FilePanel() {
   const refreshKey = diffRefreshKey(state, active)
   const loaded = active ? documents[active.id] : undefined
   const shown = loaded?.document
-  const shownChanges = loaded?.changes
+  const shownChanges = loaded?.error ? undefined : (loaded?.changes ?? active?.initialChanges)
 
   useEffect(() => {
     if (!active) return
@@ -86,7 +86,7 @@ export function FilePanel() {
     })
   }, [state.fileTabs])
 
-  if (!active) return null
+  if (!active) return <div className="file-panel-shell is-collapsed" />
   const isChanges = active.mode === 'changes'
   const showSource = sources.has(active.id)
   const toggleSource = () => setSources(all => { const next = new Set(all); if (next.has(active.id)) next.delete(active.id); else next.add(active.id); return next })
@@ -99,53 +99,55 @@ export function FilePanel() {
     setAttempt(value => value + 1)
   }
   const changesCwds = state.fileTabs.filter(tab => tab.mode === 'changes').map(tab => tab.cwd)
-  return <aside className="file-panel" aria-label="文件">
+  return <div className="file-panel-shell"><aside className="file-panel" aria-label="文件">
     <div className="file-tabs" role="tablist" aria-label="打开的文件">
       {state.fileTabs.map(tab => <TabButton key={tab.id} tab={tab} selected={tab.id === active.id} changesCwds={changesCwds} />)}
     </div>
-    <div className="file-toolbar">
-      {isChanges ? (
-        <>
-          <span className="changes-toolbar-title">
-            {shownChanges ? `未提交改动 · ${shownChanges.length} 个文件` : '未提交改动'}
-          </span>
-          {(totalAdded > 0 || totalDeleted > 0) && (
-            <span className="edit-counts">
-              {totalAdded > 0 && <span className="edit-added-count">+{totalAdded}</span>}
-              {totalDeleted > 0 && <span className="edit-deleted-count">-{totalDeleted}</span>}
+    <div className="file-card">
+      <div className="file-toolbar">
+        {isChanges ? (
+          <>
+            <span className="changes-toolbar-title">
+              {shownChanges ? `未提交改动 · ${shownChanges.length} 个文件` : '未提交改动'}
             </span>
-          )}
-          <button type="button" className="icon-button small changes-refresh" aria-label="刷新改动文件" title="刷新" onClick={retryActive}>
-            <RotateCw size={13} strokeWidth={1.8} aria-hidden="true" />
-          </button>
-        </>
-      ) : (
-        <>
-          <span className="file-path" title={toolbarPath}><bdi>{toolbarPath}</bdi></span>
-          {isMarkdown(active.path) && shown && <button type="button" className="quiet-button" onClick={toggleSource}>{showSource ? '预览' : '源码'}</button>}
-        </>
-      )}
+            {(totalAdded > 0 || totalDeleted > 0) && (
+              <span className="edit-counts">
+                {totalAdded > 0 && <span className="edit-added-count">+{totalAdded}</span>}
+                {totalDeleted > 0 && <span className="edit-deleted-count">-{totalDeleted}</span>}
+              </span>
+            )}
+            <button type="button" className="icon-button small changes-refresh" aria-label="刷新改动文件" title="刷新" onClick={retryActive}>
+              <RotateCw size={13} strokeWidth={1.8} aria-hidden="true" />
+            </button>
+          </>
+        ) : (
+          <>
+            <span className="file-path" title={toolbarPath}><bdi>{toolbarPath}</bdi></span>
+            {isMarkdown(active.path) && shown && <button type="button" className="quiet-button" onClick={toggleSource}>{showSource ? '预览' : '源码'}</button>}
+          </>
+        )}
+      </div>
+      <div className="file-body" role="tabpanel" aria-label={active.title}>
+        {!ready && !loaded?.error && <p className="detail-empty" role="status">读取中…</p>}
+        {loaded?.error && <p className="detail-empty form-error" role="alert">{loaded.error}
+          <button type="button" className="quiet-button" onClick={retryActive}>重试</button></p>}
+        {isChanges
+          ? shownChanges && (
+            <ChangedFilesView
+              key={active.id}
+              files={shownChanges}
+              workspaceRoot={active.cwd}
+              refreshToken={`${active.opened}:${attempt}:${refreshKey}`}
+              focusPath={active.focusPath}
+              focusNonce={active.opened}
+            />
+          )
+          : shown && (isMarkdown(active.path) && !showSource
+            ? <MarkdownDocumentView path={shown.path} content={shown.content} />
+            : <CodeView code={shown.content} language={extension(active.path)} />)}
+      </div>
     </div>
-    <div className="file-body" role="tabpanel" aria-label={active.title}>
-      {!ready && !loaded?.error && <p className="detail-empty" role="status">读取中…</p>}
-      {loaded?.error && <p className="detail-empty form-error" role="alert">{loaded.error}
-        <button type="button" className="quiet-button" onClick={retryActive}>重试</button></p>}
-      {isChanges
-        ? shownChanges && (
-          <ChangedFilesView
-            key={active.id}
-            files={shownChanges}
-            workspaceRoot={active.cwd}
-            refreshToken={`${active.opened}:${attempt}:${refreshKey}`}
-            focusPath={active.focusPath}
-            focusNonce={active.opened}
-          />
-        )
-        : shown && (isMarkdown(active.path) && !showSource
-          ? <MarkdownDocumentView path={shown.path} content={shown.content} />
-          : <CodeView code={shown.content} language={extension(active.path)} />)}
-    </div>
-  </aside>
+  </aside></div>
 }
 
 function ChangedFilesView({ files, workspaceRoot, refreshToken, focusPath, focusNonce }: {

@@ -1,11 +1,15 @@
-.file-panel { display: flex; flex-direction: column; min-width: 0; height: 100vh; border-left: 1px solid var(--line); background: var(--canvas); overflow: hidden; }
-.file-tabs { display: flex; flex: none; gap: 2px; padding: 8px 8px 0; overflow-x: auto; scrollbar-width: none; border-bottom: 1px solid var(--line); }
-.file-tab { display: flex; flex: none; align-items: center; max-width: 200px; border-radius: 10px 10px 0 0; color: var(--ink-soft); }
-.file-tab:hover { background: var(--surface-hover); }
-.file-tab[data-selected=true] { background: var(--surface-muted); color: var(--ink); }
-.file-tab > button[role=tab] { min-width: 0; height: 32px; padding: 0 4px 0 12px; border: 0; background: none; color: inherit; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
-.file-tab-close { display: grid; place-items: center; flex: none; width: 22px; height: 22px; margin-right: 5px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--ink-faint); cursor: pointer; }
+.file-panel-shell { flex: none; height: 100%; overflow: hidden; background: var(--sidebar); position: relative; min-width: 0; }
+.file-panel-shell.is-collapsed { pointer-events: none; }
+.file-panel-shell > .file-panel { position: absolute; inset: 0; width: var(--file-panel-width); }
+.file-panel { display: flex; flex-direction: column; min-width: 0; height: 100%; background: var(--sidebar); overflow: hidden; }
+.file-tabs { display: flex; align-items: center; flex: none; height: 38px; gap: 4px; padding: 0 8px 0 0; overflow-x: auto; scrollbar-width: none; background: var(--sidebar); }
+.file-tab { display: flex; flex: none; align-items: center; height: 28px; max-width: 200px; border-radius: 8px; color: var(--ink-soft); -webkit-app-region: no-drag; transition: background 120ms, color 120ms; }
+.file-tab:hover { background: var(--soft-fill); color: var(--ink); }
+.file-tab[data-selected=true] { background: var(--canvas); color: var(--ink); font-weight: 500; box-shadow: 0 1px 2px rgb(0 0 0 / 5%), inset 0 0 0 1px var(--line); }
+.file-tab > button[role=tab] { min-width: 0; height: 28px; padding: 0 4px 0 10px; border: 0; background: none; color: inherit; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.file-tab-close { display: grid; place-items: center; flex: none; width: 20px; height: 20px; margin-right: 4px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--ink-faint); cursor: pointer; }
 .file-tab-close:hover { background: var(--surface-hover); color: var(--ink); }
+.file-card { flex: 1; min-height: 0; display: flex; flex-direction: column; min-width: 0; margin: 0 8px 8px 0; border-radius: 12px; border: 1px solid var(--line); background: var(--canvas); overflow: hidden; }
 .file-toolbar { display: flex; flex: none; align-items: center; gap: 8px; min-height: 36px; padding: 0 10px 0 16px; color: var(--ink-faint); font-size: 12px; }
 .file-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
 .file-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
@@ -48,5 +52,8 @@
 .timeline-body code.file-link { cursor: pointer; text-decoration: underline dotted transparent; text-underline-offset: 3px; transition: text-decoration-color 120ms; }
 .timeline-body code.file-link:hover, .timeline-body code.file-link:focus-visible { text-decoration-color: currentColor; outline: none; }
 @media (max-width: 760px) {
-  .file-panel { position: fixed; z-index: 26; inset: 0 0 0 auto; width: min(100vw, 480px); box-shadow: var(--shadow-floating); }
+  .file-panel-shell { overflow: visible; }
+  .file-panel-shell > .file-panel { position: fixed; z-index: 26; inset: 30px 0 0 auto; width: min(100vw, 480px); box-shadow: var(--shadow-floating); }
+  .file-tabs { padding: 0 6px; margin-right: 46px; }
+  .file-card { margin: 0 6px 6px; }
 }
