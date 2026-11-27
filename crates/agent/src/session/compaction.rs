@@ -4,19 +4,19 @@ use app_core::estimate_tokens_of;
 use model::{ContentBlock, Message, ModelConfigurationSnapshot};
 
 use super::context::{
-    ContextEntry, context_entry, context_token_estimate_for, entry_token_estimate_for,
-    frame_compacted_summary, latest_reply_usage, message_content_mut, message_token_estimate,
-    message_with_captions_tokens, project_messages, resolve_context_entries,
+    ContextEntry, context_entry, context_token_estimate_for, frame_compacted_summary, latest_reply_usage,
+    message_content_mut, message_token_estimate, message_with_captions_tokens, project_messages,
+    resolve_context_entries,
 };
 use super::format::SessionEntry;
 use super::manager::SessionData;
 
-pub fn retention_budget_tokens(model: ModelConfigurationSnapshot) -> u64 {
+pub(crate) fn retention_budget_tokens(model: ModelConfigurationSnapshot) -> u64 {
     let message_budget = model.context_window().saturating_sub(u64::from(model.max_output_tokens));
     (message_budget * 15 / 100).max(1)
 }
 
-pub(super) fn balanced_units(active: &[&SessionEntry]) -> Vec<std::ops::Range<usize>> {
+fn balanced_units(active: &[&SessionEntry]) -> Vec<std::ops::Range<usize>> {
     let msg_start = usize::from(matches!(active.first(), Some(SessionEntry::Compaction { .. })));
     let mut units: Vec<std::ops::Range<usize>> = Vec::new();
     for (index, entry) in active.iter().enumerate().skip(msg_start) {
@@ -35,7 +35,7 @@ pub(crate) fn select_compactable_split(
     active: &[&SessionEntry],
     session: &SessionData,
     retain_tokens: u64,
-    retain_target: (&str, &str),
+    target: (&str, &str),
 ) -> Option<(usize, String)> {
     let units = balanced_units(active);
     if units.is_empty() {
@@ -45,7 +45,7 @@ pub(crate) fn select_compactable_split(
     let mut accumulated = 0u64;
     let mut keep_unit = units.len();
     for (idx, range) in units.iter().enumerate().rev() {
-        let unit_tokens = context_token_estimate_for(&active[range.clone()], session, Some(retain_target));
+        let unit_tokens = context_token_estimate_for(&active[range.clone()], session, Some(target));
         accumulated = accumulated.saturating_add(unit_tokens);
         keep_unit = idx;
         if accumulated >= retain_tokens {
@@ -59,43 +59,23 @@ pub(crate) fn select_compactable_split(
     Some((split_idx, active[split_idx].id().to_owned()))
 }
 
-#[derive(Debug)]
-pub struct CompactionInput {
-    pub(crate) first_kept_entry_id: String,
+fn compactable_prefix_split(
+    active: &[&SessionEntry],
+    data: &SessionData,
+    retain_tokens: u64,
+    identity: (&str, &str),
+) -> Option<(usize, String, u64)> {
+    let (split_idx, first_kept_entry_id) = select_compactable_split(active, data, retain_tokens, identity)?;
+    let raw_prefix_tokens = context_token_estimate_for(&active[..split_idx], data, Some(identity));
+    if raw_prefix_tokens <= message_token_estimate(&frame_compacted_summary("")) {
+        return None;
+    }
+    Some((split_idx, first_kept_entry_id, raw_prefix_tokens))
 }
 
-impl CompactionInput {
-    pub async fn select(
-        session: &super::SessionWriter,
-        retain_tokens: u64,
-        retain_target: (String, String),
-        prefix_target: (String, String),
-    ) -> Option<Self> {
-        let session = std::sync::Arc::clone(session);
-        tokio::task::spawn_blocking(move || {
-            super::with_writer(&session, |session| {
-                let data = session.data();
-                let active = resolve_context_entries(data);
-                let (split_idx, first_kept_entry_id) = select_compactable_split(
-                    &active,
-                    data,
-                    retain_tokens,
-                    (&retain_target.0, &retain_target.1),
-                )?;
-                let prefix_estimated_tokens = context_token_estimate_for(
-                    &active[..split_idx],
-                    data,
-                    Some((&prefix_target.0, &prefix_target.1)),
-                );
-                if prefix_estimated_tokens <= message_token_estimate(&frame_compacted_summary("")) {
-                    return None;
-                }
-                Some(Self { first_kept_entry_id })
-            })
-        })
-        .await
-        .expect("compaction selection completes while the runtime is running")
-    }
+pub(crate) fn has_compactable_prefix(data: &SessionData, retain_tokens: u64, identity: (&str, &str)) -> bool {
+    let active = resolve_context_entries(data);
+    compactable_prefix_split(&active, data, retain_tokens, identity).is_some()
 }
 
 #[derive(Debug)]
@@ -106,7 +86,6 @@ pub(crate) struct PlannedCompactionStep {
     pub(crate) raw_prefix_tokens: u64,
     pub(crate) estimated_request_input: u64,
     pub(crate) image_directory: std::path::PathBuf,
-    pub(crate) is_final_chunk: bool,
 }
 
 fn scale_u64(value: u64, num: u64, den: u64, ceil: bool) -> u64 {
@@ -114,7 +93,7 @@ fn scale_u64(value: u64, num: u64, den: u64, ceil: bool) -> u64 {
     u64::try_from(if ceil { prod.div_ceil(d) } else { prod / d }).unwrap_or(u64::MAX)
 }
 
-pub(crate) fn compaction_input_limit(
+fn compaction_input_limit(
     model: ModelConfigurationSnapshot,
     definition_tokens: u64,
     instruction_tokens: u64,
@@ -137,7 +116,7 @@ pub(crate) fn compaction_input_limit(
 
 pub(crate) fn plan_compaction_step(
     data: &SessionData,
-    target_first_kept_entry_id: &str,
+    retain_tokens: u64,
     identity: (&str, &str),
     definition_tokens: u64,
     instruction_tokens: u64,
@@ -146,18 +125,12 @@ pub(crate) fn plan_compaction_step(
 ) -> Result<Option<PlannedCompactionStep>, &'static str> {
     const NO_HEADROOM: &str = "当前指令与工具定义已占满模型上下文窗口，无法留出压缩摘要空间。";
     let active = resolve_context_entries(data);
-    let Some(target_split_idx) = active.iter().position(|e| e.id() == target_first_kept_entry_id) else {
+    let Some((split_idx, first_kept_entry_id, raw_prefix_tokens)) =
+        compactable_prefix_split(&active, data, retain_tokens, identity)
+    else {
         return Ok(None);
     };
-    let prefix_units: Vec<_> =
-        balanced_units(&active).into_iter().take_while(|r| r.end <= target_split_idx).collect();
     let empty_summary = message_token_estimate(&frame_compacted_summary(""));
-    if prefix_units.is_empty()
-        || context_token_estimate_for(&active[..target_split_idx], data, Some(identity)) <= empty_summary
-    {
-        return Ok(None);
-    }
-
     let limit = compaction_input_limit(model, definition_tokens, instruction_tokens, overflow_input_tokens)
         .ok_or(NO_HEADROOM)?;
     let full_est =
@@ -173,30 +146,8 @@ pub(crate) fn plan_compaction_step(
         return Err(NO_HEADROOM);
     }
 
-    let mut acc = active
-        .first()
-        .filter(|e| matches!(e, SessionEntry::Compaction { .. }))
-        .map_or(0, |e| entry_token_estimate_for(e, data, Some(identity)));
-    let mut fitting = 0usize;
-    for range in &prefix_units {
-        let next =
-            acc.saturating_add(context_token_estimate_for(&active[range.clone()], data, Some(identity)));
-        if next > max_prefix {
-            break;
-        }
-        acc = next;
-        fitting += 1;
-    }
-
-    let min_chunk = empty_summary
-        .saturating_add(instruction_tokens)
-        .min(max_prefix / 2)
-        .max(empty_summary + 1);
-    let use_fit = fitting == prefix_units.len() || (fitting >= 1 && acc >= min_chunk);
-    let chunk_end = prefix_units[fitting - usize::from(use_fit)].end;
-    let raw_prefix_tokens = context_token_estimate_for(&active[..chunk_end], data, Some(identity));
     let image_directory = data.image_directory();
-    let mut messages = project_messages(&active[..chunk_end]);
+    let mut messages = project_messages(&active[..split_idx]);
     let mut projected: u64 = messages
         .iter()
         .map(|m| message_with_captions_tokens(m, &image_directory, Some(identity)))
@@ -212,11 +163,10 @@ pub(crate) fn plan_compaction_step(
     Ok(Some(PlannedCompactionStep {
         session_id: data.session_id().to_owned(),
         messages,
-        first_kept_entry_id: active[chunk_end].id().to_owned(),
+        first_kept_entry_id,
         raw_prefix_tokens,
         estimated_request_input: scaled.saturating_add(instruction_tokens),
         image_directory,
-        is_final_chunk: chunk_end == target_split_idx,
     }))
 }
 

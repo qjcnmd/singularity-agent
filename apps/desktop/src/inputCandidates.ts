@@ -20,14 +20,15 @@ type SkillQuery =
   | { status: 'ready'; result: SkillCatalog }
   | { status: 'error'; error: Error }
 
-type QueryScope = Pick<AppState, 'selectedWorkspaceRoot' | 'selectedSessionId' | 'connection'>
+type QueryScope = Pick<AppState, 'selectedWorkspaceRoot' | 'selectedSessionId' | 'bootstrap'>
 
 export function useSkillCandidates(enabled: boolean, scope: QueryScope) {
-  const { selectedWorkspaceRoot, selectedSessionId, connection } = scope
+  const { selectedWorkspaceRoot, selectedSessionId, bootstrap } = scope
+  const ready = bootstrap !== null
   const [skills, setSkills] = useState<SkillQuery>({ status: 'idle' })
   const [reload, setReload] = useState(0)
   useLayoutEffect(() => {
-    if (!enabled || connection !== 'ready' || selectedWorkspaceRoot === null) {
+    if (!enabled || !ready || selectedWorkspaceRoot === null) {
       setSkills({ status: 'idle' })
       return
     }
@@ -38,6 +39,6 @@ export function useSkillCandidates(enabled: boolean, scope: QueryScope) {
       error => { if (active) setSkills({ status: 'error', error: error instanceof Error ? error : new Error(String(error)) }) },
     )
     return () => { active = false }
-  }, [enabled, selectedSessionId, selectedWorkspaceRoot, connection, reload])
+  }, [enabled, selectedSessionId, selectedWorkspaceRoot, ready, reload])
   return { ...skills, retry: () => setReload(value => value + 1) }
 }

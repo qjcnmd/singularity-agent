@@ -17,7 +17,6 @@
     "@shikijs/engine-javascript": "4.4.3",
     "@shikijs/langs": "4.4.3",
     "@shikijs/themes": "4.4.3",
-    "anser": "2.3.5",
     "katex": "0.18.7",
     "lucide-react": "1.42.0",
     "mermaid": "12.1.0",

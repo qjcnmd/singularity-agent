@@ -1,14 +1,13 @@
 #[cfg(feature = "typescript")]
 use crate::{
-    AppBootstrap, ContextModule, DirectoryPickResult, McpServerState, ModelCatalogResult,
-    SessionChangedFilesResult, SessionFileDiffResult, SessionReadResult, SessionStartResult, SkillCatalog,
-    TextDocument, Workspace,
+    AppBootstrap, ChangedFile, ContextModule, DirectoryPickResult, McpServerState, ModelCatalogResult,
+    SessionFileDiffResult, SessionReadResult, SessionStartResult, SkillCatalog, TextDocument, Workspace,
 };
 use crate::{
     ImageUpload, McpListParams, McpSaveParams, McpServerParams, ModelSelection, ProviderApiProtocol,
     ProviderConfigurationInput, QuestionAnswerParams,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::fmt;
 
 #[derive(Debug, Deserialize)]
@@ -154,10 +153,13 @@ pub struct SessionStartParams {
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-pub struct SessionTextParams {
-    pub session_id: String,
+pub struct MessageInput {
     pub text: String,
+    #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(as = "Option<Vec<ImageUpload>>", optional))]
     pub images: Vec<ImageUpload>,
+    #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(as = "Option<Vec<String>>", optional))]
     pub files: Vec<String>,
     #[serde(default)]
     #[cfg_attr(
@@ -165,6 +167,15 @@ pub struct SessionTextParams {
         ts(as = "Option<Vec<crate::MessageAnnotation>>", optional)
     )]
     pub annotations: Vec<crate::MessageAnnotation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTextParams {
+    pub session_id: String,
+    #[serde(flatten)]
+    pub message: MessageInput,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,49 +202,22 @@ pub struct UpdateSettingsParams {
     pub selection: ModelSelection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionChangedFilesParams {
-    #[serde(default)]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub workspace_root: Option<String>,
+    pub workspace_root: String,
     #[serde(default)]
     #[cfg_attr(feature = "typescript", ts(as = "Option<bool>", optional))]
     pub include_diffs: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct SessionFileDiffParams {
-    #[serde(default)]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub workspace_root: Option<String>,
-    pub path: String,
-}
-
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-pub struct SessionRewindInput {
-    pub text: String,
-    #[serde(default)]
-    pub images: Vec<ImageUpload>,
-    #[serde(default)]
-    pub files: Vec<String>,
-    #[serde(default)]
-    #[cfg_attr(
-        feature = "typescript",
-        ts(as = "Option<Vec<crate::MessageAnnotation>>", optional)
-    )]
-    pub annotations: Vec<crate::MessageAnnotation>,
+pub struct SessionFileDiffParams {
+    pub workspace_root: String,
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,9 +226,8 @@ pub struct SessionRewindInput {
 pub struct SessionRewindParams {
     pub session_id: String,
     pub message_id: String,
-    #[serde(default)]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub resubmit: Option<SessionRewindInput>,
+    #[serde(flatten)]
+    pub message: MessageInput,
 }
 
 macro_rules! rpc_methods {
@@ -298,7 +281,7 @@ rpc_methods! {
     SessionContext => "session.context" (SessionParams) -> (),
     BackgroundTaskStop => "session.stopBackgroundTask" (BackgroundTaskParams) -> (),
     SessionUpdateSettings => "session.updateSettings" (UpdateSettingsParams) -> (),
-    SessionChangedFiles => "session.changedFiles" (SessionChangedFilesParams) -> SessionChangedFilesResult,
+    SessionChangedFiles => "session.changedFiles" (SessionChangedFilesParams) -> Vec<ChangedFile>,
     SessionFileDiff => "session.fileDiff" (SessionFileDiffParams) -> SessionFileDiffResult,
     SessionRewind => "session.rewind" (SessionRewindParams) -> SessionReadResult,
 }

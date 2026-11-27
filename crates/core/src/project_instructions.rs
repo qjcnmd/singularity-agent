@@ -4,9 +4,8 @@ use std::path::{Path, PathBuf};
 pub(crate) const PROJECT_INSTRUCTIONS_FILE_NAME: &str = "AGENTS.md";
 
 pub fn load_agent_instructions(cwd: &Path, home: &Path) -> Result<Vec<InstructionFile>, String> {
-    let canonical = crate::canonicalize_workspace(cwd)?;
-    let cwd = canonical.as_path();
-    let root = crate::workspace::project_root(cwd)?;
+    let cwd = crate::canonicalize_workspace(cwd)?;
+    let root = crate::workspace::project_root(&cwd)?;
     let (global_dir, home_key) = match std::fs::canonicalize(home) {
         Ok(canonical_home) => {
             let key = crate::workspace_key(&canonical_home);
@@ -23,7 +22,7 @@ pub fn load_agent_instructions(cwd: &Path, home: &Path) -> Result<Vec<Instructio
         }
     };
     let directories = std::iter::once((global_dir, true)).chain(
-        instruction_directories(&root, cwd)
+        instruction_directories(&root, &cwd)
             .into_iter()
             .filter(|directory| crate::workspace_key(directory) != home_key)
             .map(|directory| (directory, false)),

@@ -71,15 +71,11 @@ pub(super) struct ConversationState {
     pub(super) last_context_window: Option<u64>,
     pub(super) auto_resume: bool,
     pub(super) closing: bool,
-    pub(super) context_preview: Option<CancellationToken>,
 }
 
 impl ConversationState {
     pub(super) fn has_work(&self, bash_tasks: &agent::tools::BashTasks) -> bool {
-        self.turn.is_busy()
-            || self.context_preview.is_some()
-            || bash_tasks.is_busy()
-            || self.has_active_inbox()
+        self.turn.is_busy() || bash_tasks.is_busy() || self.has_active_inbox()
     }
 
     pub(super) fn has_active_inbox(&self) -> bool {

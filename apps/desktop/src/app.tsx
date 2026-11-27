@@ -29,7 +29,6 @@ export function App() {
   useLayoutEffect(() => {
     for (const [name, value] of Object.entries(variables)) document.documentElement.style.setProperty(name, value)
   }, [variables])
-  useEffect(() => { appStore.start(); return () => appStore.stop() }, [])
   useEffect(() => {
     if (!filePanelOpen) return
     const onResize = () => setViewportWidth(window.innerWidth)

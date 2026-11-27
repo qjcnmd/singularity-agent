@@ -49,7 +49,7 @@ export function RunPanel() {
 }
 
 function RunPanelBody() {
-  const state = useAppStore(['session', 'selectedSessionId', 'liveSessions', 'connection', 'pendingActions'])
+  const state = useAppStore(['session', 'selectedSessionId', 'liveSessions', 'pendingActions'])
   const usage = state.session?.runtime.contextUsage
   const percent = usage ? Math.min(100, Math.round(usage.used / usage.capacity * 100)) : 0
   const tasks = state.selectedSessionId ? state.liveSessions[state.selectedSessionId]?.backgroundTasks ?? [] : []
@@ -62,17 +62,17 @@ function RunPanelBody() {
   const summaryRevision = sessionId ? state.liveSessions[sessionId]?.summaryRevision ?? 0 : 0
   const [changedFiles, setChangedFiles] = useState<ChangedFile[]>([])
   useEffect(() => {
-    if (!cwd || !sessionId || factsCount === 0 || state.connection !== 'ready') {
+    if (!cwd || !sessionId || factsCount === 0) {
       setChangedFiles([])
       return
     }
     let active = true
     void appStore.transport.rpc('session.changedFiles', { workspaceRoot: cwd }).then(
-      result => { if (active) setChangedFiles(result.files) },
+      files => { if (active) setChangedFiles(files) },
       () => { if (active) setChangedFiles([]) },
     )
     return () => { active = false }
-  }, [cwd, sessionId, factsCount, lastTurnStatus, phase, summaryRevision, state.connection])
+  }, [cwd, sessionId, factsCount, lastTurnStatus, phase, summaryRevision])
   const compaction = latestCompaction(state.session?.facts)
   const failure = state.session?.runtime.failure
   const attempt = useRef<string | null>(null)
@@ -92,7 +92,7 @@ function RunPanelBody() {
     return () => window.clearTimeout(timer)
   }, [compactDone])
   const compacting = phase === 'compacting' || state.pendingActions.has(pendingKey('session.compact', actionOrigin.session(sessionId)))
-  const compactDisabled = !appStore.modelAvailable() || !state.session?.facts.length || state.connection !== 'ready'
+  const compactDisabled = !appStore.modelAvailable() || !state.session?.facts.length
     || phase !== 'idle' || compactDone || compacting
   const startCompact = () => {
     attempt.current = compaction?.id ?? ''

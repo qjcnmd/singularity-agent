@@ -11,7 +11,7 @@ use crate::transport::http::{
     provider_transport_error, read_bounded_body, transport_error_source,
 };
 
-pub const DEFAULT_WEB_SEARCH_BASE_URL: &str = "https://api.deepseek.com";
+pub(crate) const DEFAULT_WEB_SEARCH_BASE_URL: &str = "https://api.deepseek.com";
 
 const MAX_FETCH_URL_CHARS: usize = 8192;
 const WEB_CONNECT_TIMEOUT_SECONDS: u64 = 15;

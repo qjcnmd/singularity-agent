@@ -7,7 +7,6 @@ mod manager;
 use format::Result;
 
 pub use crate::image::SavedImage;
-pub use compaction::{CompactionInput, retention_budget_tokens};
 pub(crate) use format::tool_item_id;
 pub use format::{
     CompactionEntry, LedgerRecord, MessageDisplay, SessionEntry, SessionError, SessionMetadata, text_item_id,

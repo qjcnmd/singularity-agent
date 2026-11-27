@@ -9,9 +9,6 @@
 .file-toolbar { display: flex; flex: none; align-items: center; gap: 8px; min-height: 36px; padding: 0 10px 0 16px; color: var(--ink-faint); font-size: 12px; }
 .file-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
 .file-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
-.file-body:has(> .edit-diff) { display: flex; flex-direction: column; overflow: hidden; }
-.file-body > .edit-diff { display: flex; flex-direction: column; flex: 1; min-height: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; }
-.file-body > .edit-diff .edit-diff-scroll { flex: 1; min-height: 0; max-height: none; }
 .file-body > .detail-empty { padding: 16px; }
 .file-markdown { padding: 4px 20px 24px; }
 .file-code { padding: 4px 0 24px; font: 12.5px/1.6 var(--font-mono); }

@@ -15,6 +15,7 @@ if (root === null) {
 
 document.documentElement.dataset.theme = appStore.getSnapshot().theme
 applyCssSprings()
+appStore.start()
 
 createRoot(root).render(
   <StrictMode>

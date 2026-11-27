@@ -3,7 +3,6 @@ pub(crate) mod manager;
 pub(crate) mod selection;
 pub(crate) mod user;
 
-pub use discovery::discover as discover_models;
 pub use manager::{ModelConfigManager, ModelConfigurationSnapshot};
 pub(crate) use user::*;
 
@@ -57,7 +56,7 @@ pub(crate) fn validate_api_key(value: &str) -> Result<(), ProviderError> {
     Ok(())
 }
 
-pub(crate) fn validate_base_url(value: &str) -> Result<(), ProviderError> {
+pub(crate) fn validate_base_url(value: &str) -> Result<reqwest::Url, ProviderError> {
     validate_provider_value(value, "base_url")?;
     if value.is_empty() {
         return Err(configuration_error("模型配置无效：base_url 不能为空"));
@@ -76,5 +75,5 @@ pub(crate) fn validate_base_url(value: &str) -> Result<(), ProviderError> {
             "模型配置无效：base_url 须使用 http/https 并包含主机，只能附带路径，不能包含用户名、密码、查询参数或片段",
         ));
     }
-    Ok(())
+    Ok(url)
 }

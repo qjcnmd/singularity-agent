@@ -49,9 +49,8 @@ impl AppServer {
         let app = std::sync::Arc::clone(self);
         let workspace_root = workspace_root.to_owned();
         let close = tokio::task::spawn_blocking(move || {
-            let lifecycle = app.lock_lifecycle();
-            let workspace = app.workspace(&workspace_root)?;
             let mut sessions = app.lock_sessions();
+            let workspace = app.workspace(&workspace_root)?;
             let belongs = |conversation: &std::sync::Arc<crate::runtime::Conversation>| {
                 app_core::same_saved_path(&conversation.cwd, &workspace.root)
             };
@@ -65,18 +64,16 @@ impl AppServer {
                 )));
             }
             app.workspaces.remove(&workspace.root).map_err(RpcError::new)?;
-            sessions.retain(|id, conversation| {
+            sessions.retain(|_, conversation| {
                 if belongs(conversation) {
                     conversation.mark_closing();
-                    app.hub.remove_session(id);
                     false
                 } else {
                     true
                 }
             });
-            drop(sessions);
             let close = app.mcp.disconnect_directory(Path::new(&workspace.root));
-            drop(lifecycle);
+            drop(sessions);
             app.publish_app_snapshot();
             Ok(close)
         })

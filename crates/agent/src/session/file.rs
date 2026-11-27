@@ -5,9 +5,12 @@ use std::path::{Path, PathBuf};
 use super::format::{Result, SessionEntry, SessionError, SessionHeader, SessionMetadata};
 use super::manager::SessionData;
 
-pub(super) fn parse_session_file(file: &Path) -> Result<(SessionData, Option<u64>)> {
+pub(super) fn parse_session_file(
+    file: &Path,
+    expected_id: Option<&str>,
+) -> Result<(SessionData, Option<u64>)> {
     let mut entries = Vec::new();
-    let (header, cwd, repair) = scan_session_file(file, |entry| entries.push(entry))?;
+    let (header, cwd, repair) = scan_session_file(file, expected_id, |entry| entries.push(entry))?;
     Ok((
         SessionData {
             file: file.to_path_buf(),
@@ -15,7 +18,6 @@ pub(super) fn parse_session_file(file: &Path) -> Result<(SessionData, Option<u64
             entries,
             session_id: header.id,
             header_timestamp: header.timestamp,
-            last_reply_definition_tokens: None,
         },
         repair,
     ))
@@ -23,6 +25,7 @@ pub(super) fn parse_session_file(file: &Path) -> Result<(SessionData, Option<u64
 
 pub(super) fn scan_session_file(
     file: &Path,
+    expected_id: Option<&str>,
     mut visit: impl FnMut(SessionEntry),
 ) -> Result<(SessionHeader, PathBuf, Option<u64>)> {
     let handle = std::fs::File::open(file)?;
@@ -67,7 +70,16 @@ pub(super) fn scan_session_file(
         };
         if header.is_none() {
             let parsed: SessionHeader = serde_json::from_str(text).map_err(parse_error)?;
-            header = Some(parsed.validate()?);
+            let validated = parsed.validate()?;
+            if let Some(expected) = expected_id
+                && validated.id != expected
+            {
+                return Err(SessionError::InvalidHeader(format!(
+                    "rollout header id {} does not match expected id {expected}",
+                    validated.id
+                )));
+            }
+            header = Some(validated);
         } else {
             let entry = serde_json::from_str(text).map_err(parse_error)?;
             first_is_settings.get_or_insert(matches!(

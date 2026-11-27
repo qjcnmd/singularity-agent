@@ -1,8 +1,6 @@
 import type * as Wire from './protocol.generated'
 export type * from './protocol.generated'
 
-export type ConnectionStatus = 'connecting' | 'ready' | 'recovering'
-
 export type RpcMethod = keyof Wire.RpcContract
 export type RpcParams<M extends RpcMethod> = Wire.RpcContract[M]['params']
 export type RpcResult<M extends RpcMethod> = Wire.RpcContract[M]['result']

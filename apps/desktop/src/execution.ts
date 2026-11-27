@@ -64,7 +64,7 @@ export function acceptExecutionEvent(facts: ThreadTurn[], event: TurnEventEnvelo
       break
     }
     case 'turn/error': turn = { ...finishTurn(turn, 'failed'), error: event.params.error, finishedAt: event.params.finishedAt, stats: event.params.stats }; break
-    case 'turn/completed': turn = { ...finishTurn(turn, event.params.turn.status, event.params.manuallyStopped), finishedAt: event.params.finishedAt, stats: event.params.stats }; break
+    case 'turn/completed': turn = { ...finishTurn(turn, event.params.status, event.params.manuallyStopped), finishedAt: event.params.finishedAt, stats: event.params.stats }; break
     default: event satisfies never
   }
   const next = [...facts]

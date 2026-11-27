@@ -170,14 +170,6 @@ pub struct ThreadTurn {
     pub stats: Option<SessionModelUsage>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct Turn {
-    pub turn_id: String,
-    pub status: TurnStatus,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

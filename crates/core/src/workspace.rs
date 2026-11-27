@@ -2,43 +2,6 @@ use std::path::{Path, PathBuf};
 
 use crate::display_path;
 
-#[derive(Debug, Clone)]
-pub struct CanonicalWorkspacePath {
-    native: PathBuf,
-    display: String,
-}
-
-impl PartialEq for CanonicalWorkspacePath {
-    fn eq(&self, other: &Self) -> bool {
-        same_saved_path(&self.display, &other.display)
-    }
-}
-
-impl Eq for CanonicalWorkspacePath {}
-
-impl CanonicalWorkspacePath {
-    pub fn from_saved(path: impl AsRef<Path>) -> Result<Self, String> {
-        let path = path.as_ref();
-        if !path.is_absolute() {
-            return Err("saved workspace path must be absolute".to_string());
-        }
-        Ok(Self::from_native(path.components().collect()))
-    }
-
-    fn from_native(native: PathBuf) -> Self {
-        let display = display_path(&native);
-        Self { native, display }
-    }
-
-    pub fn as_path(&self) -> &Path {
-        &self.native
-    }
-
-    pub fn display(&self) -> &str {
-        &self.display
-    }
-}
-
 pub fn saved_path_key(path: &str) -> String {
     path.to_lowercase()
 }
@@ -52,7 +15,7 @@ pub fn same_saved_path(left: &str, right: &str) -> bool {
     saved_path_key(left) == saved_path_key(right)
 }
 
-pub fn canonicalize_workspace(path: impl AsRef<Path>) -> Result<CanonicalWorkspacePath, String> {
+pub fn canonicalize_workspace(path: impl AsRef<Path>) -> Result<PathBuf, String> {
     let requested = path.as_ref();
     let native = std::fs::canonicalize(requested)
         .map_err(|error| format!("workspace directory is unavailable ({}): {error}", requested.display()))?;
@@ -62,7 +25,7 @@ pub fn canonicalize_workspace(path: impl AsRef<Path>) -> Result<CanonicalWorkspa
     if !metadata.is_dir() {
         return Err(format!("workspace path is not a directory: {}", requested.display()));
     }
-    Ok(CanonicalWorkspacePath::from_native(native))
+    Ok(native)
 }
 
 pub(crate) fn project_root(cwd: &Path) -> Result<PathBuf, String> {

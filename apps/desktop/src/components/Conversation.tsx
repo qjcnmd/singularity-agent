@@ -3,7 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { ArrowDown } from 'lucide-react'
 import { appStore, useAppStore, type AppState } from '../appStore'
 import { type TimelineRow } from '../timeline'
-import { maxTimelineEntryOffset, TimelineItem } from './TimelineItem'
+import { TimelineItem } from './TimelineItem'
 import { useConversationAnnotations } from './Annotations'
 import { defaultAnchor } from '../viewPersistence'
 
@@ -30,7 +30,6 @@ export function Conversation({ state, items }: Props) {
   const frame = useRef(0)
   const anchorFrame = useRef(0)
   const anchorRevision = useRef(0)
-  const anchorHint = useRef<{ element: HTMLElement; index: number; top: number } | null>(null)
   const cancelAnchorScan = useCallback(() => {
     cancelAnimationFrame(anchorFrame.current)
     anchorFrame.current = 0
@@ -59,7 +58,6 @@ export function Conversation({ state, items }: Props) {
     cancelAnimationFrame(frame.current)
     frame.current = 0
     cancelAnchorScan()
-    anchorHint.current = null
     if (disclosureTimer.current) clearTimeout(disclosureTimer.current)
     disclosurePause.current = 0
   }, [sessionId, cancelAnchorScan])
@@ -146,36 +144,16 @@ export function Conversation({ state, items }: Props) {
         return
       }
       const viewportTop = node.getBoundingClientRect().top
-      const earliestBottom = viewportTop - conversationDocument.getBoundingClientRect().top - maxTimelineEntryOffset - 1
-      const mayReachViewport = (index: number) => {
-        const child = children[index] as HTMLElement
-        return child.offsetTop + child.offsetHeight >= earliestBottom
-      }
       let lower = 0
       let upper = children.length
       if (children[upper - 1] && !children[upper - 1].hasAttribute('data-item-id')) upper--
       const count = upper
-      const hint = anchorHint.current
-      if (hint && children[hint.index] === hint.element && Math.abs(top - hint.top) < node.clientHeight) {
-        let index = Math.min(count - 1, Math.max(0, hint.index + Math.sign(top - hint.top)))
-        for (let probe = 0; probe < 4 && index >= lower && index < upper; probe++) {
-          if (mayReachViewport(index)) { upper = index; index-- }
-          else { lower = index + 1; index++ }
-        }
-      }
       while (lower < upper) {
-        const middle = Math.floor((lower + upper) / 2)
-        if (mayReachViewport(middle)) upper = middle
+        const middle = (lower + upper) >> 1
+        if ((children[middle] as HTMLElement).getBoundingClientRect().bottom >= viewportTop) upper = middle
         else lower = middle + 1
       }
-      for (let index = lower; index < count; index++) {
-        const element = children[index] as HTMLElement
-        if (element.getBoundingClientRect().bottom >= viewportTop) {
-          anchorHint.current = { element, index, top }
-          saveReadingPosition(node, element)
-          break
-        }
-      }
+      if (lower < count) saveReadingPosition(node, children[lower] as HTMLElement)
     })
   }, [sessionId, cancelAnchorScan])
 
@@ -226,13 +204,11 @@ export function Conversation({ state, items }: Props) {
     if (item) saveReadingPosition(node, item)
   }, [cancelAnchorScan])
 
-  const { connection, liveSessions } = useAppStore(
-    ['connection', 'liveSessions'],
-    (previous, next) => previous.connection === next.connection
-      && hasRunningBackgroundTask(previous.liveSessions, sessionId) === hasRunningBackgroundTask(next.liveSessions, sessionId),
+  const { liveSessions } = useAppStore(
+    ['liveSessions'],
+    (previous, next) => hasRunningBackgroundTask(previous.liveSessions, sessionId) === hasRunningBackgroundTask(next.liveSessions, sessionId),
   )
-  const canEdit = connection === 'ready'
-    && state.session?.runtime.phase === 'idle'
+  const canEdit = state.session?.runtime.phase === 'idle'
     && !hasRunningBackgroundTask(liveSessions, sessionId)
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
   useEffect(() => { setEditingMessageId(null) }, [sessionId])

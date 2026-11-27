@@ -117,6 +117,67 @@ async fn mcp_lazy_loading_and_module_gating() {
         "disabling web module must hide web_search and web_fetch tools"
     );
 
+    let http_url = format!(
+        "{}?token=http_tok_99&mode=fast",
+        server.base_url.replacen("http://", "http://mcp_user_1:mcp_pass_1@", 1)
+    );
+    server.enqueue(ScriptedResponse::json(
+        401,
+        json!({ "error": "denied mcp_user_1 mcp_pass_1 http_tok_99 Bearer hdr_secret_42 public_ok" }),
+    ));
+    let secrets = [
+        "mcp_user_1",
+        "mcp_pass_1",
+        "http_tok_99",
+        "hdr_secret_42",
+        "mcp_user_2",
+        "mcp_pass_2",
+        "stdio_tok_77",
+        "svc_secret_88",
+    ];
+    let leaky_servers = [
+        (
+            "redact-http",
+            json!({
+                "type": "http", "url": http_url,
+                "headers": { "Authorization": "Bearer hdr_secret_42", "X-Custom": "public_ok" }
+            }),
+        ),
+        (
+            "redact-stdio",
+            json!({
+                "type": "stdio", "command": "node", "cwd": ws,
+                "args": [
+                    "-e",
+                    "console.error('err', process.env.serviceKey, process.env.PUBLIC_TAG, process.argv.slice(1).join(' ')); process.exit(1)",
+                    "--",
+                    "https://mcp_user_2:mcp_pass_2@example.invalid/sse?token=stdio_tok_77"
+                ],
+                "env": { "serviceKey": "svc_secret_88", "PUBLIC_TAG": "public_ok" }
+            }),
+        ),
+    ];
+    for (id, transport) in leaky_servers {
+        let cfg =
+            json!({ "serverId": id, "startupTimeoutSec": 5, "toolTimeoutSec": 5, "transport": transport });
+        client.rpc_ok("mcp.save", json!({ "workspaceRoot": ws, "server": cfg })).await;
+        let state = client.rpc_ok("mcp.reconnect", json!({ "workspaceRoot": ws, "serverId": id })).await;
+        let err = state.get("error").and_then(Value::as_str).expect("redacted mcp error");
+        assert!(err.contains("[redacted]") && err.contains("public_ok"), "{id}: {err}");
+        assert!(secrets.iter().all(|secret| !err.contains(secret)), "{id} leaked secret in `{err}`");
+    }
+    let listed = client.rpc_ok("mcp.list", json!({ "workspaceRoot": ws })).await;
+    let listed_errors: Vec<&str> = listed
+        .as_array()
+        .expect("mcp.list array")
+        .iter()
+        .filter_map(|entry| entry.get("error").and_then(Value::as_str))
+        .collect();
+    assert_eq!(listed_errors.len(), 2, "expected 2 failed mcp entries in mcp.list");
+    for err in listed_errors {
+        assert!(err.contains("[redacted]") && secrets.iter().all(|s| !err.contains(s)), "mcp.list: {err}");
+    }
+
     client.shutdown().await;
 }
 

@@ -18,20 +18,6 @@ export function capacityConfigurationError(context: number | null, output: numbe
   return null
 }
 
-export function apiBaseUrlError(raw: string): string | null {
-  const trimmed = raw.trim()
-  let parsed: URL
-  try {
-    parsed = new URL(trimmed)
-  } catch {
-    return '请输入完整的 API 地址。'
-  }
-  if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash || /[?#]/.test(trimmed)) {
-    return 'API 地址必须为 http 或 https 地址，不含凭据、查询或片段。'
-  }
-  return null
-}
-
 export function formatCapacityInput(value: number | null): string {
   if (value === null) return ''
   if (value % 1_000_000 === 0) return `${value / 1_000_000}M`
@@ -41,25 +27,8 @@ export function formatCapacityInput(value: number | null): string {
 
 type ReasoningConfiguration = Pick<ModelConfigurationInput, 'reasoningVariants'>
 
-export function isConfigurationIdentifier(value: string): boolean {
-  if (value === '' || /\s/.test(value)) return false
-  for (const character of value) {
-    const code = character.charCodeAt(0)
-    if (code <= 0x1f || code === 0x7f) return false
-  }
-  return true
-}
-
 function supportsThinkingToggle(protocol: ProviderApiProtocol): boolean {
   return protocol === 'messages'
-}
-
-export function reasoningConfigurationError(model: ReasoningConfiguration, protocol: ProviderApiProtocol): string | null {
-  const declared = model.reasoningVariants ?? []
-  if (declared.some(variant => !isConfigurationIdentifier(variant))) return '思考档位无效，请取消选择此档位。'
-  if (new Set(declared).size !== declared.length) return '思考选项不能重名。'
-  if (protocol === 'responses' && declared.includes('on')) return 'Responses 须选择具体思考档位，不支持 on 开关。'
-  return null
 }
 
 export function blankModel(): ModelConfigurationInput {

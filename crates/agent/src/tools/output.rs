@@ -25,7 +25,7 @@ impl SpillWriter {
 }
 
 pub(super) struct CaptureState {
-    directory: Option<PathBuf>,
+    directory: PathBuf,
     tail: String,
     total_bytes: usize,
     completed_lines: usize,
@@ -35,22 +35,12 @@ pub(super) struct CaptureState {
 
 impl CaptureState {
     pub(super) fn persist(&mut self) {
-        if self.spill.is_none()
-            && let Some(directory) = &self.directory
-        {
-            self.spill = Some(SpillWriter::create(directory, &self.tail));
+        if self.spill.is_none() {
+            self.spill = Some(SpillWriter::create(&self.directory, &self.tail));
         }
     }
 
     pub(super) fn new(directory: PathBuf) -> Self {
-        Self::with_directory(Some(directory))
-    }
-
-    pub(super) fn new_in_memory() -> Self {
-        Self::with_directory(None)
-    }
-
-    fn with_directory(directory: Option<PathBuf>) -> Self {
         Self {
             directory,
             tail: String::new(),
@@ -66,18 +56,11 @@ impl CaptureState {
         self.completed_lines + usize::from(has_open_line)
     }
 
-    pub(super) fn is_truncated(&self) -> bool {
+    fn is_truncated(&self) -> bool {
         self.total_lines() > DEFAULT_MAX_LINES || self.total_bytes > DEFAULT_MAX_BYTES
     }
 
-    pub(super) fn has_spill(&self) -> bool {
-        self.spill.is_some()
-    }
-
     pub(super) fn will_write_disk(&self, text: &str) -> bool {
-        if self.directory.is_none() {
-            return false;
-        }
         match &self.spill {
             Some(Ok(_)) => return true,
             Some(Err(_)) => return false,
@@ -94,7 +77,7 @@ impl CaptureState {
         self.total_bytes > 0 && self.last_progress.is_none_or(|(_, bytes)| bytes < self.total_bytes)
     }
 
-    pub(super) fn current_output(&mut self, spill_note: Option<&str>) -> Option<String> {
+    pub(super) fn current_output(&mut self) -> Option<String> {
         let now = Instant::now();
         if self.total_bytes == 0
             || self.last_progress.is_some_and(|(last, bytes)| {
@@ -104,15 +87,15 @@ impl CaptureState {
             return None;
         }
         self.last_progress = Some((now, self.total_bytes));
-        Some(self.display_output(spill_note))
+        Some(self.display_output())
     }
 
-    pub(super) fn display_output(&self, spill_note: Option<&str>) -> String {
+    pub(super) fn display_output(&self) -> String {
         if self.total_bytes == 0 {
             return String::new();
         }
         let mut content = self.final_output();
-        if let Some(note) = spill_note {
+        if let Some(note) = self.spill_note() {
             let _ = write!(content, "\n\n{note}");
         }
         content
@@ -127,11 +110,8 @@ impl CaptureState {
             self.spill = Some(Err(error));
         }
         self.tail.push_str(text);
-        if self.spill.is_none()
-            && self.is_truncated()
-            && let Some(directory) = &self.directory
-        {
-            self.spill = Some(SpillWriter::create(directory, &self.tail));
+        if self.spill.is_none() && self.is_truncated() {
+            self.spill = Some(SpillWriter::create(&self.directory, &self.tail));
         }
         if self.tail.len() > INTERNAL_TAIL_MAX_BYTES {
             self.tail = truncate_string_to_bytes_from_end(&self.tail, INTERNAL_TAIL_MAX_BYTES);
@@ -161,7 +141,7 @@ impl CaptureState {
         (content, note)
     }
 
-    pub(super) fn spill_note(&self) -> Option<String> {
+    fn spill_note(&self) -> Option<String> {
         self.spill.as_ref().map(|spill| match spill {
             Ok(spill) => format!("Full output: {}", spill.path.display()),
             Err(error) => format!("Full output could not be saved: {error}"),
@@ -172,7 +152,7 @@ impl CaptureState {
         if !self.is_truncated() {
             return self.tail.clone();
         }
-        let tail_result = truncate_tail(&self.tail);
+        let tail_result = truncate_lines(&self.tail, true);
         let total_lines = self.total_lines();
         let start_line = total_lines.saturating_sub(tail_result.output_lines) + 1;
         let end_line = total_lines;
@@ -217,12 +197,12 @@ fn format_size(bytes: usize) -> String {
     }
 }
 
-fn truncate_tail(content: &str) -> Truncation {
-    let lines = content.split_terminator('\n');
+fn truncate_lines(content: &str, from_end: bool) -> Truncation {
+    let mut lines = content.split_terminator('\n');
     let mut output: Vec<&str> = Vec::new();
     let mut output_bytes = 0usize;
     let mut truncated_by = TruncatedBy::Bytes;
-    for line in lines.rev() {
+    while let Some(line) = if from_end { lines.next_back() } else { lines.next() } {
         if output.len() >= DEFAULT_MAX_LINES {
             truncated_by = TruncatedBy::Lines;
             break;
@@ -230,8 +210,13 @@ fn truncate_tail(content: &str) -> Truncation {
         let line_bytes = line.len() + usize::from(!output.is_empty());
         if output_bytes + line_bytes > DEFAULT_MAX_BYTES {
             if output.is_empty() {
+                let partial = if from_end {
+                    truncate_string_to_bytes_from_end(line, DEFAULT_MAX_BYTES)
+                } else {
+                    line[..line.floor_char_boundary(DEFAULT_MAX_BYTES)].to_string()
+                };
                 return Truncation {
-                    content: truncate_string_to_bytes_from_end(line, DEFAULT_MAX_BYTES),
+                    content: partial,
                     truncated_by: TruncatedBy::Bytes,
                     output_lines: 1,
                     partial_line: true,
@@ -242,12 +227,11 @@ fn truncate_tail(content: &str) -> Truncation {
         output.push(line);
         output_bytes += line_bytes;
     }
-    let content = {
+    if from_end {
         output.reverse();
-        output.join("\n")
-    };
+    }
     Truncation {
-        content,
+        content: output.join("\n"),
         truncated_by,
         output_lines: output.len(),
         partial_line: false,
@@ -267,7 +251,7 @@ pub(crate) fn format_head_bounded(content: &str, output_directory: &Path) -> Str
     if total_lines <= DEFAULT_MAX_LINES && content.len() <= DEFAULT_MAX_BYTES {
         return content.to_string();
     }
-    let head = truncate_head(content);
+    let head = truncate_lines(content, false);
     if !head.partial_line && head.output_lines >= total_lines {
         return head.content;
     }
@@ -295,38 +279,4 @@ pub(crate) fn format_head_bounded(content: &str, output_directory: &Path) -> Str
         )
     };
     format!("{}\n\n{summary}\n\n{spill_note}", head.content)
-}
-
-fn truncate_head(content: &str) -> Truncation {
-    let mut output: Vec<&str> = Vec::new();
-    let mut output_bytes = 0usize;
-    let mut truncated_by = TruncatedBy::Bytes;
-    for line in content.split_terminator('\n') {
-        if output.len() >= DEFAULT_MAX_LINES {
-            truncated_by = TruncatedBy::Lines;
-            break;
-        }
-        let line_bytes = line.len() + usize::from(!output.is_empty());
-        if output_bytes + line_bytes > DEFAULT_MAX_BYTES {
-            if output.is_empty() {
-                let end = line.floor_char_boundary(DEFAULT_MAX_BYTES);
-                return Truncation {
-                    content: line[..end].to_string(),
-                    truncated_by: TruncatedBy::Bytes,
-                    output_lines: 1,
-                    partial_line: true,
-                };
-            }
-            break;
-        }
-        output.push(line);
-        output_bytes += line_bytes;
-    }
-    let output_lines = output.len();
-    Truncation {
-        content: output.join("\n"),
-        truncated_by,
-        output_lines,
-        partial_line: false,
-    }
 }

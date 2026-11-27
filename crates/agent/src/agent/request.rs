@@ -43,7 +43,7 @@ impl RequestContext {
     pub(super) async fn load_definitions(
         &mut self,
         cancellation: &CancellationToken,
-    ) -> Result<(RequestDefinitions, protocol::InjectedContext)> {
+    ) -> Result<(RequestDefinitions, Vec<protocol::ContextModule>)> {
         let home = self.config.instruction_home.clone();
         let session = std::sync::Arc::clone(&self.session);
         let models = std::sync::Arc::clone(&self.models);
@@ -77,8 +77,7 @@ impl RequestContext {
         let tools = assembly.registry.provider_schemas();
         let definitions = RequestDefinitions::new(assembly.messages, tools);
         self.registry = assembly.registry;
-        let context = protocol::InjectedContext { modules: assembly.modules };
-        Ok((definitions, context))
+        Ok((definitions, assembly.modules))
     }
 
     pub(super) fn request_definitions(&self) -> &RequestDefinitions {
@@ -96,7 +95,7 @@ impl RequestContext {
         let mut messages = definitions.messages.clone();
         let overhead_tokens = definitions.estimated_tokens;
         let session = std::sync::Arc::clone(&self.session);
-        let identity = (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned());
+        let identity = self.model_identity();
         let model = self.provider.model_configuration();
         let (request, input_tokens) = tokio::task::spawn_blocking(move || {
             let prepared = prepared.unwrap_or_else(|| {
@@ -125,7 +124,6 @@ impl RequestContext {
             &self.provider,
             &self.session,
             &request,
-            Some(overhead_tokens),
             on_event,
             cancellation,
             protocol::RequestPurpose::Generation,
@@ -138,28 +136,20 @@ impl RequestContext {
 impl Agent {
     async fn drain_and_prepare(
         &mut self,
-        switch_compacted: &mut bool,
         auto_attempted: &mut bool,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<Option<PreparedContext>> {
         loop {
             self.drain_inputs(on_event, cancellation).await?;
-            let prepared = match self
-                .requests
-                .prepare_before_request(*switch_compacted, !*auto_attempted, on_event, cancellation)
-                .await?
-            {
-                PreRequestOutcome::Ready(context) => Some(context),
-                PreRequestOutcome::SwitchCompacted => {
-                    *switch_compacted = true;
-                    None
-                }
-                PreRequestOutcome::AutoAttempted => {
-                    *auto_attempted = true;
-                    None
-                }
-            };
+            let prepared =
+                match self.requests.prepare_before_request(!*auto_attempted, on_event, cancellation).await? {
+                    PreRequestOutcome::Ready(context) => Some(context),
+                    PreRequestOutcome::AutoAttempted => {
+                        *auto_attempted = true;
+                        None
+                    }
+                };
             if !self.has_pending_inputs() {
                 return Ok(prepared);
             }
@@ -171,11 +161,8 @@ impl Agent {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<(ModelTurnResponse, String, String)> {
-        let mut switch_compacted = false;
         let mut auto_attempted = false;
-        let prepared = self
-            .drain_and_prepare(&mut switch_compacted, &mut auto_attempted, on_event, cancellation)
-            .await?;
+        let prepared = self.drain_and_prepare(&mut auto_attempted, on_event, cancellation).await?;
         let (overflow, overflow_input_tokens) =
             match self.requests.request_response(prepared, on_event, cancellation).await {
                 Err((AgentError::Provider(error), input_tokens)) if error.is_context_overflow() => {
@@ -200,9 +187,7 @@ impl Agent {
             }
         }
         auto_attempted = true;
-        let prepared = self
-            .drain_and_prepare(&mut switch_compacted, &mut auto_attempted, on_event, cancellation)
-            .await?;
+        let prepared = self.drain_and_prepare(&mut auto_attempted, on_event, cancellation).await?;
         self.requests
             .request_response(prepared, on_event, cancellation)
             .await

@@ -334,28 +334,8 @@ pub fn preview(
         disabled: &[],
     })
     .modules;
-    let mut proxy_accounted = false;
     modules.extend(servers.into_iter().map(|server| {
         let id = server.server.server_id;
-        let has_tools = server.error.is_none()
-            && server.status == protocol::McpConnectionStatus::Connected
-            && !server.tools.is_empty();
-        let tokens = if has_tools {
-            let prompt = format_mcp_prompt(
-                &id,
-                None,
-                server.tools.iter().map(|tool| (tool.name.as_str(), tool.description.as_str(), false)),
-            );
-            let proxy = if proxy_accounted {
-                0
-            } else {
-                proxy_accounted = true;
-                mcp_proxy_tokens()
-            };
-            estimate_tokens_of(&prompt) + server.tokens + proxy
-        } else {
-            server.tokens
-        };
         let detail = if server.status == protocol::McpConnectionStatus::NotConnected {
             "尚未连接，创建任务时才会连接".to_string()
         } else {
@@ -366,7 +346,7 @@ pub fn preview(
             group: ContextGroup::Mcp,
             label: id,
             detail,
-            tokens,
+            tokens: 0,
             locked: false,
             enabled: true,
         }

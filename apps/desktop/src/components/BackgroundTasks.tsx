@@ -6,7 +6,7 @@ import { CommandOutput } from './CommandOutput'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 
-const fields = ['selectedSessionId', 'liveSessions', 'pendingActions', 'actionErrors', 'connection'] as const
+const fields = ['selectedSessionId', 'liveSessions', 'pendingActions', 'actionErrors'] as const
 type BackgroundState = Pick<AppState, typeof fields[number]>
 const emptyTasks: VisibleBackgroundTask[] = []
 function selectedTasks(state: BackgroundState): VisibleBackgroundTask[] {
@@ -18,7 +18,7 @@ function selectedTasks(state: BackgroundState): VisibleBackgroundTask[] {
 export const BackgroundTasks = memo(function BackgroundTasks() {
   const state = useAppStore(fields, (previous, next) => previous.selectedSessionId === next.selectedSessionId
     && selectedTasks(previous) === selectedTasks(next) && previous.pendingActions === next.pendingActions
-    && previous.actionErrors === next.actionErrors && previous.connection === next.connection)
+    && previous.actionErrors === next.actionErrors)
   const tasks = selectedTasks(state).filter(task => task.state.status === 'running')
   const sessionId = state.selectedSessionId
   if (sessionId === null || tasks.length === 0) return null
@@ -27,20 +27,20 @@ export const BackgroundTasks = memo(function BackgroundTasks() {
       const origin = actionOrigin.control(sessionId, task.taskId)
       return <BackgroundTaskRow key={`${sessionId}:${task.taskId}`} task={task} sessionId={sessionId}
         pending={state.pendingActions.has(pendingKey('session.stopBackgroundTask', origin))}
-        error={state.actionErrors[origin]} connected={state.connection === 'ready'} />
+        error={state.actionErrors[origin]} />
     })}
   </section>
 })
 
-const BackgroundTaskRow = memo(function BackgroundTaskRow({ task, sessionId, pending, error, connected }: {
-  task: VisibleBackgroundTask; sessionId: string; pending: boolean; error: ActionError | undefined; connected: boolean
+const BackgroundTaskRow = memo(function BackgroundTaskRow({ task, sessionId, pending, error }: {
+  task: VisibleBackgroundTask; sessionId: string; pending: boolean; error: ActionError | undefined
 }) {
   const [expanded, setExpanded] = useState(false)
   const outputId = useId()
   const description = task.description || task.command
   return <article className="activity-step background-task">
     <div className="background-task-head">
-      <button type="button" className="task-stop" disabled={pending || !connected}
+      <button type="button" className="task-stop" disabled={pending}
         aria-busy={pending} aria-label={`${error ? '重试停止' : '停止'}后台命令：${description}`}
         title={pending ? '正在停止' : '停止命令'}
         onClick={() => void appStore.stopBackgroundTask(sessionId, task.taskId)}>

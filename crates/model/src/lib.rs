@@ -15,7 +15,7 @@ mod types;
 mod web;
 
 pub use client::ModelClient;
-pub use config::{ModelConfigManager, ModelConfigurationSnapshot, discover_models};
+pub use config::{ModelConfigManager, ModelConfigurationSnapshot};
 pub use error::{ModelErrorKind, ProviderError};
 pub use provider::ProviderStreamEvent;
 pub(crate) use types::ModelStopReason;
@@ -23,4 +23,4 @@ pub use types::{
     ContentBlock, Message, ModelToolCall, ModelTurnRequest, ModelTurnResponse, ModelUsage,
     ProviderBlockMetadata, ProviderMessageMetadata,
 };
-pub use web::{DEFAULT_WEB_SEARCH_BASE_URL, WebSearchAccess, validate_fetch_url};
+pub use web::{WebSearchAccess, validate_fetch_url};

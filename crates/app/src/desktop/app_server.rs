@@ -18,6 +18,7 @@ const MAX_CACHED_SESSIONS: usize = 16;
 #[derive(Default)]
 pub(super) struct SessionCache {
     entries: HashMap<String, (Arc<Conversation>, u64)>,
+    deleting_sessions: HashSet<String>,
     next_access: u64,
 }
 
@@ -27,6 +28,10 @@ impl SessionCache {
         self.next_access += 1;
         *last_access = self.next_access;
         Some(Arc::clone(conversation))
+    }
+
+    pub(super) fn is_deleting(&self, id: &str) -> bool {
+        self.deleting_sessions.contains(id)
     }
 
     pub(super) fn insert(&mut self, id: String, conversation: Arc<Conversation>) {
@@ -63,21 +68,9 @@ impl SessionCache {
     }
 }
 
-#[derive(Default)]
-pub(super) struct LifecycleState {
-    deleting_sessions: HashSet<String>,
-}
-
-impl LifecycleState {
-    pub(super) fn is_deleting(&self, session_id: &str) -> bool {
-        self.deleting_sessions.contains(session_id)
-    }
-}
-
 pub(crate) struct AppServer {
     hub: Arc<StreamHub>,
     app_publication: Mutex<()>,
-    lifecycle: Mutex<LifecycleState>,
     catalog: ThreadCatalog,
     workspaces: WorkspaceStore,
     models: Arc<ModelConfigManager>,
@@ -98,7 +91,6 @@ impl AppServer {
         Arc::new(Self {
             hub: StreamHub::new(stream),
             app_publication: Mutex::new(()),
-            lifecycle: Mutex::new(LifecycleState::default()),
             catalog,
             workspaces,
             models,
@@ -174,17 +166,10 @@ impl AppServer {
         base_url: &str,
         api_key: Option<&str>,
     ) -> Result<Vec<String>, RpcError> {
-        let models = Arc::clone(&self.models);
-        let provider_id = provider_id.to_owned();
-        let base_url_for_auth = base_url.to_owned();
-        let api_key = api_key.map(str::to_owned);
-        let api_key = tokio::task::spawn_blocking(move || {
-            models.discovery_credential(&provider_id, &base_url_for_auth, api_key.as_deref())
-        })
-        .await
-        .expect("model credential lookup completes while the backend is running")
-        .map_err(RpcError::new)?;
-        model::discover_models(base_url, &api_key, api_protocol).await.map_err(RpcError::new)
+        self.models
+            .discover_models(provider_id, api_protocol, base_url, api_key)
+            .await
+            .map_err(RpcError::new)
     }
 
     pub(crate) fn start_session(
@@ -203,13 +188,13 @@ impl AppServer {
             skill_expansion,
         )
         .map_err(RpcError::new)?;
-        let _lifecycle = self.lock_lifecycle();
+        let mut sessions = self.lock_sessions();
         let workspace = self.workspace(&params.workspace_root)?;
         let thread = self
             .catalog
             .create_thread(&workspace.root, params.selection, params.disabled_modules)
             .map_err(catalog_error)?;
-        let conversation = self.insert_conversation(thread);
+        let conversation = self.insert_conversation(&mut sessions, thread);
         conversation.start(input).map_err(conversation_error)?;
         Ok(conversation.start_result())
     }
@@ -220,62 +205,40 @@ impl AppServer {
         focus_epoch: u64,
     ) -> Result<SessionReadResult, RpcError> {
         let conversation = {
-            let lifecycle = self.lock_lifecycle();
-            self.open_conversation(&lifecycle, session_id)?
+            let mut sessions = self.lock_sessions();
+            self.open_conversation(&mut sessions, session_id, false)?
         };
         self.set_focused_session(focus_epoch, Some(session_id.to_owned()));
         conversation.read().map_err(catalog_error)
     }
 
-    fn open_conversation(
+    pub(super) fn open_conversation(
         &self,
-        lifecycle: &LifecycleState,
+        sessions: &mut SessionCache,
         session_id: &str,
+        require_workspace: bool,
     ) -> Result<Arc<Conversation>, RpcError> {
-        if lifecycle.is_deleting(session_id) {
+        if sessions.is_deleting(session_id) {
             return Err(session_busy());
         }
-        let open = self.lock_sessions().get(session_id);
-        if let Some(conversation) = open {
-            return Ok(conversation);
-        }
-        let thread = self.catalog.open_session(session_id).map_err(catalog_error)?;
-        Ok(self.insert_conversation(thread))
-    }
-
-    fn open_action_conversation(
-        &self,
-        lifecycle: &LifecycleState,
-        session_id: &str,
-    ) -> Result<Arc<Conversation>, RpcError> {
-        let conversation = self.open_conversation(lifecycle, session_id)?;
-        if conversation.is_deleting() {
-            return Err(session_busy());
-        }
-        Ok(conversation)
-    }
-
-    pub(super) fn open_workspace_conversation(
-        &self,
-        lifecycle: &LifecycleState,
-        session_id: &str,
-    ) -> Result<Arc<Conversation>, RpcError> {
-        if lifecycle.is_deleting(session_id) {
-            return Err(session_busy());
-        }
-        if let Some(conversation) = self.lock_sessions().get(session_id) {
-            if conversation.is_deleting() {
-                return Err(session_busy());
+        if let Some(conversation) = sessions.get(session_id) {
+            if require_workspace {
+                self.workspace(&conversation.cwd)?;
             }
-            self.workspace(&conversation.cwd)?;
             return Ok(conversation);
         }
         let thread = self.catalog.open_session(session_id).map_err(catalog_error)?;
-        self.workspace(&thread.data().cwd_string())?;
-        Ok(self.insert_conversation(thread))
+        if require_workspace {
+            self.workspace(&thread.data().cwd_string())?;
+        }
+        Ok(self.insert_conversation(sessions, thread))
     }
 
-    fn insert_conversation(&self, session: agent::session::SessionManager) -> Arc<Conversation> {
+    fn insert_conversation(
+        &self,
+        sessions: &mut SessionCache,
+        session: agent::session::SessionManager,
+    ) -> Arc<Conversation> {
         let id = session.data().session_id().to_owned();
         let conversation = Conversation::new(
             session,
@@ -285,7 +248,7 @@ impl AppServer {
             self.hub.revision(),
             Arc::clone(&self.hub),
         );
-        self.lock_sessions().insert(id, Arc::clone(&conversation));
+        sessions.insert(id, Arc::clone(&conversation));
         conversation
     }
 
@@ -303,10 +266,6 @@ impl AppServer {
 
     fn lock_app_publication(&self) -> std::sync::MutexGuard<'_, ()> {
         self.app_publication.lock().expect("app_server publication lock poisoned")
-    }
-
-    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, LifecycleState> {
-        self.lifecycle.lock().expect("app_server lifecycle lock poisoned")
     }
 
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, SessionCache> {
@@ -333,26 +292,38 @@ impl AppServer {
 pub(super) struct SessionDeleteGuard {
     app: Arc<AppServer>,
     session_id: Option<String>,
+    conversation: Option<Arc<Conversation>>,
 }
 
 impl SessionDeleteGuard {
     pub(super) fn reserve(
         app: &Arc<AppServer>,
-        lifecycle: &mut LifecycleState,
+        sessions: &mut SessionCache,
         session_id: &str,
     ) -> Result<Self, RpcError> {
-        if !lifecycle.deleting_sessions.insert(session_id.to_owned()) {
+        if !sessions.deleting_sessions.insert(session_id.to_owned()) {
             return Err(session_busy());
+        }
+        let conversation = sessions.get(session_id);
+        if let Some(conversation) = &conversation {
+            conversation.mark_closing();
         }
         Ok(Self {
             app: Arc::clone(app),
             session_id: Some(session_id.to_owned()),
+            conversation,
         })
     }
 
-    pub(super) fn release_locked(mut self, lifecycle: &mut LifecycleState) {
+    pub(super) fn conversation(&self) -> Option<&Arc<Conversation>> {
+        self.conversation.as_ref()
+    }
+
+    pub(super) fn complete_locked(mut self, sessions: &mut SessionCache) {
         if let Some(session_id) = self.session_id.take() {
-            lifecycle.deleting_sessions.remove(&session_id);
+            self.conversation.take();
+            sessions.remove(&session_id);
+            sessions.deleting_sessions.remove(&session_id);
         }
     }
 }
@@ -360,7 +331,11 @@ impl SessionDeleteGuard {
 impl Drop for SessionDeleteGuard {
     fn drop(&mut self) {
         if let Some(session_id) = self.session_id.take() {
-            self.app.lock_lifecycle().deleting_sessions.remove(&session_id);
+            let mut sessions = self.app.lock_sessions();
+            if let Some(conversation) = self.conversation.take() {
+                conversation.clear_closing();
+            }
+            sessions.deleting_sessions.remove(&session_id);
         }
     }
 }

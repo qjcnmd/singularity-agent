@@ -12,7 +12,7 @@ pub(super) struct ConversationView {
     pub(super) activity: Activity,
     pub(super) failure: Option<SessionFailure>,
     usage: protocol::SessionModelUsage,
-    pub(super) context: Option<protocol::InjectedContext>,
+    pub(super) context: Option<Vec<protocol::ContextModule>>,
 }
 impl ConversationView {
     pub(super) fn new(usage: protocol::SessionModelUsage, initial_revision: u64) -> Self {

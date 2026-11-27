@@ -5,7 +5,6 @@ import { actionOrigin, appStore, pendingKey, useAppStore } from '../appStore'
 import { palette } from '../bubbleColors'
 import { smooth } from '../motion'
 import type { RedactedProvider } from '../protocol'
-import { apiBaseUrlError } from '../modelConfiguration'
 import { messageFontSize } from '../viewPersistence'
 import { ProviderEditor } from './ProviderEditor'
 import { Dialog } from './Dialog'
@@ -25,8 +24,6 @@ const settingsTabs: ReadonlyArray<{ id: SettingsTab; label: string }> = [
   { id: 'skills', label: 'Skills' },
   { id: 'mcp', label: 'MCP' },
 ]
-
-const DEFAULT_WEB_SEARCH_URL = 'https://api.deepseek.com'
 
 export function Settings() {
   const { settingsOpen, pendingActions } = useAppStore(['settingsOpen', 'pendingActions'])
@@ -284,13 +281,12 @@ function WebSearchSection() {
   const state = useAppStore(['bootstrap', 'actionErrors', 'pendingActions'])
   const catalog = state.bootstrap?.modelCatalog
   const saved = catalog?.webSearch
-  const savedUrl = saved?.baseUrl || DEFAULT_WEB_SEARCH_URL
+  const savedUrl = saved?.baseUrl ?? ''
   const credentialConfigured = saved?.credentialConfigured ?? false
   const unreadable = Boolean(catalog?.error && catalog.providers.length === 0)
   const [baseUrl, setBaseUrl] = useState(savedUrl)
   const [apiKey, setApiKey] = useState('')
   const [clearKey, setClearKey] = useState(false)
-  const [failure, setFailure] = useState<string | null>(null)
   const [savedNotice, setSavedNotice] = useState(false)
   const origin = actionOrigin.inline('model.saveWebSearch', 'web')
   const busy = state.pendingActions.has(pendingKey('model.saveWebSearch', origin))
@@ -311,17 +307,10 @@ function WebSearchSection() {
   async function submit(event: FormEvent) {
     event.preventDefault()
     if (busy) return
-    setFailure(null)
     setSavedNotice(false)
     appStore.clearError(origin)
-    const trimmedUrl = baseUrl.trim() || DEFAULT_WEB_SEARCH_URL
-    const urlError = apiBaseUrlError(trimmedUrl)
-    if (urlError !== null) {
-      setFailure(urlError)
-      return
-    }
     const nextKey = clearKey ? '' : apiKey.trim() !== '' ? apiKey.trim() : undefined
-    const ok = await appStore.saveWebSearch(trimmedUrl, nextKey)
+    const ok = await appStore.saveWebSearch(baseUrl.trim(), nextKey)
     if (ok) {
       setApiKey('')
       setClearKey(false)
@@ -348,7 +337,7 @@ function WebSearchSection() {
               <input
                 className="input"
                 value={baseUrl}
-                placeholder={DEFAULT_WEB_SEARCH_URL}
+                placeholder={saved?.baseUrl}
                 onChange={event => { setBaseUrl(event.target.value); setSavedNotice(false) }}
               />
               <small className="field-hint">将请求 /v1/tools/search 与 /v1/tools/fetch</small>
@@ -373,7 +362,6 @@ function WebSearchSection() {
                 )}
               </div>
             </div>
-            {failure && <p className="form-error" role="alert">{failure}</p>}
             {saveError && <p className="form-error" role="alert">{saveError.message}</p>}
             <footer className="sg-editor-actions web-search-actions">
               <span className="web-search-saved" role="status" aria-live="polite">

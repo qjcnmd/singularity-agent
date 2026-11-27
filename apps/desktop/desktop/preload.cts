@@ -8,13 +8,6 @@ contextBridge.exposeInMainWorld('desktop', {
   pathForFile: (file: File) => webUtils.getPathForFile(file),
   connect: () => ipcRenderer.invoke('desktop:connect'),
   onFrame: (listener: (frame: StreamEnvelope) => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, frame: StreamEnvelope) => listener(frame)
-    ipcRenderer.on('desktop:frame', handler)
-    return () => ipcRenderer.removeListener('desktop:frame', handler)
-  },
-  onFailure: (listener: () => void) => {
-    const handler = () => listener()
-    ipcRenderer.on('desktop:failure', handler)
-    return () => ipcRenderer.removeListener('desktop:failure', handler)
+    ipcRenderer.on('desktop:frame', (_event: Electron.IpcRendererEvent, frame: StreamEnvelope) => listener(frame))
   },
 })

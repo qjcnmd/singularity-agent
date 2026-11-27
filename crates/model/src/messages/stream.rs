@@ -33,26 +33,6 @@ pub(crate) async fn read_messages_sse_stream(
     decoder.finish(result, config, selection, endpoint, prefix_digest)
 }
 
-#[cfg(test)]
-pub(crate) fn decode_messages_events_for_test(
-    events: &[Value],
-    config: &ProviderConfig,
-    selection: &SelectedModel,
-    endpoint: &str,
-) -> ModelTurnResponse {
-    let mut noop = |_| {};
-    let mut decoder = MessagesSseDecoder::new(&mut noop, &config.api_key);
-    let mut result = Ok(());
-    for event in events {
-        let bytes = serde_json::to_vec(event).expect("serialize test sse event");
-        if let Err(err) = decoder.dispatch_event(&bytes) {
-            result = Err(err);
-            break;
-        }
-    }
-    decoder.finish(result, config, selection, endpoint, None)
-}
-
 enum MessagesBlock {
     Text {
         text: String,

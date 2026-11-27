@@ -74,9 +74,8 @@ impl ServerConfig {
                 }
             }
             McpTransportConfig::Http { url, headers } => {
-                let parsed = reqwest::Url::parse(url).map_err(|error| {
-                    McpError::new(self.redact(format!("MCP 服务器 {id} 地址无效：{error}")))
-                })?;
+                let parsed = reqwest::Url::parse(url)
+                    .map_err(|error| McpError::new(format!("MCP 服务器 {id} 地址无效：{error}")))?;
                 if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
                     return Err(McpError::new(format!(
                         "MCP 服务器 {id} 地址必须是有效的 HTTP 或 HTTPS URL。"
@@ -113,9 +112,6 @@ impl ServerConfig {
             McpTransportConfig::Http { url, headers } => {
                 if let Ok(parsed) = reqwest::Url::parse(url) {
                     collect_parsed_url_secrets(&parsed, &mut values);
-                    if let Some(query) = parsed.query() {
-                        values.push(Cow::Owned(query.to_owned()));
-                    }
                 } else {
                     values.push(Cow::Borrowed(url.as_str()));
                 }
@@ -147,26 +143,12 @@ fn collect_secret_value<'a>(value: &'a str, values: &mut Vec<Cow<'a, str>>) {
 fn collect_parsed_url_secrets(parsed: &reqwest::Url, values: &mut Vec<Cow<'_, str>>) {
     if !parsed.username().is_empty() {
         values.push(Cow::Owned(parsed.username().to_owned()));
-        if let Some(decoded) = percent_decode(parsed.username()) {
-            values.push(Cow::Owned(decoded));
-        }
     }
     if let Some(password) = parsed.password().filter(|value| !value.is_empty()) {
         values.push(Cow::Owned(password.to_owned()));
-        if let Some(decoded) = percent_decode(password) {
-            values.push(Cow::Owned(decoded));
-        }
     }
-    if let Some(query) = parsed.query() {
-        for pair in query.split('&') {
-            if let Some((key, value)) = pair.split_once('=')
-                && !value.is_empty()
-                && (is_secret_name(key)
-                    || percent_decode(&key.replace('+', " ")).as_deref().is_some_and(is_secret_name))
-            {
-                values.push(Cow::Owned(value.to_owned()));
-            }
-        }
+    if let Some(query) = parsed.query().filter(|value| !value.is_empty()) {
+        values.push(Cow::Owned(query.to_owned()));
     }
     for (key, value) in parsed.query_pairs() {
         if is_secret_name(&key) && !value.is_empty() {
@@ -247,92 +229,53 @@ fn replace_non_overlapping(error: String, mut values: Vec<Cow<'_, str>>) -> Stri
     redacted
 }
 
-fn percent_decode(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    let mut changed = false;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let (Some(high), Some(low)) = (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2]))
-        {
-            decoded.push((high << 4) | low);
-            index += 3;
-            changed = true;
-            continue;
-        }
-        decoded.push(bytes[index]);
-        index += 1;
-    }
-    changed.then(|| String::from_utf8_lossy(&decoded).into_owned())
-}
+const SECRET_SUBSTRINGS: &[&[u8]] = &[
+    b"token",
+    b"secret",
+    b"password",
+    b"passwd",
+    b"credential",
+    b"cookie",
+    b"bearer",
+    b"authorization",
+    b"apikey",
+];
 
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
+const SECRET_WORDS: &[&[u8]] = &[b"auth", b"key", b"keys", b"pass", b"pat", b"jwt"];
 
 fn is_secret_name(name: &str) -> bool {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut chars = name.chars().peekable();
-    let mut prev: Option<char> = None;
-    while let Some(ch) = chars.next() {
-        if !ch.is_ascii_alphanumeric() {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-            prev = None;
+    let bytes = name.as_bytes();
+    if SECRET_SUBSTRINGS
+        .iter()
+        .any(|needle| bytes.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle)))
+    {
+        return true;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_alphanumeric() {
+            i += 1;
             continue;
         }
-        let next = chars.peek().copied();
-        let split_camel = ch.is_ascii_uppercase()
-            && (prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
-                || (prev.as_ref().is_some_and(char::is_ascii_uppercase)
-                    && next.as_ref().is_some_and(char::is_ascii_lowercase)));
-        if split_camel && !current.is_empty() {
-            words.push(std::mem::take(&mut current));
+        let start = i;
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+            let split_camel = bytes[i].is_ascii_uppercase()
+                && (bytes[i - 1].is_ascii_lowercase()
+                    || bytes[i - 1].is_ascii_digit()
+                    || (bytes[i - 1].is_ascii_uppercase()
+                        && bytes.get(i + 1).is_some_and(u8::is_ascii_lowercase)));
+            if split_camel {
+                break;
+            }
+            i += 1;
         }
-        current.push(ch.to_ascii_lowercase());
-        prev = Some(ch);
+        let word = &bytes[start..i];
+        if SECRET_WORDS.iter().any(|secret| word.eq_ignore_ascii_case(secret)) {
+            return true;
+        }
     }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words.iter().any(|word| {
-        matches!(
-            word.as_str(),
-            "auth"
-                | "authorization"
-                | "bearer"
-                | "cookie"
-                | "jwt"
-                | "key"
-                | "keys"
-                | "apikey"
-                | "apikeys"
-                | "pass"
-                | "passwd"
-                | "password"
-                | "passwords"
-                | "pat"
-                | "token"
-                | "tokens"
-                | "accesstoken"
-                | "authtoken"
-                | "apitoken"
-                | "secret"
-                | "secrets"
-                | "clientsecret"
-                | "credential"
-                | "credentials"
-        )
-    })
+    false
 }
 
 pub(crate) fn read(home: &Path) -> Result<Configuration, McpError> {
@@ -359,86 +302,4 @@ pub(crate) fn read(home: &Path) -> Result<Configuration, McpError> {
 pub(crate) fn write(home: &Path, config: &Configuration) -> Result<(), McpError> {
     app_core::write_json_atomic(&home.join("mcp.json"), config)
         .map_err(|source| McpError::io("无法保存 mcp.json", source))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ServerConfig;
-    use protocol::McpTransportConfig;
-    use std::collections::BTreeMap;
-
-    fn stdio_config(args: Vec<&str>, env: Vec<(&str, &str)>) -> ServerConfig {
-        ServerConfig {
-            startup_timeout_sec: 30,
-            tool_timeout_sec: 120,
-            transport: McpTransportConfig::Stdio {
-                command: "demo".into(),
-                args: args.into_iter().map(str::to_owned).collect(),
-                cwd: None,
-                env: env.into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
-            },
-        }
-    }
-
-    #[test]
-    fn redact_handles_bare_url_args_with_query_strings_and_userinfo() {
-        let cfg = stdio_config(
-            vec![
-                "https://alice:s3cr3tPass@example.com/sse?mode=fast&token=tok_xyz_99&api_key=k%2F123&tok%65n=sec%2Fret",
-                "--endpoint=https://bob:p%40ss@example.org/mcp?auth=bearer_val&api%5Fkey=v%40l",
-            ],
-            vec![],
-        );
-        let msg = "failed connecting to https://alice:s3cr3tPass@example.com/sse?mode=fast&token=tok_xyz_99&api_key=k%2F123&tok%65n=sec%2Fret and sec/ret bob p@ss bearer_val v%40l v@l";
-        let redacted = cfg.redact(msg.into());
-        for leaked in [
-            "alice",
-            "s3cr3tPass",
-            "tok_xyz_99",
-            "k%2F123",
-            "sec%2Fret",
-            "sec/ret",
-            "bob",
-            "p@ss",
-            "bearer_val",
-            "v%40l",
-            "v@l",
-        ] {
-            assert!(!redacted.contains(leaked), "leaked `{leaked}` in `{redacted}`");
-        }
-        assert!(redacted.contains("mode=fast"), "non-secret query param should stay visible: {redacted}");
-    }
-
-    #[test]
-    fn redact_is_single_pass_non_overlapping_and_never_corrupts_redacted_marker() {
-        let cfg = stdio_config(
-            vec!["--api-key", "Bearer super_secret_token", "--token=redacted"],
-            vec![("AUTH_TOKEN", "super_secret"), ("SHORT_KEY", "ed")],
-        );
-        let msg = "error: Bearer super_secret_token and super_secret and redacted";
-        let redacted = cfg.redact(msg.into());
-        assert!(!redacted.contains("super_secret"));
-        assert!(!redacted.contains("[[redacted]]"));
-        assert_eq!(redacted, "error: [redacted] and [redacted] and [redacted]");
-    }
-
-    #[test]
-    fn redact_http_config_covers_query_userinfo_and_secret_headers() {
-        let cfg = ServerConfig {
-            startup_timeout_sec: 30,
-            tool_timeout_sec: 120,
-            transport: McpTransportConfig::Http {
-                url: "https://u1:p1@mcp.example.com/v1?token=abc999".into(),
-                headers: BTreeMap::from([
-                    ("Authorization".into(), "Bearer hdr_secret_42".into()),
-                    ("X-Custom".into(), "public_val".into()),
-                ]),
-            },
-        };
-        let redacted = cfg.redact("err u1 p1 token=abc999 hdr_secret_42 public_val".into());
-        for leaked in ["u1", "p1", "abc999", "hdr_secret_42"] {
-            assert!(!redacted.contains(leaked), "leaked `{leaked}` in `{redacted}`");
-        }
-        assert!(redacted.contains("public_val"));
-    }
 }

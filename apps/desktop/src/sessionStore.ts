@@ -1,7 +1,7 @@
 import { reduceUnread, initialSyncState, acceptSessionStart, acceptSessionRead, resetBaseline, reduceStream, pruneStaleSelection, type SyncState } from './sync'
 import { loadPersisted, persistView, type PersistedView } from './viewPersistence'
-import { RpcFailure, RpcClient } from './rpcClient'
-import type { ConnectionStatus, SessionReadResult, StreamEnvelope, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
+import { RpcClient } from './rpcClient'
+import type { SessionReadResult, StreamEnvelope, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
 import { DraftStore, type DraftSnapshot } from './drafts'
 import { workspaceKey } from './workspace'
 
@@ -32,8 +32,7 @@ interface SessionLoadState {
 
 export interface FileTab {
   id: string; path: string; cwd: string; title: string
-  mode: 'file' | 'diff' | 'changes'
-  sessionId?: string
+  mode: 'file' | 'changes'
   focusPath?: string
   opened: number
 }
@@ -43,7 +42,6 @@ export interface QuestionDraft { itemId: string; index: number; answers: UserQue
 export interface AppState extends PersistedView, SyncState {
   drafts: DraftSnapshot | null
   questionDrafts: Readonly<Record<string, QuestionDraft>>
-  connection: ConnectionStatus
   bootstrapLoad: SessionLoadState
   sessionLoad: SessionLoadState
   unreadSessions: ReadonlySet<string>
@@ -63,8 +61,7 @@ export class SessionStore {
     ...initialSyncState(),
     drafts: null,
     questionDrafts: {},
-    connection: 'connecting',
-    bootstrapLoad: { status: 'idle', error: null },
+    bootstrapLoad: { status: 'loading', error: null },
     sessionLoad: { status: 'idle', error: null },
     unreadSessions: new Set(),
     pendingActions: new Set(),
@@ -78,9 +75,8 @@ export class SessionStore {
   private readonly listeners = new Set<() => void>()
   private notification: number | null = null
   private viewSave: ReturnType<typeof setTimeout> | null = null
-  readonly transport = new RpcClient(frame => this.onFrame(frame), connection => this.patch({ connection }))
+  readonly transport = new RpcClient(frame => this.onFrame(frame))
   protected readonly drafts = new DraftStore(drafts => this.patch({ drafts }))
-  private started = false
   private queuedFrames: StreamEnvelope[] = []
 
   private resyncing: Promise<void> | null = null
@@ -95,21 +91,9 @@ export class SessionStore {
   readonly getSnapshot = (): AppState => this.state
 
   start(): void {
-    if (this.started) return
-    this.started = true
     window.addEventListener('pagehide', this.flushView)
     void this.drafts.load()
     this.transport.start()
-  }
-
-  stop(): void {
-    if (!this.started) return
-    this.started = false
-    this.flushView()
-    window.removeEventListener('pagehide', this.flushView)
-    this.transport.stop()
-    if (this.notification !== null) cancelAnimationFrame(this.notification)
-    this.notification = null
   }
 
   protected isPending(method: string, origin: string): boolean {
@@ -156,7 +140,7 @@ export class SessionStore {
   }
 
   private syncFocus(sessionId: string | null): void {
-    if (this.state.connection !== 'ready') return
+    if (this.state.bootstrap === null) return
     void this.transport.rpc('session.focus', { sessionId }).catch(() => {})
   }
 
@@ -204,12 +188,7 @@ export class SessionStore {
   }
 
   private onFrame(frame: StreamEnvelope): void {
-    if (this.resyncing === null && this.latestRead == null && this.state.bootstrapLoad.status === 'error') {
-      if (frame.type === 'ready' || frame.type === 'app_changed' || frame.type === 'session_changed' || frame.type === 'session_settled' || frame.type === 'background_task_updated') {
-        this.applyFrame(frame)
-      }
-      return
-    }
+    if (this.state.bootstrapLoad.status === 'error') return
     if (this.resyncing !== null || this.latestRead != null
       || (frame.type !== 'ready' && this.state.bootstrap === null)) {
       this.queuedFrames.push(frame)
@@ -223,27 +202,14 @@ export class SessionStore {
       void this.resync()
       return
     }
-    const previousSelectedSessionId = this.state.selectedSessionId
-    const recoveredBootstrap = frame.type === 'app_changed'
-      && frame.revision > this.state.revision
-      && (this.state.bootstrapLoad.status === 'error' || this.state.bootstrap === null)
     if (frame.type === 'app_read_failed' && frame.revision > this.state.revision) {
       this.patch({ bootstrapLoad: { status: 'error', error: frame.error } })
-    } else if (recoveredBootstrap) {
-      this.patch({ bootstrapLoad: { status: 'idle', error: null } })
     }
-    const state = recoveredBootstrap
-      ? resetBaseline({ ...this.state, revision: Math.max(this.state.revision, frame.revision) }, frame.payload)
-      : reduceStream(this.state, frame)
+    const state = reduceStream(this.state, frame)
     this.applySync(state, (frame.type === 'background_task_updated' && frame.payload.task.state.status === 'running')
       || (frame.type === 'turn_event' && (
         frame.payload.method === 'item/textDelta'
         || frame.payload.method === 'tool/output')))
-    if (recoveredBootstrap) {
-      const { selectedSessionId } = this.state
-      if (selectedSessionId !== null) void this.readSession(selectedSessionId)
-      else if (previousSelectedSessionId === null) this.syncFocus(null)
-    }
     if ((frame.type === 'session_changed' || frame.type === 'session_settled')
       && this.state.session?.summary.threadId !== frame.sessionId
       && state.liveSessions[frame.sessionId]?.revision === frame.revision) {
@@ -315,7 +281,6 @@ export class SessionStore {
   }
 
   protected reportError(error: unknown, origin: string): void {
-    if (error instanceof RpcFailure && error.unavailable) return
     this.patch({
       actionErrors: { ...this.state.actionErrors, [origin]: this.toActionError(error) },
       actionErrorOrigin: origin,
@@ -333,33 +298,16 @@ export class SessionStore {
       if (accepted !== this.state) this.applySync(accepted)
       else void this.readSession(id)
     }
-    this.bumpSessionDiffTabs(id, result.history.summary.cwd)
   }
 
-  protected bumpSessionDiffTabs(sessionId: string, cwd: string): void {
-    const wsKey = workspaceKey(cwd)
-    const matches = (tab: FileTab) => (tab.mode === 'diff' && tab.sessionId === sessionId)
-      || (tab.mode === 'changes' && workspaceKey(tab.cwd) === wsKey)
-    if (!this.state.fileTabs.some(matches)) return
-    this.patch({
-      fileTabs: this.state.fileTabs.map(tab => matches(tab) ? { ...tab, opened: tab.opened + 1 } : tab),
-    })
-  }
-
-  protected closeSessionDiffTabs(sessionIds: ReadonlySet<string>): void {
-    const next = filterFileTabs(this.state.fileTabs, this.state.activeFileTab,
-      tab => tab.mode !== 'diff' || tab.sessionId === undefined || !sessionIds.has(tab.sessionId))
+  protected retainFileTabs(keep: (tab: FileTab) => boolean): void {
+    const next = filterFileTabs(this.state.fileTabs, this.state.activeFileTab, keep)
     if (next) this.patch(next)
   }
 
-  protected closeWorkspaceTabs(workspaceRoot: string, sessionIds: ReadonlySet<string>): void {
+  protected closeWorkspaceTabs(workspaceRoot: string): void {
     const wsKey = workspaceKey(workspaceRoot)
-    const next = filterFileTabs(this.state.fileTabs, this.state.activeFileTab, tab => {
-      if (tab.mode === 'changes') return workspaceKey(tab.cwd) !== wsKey
-      if (tab.mode === 'diff') return tab.sessionId === undefined || !sessionIds.has(tab.sessionId)
-      return true
-    })
-    if (next) this.patch(next)
+    this.retainFileTabs(tab => tab.mode !== 'changes' || workspaceKey(tab.cwd) !== wsKey)
   }
 
   protected applySync(state: SyncState, progress = false): void {
@@ -384,14 +332,10 @@ export class SessionStore {
         patch.selectedSessionId = pruned.selectedSessionId
         patch.sessionLoad = { status: 'idle', error: null }
       }
-      if (this.state.fileTabs.some(tab => tab.mode === 'diff' || tab.mode === 'changes')) {
-        const existingSessions = new Set(Object.values(bootstrap.sessionsByWorkspace).flat().map(item => item.threadId))
+      if (this.state.fileTabs.some(tab => tab.mode === 'changes')) {
         const existingWorkspaces = new Set(bootstrap.workspaces.map(item => workspaceKey(item.root)))
-        const retainedTabs = filterFileTabs(this.state.fileTabs, this.state.activeFileTab, tab => {
-          if (tab.mode === 'changes') return existingWorkspaces.has(workspaceKey(tab.cwd))
-          if (tab.mode === 'diff') return tab.sessionId === undefined || existingSessions.has(tab.sessionId)
-          return true
-        })
+        const retainedTabs = filterFileTabs(this.state.fileTabs, this.state.activeFileTab,
+          tab => tab.mode !== 'changes' || existingWorkspaces.has(workspaceKey(tab.cwd)))
         if (retainedTabs) Object.assign(patch, retainedTabs)
       }
     }

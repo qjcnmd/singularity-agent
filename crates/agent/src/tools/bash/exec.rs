@@ -8,9 +8,9 @@ use tokio::process::Command;
 use tokio::time::{Instant, Interval};
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::registry::{ABORTED_MESSAGE, ToolDisplay, ToolExecution};
+use crate::tools::registry::{ABORTED_MESSAGE, ToolExecution};
 
-use super::pump::{OutputChunk, OutputStreams};
+use super::pump::OutputStreams;
 use super::shell::bash_path;
 use super::spec::BashArgs;
 use crate::tools::output::CaptureState;
@@ -50,7 +50,6 @@ pub(super) struct Process {
     child: Box<dyn ChildWrapper>,
     output: OutputStreams,
     capture: CaptureState,
-    model_capture: CaptureState,
     progress: Interval,
     started: Instant,
     timeout: Option<(Instant, u64)>,
@@ -58,21 +57,14 @@ pub(super) struct Process {
 
 impl Process {
     pub(super) fn persist_output(&mut self) {
-        tokio::task::block_in_place(|| self.model_capture.persist());
+        tokio::task::block_in_place(|| self.capture.persist());
     }
 
-    fn ingest(&mut self, chunk: &OutputChunk) {
-        self.capture.ingest(&chunk.display);
-        let force_spill = self.capture.is_truncated() && !self.model_capture.has_spill();
-        if force_spill || self.model_capture.will_write_disk(&chunk.model) {
-            tokio::task::block_in_place(|| {
-                self.model_capture.ingest(&chunk.model);
-                if force_spill {
-                    self.model_capture.persist();
-                }
-            });
+    fn ingest(&mut self, chunk: &str) {
+        if self.capture.will_write_disk(chunk) {
+            tokio::task::block_in_place(|| self.capture.ingest(chunk));
         } else {
-            self.model_capture.ingest(&chunk.model);
+            self.capture.ingest(chunk);
         }
     }
 
@@ -116,8 +108,7 @@ impl Process {
         Ok(Self {
             child,
             output,
-            capture: CaptureState::new_in_memory(),
-            model_capture: CaptureState::new(output_directory.to_path_buf()),
+            capture: CaptureState::new(output_directory.to_path_buf()),
             progress,
             started,
             timeout,
@@ -146,7 +137,7 @@ impl Process {
                     None => {},
                 }
             }
-            if let Some(output) = self.capture.current_output(self.model_capture.spill_note().as_deref()) {
+            if let Some(output) = self.capture.current_output() {
                 return ProcessEvent::Progress {
                     display: output,
                     model: self.model_output(),
@@ -156,11 +147,11 @@ impl Process {
     }
 
     pub(super) fn display_output(&self) -> String {
-        self.capture.display_output(self.model_capture.spill_note().as_deref())
+        self.capture.display_output()
     }
 
     pub(super) fn model_output(&self) -> CommandOutputSnapshot {
-        self.model_capture.snapshot()
+        self.capture.snapshot()
     }
 
     pub(super) async fn finish(
@@ -198,19 +189,11 @@ impl Process {
             };
             outcome = Outcome::CleanupFailed(format!("{primary}{}", failures.join("; ")));
         }
-        let mut model_output = self.model_capture.snapshot();
+        let mut model_output = self.capture.snapshot();
         model_output.incomplete = truncated;
-        let (display_content, _) = self.capture.finish();
-        let (model_content, spill_note) = self.model_capture.finish();
-        let display = finished_output(display_content, spill_note.as_deref(), &outcome, truncated);
+        let (content, spill_note) = self.capture.finish();
         let mut execution =
-            ToolExecution::text(finished_output(model_content, spill_note.as_deref(), &outcome, truncated));
-        if display != execution.content {
-            execution.display = Some(Box::new(ToolDisplay {
-                output: display,
-                background_task_id: None,
-            }));
-        }
+            ToolExecution::text(finished_output(content, spill_note.as_deref(), &outcome, truncated));
         execution.is_error = !matches!(outcome, Outcome::Exited(0));
         execution.duration_ms = Some(app_core::duration_millis(self.started.elapsed()));
         (execution, outcome, model_output)

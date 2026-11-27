@@ -26,7 +26,6 @@ pub struct SessionData {
     pub(super) entries: Vec<SessionEntry>,
     pub(super) session_id: String,
     pub(super) header_timestamp: String,
-    pub(super) last_reply_definition_tokens: Option<(String, u64)>,
 }
 
 impl SessionManager {
@@ -36,24 +35,16 @@ impl SessionManager {
     pub fn create_with_id(
         cwd: &Path,
         sessions_dir: &Path,
-        session_id: &str,
+        session_id: uuid::Uuid,
         selection: protocol::ModelSelection,
         disabled_modules: Vec<String>,
     ) -> Result<Self> {
-        let invalid_id = || {
-            SessionError::InvalidHeader(format!(
-                "session id must be a canonical lowercase UUID: {session_id}"
-            ))
-        };
-        let parsed_id = uuid::Uuid::parse_str(session_id).map_err(|_| invalid_id())?;
-        if parsed_id.to_string() != session_id {
-            return Err(invalid_id());
-        }
+        let session_id = session_id.to_string();
         let cwd = app_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
-        let cwd_display = cwd.display().to_string();
+        let cwd_display = app_core::display_path(&cwd);
         std::fs::create_dir_all(sessions_dir)?;
-        let file = sessions_dir.join(super::session_file_name(session_id));
-        let header = SessionHeader::new(session_id.to_string(), cwd_display, now_iso());
+        let file = sessions_dir.join(super::session_file_name(&session_id));
+        let header = SessionHeader::new(session_id, cwd_display, now_iso());
         let mut header_bytes = serde_json::to_vec(&header)?;
         header_bytes.push(b'\n');
         let metadata = [SessionMetadata::ThreadSettings { selection }].into_iter().chain(
@@ -80,19 +71,17 @@ impl SessionManager {
         Ok(Self {
             data: SessionData {
                 file,
-                cwd: cwd.as_path().to_path_buf(),
+                cwd,
                 entries,
                 session_id: header.id,
                 header_timestamp: header.timestamp,
-                last_reply_definition_tokens: None,
             },
             append_error: None,
         })
     }
 
     pub fn open_existing(path: &Path, expected_id: &str) -> Result<Self> {
-        let (data, repair) = parse_session_file(path)?;
-        data.verify_session_id(expected_id)?;
+        let (data, repair) = parse_session_file(path, Some(expected_id))?;
         if let Some(offset) = repair {
             repair_tail(path, offset)?;
         }
@@ -134,8 +123,8 @@ impl SessionData {
         Ok(self.image_attachment(image_id)?.data_url()?)
     }
 
-    pub fn open(path: &Path) -> Result<Self> {
-        parse_session_file(path).map(|(data, _)| data)
+    pub fn open(path: &Path, expected_id: Option<&str>) -> Result<Self> {
+        parse_session_file(path, expected_id).map(|(data, _)| data)
     }
 }
 
@@ -144,19 +133,8 @@ pub fn scan_session_entries(
     expected_id: &str,
     visit: impl FnMut(SessionEntry),
 ) -> Result<(PathBuf, String)> {
-    let (header, cwd, _) = scan_session_file(path, visit)?;
-    verify_session_id(&header.id, expected_id)?;
+    let (header, cwd, _) = scan_session_file(path, Some(expected_id), visit)?;
     Ok((cwd, header.timestamp))
-}
-
-fn verify_session_id(actual: &str, expected: &str) -> Result<()> {
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(SessionError::InvalidHeader(format!(
-            "rollout header id {actual} does not match expected id {expected}"
-        )))
-    }
 }
 
 fn latest_settings(entries: &[SessionEntry]) -> Option<&protocol::ModelSelection> {
@@ -314,13 +292,8 @@ impl SessionManager {
 
         self.data.entries.truncate(cut_idx);
         self.data.entries.extend(preserved);
-        self.data.last_reply_definition_tokens = None;
         self.append_error = None;
         Ok(())
-    }
-
-    pub(crate) fn record_reply_definition_tokens(&mut self, entry_id: String, definition_tokens: u64) {
-        self.data.last_reply_definition_tokens = Some((entry_id, definition_tokens));
     }
 
     pub(crate) fn append_message_with_id(
@@ -367,10 +340,6 @@ impl SessionData {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
-    }
-
-    pub fn verify_session_id(&self, expected: &str) -> Result<()> {
-        verify_session_id(self.session_id(), expected)
     }
 
     pub fn created_at(&self) -> &str {

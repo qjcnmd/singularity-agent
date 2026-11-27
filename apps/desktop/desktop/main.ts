@@ -68,7 +68,6 @@ async function start(): Promise<void> {
   backend = new Backend(app.isPackaged ? join(process.resourcesPath, 'runtime', BACKEND_BINARY) : join(app.getAppPath(), 'desktop-runtime', BACKEND_BINARY))
   backend.on('failure', (error: Error) => {
     if (!window || window.isDestroyed()) return
-    window.webContents.send(IPC_CHANNELS.failure)
     void dialog.showMessageBox({ type: 'error', title: APP_NAME, message: '工作台后端已停止', detail: error.message, buttons: ['退出'] }).then(() => app.quit())
   })
   await backend.ready

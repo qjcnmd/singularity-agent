@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{ProviderError, configuration_error, validate_api_key, validate_base_url, validate_identifier};
+use super::{ProviderError, configuration_error, validate_identifier};
 use crate::ModelErrorKind;
 use crate::error::{
     apply_provider_error_body, bounded_provider_error_diagnostic, provider_error_kind_for_http_status,
@@ -34,14 +34,11 @@ fn discovery_client() -> Result<reqwest::Client, ProviderError> {
     Ok(CLIENT.get_or_init(|| client).clone())
 }
 
-pub async fn discover(
+pub(crate) async fn discover(
     base_url: &str,
     api_key: &str,
     protocol: protocol::ProviderApiProtocol,
 ) -> Result<Vec<String>, ProviderError> {
-    let base_url = crate::provider::canonical_base_url(base_url);
-    validate_base_url(base_url)?;
-    validate_api_key(api_key)?;
     let client = discovery_client()?;
     let request =
         apply_provider_auth(client.get(crate::provider::endpoint(base_url, "/models")), protocol, api_key)?;
@@ -75,24 +72,16 @@ fn discovery_transport_error(error: reqwest::Error) -> ProviderError {
 }
 
 fn read_listing(body: &Value) -> Result<Vec<String>, ProviderError> {
+    let Some(data) = body.get("data").and_then(Value::as_array) else {
+        return Err(ProviderError::new(ModelErrorKind::Other, "提供方未返回 data 模型列表。"));
+    };
     let mut models = BTreeSet::new();
-    let mut add_model = |id: &str, entry: &Value| {
-        if entry.is_object() && validate_identifier(id, "model id").is_ok() {
+    for entry in data {
+        if let Some(id) = entry.get("id").and_then(Value::as_str)
+            && validate_identifier(id, "model id").is_ok()
+        {
             models.insert(id.to_string());
         }
-    };
-    if let Some(data) = body.get("data").and_then(Value::as_array) {
-        for entry in data {
-            if let Some(id) = entry.get("id").and_then(Value::as_str) {
-                add_model(id, entry);
-            }
-        }
-    } else if let Some(directory) = body.get("models").and_then(Value::as_object) {
-        for (id, entry) in directory {
-            add_model(id, entry);
-        }
-    } else {
-        return Err(ProviderError::new(ModelErrorKind::Other, "提供方未返回 data 模型列表或 models 目录。"));
     }
     Ok(models.into_iter().collect())
 }

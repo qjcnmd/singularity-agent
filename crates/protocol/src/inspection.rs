@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ChangedFileStatus {
@@ -9,7 +9,7 @@ pub enum ChangedFileStatus {
     Deleted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ChangedFile {
@@ -17,19 +17,12 @@ pub struct ChangedFile {
     pub added: u32,
     pub deleted: u32,
     pub status: ChangedFileStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub diff: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct SessionChangedFilesResult {
-    pub files: Vec<ChangedFile>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionFileDiffResult {
@@ -65,13 +58,6 @@ pub struct SkillCatalog {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct DirectoryPickResult {
     pub path: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct InjectedContext {
-    pub modules: Vec<ContextModule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

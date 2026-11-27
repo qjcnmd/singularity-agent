@@ -1,7 +1,7 @@
 import { X } from 'lucide-react'
 import { useState, type FormEvent } from 'react'
 import type { ProviderApiProtocol, ProviderConfigurationInput } from '../protocol'
-import { capacityConfigurationError, formatCapacityInput, parseCapacity, reasoningConfigurationError, reasoningOptionsFor } from '../modelConfiguration'
+import { capacityConfigurationError, formatCapacityInput, parseCapacity, reasoningOptionsFor } from '../modelConfiguration'
 import { Dialog } from './Dialog'
 
 function ReasoningOptions({ options, selected, onChange }: {
@@ -50,8 +50,6 @@ export function ModelEditor({ index, initial, protocol, onConfirm, onClose }: Mo
     const output = parseCapacity(draft.outputText)
     const capacityError = capacityConfigurationError(context, output)
     if (capacityError !== null) return capacityError
-    const reasoningError = reasoningConfigurationError(draft, protocol)
-    if (reasoningError !== null) return reasoningError
     const { contextText, outputText, ...model } = draft
     const next: ModelInput = { ...model, maxContextTokens: context, maxOutputTokens: output }
     return onConfirm(next)

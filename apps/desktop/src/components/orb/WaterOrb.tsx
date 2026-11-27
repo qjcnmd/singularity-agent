@@ -15,22 +15,8 @@ const CALM_INTERVAL_MS = 1000 / 24
 const clamp01 = (value: number) => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0))
 
 function parseRgb(color: string): [number, number, number] {
-  const trimmed = color.trim()
-  if (trimmed.startsWith('#')) {
-    const hex = trimmed.slice(1)
-    if (hex.length === 3 || hex.length === 4) {
-      return [parseInt(hex[0] + hex[0], 16), parseInt(hex[1] + hex[1], 16), parseInt(hex[2] + hex[2], 16)]
-    }
-    if (hex.length >= 6) {
-      const value = parseInt(hex.slice(0, 6), 16)
-      if (!Number.isNaN(value)) return [(value >> 16) & 255, (value >> 8) & 255, value & 255]
-    }
-  }
-  const match = trimmed.match(/rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)/i)
-  if (match) {
-    return [Number(match[1]) || 0, Number(match[2]) || 0, Number(match[3]) || 0]
-  }
-  return [23, 131, 255]
+  const value = parseInt(color.slice(1, 7), 16)
+  return [(value >> 16) & 255, (value >> 8) & 255, value & 255]
 }
 
 function buildGlassShell(pixelSize: number): HTMLCanvasElement {

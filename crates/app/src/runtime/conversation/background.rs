@@ -66,14 +66,10 @@ impl Conversation {
 
     pub(crate) fn mark_closing(&self) {
         let _view = self.lock_view();
-        let mut state = self.lock_state();
-        state.closing = true;
-        if let Some(preview) = &state.context_preview {
-            preview.cancel();
-        }
+        self.lock_state().closing = true;
     }
 
-    pub(super) fn clear_closing(&self) {
+    pub(crate) fn clear_closing(&self) {
         let _view = self.lock_view();
         self.lock_state().closing = false;
     }

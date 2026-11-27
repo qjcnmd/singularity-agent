@@ -105,7 +105,6 @@ class AppStore extends SessionStore {
     const submitPending = this.isPending('session.submit', actionOrigin.session(state.selectedSessionId))
     let blockedReason: string | null = null
     if (state.selectedWorkspaceRoot === null) blockedReason = '请先选择项目'
-    else if (state.connection !== 'ready') blockedReason = '连接未就绪'
     else if (state.bootstrapLoad.status !== 'idle') blockedReason = state.bootstrapLoad.status === 'error' ? '项目读取失败' : '正在读取项目'
     else if (state.sessionLoad.status === 'loading' || (state.selectedSessionId !== null && state.session === null && state.sessionLoad.status !== 'error')) blockedReason = '正在读取任务'
     else if (state.selectedSessionId !== null && state.session === null) blockedReason = '任务读取失败'
@@ -180,7 +179,6 @@ class AppStore extends SessionStore {
   async deleteSession(sessionId: string): Promise<boolean> {
     return this.action('session.delete', actionOrigin.inline('session.delete', sessionId), async () => {
       await this.transport.rpc('session.delete', { sessionId })
-      this.closeSessionDiffTabs(new Set([sessionId]))
       this.clearSessionAnchors([sessionId])
       this.clearQuestionDrafts([sessionId])
       await this.drafts.remove([sessionId])
@@ -209,7 +207,10 @@ class AppStore extends SessionStore {
       const rewound = await this.transport.rpc('session.rewind', {
         sessionId,
         messageId: message.id,
-        resubmit: { text: nextText, images, files, annotations },
+        text: nextText,
+        images,
+        files,
+        annotations,
       })
       this.applyRewoundSession(rewound)
       if (this.state.selectedSessionId === sessionId) this.setViewportAnchor(defaultAnchor())
@@ -230,7 +231,7 @@ class AppStore extends SessionStore {
     const removedDrafts = sessions.map(session => session.threadId)
     return this.action('workspace.remove', actionOrigin.inline('workspace.remove', workspaceRoot), async () => {
       await this.transport.rpc('workspace.remove', { workspaceRoot })
-      this.closeWorkspaceTabs(workspaceRoot, new Set(removedDrafts))
+      this.closeWorkspaceTabs(workspaceRoot)
       this.clearSessionAnchors(removedDrafts)
       this.clearQuestionDrafts(removedDrafts)
       this.saveView({ sidebarView: {
@@ -377,22 +378,9 @@ class AppStore extends SessionStore {
   openFile(path: string, cwd: string, title = path.split(/[\\/]/).filter(Boolean).pop() ?? path): void {
     const resolved = resolveFileUrl(path, cwd, this.state.bootstrap?.userHome)
     if (!resolved) return
-    const id = resolved.file.href.toLowerCase()
+    const id = resolved.href.toLowerCase()
     if (this.state.settingsOpen) this.patch({ settingsOpen: false })
     this.upsertFileTab({ id, path, cwd, title, mode: 'file', opened: 0 })
-  }
-
-  openFileDiff(cwd: string, sessionId: string, path: string, title?: string): void {
-    const resolved = resolveFileUrl(path, cwd, this.state.bootstrap?.userHome)
-    if (!resolved) return
-    const rel = resolved.file.href.toLowerCase().startsWith(resolved.base.href.toLowerCase())
-      ? decodeURIComponent(resolved.file.href.slice(resolved.base.href.length))
-      : ''
-    const diffPath = rel || path.trim().replace(/\\/g, '/')
-    const tabTitle = title ?? (diffPath.split('/').filter(Boolean).pop() ?? diffPath)
-    const id = `diff:${sessionId}:${diffPath}`
-    if (this.state.settingsOpen) this.patch({ settingsOpen: false })
-    this.upsertFileTab({ id, path: diffPath, cwd, title: tabTitle, mode: 'diff', sessionId, opened: 0 })
   }
 
   openChangedFiles(cwd: string, focusPath?: string): void {
@@ -404,18 +392,14 @@ class AppStore extends SessionStore {
   private upsertFileTab(tab: FileTab): void {
     const fileTabs = this.state.fileTabs.some(item => item.id === tab.id)
       ? this.state.fileTabs.map(item => item.id === tab.id
-        ? { ...item, sessionId: tab.sessionId ?? item.sessionId, focusPath: tab.focusPath, opened: item.opened + 1 }
+        ? { ...item, focusPath: tab.focusPath, opened: item.opened + 1 }
         : item)
       : [...this.state.fileTabs, tab]
     this.patch({ fileTabs, activeFileTab: tab.id })
   }
 
   closeFile(id: string): void {
-    const index = this.state.fileTabs.findIndex(tab => tab.id === id)
-    if (index < 0) return
-    const fileTabs = this.state.fileTabs.filter(tab => tab.id !== id)
-    const activeFileTab = this.state.activeFileTab !== id ? this.state.activeFileTab : (fileTabs[index] ?? fileTabs[index - 1])?.id ?? null
-    this.patch({ fileTabs, activeFileTab })
+    this.retainFileTabs(tab => tab.id !== id)
   }
 
   selectFile(id: string): void {
@@ -450,7 +434,7 @@ export function useAppStore<K extends keyof AppState>(
   return useSyncExternalStore(appStore.subscribe, snapshot)
 }
 
-function resolveFileUrl(path: string, cwd: string, userHome?: string | null): { base: URL; file: URL } | null {
+function resolveFileUrl(path: string, cwd: string, userHome?: string | null): URL | null {
   let target = path.trim().replace(/\\/g, '/')
   if (target === '') return null
   if (target.startsWith('~/') && userHome) {
@@ -462,7 +446,7 @@ function resolveFileUrl(path: string, cwd: string, userHome?: string | null): { 
     const base = new URL(encodePath(directory.startsWith('//') ? `file:${directory}/` : `file:///${directory}/`))
     const targetHref = /^[a-z]:\//i.test(target) ? `file:///${target}`
       : target.startsWith('//') ? `file:${target}` : target
-    return { base, file: new URL(encodePath(targetHref), base) }
+    return new URL(encodePath(targetHref), base)
   } catch {
     return null
   }

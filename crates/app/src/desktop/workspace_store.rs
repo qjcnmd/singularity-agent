@@ -69,15 +69,16 @@ impl WorkspaceStore {
 
     pub(crate) fn add(&self, root: &Path) -> Result<Workspace, WorkspaceError> {
         let canonical = app_core::canonicalize_workspace(root).map_err(WorkspaceError::InvalidInput)?;
+        let display = app_core::display_path(&canonical);
         self.update(|registry| {
             if registry
                 .workspaces
                 .iter()
-                .any(|workspace| app_core::same_saved_path(&workspace.root, canonical.display()))
+                .any(|workspace| app_core::same_saved_path(&workspace.root, &display))
             {
                 return Err(WorkspaceError::InvalidInput("此项目已经添加。".into()));
             }
-            let workspace = Workspace { root: canonical.display().to_string() };
+            let workspace = Workspace { root: display };
             registry.workspaces.push(workspace.clone());
             Ok(workspace)
         })

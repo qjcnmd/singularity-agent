@@ -37,7 +37,7 @@ export const ContextPanel = memo(function ContextPanel() {
   }
   return <div className="context-panel" key={state.selectedSessionId}>
     <div className="capsules">
-      {context.modules.filter(module => module.enabled).map(module => <span key={module.id} className="capsule capsule-static is-on" title={module.detail}>
+      {context.filter(module => module.enabled).map(module => <span key={module.id} className="capsule capsule-static is-on" title={module.detail}>
         <CapsuleIcon /><span className="capsule-name">{module.label}</span><CapsuleTokens tokens={module.tokens} />
       </span>)}
     </div>

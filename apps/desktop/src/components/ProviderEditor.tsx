@@ -3,7 +3,7 @@ import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import { formatTokenCount } from '../copy'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import type { ProviderConfigurationInput, RedactedProvider } from '../protocol'
-import { apiBaseUrlError, blankModel, capacityConfigurationError, isConfigurationIdentifier, reasoningConfigurationError } from '../modelConfiguration'
+import { blankModel } from '../modelConfiguration'
 import { ModelEditor } from './ModelEditor'
 import { Dialog } from './Dialog'
 import { ProtocolPicker } from './ProtocolPicker'
@@ -40,7 +40,8 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
   }, [providerId, protocol, baseUrl, apiKey, active])
   const saveError = state.actionErrors[origin]
   const commitModel = (index: number | null, draft: ModelInput): string | null => {
-    if (invalidModelId(models, index, draft.modelId)) return '请输入有效且不重复的模型 ID。'
+    const id = draft.modelId.trim()
+    if (id === '' || models.some((model, at) => at !== index && model.modelId.trim() === id)) return '请输入有效且不重复的模型 ID。'
     setModels(rows => index === null ? [...rows, draft] : rows.map((row, at) => at === index ? draft : row))
     setModelEditor(null)
     return null
@@ -85,41 +86,16 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
     event.preventDefault()
     setFailure(null)
     appStore.clearError(origin)
-    if (!isConfigurationIdentifier(providerId.trim())) {
-      setFailure('请输入不含空白和控制字符的提供方 ID。')
-      return
-    }
-    if (!provider && state.bootstrap?.modelCatalog.providers.some(p => p.providerId === providerId.trim())) {
+    const trimmedId = providerId.trim()
+    if (!provider && state.bootstrap?.modelCatalog.providers.some(p => p.providerId === trimmedId)) {
       setFailure('该提供方 ID 已存在，请编辑已有提供方。')
       return
     }
-    const trimmedUrl = baseUrl.trim()
-    const urlError = apiBaseUrlError(trimmedUrl)
-    if (urlError !== null) {
-      setFailure(urlError)
-      return
-    }
-    const submitted: ModelInput[] = []
-    for (const [index, model] of models.entries()) {
-      const id = model.modelId.trim()
-      if (invalidModelId(models, index, id)) {
-        setFailure(`第 ${index + 1} 行模型 ID 为空、重复或包含无效字符。`)
-        return
-      }
-      const capacityError = capacityConfigurationError(model.maxContextTokens, model.maxOutputTokens)
-      if (capacityError !== null) {
-        setFailure(`模型 ${id}：${capacityError}`)
-        return
-      }
-      const normalized = { ...model, modelId: id }
-      const reasoningError = reasoningConfigurationError(normalized, protocol)
-      if (reasoningError !== null) {
-        setFailure(`模型 ${id}：${reasoningError}`)
-        return
-      }
-      submitted.push(normalized)
-    }
-    const result = await appStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl: trimmedUrl, apiProtocol: protocol, models: submitted }, apiKey.trim())
+    const submitted = models.map(model => ({ ...model, modelId: model.modelId.trim() }))
+    const result = await appStore.saveProvider(
+      { providerId: trimmedId, displayName: name.trim() || null, baseUrl: baseUrl.trim(), apiProtocol: protocol, models: submitted },
+      apiKey.trim(),
+    )
     if (result) {
       setApiKey('')
       onDone()
@@ -151,9 +127,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
               </div>
               {models.length === 0 && <p className="sg-model-empty">尚无模型。</p>}
               <div className="sg-model-list">
-                {models.map((model, index) => {
-                  const reasoningError = reasoningConfigurationError(model, protocol)
-                  return (
+                {models.map((model, index) => (
                   <div key={index}>
                     <div className="sg-model-row">
                       <span className="catalog-id">{model.modelId}</span>
@@ -161,10 +135,11 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
                       <button type="button" className="quiet-button" onClick={() => setModelEditor({ index, draft: model })}>编辑</button>
                       <button type="button" className="icon-button small danger" aria-label={`删除模型 ${model.modelId}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}><X size={14} /></button>
                     </div>
-                    {reasoningError && <p className="form-error" role="alert">{reasoningError}</p>}
+                    {protocol === 'responses' && model.reasoningVariants?.includes('on') && (
+                      <p className="form-error" role="alert">Responses 须选择具体思考档位，不支持 on 开关。</p>
+                    )}
                   </div>
-                  )
-                })}
+                ))}
               </div>
               <button type="button" className="sg-add-model-btn" onClick={() => setModelEditor({ index: null, draft: blankModel() })}><Plus size={14} />添加模型</button>
             </section>
@@ -203,9 +178,4 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
       </Dialog>
     </>
   )
-}
-
-function invalidModelId(models: ModelInput[], index: number | null, value: string): boolean {
-  const id = value.trim()
-  return !isConfigurationIdentifier(id) || models.some((model, at) => at !== index && model.modelId.trim() === id)
 }

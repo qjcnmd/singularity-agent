@@ -20,7 +20,6 @@ type ConnectionGuard = tokio::sync::OwnedMutexGuard<ConnectionState>;
 struct ConnectionState {
     connection: Option<Arc<Connection>>,
     catalog: Result<Vec<McpToolInfo>, String>,
-    tokens: u64,
 }
 
 impl ConnectionState {
@@ -28,7 +27,6 @@ impl ConnectionState {
         Arc::new(tokio::sync::Mutex::new(Self {
             connection: None,
             catalog: Ok(Vec::new()),
-            tokens: 0,
         }))
     }
 }
@@ -192,7 +190,6 @@ impl McpManager {
                         })
                         .collect();
                     let prompt = connection.instructions().map(|text| format!("MCP server {id}:\n{text}"));
-                    state.tokens = prompt.as_deref().map_or(0, app_core::estimate_tokens_of);
                     Ok(McpServerDiscovery {
                         id: id.clone(),
                         tools,
@@ -214,7 +211,6 @@ impl McpManager {
             let error = error.to_string();
             tracing::warn!(server_id = %id, error = %error, "MCP server discovery failed");
             let prompt = format!("Unavailable MCP server {id}:\n{error}");
-            state.tokens = app_core::estimate_tokens_of(&prompt);
             state.catalog = Err(error.clone());
             McpServerDiscovery {
                 id,
@@ -356,14 +352,12 @@ impl McpManager {
             status: McpConnectionStatus::NotConnected,
             error: None,
             tools: vec![],
-            tokens: 0,
         };
         let Some(cell) = cell else { return inspection };
         let Ok(state) = cell.try_lock() else {
             inspection.status = McpConnectionStatus::Connecting;
             return inspection;
         };
-        inspection.tokens = state.tokens;
         match (&state.catalog, &state.connection) {
             (Err(error), _) => {
                 inspection.status = McpConnectionStatus::Failed;

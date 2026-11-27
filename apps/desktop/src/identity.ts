@@ -12,5 +12,4 @@ export const IPC_CHANNELS = {
   theme: 'desktop:theme',
   connect: 'desktop:connect',
   frame: 'desktop:frame',
-  failure: 'desktop:failure',
 } as const

@@ -4,6 +4,7 @@ import { CodeTokens, useCodeTokens } from '../highlight'
 import { useSelectionGuard } from '../interactions'
 import type { ChangedFile } from '../protocol'
 import type { TurnFileEdit } from '../timeline'
+import { workspaceRelativePath } from '../workspace'
 import { CopyButton } from './CopyButton'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
@@ -86,39 +87,26 @@ interface SummarizedTurnFile {
 }
 
 function summarizeTurnFiles(edits: TurnFileEdit[], cwd: string): SummarizedTurnFile[] {
-  const root = cwd.replaceAll('\\', '/').replace(/\/+$/, '')
-  const rootLower = root.toLowerCase()
   const byKey = new Map<string, SummarizedTurnFile>()
   for (const edit of edits) {
-    let normalized = edit.path.replaceAll('\\', '/').trim()
-    while (normalized.startsWith('./')) normalized = normalized.slice(2)
-    let relPath = normalized
-    let inWorkspace = true
-    const isAbsolute = /^[a-z]:\//i.test(normalized) || normalized.startsWith('/')
-    if (isAbsolute) {
-      if (normalized.toLowerCase().startsWith(`${rootLower}/`)) {
-        relPath = normalized.slice(root.length + 1)
-      } else {
-        inWorkspace = false
-      }
-    } else if (normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) {
-      inWorkspace = false
-    }
-    const key = (inWorkspace ? relPath : normalized).toLowerCase()
+    const normalized = edit.path.replaceAll('\\', '/').trim()
+    const rel = workspaceRelativePath(edit.path, cwd)
+    const inWorkspace = rel !== null
+    const relPath = rel ?? normalized
+    const key = relPath.toLowerCase()
     const existing = byKey.get(key)
     if (existing) {
       existing.added += edit.added
       existing.deleted += edit.deleted
       continue
     }
-    const display = inWorkspace ? relPath : normalized
-    const slash = display.lastIndexOf('/')
+    const slash = relPath.lastIndexOf('/')
     byKey.set(key, {
       rawPath: edit.path,
       relPath,
       inWorkspace,
-      name: slash >= 0 ? display.slice(slash + 1) : display,
-      dir: slash >= 0 ? display.slice(0, slash) : '',
+      name: slash >= 0 ? relPath.slice(slash + 1) : relPath,
+      dir: slash >= 0 ? relPath.slice(0, slash) : '',
       added: edit.added,
       deleted: edit.deleted,
       status: edit.created ? 'added' : 'modified',

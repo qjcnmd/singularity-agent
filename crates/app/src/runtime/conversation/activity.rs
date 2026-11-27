@@ -15,7 +15,6 @@ impl Activity {
     }
     pub(super) fn apply(&mut self, event: &TurnEvent) {
         match event {
-            TurnEvent::TurnStarted { turn, .. } => self.turn_id = Some(turn.turn_id.clone()),
             TurnEvent::TextDelta { item_id, thinking, delta } => {
                 if let Some(HistoryItem::Message { text, .. } | HistoryItem::Thinking { text, .. }) =
                     self.items.iter_mut().find(|item| item.id() == item_id)

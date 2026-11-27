@@ -201,7 +201,7 @@ pub struct SessionReadResult {
     pub history: ThreadHistory,
     pub runtime: SessionRuntime,
     pub background_tasks: Vec<crate::VisibleBackgroundTask>,
-    pub context: Option<crate::InjectedContext>,
+    pub context: Option<Vec<crate::ContextModule>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

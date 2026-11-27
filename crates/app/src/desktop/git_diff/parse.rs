@@ -114,16 +114,16 @@ impl DiffSection {
 
 pub(super) fn commit_section(
     section: DiffSection,
-    prefix: &str,
     files: &mut BTreeMap<String, ChangedFile>,
     remaining_budget: &mut usize,
 ) {
     let Some(raw_path) = section.target_path() else {
         return;
     };
-    let Some(rel) = strip_prefix(&raw_path, prefix) else {
+    let rel = raw_path.replace('\\', "/");
+    if rel.is_empty() {
         return;
-    };
+    }
     let (status, added, deleted, formatted) = section.into_formatted(*remaining_budget > 0);
     let diff = match formatted {
         Some(text) if text.len() <= *remaining_budget => {
@@ -135,7 +135,7 @@ pub(super) fn commit_section(
     files.insert(rel.clone(), ChangedFile { path: rel, added, deleted, status, diff });
 }
 
-pub(super) fn parse_raw_numstat(out: &[u8], prefix: &str, files: &mut BTreeMap<String, ChangedFile>) {
+pub(super) fn parse_raw_numstat(out: &[u8], files: &mut BTreeMap<String, ChangedFile>) {
     let parse_count = |s: &str| s.parse::<u64>().ok().map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
     let mut parts = out.split(|&b| b == 0);
     while let Some(chunk) = parts.next() {
@@ -156,9 +156,10 @@ pub(super) fn parse_raw_numstat(out: &[u8], prefix: &str, files: &mut BTreeMap<S
                 let Some(path_bytes) = parts.next() else { break };
                 String::from_utf8_lossy(path_bytes).into_owned()
             };
-            let Some(rel) = strip_prefix(&raw_path, prefix) else {
+            let rel = raw_path.replace('\\', "/");
+            if rel.is_empty() {
                 continue;
-            };
+            }
             let status = match first_char {
                 b'A' => ChangedFileStatus::Added,
                 b'D' => ChangedFileStatus::Deleted,
@@ -189,7 +190,8 @@ pub(super) fn parse_raw_numstat(out: &[u8], prefix: &str, files: &mut BTreeMap<S
         } else {
             path_field.to_owned()
         };
-        if let Some(rel) = strip_prefix(&raw_path, prefix)
+        let rel = raw_path.replace('\\', "/");
+        if !rel.is_empty()
             && let Some(file) = files.get_mut(&rel)
         {
             file.added = parse_count(added);
@@ -331,103 +333,4 @@ fn unquote_git_path(raw: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-fn strip_prefix(path: &str, prefix: &str) -> Option<String> {
-    let normalized = path.replace('\\', "/");
-    if prefix.is_empty() {
-        return (!normalized.is_empty()).then_some(normalized);
-    }
-    if let Some(rest) = normalized.strip_prefix(prefix) {
-        return (!rest.is_empty()).then_some(rest.to_owned());
-    }
-    #[cfg(windows)]
-    if normalized.len() > prefix.len()
-        && normalized.is_char_boundary(prefix.len())
-        && normalized[..prefix.len()].eq_ignore_ascii_case(prefix)
-    {
-        return Some(normalized[prefix.len()..].to_owned());
-    }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_paths_with_spaces_embedded_delimiter_and_quotes() {
-        assert_eq!(
-            parse_diff_git_header("diff --git a/dir b/file name.txt b/dir b/file name.txt").as_deref(),
-            Some("dir b/file name.txt")
-        );
-        assert_eq!(
-            parse_diff_git_header("diff --git \"a/with \\\"quote\\\".txt\" \"b/with \\\"quote\\\".txt\"")
-                .as_deref(),
-            Some("with \"quote\".txt")
-        );
-    }
-
-    #[test]
-    fn commits_sections_with_derived_status_rename_binary_and_budget_cap() {
-        let mut files = BTreeMap::new();
-        let mut deleted = DiffSection::new("diff --git a/old.rs b/old.rs".to_owned());
-        for line in [
-            "deleted file mode 100644",
-            "--- a/old.rs",
-            "+++ /dev/null",
-            "@@ -1 +0,0 @@",
-            "-gone",
-        ] {
-            deleted.push_line(line, true);
-        }
-        let mut added = DiffSection::new("diff --git a/new name.rs b/new name.rs".to_owned());
-        for line in [
-            "new file mode 100644",
-            "--- /dev/null",
-            "+++ b/new name.rs",
-            "@@ -0,0 +1 @@",
-            "+fresh",
-        ] {
-            added.push_line(line, true);
-        }
-        let mut budget = 1024;
-        commit_section(deleted, "", &mut files, &mut budget);
-        commit_section(added, "", &mut files, &mut budget);
-        assert_eq!(files["old.rs"].status, ChangedFileStatus::Deleted);
-        assert_eq!((files["old.rs"].added, files["old.rs"].deleted), (0, 1));
-        assert_eq!(files["new name.rs"].status, ChangedFileStatus::Added);
-        assert!(files["new name.rs"].diff.as_deref().unwrap_or_default().contains("+fresh"));
-
-        let mut binary = DiffSection::new("diff --git a/logo.png b/logo.png".to_owned());
-        binary.push_line("Binary files a/logo.png and b/logo.png differ", true);
-        let mut zero_budget = 0;
-        commit_section(binary, "", &mut files, &mut zero_budget);
-        assert_eq!(files["logo.png"].diff, None);
-    }
-
-    #[test]
-    fn parses_raw_numstat_for_split_mv_rename_and_subdir_prefix() {
-        let raw = b":000000 100644 0000000 4dda334 A\0sub/new.txt\0\
-:100644 000000 84275f9 0000000 D\0sub/old.txt\0\
-:100644 100644 1111111 2222222 R090\0sub/a.rs\0sub/b.rs\0\
-5\t0\tsub/new.txt\0\
-0\t4\tsub/old.txt\0\
-2\t1\t\0sub/a.rs\0sub/b.rs\0";
-        let mut files = BTreeMap::new();
-        parse_raw_numstat(raw, "sub/", &mut files);
-        assert_eq!(files.len(), 3);
-        assert_eq!(
-            (files["new.txt"].status, files["new.txt"].added, files["new.txt"].deleted),
-            (ChangedFileStatus::Added, 5, 0)
-        );
-        assert_eq!(
-            (files["old.txt"].status, files["old.txt"].added, files["old.txt"].deleted),
-            (ChangedFileStatus::Deleted, 0, 4)
-        );
-        assert_eq!(
-            (files["b.rs"].status, files["b.rs"].added, files["b.rs"].deleted),
-            (ChangedFileStatus::Modified, 2, 1)
-        );
-    }
 }

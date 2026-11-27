@@ -6,7 +6,7 @@ import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '
 import type { PendingQuestion, UserQuestionAnswer } from '../protocol'
 
 export function QuestionPanel({ request, headerMeta }: { request: PendingQuestion; headerMeta?: ReactNode }) {
-  const state = useAppStore(['selectedSessionId', 'questionDrafts', 'pendingActions', 'actionErrors', 'connection'])
+  const state = useAppStore(['selectedSessionId', 'questionDrafts', 'pendingActions', 'actionErrors'])
   const reducedMotion = useReducedMotion()
   const sessionId = state.selectedSessionId!
   const saved = state.questionDrafts[sessionId]
@@ -20,7 +20,7 @@ export function QuestionPanel({ request, headerMeta }: { request: PendingQuestio
   const origin = actionOrigin.control(state.selectedSessionId, request.itemId)
   const submitting = state.pendingActions.has(pendingKey('session.answerQuestion', origin))
   const stopping = state.pendingActions.has(pendingKey('session.abort', actionOrigin.session(state.selectedSessionId)))
-  const disabled = submitting || stopping || state.connection !== 'ready'
+  const disabled = submitting || stopping
   const question = request.questions[index]
   const answer = answers[index]
   const answered = answer.selected.length > 0 || answer.text.trim().length > 0

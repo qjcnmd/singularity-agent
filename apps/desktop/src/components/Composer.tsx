@@ -16,7 +16,7 @@ export const Composer = memo(ComposerView)
 
 function ComposerView({ accent }: { accent: string }) {
   const reducedMotion = useReducedMotion()
-  const state = useAppStore(['drafts', 'pendingActions', 'bootstrap', 'bootstrapLoad', 'connection', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'liveSessions', 'sessionLoad'])
+  const state = useAppStore(['drafts', 'pendingActions', 'bootstrap', 'bootstrapLoad', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'liveSessions', 'sessionLoad'])
   const { text: draft, images: imageDraft, files: fileDraft, annotations: annotationDraft, disabledModules } = appStore.inputDraft()
   const sessionId = state.selectedSessionId
   const draftKey = appStore.draftKey()
@@ -27,7 +27,7 @@ function ComposerView({ accent }: { accent: string }) {
   const phase = selectedSessionPhase(state)
   const busy = phase === 'running' || phase === 'compacting' || phase === 'stopping'
   const [caret, setCaret] = useState(draft.length)
-  const skillsModule = state.session?.context?.modules.find(module => module.id === 'skills')
+  const skillsModule = state.session?.context?.find(module => module.id === 'skills')
   const skillsEnabled = sessionId === null ? !(disabledModules ?? []).includes('skills') : (skillsModule?.enabled ?? true)
   const trigger = pendingQuestion || !skillsEnabled ? null : inputTrigger(draft, caret)
   const skills = useSkillCandidates(trigger !== null, state)

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use protocol::{
     ModelConfigurationInput, ProviderConfigurationInput, RedactedModelCatalog, RedactedProvider,
@@ -67,32 +67,36 @@ impl ModelConfigManager {
         Ok(catalog_from_data(&data))
     }
 
-    pub fn discovery_credential(
-        &self,
+    pub async fn discover_models(
+        self: &Arc<Self>,
         provider_id: &str,
+        api_protocol: ProviderApiProtocol,
         base_url: &str,
         api_key: Option<&str>,
-    ) -> Result<String, ProviderError> {
-        let _access = self.lock();
+    ) -> Result<Vec<String>, ProviderError> {
         let normalized_url = crate::provider::canonical_base_url(base_url);
-        validate_base_url(normalized_url)?;
-        let key = match api_key {
-            Some(key) => key.to_string(),
-            None => match read_user_config_file(&self.directory)?
-                .and_then(|mut config| config.providers.remove(provider_id))
-                .filter(|provider| !provider.api_key.is_empty())
-            {
-                Some(existing) => {
-                    if !same_url_origin(&existing.base_url, normalized_url) {
-                        return Err(configuration_error("更改提供方 API 地址时，请重新填写 API 密钥。"));
-                    }
-                    existing.api_key
-                }
-                None => String::new(),
-            },
+        let target_url = validate_base_url(normalized_url)?;
+        let api_key = match api_key {
+            Some(key) => resolve_api_key(Some(key), None, &target_url, PROVIDER_ORIGIN_CHANGE_ERROR)?,
+            None => {
+                let manager = Arc::clone(self);
+                let provider_id = provider_id.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    let _access = manager.lock();
+                    let existing = read_user_config_file(&manager.directory)?
+                        .and_then(|mut config| config.providers.remove(&provider_id));
+                    resolve_api_key(
+                        None,
+                        existing.as_ref().map(|p| (p.base_url.as_str(), p.api_key.as_str())),
+                        &target_url,
+                        PROVIDER_ORIGIN_CHANGE_ERROR,
+                    )
+                })
+                .await
+                .expect("model credential lookup completes while the backend is running")?
+            }
         };
-        validate_api_key(&key)?;
-        Ok(key)
+        super::discovery::discover(normalized_url, &api_key, api_protocol).await
     }
 
     pub fn open(directory: PathBuf) -> Self {
@@ -116,25 +120,18 @@ impl ModelConfigManager {
         let _access = self.lock();
         validate_identifier(&input.provider_id, "提供方标识")?;
         let base_url = crate::provider::canonical_base_url(&input.base_url).to_string();
-        validate_base_url(&base_url)?;
+        let target_url = validate_base_url(&base_url)?;
         let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
         let models = model_definitions(input.models, input.api_protocol)?;
-        let key = match api_key {
-            Some(value) => value.to_string(),
-            None => {
-                match config.providers.get(&input.provider_id).filter(|provider| !provider.api_key.is_empty())
-                {
-                    Some(existing) => {
-                        if !same_url_origin(&existing.base_url, &base_url) {
-                            return Err(configuration_error("更改提供方 API 地址时，请重新填写 API 密钥。"));
-                        }
-                        existing.api_key.clone()
-                    }
-                    None => String::new(),
-                }
-            }
-        };
-        validate_api_key(&key)?;
+        let key = resolve_api_key(
+            api_key,
+            config
+                .providers
+                .get(&input.provider_id)
+                .map(|p| (p.base_url.as_str(), p.api_key.as_str())),
+            &target_url,
+            PROVIDER_ORIGIN_CHANGE_ERROR,
+        )?;
         config.providers.insert(
             input.provider_id,
             UserConfigProvider {
@@ -156,37 +153,15 @@ impl ModelConfigManager {
         api_key: Option<&str>,
     ) -> Result<RedactedModelCatalog, ProviderError> {
         let _access = self.lock();
-        let trimmed_url = base_url.trim();
-        let effective_url = if trimmed_url.is_empty() {
-            DEFAULT_WEB_SEARCH_BASE_URL
-        } else {
-            trimmed_url
-        };
-        let normalized_url = crate::provider::canonical_base_url(effective_url).to_string();
-        validate_base_url(&normalized_url)?;
+        let normalized_url = crate::provider::canonical_base_url(web_search_base_url(base_url)).to_string();
+        let target_url = validate_base_url(&normalized_url)?;
         let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
-        let key = match api_key {
-            Some(value) => value.to_string(),
-            None => match config.web_search.as_ref().filter(|web| !web.api_key.is_empty()) {
-                Some(existing) => {
-                    let prev_url = if existing.base_url.trim().is_empty() {
-                        DEFAULT_WEB_SEARCH_BASE_URL
-                    } else {
-                        existing.base_url.trim()
-                    };
-                    if !same_url_origin(prev_url, &normalized_url) {
-                        return Err(configuration_error(
-                            "更改联网搜索 API 地址时，请重新填写或清除 API 密钥。",
-                        ));
-                    }
-                    existing.api_key.clone()
-                }
-                None => String::new(),
-            },
-        };
-        if !key.is_empty() {
-            validate_api_key(&key)?;
-        }
+        let key = resolve_api_key(
+            api_key,
+            config.web_search.as_ref().map(|w| (web_search_base_url(&w.base_url), w.api_key.as_str())),
+            &target_url,
+            "更改联网搜索 API 地址时，请重新填写或清除 API 密钥。",
+        )?;
         config.web_search = Some(UserConfigWebSearch { base_url: normalized_url, api_key: key });
         write_user_config_file(&self.directory, &config)?;
         Ok(catalog_from_data(&config))
@@ -198,12 +173,7 @@ impl ModelConfigManager {
         if web.api_key.is_empty() || validate_api_key(&web.api_key).is_err() {
             return None;
         }
-        let raw_url = if web.base_url.trim().is_empty() {
-            DEFAULT_WEB_SEARCH_BASE_URL
-        } else {
-            web.base_url.trim()
-        };
-        let base_url = crate::provider::canonical_base_url(raw_url).to_string();
+        let base_url = crate::provider::canonical_base_url(web_search_base_url(&web.base_url)).to_string();
         validate_base_url(&base_url).ok()?;
         Some(WebSearchAccess::new(base_url, web.api_key))
     }
@@ -256,30 +226,47 @@ fn clear_invalid_default_selection(config: &mut UserConfigFile) {
     }
 }
 
-fn same_url_origin(left: &str, right: &str) -> bool {
-    let Ok(left) = reqwest::Url::parse(left) else {
-        return false;
+const PROVIDER_ORIGIN_CHANGE_ERROR: &str = "更改提供方 API 地址时，请重新填写 API 密钥。";
+
+fn resolve_api_key(
+    api_key: Option<&str>,
+    existing: Option<(&str, &str)>,
+    target_url: &reqwest::Url,
+    origin_change_error: &str,
+) -> Result<String, ProviderError> {
+    let key = match api_key {
+        Some(value) => value.to_string(),
+        None => match existing.filter(|(_, key)| !key.is_empty()) {
+            Some((existing_url, existing_key)) => {
+                if !same_url_origin(existing_url, target_url) {
+                    return Err(configuration_error(origin_change_error));
+                }
+                existing_key.to_string()
+            }
+            None => String::new(),
+        },
     };
-    let Ok(right) = reqwest::Url::parse(right) else {
-        return false;
-    };
-    left.origin() == right.origin()
+    validate_api_key(&key)?;
+    Ok(key)
+}
+
+fn web_search_base_url(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        DEFAULT_WEB_SEARCH_BASE_URL
+    } else {
+        trimmed
+    }
+}
+
+fn same_url_origin(existing_url: &str, target_url: &reqwest::Url) -> bool {
+    reqwest::Url::parse(existing_url).is_ok_and(|existing| existing.origin() == target_url.origin())
 }
 
 fn redacted_web_search(web: Option<&UserConfigWebSearch>) -> RedactedWebSearchConfig {
-    match web {
-        Some(web) => RedactedWebSearchConfig {
-            base_url: if web.base_url.trim().is_empty() {
-                DEFAULT_WEB_SEARCH_BASE_URL.to_string()
-            } else {
-                web.base_url.clone()
-            },
-            credential_configured: !web.api_key.is_empty(),
-        },
-        None => RedactedWebSearchConfig {
-            base_url: DEFAULT_WEB_SEARCH_BASE_URL.to_string(),
-            credential_configured: false,
-        },
+    RedactedWebSearchConfig {
+        base_url: web_search_base_url(web.map_or("", |w| w.base_url.as_str())).to_string(),
+        credential_configured: web.is_some_and(|w| !w.api_key.is_empty()),
     }
 }
 

@@ -4,11 +4,6 @@ use tokio::process::{ChildStderr, ChildStdout};
 
 const PIPE_BUFFER_BYTES: usize = 64 * 1024;
 
-pub(super) struct OutputChunk {
-    pub(super) display: String,
-    pub(super) model: String,
-}
-
 #[derive(Default)]
 struct PlainText(String);
 
@@ -41,7 +36,7 @@ impl OutputStreams {
         !self.stdout.closed || !self.stderr.closed
     }
 
-    pub(super) async fn next(&mut self) -> Option<io::Result<OutputChunk>> {
+    pub(super) async fn next(&mut self) -> Option<io::Result<String>> {
         loop {
             let chunk = tokio::select! {
                 chunk = self.stdout.next(), if !self.stdout.closed => chunk,
@@ -76,18 +71,18 @@ impl<R: AsyncRead + Unpin> OutputReader<R> {
         }
     }
 
-    async fn next(&mut self) -> Option<io::Result<OutputChunk>> {
+    async fn next(&mut self) -> Option<io::Result<String>> {
         while !self.closed {
             match self.reader.read(&mut self.buffer).await {
                 Ok(read) => {
                     self.closed = read == 0;
                     let text = self.decoder.decode(&self.buffer[..read], self.closed);
                     if !text.is_empty() {
-                        let mut model = PlainText::default();
-                        self.terminal.advance(&mut model, text.as_bytes());
-                        let mut display = String::new();
-                        push_visible(&mut display, &text);
-                        return Some(Ok(OutputChunk { display, model: model.0 }));
+                        let mut plain = PlainText::default();
+                        self.terminal.advance(&mut plain, text.as_bytes());
+                        if !plain.0.is_empty() {
+                            return Some(Ok(plain.0));
+                        }
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -145,11 +140,4 @@ impl Utf8Decoder {
         self.pending.drain(..consumed);
         output
     }
-}
-
-fn push_visible(output: &mut String, text: &str) {
-    output.extend(
-        text.chars()
-            .filter(|character| matches!(character, '\t' | '\n' | '\u{1b}') || !character.is_control()),
-    );
 }

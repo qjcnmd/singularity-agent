@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { RotateCw, X } from 'lucide-react'
 import { appStore, useAppStore, type AppState, type FileTab } from '../appStore'
 import type { ChangedFile, SessionFileDiffResult, TextDocument } from '../protocol'
@@ -8,29 +8,22 @@ import { workspaceKey } from '../workspace'
 import { EditDiff, FileChangeStats } from './EditDiff'
 import { ExpandChevron } from './ExpandChevron'
 
-type Loaded = { document?: TextDocument; diff?: SessionFileDiffResult; changes?: ChangedFile[]; error?: string }
-type CachedDiff = { token: string; diff?: SessionFileDiffResult; error?: string }
+type Loaded = { document?: TextDocument; changes?: ChangedFile[]; error?: string }
 
 const extension = (path: string) => /\.([\w-]+)$/.exec(path)?.[1]?.toLowerCase() ?? ''
 const isMarkdown = (path: string) => ['md', 'markdown'].includes(extension(path))
 
 function diffRefreshKey(state: Pick<AppState, 'bootstrap' | 'liveSessions' | 'session'>, tab: FileTab | null): string {
-  if (!tab) return ''
-  if (tab.mode === 'changes') {
-    const wsKey = workspaceKey(tab.cwd)
-    const sessions = state.bootstrap?.sessionsByWorkspace[wsKey] ?? []
-    const sessionKeys = sessions.map(item => {
-      const live = state.liveSessions[item.threadId]
-      const tasks = live?.backgroundTasks.map(task => `${task.taskId}:${task.state.status}`).join(',') ?? ''
-      return `${item.threadId}:${item.updatedAt}:${item.status ?? ''}:${live?.phase ?? ''}:${live?.summaryRevision ?? ''}:${tasks}`
-    }).join('|')
-    const current = state.session && workspaceKey(state.session.summary.cwd) === wsKey ? state.session : null
-    return `${sessionKeys}#${current?.summary.threadId ?? ''}:${current?.facts.length ?? ''}:${current?.facts.at(-1)?.status ?? ''}`
-  }
-  if (tab.mode !== 'diff' || !tab.sessionId) return ''
-  const live = state.liveSessions[tab.sessionId]
-  const current = state.session?.summary.threadId === tab.sessionId ? state.session : null
-  return `${live?.phase ?? ''}:${live?.summaryRevision ?? ''}:${current?.facts.length ?? ''}:${current?.facts.at(-1)?.status ?? ''}`
+  if (tab?.mode !== 'changes') return ''
+  const wsKey = workspaceKey(tab.cwd)
+  const sessions = state.bootstrap?.sessionsByWorkspace[wsKey] ?? []
+  const sessionKeys = sessions.map(item => {
+    const live = state.liveSessions[item.threadId]
+    const tasks = live?.backgroundTasks.map(task => `${task.taskId}:${task.state.status}`).join(',') ?? ''
+    return `${item.threadId}:${item.updatedAt}:${item.status ?? ''}:${live?.phase ?? ''}:${live?.summaryRevision ?? ''}:${tasks}`
+  }).join('|')
+  const current = state.session && workspaceKey(state.session.summary.cwd) === wsKey ? state.session : null
+  return `${sessionKeys}#${current?.summary.threadId ?? ''}:${current?.facts.length ?? ''}:${current?.facts.at(-1)?.status ?? ''}`
 }
 
 function splitPathSegments(path: string): string[] {
@@ -64,7 +57,6 @@ export function FilePanel() {
   const refreshKey = diffRefreshKey(state, active)
   const loaded = active ? documents[active.id] : undefined
   const shown = loaded?.document
-  const shownDiff = loaded?.diff
   const shownChanges = loaded?.changes
 
   useEffect(() => {
@@ -73,13 +65,8 @@ export function FilePanel() {
     const update = (patch: Loaded) => setDocuments(all => ({ ...all, [active.id]: { ...all[active.id], ...patch } }))
     if (active.mode === 'changes') {
       void appStore.transport.rpc('session.changedFiles', { workspaceRoot: active.cwd, includeDiffs: true }).then(
-        result => { if (current) update({ changes: result.files, error: undefined }) },
+        changes => { if (current) update({ changes, error: undefined }) },
         error => { if (current) update({ changes: undefined, error: error instanceof Error ? error.message : String(error) }) },
-      )
-    } else if (active.mode === 'diff' && active.sessionId) {
-      void appStore.transport.rpc('session.fileDiff', { sessionId: active.sessionId, path: active.path }).then(
-        diff => { if (current) update({ diff, error: undefined }) },
-        error => { if (current) update({ diff: undefined, error: error instanceof Error ? error.message : String(error) }) },
       )
     } else {
       void appStore.transport.rpc('file.read', { cwd: active.cwd, path: active.path }).then(
@@ -101,11 +88,10 @@ export function FilePanel() {
 
   if (!active) return null
   const isChanges = active.mode === 'changes'
-  const isDiff = active.mode === 'diff'
   const showSource = sources.has(active.id)
   const toggleSource = () => setSources(all => { const next = new Set(all); if (next.has(active.id)) next.delete(active.id); else next.add(active.id); return next })
-  const toolbarPath = isDiff ? shownDiff?.path ?? active.path : shown?.path ?? active.path
-  const ready = isChanges ? shownChanges : isDiff ? shownDiff : shown
+  const toolbarPath = shown?.path ?? active.path
+  const ready = isChanges ? shownChanges : shown
   const totalAdded = shownChanges?.reduce((sum, file) => sum + file.added, 0) ?? 0
   const totalDeleted = shownChanges?.reduce((sum, file) => sum + file.deleted, 0) ?? 0
   const retryActive = () => {
@@ -136,7 +122,7 @@ export function FilePanel() {
       ) : (
         <>
           <span className="file-path" title={toolbarPath}><bdi>{toolbarPath}</bdi></span>
-          {!isDiff && isMarkdown(active.path) && shown && <button type="button" className="quiet-button" onClick={toggleSource}>{showSource ? '预览' : '源码'}</button>}
+          {isMarkdown(active.path) && shown && <button type="button" className="quiet-button" onClick={toggleSource}>{showSource ? '预览' : '源码'}</button>}
         </>
       )}
     </div>
@@ -155,11 +141,9 @@ export function FilePanel() {
             focusNonce={active.opened}
           />
         )
-        : isDiff
-          ? shownDiff && <EditDiff path={shownDiff.path} output={shownDiff.output} />
-          : shown && (isMarkdown(active.path) && !showSource
-            ? <MarkdownDocumentView path={shown.path} content={shown.content} />
-            : <CodeView code={shown.content} language={extension(active.path)} />)}
+        : shown && (isMarkdown(active.path) && !showSource
+          ? <MarkdownDocumentView path={shown.path} content={shown.content} />
+          : <CodeView code={shown.content} language={extension(active.path)} />)}
     </div>
   </aside>
 }
@@ -172,7 +156,6 @@ function ChangedFilesView({ files, workspaceRoot, refreshToken, focusPath, focus
   focusNonce: number
 }) {
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set())
-  const [fallbackDiffs, setFallbackDiffs] = useState<Record<string, CachedDiff>>({})
   const rowRefs = useRef(new Map<string, HTMLElement>())
   const appliedFocus = useRef<string | null>(null)
 
@@ -181,10 +164,6 @@ function ChangedFilesView({ files, workspaceRoot, refreshToken, focusPath, focus
     setExpanded(all => {
       const next = new Set([...all].filter(path => valid.has(path)))
       return next.size === all.size ? all : next
-    })
-    setFallbackDiffs(all => {
-      const entries = Object.entries(all).filter(([path]) => valid.has(path))
-      return entries.length === Object.keys(all).length ? all : Object.fromEntries(entries)
     })
   }, [files])
 
@@ -206,10 +185,6 @@ function ChangedFilesView({ files, workspaceRoot, refreshToken, focusPath, focus
       rowRefs.current.get(matched.path)?.scrollIntoView({ block: 'start', behavior: 'smooth' })
     })
   }, [files, focusPath, focusNonce])
-
-  const cacheDiff = useCallback((path: string, entry: CachedDiff) => {
-    setFallbackDiffs(all => ({ ...all, [path]: entry }))
-  }, [])
 
   const toggle = (path: string) => setExpanded(all => {
     const next = new Set(all)
@@ -255,15 +230,7 @@ function ChangedFilesView({ files, workspaceRoot, refreshToken, focusPath, focus
             {isOpen && (
               file.diff !== undefined
                 ? <div className="changes-inline-diff"><EditDiff path={file.path} output={file.diff} bare /></div>
-                : (
-                  <LazyInlineFileDiff
-                    workspaceRoot={workspaceRoot}
-                    path={file.path}
-                    refreshToken={refreshToken}
-                    cached={fallbackDiffs[file.path]}
-                    onLoaded={cacheDiff}
-                  />
-                )
+                : <LazyInlineFileDiff workspaceRoot={workspaceRoot} path={file.path} refreshToken={refreshToken} />
             )}
           </section>
         )
@@ -272,59 +239,36 @@ function ChangedFilesView({ files, workspaceRoot, refreshToken, focusPath, focus
   )
 }
 
-function LazyInlineFileDiff({ workspaceRoot, path, refreshToken, cached, onLoaded }: {
+function LazyInlineFileDiff({ workspaceRoot, path, refreshToken }: {
   workspaceRoot: string
   path: string
   refreshToken: string
-  cached?: CachedDiff
-  onLoaded: (path: string, entry: CachedDiff) => void
 }) {
   const [retry, setRetry] = useState(0)
-  const [showPending, setShowPending] = useState(false)
-  const current = cached?.token === refreshToken
-  const hasCurrentOutcome = current && (cached?.diff !== undefined || cached?.error !== undefined)
-  const loading = !hasCurrentOutcome
+  const [state, setState] = useState<{ diff?: SessionFileDiffResult; error?: string }>({})
 
   useEffect(() => {
-    if (hasCurrentOutcome) return
     let active = true
+    setState(previous => previous.error ? { diff: previous.diff } : previous)
     void appStore.transport.rpc('session.fileDiff', { workspaceRoot, path }).then(
-      diff => { if (active) onLoaded(path, { token: refreshToken, diff }) },
-      error => {
-        if (active) onLoaded(path, { token: refreshToken, error: error instanceof Error ? error.message : String(error) })
-      },
+      diff => { if (active) setState({ diff }) },
+      error => { if (active) setState({ error: error instanceof Error ? error.message : String(error) }) },
     )
     return () => { active = false }
-  }, [workspaceRoot, path, refreshToken, retry, hasCurrentOutcome, onLoaded])
-
-  useEffect(() => {
-    if (!loading || cached?.diff) {
-      setShowPending(false)
-      return
-    }
-    const timer = window.setTimeout(() => setShowPending(true), 150)
-    return () => window.clearTimeout(timer)
-  }, [loading, cached?.diff])
+  }, [workspaceRoot, path, refreshToken, retry])
 
   return (
     <div className="changes-inline-diff">
-      {!cached?.diff && !cached?.error && showPending && <p className="changes-inline-status" role="status">读取差异中…</p>}
-      {cached?.error && (
+      {!state.diff && !state.error && <p className="changes-inline-status" role="status">读取差异中…</p>}
+      {state.error && (
         <p className="changes-inline-status form-error" role="alert">
-          {cached.error}
-          <button
-            type="button"
-            className="quiet-button"
-            onClick={() => {
-              onLoaded(path, { token: '' })
-              setRetry(value => value + 1)
-            }}
-          >
+          {state.error}
+          <button type="button" className="quiet-button" onClick={() => setRetry(value => value + 1)}>
             重试
           </button>
         </p>
       )}
-      {cached?.diff && <EditDiff path={cached.diff.path} output={cached.diff.output} bare />}
+      {state.diff && <EditDiff path={state.diff.path} output={state.diff.output} bare />}
     </div>
   )
 }
@@ -333,7 +277,7 @@ function TabButton({ tab, selected, changesCwds }: { tab: FileTab; selected: boo
   const label = tab.mode === 'changes' && changesCwds.length > 1
     ? `${tab.title} · ${disambiguateWorkspaceLabel(tab.cwd, changesCwds)}`
     : tab.title
-  const title = tab.mode === 'changes' ? `${tab.cwd} · 工作区改动文件` : tab.mode === 'diff' ? `${tab.path}（差异）` : tab.path
+  const title = tab.mode === 'changes' ? `${tab.cwd} · 工作区改动文件` : tab.path
   return <div className="file-tab" data-selected={selected}>
     <button type="button" role="tab" aria-selected={selected} title={title} onClick={() => appStore.selectFile(tab.id)}
       onAuxClick={event => { if (event.button === 1) appStore.closeFile(tab.id) }}>{label}</button>

@@ -4,6 +4,7 @@ import { appStore, useAppStore } from '../appStore'
 import { factStatusText } from '../copy'
 import { useSelectionGuard } from '../interactions'
 import { formatTurnDuration, toolDisplay } from '../timeline'
+import { workspaceRelativePath } from '../workspace'
 import type { HistoryItem, ReadSource, ToolStatus, UserQuestion, UserQuestionAnswer, VisibleBackgroundTask } from '../protocol'
 import { CommandOutput } from './CommandOutput'
 import { Disclosure } from './Disclosure'
@@ -135,7 +136,7 @@ export function ToolCard({ item, itemKey, cwd, userHome, sessionId, onDisclosure
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
         {shown.result?.durationMs !== undefined && <div className="tool-duration">耗时 {formatTurnDuration(shown.result.durationMs)}</div>}
-        <div className="timeline-body activity-output"><ToolOutput item={shown} spec={spec} filePath={filePath} command={item.name === 'bash' ? argument : null} cwd={cwd} sessionId={sessionId} />{sessionId && item.result?.images && <AttachedImages sessionId={sessionId} images={item.result.images} />}</div>
+        <div className="timeline-body activity-output"><ToolOutput item={shown} spec={spec} filePath={filePath} command={item.name === 'bash' ? argument : null} cwd={cwd} />{sessionId && item.result?.images && <AttachedImages sessionId={sessionId} images={item.result.images} />}</div>
       </div></Disclosure>
     </article>
   )
@@ -163,8 +164,8 @@ function QuestionAnswers({ questions, output }: { questions?: UserQuestion[]; ou
   </div>
 }
 
-function ToolOutput({ item: fact, spec, filePath, command, cwd, sessionId }: {
-  item: ToolItem; spec: ToolPresentation | undefined; filePath: string | null; command: string | null; cwd: string; sessionId?: string
+function ToolOutput({ item: fact, spec, filePath, command, cwd }: {
+  item: ToolItem; spec: ToolPresentation | undefined; filePath: string | null; command: string | null; cwd: string
 }) {
   const input = fact.args
   const background = spec?.background === true
@@ -180,7 +181,11 @@ function ToolOutput({ item: fact, spec, filePath, command, cwd, sessionId }: {
   }
   if (command !== null) return <CommandOutput command={command} output={output} />
   if (spec?.diffOutput && filePath !== null && fact.status === 'completed') {
-    return <EditDiff path={filePath} output={output} onOpenFile={sessionId ? () => appStore.openFileDiff(cwd, sessionId, filePath) : undefined} />
+    const relPath = workspaceRelativePath(filePath, cwd)
+    return <EditDiff path={filePath} output={output} onOpenFile={() => {
+      if (relPath !== null) appStore.openChangedFiles(cwd, relPath)
+      else appStore.openFile(filePath, cwd)
+    }} />
   }
   const readSource = fact.result?.readSource
   if (filePath !== null && (output !== '' || (readSource !== undefined && readSource.lineCount > 0)) && fact.status !== 'failed') return <div>

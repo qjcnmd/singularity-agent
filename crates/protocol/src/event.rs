@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::params::Turn;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -17,9 +15,9 @@ pub struct TurnErrorDetail {
 #[serde(tag = "method", content = "params", rename_all_fields = "camelCase")]
 pub enum TurnEvent {
     #[serde(rename = "context/loaded")]
-    ContextLoaded { context: crate::InjectedContext },
+    ContextLoaded { context: Vec<crate::ContextModule> },
     #[serde(rename = "turn/started")]
-    TurnStarted { turn: Turn, started_at: String },
+    TurnStarted { started_at: String },
     #[serde(rename = "item/updated")]
     ItemUpdated { item: crate::HistoryItem },
     #[serde(rename = "item/textDelta")]
@@ -44,7 +42,7 @@ pub enum TurnEvent {
     },
     #[serde(rename = "turn/completed")]
     TurnCompleted {
-        turn: Turn,
+        status: crate::TurnStatus,
         manually_stopped: bool,
         finished_at: String,
         #[serde(skip_serializing_if = "Option::is_none")]

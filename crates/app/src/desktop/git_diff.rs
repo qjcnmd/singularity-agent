@@ -1,8 +1,8 @@
 mod parse;
 
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, BufReader, ErrorKind, Read};
-use std::path::{Component, Path, PathBuf};
+use std::io::{self, BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 
@@ -30,6 +30,7 @@ const DIFF_COMMON_ARGS: &[&str] = &[
     "-c",
     "diff.relative=false",
     "diff",
+    "--relative",
 ];
 const DIFF_PATCH_ARGS: &[&str] = &["--no-color", "-U3", "--no-textconv", "--no-ext-diff"];
 const DIFF_SUMMARY_ARGS: &[&str] = &["--raw", "--numstat", "-z"];
@@ -52,22 +53,23 @@ enum DiffAttempt<T> {
 }
 
 pub(crate) fn changed_files(cwd: &Path, include_diffs: bool) -> io::Result<Vec<ChangedFile>> {
-    let Some((git, prefix)) = repo_prefix(cwd) else {
+    let Some(git) = git_binary() else {
+        return Ok(Vec::new());
+    };
+    let Some(untracked_out) = ls_untracked(git, cwd, ".")? else {
         return Ok(Vec::new());
     };
     let mut files = BTreeMap::<String, ChangedFile>::new();
     let mut remaining_budget = if include_diffs { MAX_BATCH_DIFF_BYTES } else { 0 };
 
     if include_diffs {
-        apply_batch_diffs(git, cwd, &prefix, &mut files, &mut remaining_budget)?;
+        apply_batch_diffs(git, cwd, &mut files, &mut remaining_budget)?;
     } else if let Some(raw_numstat) =
         run_git_diff_with_empty_tree_fallback(git, cwd, DIFF_SUMMARY_ARGS, &["--", "."])?
     {
-        parse_raw_numstat(&raw_numstat, &prefix, &mut files);
+        parse_raw_numstat(&raw_numstat, &mut files);
     }
 
-    let ls_args: Vec<&str> = LS_UNTRACKED_ARGS.iter().copied().chain(["--", "."]).collect();
-    let untracked_out = run_git_ok(git, cwd, &ls_args)?;
     for raw in untracked_out.split(|&b| b == 0) {
         if raw.is_empty() {
             continue;
@@ -107,20 +109,19 @@ pub(crate) fn changed_files(cwd: &Path, include_diffs: bool) -> io::Result<Vec<C
 }
 
 pub(crate) fn file_diff(cwd: &Path, rel_path: &str) -> io::Result<String> {
-    let rel = validate_relative_path(rel_path)?;
     let Some(git) = git_binary() else {
         return Ok("当前目录不是 Git 仓库。".to_owned());
     };
-    match single_file_diff(git, cwd, &rel)? {
+    match single_file_diff(git, cwd, rel_path)? {
         SingleDiff::NotGitRepo => return Ok("当前目录不是 Git 仓库。".to_owned()),
         SingleDiff::Output(text) => return Ok(text),
         SingleDiff::Empty => {}
     }
     #[cfg(windows)]
     if let Ok(listed) = changed_files(cwd, false) {
-        let target = rel.to_lowercase();
+        let target = rel_path.to_lowercase();
         if let Some(matched) = listed.into_iter().find(|f| f.path.to_lowercase() == target)
-            && matched.path != rel
+            && matched.path != rel_path
             && let SingleDiff::Output(text) = single_file_diff(git, cwd, &matched.path)?
         {
             return Ok(text);
@@ -136,14 +137,15 @@ enum SingleDiff {
 }
 
 fn single_file_diff(git: &Path, cwd: &Path, rel: &str) -> io::Result<SingleDiff> {
+    let Some(untracked) = ls_untracked(git, cwd, rel)? else {
+        return Ok(SingleDiff::NotGitRepo);
+    };
     let Some(out) = run_git_diff_with_empty_tree_fallback(git, cwd, DIFF_PATCH_ARGS, &["--", rel])? else {
         return Ok(SingleDiff::NotGitRepo);
     };
     if !out.is_empty() {
         return Ok(SingleDiff::Output(format_git_diff(&String::from_utf8_lossy(&out))));
     }
-    let ls_args: Vec<&str> = LS_UNTRACKED_ARGS.iter().copied().chain(["--", rel]).collect();
-    let untracked = run_git_ok(git, cwd, &ls_args)?;
     if !untracked.is_empty() {
         return match read_regular_bounded(&cwd.join(rel), MAX_UNTRACKED_BYTES)? {
             Some((bytes, truncated)) => Ok(SingleDiff::Output(format_untracked_bytes(&bytes, truncated))),
@@ -166,21 +168,6 @@ fn contains_path(files: &BTreeMap<String, ChangedFile>, rel: &str) -> bool {
     {
         false
     }
-}
-
-fn repo_prefix(cwd: &Path) -> Option<(&'static Path, String)> {
-    let git = git_binary()?;
-    let out = run_git(git, cwd, &["rev-parse", "--is-inside-work-tree", "--show-prefix"]).ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut lines = text.lines();
-    if lines.next()?.trim() != "true" {
-        return None;
-    }
-    let prefix = lines.next().unwrap_or("").trim_end_matches('\r').replace('\\', "/");
-    Some((git, prefix))
 }
 
 fn empty_tree_oid(git: &Path, cwd: &Path) -> &'static str {
@@ -260,13 +247,17 @@ fn run_git(git: &Path, cwd: &Path, args: &[&str]) -> io::Result<Output> {
     git_command(git, cwd, args).output()
 }
 
-fn run_git_ok(git: &Path, cwd: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
-    let out = run_git(git, cwd, args)?;
+fn ls_untracked(git: &Path, cwd: &Path, target: &str) -> io::Result<Option<Vec<u8>>> {
+    let args: Vec<&str> = LS_UNTRACKED_ARGS.iter().copied().chain(["--", target]).collect();
+    let out = run_git(git, cwd, &args)?;
     if out.status.success() {
-        return Ok(out.stdout);
+        return Ok(Some(out.stdout));
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    Err(io::Error::other(format!("git {:?} 失败：{}", args.first().unwrap_or(&""), stderr.trim())))
+    match classify_diff_stderr(&stderr) {
+        Some(DiffAttempt::NotGitRepo) => Ok(None),
+        _ => Err(io::Error::other(format!("git ls-files 失败：{}", stderr.trim()))),
+    }
 }
 
 fn classify_diff_stderr(stderr: &str) -> Option<DiffAttempt<()>> {
@@ -319,15 +310,14 @@ fn run_git_diff_with_empty_tree_fallback(
 fn apply_batch_diffs(
     git: &Path,
     cwd: &Path,
-    prefix: &str,
     files: &mut BTreeMap<String, ChangedFile>,
     remaining_budget: &mut usize,
 ) -> io::Result<()> {
-    match stream_batch_diffs(git, cwd, "HEAD", prefix, files, remaining_budget)? {
+    match stream_batch_diffs(git, cwd, "HEAD", files, remaining_budget)? {
         DiffAttempt::Ok(()) | DiffAttempt::NotGitRepo => Ok(()),
         DiffAttempt::UnbornHead => {
             let empty = empty_tree_oid(git, cwd);
-            let _ = stream_batch_diffs(git, cwd, empty, prefix, files, remaining_budget)?;
+            let _ = stream_batch_diffs(git, cwd, empty, files, remaining_budget)?;
             Ok(())
         }
     }
@@ -337,7 +327,6 @@ fn stream_batch_diffs(
     git: &Path,
     cwd: &Path,
     base: &str,
-    prefix: &str,
     files: &mut BTreeMap<String, ChangedFile>,
     remaining_budget: &mut usize,
 ) -> io::Result<DiffAttempt<()>> {
@@ -368,7 +357,7 @@ fn stream_batch_diffs(
             match reader.read_until(b'\n', &mut raw_line) {
                 Ok(0) => {
                     if let Some(section) = current.take() {
-                        commit_section(section, prefix, files, remaining_budget);
+                        commit_section(section, files, remaining_budget);
                     }
                     break Ok(());
                 }
@@ -379,7 +368,7 @@ fn stream_batch_diffs(
                     let line = String::from_utf8_lossy(&raw_line);
                     if line.starts_with("diff --git ") {
                         if let Some(section) = current.take() {
-                            commit_section(section, prefix, files, remaining_budget);
+                            commit_section(section, files, remaining_budget);
                         }
                         current = Some(DiffSection::new(line.into_owned()));
                     } else if let Some(section) = current.as_mut() {
@@ -418,19 +407,4 @@ fn read_regular_bounded(path: &Path, limit: usize) -> io::Result<Option<(Vec<u8>
         buf.truncate(limit);
     }
     Ok(Some((buf, truncated)))
-}
-
-fn validate_relative_path(rel_path: &str) -> io::Result<String> {
-    let normalized = rel_path.replace('\\', "/");
-    let parts = Path::new(&normalized)
-        .components()
-        .map(|c| match c {
-            Component::Normal(p) => Ok(p.to_string_lossy().into_owned()),
-            _ => Err(io::Error::new(ErrorKind::InvalidInput, format!("invalid relative path: {rel_path}"))),
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    if parts.is_empty() {
-        return Err(io::Error::new(ErrorKind::InvalidInput, "relative path is empty"));
-    }
-    Ok(parts.join("/"))
 }

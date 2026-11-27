@@ -111,7 +111,7 @@ pub(super) fn message_with_captions_tokens(
     tokens
 }
 
-pub(super) fn entry_token_estimate_for(
+fn entry_token_estimate_for(
     entry: &SessionEntry,
     session: &SessionData,
     target: Option<(&str, &str)>,
@@ -170,25 +170,6 @@ fn text_block_token_estimate(text: &str) -> u64 {
     estimate_tokens_of(text).saturating_add(CONTENT_BLOCK_OVERHEAD_TOKENS)
 }
 
-pub(crate) fn last_routed_model(session: &SessionData) -> Option<protocol::ModelSelection> {
-    session.entries().iter().rev().find_map(|entry| match entry {
-        SessionEntry::Message {
-            message: Message::Assistant { provider_metadata, .. },
-            observation: Some(observation),
-            ..
-        } if observation.status == protocol::ProviderAttemptStatus::Ok
-            && observation.purpose == protocol::RequestPurpose::Generation =>
-        {
-            Some(protocol::ModelSelection {
-                provider: observation.provider.clone(),
-                model: observation.model.clone(),
-                reasoning: provider_metadata.as_ref().and_then(|meta| meta.reasoning.clone()),
-            })
-        }
-        _ => None,
-    })
-}
-
 pub(super) fn latest_reply_usage<'a>(
     session: &'a SessionData,
     entries: &[&SessionEntry],
@@ -204,26 +185,13 @@ pub(super) fn latest_reply_usage<'a>(
         return None;
     };
     let usage = obs.usage.as_ref()?;
+    if usage.input_tokens <= definition_tokens {
+        return None;
+    }
     let reply_pos = entries.iter().position(|e| e.id() == id).expect("latest assistant in active context");
     let id_pair = (obs.provider.as_str(), obs.model.as_str());
     let tail = context_token_estimate_for(&entries[reply_pos + 1..], session, Some(id_pair));
-    let calibrated = match session.last_reply_definition_tokens.as_ref() {
-        Some((recorded_id, prev_def)) if recorded_id == id => {
-            let adjusted = if definition_tokens >= *prev_def {
-                usage.total_tokens.saturating_add(definition_tokens - *prev_def)
-            } else {
-                usage.total_tokens.saturating_sub(*prev_def - definition_tokens).max(definition_tokens)
-            };
-            adjusted.saturating_add(tail)
-        }
-        _ => {
-            let est_prev_input = context_token_estimate_for(&entries[..reply_pos], session, Some(id_pair))
-                .saturating_add(definition_tokens);
-            let def_growth = est_prev_input.saturating_sub(usage.input_tokens);
-            usage.total_tokens.saturating_add(def_growth).saturating_add(tail)
-        }
-    };
-    Some((id_pair.0, id_pair.1, calibrated))
+    Some((id_pair.0, id_pair.1, usage.total_tokens.saturating_add(tail)))
 }
 
 pub(crate) fn input_tokens(
@@ -238,15 +206,6 @@ pub(crate) fn input_tokens(
         return total;
     }
     context_token_estimate_for(entries, session, Some(identity)).saturating_add(definition_tokens)
-}
-
-pub(crate) fn estimated_input_tokens(
-    session: &SessionData,
-    identity: (&str, &str),
-    definition_tokens: u64,
-) -> u64 {
-    let entries = resolve_context_entries(session);
-    input_tokens(session, &entries, identity, definition_tokens)
 }
 
 pub(crate) fn prepare_context(

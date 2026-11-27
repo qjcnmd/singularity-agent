@@ -41,10 +41,9 @@ export function loadPersisted(): PersistedView {
     viewportAnchors: {},
   }
   try {
-    const stored = JSON.parse(localStorage.getItem(VIEW_STORAGE_KEY) ?? 'null') as (Partial<PersistedView> & { assistantBubble?: string }) | null
+    const stored = JSON.parse(localStorage.getItem(VIEW_STORAGE_KEY) ?? 'null') as Partial<PersistedView> | null
     if (!stored) return fallback
-    const accentColor = resolveAccentId(stored.accentColor ?? stored.assistantBubble)
-    return { ...fallback, ...stored, accentColor }
+    return { ...fallback, ...stored, accentColor: resolveAccentId(stored.accentColor) }
   } catch {
     return fallback
   }

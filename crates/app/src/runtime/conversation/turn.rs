@@ -4,7 +4,7 @@ use agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, RequestContext};
 use agent::session::{LedgerRecord, lock_writer, with_writer_async};
 use model::ModelClient;
 
-use protocol::{Turn, TurnErrorDetail, TurnEvent, TurnStatus};
+use protocol::{TurnErrorDetail, TurnEvent, TurnStatus};
 use tokio_util::sync::CancellationToken;
 
 use super::{Conversation, ConversationError};
@@ -13,15 +13,13 @@ impl Conversation {
     pub(super) async fn run_single_turn(
         self: &Arc<Self>,
         controls: &Arc<crate::runtime::conversation::TurnControls>,
-        prepared_context: Option<Box<RequestContext>>,
         sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<TurnStatus, TurnErrorDetail> {
         let conversation = Arc::clone(self);
         let preparing = Arc::clone(controls);
-        let prepared =
-            tokio::task::spawn_blocking(move || conversation.prepare_turn(&preparing, prepared_context))
-                .await
-                .expect("turn preparation completes while the runtime is running");
+        let prepared = tokio::task::spawn_blocking(move || conversation.prepare_turn(&preparing))
+            .await
+            .expect("turn preparation completes while the runtime is running");
         let ReadyTurn { mut agent, started_at, context_window } = match prepared {
             Ok(PreparedTurn::Ready(ready)) => *ready,
             Ok(PreparedTurn::Cancelled) => {
@@ -38,11 +36,7 @@ impl Conversation {
         };
         self.lock_state().last_context_window = Some(context_window);
         let turn_id = controls.turn_id.clone();
-        let turn = Turn {
-            turn_id: turn_id.clone(),
-            status: TurnStatus::Running,
-        };
-        sink(AgentEvent::Turn(TurnEvent::TurnStarted { turn, started_at }));
+        sink(AgentEvent::Turn(TurnEvent::TurnStarted { started_at }));
 
         let run_result = {
             let mut on_event = |event: AgentEvent| match &event {
@@ -108,10 +102,7 @@ impl Conversation {
             }));
         } else {
             sink(AgentEvent::Turn(TurnEvent::TurnCompleted {
-                turn: Turn {
-                    turn_id: turn_id.clone(),
-                    status: turn_status,
-                },
+                status: turn_status,
                 manually_stopped,
                 finished_at,
                 stats: None,
@@ -123,16 +114,12 @@ impl Conversation {
     fn prepare_turn(
         &self,
         controls: &crate::runtime::conversation::TurnControls,
-        prepared_context: Option<Box<RequestContext>>,
     ) -> Result<PreparedTurn, TurnErrorDetail> {
         if controls.cancellation().is_cancelled() {
             return Ok(PreparedTurn::Cancelled);
         }
         let inbox = Arc::clone(&self.lock_state().steering_inbox);
-        let context = match prepared_context {
-            Some(context) => *context,
-            None => self.prepare_request_context()?,
-        };
+        let context = self.prepare_request_context()?;
         let context_window = context.context_window();
         let agent = Agent::new(context, inbox, Arc::clone(&controls.questions), Arc::clone(&self.bash_tasks));
         if controls.cancellation().is_cancelled() {
@@ -144,80 +131,38 @@ impl Conversation {
         Ok(PreparedTurn::Ready(Box::new(ReadyTurn { agent, started_at, context_window })))
     }
 
-    pub(crate) fn begin_context_preview(self: &Arc<Self>, signal: &CancellationToken) -> ContextPreview {
-        let view = self.lock_view();
-        let mut state = self.lock_state();
-        if signal.is_cancelled() || view.context.is_some() || state.closing || state.turn.is_busy() {
-            return ContextPreview::Skip;
-        }
-        if state.context_preview.is_some() {
-            return ContextPreview::Busy;
-        }
-        state.context_preview = Some(signal.clone());
-        ContextPreview::Run(PreviewGuard { conversation: Arc::clone(self) })
-    }
-
-    pub(crate) async fn wait_context_preview(&self, signal: &CancellationToken) {
-        loop {
-            let changed = self.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if signal.is_cancelled() || self.lock_state().context_preview.is_none() {
-                return;
-            }
-            tokio::select! {
-                biased;
-                () = signal.cancelled() => return,
-                () = changed => {}
-            }
-        }
-    }
-
     pub(crate) async fn inspect_context(
         self: &Arc<Self>,
-        signal: CancellationToken,
-        guard: PreviewGuard,
+        shutdown: &CancellationToken,
     ) -> Result<(), ConversationError> {
+        {
+            let view = self.lock_view();
+            let state = self.lock_state();
+            if shutdown.is_cancelled() || state.closing || state.turn.is_busy() || view.context.is_some() {
+                return Ok(());
+            }
+        }
         let conversation = Arc::clone(self);
         let result = async {
             let requests = tokio::task::spawn_blocking(move || conversation.prepare_request_context())
                 .await
                 .expect("context preparation completes while the runtime is running")
                 .map_err(|error| ConversationError::Message(error.message))?;
-            Ok::<_, ConversationError>(requests.inspect_context(&signal).await?)
+            Ok::<_, ConversationError>(requests.inspect_context(shutdown).await?)
         }
         .await;
-        let result = {
-            let mut view = self.lock_view();
-            if signal.is_cancelled() {
-                Ok(())
-            } else {
-                result.map(|context| self.publish_event(&mut view, TurnEvent::ContextLoaded { context }))
-            }
-        };
-        drop(guard);
-        result
-    }
-
-    pub(crate) fn prepare_resubmit_context(
-        &self,
-    ) -> Result<(protocol::ModelSelection, agent::agent::RequestContext), ConversationError> {
-        let selection = self.model();
-        let context = self
-            .prepare_request_context_for(&selection)
-            .map_err(|error| ConversationError::Message(error.message))?;
-        Ok((selection, context))
+        let mut view = self.lock_view();
+        let state = self.lock_state();
+        if shutdown.is_cancelled() || state.closing || state.turn.is_busy() || view.context.is_some() {
+            return Ok(());
+        }
+        drop(state);
+        result.map(|context| self.publish_event(&mut view, TurnEvent::ContextLoaded { context }))
     }
 
     pub(super) fn prepare_request_context(&self) -> Result<RequestContext, TurnErrorDetail> {
-        self.prepare_request_context_for(&self.model())
-    }
-
-    fn prepare_request_context_for(
-        &self,
-        selection: &protocol::ModelSelection,
-    ) -> Result<RequestContext, TurnErrorDetail> {
-        let provider = ModelClient::new(&self.models, selection).map_err(preparation_error)?;
+        let selection = self.model();
+        let provider = ModelClient::new(&self.models, &selection).map_err(preparation_error)?;
         let instruction_home = self.home.clone();
         let initial_instructions =
             app_core::load_agent_instructions(std::path::Path::new(&self.cwd), &instruction_home)
@@ -246,23 +191,6 @@ struct ReadyTurn {
 enum PreparedTurn {
     Ready(Box<ReadyTurn>),
     Cancelled,
-}
-
-pub(crate) enum ContextPreview {
-    Skip,
-    Busy,
-    Run(PreviewGuard),
-}
-
-pub(crate) struct PreviewGuard {
-    conversation: Arc<Conversation>,
-}
-
-impl Drop for PreviewGuard {
-    fn drop(&mut self) {
-        self.conversation.lock_state().context_preview = None;
-        self.conversation.changed.notify_waiters();
-    }
 }
 
 fn preparation_error(error: impl std::fmt::Display) -> TurnErrorDetail {

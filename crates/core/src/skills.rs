@@ -106,7 +106,7 @@ impl SkillCatalog {
                 None
             }
         };
-        let effective_cwd = canonical.as_ref().map_or(cwd, crate::CanonicalWorkspacePath::as_path);
+        let effective_cwd = canonical.as_deref().unwrap_or(cwd);
         let root = match crate::workspace::project_root(effective_cwd) {
             Ok(root) => root,
             Err(error) => {

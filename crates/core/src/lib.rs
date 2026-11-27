@@ -8,9 +8,7 @@ mod workspace;
 pub use project_instructions::{InstructionFile, load_agent_instructions};
 pub use tool::{ToolDefinition, estimate_tool_tokens};
 pub use user_home::resolve_home;
-pub use workspace::{
-    CanonicalWorkspacePath, canonicalize_workspace, same_saved_path, saved_path_key, workspace_key,
-};
+pub use workspace::{canonicalize_workspace, same_saved_path, saved_path_key, workspace_key};
 
 pub(crate) const PROJECT_ROOT_MARKER: &str = ".git";
 

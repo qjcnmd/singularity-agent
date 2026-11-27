@@ -2,11 +2,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use agent::agent::UserInput;
-use protocol::{RpcError, SessionChangedFilesResult, SessionFileDiffResult, SessionReadResult};
+use protocol::{ChangedFile, RpcError, SessionFileDiffResult, SessionReadResult};
 
-use super::{AppServer, SessionDeleteGuard, catalog_error, conversation_error, session_busy};
+use super::{AppServer, SessionDeleteGuard, catalog_error, conversation_error};
 use crate::desktop::git_diff;
-use crate::runtime::{ContextPreview, Conversation};
+use crate::runtime::Conversation;
 
 impl AppServer {
     pub(crate) fn image_data(&self, session_id: &str, image_id: &str) -> Result<String, RpcError> {
@@ -18,25 +18,9 @@ impl AppServer {
     }
 
     pub(crate) fn submit(&self, params: protocol::SessionTextParams) -> Result<(), RpcError> {
-        let (cwd, skill_expansion) = {
-            let lifecycle = self.lock_lifecycle();
-            let conversation = self.open_workspace_conversation(&lifecycle, &params.session_id)?;
-            let skill_expansion =
-                agent::agent::SkillExpansion::from_disabled_modules(&conversation.disabled_modules);
-            (conversation.cwd.clone(), skill_expansion)
-        };
-        let input = UserInput::from_uploads(
-            params.text,
-            params.images,
-            params.files,
-            params.annotations,
-            std::path::Path::new(&cwd),
-            &self.home,
-            skill_expansion,
-        )
-        .map_err(RpcError::new)?;
-        let lifecycle = self.lock_lifecycle();
-        let conversation = self.open_workspace_conversation(&lifecycle, &params.session_id)?;
+        let (_, input) = self.parse_session_input(&params.session_id, params.message)?;
+        let mut sessions = self.lock_sessions();
+        let conversation = self.open_conversation(&mut sessions, &params.session_id, true)?;
         conversation.start(input).map_err(conversation_error)
     }
 
@@ -60,8 +44,8 @@ impl AppServer {
         session_id: &str,
         apply: impl FnOnce(&Arc<Conversation>) -> Result<(), RpcError>,
     ) -> Result<(), RpcError> {
-        let lifecycle = self.lock_lifecycle();
-        let conversation = self.open_action_conversation(&lifecycle, session_id)?;
+        let mut sessions = self.lock_sessions();
+        let conversation = self.open_conversation(&mut sessions, session_id, false)?;
         apply(&conversation)
     }
 
@@ -70,35 +54,23 @@ impl AppServer {
         session_id: &str,
         shutdown: &tokio_util::sync::CancellationToken,
     ) -> Result<(), RpcError> {
-        let signal = shutdown.child_token();
-        loop {
-            if signal.is_cancelled() {
-                return Ok(());
-            }
-            let app = Arc::clone(self);
-            let id = session_id.to_string();
-            let preview_signal = signal.clone();
-            let (conversation, attempt) = tokio::task::spawn_blocking(move || {
-                let lifecycle = app.lock_lifecycle();
-                let conversation = app.open_workspace_conversation(&lifecycle, &id)?;
-                let attempt = conversation.begin_context_preview(&preview_signal);
-                Ok::<_, RpcError>((conversation, attempt))
-            })
-            .await
-            .expect("conversation lookup completes while the backend is running")?;
-            match attempt {
-                ContextPreview::Skip => return Ok(()),
-                ContextPreview::Busy => conversation.wait_context_preview(&signal).await,
-                ContextPreview::Run(guard) => {
-                    return conversation.inspect_context(signal, guard).await.map_err(conversation_error);
-                }
-            }
+        if shutdown.is_cancelled() {
+            return Ok(());
         }
+        let app = Arc::clone(self);
+        let id = session_id.to_string();
+        let conversation = tokio::task::spawn_blocking(move || {
+            let mut sessions = app.lock_sessions();
+            app.open_conversation(&mut sessions, &id, true)
+        })
+        .await
+        .expect("conversation lookup completes while the backend is running")?;
+        conversation.inspect_context(shutdown).await.map_err(conversation_error)
     }
 
     pub(crate) fn compact(&self, session_id: &str) -> Result<(), RpcError> {
-        let lifecycle = self.lock_lifecycle();
-        let conversation = self.open_workspace_conversation(&lifecycle, session_id)?;
+        let mut sessions = self.lock_sessions();
+        let conversation = self.open_conversation(&mut sessions, session_id, true)?;
         conversation.compact().map_err(conversation_error)
     }
 
@@ -109,23 +81,13 @@ impl AppServer {
     pub(crate) async fn delete_session(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {
         let app = Arc::clone(self);
         let id = session_id.to_string();
-        let (open_session, reservation) = tokio::task::spawn_blocking(move || {
-            let mut lifecycle = app.lock_lifecycle();
-            if lifecycle.is_deleting(&id) {
-                return Err(session_busy());
-            }
-            let open_session = if let Some(conversation) = app.lock_sessions().get(&id) {
-                let deletion = conversation.begin_delete().map_err(conversation_error)?;
-                Some((conversation, deletion))
-            } else {
-                None
-            };
-            let reservation = SessionDeleteGuard::reserve(&app, &mut lifecycle, &id)?;
-            Ok((open_session, reservation))
+        let reservation = tokio::task::spawn_blocking(move || {
+            let mut sessions = app.lock_sessions();
+            SessionDeleteGuard::reserve(&app, &mut sessions, &id)
         })
         .await
         .expect("delete preparation completes while the backend is running")?;
-        if let Some((conversation, _)) = &open_session {
+        if let Some(conversation) = reservation.conversation() {
             conversation.stop().await.map_err(conversation_error)?;
         }
         let app = Arc::clone(self);
@@ -133,13 +95,8 @@ impl AppServer {
         tokio::task::spawn_blocking(move || {
             app.catalog.delete(&id).map_err(catalog_error)?;
             {
-                let mut lifecycle = app.lock_lifecycle();
-                if let Some((_, deletion)) = open_session {
-                    app.lock_sessions().remove(&id);
-                    deletion.complete();
-                }
-                app.hub.remove_session(&id);
-                reservation.release_locked(&mut lifecycle);
+                let mut sessions = app.lock_sessions();
+                reservation.complete_locked(&mut sessions);
             }
             app.publish_app_snapshot();
             Ok(())
@@ -166,8 +123,8 @@ impl AppServer {
         let app = Arc::clone(self);
         let id = session_id.to_owned();
         let tasks = tokio::task::spawn_blocking(move || {
-            let lifecycle = app.lock_lifecycle();
-            Ok::<_, RpcError>(Arc::clone(app.open_action_conversation(&lifecycle, &id)?.bash_tasks()))
+            let mut sessions = app.lock_sessions();
+            Ok::<_, RpcError>(Arc::clone(app.open_conversation(&mut sessions, &id, false)?.bash_tasks()))
         })
         .await
         .expect("background task lookup completes while the backend is running")?;
@@ -177,19 +134,19 @@ impl AppServer {
     pub(crate) fn changed_files(
         &self,
         params: protocol::SessionChangedFilesParams,
-    ) -> Result<SessionChangedFilesResult, RpcError> {
-        let cwd = self.resolve_diff_cwd(params.session_id.as_deref(), params.workspace_root.as_deref())?;
-        let files = git_diff::changed_files(&cwd, params.include_diffs).map_err(RpcError::new)?;
-        Ok(SessionChangedFilesResult { files })
+    ) -> Result<Vec<ChangedFile>, RpcError> {
+        let workspace = self.workspace(&params.workspace_root)?;
+        git_diff::changed_files(Path::new(&workspace.root), params.include_diffs).map_err(RpcError::new)
     }
 
     pub(crate) fn file_diff(
         &self,
         params: protocol::SessionFileDiffParams,
     ) -> Result<SessionFileDiffResult, RpcError> {
-        let cwd = self.resolve_diff_cwd(params.session_id.as_deref(), params.workspace_root.as_deref())?;
-        let rel_path = workspace_relative_path(&cwd, &params.path)?;
-        let output = git_diff::file_diff(&cwd, &rel_path).map_err(RpcError::new)?;
+        let workspace = self.workspace(&params.workspace_root)?;
+        let cwd = Path::new(&workspace.root);
+        let rel_path = workspace_relative_path(cwd, &params.path)?;
+        let output = git_diff::file_diff(cwd, &rel_path).map_err(RpcError::new)?;
         Ok(SessionFileDiffResult { path: rel_path, output })
     }
 
@@ -197,63 +154,38 @@ impl AppServer {
         &self,
         params: protocol::SessionRewindParams,
     ) -> Result<SessionReadResult, RpcError> {
-        let resubmit = if let Some(input) = params.resubmit {
-            let conversation = {
-                let lifecycle = self.lock_lifecycle();
-                self.open_workspace_conversation(&lifecycle, &params.session_id)?
-            };
-            let skill_expansion =
-                agent::agent::SkillExpansion::from_disabled_modules(&conversation.disabled_modules);
-            let parsed_input = UserInput::from_uploads(
-                input.text,
-                input.images,
-                input.files,
-                input.annotations,
-                Path::new(&conversation.cwd),
-                &self.home,
-                skill_expansion,
-            )
-            .map_err(RpcError::new)?;
-            let (selection, context) = conversation.prepare_resubmit_context().map_err(conversation_error)?;
-            Some((parsed_input, selection, context))
-        } else {
-            None
-        };
-        let lifecycle = self.lock_lifecycle();
-        let conversation = self.open_workspace_conversation(&lifecycle, &params.session_id)?;
+        let (cwd, input) = self.parse_session_input(&params.session_id, params.message)?;
+        app_core::load_agent_instructions(Path::new(&cwd), &self.home).map_err(RpcError::new)?;
+        let mut sessions = self.lock_sessions();
+        let conversation = self.open_conversation(&mut sessions, &params.session_id, true)?;
         conversation
-            .rewind(&params.message_id, resubmit)
+            .rewind(&params.message_id, input)
             .map(|read| *read)
             .map_err(conversation_error)
     }
 
-    fn resolve_diff_cwd(
+    fn parse_session_input(
         &self,
-        session_id: Option<&str>,
-        workspace_root: Option<&str>,
-    ) -> Result<PathBuf, RpcError> {
-        if let Some(root) = workspace_root {
-            return Ok(PathBuf::from(self.workspace(root)?.root));
-        }
-        if let Some(id) = session_id {
-            return self.session_cwd(id);
-        }
-        Err(RpcError::new("缺少项目路径或会话标识。"))
-    }
-
-    fn session_cwd(&self, session_id: &str) -> Result<PathBuf, RpcError> {
-        let lifecycle = self.lock_lifecycle();
-        if lifecycle.is_deleting(session_id) {
-            return Err(session_busy());
-        }
-        if let Some(conversation) = self.lock_sessions().get(session_id) {
-            if conversation.is_deleting() {
-                return Err(session_busy());
-            }
-            return Ok(PathBuf::from(&conversation.cwd));
-        }
-        drop(lifecycle);
-        self.catalog.session_cwd(session_id).map_err(catalog_error)
+        session_id: &str,
+        input: protocol::MessageInput,
+    ) -> Result<(String, UserInput), RpcError> {
+        let conversation = {
+            let mut sessions = self.lock_sessions();
+            self.open_conversation(&mut sessions, session_id, true)?
+        };
+        let skill_expansion =
+            agent::agent::SkillExpansion::from_disabled_modules(&conversation.disabled_modules);
+        let parsed = UserInput::from_uploads(
+            input.text,
+            input.images,
+            input.files,
+            input.annotations,
+            Path::new(&conversation.cwd),
+            &self.home,
+            skill_expansion,
+        )
+        .map_err(RpcError::new)?;
+        Ok((conversation.cwd.clone(), parsed))
     }
 }
 

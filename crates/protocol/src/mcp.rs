@@ -110,5 +110,4 @@ pub struct McpServerState {
     pub status: McpConnectionStatus,
     pub error: Option<String>,
     pub tools: Vec<McpToolInfo>,
-    pub tokens: u64,
 }

@@ -416,102 +416,6 @@ async fn context_pressure_and_overflow_invariants() {
         "main generation request must proceed immediately after automatic compaction failure"
     );
 
-    restarted
-        .rpc_ok(
-            "model.saveProvider",
-            json!({
-                "provider": {
-                    "apiProtocol": "messages",
-                    "providerId": "local",
-                    "displayName": "local",
-                    "baseUrl": server.base_url,
-                    "models": [
-                        {
-                            "modelId": "compact-model",
-                            "maxContextTokens": 20_000,
-                            "maxOutputTokens": 2048,
-                            "reasoningVariants": ["off", "low", "high"]
-                        },
-                        {
-                            "modelId": "small-model",
-                            "maxContextTokens": 6_000,
-                            "maxOutputTokens": 1024,
-                            "reasoningVariants": ["off", "low", "high"]
-                        }
-                    ]
-                },
-                "apiKey": "test-secret-key"
-            }),
-        )
-        .await;
-    restarted
-        .rpc_ok(
-            "session.updateSettings",
-            json!({
-                "sessionId": session_id,
-                "selection": { "provider": "local", "model": "small-model", "reasoning": null }
-            }),
-        )
-        .await;
-
-    let tail_pad = "p".repeat(3_200);
-    let reqs_before_switch_fail = server.model_requests().len();
-    server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "   ", 500, 0, 5, "end_turn")));
-    restarted
-        .submit(&session_id, &format!("SWITCH_FAIL_SHOULD_NOT_HIT_SMALL_MODEL {tail_pad}"))
-        .await;
-    let s_switch_fail = restarted.wait_settled(&session_id).await;
-    assert_eq!(
-        s_switch_fail.pointer("/summary/status").and_then(Value::as_str),
-        Some("failed"),
-        "model-switch pre-compaction failure must abort turn explicitly"
-    );
-    let switch_fail_reqs = server.model_requests();
-    let fail_slice = &switch_fail_reqs[reqs_before_switch_fail..];
-    assert!(
-        fail_slice.iter().any(|r| {
-            is_compaction_request(&r.body)
-                && r.body.get("model").and_then(Value::as_str) == Some("compact-model")
-        }),
-        "model-switch pre-compaction must run on the previous model"
-    );
-    assert!(
-        fail_slice
-            .iter()
-            .all(|r| r.body.get("model").and_then(Value::as_str) != Some("small-model")),
-        "failed model-switch pre-compaction must not send oversized request to the target model"
-    );
-
-    let reqs_before_switch_ok = server.model_requests().len();
-    restarted.submit(&session_id, &format!("SWITCH_PRECOMPACT_OK_TURN {tail_pad}")).await;
-    let s_switch_ok = restarted.wait_settled(&session_id).await;
-    assert_eq!(
-        s_switch_ok.pointer("/summary/status").and_then(Value::as_str),
-        Some("completed"),
-        "model-switch pre-compaction success must continue generation on the target model"
-    );
-    let switch_ok_reqs = server.model_requests();
-    let ok_slice = &switch_ok_reqs[reqs_before_switch_ok..];
-    assert!(
-        ok_slice.iter().any(|r| {
-            is_compaction_request(&r.body)
-                && r.body.get("model").and_then(Value::as_str) == Some("compact-model")
-        }),
-        "successful model-switch pre-compaction must compact using the previous model"
-    );
-    let final_small_req = ok_slice.last().expect("final generation request on small-model");
-    assert_eq!(
-        final_small_req.body.get("model").and_then(Value::as_str),
-        Some("small-model"),
-        "post-compaction generation must run on the target model"
-    );
-    let final_small_text = final_small_req.body.to_string();
-    assert!(
-        final_small_text.contains("SECOND_CHECKPOINT_UNIQUE_MARKER")
-            && final_small_text.contains("SWITCH_PRECOMPACT_OK_TURN")
-            && !final_small_text.contains("AUTO_90_TRIGGER_TURN"),
-        "target model must receive compacted checkpoint and small retained tail"
-    );
     server.assert_no_protocol_violations();
     restarted.shutdown().await;
 }
@@ -664,62 +568,42 @@ async fn abort_delete_corruption_and_focus_invariants() {
     });
     assert!(!leaked_delta, "non-focused session must suppress high-frequency TextDelta frames");
 
-    let mut batch_ids = Vec::new();
-    for i in 0..18 {
-        server.enqueue(ScriptedResponse::sse(messages_text_sse(
-            None,
-            &format!("reply_{i}"),
-            30,
-            0,
-            10,
-            "end_turn",
-        )));
-        let id = client
-            .start_session(&ws, "local", "demo", None, &format!("batch_{i}"), vec![], vec![])
-            .await;
-        client.wait_settled(&id).await;
-        batch_ids.push(id);
-    }
-    let first_reread = client.rpc_ok("session.read", json!({ "sessionId": batch_ids[0] })).await;
-    assert!(first_reread.to_string().contains("reply_0"));
-
     client.rpc_ok("workspace.remove", json!({ "workspaceRoot": ws })).await;
     let boot_removed = client.rpc_ok("app.bootstrap", json!({})).await;
     assert!(
         boot_removed.get("workspaces").and_then(Value::as_array).is_some_and(Vec::is_empty),
         "removed workspace must disappear from bootstrap"
     );
-    let preserved_log = env.home.join("sessions").join(format!("{}.jsonl", batch_ids[0]));
+    let preserved_log = env.home.join("sessions").join(format!("{s_abort}.jsonl"));
     assert!(preserved_log.exists(), "removing a workspace must preserve session logs on disk");
 
     client.rpc_ok("workspace.add", json!({ "root": ws })).await;
     let boot_readded = client.rpc_ok("app.bootstrap", json!({})).await;
     assert!(
-        boot_readded.to_string().contains(&batch_ids[0]),
+        boot_readded.to_string().contains(&s_abort),
         "re-adding workspace must restore historical sessions in bootstrap"
     );
 
     server.assert_no_protocol_violations();
     client.shutdown().await;
 
-    let target_log = env.home.join("sessions").join(format!("{}.jsonl", batch_ids[0]));
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&target_log).expect("open log");
+        let mut f = std::fs::OpenOptions::new().append(true).open(&preserved_log).expect("open log");
         f.write_all(b"{\"type\":\"message\",\"truncated\":true").expect("append partial tail");
     }
 
     let mut repaired_client = BackendClient::spawn(&env.home).await;
-    let repaired = repaired_client.rpc_ok("session.read", json!({ "sessionId": batch_ids[0] })).await;
+    let repaired = repaired_client.rpc_ok("session.read", json!({ "sessionId": s_abort })).await;
     assert!(
-        repaired.to_string().contains("reply_0"),
+        repaired.to_string().contains("CONTINUED_AFTER_TOOL_AND_QUESTION_ABORTS"),
         "trailing partial line without newline must auto-repair"
     );
     repaired_client.shutdown().await;
 
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&target_log).expect("open log");
+        let mut f = std::fs::OpenOptions::new().append(true).open(&preserved_log).expect("open log");
         f.write_all(b"{corrupt json line}\n").expect("append corrupt complete line");
     }
     let mut corrupt_client = BackendClient::spawn(&env.home).await;
@@ -729,7 +613,7 @@ async fn abort_delete_corruption_and_focus_invariants() {
 }
 
 #[tokio::test]
-async fn git_diff_and_pure_rewind_invariants() {
+async fn git_diff_and_rewind_invariants() {
     let env = TestEnv::new("rewind-invariants");
     let server = MockModelServer::start().await;
     let ws = env.workspace_str();
@@ -788,15 +672,11 @@ async fn git_diff_and_pure_rewind_invariants() {
         .await;
     client.rpc_ok("workspace.add", json!({ "root": plain_ws })).await;
 
-    // Non-git workspace returns empty changedFiles cleanly without creating any snapshot dir.
+    // Non-git workspace returns empty changedFiles cleanly.
     let s_plain = client.start_session(&plain_ws, "local", "demo", None, "plain turn", vec![], vec![]).await;
     client.wait_settled(&s_plain).await;
-    let plain_changed = client.rpc_ok("session.changedFiles", json!({ "sessionId": s_plain })).await;
-    assert_eq!(plain_changed.get("files").and_then(Value::as_array).map(Vec::len), Some(0));
-    assert!(
-        !env.home.join("sessions").join("snapshots").exists(),
-        "Shadow Git snapshots dir must not exist"
-    );
+    let plain_changed = client.rpc_ok("session.changedFiles", json!({ "workspaceRoot": plain_ws })).await;
+    assert_eq!(plain_changed.as_array().map(Vec::len), Some(0));
 
     let s_git = client.start_session(&ws, "local", "demo", None, "baseline turn", vec![], vec![]).await;
     client.wait_settled(&s_git).await;
@@ -806,7 +686,7 @@ async fn git_diff_and_pure_rewind_invariants() {
     assert_eq!(std::fs::read_to_string(&tracked).expect("read mutated file"), "v2\n");
     assert!(extra.exists(), "extra.txt must exist after turn 2");
 
-    // Rename after turn 2 to verify pure rewind preserves ThreadName and ThreadSettings.
+    // Rename after turn 2 to verify rewind preserves ThreadName and ThreadSettings.
     client.rpc_ok("session.rename", json!({ "sessionId": s_git, "name": "Keep Title" })).await;
 
     let before_rewind = client.rpc_ok("session.read", json!({ "sessionId": s_git })).await;
@@ -849,7 +729,7 @@ async fn git_diff_and_pure_rewind_invariants() {
     std::fs::write(&plain_i_file, "export const i = 2\n").expect("modify i");
 
     let changed = client.rpc_ok("session.changedFiles", json!({ "workspaceRoot": ws })).await;
-    let changed_items = changed.get("files").and_then(Value::as_array).expect("changed files");
+    let changed_items = changed.as_array().expect("changed files");
     let changed_paths: Vec<&str> =
         changed_items.iter().filter_map(|f| f.get("path").and_then(Value::as_str)).collect();
     assert!(changed_paths.contains(&"tracked.txt"), "changedFiles: {changed_paths:?}");
@@ -864,10 +744,7 @@ async fn git_diff_and_pure_rewind_invariants() {
     let changed_with_diffs = client
         .rpc_ok("session.changedFiles", json!({ "workspaceRoot": ws, "includeDiffs": true }))
         .await;
-    let diff_items = changed_with_diffs
-        .get("files")
-        .and_then(Value::as_array)
-        .expect("changed files with diffs");
+    let diff_items = changed_with_diffs.as_array().expect("changed files with diffs");
     let tracked_batch = diff_items
         .iter()
         .find(|f| f.get("path").and_then(Value::as_str) == Some("tracked.txt"))
@@ -920,8 +797,7 @@ async fn git_diff_and_pure_rewind_invariants() {
         .rpc_ok("session.changedFiles", json!({ "workspaceRoot": unborn_ws, "includeDiffs": true }))
         .await;
     let am_diff = unborn_changed
-        .get("files")
-        .and_then(Value::as_array)
+        .as_array()
         .and_then(|arr| arr.iter().find(|f| f.get("path").and_then(Value::as_str) == Some("am.txt")))
         .and_then(|f| f.get("diff").and_then(Value::as_str))
         .unwrap_or_default();
@@ -931,13 +807,13 @@ async fn git_diff_and_pure_rewind_invariants() {
     );
 
     let diff = client
-        .rpc_ok("session.fileDiff", json!({ "sessionId": s_git, "path": "tracked.txt" }))
+        .rpc_ok("session.fileDiff", json!({ "workspaceRoot": ws, "path": "tracked.txt" }))
         .await;
     let diff_out = diff.get("output").and_then(Value::as_str).unwrap_or_default();
     assert!(diff_out.contains("-v1") && diff_out.contains("+v2"), "unexpected diff: {diff_out}");
 
     let untracked_diff = client
-        .rpc_ok("session.fileDiff", json!({ "sessionId": s_git, "path": "extra.txt" }))
+        .rpc_ok("session.fileDiff", json!({ "workspaceRoot": ws, "path": "extra.txt" }))
         .await;
     let untracked_out = untracked_diff.get("output").and_then(Value::as_str).unwrap_or_default();
     assert!(untracked_out.contains("+extra"), "unexpected untracked diff: {untracked_out}");
@@ -964,7 +840,7 @@ async fn git_diff_and_pure_rewind_invariants() {
         "failed turn must clear unconsumed steering input"
     );
 
-    // Atomic rewind with invalid resubmit input (missing file attachment) must fail WITHOUT truncating history.
+    // Atomic rewind with invalid message input (missing file attachment) must fail WITHOUT truncating history.
     let missing_file = app_core::display_path(&env.workspace.join("missing_file.txt"));
     let invalid_err = client
         .rpc_err(
@@ -972,7 +848,8 @@ async fn git_diff_and_pure_rewind_invariants() {
             json!({
                 "sessionId": s_git,
                 "messageId": turn2_user_msg_id,
-                "resubmit": { "text": "edited text", "files": [missing_file] }
+                "text": "edited text",
+                "files": [missing_file]
             }),
         )
         .await;
@@ -984,7 +861,7 @@ async fn git_diff_and_pure_rewind_invariants() {
         "failed atomic rewind must leave session history intact"
     );
 
-    // Atomic rewind with valid resubmit truncates and immediately starts the edited turn.
+    // Atomic rewind truncates history from turn 2 user message, keeps workspace files and ThreadName intact, and starts the edited turn.
     server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "TURN_2_EDITED_OK", 70, 0, 15, "end_turn")));
     let tracked_abs = app_core::display_path(&tracked);
     let atomic_resubmit = client
@@ -993,7 +870,8 @@ async fn git_diff_and_pure_rewind_invariants() {
             json!({
                 "sessionId": s_git,
                 "messageId": turn2_user_msg_id,
-                "resubmit": { "text": "edited prompt", "files": [tracked_abs] }
+                "text": "edited prompt",
+                "files": [tracked_abs]
             }),
         )
         .await;
@@ -1002,39 +880,24 @@ async fn git_diff_and_pure_rewind_invariants() {
         Some("running"),
         "atomic rewind+resubmit must start the edited turn immediately"
     );
+    assert_eq!(
+        atomic_resubmit.pointer("/history/turns").and_then(Value::as_array).map(Vec::len),
+        Some(1),
+        "rewind must truncate turn 2 and failed turn from history"
+    );
     client.wait_settled(&s_git).await;
     let after_edit = client.rpc_ok("session.read", json!({ "sessionId": s_git })).await;
+    let edited_turns = after_edit.pointer("/history/turns").and_then(Value::as_array).expect("edited turns");
+    assert_eq!(edited_turns.len(), 2, "edited session must contain turn 1 plus replacement turn 2");
     assert!(after_edit.to_string().contains("TURN_2_EDITED_OK"));
     assert!(!after_edit.to_string().contains("TURN_2_MUTATED"));
-    let edited_turn2_user_msg_id = after_edit
-        .pointer("/history/turns/1/items")
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|item| {
-                    item.get("type").and_then(Value::as_str) == Some("message")
-                        && item.get("role").and_then(Value::as_str) == Some("user")
-                })
-                .and_then(|item| item.get("id").and_then(Value::as_str))
-        })
-        .expect("edited turn 2 user message id")
-        .to_string();
-
-    // Pure rewind truncates history from turn 2 user message while keeping workspace files, ThreadName, and settings intact.
-    let rewound = client
-        .rpc_ok("session.rewind", json!({ "sessionId": s_git, "messageId": edited_turn2_user_msg_id }))
-        .await;
-    let rewound_turns = rewound.pointer("/history/turns").and_then(Value::as_array).expect("rewound turns");
-    assert_eq!(rewound_turns.len(), 1, "rewind must truncate turn 2 and failed turn from history");
-    assert!(!rewound.to_string().contains("TURN_2_MUTATED"));
-    assert_eq!(rewound.pointer("/history/summary/title").and_then(Value::as_str), Some("Keep Title"));
+    assert_eq!(after_edit.pointer("/history/summary/title").and_then(Value::as_str), Some("Keep Title"));
     assert_eq!(
-        std::fs::read_to_string(&tracked).expect("read tracked after pure rewind"),
+        std::fs::read_to_string(&tracked).expect("read tracked after rewind"),
         "v2\n",
-        "pure rewind must leave workspace files untouched"
+        "rewind must leave workspace files untouched"
     );
-    assert!(extra.exists(), "pure rewind must leave extra.txt untouched");
+    assert!(extra.exists(), "rewind must leave extra.txt untouched");
 
     server.assert_no_protocol_violations();
     client.shutdown().await;
@@ -1042,7 +905,7 @@ async fn git_diff_and_pure_rewind_invariants() {
     let mut restarted = BackendClient::spawn(&env.home).await;
     let after_restart = restarted.rpc_ok("session.read", json!({ "sessionId": s_git })).await;
     assert_eq!(
-        rewound.pointer("/history/turns"),
+        after_edit.pointer("/history/turns"),
         after_restart.pointer("/history/turns"),
         "rewound session history must persist identically across restart"
     );

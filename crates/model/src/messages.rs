@@ -1,6 +1,3 @@
-#[cfg(test)]
-pub(crate) mod stream;
-#[cfg(not(test))]
 mod stream;
 pub(crate) use self::stream::read_messages_sse_stream;
 

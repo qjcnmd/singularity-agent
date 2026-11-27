@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use super::Conversation;
 use super::state::TurnControls;
-use agent::agent::{AgentError, AgentEvent, compaction_unneeded};
-use agent::session::{CompactionInput, retention_budget_tokens};
+use agent::agent::{AgentError, AgentEvent};
 use protocol::{TurnErrorDetail, TurnStatus};
 
 impl Conversation {
@@ -26,23 +25,7 @@ impl Conversation {
                 };
             }
         };
-        let retain_tokens = retention_budget_tokens(requests.model_configuration());
-        let identity = requests.model_identity();
-        let Some(input) =
-            CompactionInput::select(&self.writer, retain_tokens, identity.clone(), identity).await
-        else {
-            controls.finish_cancel();
-            return Ok(compaction_unneeded(sink, controls.cancellation()));
-        };
-        let result = requests
-            .compact_selected(input, sink, controls.cancellation(), |is_final| {
-                if is_final {
-                    !controls.finish_cancel()
-                } else {
-                    !controls.cancellation().is_cancelled()
-                }
-            })
-            .await;
+        let result = requests.compact_manual(sink, controls.cancellation()).await;
         let cancelled = controls.finish_cancel();
         match result {
             Ok(()) if cancelled => Ok(TurnStatus::Interrupted),

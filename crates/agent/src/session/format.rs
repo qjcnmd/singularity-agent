@@ -208,8 +208,10 @@ impl SessionHeader {
     }
 
     pub(super) fn canonical_cwd(&self) -> Result<std::path::PathBuf> {
-        app_core::CanonicalWorkspacePath::from_saved(&self.cwd)
-            .map_err(SessionError::InvalidHeader)
-            .map(|cwd| cwd.as_path().to_path_buf())
+        let path = std::path::Path::new(&self.cwd);
+        if !path.is_absolute() {
+            return Err(SessionError::InvalidHeader("saved workspace path must be absolute".into()));
+        }
+        Ok(path.components().collect())
     }
 }

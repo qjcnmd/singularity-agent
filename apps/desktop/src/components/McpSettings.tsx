@@ -1,7 +1,6 @@
 import { Pencil, Plus, Trash2, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { appStore } from '../appStore'
-import { formatTokenCount } from '../copy'
 import type { McpConnectionStatus, McpServerInput, McpServerState } from '../protocol'
 import { Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
@@ -144,7 +143,7 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
                 <small className="mcp-endpoint-inline">{server.transport.type === 'stdio' ? `${server.transport.command} ${server.transport.args.join(' ')}`.trim() : server.transport.url}</small>
               </span>
               <span className={`mcp-status-pill status-${result.status}`}>
-                {result.status === 'connected' ? `${result.tools.length} 个工具 · ≈ ${formatTokenCount(result.tokens).toLowerCase()} tokens` : connectionLabels[result.status]}
+                {result.status === 'connected' ? `${result.tools.length} 个工具` : connectionLabels[result.status]}
               </span>
               <ExpandChevron expanded={open} size={15} />
             </button>

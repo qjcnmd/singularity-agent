@@ -34,8 +34,6 @@ export type ImageAttachment = { id: string, name: string, mimeType: string, widt
 
 export type ImageUpload = { name: string, dataUrl: string, };
 
-export type InjectedContext = { modules: Array<ContextModule>, };
-
 export type InstructionsReadParams = { workspaceRoot: string | null, };
 
 export type InstructionsSaveParams = { workspaceRoot: string | null, content: string, };
@@ -52,7 +50,7 @@ export type McpServerInput = { serverId: string, startupTimeoutSec: number, tool
 
 export type McpServerParams = { serverId: string, workspaceRoot: string | null, };
 
-export type McpServerState = { server: McpServerInput, status: McpConnectionStatus, error: string | null, tools: Array<McpToolInfo>, tokens: number, };
+export type McpServerState = { server: McpServerInput, status: McpConnectionStatus, error: string | null, tools: Array<McpToolInfo>, };
 
 export type McpToolInfo = { name: string, description: string, };
 
@@ -92,13 +90,11 @@ export type RpcError = { message: string, };
 
 export type RpcResponse = { "type": "success", result: JsonValue, } | { "type": "error", error: RpcError, };
 
-export type SessionChangedFilesParams = { sessionId?: string, workspaceRoot?: string, includeDiffs?: boolean, };
-
-export type SessionChangedFilesResult = { files: Array<ChangedFile>, };
+export type SessionChangedFilesParams = { workspaceRoot: string, includeDiffs?: boolean, };
 
 export type SessionFailure = { source: SessionOperation, error: TurnErrorDetail, };
 
-export type SessionFileDiffParams = { sessionId?: string, workspaceRoot?: string, path: string, };
+export type SessionFileDiffParams = { workspaceRoot: string, path: string, };
 
 export type SessionFileDiffResult = { path: string, output: string, };
 
@@ -118,13 +114,11 @@ export type SessionParams = { sessionId: string, };
 
 export type SessionPhase = "idle" | "running" | "compacting" | "stopping";
 
-export type SessionReadResult = { revision: number, history: ThreadHistory, runtime: SessionRuntime, backgroundTasks: Array<VisibleBackgroundTask>, context: InjectedContext | null, };
+export type SessionReadResult = { revision: number, history: ThreadHistory, runtime: SessionRuntime, backgroundTasks: Array<VisibleBackgroundTask>, context: Array<ContextModule> | null, };
 
 export type SessionRenameParams = { sessionId: string, name: string, };
 
-export type SessionRewindInput = { text: string, images: Array<ImageUpload>, files: Array<string>, annotations?: Array<MessageAnnotation>, };
-
-export type SessionRewindParams = { sessionId: string, messageId: string, resubmit?: SessionRewindInput, };
+export type SessionRewindParams = { sessionId: string, messageId: string, text: string, images?: Array<ImageUpload>, files?: Array<string>, annotations?: Array<MessageAnnotation>, };
 
 export type SessionRuntime = { phase: SessionPhase, selection: ModelSelection, contextUsage: ContextUsage | null, pendingQuestion: PendingQuestion | null, pendingMessages: Array<PendingUserMessage>, failure: SessionFailure | null, };
 
@@ -134,7 +128,7 @@ export type SessionStartResult = { summary: ThreadSummary, status: SessionStatus
 
 export type SessionStatus = { phase: SessionPhase, failure: SessionFailure | null, };
 
-export type SessionTextParams = { sessionId: string, text: string, images: Array<ImageUpload>, files: Array<string>, annotations?: Array<MessageAnnotation>, };
+export type SessionTextParams = { sessionId: string, text: string, images?: Array<ImageUpload>, files?: Array<string>, annotations?: Array<MessageAnnotation>, };
 
 export type SkillCatalog = { skills: Array<SkillMetadata>, diagnostics: Array<string>, };
 
@@ -154,11 +148,9 @@ export type ToolResult = { output: string, backgroundTaskId?: string, images?: A
 
 export type ToolStatus = "pending" | "running" | "completed" | "failed" | "interrupted";
 
-export type Turn = { turnId: string, status: TurnStatus, };
-
 export type TurnErrorDetail = { message: string, itemId?: string, };
 
-export type TurnEventEnvelope = { turnId: string | null, phase: SessionPhase, } & ({ "method": "context/loaded", "params": { context: InjectedContext, } } | { "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "item/updated", "params": { item: HistoryItem, } } | { "method": "item/textDelta", "params": { itemId: string, thinking: boolean, delta: string, } } | { "method": "message/finished", "params": { messageId: string, items: Array<HistoryItem>, } } | { "method": "message/discarded", "params": { messageId: string, } } | { "method": "tool/output", "params": { itemId: string, output: string, } } | { "method": "tool/finished", "params": { itemId: string, result: ToolResult, } } | { "method": "turn/completed", "params": { turn: Turn, manuallyStopped: boolean, finishedAt: string, stats?: SessionModelUsage, } } | { "method": "turn/error", "params": { error: TurnErrorDetail, finishedAt: string, stats?: SessionModelUsage, } });
+export type TurnEventEnvelope = { turnId: string | null, phase: SessionPhase, } & ({ "method": "context/loaded", "params": { context: Array<ContextModule>, } } | { "method": "turn/started", "params": { startedAt: string, } } | { "method": "item/updated", "params": { item: HistoryItem, } } | { "method": "item/textDelta", "params": { itemId: string, thinking: boolean, delta: string, } } | { "method": "message/finished", "params": { messageId: string, items: Array<HistoryItem>, } } | { "method": "message/discarded", "params": { messageId: string, } } | { "method": "tool/output", "params": { itemId: string, output: string, } } | { "method": "tool/finished", "params": { itemId: string, result: ToolResult, } } | { "method": "turn/completed", "params": { status: TurnStatus, manuallyStopped: boolean, finishedAt: string, stats?: SessionModelUsage, } } | { "method": "turn/error", "params": { error: TurnErrorDetail, finishedAt: string, stats?: SessionModelUsage, } });
 
 export type TurnStatus = "running" | "completed" | "failed" | "interrupted";
 
@@ -212,7 +204,7 @@ export interface RpcContract {
   "session.context": { params: SessionParams; result: null }
   "session.stopBackgroundTask": { params: BackgroundTaskParams; result: null }
   "session.updateSettings": { params: UpdateSettingsParams; result: null }
-  "session.changedFiles": { params: SessionChangedFilesParams; result: SessionChangedFilesResult }
+  "session.changedFiles": { params: SessionChangedFilesParams; result: Array<ChangedFile> }
   "session.fileDiff": { params: SessionFileDiffParams; result: SessionFileDiffResult }
   "session.rewind": { params: SessionRewindParams; result: SessionReadResult }
 }

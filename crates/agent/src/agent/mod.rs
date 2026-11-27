@@ -1,5 +1,4 @@
 mod compaction;
-pub use compaction::compaction_unneeded;
 mod dispatch;
 mod inbox;
 pub mod modules;
@@ -107,7 +106,7 @@ impl RequestContext {
     pub async fn inspect_context(
         mut self,
         cancellation: &CancellationToken,
-    ) -> Result<protocol::InjectedContext> {
+    ) -> Result<Vec<protocol::ContextModule>> {
         let (_, context) = self.load_definitions(cancellation).await?;
         Ok(context)
     }
@@ -134,11 +133,7 @@ impl RequestContext {
         self.provider.model_configuration().context_window()
     }
 
-    pub fn model_configuration(&self) -> model::ModelConfigurationSnapshot {
-        self.provider.model_configuration()
-    }
-
-    pub fn model_identity(&self) -> (String, String) {
+    pub(super) fn model_identity(&self) -> (String, String) {
         (self.provider.provider_name().to_owned(), self.provider.model_name().to_owned())
     }
 }

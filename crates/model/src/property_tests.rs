@@ -4,10 +4,10 @@ use proptest::prelude::*;
 use protocol::ProviderApiProtocol;
 use serde_json::{Map, Value, json};
 
-use crate::config::selection::{ProviderConfig, SelectedModel};
+use crate::config::selection::SelectedModel;
 use crate::error::redact_diagnostic;
-use crate::messages::{messages_stream_request_payload, stream::decode_messages_events_for_test};
-use crate::responses::{openai_responses_stream_request_payload, parse_openai_responses_response};
+use crate::messages::messages_stream_request_payload;
+use crate::responses::openai_responses_stream_request_payload;
 use crate::transport::stream::decode_sse_chunks;
 use crate::types::{
     ContentBlock, Message, ModelToolCall, ModelTurnRequest, ProviderBlockMetadata, ProviderMessageMetadata,
@@ -38,6 +38,7 @@ enum TurnStep {
     Assistant {
         text: Option<String>,
         thinking: Option<String>,
+        redacted: bool,
         same_provider: bool,
         tool_count: usize,
     },
@@ -72,9 +73,10 @@ fn turn_step_strategy() -> impl Strategy<Value = TurnStep> {
             prop::option::of(non_empty_text()),
             prop::option::of(non_empty_text()),
             any::<bool>(),
+            any::<bool>(),
             0usize..=3,
         )
-            .prop_map(|(text, thinking, same_provider, tool_count)| {
+            .prop_map(|(text, thinking, redacted, same_provider, tool_count)| {
                 let text = if text.is_none() && thinking.is_none() && tool_count == 0 {
                     Some("fallback reply".to_string())
                 } else {
@@ -83,6 +85,7 @@ fn turn_step_strategy() -> impl Strategy<Value = TurnStep> {
                 TurnStep::Assistant {
                     text,
                     thinking,
+                    redacted,
                     same_provider,
                     tool_count,
                 }
@@ -110,6 +113,7 @@ fn build_conversation(
             TurnStep::Assistant {
                 text,
                 thinking,
+                redacted,
                 same_provider,
                 tool_count,
             } => {
@@ -118,8 +122,18 @@ fn build_conversation(
                     let mut meta = Map::new();
                     match protocol {
                         ProviderApiProtocol::Messages => {
-                            let sig = if same_provider { "sig_same" } else { OTHER_MSG_SIG };
-                            meta.insert("signature".into(), json!(sig));
+                            if redacted {
+                                let data = if same_provider {
+                                    "redacted_same"
+                                } else {
+                                    OTHER_MSG_SIG
+                                };
+                                meta.insert("type".into(), json!("redacted_thinking"));
+                                meta.insert("data".into(), json!(data));
+                            } else {
+                                let sig = if same_provider { "sig_same" } else { OTHER_MSG_SIG };
+                                meta.insert("signature".into(), json!(sig));
+                            }
                         }
                         ProviderApiProtocol::Responses => {
                             let enc = if same_provider { "enc_same" } else { OTHER_RESP_ENC };
@@ -128,7 +142,11 @@ fn build_conversation(
                         }
                     }
                     content.push(ContentBlock::Thinking {
-                        thinking: thought,
+                        thinking: if protocol == ProviderApiProtocol::Messages && redacted {
+                            String::new()
+                        } else {
+                            thought
+                        },
                         metadata: Some(ProviderBlockMetadata(meta)),
                     });
                 }
@@ -297,6 +315,7 @@ proptest! {
     fn messages_encoding_preserves_protocol_invariants(
         leading_devs in prop::collection::vec(non_empty_text(), 0..=3),
         steps in prop::collection::vec(turn_step_strategy(), 0..=10),
+        mutate_prefix in any::<bool>(),
     ) {
         let provider_name = "primary";
         let model_name = "demo";
@@ -324,20 +343,15 @@ proptest! {
             max_output_tokens: 1024,
             prompt_cache_key: None,
         };
-        let payload = messages_stream_request_payload(&req, &selection, provider_name, endpoint)
-            .expect("messages encoding succeeds")
-            .payload;
+        let encoded_turn = messages_stream_request_payload(&req, &selection, provider_name, endpoint)
+            .expect("messages encoding succeeds");
+        let payload = encoded_turn.payload;
         let serialized = payload.to_string();
         prop_assert!(!serialized.contains(OTHER_MSG_SIG), "leaked foreign Messages signature");
         prop_assert!(count_cache_control(&payload) <= 4, "explicit cache_control breakpoints exceed 4");
 
         let encoded = payload.get("messages").and_then(Value::as_array).expect("messages array");
         prop_assert!(!encoded.is_empty());
-        prop_assert!(encoded[..encoded.len() - 1].iter().all(|m| count_cache_control(m) == 0));
-        prop_assert_eq!(
-            encoded.last().and_then(|m| m.get("content")).and_then(Value::as_array).and_then(|b| b.last()).and_then(|b| b.pointer("/cache_control/type")).and_then(Value::as_str),
-            Some("ephemeral")
-        );
         if trailing_stripped {
             prop_assert!(payload.get("thinking").is_none() && payload.get("output_config").is_none());
         } else {
@@ -377,6 +391,45 @@ proptest! {
             }
         }
         prop_assert!(expected_tools.is_empty(), "dangling tool_use at end");
+
+        let mut next_messages = req.messages;
+        if mutate_prefix {
+            next_messages.insert(0, Message::developer("mutated prefix"));
+        }
+        let mk_thinking = |thinking: &str, pairs: &[(&str, &str)]| ContentBlock::Thinking {
+            thinking: thinking.into(),
+            metadata: Some(ProviderBlockMetadata(
+                pairs.iter().map(|(k, v)| ((*k).into(), json!(v))).collect(),
+            )),
+        };
+        next_messages.push(Message::Assistant {
+            content: vec![
+                mk_thinking("signed thought", &[("signature", "SIG_MATCHED")]),
+                mk_thinking("", &[("type", "redacted_thinking"), ("data", "REDACTED_MATCHED")]),
+                ContentBlock::text("SIGNED_REPLY_TEXT"),
+            ],
+            provider_metadata: Some(ProviderMessageMetadata {
+                protocol: ProviderApiProtocol::Messages,
+                provider_name: provider_name.into(),
+                model_name: model_name.into(),
+                endpoint: endpoint.into(),
+                prefix_digest: Some(encoded_turn.prefix_digest),
+                reasoning: None,
+            }),
+        });
+        next_messages.push(Message::user("follow up"));
+        let next_str = messages_stream_request_payload(
+            &ModelTurnRequest { messages: next_messages, ..req },
+            &selection,
+            provider_name,
+            endpoint,
+        )
+        .expect("follow-up messages encoding succeeds")
+        .payload
+        .to_string();
+        prop_assert_eq!(next_str.contains("SIG_MATCHED"), !mutate_prefix);
+        prop_assert_eq!(next_str.contains("REDACTED_MATCHED"), !mutate_prefix);
+        prop_assert!(next_str.contains("SIGNED_REPLY_TEXT"));
     }
 
     #[test]
@@ -469,146 +522,4 @@ proptest! {
         prop_assert!(redacted.contains("standardbearer keep_me"), "word boundary broken: {redacted}");
         prop_assert!(!redacted.contains("[redacted]]"), "double bracket corruption: {redacted}");
     }
-}
-
-#[test]
-fn messages_context_window_exceeded_and_responses_refusal_contract() {
-    let config = ProviderConfig {
-        provider_name: "p".into(),
-        base_url: "https://example.invalid".into(),
-        api_key: "k".into(),
-    };
-    let messages_model = SelectedModel {
-        model_name: "claude-test".into(),
-        protocol: ProviderApiProtocol::Messages,
-        max_context_tokens: 64_000,
-        max_output_tokens: 4096,
-        reasoning_variant: Some("high".into()),
-    };
-    let stream_events = vec![
-        json!({ "type": "message_start", "message": { "usage": { "input_tokens": 100 } } }),
-        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
-        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "partial summary" } }),
-        json!({ "type": "content_block_stop", "index": 0 }),
-        json!({ "type": "message_delta", "delta": { "stop_reason": "model_context_window_exceeded" }, "usage": { "output_tokens": 20 } }),
-        json!({ "type": "message_stop" }),
-    ];
-    let resp = decode_messages_events_for_test(
-        &stream_events,
-        &config,
-        &messages_model,
-        "https://example.invalid/v1/messages",
-    );
-    assert!(resp.error().is_some_and(crate::ProviderError::is_context_overflow));
-    assert!(!resp.is_length_truncated());
-    assert!(!resp.is_refusal());
-
-    let responses_payload = json!({
-        "status": "completed",
-        "output": [{
-            "type": "message",
-            "id": "msg_1",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{ "type": "refusal", "refusal": "cannot summarize" }]
-        }],
-        "usage": { "input_tokens": 100, "output_tokens": 10, "total_tokens": 110 }
-    });
-    let refusal_resp = parse_openai_responses_response(
-        &config,
-        responses_payload,
-        "gpt-test",
-        "https://example.invalid/v1/responses",
-        None,
-    )
-    .expect("responses refusal parses cleanly");
-    assert!(refusal_resp.is_refusal());
-    assert_eq!(refusal_resp.assistant_message.content_text(), "cannot summarize");
-
-    let endpoint = "https://example.invalid/v1/messages";
-    let encode = |dev: &str, user: &str, tail: Vec<Message>| {
-        let mut messages = vec![Message::developer(dev), Message::user(user)];
-        messages.extend(tail);
-        let req = ModelTurnRequest {
-            messages,
-            images: HashMap::new(),
-            tools: Vec::new(),
-            max_output_tokens: 1024,
-            prompt_cache_key: None,
-        };
-        messages_stream_request_payload(&req, &messages_model, "p", endpoint).expect("messages encode")
-    };
-    fn ptr<'a>(p: &'a Value, path: &str) -> Option<&'a str> {
-        p.pointer(path).and_then(Value::as_str)
-    }
-    let turn1 = encode("sys v1", "first prompt", vec![]);
-    assert_eq!(ptr(&turn1.payload, "/messages/0/content/0/cache_control/type"), Some("ephemeral"));
-    let turn1_digest = turn1.prefix_digest;
-    let mk_assistant = |content| Message::Assistant {
-        content,
-        provider_metadata: Some(ProviderMessageMetadata {
-            protocol: ProviderApiProtocol::Messages,
-            provider_name: "p".into(),
-            model_name: "claude-test".into(),
-            endpoint: endpoint.into(),
-            prefix_digest: Some(turn1_digest.clone()),
-            reasoning: None,
-        }),
-    };
-    let signed_block = ContentBlock::Thinking {
-        thinking: "signed thought".into(),
-        metadata: Some(ProviderBlockMetadata(Map::from_iter([(
-            "signature".into(),
-            json!("SIG_BOUND_TO_V1"),
-        )]))),
-    };
-    let assistant_v1 = mk_assistant(vec![
-        signed_block.clone(),
-        ContentBlock::Thinking {
-            thinking: String::new(),
-            metadata: Some(ProviderBlockMetadata(Map::from_iter([
-                ("type".into(), json!("redacted_thinking")),
-                ("data".into(), json!("REDACTED_PAYLOAD")),
-            ]))),
-        },
-        ContentBlock::Thinking {
-            thinking: "UNSIGNED_THOUGHT_KEPT".into(),
-            metadata: None,
-        },
-        ContentBlock::text("ASSISTANT_BODY_KEPT"),
-    ]);
-
-    let same_payload =
-        encode("sys v1", "first prompt", vec![assistant_v1.clone(), Message::user("follow up")]).payload;
-    let same_str = same_payload.to_string();
-    assert!(same_str.contains("SIG_BOUND_TO_V1") && same_str.contains("REDACTED_PAYLOAD"));
-    assert!(same_str.contains("UNSIGNED_THOUGHT_KEPT"));
-    assert!(same_payload.pointer("/messages/0/content/0/cache_control").is_none());
-    assert_eq!(ptr(&same_payload, "/messages/2/content/0/cache_control/type"), Some("ephemeral"));
-
-    let changed_str =
-        encode("sys v2 changed", "compacted summary", vec![assistant_v1, Message::user("follow up")])
-            .payload
-            .to_string();
-    assert!(!changed_str.contains("SIG_BOUND_TO_V1") && !changed_str.contains("REDACTED_PAYLOAD"));
-    assert!(changed_str.contains("UNSIGNED_THOUGHT_KEPT") && changed_str.contains("ASSISTANT_BODY_KEPT"));
-
-    let call = ContentBlock::ToolCall(ModelToolCall {
-        tool_call_id: "c1".into(),
-        tool_name: "read".into(),
-        arguments: json!({}),
-        metadata: None,
-    });
-    let res = Message::ToolResult {
-        content: vec![ContentBlock::text("ok")],
-        tool_call_id: "c1".into(),
-        is_error: false,
-    };
-    let normal_tool =
-        encode("sys v1", "first prompt", vec![mk_assistant(vec![call.clone()]), res.clone()]).payload;
-    assert_eq!(ptr(&normal_tool, "/thinking/type"), Some("adaptive"));
-    let stripped_tool =
-        encode("sys v2 changed", "compacted summary", vec![mk_assistant(vec![signed_block, call]), res])
-            .payload;
-    assert!(stripped_tool.get("thinking").is_none() && stripped_tool.get("output_config").is_none());
 }

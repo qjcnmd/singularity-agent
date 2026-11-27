@@ -26,15 +26,9 @@ impl ThreadCatalog {
         model: protocol::ModelSelection,
         disabled_modules: Vec<String>,
     ) -> Result<SessionManager, CatalogError> {
-        let thread_id = Uuid::now_v7().to_string();
-        SessionManager::create_with_id(
-            Path::new(cwd),
-            &self.sessions_dir,
-            &thread_id,
-            model,
-            disabled_modules,
-        )
-        .map_err(|error| self.session_error(&thread_id, error))
+        let thread_id = Uuid::now_v7();
+        SessionManager::create_with_id(Path::new(cwd), &self.sessions_dir, thread_id, model, disabled_modules)
+            .map_err(|error| self.session_error(&thread_id.to_string(), error))
     }
 
     pub(crate) fn open_session(&self, thread_id: &str) -> Result<SessionManager, CatalogError> {
@@ -88,10 +82,6 @@ impl ThreadCatalog {
             })
     }
 
-    pub(crate) fn session_cwd(&self, thread_id: &str) -> Result<PathBuf, CatalogError> {
-        Ok(open_thread_read_only(&self.sessions_dir, thread_id)?.cwd().to_path_buf())
-    }
-
     pub(crate) fn delete(&self, thread_id: &str) -> Result<(), CatalogError> {
         let path = checked_session_path(&self.sessions_dir, thread_id)?;
         for directory in [
@@ -141,11 +131,7 @@ fn checked_session_path(sessions_dir: &Path, thread_id: &str) -> Result<PathBuf,
 
 fn open_thread_read_only(sessions_dir: &Path, thread_id: &str) -> Result<SessionData, CatalogError> {
     let path = checked_session_path(sessions_dir, thread_id)?;
-    let session = SessionData::open(&path).map_err(|error| CatalogError::session(thread_id, &path, error))?;
-    session
-        .verify_session_id(thread_id)
-        .map_err(|error| CatalogError::session(thread_id, &path, error))?;
-    Ok(session)
+    SessionData::open(&path, Some(thread_id)).map_err(|error| CatalogError::session(thread_id, &path, error))
 }
 
 #[derive(Debug, thiserror::Error)]

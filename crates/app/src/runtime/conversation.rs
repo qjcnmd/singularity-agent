@@ -7,7 +7,6 @@ mod turn;
 mod view;
 
 use self::state::{ConversationState, TurnControls, TurnLifecycle};
-pub(crate) use self::turn::ContextPreview;
 
 use std::sync::{Arc, Mutex};
 
@@ -35,7 +34,6 @@ pub(crate) struct Conversation {
 struct Operation {
     source: protocol::SessionOperation,
     controls: Arc<TurnControls>,
-    prepared_context: Option<Box<agent::agent::RequestContext>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -107,7 +105,6 @@ impl Conversation {
                     last_context_window: context_window,
                     auto_resume: true,
                     closing: false,
-                    context_preview: None,
                 }),
                 writer,
                 bash_tasks,
@@ -214,9 +211,6 @@ impl Conversation {
         writer.append_metadata(SessionMetadata::ThreadSettings { selection: selection.clone() })?;
         state.model = selection.clone();
         state.last_context_window = Some(context_window);
-        if let Some(preview) = &state.context_preview {
-            preview.cancel();
-        }
         drop(writer);
         drop(state);
         self.publish_changed(&mut view);

@@ -168,10 +168,7 @@ function extractTurnEdits(items: HistoryItem[]): TurnFileEdit[] {
     const counts = /^\+(\d+) -(\d+)$/.exec(summaryLine)
     const added = counts ? Number(counts[1]) : 0
     const deleted = counts ? Number(counts[2]) : 0
-    const body = firstNewline >= 0 ? output.slice(firstNewline + 1) : ''
-    const fileCreated = item.result?.fileCreated
-    const created = fileCreated === true
-      || (fileCreated === undefined && item.name === 'write' && deleted === 0 && body.startsWith('@@ -0,0 +'))
+    const created = item.result?.fileCreated === true
     if (!created && added === 0 && deleted === 0) continue
     edits.push({ path: rawPath, added, deleted, created })
   }

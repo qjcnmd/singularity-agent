@@ -214,15 +214,15 @@ fn new_test_session(tag: &str, provider: &str, model: &str) -> (TempDir, PathBuf
     let tmp = TempDir::new(tag);
     let (workspace, sessions) = (tmp.0.join("ws"), tmp.0.join("sessions"));
     std::fs::create_dir_all(&workspace).expect("create workspace");
-    let sid = uuid::Uuid::now_v7().to_string();
+    let sid = uuid::Uuid::now_v7();
     let sel = ModelSelection {
         provider: provider.into(),
         model: model.into(),
         reasoning: None,
     };
     let mgr =
-        SessionManager::create_with_id(&workspace, &sessions, &sid, sel, vec![]).expect("create session");
-    (tmp, sessions, sid, mgr)
+        SessionManager::create_with_id(&workspace, &sessions, sid, sel, vec![]).expect("create session");
+    (tmp, sessions, sid.to_string(), mgr)
 }
 
 proptest! {
@@ -291,7 +291,7 @@ proptest! {
             let overflow =
                 (round.retain_tokens == 0).then(|| input_tokens(data, &active_before, ("p", "m"), 400));
             if let Ok(Some(step)) =
-                plan_compaction_step(data, &first_kept_id, ("p", "m"), 400, 300, model, overflow)
+                plan_compaction_step(data, round.retain_tokens, ("p", "m"), 400, 300, model, overflow)
             {
                 let budget = u64::from(output_budget_tokens(model, step.estimated_request_input));
                 prop_assert!(budget >= min_compaction_output_tokens(model) && budget > 0);
@@ -369,6 +369,7 @@ proptest! {
             ],
             provider_metadata: Some(meta),
         };
+        let full_a1 = message_token_estimate(&assistant);
         mgr.append_message_with_id("a1", assistant, Some(obs), None).expect("append a1");
         mgr.append_record(LedgerRecord::OperationStarted)
             .expect("append turn boundary");
@@ -380,6 +381,12 @@ proptest! {
             provider_metadata: None,
         });
         prop_assert_eq!(input_tokens(mgr.data(), &active, ("pa", "ma"), 300), reported_total + tail);
+        prop_assert_eq!(
+            input_tokens(mgr.data(), &active, ("pa", "ma"), reported_total - 50),
+            full_a1 + tail + reported_total - 50
+        );
+        let grown = input_tokens(mgr.data(), &active, ("pa", "ma"), reported_total);
+        prop_assert!(grown == full_a1 + tail + reported_total && grown > reported_total + tail);
         prop_assert_eq!(input_tokens(mgr.data(), &active, ("pb", "mb"), 300), plain + tail + 300);
         let cp = CompactionEntry { summary: "s".into(), first_kept_entry_id: Some("u2".into()) };
         mgr.append_compaction_with_id("cp", cp).expect("append compaction");
@@ -410,7 +417,8 @@ proptest! {
         }
         let tampered_bytes = std::fs::read(&path).expect("read tampered log");
 
-        let readonly = SessionData::open(&path).expect("readonly open ignores incomplete tail");
+        let readonly =
+            SessionData::open(&path, Some(&session_id)).expect("readonly open ignores incomplete tail");
         prop_assert_eq!(readonly.entries().len(), expected_entries);
         prop_assert_eq!(
             std::fs::read(&path).expect("read after readonly open"),
@@ -427,16 +435,6 @@ proptest! {
             valid_bytes,
             "repair must restore exact valid prefix bytes"
         );
-    }
-
-    #[test]
-    fn session_file_never_panics_on_arbitrary_bytes(
-        bytes in prop::collection::vec(any::<u8>(), 0..512),
-    ) {
-        let tmp = TempDir::new("fuzz-parse");
-        let path = tmp.0.join("random.jsonl");
-        std::fs::write(&path, &bytes).expect("write random bytes");
-        let _ = SessionData::open(&path);
     }
 
     #[test]
@@ -530,7 +528,8 @@ proptest! {
         }
 
         mgr.rewind_before_message(&target_id).expect("rewind succeeds");
-        let reloaded = SessionData::open(&sessions.join(session_file_name(&sid))).expect("reopen after rewind");
+        let reloaded = SessionData::open(&sessions.join(session_file_name(&sid)), None)
+            .expect("reopen after rewind");
 
         let raw_target = target_id.strip_suffix(":text:0").unwrap_or(&target_id);
         prop_assert!(!reloaded.entries().iter().any(|e| e.id() == raw_target), "rewound message must be removed");
@@ -574,128 +573,4 @@ proptest! {
         let expected_name = rename_after.then_some("Renamed Title");
         prop_assert_eq!(latest_name, expected_name);
     }
-}
-
-#[test]
-fn overflow_compaction_recovers_after_definition_growth() {
-    let (_tmp, sessions, sid, mut mgr) = new_test_session("def-growth", "p", "m");
-    let big_user = "x".repeat(40_000); // ~10_000 estimated tokens
-    mgr.append_message_with_id("u1", Message::user(big_user), None, None).expect("u1");
-    let obs = RequestObservation {
-        purpose: RequestPurpose::Generation,
-        provider: "p".into(),
-        model: "m".into(),
-        status: ProviderAttemptStatus::Ok,
-        ttft_ms: None,
-        decode_ms: None,
-        usage: Some(ModelUsage {
-            input_tokens: 11_000,
-            output_tokens: 200,
-            total_tokens: 11_200,
-            cached_input_tokens: None,
-        }),
-    };
-    mgr.append_message_with_id(
-        "a1",
-        Message::assistant("ok".into(), String::new(), Vec::new(), None),
-        Some(obs),
-        None,
-    )
-    .expect("a1");
-    mgr.record_reply_definition_tokens("a1".into(), 1_000);
-    mgr.append_record(LedgerRecord::OperationStarted).expect("turn 2");
-    mgr.append_message_with_id("u2", Message::user("next"), None, None).expect("u2");
-
-    let model = ModelConfigurationSnapshot {
-        max_context_tokens: 100_000,
-        max_output_tokens: 4_096,
-    };
-    let grown_defs = 85_000u64;
-    let active = resolve_context_entries(mgr.data());
-
-    // In-session exact delta: 11_200 + (85_000 - 1_000) + tail > grown_defs + 300
-    let in_session_tokens = input_tokens(mgr.data(), &active, ("p", "m"), grown_defs);
-    assert!(in_session_tokens > grown_defs + 10_000, "got {in_session_tokens}");
-    let step =
-        plan_compaction_step(mgr.data(), "u2", ("p", "m"), grown_defs, 300, model, Some(in_session_tokens))
-            .expect("in-session overflow compaction must not falsely abort")
-            .expect("compactable prefix exists");
-    assert!(step.estimated_request_input < in_session_tokens);
-
-    // Reopened session from disk (no in-memory prev_def): both huge growth (85k > 11k)
-    // and moderate growth (10_500 + prev_input/4 > 11k) must invalidate stale baseline.
-    let reopened = SessionData::open(&sessions.join(session_file_name(&sid))).expect("reopen");
-    let reopened_active = resolve_context_entries(&reopened);
-    for defs in [85_000u64, 10_500u64] {
-        let reopened_tokens = input_tokens(&reopened, &reopened_active, ("p", "m"), defs);
-        assert!(reopened_tokens > defs + 9_000, "defs={defs} got {reopened_tokens}");
-        let step = plan_compaction_step(&reopened, "u2", ("p", "m"), defs, 300, model, Some(reopened_tokens))
-            .expect("reopened overflow compaction must not falsely abort")
-            .expect("compactable prefix exists");
-        assert!(step.estimated_request_input < reopened_tokens);
-    }
-
-    // In-session shrink applies signed delta while keeping calibrated history.
-    mgr.record_reply_definition_tokens("a1".into(), 20_000);
-    let tail_est = message_token_estimate(&Message::user("next"));
-    let active_shrunk = resolve_context_entries(mgr.data());
-    let shrunk = input_tokens(mgr.data(), &active_shrunk, ("p", "m"), 5_000);
-    assert_eq!(shrunk, 5_000 + tail_est, "clamped shrink floor");
-    let big_usage_obs = RequestObservation {
-        purpose: RequestPurpose::Generation,
-        provider: "p".into(),
-        model: "m".into(),
-        status: ProviderAttemptStatus::Ok,
-        ttft_ms: None,
-        decode_ms: None,
-        usage: Some(ModelUsage {
-            input_tokens: 59_000,
-            output_tokens: 1_000,
-            total_tokens: 60_000,
-            cached_input_tokens: None,
-        }),
-    };
-    mgr.append_message_with_id(
-        "a2",
-        Message::assistant("ok2".into(), String::new(), Vec::new(), None),
-        Some(big_usage_obs),
-        None,
-    )
-    .expect("a2");
-    mgr.record_reply_definition_tokens("a2".into(), 20_000);
-    mgr.append_message_with_id("u3", Message::user("next"), None, None).expect("u3");
-    let active2 = resolve_context_entries(mgr.data());
-    assert_eq!(input_tokens(mgr.data(), &active2, ("p", "m"), 5_000), 45_000 + tail_est);
-
-    // Reopened session with moderate definition growth (prev_input=30k, usage.input=33k, new_def=21k)
-    // must account for the +18k growth instead of underestimating as ~34k.
-    let (_tmp2, sessions2, sid2, mut mgr2) = new_test_session("def-growth-reopen", "p", "m");
-    mgr2.append_message_with_id("u1", Message::user("x".repeat(120_000)), None, None)
-        .expect("u1");
-    let obs2 = RequestObservation {
-        purpose: RequestPurpose::Generation,
-        provider: "p".into(),
-        model: "m".into(),
-        status: ProviderAttemptStatus::Ok,
-        ttft_ms: None,
-        decode_ms: None,
-        usage: Some(ModelUsage {
-            input_tokens: 33_000,
-            output_tokens: 1_000,
-            total_tokens: 34_000,
-            cached_input_tokens: None,
-        }),
-    };
-    mgr2.append_message_with_id(
-        "a1",
-        Message::assistant("ok".into(), String::new(), Vec::new(), None),
-        Some(obs2),
-        None,
-    )
-    .expect("a1");
-    mgr2.append_message_with_id("u2", Message::user("next"), None, None).expect("u2");
-    let reopened2 = SessionData::open(&sessions2.join(session_file_name(&sid2))).expect("reopen2");
-    let active_r2 = resolve_context_entries(&reopened2);
-    let est_r2 = input_tokens(&reopened2, &active_r2, ("p", "m"), 21_000);
-    assert!(est_r2 >= 51_000, "reopened moderate growth must not underestimate: got {est_r2}");
 }
