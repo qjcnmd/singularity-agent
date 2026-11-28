@@ -7,18 +7,18 @@ use std::{borrow::Cow, collections::BTreeMap, path::Path};
 #[serde(deny_unknown_fields)]
 pub(crate) struct Configuration {
     #[serde(rename = "mcpServers", default)]
-    pub servers: BTreeMap<String, ServerConfig>,
+    pub(crate) servers: BTreeMap<String, ServerConfig>,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ServerConfig {
     #[serde(default = "startup_timeout")]
-    pub startup_timeout_sec: u64,
+    pub(crate) startup_timeout_sec: u64,
     #[serde(default = "tool_timeout")]
-    pub tool_timeout_sec: u64,
+    pub(crate) tool_timeout_sec: u64,
     #[serde(flatten)]
-    pub transport: McpTransportConfig,
+    pub(crate) transport: McpTransportConfig,
 }
 
 fn startup_timeout() -> u64 {
@@ -29,7 +29,7 @@ fn tool_timeout() -> u64 {
 }
 
 impl ServerConfig {
-    pub fn from_input(input: McpServerInput) -> Self {
+    pub(crate) fn from_input(input: McpServerInput) -> Self {
         Self {
             startup_timeout_sec: input.startup_timeout_sec,
             tool_timeout_sec: input.tool_timeout_sec,
@@ -37,7 +37,7 @@ impl ServerConfig {
         }
     }
 
-    pub fn into_input(self, server_id: String) -> McpServerInput {
+    pub(crate) fn into_input(self, server_id: String) -> McpServerInput {
         McpServerInput {
             server_id,
             startup_timeout_sec: self.startup_timeout_sec,
@@ -46,7 +46,7 @@ impl ServerConfig {
         }
     }
 
-    pub fn validate(&self, id: &str) -> Result<(), McpError> {
+    pub(crate) fn validate(&self, id: &str) -> Result<(), McpError> {
         if id.is_empty()
             || !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
         {
@@ -98,7 +98,7 @@ impl ServerConfig {
         Ok(())
     }
 
-    pub fn redact(&self, error: String) -> String {
+    pub(crate) fn redact(&self, error: String) -> String {
         let mut values: Vec<Cow<'_, str>> = Vec::new();
         match &self.transport {
             McpTransportConfig::Stdio { args, env, .. } => {
@@ -286,7 +286,7 @@ pub(crate) fn read(home: &Path) -> Result<Configuration, McpError> {
             return Ok(Configuration::default());
         }
         Err(source) => {
-            return Err(McpError::io(&format!("无法读取 {}", path.display()), source));
+            return Err(McpError::io(&format!("无法读取 {}", path.display()), &source));
         }
     };
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
@@ -301,5 +301,5 @@ pub(crate) fn read(home: &Path) -> Result<Configuration, McpError> {
 
 pub(crate) fn write(home: &Path, config: &Configuration) -> Result<(), McpError> {
     app_core::write_json_atomic(&home.join("mcp.json"), config)
-        .map_err(|source| McpError::io("无法保存 mcp.json", source))
+        .map_err(|source| McpError::io("无法保存 mcp.json", &source))
 }

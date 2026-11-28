@@ -11,9 +11,8 @@ use crate::provider::{ProviderStreamEvent, endpoint};
 use crate::responses::{openai_responses_stream_request_payload, read_responses_sse_stream};
 use crate::transport::http::{
     BoundedBodyReadError, MAX_HTTP_ERROR_BODY_BYTES, apply_provider_auth, provider_cancelled_error,
-    provider_transport_error, read_bounded_body,
+    provider_client, provider_future, provider_transport_error, read_bounded_body, retry_after_delay,
 };
-use crate::transport::{provider_client, provider_future, retry_after_delay};
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
 
 pub struct ModelClient {

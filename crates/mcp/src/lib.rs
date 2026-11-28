@@ -90,14 +90,16 @@ impl McpManager {
         .expect("MCP config read completes while the runtime is running")
     }
 
-    fn spawn_close(&self, cells: Vec<ConnectionCell>) {
-        if cells.is_empty() {
-            return;
-        }
-        let task = tokio::spawn(close_connections(cells));
+    fn track_close(&self, task: tokio::task::JoinHandle<()>) {
         let mut closing = self.closing.lock().expect("MCP closing lock poisoned");
         closing.retain(|existing| !existing.is_finished());
         closing.push(task);
+    }
+
+    fn spawn_close(&self, cells: Vec<ConnectionCell>) {
+        if !cells.is_empty() {
+            self.track_close(tokio::spawn(close_connections(cells)));
+        }
     }
 
     pub fn list(&self, cwd: &Path) -> Result<Vec<McpServerState>, McpError> {
@@ -318,13 +320,27 @@ impl McpManager {
                 Ok((server_config, cell, guard, evicted))
             })
             .await?;
+        let evicted_closed = if evicted.is_empty() {
+            None
+        } else {
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            self.track_close(tokio::spawn(async move {
+                close_connections(evicted).await;
+                let _ = done_tx.send(());
+            }));
+            Some(done_rx)
+        };
         shutdown
             .run_until_cancelled(async {
-                close_connections(evicted).await;
+                if let Some(closed) = evicted_closed {
+                    let _ = closed.await;
+                }
                 let still_current =
                     self.lock_pool().get(&key).is_some_and(|(_, current)| Arc::ptr_eq(current, &cell));
                 if still_current {
                     let _ = Self::tools(id.to_owned(), cwd, config, guard).await;
+                } else {
+                    drop(guard);
                 }
                 self.with_config(move |mut config, pool| {
                     let (directory, id) = key;

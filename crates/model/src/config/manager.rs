@@ -3,16 +3,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use protocol::{
-    ModelConfigurationInput, ProviderConfigurationInput, RedactedModelCatalog, RedactedProvider,
-    RedactedWebSearchConfig,
+    ModelConfigurationInput, ModelSelection, ProviderApiProtocol, ProviderConfigurationInput,
+    RedactedModelCatalog, RedactedProvider, RedactedWebSearchConfig,
 };
 
-use super::{
-    ModelSelection, ProviderApiProtocol, ProviderConfig, ProviderError, SelectedModel, UserConfigFile,
-    UserConfigModel, UserConfigProvider, UserConfigWebSearch, configuration_error, read_user_config_file,
-    resolve_model_definition, resolve_model_selection, validate_api_key, validate_base_url,
-    validate_identifier, write_user_config_file,
+use super::selection::{ProviderConfig, SelectedModel, resolve_model_definition, resolve_model_selection};
+use super::user::{
+    UserConfigFile, UserConfigModel, UserConfigProvider, UserConfigWebSearch, read_user_config_file,
+    write_user_config_file,
 };
+use super::{configuration_error, validate_api_key, validate_base_url, validate_identifier};
+use crate::error::ProviderError;
 use crate::web::{DEFAULT_WEB_SEARCH_BASE_URL, WebSearchAccess};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

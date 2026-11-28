@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{ProviderError, configuration_error, validate_identifier};
-use crate::ModelErrorKind;
+use super::{configuration_error, validate_identifier};
 use crate::error::{
-    apply_provider_error_body, bounded_provider_error_diagnostic, provider_error_kind_for_http_status,
+    ModelErrorKind, ProviderError, apply_provider_error_body, bounded_provider_error_diagnostic,
+    provider_error_kind_for_http_status,
 };
 use crate::transport::http::{
     BoundedBodyReadError, MAX_HTTP_ERROR_BODY_BYTES, apply_provider_auth, client_builder, read_bounded_body,
@@ -23,14 +23,9 @@ fn discovery_client() -> Result<reqwest::Client, ProviderError> {
     if let Some(client) = CLIENT.get() {
         return Ok(client.clone());
     }
-    let client = client_builder()
-        .timeout(Duration::from_secs(DISCOVERY_TIMEOUT_SECONDS))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(app_core::identity::USER_AGENT)
-        .build()
-        .map_err(|error| {
-            configuration_error(format!("模型查询客户端无法启动（{}）。", transport_error_source(error)))
-        })?;
+    let client = client_builder().timeout(Duration::from_secs(DISCOVERY_TIMEOUT_SECONDS)).build().map_err(
+        |error| configuration_error(format!("模型查询客户端无法启动（{}）。", transport_error_source(error))),
+    )?;
     Ok(CLIENT.get_or_init(|| client).clone())
 }
 
@@ -46,22 +41,19 @@ pub(crate) async fn discover(
     if !response.status().is_success() {
         return Err(discovery_http_error(response, api_key).await);
     }
-    let body: Value = read_response_body(response).await?;
-    read_listing(&body)
-}
-
-async fn read_response_body(mut response: reqwest::Response) -> Result<Value, ProviderError> {
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(discovery_transport_error)? {
-        if bytes.len().saturating_add(chunk.len()) > MAX_DISCOVERY_BODY_BYTES {
-            return Err(ProviderError::new(ModelErrorKind::Other, "模型目录响应过大。"));
-        }
-        bytes.extend_from_slice(&chunk);
+    let bytes = match read_bounded_body(response, MAX_DISCOVERY_BODY_BYTES + 1, None).await {
+        Ok(bytes) => bytes,
+        Err(BoundedBodyReadError::Transport(error)) => return Err(discovery_transport_error(error)),
+        Err(BoundedBodyReadError::Cancelled) => unreachable!("un-cancellable body read"),
+    };
+    if bytes.len() > MAX_DISCOVERY_BODY_BYTES {
+        return Err(ProviderError::new(ModelErrorKind::Other, "模型目录响应过大。"));
     }
-    serde_json::from_slice(&bytes).map_err(|error| {
+    let body: Value = serde_json::from_slice(&bytes).map_err(|error| {
         let detail = bounded_provider_error_diagnostic(&error.to_string());
         ProviderError::new(ModelErrorKind::Other, format!("提供方未返回有效的模型目录（{detail}）。"))
-    })
+    })?;
+    read_listing(&body)
 }
 
 fn discovery_transport_error(error: reqwest::Error) -> ProviderError {

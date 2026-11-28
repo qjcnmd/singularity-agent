@@ -26,7 +26,7 @@ pub(crate) struct Connection {
     config: ServerConfig,
 }
 
-pub(crate) struct Handler {
+struct Handler {
     root: String,
 }
 
@@ -89,11 +89,11 @@ impl StderrCapture {
 }
 
 impl Connection {
-    pub fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.peer.is_transport_closed()
     }
 
-    pub async fn connect(cwd: &Path, config: ServerConfig) -> Result<Self, McpError> {
+    pub(crate) async fn connect(cwd: &Path, config: ServerConfig) -> Result<Self, McpError> {
         let stderr_capture = StderrCapture::default();
         let root = reqwest::Url::from_directory_path(cwd)
             .map_err(|()| McpError::new(format!("MCP 项目目录无法转换为文件 URI：{}", cwd.display())))?
@@ -142,18 +142,18 @@ impl Connection {
         }
     }
 
-    pub async fn tools(&self) -> Result<Vec<Tool>, McpError> {
+    pub(crate) async fn tools(&self) -> Result<Vec<Tool>, McpError> {
         tokio::time::timeout(Duration::from_secs(self.config.startup_timeout_sec), self.peer.list_all_tools())
             .await
             .map_err(|_| McpError::new("MCP 工具发现超时。"))?
             .map_err(|error| McpError::new(self.config.redact(format!("MCP 工具发现失败：{error}"))))
     }
 
-    pub fn instructions(&self) -> Option<String> {
+    pub(crate) fn instructions(&self) -> Option<String> {
         self.peer.peer_info().and_then(|info| info.instructions.clone())
     }
 
-    pub async fn call(
+    pub(crate) async fn call(
         &self,
         name: &str,
         args: serde_json::Map<String, serde_json::Value>,
@@ -203,7 +203,7 @@ impl Connection {
         Err(McpError::new(message))
     }
 
-    pub async fn close(mut self) {
+    pub(crate) async fn close(mut self) {
         // 给 rmcp 内部 3 秒优雅退出的基础上预留额外时间，确保超时后能完成 kill。
         match self.service.close_with_timeout(Duration::from_secs(5)).await {
             Ok(Some(_)) => {}
@@ -272,6 +272,7 @@ async fn connect_http(
         .redirect(reqwest::redirect::Policy::none())
         .no_gzip()
         .connect_timeout(startup)
+        .user_agent(app_core::identity::USER_AGENT)
         .build()
         .map_err(|error| McpError::new(format!("无法建立 MCP HTTP 客户端：{error}")))?;
     let headers = headers

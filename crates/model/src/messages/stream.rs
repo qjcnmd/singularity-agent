@@ -4,20 +4,20 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::selection::{ProviderConfig, SelectedModel};
-use crate::error::{
-    ModelErrorKind, ProviderError, bounded_provider_error_diagnostic, provider_embedded_error,
-    provider_error_fields,
-};
+use crate::error::{ModelErrorKind, ProviderError, bounded_provider_error_diagnostic};
 use crate::provider::{
     ProviderStreamEvent, finalize_provider_response, parse_tool_arguments, provider_response_validation_error,
 };
 use crate::transport::stream::{
-    SseStreamDecoder, provider_stream_malformed_error, provider_stream_unterminated_error, read_sse_stream,
+    SseStreamDecoder, embedded_stream_error, parse_sse_json_event, provider_stream_malformed_error,
+    provider_stream_unterminated_error, read_sse_stream, stream_premature_eof_error,
 };
 use crate::types::{
     ContentBlock, Message, ModelStopReason, ModelToolCall, ModelTurnResponse, ModelUsage,
     ProviderBlockMetadata, ProviderMessageMetadata,
 };
+
+const MALFORMED_STREAM_MESSAGE: &str = "provider Messages stream was malformed";
 
 pub(crate) async fn read_messages_sse_stream(
     cancellation: &CancellationToken,
@@ -111,23 +111,12 @@ impl SseStreamDecoder for MessagesSseDecoder<'_> {
     }
 
     fn frame_unterminated(&self) -> ProviderError {
-        provider_stream_unterminated_error("provider Messages stream was malformed", self.received_event)
+        provider_stream_unterminated_error(MALFORMED_STREAM_MESSAGE, self.received_event)
     }
 
     fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError> {
-        let payload = serde_json::from_slice::<Value>(data).map_err(|error| {
-            let detail = bounded_provider_error_diagnostic(&error.to_string());
-            ProviderError::diagnostic(
-                ModelErrorKind::Other,
-                "provider Messages stream was malformed",
-                &["event_data_invalid_json", detail.as_str()],
-            )
-        })?;
-        let event_type = payload
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| provider_messages_stream_malformed_error("event_type_missing"))?;
-        match event_type {
+        let (event_type, payload) = parse_sse_json_event(data, MALFORMED_STREAM_MESSAGE)?;
+        match event_type.as_str() {
             "message_start" => {
                 let message = payload
                     .get("message")
@@ -156,11 +145,8 @@ impl SseStreamDecoder for MessagesSseDecoder<'_> {
             }
             "ping" => {}
             "error" => {
-                let fields = provider_error_fields(
-                    payload.get("error").filter(|error| error.is_object()).unwrap_or(&payload),
-                );
-                return Err(provider_embedded_error(
-                    &fields,
+                return Err(embedded_stream_error(
+                    &payload,
                     "provider Messages stream returned an error",
                     self.api_key,
                 ));
@@ -319,7 +305,10 @@ impl<'a> MessagesSseDecoder<'a> {
     ) -> ModelTurnResponse {
         let stop_reason = result.and_then(|()| {
             if !self.completed {
-                return Err(provider_messages_stream_terminal_missing_error(self.received_event));
+                return Err(stream_premature_eof_error(
+                    "provider Messages stream did not contain message_stop",
+                    self.received_event,
+                ));
             }
             match self.stop_reason.as_deref() {
                 Some("end_turn" | "tool_use" | "stop_sequence" | "pause_turn") => Ok(ModelStopReason::Stop),
@@ -426,14 +415,5 @@ fn block_index(payload: &Value) -> Result<u64, ProviderError> {
 }
 
 fn provider_messages_stream_malformed_error(reason: &'static str) -> ProviderError {
-    provider_stream_malformed_error("provider Messages stream was malformed", reason)
-}
-
-fn provider_messages_stream_terminal_missing_error(received_event: bool) -> ProviderError {
-    let kind = if received_event {
-        ModelErrorKind::Temporary
-    } else {
-        ModelErrorKind::Other
-    };
-    ProviderError::new(kind, "provider Messages stream did not contain message_stop")
+    provider_stream_malformed_error(MALFORMED_STREAM_MESSAGE, reason)
 }

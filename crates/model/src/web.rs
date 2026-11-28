@@ -114,10 +114,8 @@ fn web_client() -> Result<reqwest::Client, ProviderError> {
         return Ok(client.clone());
     }
     let client = client_builder()
-        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(WEB_CONNECT_TIMEOUT_SECONDS))
         .read_timeout(Duration::from_secs(WEB_READ_TIMEOUT_SECONDS))
-        .user_agent(app_core::identity::USER_AGENT)
         .build()
         .map_err(|error| {
             ProviderError::new(

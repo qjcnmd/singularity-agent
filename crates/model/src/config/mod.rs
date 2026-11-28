@@ -1,15 +1,13 @@
 mod discovery;
-pub(crate) mod manager;
+mod manager;
 pub(crate) mod selection;
-pub(crate) mod user;
+mod user;
 
 pub use manager::{ModelConfigManager, ModelConfigurationSnapshot};
-pub(crate) use user::*;
 
-use super::{ModelErrorKind, ProviderError};
+use protocol::ProviderApiProtocol;
 
-use protocol::{ModelSelection, ProviderApiProtocol};
-use selection::{ProviderConfig, SelectedModel, resolve_model_definition, resolve_model_selection};
+use crate::error::{ModelErrorKind, ProviderError};
 
 pub(crate) fn configuration_error(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ModelErrorKind::Other, message)

@@ -1,7 +1,11 @@
 use reqwest::Response;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{ModelErrorKind, ProviderError};
+use crate::error::{
+    ModelErrorKind, ProviderError, bounded_provider_error_diagnostic, provider_embedded_error,
+    provider_error_fields,
+};
 use crate::transport::http::{provider_cancelled_error, provider_future};
 
 const MAX_SSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -146,6 +150,44 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
     }
 }
 
+pub(crate) fn parse_sse_json_event(
+    data: &[u8],
+    malformed_message: &'static str,
+) -> Result<(String, Value), ProviderError> {
+    let payload = serde_json::from_slice::<Value>(data).map_err(|error| {
+        let detail = bounded_provider_error_diagnostic(&error.to_string());
+        ProviderError::diagnostic(
+            ModelErrorKind::Other,
+            malformed_message,
+            &["event_data_invalid_json", detail.as_str()],
+        )
+    })?;
+    let event_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| provider_stream_malformed_error(malformed_message, "event_type_missing"))?
+        .to_owned();
+    Ok((event_type, payload))
+}
+
+pub(crate) fn embedded_stream_error(payload: &Value, fallback_message: &str, api_key: &str) -> ProviderError {
+    let fields =
+        provider_error_fields(payload.get("error").filter(|error| error.is_object()).unwrap_or(payload));
+    provider_embedded_error(&fields, fallback_message, api_key)
+}
+
+fn premature_eof_kind(received_event: bool) -> ModelErrorKind {
+    if received_event {
+        ModelErrorKind::Temporary
+    } else {
+        ModelErrorKind::Other
+    }
+}
+
+pub(crate) fn stream_premature_eof_error(message: &'static str, received_event: bool) -> ProviderError {
+    ProviderError::new(premature_eof_kind(received_event), message)
+}
+
 pub(crate) fn provider_stream_malformed_error(message: &'static str, reason: &'static str) -> ProviderError {
     ProviderError::diagnostic(ModelErrorKind::Other, message, &[reason])
 }
@@ -154,12 +196,7 @@ pub(crate) fn provider_stream_unterminated_error(
     message: &'static str,
     received_event: bool,
 ) -> ProviderError {
-    let kind = if received_event {
-        ModelErrorKind::Temporary
-    } else {
-        ModelErrorKind::Other
-    };
-    ProviderError::diagnostic(kind, message, &["event_frame_unterminated"])
+    ProviderError::diagnostic(premature_eof_kind(received_event), message, &["event_frame_unterminated"])
 }
 
 #[cfg(test)]
