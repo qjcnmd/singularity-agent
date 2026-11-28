@@ -1,5 +1,5 @@
 import { DRAFTS_DB_NAME } from './identity'
-import type { ModelSelection, ImageUpload } from './protocol'
+import type { ImageUpload } from './protocol'
 
 export interface DraftAnnotation {
   id: string
@@ -17,7 +17,6 @@ export interface Draft {
   images: File[]
   files: string[]
   annotations: DraftAnnotation[]
-  selection?: ModelSelection
   disabledModules?: string[]
 }
 export const emptyDraft: Draft = { text: '', images: [], files: [], annotations: [] }
@@ -29,7 +28,6 @@ const hasDraft = (draft: Draft | undefined) => draft !== undefined && (
   || draft.images.length > 0
   || draft.files.length > 0
   || draft.annotations.length > 0
-  || draft.selection !== undefined
   || (draft.disabledModules?.length ?? 0) > 0
 )
 

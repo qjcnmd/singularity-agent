@@ -15,6 +15,7 @@ dependencies = [
  "app_core",
  "base64 0.22.1",
  "globset",
+ "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "ignore",
