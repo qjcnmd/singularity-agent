@@ -90,7 +90,10 @@ class AppStore extends SessionStore {
 
   modelSelection(): ModelSelection | null {
     if (this.state.selectedSessionId !== null) return this.state.session?.runtime.selection ?? null
-    return this.inputDraft().selection ?? this.state.bootstrap?.modelCatalog.defaultSelection ?? null
+    const catalog = this.state.bootstrap?.modelCatalog
+    const last = this.state.lastModelSelection
+    if (last !== null && (catalog === undefined || selectedModel(catalog, last) !== undefined)) return last
+    return catalog?.defaultSelection ?? null
   }
 
   modelAvailable(): boolean {
@@ -221,10 +224,12 @@ class AppStore extends SessionStore {
 
   async updateSettings(selection: ModelSelection): Promise<boolean> {
     if (this.state.selectedSessionId === null) {
-      const key = this.draftKey()
-      return key !== null ? this.drafts.set(key, { ...this.inputDraft(), selection }) : false
+      this.saveView({ lastModelSelection: selection })
+      return true
     }
-    return this.sessionAction('session.updateSettings', sessionId => ({ sessionId, selection }))
+    const updated = await this.sessionAction('session.updateSettings', sessionId => ({ sessionId, selection }))
+    if (updated) this.saveView({ lastModelSelection: selection })
+    return updated
   }
 
   async removeWorkspace(workspaceRoot: string): Promise<boolean> {

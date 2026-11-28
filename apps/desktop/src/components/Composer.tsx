@@ -17,7 +17,7 @@ export const Composer = memo(ComposerView)
 
 function ComposerView() {
   const reducedMotion = useReducedMotion()
-  const state = useAppStore(['drafts', 'pendingActions', 'bootstrap', 'bootstrapLoad', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'liveSessions', 'sessionLoad'])
+  const state = useAppStore(['drafts', 'pendingActions', 'bootstrap', 'bootstrapLoad', 'selectedSessionId', 'selectedWorkspaceRoot', 'session', 'liveSessions', 'sessionLoad', 'lastModelSelection'])
   const { text: draft, images: imageDraft, files: fileDraft, annotations: annotationDraft, disabledModules } = appStore.inputDraft()
   const sessionId = state.selectedSessionId
   const draftKey = appStore.draftKey()

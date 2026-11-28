@@ -1,6 +1,6 @@
 import { defaultAccentColor, resolveAccentId } from './bubbleColors'
 import { VIEW_STORAGE_KEY } from './identity'
-import type { ViewportAnchor } from './protocol'
+import type { ModelSelection, ViewportAnchor } from './protocol'
 
 export const defaultAnchor = (): ViewportAnchor => ({
   mode: 'following', anchorItemId: null, offset: 0,
@@ -18,6 +18,7 @@ export interface PersistedView {
   accentColor: string
   selectedWorkspaceRoot: string | null
   selectedSessionId: string | null
+  lastModelSelection: ModelSelection | null
   sidebarWidth: number
   filePanelWidth: number
   sidebarCollapsed: boolean
@@ -27,6 +28,13 @@ export interface PersistedView {
   viewportAnchors: Record<string, ViewportAnchor>
 }
 
+function parseModelSelection(value: unknown): ModelSelection | null {
+  if (!value || typeof value !== 'object') return null
+  const { provider, model, reasoning } = value as Record<string, unknown>
+  if (typeof provider !== 'string' || typeof model !== 'string') return null
+  return { provider, model, reasoning: typeof reasoning === 'string' ? reasoning : null }
+}
+
 export function loadPersisted(): PersistedView {
   const fallback: PersistedView = {
     theme: 'light',
@@ -34,6 +42,7 @@ export function loadPersisted(): PersistedView {
     accentColor: defaultAccentColor,
     selectedWorkspaceRoot: null,
     selectedSessionId: null,
+    lastModelSelection: null,
     sidebarWidth: 268,
     filePanelWidth: 480,
     sidebarCollapsed: false,
@@ -58,6 +67,7 @@ export function loadPersisted(): PersistedView {
       selectedSessionId: typeof stored.selectedSessionId === 'string' || stored.selectedSessionId === null
         ? stored.selectedSessionId
         : fallback.selectedSessionId,
+      lastModelSelection: parseModelSelection(stored.lastModelSelection),
       sidebarWidth: typeof stored.sidebarWidth === 'number' && Number.isFinite(stored.sidebarWidth)
         ? clampSidebarWidth(stored.sidebarWidth)
         : fallback.sidebarWidth,
@@ -80,8 +90,8 @@ export function loadPersisted(): PersistedView {
 }
 
 export function persistView(value: PersistedView): void {
-  const { theme, messageFontSize, accentColor, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, stepsDefaultExpanded, viewportAnchors } = value
-  const view: PersistedView = { theme, messageFontSize, accentColor, selectedWorkspaceRoot, selectedSessionId, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, stepsDefaultExpanded, viewportAnchors }
+  const { theme, messageFontSize, accentColor, selectedWorkspaceRoot, selectedSessionId, lastModelSelection, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, stepsDefaultExpanded, viewportAnchors } = value
+  const view: PersistedView = { theme, messageFontSize, accentColor, selectedWorkspaceRoot, selectedSessionId, lastModelSelection, sidebarWidth, filePanelWidth, sidebarCollapsed, sidebarView, backgroundOpen, stepsDefaultExpanded, viewportAnchors }
   localStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify(view))
 }
 

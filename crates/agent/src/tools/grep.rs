@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use globset::GlobMatcher;
+use grep_matcher::LineTerminator;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{
     BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
@@ -97,15 +98,8 @@ pub(crate) fn execute(args: &GrepArgs, cwd: &Path, signal: &CancellationToken) -
     if signal.is_cancelled() {
         return error_result(ABORTED_MESSAGE);
     }
-    let matcher = match RegexMatcherBuilder::new()
-        .case_insensitive(args.ignore_case)
-        .fixed_strings(args.literal)
-        .multi_line(true)
-        .crlf(true)
-        .line_terminator(None)
-        .build(&args.pattern)
-    {
-        Ok(matcher) => matcher,
+    let matcher = match build_matcher(args) {
+        Ok(built) => built,
         Err(error) => return error_result(format!("Invalid regex pattern: {error}")),
     };
     let file_glob = match args.glob.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
@@ -295,10 +289,27 @@ pub(crate) fn execute(args: &GrepArgs, cwd: &Path, signal: &CancellationToken) -
     ToolExecution::text(output)
 }
 
+/// `\s` and negated classes never cross a newline; a pattern that spells out a newline is built without that restriction.
+fn build_matcher(args: &GrepArgs) -> Result<grep_regex::RegexMatcher, grep_regex::Error> {
+    let mut builder = RegexMatcherBuilder::new();
+    builder
+        .case_insensitive(args.ignore_case)
+        .fixed_strings(args.literal)
+        .multi_line(true)
+        .crlf(true);
+    match builder.build(&args.pattern) {
+        Err(error) if matches!(error.kind(), grep_regex::ErrorKind::NotAllowed(_)) => {
+            builder.line_terminator(None).build(&args.pattern)
+        }
+        built => built,
+    }
+}
+
 fn build_searcher(context_lines: usize) -> Searcher {
     SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(b'\x00'))
         .line_number(true)
+        .line_terminator(LineTerminator::crlf())
         .multi_line(true)
         .before_context(context_lines)
         .after_context(context_lines)
