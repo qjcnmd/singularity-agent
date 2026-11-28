@@ -164,11 +164,20 @@ impl Conversation {
         }
         let conversation = Arc::clone(self);
         let result = async {
-            let requests = tokio::task::spawn_blocking(move || conversation.prepare_request_context())
+            let config = tokio::task::spawn_blocking(move || conversation.load_agent_config())
                 .await
                 .expect("context preparation completes while the runtime is running")
-                .map_err(|error| ConversationError::Message(error.message))?;
-            Ok::<_, ConversationError>(requests.inspect_context(shutdown).await?)
+                .map_err(ConversationError::Message)?;
+            Ok::<_, ConversationError>(
+                agent::agent::modules::inspect(
+                    std::path::Path::new(&self.cwd),
+                    &config,
+                    Arc::clone(&self.models),
+                    &self.mcp,
+                    shutdown,
+                )
+                .await?,
+            )
         }
         .await;
         let mut inner = self.lock_inner();
@@ -182,18 +191,21 @@ impl Conversation {
         result.map(|context| self.publish_event(&mut inner, TurnEvent::ContextLoaded { context }))
     }
 
-    fn prepare_request_context(&self) -> Result<RequestContext, TurnErrorDetail> {
-        let selection = self.model();
-        let provider = ModelClient::new(&self.models, &selection).map_err(preparation_error)?;
+    fn load_agent_config(&self) -> Result<AgentConfig, String> {
         let instruction_home = self.home.clone();
         let initial_instructions =
-            app_core::load_agent_instructions(std::path::Path::new(&self.cwd), &instruction_home)
-                .map_err(preparation_error)?;
-        let config = AgentConfig {
+            app_core::load_agent_instructions(std::path::Path::new(&self.cwd), &instruction_home)?;
+        Ok(AgentConfig {
             instruction_home,
             initial_instructions,
             disabled_modules: self.disabled_modules.clone(),
-        };
+        })
+    }
+
+    fn prepare_request_context(&self) -> Result<RequestContext, TurnErrorDetail> {
+        let selection = self.model();
+        let provider = ModelClient::new(&self.models, &selection).map_err(preparation_error)?;
+        let config = self.load_agent_config().map_err(preparation_error)?;
         Ok(RequestContext::new(
             provider,
             Arc::clone(&self.models),

@@ -96,14 +96,6 @@ impl std::fmt::Debug for RequestContext {
     }
 }
 impl RequestContext {
-    pub async fn inspect_context(
-        mut self,
-        cancellation: &CancellationToken,
-    ) -> Result<Vec<protocol::ContextModule>> {
-        let (_, context) = self.load_definitions(cancellation).await?;
-        Ok(context)
-    }
-
     pub fn new(
         provider: ModelClient,
         models: Arc<model::ModelConfigManager>,

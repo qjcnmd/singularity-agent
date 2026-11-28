@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use app_core::skills::SkillCatalog;
@@ -5,7 +6,9 @@ use app_core::{InstructionFile, estimate_tokens_of};
 use mcp::McpDiscovery;
 use model::{Message, estimate_tool_tokens};
 use protocol::{ContextGroup, ContextModule};
+use tokio_util::sync::CancellationToken;
 
+use super::{AgentConfig, AgentError};
 use crate::tools::{self, ToolRegistrySnapshot};
 
 const SYSTEM_PROMPT: &str = "system";
@@ -23,7 +26,7 @@ const TODO: &str = "todo";
 const QUESTION: &str = "ask-user-question";
 const WEB: &str = "web";
 pub(super) const SKILLS_MODULE_ID: &str = "skills";
-pub(super) const MCP_PREFIX: &str = "mcp:";
+const MCP_PREFIX: &str = "mcp:";
 
 const MCP_SUMMARY_MAX_CHARS: usize = 120;
 
@@ -72,14 +75,14 @@ fn mcp_module_id(server_id: &str) -> String {
     format!("{MCP_PREFIX}{server_id}")
 }
 
-pub(crate) struct ModuleInputs<'a> {
-    pub cwd: &'a str,
-    pub instructions: Vec<InstructionFile>,
-    pub skills: SkillCatalog,
-    pub mcp: McpDiscovery,
-    pub web: Option<Arc<model::WebSearchAccess>>,
+struct ModuleInputs<'a> {
+    cwd: &'a str,
+    instructions: Vec<InstructionFile>,
+    skills: SkillCatalog,
+    mcp: McpDiscovery,
+    web: Option<Arc<model::WebSearchAccess>>,
 
-    pub disabled: &'a [String],
+    disabled: &'a [String],
 }
 
 pub(crate) struct Assembly {
@@ -118,7 +121,7 @@ impl Collector<'_> {
     }
 }
 
-pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
+fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
     let ModuleInputs {
         cwd,
         instructions,
@@ -333,6 +336,58 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         registry,
         modules: collector.modules,
     }
+}
+
+pub(crate) async fn load(
+    cwd: &Path,
+    config: &AgentConfig,
+    models: Arc<model::ModelConfigManager>,
+    mcp: &mcp::McpManager,
+    cancellation: &CancellationToken,
+) -> super::Result<Assembly> {
+    if cancellation.is_cancelled() {
+        return Err(AgentError::Aborted);
+    }
+    let discover_cwd = cwd.to_path_buf();
+    let home = config.instruction_home.clone();
+    let (skills, web) = tokio::task::spawn_blocking(move || {
+        let skills = SkillCatalog::discover(&discover_cwd, &home);
+        let web = models.web_search_access().map(Arc::new);
+        (skills, web)
+    })
+    .await
+    .expect("skill discovery completes while the runtime is running");
+    if cancellation.is_cancelled() {
+        return Err(AgentError::Aborted);
+    }
+    let skipped_servers: Vec<String> = config
+        .disabled_modules
+        .iter()
+        .filter_map(|id| id.strip_prefix(MCP_PREFIX))
+        .map(str::to_owned)
+        .collect();
+    let discovered = mcp.discover(cwd, cancellation, &skipped_servers).await;
+    if cancellation.is_cancelled() {
+        return Err(AgentError::Aborted);
+    }
+    Ok(assemble(ModuleInputs {
+        cwd: &app_core::display_path(cwd),
+        instructions: config.initial_instructions.clone(),
+        skills,
+        mcp: discovered,
+        web,
+        disabled: &config.disabled_modules,
+    }))
+}
+
+pub async fn inspect(
+    cwd: &Path,
+    config: &AgentConfig,
+    models: Arc<model::ModelConfigManager>,
+    mcp: &mcp::McpManager,
+    cancellation: &CancellationToken,
+) -> std::result::Result<Vec<ContextModule>, AgentError> {
+    Ok(load(cwd, config, models, mcp, cancellation).await?.modules)
 }
 
 pub fn preview(

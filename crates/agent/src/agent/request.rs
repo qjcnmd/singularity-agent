@@ -44,36 +44,10 @@ impl RequestContext {
         &mut self,
         cancellation: &CancellationToken,
     ) -> Result<(RequestDefinitions, Vec<protocol::ContextModule>)> {
-        let home = self.config.instruction_home.clone();
-        let session = std::sync::Arc::clone(&self.session);
-        let models = std::sync::Arc::clone(&self.models);
-        let instructions = self.config.initial_instructions.clone();
-        let disabled = &self.config.disabled_modules;
-        let (cwd, skills, web) = tokio::task::spawn_blocking(move || {
-            let cwd = with_writer(&session, |writer| writer.data().cwd().to_path_buf());
-            let skills = app_core::skills::SkillCatalog::discover(&cwd, &home);
-            let web = models.web_search_access().map(std::sync::Arc::new);
-            (cwd, skills, web)
-        })
-        .await
-        .expect("skill discovery completes while the runtime is running");
-        let skipped_servers: Vec<String> = disabled
-            .iter()
-            .filter_map(|id| id.strip_prefix(modules::MCP_PREFIX))
-            .map(str::to_owned)
-            .collect();
-        let discovered = self.mcp.discover(&cwd, cancellation, &skipped_servers).await;
-        if cancellation.is_cancelled() {
-            return Err(AgentError::Aborted);
-        }
-        let assembly = modules::assemble(modules::ModuleInputs {
-            cwd: &app_core::display_path(&cwd),
-            instructions,
-            skills,
-            mcp: discovered,
-            web,
-            disabled,
-        });
+        let cwd = with_writer(&self.session, |writer| writer.data().cwd().to_path_buf());
+        let assembly =
+            modules::load(&cwd, &self.config, std::sync::Arc::clone(&self.models), &self.mcp, cancellation)
+                .await?;
         let tools = assembly.registry.provider_schemas();
         let definitions = RequestDefinitions::new(assembly.messages, tools);
         self.registry = assembly.registry;
