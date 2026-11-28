@@ -224,9 +224,10 @@ function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): RawTimelineRow
         ? { ...item, stats: undefined, at: stripEndTime ? undefined : item.at } : item,
     }
   })
+  const trailingCompactions = result.splice(lastStepIndex + 1)
   if (turn.finishedAt || turn.status === 'running') {
     const workStartIndex = items.findIndex(item => item.type !== 'message' || item.role !== 'user')
-    result.splice(workStartIndex < 0 ? result.length : workStartIndex, 0, {
+    result.splice(workStartIndex < 0 ? result.length : Math.min(workStartIndex, result.length), 0, {
       key: `content:${turn.turnId}:duration`, stable: true,
       item: { type: 'duration', startedAt: turn.startedAt, finishedAt: turn.finishedAt },
     })
@@ -253,6 +254,7 @@ function turnRows(turn: ThreadTurn, failureFromRuntime: boolean): RawTimelineRow
       item: { type: 'stats', at: trailingAt },
     })
   }
+  result.push(...trailingCompactions)
   return groupAdjacentTools(result)
 }
 

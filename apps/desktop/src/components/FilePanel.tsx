@@ -13,8 +13,8 @@ type Loaded = { document?: TextDocument; changes?: ChangedFile[]; error?: string
 const extension = (path: string) => /\.([\w-]+)$/.exec(path)?.[1]?.toLowerCase() ?? ''
 const isMarkdown = (path: string) => ['md', 'markdown'].includes(extension(path))
 
-function diffRefreshKey(state: Pick<AppState, 'bootstrap' | 'liveSessions' | 'session'>, tab: FileTab | null): string {
-  if (tab?.mode !== 'changes') return ''
+function workspaceRefreshKey(state: Pick<AppState, 'bootstrap' | 'liveSessions' | 'session'>, tab: FileTab | null): string {
+  if (!tab) return ''
   const wsKey = workspaceKey(tab.cwd)
   const sessions = state.bootstrap?.sessionsByWorkspace[wsKey] ?? []
   const sessionKeys = sessions.map(item => {
@@ -23,7 +23,12 @@ function diffRefreshKey(state: Pick<AppState, 'bootstrap' | 'liveSessions' | 'se
     return `${item.threadId}:${item.updatedAt}:${item.status ?? ''}:${live?.phase ?? ''}:${live?.summaryRevision ?? ''}:${tasks}`
   }).join('|')
   const current = state.session && workspaceKey(state.session.summary.cwd) === wsKey ? state.session : null
-  return `${sessionKeys}#${current?.summary.threadId ?? ''}:${current?.facts.length ?? ''}:${current?.facts.at(-1)?.status ?? ''}`
+  const lastTurn = current?.facts.at(-1)
+  const completedTools = lastTurn?.items.reduce(
+    (count, item) => count + (item.type === 'tool' && item.status === 'completed' ? 1 : 0),
+    0,
+  ) ?? 0
+  return `${sessionKeys}#${current?.summary.threadId ?? ''}:${current?.facts.length ?? ''}:${lastTurn?.status ?? ''}:${completedTools}`
 }
 
 function splitPathSegments(path: string): string[] {
@@ -48,13 +53,13 @@ export function FilePanel() {
   const state = useAppStore(['fileTabs', 'activeFileTab', 'bootstrap', 'liveSessions', 'session'], (previous, next) => {
     if (previous.fileTabs !== next.fileTabs || previous.activeFileTab !== next.activeFileTab) return false
     const tab = next.fileTabs.find(item => item.id === next.activeFileTab) ?? null
-    return diffRefreshKey(previous, tab) === diffRefreshKey(next, tab)
+    return workspaceRefreshKey(previous, tab) === workspaceRefreshKey(next, tab)
   })
   const [documents, setDocuments] = useState<Record<string, Loaded>>({})
   const [sources, setSources] = useState<ReadonlySet<string>>(new Set())
   const [attempt, setAttempt] = useState(0)
   const active = state.fileTabs.find(tab => tab.id === state.activeFileTab) ?? null
-  const refreshKey = diffRefreshKey(state, active)
+  const refreshKey = workspaceRefreshKey(state, active)
   const loaded = active ? documents[active.id] : undefined
   const shown = loaded?.document
   const shownChanges = loaded?.error ? undefined : (loaded?.changes ?? active?.initialChanges)

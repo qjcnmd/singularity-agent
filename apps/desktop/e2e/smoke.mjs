@@ -506,7 +506,14 @@ async function runFullSmoke(initialApp, initialPage, env, mock) {
     await page.getByRole('button', { name: '关闭设置' }).click()
     await page.reload()
     await page.getByLabel('任务说明').waitFor({ state: 'visible', timeout: 20_000 })
-    assert.equal(await page.getByLabel('任务说明').inputValue(), 'UNSENT_DRAFT_SURVIVES_RELOAD')
+    await page.waitForFunction(
+      expected => {
+        const el = document.querySelector('textarea[aria-label="任务说明"]')
+        return el instanceof HTMLTextAreaElement && el.value === expected
+      },
+      'UNSENT_DRAFT_SURVIVES_RELOAD',
+      { timeout: 10_000 },
+    )
     assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'dark')
 
     const globalInstructionsCapsule = page.getByRole('switch', { name: /全局指令/ })

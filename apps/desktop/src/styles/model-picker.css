@@ -1,5 +1,7 @@
-.sg-trigger:hover { background: var(--surface-hover); }
-.sg-trigger:active { transform: scale(.96); transition-duration: 80ms; }
+.sg-trigger:hover:not(:disabled) { background: var(--surface-hover); }
+.sg-trigger:active:not(:disabled) { transform: scale(.96); transition-duration: 80ms; }
+.sg-trigger:disabled { opacity: .45; cursor: default; }
+.sg-trigger:disabled .sg-triggerLabel { color: var(--ink-faint); }
 .sg-triggerLabel { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent-ink); font-weight: 400; }
 .sg-triggerEffort { flex: none; color: var(--ink-soft); }
 .sg-groups { max-height: 244px; overflow-y: auto; }

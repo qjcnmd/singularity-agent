@@ -53,7 +53,7 @@
 .timeline-body code.file-link:hover, .timeline-body code.file-link:focus-visible { text-decoration-color: currentColor; outline: none; }
 @media (max-width: 760px) {
   .file-panel-shell { overflow: visible; }
-  .file-panel-shell > .file-panel { position: fixed; z-index: 26; inset: 30px 0 0 auto; width: min(100vw, 480px); box-shadow: var(--shadow-floating); }
+  .file-panel-shell > .file-panel { position: fixed; z-index: 26; inset: 30px 0 0 auto; width: min(100vw, 480px); height: auto; box-shadow: var(--shadow-floating); }
   .file-tabs { padding: 0 6px; margin-right: 46px; }
   .file-card { margin: 0 6px 6px; }
 }
