@@ -1,6 +1,8 @@
-import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import electron = require('electron')
 import type { IPC_CHANNELS } from '../src/identity.js'
 import type { StreamEnvelope } from '../src/protocol.generated.js'
+
+const { contextBridge, ipcRenderer, webUtils } = electron
 
 contextBridge.exposeInMainWorld('desktop', {
   rpc: (request: unknown) => ipcRenderer.invoke('desktop:rpc' satisfies (typeof IPC_CHANNELS)['rpc'], request),
