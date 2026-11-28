@@ -23,14 +23,7 @@ async fn dispatch(
 ) -> Result<Box<RawValue>, RpcError> {
     match request {
         RpcRequest::McpReconnect(params) => {
-            let cwd = {
-                let app = Arc::clone(&app);
-                let workspace_root = params.workspace_root;
-                tokio::task::spawn_blocking(move || app.scope_directory(workspace_root.as_deref()))
-                    .await
-                    .expect("RPC worker completes while the backend is running")?
-            };
-            Ok(value(app.mcp.reconnect(&params.server_id, &cwd, shutdown).await.map_err(RpcError::new)?))
+            Ok(value(app.mcp_reconnect(params.workspace_root, &params.server_id, shutdown).await?))
         }
         RpcRequest::ModelDiscover(params) => {
             let discover = app.discover_models(
@@ -70,26 +63,12 @@ async fn dispatch(
         RpcRequest::ModelSaveWebSearch(params) => {
             blocking(move || app.save_web_search(&params.base_url, params.api_key.as_deref())).await
         }
-        RpcRequest::McpList(params) => {
-            blocking(move || {
-                let cwd = app.scope_directory(params.workspace_root.as_deref())?;
-                app.mcp.list(&cwd).map_err(RpcError::new)
-            })
-            .await
-        }
+        RpcRequest::McpList(params) => blocking(move || app.mcp_list(params.workspace_root.as_deref())).await,
         RpcRequest::McpSave(params) => {
-            blocking(move || {
-                let cwd = app.scope_directory(params.workspace_root.as_deref())?;
-                app.mcp.save(params.server, &cwd).map_err(RpcError::new)
-            })
-            .await
+            blocking(move || app.mcp_save(params.workspace_root.as_deref(), params.server)).await
         }
         RpcRequest::McpRemove(params) => {
-            blocking(move || {
-                let cwd = app.scope_directory(params.workspace_root.as_deref())?;
-                app.mcp.remove(&params.server_id, &cwd).map_err(RpcError::new)
-            })
-            .await
+            blocking(move || app.mcp_remove(params.workspace_root.as_deref(), &params.server_id)).await
         }
         RpcRequest::ContextPreview(params) => {
             blocking(move || app.context_preview(&params.workspace_root)).await
@@ -117,8 +96,8 @@ async fn dispatch(
         RpcRequest::SessionUpdateSettings(params) => {
             blocking(move || app.update_settings(&params.session_id, &params.selection)).await
         }
-        RpcRequest::SessionChangedFiles(params) => blocking(move || app.changed_files(params)).await,
-        RpcRequest::SessionFileDiff(params) => blocking(move || app.file_diff(params)).await,
+        RpcRequest::SessionChangedFiles(params) => blocking(move || app.changed_files(&params)).await,
+        RpcRequest::SessionFileDiff(params) => blocking(move || app.file_diff(&params)).await,
         RpcRequest::SessionRewind(params) => blocking(move || app.rewind_session(params)).await,
     }
 }

@@ -7,12 +7,13 @@ use model::ModelClient;
 use protocol::{TurnErrorDetail, TurnEvent, TurnStatus};
 use tokio_util::sync::CancellationToken;
 
+use super::state::TurnControls;
 use super::{Conversation, ConversationError};
 
 impl Conversation {
     pub(super) async fn run_single_turn(
         self: &Arc<Self>,
-        controls: &Arc<crate::runtime::conversation::TurnControls>,
+        controls: &Arc<TurnControls>,
         sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<TurnStatus, TurnErrorDetail> {
         let conversation = Arc::clone(self);
@@ -26,15 +27,9 @@ impl Conversation {
                 controls.finish_cancel();
                 return Ok(TurnStatus::Interrupted);
             }
-            Err(error) => {
-                return if controls.finish_cancel() {
-                    Ok(TurnStatus::Interrupted)
-                } else {
-                    Err(error)
-                };
-            }
+            Err(error) => return finish_preparation_error(controls, error),
         };
-        self.lock_state().last_context_window = Some(context_window);
+        self.lock_inner().state.last_context_window = Some(context_window);
         let turn_id = controls.turn_id.clone();
         sink(AgentEvent::Turn(TurnEvent::TurnStarted { started_at }));
 
@@ -111,14 +106,36 @@ impl Conversation {
         Ok(turn_status)
     }
 
-    fn prepare_turn(
-        &self,
-        controls: &crate::runtime::conversation::TurnControls,
-    ) -> Result<PreparedTurn, TurnErrorDetail> {
+    pub(super) async fn compact_thread(
+        self: &Arc<Self>,
+        controls: &TurnControls,
+        sink: &mut (dyn FnMut(AgentEvent) + Send),
+    ) -> Result<TurnStatus, TurnErrorDetail> {
+        let conversation = Arc::clone(self);
+        let prepared = tokio::task::spawn_blocking(move || conversation.prepare_request_context())
+            .await
+            .expect("compaction preparation completes while the runtime is running");
+        let mut requests = match prepared {
+            Ok(requests) => requests,
+            Err(error) => return finish_preparation_error(controls, error),
+        };
+        let result = requests.compact_manual(sink, controls.cancellation()).await;
+        let cancelled = controls.finish_cancel();
+        match result {
+            Ok(()) if cancelled => Ok(TurnStatus::Interrupted),
+            Ok(()) => Ok(TurnStatus::Completed),
+            Err(AgentError::Aborted) => Ok(TurnStatus::Interrupted),
+            Err(error) if error.is_session_failure() => Err(error.detail()),
+            Err(_) if cancelled => Ok(TurnStatus::Interrupted),
+            Err(error) => Err(error.detail()),
+        }
+    }
+
+    fn prepare_turn(&self, controls: &TurnControls) -> Result<PreparedTurn, TurnErrorDetail> {
         if controls.cancellation().is_cancelled() {
             return Ok(PreparedTurn::Cancelled);
         }
-        let inbox = Arc::clone(&self.lock_state().steering_inbox);
+        let inbox = Arc::clone(&self.lock_inner().state.steering_inbox);
         let context = self.prepare_request_context()?;
         let context_window = context.context_window();
         let agent = Agent::new(context, inbox, Arc::clone(&controls.questions), Arc::clone(&self.bash_tasks));
@@ -136,9 +153,12 @@ impl Conversation {
         shutdown: &CancellationToken,
     ) -> Result<(), ConversationError> {
         {
-            let view = self.lock_view();
-            let state = self.lock_state();
-            if shutdown.is_cancelled() || state.closing || state.turn.is_busy() || view.context.is_some() {
+            let inner = self.lock_inner();
+            if shutdown.is_cancelled()
+                || inner.state.closing
+                || inner.state.turn.is_busy()
+                || inner.view.context.is_some()
+            {
                 return Ok(());
             }
         }
@@ -151,16 +171,18 @@ impl Conversation {
             Ok::<_, ConversationError>(requests.inspect_context(shutdown).await?)
         }
         .await;
-        let mut view = self.lock_view();
-        let state = self.lock_state();
-        if shutdown.is_cancelled() || state.closing || state.turn.is_busy() || view.context.is_some() {
+        let mut inner = self.lock_inner();
+        if shutdown.is_cancelled()
+            || inner.state.closing
+            || inner.state.turn.is_busy()
+            || inner.view.context.is_some()
+        {
             return Ok(());
         }
-        drop(state);
-        result.map(|context| self.publish_event(&mut view, TurnEvent::ContextLoaded { context }))
+        result.map(|context| self.publish_event(&mut inner, TurnEvent::ContextLoaded { context }))
     }
 
-    pub(super) fn prepare_request_context(&self) -> Result<RequestContext, TurnErrorDetail> {
+    fn prepare_request_context(&self) -> Result<RequestContext, TurnErrorDetail> {
         let selection = self.model();
         let provider = ModelClient::new(&self.models, &selection).map_err(preparation_error)?;
         let instruction_home = self.home.clone();
@@ -191,6 +213,17 @@ struct ReadyTurn {
 enum PreparedTurn {
     Ready(Box<ReadyTurn>),
     Cancelled,
+}
+
+fn finish_preparation_error(
+    controls: &TurnControls,
+    error: TurnErrorDetail,
+) -> Result<TurnStatus, TurnErrorDetail> {
+    if controls.finish_cancel() {
+        Ok(TurnStatus::Interrupted)
+    } else {
+        Err(error)
+    }
 }
 
 fn preparation_error(error: impl std::fmt::Display) -> TurnErrorDetail {

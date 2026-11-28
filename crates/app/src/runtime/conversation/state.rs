@@ -92,6 +92,14 @@ impl ConversationState {
             && !self.closing
             && !self.steering_inbox.lock().expect("turn inbox lock poisoned").pending().is_empty()
     }
+
+    pub(super) fn pause_background_resume(&mut self) {
+        self.auto_resume = false;
+        self.steering_inbox.lock().expect("turn inbox lock poisoned").cancel();
+        if let TurnLifecycle::Running(controls) = &self.turn {
+            controls.cancellation().cancel();
+        }
+    }
 }
 
 pub(super) enum TurnLifecycle {

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use protocol::{AppBootstrap, RedactedModelCatalog, RpcError, ThreadSummary, Workspace};
 
@@ -143,10 +143,7 @@ impl AppServer {
         workspace_root: Option<&str>,
         content: &str,
     ) -> Result<protocol::TextDocument, RpcError> {
-        let dir = match workspace_root {
-            Some(workspace_root) => PathBuf::from(self.workspace(workspace_root)?.root),
-            None => self.home.clone(),
-        };
+        let dir = self.scope_directory(workspace_root)?;
         let path = dir.join("AGENTS.md");
         app_core::write_bytes_atomic(&path, content.as_bytes())
             .map_err(|error| RpcError::new(format!("{}: {error}", path.display())))?;
@@ -158,9 +155,7 @@ impl AppServer {
 
     pub(crate) fn read_text_file(&self, cwd: &str, path: &str) -> Result<protocol::TextDocument, RpcError> {
         let resolved = crate::desktop::file_view::resolve_path(cwd, path);
-        let mut document = crate::desktop::file_view::read_text_file(&resolved)?;
-        document.path = app_core::display_path(&resolved);
-        Ok(document)
+        crate::desktop::file_view::read_text_file(&resolved)
     }
 }
 

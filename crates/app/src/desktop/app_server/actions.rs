@@ -44,8 +44,10 @@ impl AppServer {
         session_id: &str,
         apply: impl FnOnce(&Arc<Conversation>) -> Result<(), RpcError>,
     ) -> Result<(), RpcError> {
-        let mut sessions = self.lock_sessions();
-        let conversation = self.open_conversation(&mut sessions, session_id, false)?;
+        let conversation = {
+            let mut sessions = self.lock_sessions();
+            self.open_conversation(&mut sessions, session_id, false)?
+        };
         apply(&conversation)
     }
 
@@ -133,7 +135,7 @@ impl AppServer {
 
     pub(crate) fn changed_files(
         &self,
-        params: protocol::SessionChangedFilesParams,
+        params: &protocol::SessionChangedFilesParams,
     ) -> Result<Vec<ChangedFile>, RpcError> {
         let workspace = self.workspace(&params.workspace_root)?;
         git_diff::changed_files(Path::new(&workspace.root), params.include_diffs).map_err(RpcError::new)
@@ -141,7 +143,7 @@ impl AppServer {
 
     pub(crate) fn file_diff(
         &self,
-        params: protocol::SessionFileDiffParams,
+        params: &protocol::SessionFileDiffParams,
     ) -> Result<SessionFileDiffResult, RpcError> {
         let workspace = self.workspace(&params.workspace_root)?;
         let cwd = Path::new(&workspace.root);
@@ -156,8 +158,10 @@ impl AppServer {
     ) -> Result<SessionReadResult, RpcError> {
         let (cwd, input) = self.parse_session_input(&params.session_id, params.message)?;
         app_core::load_agent_instructions(Path::new(&cwd), &self.home).map_err(RpcError::new)?;
-        let mut sessions = self.lock_sessions();
-        let conversation = self.open_conversation(&mut sessions, &params.session_id, true)?;
+        let conversation = {
+            let mut sessions = self.lock_sessions();
+            self.open_conversation(&mut sessions, &params.session_id, true)?
+        };
         conversation
             .rewind(&params.message_id, input)
             .map(|read| *read)
