@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use model::{ModelErrorKind, WebSearchAccess};
+use model::WebSearchAccess;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -114,8 +114,8 @@ struct FetchResponse {
     content: String,
 }
 
-pub(crate) fn search_spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn search_spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: WEB_SEARCH_TOOL_NAME.into(),
         description: "Search the web for up-to-date documentation, APIs, issues, and facts. Returns ranked titles, URLs, and summaries. Call web_fetch on a specific URL when you need the full page.".into(),
         parameters_schema: json!({
@@ -142,8 +142,8 @@ pub(crate) fn search_spec() -> app_core::ToolDefinition {
     }
 }
 
-pub(crate) fn fetch_spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn fetch_spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: WEB_FETCH_TOOL_NAME.into(),
         description: "Fetch a specific http/https web page and return its cleaned Markdown content. Use after web_search or on a user-provided URL when full page details are needed.".into(),
         parameters_schema: json!({
@@ -177,7 +177,7 @@ pub(super) async fn execute_search(
     };
     let response: SearchResponse = match access.post_json("/v1/tools/search", &request, signal).await {
         Ok(response) => response,
-        Err(error) if error.kind == ModelErrorKind::Cancelled => return error_result(super::ABORTED_MESSAGE),
+        Err(error) if error.is_cancelled() => return error_result(super::ABORTED_MESSAGE),
         Err(error) => return error_result(error.to_string()),
     };
     let formatted = format_search_results(&args.query, &response.results);
@@ -196,7 +196,7 @@ pub(super) async fn execute_fetch(
     let request = FetchRequest { url: &args.url };
     let response: FetchResponse = match access.post_json("/v1/tools/fetch", &request, signal).await {
         Ok(response) => response,
-        Err(error) if error.kind == ModelErrorKind::Cancelled => return error_result(super::ABORTED_MESSAGE),
+        Err(error) if error.is_cancelled() => return error_result(super::ABORTED_MESSAGE),
         Err(error) => return error_result(error.to_string()),
     };
     let formatted = format_fetch_result(&args.url, &response);

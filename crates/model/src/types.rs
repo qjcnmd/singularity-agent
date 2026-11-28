@@ -1,12 +1,28 @@
 use std::fmt;
 
-use app_core::ToolDefinition;
 pub use protocol::ModelUsage;
 use protocol::ProviderApiProtocol;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ProviderError;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters_schema: Value,
+}
+
+pub fn estimate_tool_tokens<'a>(tools: impl IntoIterator<Item = &'a ToolDefinition>) -> u64 {
+    let tools: Vec<_> = tools.into_iter().collect();
+    if tools.is_empty() {
+        return 0;
+    }
+    app_core::estimate_tokens_of(&serde_json::to_string(&tools).expect("tool definitions are serializable"))
+        + 4
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderMessageMetadata {
@@ -143,13 +159,6 @@ impl Message {
             ContentBlock::ToolCall(call) => Some(call),
             _ => None,
         })
-    }
-
-    pub fn tool_call_id(&self) -> Option<&str> {
-        match self {
-            Self::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
-            _ => None,
-        }
     }
 
     pub(crate) fn provider_metadata(&self) -> Option<&ProviderMessageMetadata> {

@@ -51,8 +51,8 @@ pub(crate) struct TaskIdArgs {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TaskListArgs {}
 
-pub(crate) fn spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: BASH_TOOL_NAME.to_string(),
         description: format!(
             "Execute a Bash command in the current working directory (Git Bash on Windows). Use POSIX syntax; `2>nul` creates a file named nul. Returns stdout and stderr; output over {} keeps the beginning and end with the middle omitted, and the full output is saved to a file. Independent commands may run in parallel; send dependent commands in order. Each command starts exactly once. yield_time_ms controls how long to wait before returning a task ID for a still-running command (0 to 30000 ms, default 10000); use 0 to return immediately. Use task_list, task_output and task_stop to manage background commands. Background completion automatically delivers status and new output. Continue independent work; if none remains, give a brief status message and finish this response; you will resume on completion. Do not poll, sleep, or repeatedly read logs to wait. timeout_ms optionally limits total execution time, including time spent in the background; without it there is no total time limit. Stopping a task terminates its entire process tree. No interactive stdin or PTY is available.",
@@ -72,16 +72,16 @@ pub(crate) fn spec() -> app_core::ToolDefinition {
     }
 }
 
-pub(crate) fn task_list_spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn task_list_spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: TASK_LIST_TOOL_NAME.to_string(),
         description: "List this session's background commands, including saved commands from earlier runs. Commands left running in saved history are interrupted; they are not restarted. Completion notifies you automatically; do not repeatedly poll.".to_string(),
         parameters_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
     }
 }
 
-pub(crate) fn task_output_spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn task_output_spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: TASK_OUTPUT_TOOL_NAME.to_string(),
         description: "Inspect a background command when its current output helps you act now. Returns immediately with status and only output not already delivered by bash, task_output or a completion notice. No cursor or waiting is needed. Completion delivers new output automatically; do not poll. Use read on the full-output file to revisit earlier text.".to_string(),
         parameters_schema: json!({
@@ -94,8 +94,8 @@ pub(crate) fn task_output_spec() -> app_core::ToolDefinition {
     }
 }
 
-pub(crate) fn task_stop_spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn task_stop_spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: TASK_STOP_TOOL_NAME.to_string(),
         description: "Stop this background command and all descendants, then wait for cleanup. Stopping an already finished command returns its existing result.".to_string(),
         parameters_schema: json!({

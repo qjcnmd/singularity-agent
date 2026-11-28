@@ -23,8 +23,8 @@ struct Replacement {
     new_text: String,
 }
 
-pub(crate) fn spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: EDIT_TOOL_NAME.into(),
         description: "Edit an existing UTF-8 text file using one or more replacements. Exact match runs first; if it misses, matching falls back to ignoring trailing whitespace, common Unicode quote/dash/space variants, or line indentation differences. Each old_text must be nonempty and match uniquely in the original file; edits must not overlap. All replacements are checked before writing once. Read the relevant content first. LF and CRLF match equivalently. Use an empty new_text to delete text. Keep enough context to identify each location. Combine independent changes to one file in a single call; do not issue dependent edits concurrently.".into(),
         parameters_schema: json!({
@@ -95,7 +95,7 @@ fn execute_locked(
 }
 
 fn apply_edits(content: &str, display_path: &str, edits: &[Replacement]) -> Result<(String, String), String> {
-    let source = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let source = app_core::strip_utf8_bom(content);
     let view = source.replace("\r\n", "\n");
     let removed: Vec<_> = source
         .match_indices("\r\n")

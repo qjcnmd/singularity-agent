@@ -358,6 +358,11 @@ impl SessionData {
         &self.entries
     }
 
+    pub fn latest_selection(&self) -> &protocol::ModelSelection {
+        latest_settings(&self.entries)
+            .expect("session creation and parsing require an initial model selection")
+    }
+
     pub fn disabled_modules(&self) -> Vec<String> {
         self.entries
             .iter()

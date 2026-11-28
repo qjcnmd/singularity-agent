@@ -289,7 +289,7 @@ pub(crate) fn read(home: &Path) -> Result<Configuration, McpError> {
             return Err(McpError::io(&format!("无法读取 {}", path.display()), &source));
         }
     };
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    let bytes = app_core::strip_utf8_bom_bytes(&bytes);
     let config: Configuration = serde_json::from_slice(bytes).map_err(|error| {
         McpError::new(format!("mcp.json 格式无效（第 {} 行，第 {} 列）。", error.line(), error.column()))
     })?;

@@ -1,29 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CommandOutputSnapshot {
-    pub text: String,
-    pub total_bytes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub full_output: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_error: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub incomplete: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct BackgroundTask {
-    pub task_id: String,
-    pub command: String,
-    pub description: String,
-    pub output: String,
-    pub model_output: CommandOutputSnapshot,
-    pub state: BackgroundTaskState,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -35,8 +11,8 @@ pub struct VisibleBackgroundTask {
     pub state: BackgroundTaskState,
 }
 
-impl From<BackgroundTask> for VisibleBackgroundTask {
-    fn from(task: BackgroundTask) -> Self {
+impl From<crate::BackgroundTask> for VisibleBackgroundTask {
+    fn from(task: crate::BackgroundTask) -> Self {
         Self {
             task_id: task.task_id,
             command: task.command,

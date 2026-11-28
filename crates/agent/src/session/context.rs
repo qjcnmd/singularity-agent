@@ -183,7 +183,7 @@ pub(super) fn context_token_estimate_for(
         tokens = tokens.saturating_add(entry_token_estimate_for(entry, session, target, cleared));
         if let SessionEntry::Message { message, .. } = entry {
             calls = calls.saturating_add(message.tool_calls().count());
-            if message.tool_call_id().is_some() {
+            if matches!(message, Message::ToolResult { .. }) {
                 results = results.saturating_add(1);
             }
         }
@@ -299,16 +299,7 @@ pub(super) fn latest_reply_usage<'a>(
         .entries()
         .iter()
         .rev()
-        .take_while(|entry| {
-            !matches!(
-                entry,
-                SessionEntry::Compaction { .. }
-                    | SessionEntry::Record {
-                        record: LedgerRecord::ToolResultsCleared { .. },
-                        ..
-                    }
-            )
-        })
+        .take_while(|entry| !entry.resets_context_usage())
         .find(|entry| matches!(context_entry(entry), Some(ContextEntry::Message(Message::Assistant { .. }))));
     let Some(SessionEntry::Message { id, observation: Some(obs), .. }) = latest else {
         return None;

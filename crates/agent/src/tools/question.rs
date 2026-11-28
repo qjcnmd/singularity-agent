@@ -36,8 +36,8 @@ impl QuestionArgs {
     }
 }
 
-pub(crate) fn spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: QUESTION_TOOL_NAME.to_string(),
         description: "Ask for missing information or a decision that only the user can provide. Execution waits until the user submits answers or stops the task. Ask concise, self-contained questions. Options are optional; users can always enter their own text. Use multiSelect for choices that can coexist. Do not use this tool for facts you can inspect yourself or routine implementation decisions. Put a recommended option first and mark its label when useful.".to_string(),
         parameters_schema: json!({

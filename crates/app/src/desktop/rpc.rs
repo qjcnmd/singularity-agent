@@ -25,15 +25,16 @@ async fn dispatch(
         RpcRequest::McpReconnect(params) => {
             Ok(value(app.mcp_reconnect(params.workspace_root, &params.server_id, shutdown).await?))
         }
-        RpcRequest::ModelDiscover(params) => {
-            let discover = app.discover_models(
+        RpcRequest::ModelDiscover(params) => Ok(value(
+            app.discover_models(
                 &params.provider_id,
                 params.api_protocol,
                 &params.base_url,
                 params.api_key.as_deref(),
-            );
-            Ok(value(unless_shutdown(shutdown, discover).await?))
-        }
+                shutdown,
+            )
+            .await?,
+        )),
         RpcRequest::BackgroundTaskStop(params) => {
             Ok(value(app.stop_background_task(&params.session_id, &params.task_id).await?))
         }
@@ -108,16 +109,6 @@ async fn blocking<T: Serialize>(
     tokio::task::spawn_blocking(move || Ok(value(operation()?)))
         .await
         .expect("RPC worker completes while the backend is running")
-}
-
-async fn unless_shutdown<T>(
-    shutdown: &tokio_util::sync::CancellationToken,
-    work: impl Future<Output = Result<T, RpcError>>,
-) -> Result<T, RpcError> {
-    tokio::select! {
-        result = work => result,
-        () = shutdown.cancelled() => Err(RpcError::new("工作台正在退出。")),
-    }
 }
 
 fn value(output: impl Serialize) -> Box<RawValue> {

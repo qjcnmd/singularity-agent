@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use app_core::skills::SkillCatalog;
-use app_core::{InstructionFile, estimate_tokens_of, estimate_tool_tokens};
+use app_core::{InstructionFile, estimate_tokens_of};
 use mcp::McpDiscovery;
-use model::Message;
+use model::{Message, estimate_tool_tokens};
 use protocol::{ContextGroup, ContextModule};
 
 use crate::tools::{self, ToolRegistrySnapshot};

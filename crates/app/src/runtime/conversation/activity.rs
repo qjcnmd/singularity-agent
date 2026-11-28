@@ -50,10 +50,7 @@ impl Activity {
             TurnEvent::ItemUpdated { item: HistoryItem::Compaction { id, .. } }
             | TurnEvent::ToolFinished { item_id: id, .. } => self.items.retain(|item| item.id() != id),
             TurnEvent::MessageFinished { message_id, .. } | TurnEvent::MessageDiscarded { message_id } => {
-                let text = agent::session::text_item_id(message_id, 0);
-                let thinking = agent::session::thinking_item_id(message_id, 0);
-                self.items
-                    .retain(|item| item.id() != message_id && item.id() != text && item.id() != thinking);
+                self.items.retain(|item| !agent::session::is_streaming_item_of(item.id(), message_id));
             }
             TurnEvent::ToolOutput { item_id, output } => {
                 if let Some(HistoryItem::Tool { result, .. }) =

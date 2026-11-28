@@ -147,9 +147,10 @@ pub(crate) fn provider_cancelled_error() -> ProviderError {
     ProviderError::new(ModelErrorKind::Cancelled, "provider request cancelled")
 }
 
-pub(crate) async fn provider_future<F, T>(
+pub(crate) async fn provider_future_with<F, T>(
     cancellation: &CancellationToken,
     future: F,
+    map_error: impl FnOnce(reqwest::Error) -> ProviderError,
 ) -> Result<T, ProviderError>
 where
     F: Future<Output = Result<T, reqwest::Error>>,
@@ -160,7 +161,16 @@ where
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(provider_cancelled_error()),
-        result = future => result
-            .map_err(provider_transport_error),
+        result = future => result.map_err(map_error),
     }
+}
+
+pub(crate) async fn provider_future<F, T>(
+    cancellation: &CancellationToken,
+    future: F,
+) -> Result<T, ProviderError>
+where
+    F: Future<Output = Result<T, reqwest::Error>>,
+{
+    provider_future_with(cancellation, future, provider_transport_error).await
 }

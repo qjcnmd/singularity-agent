@@ -47,8 +47,8 @@ impl GrepArgs {
     }
 }
 
-pub(crate) fn spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: GREP_TOOL_NAME.to_string(),
         description: format!(
             "Search file contents using regex or literal matching, respecting .gitignore and skipping binary files and .git. Returns 'path:line: content' (context lines use 'path-line- content' separated by '--'). Capped at {DEFAULT_GREP_LIMIT} matches by default (max {MAX_GREP_LIMIT}), {MAX_LINE_CHARS} chars per line, and {}KB total.",

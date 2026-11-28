@@ -19,8 +19,8 @@ pub(crate) struct ReadArgs {
     pub(crate) limit: Option<u64>,
 }
 
-pub(crate) fn spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: READ_TOOL_NAME.to_string(),
         description: format!(
             "Read a text file. Text output is limited to {} (whichever is hit first). Use the returned offset to continue with unread lines. A line larger than {}KB is explicitly marked incomplete; use bash to read that line in byte ranges.",

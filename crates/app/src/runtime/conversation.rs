@@ -61,18 +61,7 @@ impl Conversation {
         hub: Arc<StreamHub>,
     ) -> Arc<Self> {
         let data = session.data();
-        let model = data
-            .entries()
-            .iter()
-            .rev()
-            .find_map(|entry| match entry {
-                agent::session::SessionEntry::Metadata {
-                    metadata: SessionMetadata::ThreadSettings { selection },
-                    ..
-                } => Some(selection.clone()),
-                _ => None,
-            })
-            .expect("session creation and parsing require an initial model selection");
+        let model = data.latest_selection().clone();
         let thread_id = data.session_id().to_owned();
         let cwd = data.cwd_string();
         let disabled_modules = data.disabled_modules();

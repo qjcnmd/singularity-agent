@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use super::{configuration_error, validate_identifier};
 use crate::error::{
@@ -11,8 +12,8 @@ use crate::error::{
     provider_error_kind_for_http_status,
 };
 use crate::transport::http::{
-    BoundedBodyReadError, MAX_HTTP_ERROR_BODY_BYTES, apply_provider_auth, client_builder, read_bounded_body,
-    transport_error_source,
+    BoundedBodyReadError, MAX_HTTP_ERROR_BODY_BYTES, apply_provider_auth, client_builder,
+    provider_cancelled_error, provider_future_with, read_bounded_body, transport_error_source,
 };
 
 const MAX_DISCOVERY_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -33,18 +34,19 @@ pub(crate) async fn discover(
     base_url: &str,
     api_key: &str,
     protocol: protocol::ProviderApiProtocol,
+    cancellation: &CancellationToken,
 ) -> Result<Vec<String>, ProviderError> {
     let client = discovery_client()?;
     let request =
         apply_provider_auth(client.get(crate::provider::endpoint(base_url, "/models")), protocol, api_key)?;
-    let response = request.send().await.map_err(discovery_transport_error)?;
+    let response = provider_future_with(cancellation, request.send(), discovery_transport_error).await?;
     if !response.status().is_success() {
-        return Err(discovery_http_error(response, api_key).await);
+        return Err(discovery_http_error(response, api_key, cancellation).await);
     }
-    let bytes = match read_bounded_body(response, MAX_DISCOVERY_BODY_BYTES + 1, None).await {
+    let bytes = match read_bounded_body(response, MAX_DISCOVERY_BODY_BYTES + 1, Some(cancellation)).await {
         Ok(bytes) => bytes,
         Err(BoundedBodyReadError::Transport(error)) => return Err(discovery_transport_error(error)),
-        Err(BoundedBodyReadError::Cancelled) => unreachable!("un-cancellable body read"),
+        Err(BoundedBodyReadError::Cancelled) => return Err(provider_cancelled_error()),
     };
     if bytes.len() > MAX_DISCOVERY_BODY_BYTES {
         return Err(ProviderError::new(ModelErrorKind::Other, "模型目录响应过大。"));
@@ -78,19 +80,23 @@ fn read_listing(body: &Value) -> Result<Vec<String>, ProviderError> {
     Ok(models.into_iter().collect())
 }
 
-async fn discovery_http_error(response: reqwest::Response, api_key: &str) -> ProviderError {
+async fn discovery_http_error(
+    response: reqwest::Response,
+    api_key: &str,
+    cancellation: &CancellationToken,
+) -> ProviderError {
     let status = response.status().as_u16();
     let mut error = ProviderError::new(
         provider_error_kind_for_http_status(status),
         format!("获取模型失败：HTTP {status}。"),
     );
-    match read_bounded_body(response, MAX_HTTP_ERROR_BODY_BYTES, None).await {
+    match read_bounded_body(response, MAX_HTTP_ERROR_BODY_BYTES, Some(cancellation)).await {
         Ok(body) => apply_provider_error_body(&mut error, &body, api_key),
         Err(BoundedBodyReadError::Transport(read_error)) => {
             let _ =
                 write!(error.message, " 无法读取提供方错误响应（{}）。", transport_error_source(read_error));
         }
-        Err(BoundedBodyReadError::Cancelled) => unreachable!("un-cancellable body read"),
+        Err(BoundedBodyReadError::Cancelled) => return provider_cancelled_error(),
     }
     error
 }

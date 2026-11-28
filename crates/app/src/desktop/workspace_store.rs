@@ -47,7 +47,7 @@ impl WorkspaceStore {
     pub(crate) fn open(home: &Path) -> Result<Self, WorkspaceError> {
         let path = home.join(WORKSPACE_REGISTRY_FILE_NAME);
         let state = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
+            Ok(bytes) => serde_json::from_slice(app_core::strip_utf8_bom_bytes(&bytes))
                 .map_err(|source| WorkspaceError::InvalidRegistry { path: path.clone(), source })?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => RegistryFile::default(),
             Err(source) => return Err(WorkspaceError::Read { path, source }),

@@ -124,8 +124,8 @@ pub(super) fn format_diff_result(
     after: &str,
     output_directory: &Path,
 ) -> ToolExecution {
-    let before = before.strip_prefix('\u{feff}').unwrap_or(before).replace("\r\n", "\n");
-    let after = after.strip_prefix('\u{feff}').unwrap_or(after).replace("\r\n", "\n");
+    let before = app_core::strip_utf8_bom(before).replace("\r\n", "\n");
+    let after = app_core::strip_utf8_bom(after).replace("\r\n", "\n");
     let diff = TextDiff::from_lines(&before, &after);
     let (mut added, mut deleted) = (0, 0);
     for change in diff.iter_all_changes() {

@@ -1,16 +1,22 @@
 pub mod identity;
 mod project_instructions;
 pub mod skills;
-mod tool;
 mod user_home;
 mod workspace;
 
-pub use project_instructions::{InstructionFile, load_agent_instructions};
-pub use tool::{ToolDefinition, estimate_tool_tokens};
+pub use project_instructions::{InstructionFile, PROJECT_INSTRUCTIONS_FILE_NAME, load_agent_instructions};
 pub use user_home::resolve_home;
-pub use workspace::{canonicalize_workspace, same_saved_path, saved_path_key, workspace_key};
+pub use workspace::{canonicalize_workspace, same_saved_path, workspace_key};
 
 pub(crate) const PROJECT_ROOT_MARKER: &str = ".git";
+
+pub fn strip_utf8_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
+pub fn strip_utf8_bom_bytes(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes)
+}
 
 pub fn estimate_tokens_of(text: &str) -> u64 {
     let quarters: u64 = text.chars().map(|ch| if ch.is_ascii() { 1 } else { 4 }).sum();

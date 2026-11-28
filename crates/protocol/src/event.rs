@@ -58,11 +58,3 @@ pub enum TurnEvent {
         stats: Option<crate::SessionModelUsage>,
     },
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderAttemptStatus {
-    Ok,
-    Error,
-    Cancelled,
-}

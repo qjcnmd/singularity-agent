@@ -55,7 +55,7 @@ impl SseFrameDecoder {
             line
         } else {
             self.first_line_processed = true;
-            line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line)
+            app_core::strip_utf8_bom_bytes(line)
         };
         if line.is_empty() {
             return Ok(!self.event_data.is_empty());

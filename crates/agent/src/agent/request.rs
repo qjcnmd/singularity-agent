@@ -10,14 +10,14 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone)]
 pub(crate) struct RequestDefinitions {
     pub(crate) messages: Vec<Message>,
-    pub(crate) tools: Vec<app_core::ToolDefinition>,
+    pub(crate) tools: Vec<model::ToolDefinition>,
     pub(crate) estimated_tokens: u64,
 }
 
 impl RequestDefinitions {
-    fn new(messages: Vec<Message>, tools: Vec<app_core::ToolDefinition>) -> Self {
+    fn new(messages: Vec<Message>, tools: Vec<model::ToolDefinition>) -> Self {
         let instructions = messages.iter().map(context::message_token_estimate).sum::<u64>();
-        let tool_tokens = app_core::estimate_tool_tokens(&tools);
+        let tool_tokens = model::estimate_tool_tokens(&tools);
         Self {
             messages,
             tools,

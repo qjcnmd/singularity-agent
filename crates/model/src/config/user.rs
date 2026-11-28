@@ -58,7 +58,7 @@ pub(super) fn read_user_config_file(directory: &Path) -> Result<Option<UserConfi
             return Err(configuration_error(format!("无法读取模型配置 {}：{error}", path.display())));
         }
     };
-    let config_text = config_text.strip_prefix('\u{feff}').unwrap_or(&config_text);
+    let config_text = app_core::strip_utf8_bom(&config_text);
     let config: UserConfigFile = serde_json::from_str(config_text).map_err(|error| {
         let reason = match error.classify() {
             serde_json::error::Category::Io => "读取失败",

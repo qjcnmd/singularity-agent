@@ -13,8 +13,8 @@ pub(crate) struct ViewImageArgs {
     pub(crate) path: String,
 }
 
-pub(crate) fn spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: VIEW_IMAGE_TOOL_NAME.to_string(),
         description: "View an image file (PNG, JPEG, WebP, GIF first frame, BMP). The image is returned as visual input, not text.".to_string(),
         parameters_schema: json!({

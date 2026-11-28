@@ -53,7 +53,7 @@ fn redact_url_for_debug(url: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpServerInput {
     pub server_id: String,
     pub startup_timeout_sec: u64,
@@ -63,14 +63,14 @@ pub struct McpServerInput {
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpListParams {
     pub workspace_root: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpSaveParams {
     pub server: McpServerInput,
     pub workspace_root: Option<String>,
@@ -78,7 +78,7 @@ pub struct McpSaveParams {
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpServerParams {
     pub server_id: String,
     pub workspace_root: Option<String>,

@@ -3,8 +3,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use ::mcp::McpTool;
-use app_core::ToolDefinition;
 use app_core::skills::SkillCatalog;
+use model::ToolDefinition;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;

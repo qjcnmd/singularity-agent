@@ -204,11 +204,18 @@ impl AppServer {
         api_protocol: protocol::ProviderApiProtocol,
         base_url: &str,
         api_key: Option<&str>,
+        shutdown: &tokio_util::sync::CancellationToken,
     ) -> Result<Vec<String>, RpcError> {
         self.models
-            .discover_models(provider_id, api_protocol, base_url, api_key)
+            .discover_models(provider_id, api_protocol, base_url, api_key, shutdown)
             .await
-            .map_err(RpcError::new)
+            .map_err(|error| {
+                if error.is_cancelled() {
+                    RpcError::new("工作台正在退出。")
+                } else {
+                    RpcError::new(error)
+                }
+            })
     }
 
     pub(crate) fn start_session(

@@ -23,6 +23,7 @@ impl Skill {
         let content = fs::read_to_string(&self.path).map_err(|error| {
             format!("无法加载技能 /{}（{}）：{error}", self.name, crate::display_path(&self.path))
         })?;
+        let content = crate::strip_utf8_bom(&content);
         Ok(format!(
             "<skill>\nName: {}\nPath: {}\nBase directory: {}\nSkill instructions follow. Already loaded; do not read SKILL.md again to activate it. Resolve relative resources from the base directory using absolute tool paths.\n\n{content}\n</skill>",
             self.name,
@@ -59,7 +60,7 @@ fn discover_skill(path: &Path, file: fs::File) -> Result<Skill, String> {
         .transpose()
         .map_err(|e| format!("{}: {e}", crate::display_path(path)))?
         .unwrap_or_default();
-    if first.trim_start_matches('\u{feff}').trim() != "---" {
+    if crate::strip_utf8_bom(&first).trim() != "---" {
         return Err(format!("{}: missing YAML frontmatter", crate::display_path(path)));
     }
     let mut yaml = String::new();

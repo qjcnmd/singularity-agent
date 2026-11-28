@@ -126,9 +126,9 @@ impl AppServer {
         workspace_root: Option<&str>,
     ) -> Result<protocol::TextDocument, RpcError> {
         let dir = self.scope_directory(workspace_root)?;
-        let path = dir.join("AGENTS.md");
+        let path = dir.join(app_core::PROJECT_INSTRUCTIONS_FILE_NAME);
         let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
+            Ok(content) => app_core::strip_utf8_bom(&content).to_owned(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(RpcError::new(format!("{}: {error}", path.display()))),
         };
@@ -144,7 +144,7 @@ impl AppServer {
         content: &str,
     ) -> Result<protocol::TextDocument, RpcError> {
         let dir = self.scope_directory(workspace_root)?;
-        let path = dir.join("AGENTS.md");
+        let path = dir.join(app_core::PROJECT_INSTRUCTIONS_FILE_NAME);
         app_core::write_bytes_atomic(&path, content.as_bytes())
             .map_err(|error| RpcError::new(format!("{}: {error}", path.display())))?;
         Ok(protocol::TextDocument {
@@ -165,10 +165,10 @@ fn group_threads(
 ) -> BTreeMap<String, Vec<ThreadSummary>> {
     let mut grouped: BTreeMap<String, Vec<ThreadSummary>> = workspaces
         .iter()
-        .map(|workspace| (app_core::saved_path_key(&workspace.root), Vec::new()))
+        .map(|workspace| (app_core::workspace_key(Path::new(&workspace.root)), Vec::new()))
         .collect();
     for thread in threads {
-        if let Some(bucket) = grouped.get_mut(&app_core::saved_path_key(&thread.cwd)) {
+        if let Some(bucket) = grouped.get_mut(&app_core::workspace_key(Path::new(&thread.cwd))) {
             bucket.push(thread);
         }
     }

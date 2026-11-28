@@ -44,8 +44,8 @@ impl TodoArgs {
     }
 }
 
-pub(crate) fn spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: TODO_TOOL_NAME.to_string(),
         description: "Maintain a concise checklist for complex multi-step tasks (3+ steps). Skip for simple or single-step work. Each call replaces the full list; pass an empty array [] to clear it. Keep at most one item in_progress at a time and update immediately when completing a step.".to_string(),
         parameters_schema: json!({

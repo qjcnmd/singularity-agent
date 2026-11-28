@@ -37,8 +37,8 @@ impl GlobArgs {
     }
 }
 
-pub(crate) fn spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: GLOB_TOOL_NAME.to_string(),
         description: format!(
             "Find files matching a glob pattern, respecting .gitignore and skipping .git. Patterns without path separators match filenames at any depth (e.g. '*.rs'). Results are sorted by newest modification time first, capped at {DEFAULT_GLOB_LIMIT} by default (max {MAX_GLOB_LIMIT}) and {}KB.",
