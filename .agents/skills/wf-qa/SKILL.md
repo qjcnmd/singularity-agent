@@ -7,7 +7,7 @@ description: Singularity 真实模型探索式实机 QA：派独立空白上下�
 
 ## 1. 调度方式：独立 QA 子代理
 
-* 由主代理启动 **1 个独立空白上下文的 `self` 子代理**（`Role: "Exploratory QA Tester"`）执行实机操作，避免携带开发者的先入为主，也不让快照与截图占满主对话上下文；常规探索验收可选用轻量 `flash` 模型提速降本，复杂排错再用默认模型。
+* 由主代理启动 **1 个独立空白上下文的 `self` 子代理**（`Role: "Exploratory QA Tester"`，指定 `Model: "flash"`）执行实机操作，避免携带开发者的先入为主，也不让快照与截图占满主对话上下文。
 * **派发前准备**：主代理确认 `apps/desktop/dist/index.html` 与 `apps/desktop/desktop-runtime/singularity.exe` 已对应当前源码（缺失或过期则先跑 `npm --prefix apps/desktop run build`；改了 Rust 则补 `cargo build -p app --bins && npm --prefix apps/desktop run prepare:runtime -- debug`）。
 * **简报内容**：只给子代理传入 ① 执行模式与用户视角目标（**模式 A** 写 2～3 句本次可见改动与关联主流程；**模式 B** 写全应用摸底或用户指定重点，不附源码实现细节）；② 要求按本技能与 `AGENTS.local.md` 默认真实模型执行并返回白话报告。
 
