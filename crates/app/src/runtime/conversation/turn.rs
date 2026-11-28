@@ -154,12 +154,11 @@ impl Conversation {
     ) -> Result<(), ConversationError> {
         let (cancel, mut cancel_guard) = {
             let mut inner = self.lock_inner();
-            if shutdown.is_cancelled()
-                || inner.state.closing
-                || inner.state.turn.is_busy()
-                || inner.view.context.is_some()
-            {
+            if shutdown.is_cancelled() || inner.state.turn.is_busy() || inner.view.context.is_some() {
                 return Ok(());
+            }
+            if inner.state.closing {
+                return Err(ConversationError::Busy);
             }
             let cancel = shutdown.child_token();
             let id = inner.state.register_inspect_cancel(cancel.clone());
@@ -185,12 +184,11 @@ impl Conversation {
         .await;
         let mut inner = self.lock_inner();
         cancel_guard.remove_locked(&mut inner.state);
-        if cancel.is_cancelled()
-            || inner.state.closing
-            || inner.state.turn.is_busy()
-            || inner.view.context.is_some()
-        {
+        if shutdown.is_cancelled() || inner.state.turn.is_busy() || inner.view.context.is_some() {
             return Ok(());
+        }
+        if inner.state.closing || cancel.is_cancelled() {
+            return Err(ConversationError::Busy);
         }
         result.map(|context| self.publish_event(&mut inner, TurnEvent::ContextLoaded { context }))
     }

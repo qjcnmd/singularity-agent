@@ -81,6 +81,9 @@ impl AppServer {
                 }
                 return Err(RpcError::new(error));
             }
+            for conversation in &marked {
+                conversation.mark_closing();
+            }
             sessions.retain(|_, conversation| !belongs(conversation));
             let close = app.mcp.disconnect_directory(Path::new(&workspace.root));
             drop(sessions);

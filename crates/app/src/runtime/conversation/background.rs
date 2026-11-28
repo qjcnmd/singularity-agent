@@ -60,7 +60,7 @@ impl Conversation {
         if inner.state.closing || inner.state.has_work(&self.bash_tasks) {
             return false;
         }
-        inner.state.mark_closing();
+        inner.state.closing = true;
         true
     }
 

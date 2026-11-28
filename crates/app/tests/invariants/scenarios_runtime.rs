@@ -754,6 +754,7 @@ async fn mcp_remove_live_connection_invariants() {
     assert!(!keep_exit.exists(), "mcp.remove(probe) must keep unrelated keep child alive");
     let after = client.rpc_ok("mcp.list", json!({ "workspaceRoot": ws })).await;
     assert_eq!(mcp_server_ids(&after), vec!["keep"]);
+    assert_eq!(after.pointer("/0/status").and_then(Value::as_str), Some("connected"));
 
     let disk: Value =
         serde_json::from_str(&std::fs::read_to_string(env.home.join("mcp.json")).expect("read mcp.json"))
