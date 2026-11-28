@@ -2,16 +2,20 @@
 .SYNOPSIS
     Run local quality checks aligned with .github/workflows/ci.yml.
 .PARAMETER Scope
-    Check scope: rust, protocol, desktop, size, or all (default: all).
+    Check scope: rust, protocol, desktop, size, arch, or all (default: all).
 .PARAMETER SkipE2E
     Skip the Electron Playwright smoke test in desktop/all scopes.
+.PARAMETER Check
+    Run in read-only mode without modifying working-tree files (cargo fmt --check, export_types --check).
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('rust', 'protocol', 'desktop', 'size', 'all')]
+    [ValidateSet('rust', 'protocol', 'desktop', 'size', 'arch', 'all')]
     [string]$Scope = 'all',
 
-    [switch]$SkipE2E
+    [switch]$SkipE2E,
+
+    [switch]$Check
 )
 
 Set-StrictMode -Version Latest
@@ -39,6 +43,7 @@ function Test-ProdSourcePath([string]$RelPath) {
     ($p -match '^crates/[^/]+/src/.+\.rs$' -and $p -notmatch '(^|/)property_tests\.rs$') -or
         ($p -match '^apps/desktop/desktop/.+\.(ts|tsx|cts)$') -or
         ($p -match '^apps/desktop/src/.+\.(ts|tsx)$' -and $p -ne 'apps/desktop/src/protocol.generated.ts') -or
+        ($p -match '^apps/desktop/src/styles/.+\.css$') -or
         ($p -match '^scripts/.+\.ps1$')
 }
 
@@ -196,6 +201,79 @@ function Invoke-SizeCheck {
     }
 }
 
+function Invoke-WorkspaceDagCheck {
+    $allowedEdges = @{
+        app_core = @()
+        protocol = @()
+        model    = @('app_core', 'protocol')
+        mcp      = @('app_core', 'protocol')
+        agent    = @('app_core', 'protocol', 'model', 'mcp')
+        app      = @('app_core', 'protocol', 'model', 'mcp', 'agent')
+    }
+    $raw = (& cargo metadata --locked --no-deps --format-version 1) -join "`n"
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo metadata failed ($LASTEXITCODE)"
+    }
+    $meta = $raw | ConvertFrom-Json
+    $workspaceNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($pkg in @($meta.packages)) { $null = $workspaceNames.Add([string]$pkg.name) }
+
+    $violations = [System.Collections.Generic.List[string]]::new()
+    foreach ($pkg in @($meta.packages)) {
+        $name = [string]$pkg.name
+        if (-not $allowedEdges.ContainsKey($name)) {
+            $violations.Add("unexpected workspace crate '$name'")
+            continue
+        }
+        $allowed = @($allowedEdges[$name])
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        foreach ($dep in @($pkg.dependencies)) {
+            if ($null -ne $dep.kind -and $dep.kind -ne 'normal') { continue }
+            $depName = [string]$dep.name
+            if ($workspaceNames.Contains($depName) -and $seen.Add($depName) -and ($depName -cnotin $allowed)) {
+                $allowedText = if ($allowed.Count -gt 0) { $allowed -join ', ' } else { 'none' }
+                $violations.Add("forbidden workspace dependency: $name -> $depName (allowed: $allowedText)")
+            }
+        }
+    }
+    foreach ($expected in $allowedEdges.Keys) {
+        if (-not $workspaceNames.Contains($expected)) {
+            $violations.Add("missing expected workspace crate '$expected'")
+        }
+    }
+    if ($violations.Count -gt 0) {
+        foreach ($v in $violations) { Write-Host "  $v" -ForegroundColor Red }
+        throw "Workspace crate-DAG check failed ($($violations.Count) violation(s))."
+    }
+    Write-Host "  Workspace crate DAG verified ($($workspaceNames.Count) crates)"
+}
+
+function Invoke-IdentityParityCheck {
+    $rsText = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'crates/core/src/identity.rs')).Replace("`r`n", "`n")
+    $tsText = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'apps/desktop/src/identity.ts')).Replace("`r`n", "`n")
+    $pairs = @(
+        @{ Rust = 'APP_NAME';      Ts = 'APP_NAME' }
+        @{ Rust = 'APP_SLUG';      Ts = 'APP_SCHEME' }
+        @{ Rust = 'HOME_ENV_VAR';  Ts = 'HOME_ENV_VAR' }
+        @{ Rust = 'DATA_DIR_NAME'; Ts = 'DATA_DIR_NAME' }
+    )
+    $issues = [System.Collections.Generic.List[string]]::new()
+    foreach ($pair in $pairs) {
+        $rsMatch = [regex]::Match($rsText, "(?m)^\s*pub\s+const\s+$([regex]::Escape($pair.Rust))\s*:\s*&str\s*=\s*`"([^`"\r\n]*)`"\s*;")
+        $tsMatch = [regex]::Match($tsText, "(?m)^\s*export\s+const\s+$([regex]::Escape($pair.Ts))(?:\s*:\s*\w+)?\s*=\s*(['`"])([^'`"\r\n]*)\1\s*;?\s*$")
+        if (-not $rsMatch.Success) { $issues.Add("missing Rust constant $($pair.Rust) in crates/core/src/identity.rs") }
+        if (-not $tsMatch.Success) { $issues.Add("missing TypeScript constant $($pair.Ts) in apps/desktop/src/identity.ts") }
+        if ($rsMatch.Success -and $tsMatch.Success -and ($rsMatch.Groups[1].Value -cne $tsMatch.Groups[2].Value)) {
+            $issues.Add("identity mismatch: Rust $($pair.Rust)='$($rsMatch.Groups[1].Value)' != TS $($pair.Ts)='$($tsMatch.Groups[2].Value)'")
+        }
+    }
+    if ($issues.Count -gt 0) {
+        foreach ($issue in $issues) { Write-Host "  $issue" -ForegroundColor Red }
+        throw "Cross-language identity parity check failed ($($issues.Count) issue(s))."
+    }
+    Write-Host "  Cross-language identity constants verified ($($pairs.Count) pairs)"
+}
+
 Push-Location $repoRoot
 try {
     if ($Scope -in @('rust', 'desktop', 'size', 'all')) {
@@ -204,31 +282,55 @@ try {
         }
     }
 
+    if ($Scope -in @('arch', 'rust', 'all')) {
+        Invoke-Step 'Verify Rust workspace crate DAG' {
+            Invoke-WorkspaceDagCheck
+        }
+    }
+
+    if ($Scope -in @('arch', 'protocol', 'desktop', 'all')) {
+        Invoke-Step 'Verify Rust/TypeScript identity constant parity' {
+            Invoke-IdentityParityCheck
+        }
+    }
+
     if ($Scope -in @('protocol', 'all')) {
-        $generatedPath = Join-Path $repoRoot 'apps/desktop/src/protocol.generated.ts'
-        $before = if (Test-Path -LiteralPath $generatedPath) {
-            [System.IO.File]::ReadAllText($generatedPath).Replace("`r`n", "`n")
+        if ($Check) {
+            Invoke-Step 'Verify TypeScript protocol bindings are up to date' {
+                cargo run -p protocol --features typescript --example export_types --locked -- --check
+            }
         } else {
-            $null
-        }
-        Invoke-Step 'Export TypeScript protocol bindings' {
-            cargo run -p protocol --features typescript --example export_types --locked
-        }
-        Invoke-Step 'Verify protocol.generated.ts has no drift' {
-            $after = if (Test-Path -LiteralPath $generatedPath) {
+            $generatedPath = Join-Path $repoRoot 'apps/desktop/src/protocol.generated.ts'
+            $before = if (Test-Path -LiteralPath $generatedPath) {
                 [System.IO.File]::ReadAllText($generatedPath).Replace("`r`n", "`n")
             } else {
                 $null
             }
-            if ($before -cne $after) {
-                throw 'apps/desktop/src/protocol.generated.ts drifted from crates/protocol and was updated; re-run after reviewing or updating callers.'
+            Invoke-Step 'Export TypeScript protocol bindings' {
+                cargo run -p protocol --features typescript --example export_types --locked
+            }
+            Invoke-Step 'Verify protocol.generated.ts has no drift' {
+                $after = if (Test-Path -LiteralPath $generatedPath) {
+                    [System.IO.File]::ReadAllText($generatedPath).Replace("`r`n", "`n")
+                } else {
+                    $null
+                }
+                if ($before -cne $after) {
+                    throw 'apps/desktop/src/protocol.generated.ts drifted from crates/protocol and was updated; re-run after reviewing or updating callers.'
+                }
             }
         }
     }
 
     if ($Scope -in @('rust', 'all')) {
-        Invoke-Step 'Format Rust workspace' {
-            cargo fmt --all
+        if ($Check) {
+            Invoke-Step 'Check Rust workspace formatting' {
+                cargo fmt --all -- --check
+            }
+        } else {
+            Invoke-Step 'Format Rust workspace' {
+                cargo fmt --all
+            }
         }
         Invoke-Step 'Clippy Rust workspace (CI flags)' {
             cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
