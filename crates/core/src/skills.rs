@@ -120,6 +120,10 @@ impl SkillCatalog {
             root.join(".agents").join("skills"),
             home.join("skills"),
         ];
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "user-level ~/.agents/skills discovery intentionally reads the OS home directory"
+        )]
         if let Some(os_home) = std::env::home_dir() {
             roots.push(os_home.join(".agents").join("skills"));
         }

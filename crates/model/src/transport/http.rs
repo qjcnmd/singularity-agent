@@ -36,6 +36,10 @@ fn parse_retry_after_value(value: &str) -> Option<Duration> {
 
 /// 模型调用、目录查询与联网工具共用的基础 HTTP 客户端构造器：
 /// 安装 ring TLS provider、禁用重定向并统一 User-Agent。
+#[expect(
+    clippy::disallowed_methods,
+    reason = "canonical model HTTP builder enforcing ring TLS, Policy::none(), and USER_AGENT"
+)]
 pub(crate) fn client_builder() -> reqwest::ClientBuilder {
     let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()

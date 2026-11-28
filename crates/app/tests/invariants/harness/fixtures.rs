@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-pub const TINY_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+pub(crate) const TINY_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
-pub fn find_tool_result<'a>(body: &'a Value, call_id: &str) -> &'a Value {
+pub(crate) fn find_tool_result<'a>(body: &'a Value, call_id: &str) -> &'a Value {
     body.get("messages")
         .and_then(Value::as_array)
         .expect("messages array")
@@ -22,7 +22,7 @@ fn sse_data(payload: &Value) -> String {
     format!("data: {payload}\n\n")
 }
 
-pub fn messages_text_sse(
+pub(crate) fn messages_text_sse(
     thinking: Option<(&str, &str)>,
     text: &str,
     input_tokens: u64,
@@ -82,7 +82,7 @@ pub fn messages_text_sse(
     events
 }
 
-pub fn messages_tools_sse(
+pub(crate) fn messages_tools_sse(
     preface: Option<&str>,
     calls: Vec<(&str, &str, Value)>,
     input_tokens: u64,
@@ -133,7 +133,7 @@ pub fn messages_tools_sse(
     events
 }
 
-pub fn responses_sse(
+pub(crate) fn responses_sse(
     thinking: Option<(&str, &str)>,
     text: Option<&str>,
     calls: Vec<(&str, &str, Value)>,
@@ -204,7 +204,7 @@ pub fn responses_sse(
     events
 }
 
-pub fn write_test_mcp_script(dir: &Path) -> PathBuf {
+pub(crate) fn write_test_mcp_script(dir: &Path) -> PathBuf {
     let script = dir.join("test_mcp_server.mjs");
     let source = r#"
 import { createInterface } from 'node:readline';

@@ -26,8 +26,13 @@ impl AppServer {
             .map(|(id, conversation)| (id.to_owned(), conversation.status()))
             .collect();
         let sessions_by_workspace = group_threads(&workspaces, threads);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "AppBootstrap exposes the OS home path for UI ~ display shortening"
+        )]
+        let user_home = std::env::home_dir().and_then(|home| home.into_os_string().into_string().ok());
         Ok(AppBootstrap {
-            user_home: std::env::home_dir().and_then(|home| home.into_os_string().into_string().ok()),
+            user_home,
             session_states,
             revision,
             workspaces,

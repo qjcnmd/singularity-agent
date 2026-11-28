@@ -267,6 +267,10 @@ async fn connect_http(
     headers: &std::collections::BTreeMap<String, String>,
 ) -> Result<RunningService<RoleClient, Handler>, McpError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "canonical MCP HTTP builder enforcing ring TLS, Policy::none(), and USER_AGENT"
+    )]
     let client = reqwest::Client::builder()
         // reqwest 跨源重定向时只移除预定义的鉴权头。
         .redirect(reqwest::redirect::Policy::none())

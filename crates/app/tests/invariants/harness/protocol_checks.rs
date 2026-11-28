@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-pub fn check_messages_request_invariants(body: &Value) -> Result<(), String> {
+pub(super) fn check_messages_request_invariants(body: &Value) -> Result<(), String> {
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         for tool in tools {
             if tool.get("name").and_then(Value::as_str).is_none_or(str::is_empty) {
@@ -87,7 +87,7 @@ pub fn check_messages_request_invariants(body: &Value) -> Result<(), String> {
     Ok(())
 }
 
-pub fn check_responses_request_invariants(body: &Value) -> Result<(), String> {
+pub(super) fn check_responses_request_invariants(body: &Value) -> Result<(), String> {
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         for tool in tools {
             if tool.get("type").and_then(Value::as_str) != Some("function") {
