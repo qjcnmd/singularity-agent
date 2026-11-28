@@ -152,13 +152,13 @@ cargo run -p protocol --features typescript --example export_types --locked
 Windows 包通过 `electronLanguages` 只保留简体中文（`zh-CN`）和英文（`en-US`）的 Electron 语言资源。
 
 ```powershell
-# 构建 Release 版本后端与前端
+# 构建 Release 版本后端与前端（PowerShell 需给 '--' 加引号，避免被壳层吃掉）
 npm --prefix apps/desktop run build
 cargo build --release --locked --package app --bins
-npm --prefix apps/desktop run prepare:runtime -- release
+npm --prefix apps/desktop run prepare:runtime '--' release
 
 # 使用 Electron Builder 生成免安装绿色目录（--config.directories.output 可选指定输出目录）
-npm --prefix apps/desktop run package -- --config.directories.output=<输出目录>
+npm --prefix apps/desktop run package '--' --config.directories.output=<输出目录>
 ```
 
 产物输出于 `<输出目录>/win-unpacked/`。退出正在运行的 Singularity 后替换目标运行目录，从运行目录验证通过后删除临时打包产物，只保留一份运行包。用户数据保留在 `~/.singularity`。本机具体的运行目录、输出路径与构建缓存清理阈值见本机 `AGENTS.local.md`（如有）。
