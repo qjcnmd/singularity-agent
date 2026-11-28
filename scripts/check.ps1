@@ -166,7 +166,7 @@ function Invoke-SizeCheck {
 
     $overWarn = @($files | Where-Object { $_.Lines -gt $warnLines -and $_.Lines -le $maxLines } | Sort-Object Lines -Descending)
     if ($overWarn.Count -gt 0) {
-        Write-Host "  Warning: $($overWarn.Count) production source file(s) exceed $warnLines-line soft target (hard limit: $maxLines):" -ForegroundColor Yellow
+        Write-Host "  Note: $($overWarn.Count) production source file(s) above the ~$warnLines-line soft guideline (not a limit; do not shrink mechanically; hard limit: $maxLines):" -ForegroundColor Yellow
         foreach ($item in $overWarn) {
             Write-Host "    $($item.Path) ($($item.Lines) > $warnLines)" -ForegroundColor Yellow
         }
@@ -277,7 +277,7 @@ function Invoke-IdentityParityCheck {
 Push-Location $repoRoot
 try {
     if ($Scope -in @('rust', 'desktop', 'size', 'all')) {
-        Invoke-Step 'Check production source size (warn > 600, hard limit <= 800 lines)' {
+        Invoke-Step 'Check production source size (soft guideline ~600, hard limit <= 800 lines)' {
             Invoke-SizeCheck
         }
     }

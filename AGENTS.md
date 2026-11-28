@@ -45,5 +45,5 @@ Windows 本地单用户桌面 AI 编程工作台：Electron 前端（`apps/deskt
 * **红线**：生产代码与功能验收只用真实提供方和模型，进程内不做 Mock；常驻测试隔离 `SINGULARITY_HOME`；增删测试先读[测试保留与清理标准](docs/development.md#测试保留与清理标准)，临时测试与脚本验证后即删。
 * **分级验收**（通过即止，不反复重跑）：
   * **纯文档 / 配置**：核对与源码事实一致。
-  * **代码 / 脚本**：按影响面跑 `pwsh -File scripts/check.ps1 -Scope <rust|protocol|desktop|size|all>`（`rust` / `desktop` / `all` 均含生产源码 ~600 行提醒 / 800 行硬上限及测试增量、巨批/混装黄灯预警；本地 `rust` 自动执行 `cargo fmt`，详情见[开发指南 §2](docs/development.md#2-质量检查与代码格式化)）。
+  * **代码 / 脚本**：按影响面跑 `pwsh -File scripts/check.ps1 -Scope <rust|protocol|desktop|size|all>`（`rust` / `desktop` / `all` 均含生产源码 ~600 行软参考（不机械压行）/ 800 行硬上限及测试增量、巨批/混装黄灯预警；本地 `rust` 自动执行 `cargo fmt`，详情见[开发指南 §2](docs/development.md#2-质量检查与代码格式化)）。
   * **用户可见功能**：门禁全绿后按 [wf-qa](.agents/skills/wf-qa/SKILL.md) 派独立 QA 子代理做真实模型隔离探索验收（布局与动效观感写明手测步骤交用户看）；整批功能最终收口或用户要求时按[开发指南 §5](docs/development.md#5-打包构建与发布)及 `AGENTS.local.md` 更新本地运行包并按需清理构建缓存。

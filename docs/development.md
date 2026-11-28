@@ -64,7 +64,7 @@ pwsh -File scripts/check.ps1 -Scope rust
 pwsh -File scripts/check.ps1 -Scope protocol
 pwsh -File scripts/check.ps1 -Scope desktop          # 含编译后端、prepare:runtime 与 E2E
 pwsh -File scripts/check.ps1 -Scope desktop -SkipE2E # 仅 lint + 严格构建
-pwsh -File scripts/check.ps1 -Scope size             # 仅生产源码行数（600 提醒 / 800 硬上限，含 styles/*.css）、测试增量与巨批/混装预警
+pwsh -File scripts/check.ps1 -Scope size             # 仅生产源码行数（~600 行软参考、不机械压行 / 800 硬上限，含 styles/*.css）、测试增量与巨批/混装预警
 pwsh -File scripts/check.ps1 -Scope arch -Check      # 仅校验 Rust crate DAG 与 Rust/TS 身份常量一致
 pwsh -File scripts/check.ps1 -Scope all -Check       # 只读全量门禁（与 CI 一致）
 ```
@@ -164,4 +164,4 @@ npm --prefix apps/desktop run package '--' --config.directories.output=<输出�
 产物输出于 `<输出目录>/win-unpacked/`。退出正在运行的 Singularity 后替换目标运行目录，从运行目录验证通过后删除临时打包产物，只保留一份运行包。用户数据保留在 `~/.singularity`。本机具体的运行目录、输出路径与构建缓存清理阈值见本机 `AGENTS.local.md`（如有）。
 
 ### CI
-- **CI 工作流** (`.github/workflows/ci.yml`)：推送到 `main`，以及目标分支为 `main` 的 pull request，运行生产源码行数检查（目标 ~600 行提醒，硬上限 800 行，含 CSS）、架构边界校验（Rust crate DAG 与 Rust/TS 身份常量一致）、前端 Lint（含循环与分层约束）与严格构建、Rust 格式化检查、跨端协议只读同步校验、Clippy、编译、属性测试与后端黑盒不变量测试，以及依赖安全检查。
+- **CI 工作流** (`.github/workflows/ci.yml`)：推送到 `main`，以及目标分支为 `main` 的 pull request，运行生产源码行数检查（~600 行软参考、不机械压行，硬上限 800 行，含 CSS）、架构边界校验（Rust crate DAG 与 Rust/TS 身份常量一致）、前端 Lint（含循环与分层约束）与严格构建、Rust 格式化检查、跨端协议只读同步校验、Clippy、编译、属性测试与后端黑盒不变量测试，以及依赖安全检查。
