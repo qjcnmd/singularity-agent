@@ -1,6 +1,7 @@
 import { useLayoutEffect, useState } from 'react'
 import { appStore, type AppState } from './appStore'
 import type { SkillCatalog } from './protocol'
+import { errorMessage } from './rpcClient'
 
 export function inputTrigger(text: string, caret: number): { start: number; end: number; query: string } | null {
   for (let start = caret - 1; start >= 0; start--) {
@@ -18,7 +19,7 @@ type SkillQuery =
   | { status: 'idle' }
   | { status: 'loading' }
   | { status: 'ready'; result: SkillCatalog }
-  | { status: 'error'; error: Error }
+  | { status: 'error'; message: string }
 
 type QueryScope = Pick<AppState, 'selectedWorkspaceRoot' | 'selectedSessionId' | 'bootstrap'>
 
@@ -36,7 +37,7 @@ export function useSkillCandidates(enabled: boolean, scope: QueryScope) {
     let active = true
     void appStore.transport.rpc('skills.list', { workspaceRoot: selectedWorkspaceRoot }).then(
       result => { if (active) setSkills({ status: 'ready', result }) },
-      error => { if (active) setSkills({ status: 'error', error: error instanceof Error ? error : new Error(String(error)) }) },
+      error => { if (active) setSkills({ status: 'error', message: errorMessage(error) }) },
     )
     return () => { active = false }
   }, [enabled, selectedSessionId, selectedWorkspaceRoot, ready, reload])

@@ -3,7 +3,8 @@ import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import { formatTokenCount } from '../copy'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import type { ProviderConfigurationInput, RedactedProvider } from '../protocol'
-import { blankModel } from '../modelConfiguration'
+import { blankModel } from '../models'
+import { errorMessage } from '../rpcClient'
 import { ModelEditor } from './ModelEditor'
 import { Dialog } from './Dialog'
 import { ProtocolPicker } from './ProtocolPicker'
@@ -71,7 +72,7 @@ export function ProviderEditor({ state, provider, active, onDone }: ProviderEdit
       setCandidates(found)
       setPicked(new Set(found.filter(id => models.some(model => model.modelId.trim() === id))))
     } catch (error) {
-      if (revision === discoveryRevision.current) setFailure(error instanceof Error ? error.message : '获取模型失败。')
+      if (revision === discoveryRevision.current) setFailure(errorMessage(error, '获取模型失败。'))
     } finally {
       if (revision === discoveryRevision.current) setFetching(false)
     }

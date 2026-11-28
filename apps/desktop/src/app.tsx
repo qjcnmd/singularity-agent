@@ -9,6 +9,7 @@ import { Settings } from './components/Settings'
 import { Sidebar, SidebarToggle } from './components/Sidebar'
 import { RunPanel } from './components/RunPanel'
 import { hasInlineActionError, useAppStore, appStore } from './appStore'
+import { isCompactViewport } from './interactions'
 import { buildHistoryRows, buildTimeline, formatSessionMetrics } from './timeline'
 import { bubbleVariables } from './bubbleColors'
 import { clampFilePanelWidth } from './viewPersistence'
@@ -97,7 +98,7 @@ const MainContent = memo(function MainContent({ filePanelOpen }: { filePanelOpen
     <div
       className="main-column"
       onPointerDownCapture={() => {
-        if (!state.sidebarCollapsed && window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
+        if (!state.sidebarCollapsed && isCompactViewport()) appStore.toggleSidebar()
       }}
     >
       <header className="conversation-header">

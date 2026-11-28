@@ -2,6 +2,7 @@ import { Pencil, Plus, Trash2, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { appStore } from '../appStore'
 import type { McpConnectionStatus, McpServerInput, McpServerState } from '../protocol'
+import { errorMessage } from '../rpcClient'
 import { Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
@@ -35,7 +36,7 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
       }
     } catch (error) {
       if (ep === epoch.current && version === loadRevision.current) {
-        setLoadError(error instanceof Error ? error.message : '读取 MCP 配置失败。')
+        setLoadError(errorMessage(error, '读取 MCP 配置失败。'))
       }
     } finally {
       if (ep === epoch.current && version === loadRevision.current) setLoading(false)
@@ -81,7 +82,7 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
     } catch (error) {
       if (ep === epoch.current && reconnectRevisions.current.get(serverId) === version) {
         setServers(current => current.map(state => state.server.serverId === serverId
-          ? { ...state, status: 'failed', error: error instanceof Error ? error.message : '连接 MCP 失败。', tools: [] } : state))
+          ? { ...state, status: 'failed', error: errorMessage(error, '连接 MCP 失败。'), tools: [] } : state))
       }
     } finally {
       setReconnecting(count => Math.max(0, count - 1))
@@ -107,7 +108,7 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
       return true
     }
     catch (error) {
-      if (startEpoch === epoch.current) setMutationError(error instanceof Error ? error.message : '保存 MCP 配置失败。')
+      if (startEpoch === epoch.current) setMutationError(errorMessage(error, '保存 MCP 配置失败。'))
       return false
     }
     finally { setBusy(false) }
@@ -214,7 +215,7 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
         transport: type === 'stdio' ? { type, command: command.trim(), args: parsedArgs, cwd: cwd.trim() || null, env: stringMap(env, '环境变量') }
           : { type, url: url.trim(), headers: stringMap(headers, '请求头') },
       })
-    } catch (error) { setFailure(error instanceof Error ? error.message : '配置格式无效。') }
+    } catch (error) { setFailure(errorMessage(error, '配置格式无效。')) }
   }
 
   return <form className="sg-editor mcp-editor" onSubmit={event => void save(event)}>

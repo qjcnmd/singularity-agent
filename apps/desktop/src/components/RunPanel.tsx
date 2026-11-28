@@ -1,14 +1,17 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { appStore, actionOrigin, pendingKey, useAppStore, type AppState } from '../appStore'
-import { selectedSessionPhase } from '../sessionState'
+import { contextUsageStats, selectedSessionPhase, sessionBackgroundTasks } from '../sessionState'
 import { formatTokenCount } from '../copy'
+import { useDismissOnOutside } from '../interactions'
 import { pop } from '../motion'
+import { latestTodos, todoProgress } from '../todos'
 import { ContextPanel } from './ContextPanel'
 import { BackgroundTasks } from './BackgroundTasks'
 import { Disclosure } from './Disclosure'
+import { DiffCounts } from './EditDiff'
 import { ExpandChevron } from './ExpandChevron'
-import { latestTodos, TodoList, todoProgress } from './TodoList'
+import { TodoList } from './TodoList'
 import type { ChangedFile } from '../protocol'
 import { LoaderCircle } from 'lucide-react'
 
@@ -54,17 +57,9 @@ export function RunPanel({ overlay = false }: { overlay?: boolean }) {
   const container = useRef<HTMLDivElement>(null)
   const opener = useRef<HTMLButtonElement>(null)
   const reduced = useReducedMotion()
-  useEffect(() => {
-    if (!backgroundOpen || !overlay) return
-    const onPointerDown = (event: PointerEvent) => {
-      const target = event.target
-      if (!(target instanceof Node) || container.current?.contains(target)) return
-      if (document.querySelector(':modal')) return
-      appStore.setBackgroundOpen(false)
-    }
-    window.addEventListener('pointerdown', onPointerDown)
-    return () => window.removeEventListener('pointerdown', onPointerDown)
-  }, [backgroundOpen, overlay])
+  useDismissOnOutside(container, backgroundOpen && overlay, () => appStore.setBackgroundOpen(false), {
+    ignore: () => Boolean(document.querySelector(':modal')),
+  })
   useEffect(() => {
     const close = (event: KeyboardEvent) => {
       if (event.key !== 'Escape' || event.defaultPrevented || !appStore.getSnapshot().backgroundOpen) return
@@ -76,13 +71,13 @@ export function RunPanel({ overlay = false }: { overlay?: boolean }) {
     return () => window.removeEventListener('keydown', close)
   }, [])
   const usage = state.session?.runtime.contextUsage
-  const percent = usage ? Math.min(100, Math.round(usage.used / usage.capacity * 100)) : 0
+  const { percent, tone } = contextUsageStats(usage)
   return <div ref={container} className="run-panel-anchor">
     <button ref={opener} type="button" className="status-chip run-panel-trigger" aria-label="运行状态面板"
       title={usage ? `Context ${percent}%` : 'Context'}
       aria-expanded={backgroundOpen} aria-controls="run-panel"
       onClick={() => appStore.setBackgroundOpen(!backgroundOpen)}>
-      <ContextRing percent={percent} hasUsage={Boolean(usage)} />
+      <ContextRing percent={percent} tone={tone} hasUsage={Boolean(usage)} />
     </button>
     <AnimatePresence>{backgroundOpen && <motion.aside id="run-panel" className={`float-panel${overlay ? ' is-overlay' : ''}`} aria-label="运行状态"
       initial={reduced ? false : { opacity: 0, scale: .96, y: -4 }}
@@ -97,8 +92,8 @@ export function RunPanel({ overlay = false }: { overlay?: boolean }) {
 function RunPanelBody({ changedFiles }: { changedFiles: ChangedFile[] }) {
   const state = useAppStore(['session', 'selectedSessionId', 'liveSessions', 'pendingActions'])
   const usage = state.session?.runtime.contextUsage
-  const percent = usage ? Math.min(100, Math.round(usage.used / usage.capacity * 100)) : 0
-  const tasks = state.selectedSessionId ? state.liveSessions[state.selectedSessionId]?.backgroundTasks ?? [] : []
+  const { percent, tone } = contextUsageStats(usage)
+  const tasks = sessionBackgroundTasks(state.liveSessions, state.selectedSessionId)
   const running = tasks.filter(task => task.state.status === 'running').length
   const phase = selectedSessionPhase(state)
   const sessionId = state.selectedSessionId
@@ -129,25 +124,10 @@ function RunPanelBody({ changedFiles }: { changedFiles: ChangedFile[] }) {
   useEffect(() => {
     if (compactDisabled) setConfirmingCompact(false)
   }, [compactDisabled])
-  useEffect(() => {
-    if (!confirmingCompact) return
-    const onPointerDown = (event: PointerEvent) => {
-      const target = event.target
-      if (target instanceof Node && compactButton.current?.contains(target)) return
-      setConfirmingCompact(false)
-    }
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
-      event.preventDefault()
-      setConfirmingCompact(false)
-    }
-    window.addEventListener('pointerdown', onPointerDown, true)
-    window.addEventListener('keydown', onKeyDown, true)
-    return () => {
-      window.removeEventListener('pointerdown', onPointerDown, true)
-      window.removeEventListener('keydown', onKeyDown, true)
-    }
-  }, [confirmingCompact])
+  useDismissOnOutside(compactButton, confirmingCompact, () => setConfirmingCompact(false), {
+    capture: true,
+    onEscape: event => { event.preventDefault(); setConfirmingCompact(false) },
+  })
   const startCompact = () => {
     attempt.current = compaction?.id ?? ''
     void appStore.compact().then(accepted => { if (!accepted) attempt.current = null })
@@ -169,7 +149,7 @@ function RunPanelBody({ changedFiles }: { changedFiles: ChangedFile[] }) {
         {usage && (
           <span className="context-usage-text">
             {`${formatTokenCount(usage.used).toLowerCase()}/${formatTokenCount(usage.capacity).toLowerCase()} · `}
-            <span className={`context-usage-percent${percent >= 90 ? ' is-danger' : percent >= 75 ? ' is-warning' : ''}`}>{percent}%</span>
+            <span className={`context-usage-percent${tone ? ` is-${tone}` : ''}`}>{percent}%</span>
           </span>
         )}
         <button ref={compactButton} type="button"
@@ -195,12 +175,7 @@ function RunPanelBody({ changedFiles }: { changedFiles: ChangedFile[] }) {
           >
             <strong>Changes</strong>
             <span className="run-row-summary">
-              {(totalAdded > 0 || totalDeleted > 0) && (
-                <span className="edit-counts">
-                  {totalAdded > 0 && <span className="edit-added-count">+{totalAdded}</span>}
-                  {totalDeleted > 0 && <span className="edit-deleted-count">-{totalDeleted}</span>}
-                </span>
-              )}
+              <DiffCounts added={totalAdded} deleted={totalDeleted} />
               <ExpandChevron expanded={false} size={13} />
             </span>
           </button>
@@ -211,12 +186,11 @@ function RunPanelBody({ changedFiles }: { changedFiles: ChangedFile[] }) {
   </>
 }
 
-function ContextRing({ percent, hasUsage }: { percent: number; hasUsage: boolean }) {
-  const tone = percent >= 90 ? ' is-danger' : percent >= 75 ? ' is-warning' : ''
+function ContextRing({ percent, tone, hasUsage }: { percent: number; tone: '' | 'warning' | 'danger'; hasUsage: boolean }) {
   return <svg className="context-ring" width="18" height="18" viewBox="0 0 20 20" aria-hidden="true">
     <circle className={`context-ring-track${hasUsage ? '' : ' is-empty'}`} cx="10" cy="10" r="7.5" />
     {hasUsage && percent > 0 && (
-      <circle className={`context-ring-arc${tone}`} cx="10" cy="10" r="7.5" pathLength={100} strokeDasharray={`${percent} 100`} transform="rotate(-90 10 10)" />
+      <circle className={`context-ring-arc${tone ? ` is-${tone}` : ''}`} cx="10" cy="10" r="7.5" pathLength={100} strokeDasharray={`${percent} 100`} transform="rotate(-90 10 10)" />
     )}
   </svg>
 }

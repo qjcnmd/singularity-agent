@@ -2,6 +2,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { ArrowDown } from 'lucide-react'
 import { appStore, useAppStore, type AppState } from '../appStore'
+import { hasRunningBackgroundTask } from '../sessionState'
 import { type TimelineRow } from '../timeline'
 import { TimelineItem } from './TimelineItem'
 import { useConversationAnnotations } from './Annotations'
@@ -10,11 +11,6 @@ import { defaultAnchor } from '../viewPersistence'
 interface Props {
   state: Pick<AppState, 'selectedSessionId' | 'session' | 'sessionLoad' | 'bootstrap'>
   items: TimelineRow[]
-}
-
-function hasRunningBackgroundTask(liveSessions: AppState['liveSessions'], sessionId: string | null): boolean {
-  if (sessionId === null) return false
-  return liveSessions[sessionId]?.backgroundTasks.some(task => task.state.status === 'running') ?? false
 }
 
 export function Conversation({ state, items }: Props) {

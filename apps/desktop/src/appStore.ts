@@ -1,8 +1,9 @@
 import { workspaceKey } from './workspace'
-import { SessionStore, actionOrigin, type AppState, type FileTab, type QuestionDraft } from './sessionStore'
+import { SessionStore, actionOrigin, type AppState, type QuestionDraft } from './sessionStore'
 export { actionOrigin, hasInlineActionError, pendingKey } from './sessionStore'
 export type { AppState, ActionError, FileTab } from './sessionStore'
-import { selectedModel } from './modelChoices'
+import { closeFileTab, closeWorkspaceTabs, openChangedFilesTab, openFileTab, selectFileTab } from './fileTabs'
+import { selectedModel } from './models'
 import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, clampFilePanelWidth, type PersistedView } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { emptyDraft, hasDraftContent, imageUpload, type Draft, type DraftAnnotation } from './drafts'
@@ -231,7 +232,8 @@ class AppStore extends SessionStore {
     const removedDrafts = sessions.map(session => session.threadId)
     return this.action('workspace.remove', actionOrigin.inline('workspace.remove', workspaceRoot), async () => {
       await this.transport.rpc('workspace.remove', { workspaceRoot })
-      this.closeWorkspaceTabs(workspaceRoot)
+      const nextTabs = closeWorkspaceTabs(this.state, workspaceRoot)
+      if (nextTabs) this.patch(nextTabs)
       this.clearSessionAnchors(removedDrafts)
       this.clearQuestionDrafts(removedDrafts)
       this.saveView({ sidebarView: {
@@ -379,35 +381,24 @@ class AppStore extends SessionStore {
     this.saveView({ stepsDefaultExpanded })
   }
 
-  openFile(path: string, cwd: string, title = path.split(/[\\/]/).filter(Boolean).pop() ?? path): void {
-    const resolved = resolveFileUrl(path, cwd, this.state.bootstrap?.userHome)
-    if (!resolved) return
-    const id = resolved.href.toLowerCase()
-    if (this.state.settingsOpen) this.patch({ settingsOpen: false })
-    this.upsertFileTab({ id, path, cwd, title, mode: 'file', opened: 0 })
+  openFile(path: string, cwd: string, title?: string): void {
+    const next = openFileTab(this.state, path, cwd, this.state.bootstrap?.userHome, title)
+    if (!next) return
+    this.patch(this.state.settingsOpen ? { ...next, settingsOpen: false } : next)
   }
 
   openChangedFiles(cwd: string, focusPath?: string, initialFiles?: ChangedFile[]): void {
-    if (this.state.settingsOpen) this.patch({ settingsOpen: false })
-    const id = `changes:${workspaceKey(cwd)}`
-    this.upsertFileTab({ id, path: cwd, cwd, title: 'Changes', mode: 'changes', focusPath, initialChanges: initialFiles, opened: 0 })
-  }
-
-  private upsertFileTab(tab: FileTab): void {
-    const fileTabs = this.state.fileTabs.some(item => item.id === tab.id)
-      ? this.state.fileTabs.map(item => item.id === tab.id
-        ? { ...item, focusPath: tab.focusPath, initialChanges: item.initialChanges ?? tab.initialChanges, opened: item.opened + 1 }
-        : item)
-      : [...this.state.fileTabs, tab]
-    this.patch({ fileTabs, activeFileTab: tab.id })
+    const next = openChangedFilesTab(this.state, cwd, focusPath, initialFiles)
+    this.patch(this.state.settingsOpen ? { ...next, settingsOpen: false } : next)
   }
 
   closeFile(id: string): void {
-    this.retainFileTabs(tab => tab.id !== id)
+    const next = closeFileTab(this.state, id)
+    if (next) this.patch(next)
   }
 
   selectFile(id: string): void {
-    this.patch({ activeFileTab: id })
+    this.patch(selectFileTab(this.state, id))
   }
 
   setFilePanelWidth(value: number): void {
@@ -436,22 +427,4 @@ export function useAppStore<K extends keyof AppState>(
     return next
   }
   return useSyncExternalStore(appStore.subscribe, snapshot)
-}
-
-function resolveFileUrl(path: string, cwd: string, userHome?: string | null): URL | null {
-  let target = path.trim().replace(/\\/g, '/')
-  if (target === '') return null
-  if (target.startsWith('~/') && userHome) {
-    target = `${userHome.replace(/\\/g, '/')}/${target.slice(2)}`
-  }
-  const directory = cwd.replace(/\\/g, '/').replace(/\/+$/, '')
-  const encodePath = (value: string) => encodeURI(value).replace(/[?#]/g, encodeURIComponent)
-  try {
-    const base = new URL(encodePath(directory.startsWith('//') ? `file:${directory}/` : `file:///${directory}/`))
-    const targetHref = /^[a-z]:\//i.test(target) ? `file:///${target}`
-      : target.startsWith('//') ? `file:${target}` : target
-    return new URL(encodePath(targetHref), base)
-  } catch {
-    return null
-  }
 }

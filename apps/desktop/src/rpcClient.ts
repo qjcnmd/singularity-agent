@@ -4,11 +4,15 @@ import type {
   StreamEnvelope,
 } from './protocol'
 
-export class RpcFailure extends Error {
+class RpcFailure extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'RpcFailure'
   }
+}
+
+export function errorMessage(error: unknown, fallback?: string): string {
+  return error instanceof Error ? error.message : fallback ?? String(error)
 }
 
 declare global {

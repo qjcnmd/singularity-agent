@@ -3,15 +3,18 @@ import { CircleAlert, CircleX, LoaderCircle, FileText, FolderSearch, SquareTermi
 import { appStore, useAppStore } from '../appStore'
 import { factStatusText } from '../copy'
 import { useSelectionGuard } from '../interactions'
+import { sessionBackgroundTasks } from '../sessionState'
 import { formatTurnDuration, toolDisplay } from '../timeline'
-import { workspaceRelativePath } from '../workspace'
+import { parseTodos, todoSummary } from '../todos'
+import { displayPath, workspaceRelativePath } from '../workspace'
 import type { HistoryItem, ReadSource, ToolStatus, UserQuestion, UserQuestionAnswer, VisibleBackgroundTask } from '../protocol'
 import { CommandOutput } from './CommandOutput'
 import { Disclosure } from './Disclosure'
 import { EditDiff } from './EditDiff'
 import { ExpandChevron } from './ExpandChevron'
 import { AttachedImages } from './Images'
-import { parseTodos, TodoList, todoSummary } from './TodoList'
+import { StepCheckIcon } from './StepCheckIcon'
+import { TodoList } from './TodoList'
 
 type ToolItem = Extract<HistoryItem, { type: 'tool' }>
 type ArgRecord = Record<string, unknown>
@@ -123,10 +126,10 @@ export function useBackgroundTasks(sessionId: string | undefined, enabled: boole
   const { liveSessions } = useAppStore(
     ['liveSessions'],
     enabled
-      ? (previous, next) => previous.liveSessions[sessionId ?? '']?.backgroundTasks === next.liveSessions[sessionId ?? '']?.backgroundTasks
+      ? (previous, next) => sessionBackgroundTasks(previous.liveSessions, sessionId) === sessionBackgroundTasks(next.liveSessions, sessionId)
       : () => true,
   )
-  return enabled ? liveSessions[sessionId ?? '']?.backgroundTasks : undefined
+  return enabled ? sessionBackgroundTasks(liveSessions, sessionId) : undefined
 }
 
 interface ToolCardProps {
@@ -264,28 +267,11 @@ export function StepStatusIcon({ name, status }: { name: string; status: ToolSta
   }, [status])
 
   if (status === 'running') return <LoaderCircle size={14} className="spinner step-spinner" aria-hidden="true" />
-  if (status === 'completed') {
-    return (
-      <svg className={`step-tick${justCompleted ? ' is-fresh' : ''}`} width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
-        <circle className="step-tick-ring" cx="8" cy="8" r="6.25" />
-        <path className="step-tick-check" d="M5.1 8.2l2 2 3.8-4.2" />
-      </svg>
-    )
-  }
+  if (status === 'completed') return <StepCheckIcon fresh={justCompleted} />
   if (status === 'failed') return <CircleAlert size={14} className="bad" aria-hidden="true" />
   if (status === 'interrupted') return <CircleX size={14} className="bad" aria-hidden="true" />
   const Icon = toolPresentations[name]?.icon ?? FileText
   return <Icon size={14} aria-hidden="true" />
-}
-
-function displayPath(path: string, cwd: string, userHome?: string | null): string {
-  const normalized = path.replace(/\\/g, '/')
-  const root = cwd.replace(/\\/g, '/').replace(/\/$/, '')
-  if (normalized.toLowerCase().startsWith(`${root.toLowerCase()}/`)) return normalized.slice(root.length + 1)
-  const home = userHome?.replace(/\\/g, '/').replace(/\/$/, '')
-  if (home && normalized.toLowerCase() === home.toLowerCase()) return '~'
-  if (home && normalized.toLowerCase().startsWith(`${home.toLowerCase()}/`)) return `~${normalized.slice(home.length)}`
-  return path
 }
 
 function firstLine(text: string): string {

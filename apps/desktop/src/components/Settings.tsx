@@ -11,7 +11,8 @@ import { Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 import { SelectionSlider } from './SelectionSlider'
-import { InstructionsPage, McpPage, PageFrame, SkillsPage } from './ManagePages'
+import { InstructionsPage, PageFrame, SkillsPage } from './ManagePages'
+import { McpSettings } from './McpSettings'
 
 type SettingsTab = 'appearance' | 'models' | 'web-search' | 'instructions' | 'skills' | 'mcp'
 type ProviderEditorState = null | 'new' | RedactedProvider
@@ -26,7 +27,7 @@ const settingsTabs: ReadonlyArray<{ id: SettingsTab; label: string }> = [
 ]
 
 export function Settings() {
-  const { settingsOpen, pendingActions } = useAppStore(['settingsOpen', 'pendingActions'])
+  const { settingsOpen, pendingActions, selectedWorkspaceRoot } = useAppStore(['settingsOpen', 'pendingActions', 'selectedWorkspaceRoot'])
   const [tab, setTab] = useState<SettingsTab>('appearance')
   const navRef = useRef<HTMLElement>(null)
   const reduced = useReducedMotion()
@@ -76,7 +77,7 @@ export function Settings() {
               {tab === 'web-search' && <WebSearchSection />}
               {tab === 'instructions' && <InstructionsPage />}
               {tab === 'skills' && <SkillsPage />}
-              {tab === 'mcp' && <McpPage />}
+              {tab === 'mcp' && <PageFrame title="MCP"><McpSettings workspaceRoot={selectedWorkspaceRoot} /></PageFrame>}
             </motion.div>
           </div>
         </div>

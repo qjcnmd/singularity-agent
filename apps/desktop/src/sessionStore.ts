@@ -1,9 +1,12 @@
 import { reduceUnread, initialSyncState, acceptSessionStart, acceptSessionRead, resetBaseline, reduceStream, pruneStaleSelection, type SyncState } from './sync'
 import { loadPersisted, persistView, type PersistedView } from './viewPersistence'
-import { RpcClient } from './rpcClient'
-import type { ChangedFile, SessionReadResult, StreamEnvelope, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
+import { errorMessage, RpcClient } from './rpcClient'
+import type { SessionReadResult, StreamEnvelope, ThreadSummary, UserQuestionAnswer, SessionStartParams } from './protocol'
 import { DraftStore, type DraftSnapshot } from './drafts'
+import { retainFileTabs, type FileTab } from './fileTabs'
 import { workspaceKey } from './workspace'
+
+export type { FileTab } from './fileTabs'
 
 export const actionOrigin = {
   session: (id: string | null) => `session:${id}`,
@@ -28,14 +31,6 @@ export interface ActionError {
 interface SessionLoadState {
   status: 'idle' | 'loading' | 'error'
   error: ActionError | null
-}
-
-export interface FileTab {
-  id: string; path: string; cwd: string; title: string
-  mode: 'file' | 'changes'
-  focusPath?: string
-  initialChanges?: ChangedFile[]
-  opened: number
 }
 
 export interface QuestionDraft { itemId: string; index: number; answers: UserQuestionAnswer[] }
@@ -289,7 +284,7 @@ export class SessionStore {
   }
 
   private toActionError(error: unknown): ActionError {
-    return { message: error instanceof Error ? error.message : '发生了未知错误。' }
+    return { message: errorMessage(error, '发生了未知错误。') }
   }
 
   protected applyRewoundSession(result: SessionReadResult): void {
@@ -299,16 +294,6 @@ export class SessionStore {
       if (accepted !== this.state) this.applySync(accepted)
       else void this.readSession(id)
     }
-  }
-
-  protected retainFileTabs(keep: (tab: FileTab) => boolean): void {
-    const next = filterFileTabs(this.state.fileTabs, this.state.activeFileTab, keep)
-    if (next) this.patch(next)
-  }
-
-  protected closeWorkspaceTabs(workspaceRoot: string): void {
-    const wsKey = workspaceKey(workspaceRoot)
-    this.retainFileTabs(tab => tab.mode !== 'changes' || workspaceKey(tab.cwd) !== wsKey)
   }
 
   protected applySync(state: SyncState, progress = false): void {
@@ -333,12 +318,9 @@ export class SessionStore {
         patch.selectedSessionId = pruned.selectedSessionId
         patch.sessionLoad = { status: 'idle', error: null }
       }
-      if (this.state.fileTabs.some(tab => tab.mode === 'changes')) {
-        const existingWorkspaces = new Set(bootstrap.workspaces.map(item => workspaceKey(item.root)))
-        const retainedTabs = filterFileTabs(this.state.fileTabs, this.state.activeFileTab,
-          tab => tab.mode !== 'changes' || existingWorkspaces.has(workspaceKey(tab.cwd)))
-        if (retainedTabs) Object.assign(patch, retainedTabs)
-      }
+      const existingWorkspaces = new Set(bootstrap.workspaces.map(item => workspaceKey(item.root)))
+      const retainedTabs = retainFileTabs(this.state, existingWorkspaces)
+      if (retainedTabs) Object.assign(patch, retainedTabs)
     }
     this.patch(patch, progress)
     if (selectionDropped) {
@@ -400,20 +382,4 @@ function retainedQuestionDrafts(drafts: AppState['questionDrafts'], sessionId: s
   const retained = { ...drafts }
   delete retained[sessionId]
   return retained
-}
-
-function filterFileTabs(
-  tabs: readonly FileTab[],
-  activeFileTab: string | null,
-  keep: (tab: FileTab) => boolean,
-): Pick<AppState, 'fileTabs' | 'activeFileTab'> | null {
-  const fileTabs = tabs.filter(keep)
-  if (fileTabs.length === tabs.length) return null
-  if (activeFileTab === null || fileTabs.some(tab => tab.id === activeFileTab)) {
-    return { fileTabs, activeFileTab }
-  }
-  const previousIndex = tabs.findIndex(tab => tab.id === activeFileTab)
-  const fallback = tabs.slice(previousIndex + 1).find(keep)
-    ?? tabs.slice(0, previousIndex).findLast(keep)
-  return { fileTabs, activeFileTab: fallback?.id ?? null }
 }

@@ -2,16 +2,15 @@ import { useEffect, useRef, useState } from 'react'
 import { RotateCw, X } from 'lucide-react'
 import { appStore, useAppStore, type AppState, type FileTab } from '../appStore'
 import type { ChangedFile, SessionFileDiffResult, TextDocument } from '../protocol'
-import { CodeTokens, useCodeTokens } from '../highlight'
-import { MarkdownBody, PathBase } from '../markdown'
-import { workspaceKey } from '../workspace'
-import { EditDiff, FileChangeStats } from './EditDiff'
+import { errorMessage } from '../rpcClient'
+import { normalizePath, pathExtension, splitPathNameDir, workspaceKey } from '../workspace'
+import { CodeView, MarkdownDocumentView } from './DocumentView'
+import { DiffCounts, EditDiff, FileChangeStats } from './EditDiff'
 import { ExpandChevron } from './ExpandChevron'
 
 type Loaded = { document?: TextDocument; changes?: ChangedFile[]; error?: string }
 
-const extension = (path: string) => /\.([\w-]+)$/.exec(path)?.[1]?.toLowerCase() ?? ''
-const isMarkdown = (path: string) => ['md', 'markdown'].includes(extension(path))
+const isMarkdown = (path: string) => ['md', 'markdown'].includes(pathExtension(path))
 
 function workspaceRefreshKey(state: Pick<AppState, 'bootstrap' | 'liveSessions' | 'session'>, tab: FileTab | null): string {
   if (!tab) return ''
@@ -32,7 +31,7 @@ function workspaceRefreshKey(state: Pick<AppState, 'bootstrap' | 'liveSessions' 
 }
 
 function splitPathSegments(path: string): string[] {
-  const normalized = path.replaceAll('\\', '/').replace(/\/+$/, '')
+  const normalized = normalizePath(path).replace(/\/+$/, '')
   return normalized.split('/').filter(Boolean)
 }
 
@@ -71,12 +70,12 @@ export function FilePanel() {
     if (active.mode === 'changes') {
       void appStore.transport.rpc('session.changedFiles', { workspaceRoot: active.cwd, includeDiffs: true }).then(
         changes => { if (current) update({ changes, error: undefined }) },
-        error => { if (current) update({ changes: undefined, error: error instanceof Error ? error.message : String(error) }) },
+        error => { if (current) update({ changes: undefined, error: errorMessage(error) }) },
       )
     } else {
       void appStore.transport.rpc('file.read', { cwd: active.cwd, path: active.path }).then(
         document => { if (current) update({ document, error: undefined }) },
-        error => { if (current) update({ document: undefined, error: error instanceof Error ? error.message : String(error) }) },
+        error => { if (current) update({ document: undefined, error: errorMessage(error) }) },
       )
     }
     return () => { current = false }
@@ -115,12 +114,7 @@ export function FilePanel() {
             <span className="changes-toolbar-title">
               {shownChanges ? `未提交改动 · ${shownChanges.length} 个文件` : '未提交改动'}
             </span>
-            {(totalAdded > 0 || totalDeleted > 0) && (
-              <span className="edit-counts">
-                {totalAdded > 0 && <span className="edit-added-count">+{totalAdded}</span>}
-                {totalDeleted > 0 && <span className="edit-deleted-count">-{totalDeleted}</span>}
-              </span>
-            )}
+            <DiffCounts added={totalAdded} deleted={totalDeleted} />
             <button type="button" className="icon-button small changes-refresh" aria-label="刷新改动文件" title="刷新" onClick={retryActive}>
               <RotateCw size={13} strokeWidth={1.8} aria-hidden="true" />
             </button>
@@ -149,7 +143,7 @@ export function FilePanel() {
           )
           : shown && (isMarkdown(active.path) && !showSource
             ? <MarkdownDocumentView path={shown.path} content={shown.content} />
-            : <CodeView code={shown.content} language={extension(active.path)} />)}
+            : <CodeView code={shown.content} language={pathExtension(active.path)} />)}
       </div>
     </div>
   </aside></div>
@@ -178,8 +172,8 @@ function ChangedFilesView({ files, workspaceRoot, refreshToken, focusPath, focus
     if (!focusPath) return
     const key = `${focusNonce}:${focusPath}`
     if (appliedFocus.current === key) return
-    const target = focusPath.replaceAll('\\', '/').toLowerCase()
-    const matched = files.find(file => file.path.replaceAll('\\', '/').toLowerCase() === target)
+    const target = normalizePath(focusPath).toLowerCase()
+    const matched = files.find(file => normalizePath(file.path).toLowerCase() === target)
     if (!matched) return
     appliedFocus.current = key
     setExpanded(all => {
@@ -205,10 +199,7 @@ function ChangedFilesView({ files, workspaceRoot, refreshToken, focusPath, focus
     <div className="changes-list">
       {files.map(file => {
         const isOpen = expanded.has(file.path)
-        const normalized = file.path.replaceAll('\\', '/')
-        const slash = normalized.lastIndexOf('/')
-        const name = slash >= 0 ? normalized.slice(slash + 1) : normalized
-        const dir = slash >= 0 ? normalized.slice(0, slash) : ''
+        const { name, dir } = splitPathNameDir(file.path)
         const statusLetter = file.status === 'added' ? 'A' : file.status === 'deleted' ? 'D' : 'M'
         return (
           <section
@@ -259,7 +250,7 @@ function LazyInlineFileDiff({ workspaceRoot, path, refreshToken }: {
     setState(previous => previous.error ? { diff: previous.diff } : previous)
     void appStore.transport.rpc('session.fileDiff', { workspaceRoot, path }).then(
       diff => { if (active) setState({ diff }) },
-      error => { if (active) setState({ error: error instanceof Error ? error.message : String(error) }) },
+      error => { if (active) setState({ error: errorMessage(error) }) },
     )
     return () => { active = false }
   }, [workspaceRoot, path, refreshToken, retry])
@@ -290,30 +281,4 @@ function TabButton({ tab, selected, changesCwds }: { tab: FileTab; selected: boo
       onAuxClick={event => { if (event.button === 1) appStore.closeFile(tab.id) }}>{label}</button>
     <button type="button" className="file-tab-close" aria-label={`关闭 ${label}`} onClick={() => appStore.closeFile(tab.id)}><X size={13} /></button>
   </div>
-}
-
-const maxHighlightedLength = 200_000
-
-export function MarkdownDocumentView({ path, content }: { path: string; content: string }) {
-  return <PathBase.Provider value={directoryOf(path)}>
-    <div className="file-markdown timeline-body message-body"><MarkdownBody text={frontmatterAsCode(content)} /></div>
-  </PathBase.Provider>
-}
-
-export function CodeView({ code, language }: { code: string; language: string }) {
-  const normalized = code.replace(/\r\n/g, '\n')
-  const tokens = useCodeTokens(normalized, normalized.length > maxHighlightedLength ? 'text' : language)
-  const lines = normalized.split('\n')
-  return <div className="file-code">{lines.map((line, row) => <div key={row} className="tool-line">
-    <span className="tool-line-number">{row + 1}</span>
-    <span>{tokens?.[row] ? <CodeTokens tokens={tokens[row]} /> : line}</span>
-  </div>)}</div>
-}
-
-function frontmatterAsCode(content: string): string {
-  return content.replace(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/, (_, yaml: string) => '```yaml\n' + yaml + '\n```\n\n')
-}
-
-function directoryOf(path: string): string {
-  return path.replace(/[\\/][^\\/]*$/, '') || path
 }

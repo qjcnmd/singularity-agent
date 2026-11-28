@@ -6,6 +6,7 @@ import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '
 import type { ThreadSummary, Workspace } from '../protocol'
 import { sessionTitles } from '../sessionTitle'
 import { workspaceName } from '../copy'
+import { isCompactViewport } from '../interactions'
 import { sessionState } from '../sessionState'
 import { Dialog } from './Dialog'
 import { Menu } from './Menu'
@@ -117,7 +118,7 @@ function SidebarView() {
                 className="nav-item"
                 onClick={() => {
                   appStore.setSettingsOpen(true)
-                  if (window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
+                  if (isCompactViewport()) appStore.toggleSidebar()
                 }}
               >设置</button>
             </footer>
@@ -174,7 +175,7 @@ function SessionButton({
       <button ref={anchor} type="button" className="session-main" aria-haspopup="menu" aria-expanded={menuOpen}
         onKeyDown={event => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); setMenuOpen(true) } }} onClick={() => {
         appStore.selectSession(session.threadId)
-        if (window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
+        if (isCompactViewport()) appStore.toggleSidebar()
       }}>
         <span className={`session-status status-${statusClass}`} aria-hidden="true" />
         <span className="session-label">

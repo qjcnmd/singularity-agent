@@ -13,11 +13,11 @@ import { CircleAlert, CircleX, LoaderCircle, Pencil } from 'lucide-react'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { actionOrigin, appStore, pendingKey, useAppStore } from '../appStore'
 import { pop } from '../motion'
-import { useBodyCollapse, useSelectionGuard } from '../interactions'
-import { MarkdownBody } from '../markdown'
+import { isPlainEnter, useBodyCollapse, useSelectionGuard } from '../interactions'
+import { MarkdownBody } from './MarkdownBody'
 import { compactionText, factStatusText } from '../copy'
-import { formatClock, compactionResultText, formatTurnDuration, toolDisplay, type ActivityGroup, type ActivityRowItem, type TimelineRow } from '../timeline'
-import type { HistoryItem, ToolStatus, VisibleBackgroundTask } from '../protocol'
+import { formatClock, compactionResultText, formatTurnDuration, summarizeActivity, type ActivityGroup, type ActivityRowItem, type TimelineRow } from '../timeline'
+import type { HistoryItem } from '../protocol'
 
 const previewLineCount = 8
 
@@ -205,7 +205,7 @@ function InlineMessageEditor({ sessionId, message, attachments, onCancel }: {
             if (!busy) onCancel()
             return
           }
-          if (event.key === 'Enter' && !event.shiftKey) {
+          if (isPlainEnter(event)) {
             event.preventDefault()
             if (!event.repeat) void submit()
           }
@@ -220,80 +220,6 @@ function InlineMessageEditor({ sessionId, message, attachments, onCancel }: {
       </div>
     </div>
   )
-}
-
-function summarizeActivity(rows: ActivityGroup['rows'], tasks: VisibleBackgroundTask[] | undefined) {
-  let stepCount = 0
-  let failedToolCount = 0
-  let runningKind: ActivityRowItem['type'] | null = null
-  let hasTyping = false
-  let turnFailed = false
-  let hasInterrupted = false
-  let hasCompleted = false
-  let terminalText: string | null = null
-  for (const { item } of rows) {
-    if (item.type === 'typing') {
-      hasTyping = true
-      continue
-    }
-    if (item.type === 'terminal') {
-      if (item.status === 'failed') turnFailed = true
-      else { hasInterrupted = true; terminalText = item.text }
-      continue
-    }
-    if (item.type === 'tool_group') {
-      stepCount += item.rows.length
-      for (const sub of item.rows) {
-        const status = toolDisplay(sub.item, tasks).status
-        if (status === 'running') runningKind = 'tool_group'
-        else if (status === 'failed') failedToolCount += 1
-        else if (status === 'interrupted') hasInterrupted = true
-        else if (status === 'completed') hasCompleted = true
-      }
-      continue
-    }
-    stepCount += 1
-    const status: ToolStatus = item.type === 'tool'
-      ? toolDisplay(item, tasks).status
-      : item.type === 'compaction'
-        ? 'completed'
-        : item.status
-    if (status === 'running') runningKind = item.type
-    else if (status === 'failed') {
-      if (item.type === 'tool') failedToolCount += 1
-      else turnFailed = true
-    } else if (status === 'interrupted') hasInterrupted = true
-    else if (status === 'completed') hasCompleted = true
-  }
-  const status: ToolStatus = runningKind !== null || hasTyping ? 'running'
-    : turnFailed ? 'failed'
-    : terminalText !== null ? 'interrupted'
-    : hasInterrupted ? 'interrupted'
-    : hasCompleted || failedToolCount > 0 ? 'completed'
-    : 'pending'
-  let label: string
-  if (runningKind !== null) {
-    if (stepCount === 1 && runningKind === 'thinking') label = '思考中'
-    else if (stepCount === 1 && runningKind === 'compaction_result') label = compactionText.running
-    else if (runningKind === 'thinking') label = `思考中 · 共 ${stepCount} 步`
-    else label = `执行中 · 共 ${stepCount} 步`
-  } else if (hasTyping) {
-    label = stepCount > 0 ? `等待回复 · 共 ${stepCount} 步` : '等待模型回复…'
-  } else if (status === 'failed') {
-    label = stepCount > 0 ? `执行失败 · ${stepCount} 个步骤` : '执行失败'
-  } else if (status === 'interrupted') {
-    const title = terminalText ?? '已中断'
-    label = stepCount > 0 ? `${title} · ${stepCount} 个步骤` : title
-  } else if (status === 'completed') {
-    label = failedToolCount > 0
-      ? `已完成 ${stepCount} 个步骤 · ${failedToolCount} 步失败`
-      : stepCount === 1 && rows[0]?.item.type === 'thinking'
-        ? '思考过程'
-        : `已完成 ${stepCount} 个步骤`
-  } else {
-    label = `等待执行 · ${stepCount} 个步骤`
-  }
-  return { status, label, stepCount }
 }
 
 function ActivityCard({ group, itemKey, cwd, userHome, sessionId, onDisclosureChange }: Omit<Props, 'item'> & { group: ActivityGroup }) {

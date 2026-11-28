@@ -1,11 +1,11 @@
 import { memo, useEffect, useState } from 'react'
 import { appStore, useAppStore } from '../appStore'
-import { formatTokenCount } from '../copy'
+import { CONTEXT_GROUP_ORDER, formatTokenCount } from '../copy'
 import type { ContextGroup, ContextModule } from '../protocol'
+import { errorMessage } from '../rpcClient'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 
-const groupOrder: ContextGroup[] = ['instructions', 'tools', 'skills', 'mcp']
 const groupLabels: Record<ContextGroup, string> = {
   instructions: 'Instructions',
   tools: 'Tools',
@@ -41,7 +41,7 @@ export const ContextPanel = memo(function ContextPanel() {
     let cancelled = false
     setFailure(null)
     void appStore.transport.rpc('session.context', { sessionId }).catch(error => {
-      if (!cancelled) setFailure({ sessionId, message: error instanceof Error ? error.message : String(error) })
+      if (!cancelled) setFailure({ sessionId, message: errorMessage(error) })
     })
     return () => { cancelled = true }
   }, [missing, sessionId, phase, selection?.provider, selection?.model, selection?.reasoning, attempt])
@@ -51,8 +51,8 @@ export const ContextPanel = memo(function ContextPanel() {
     return <p className="detail-empty" role="status">读取中…</p>
   }
   const enabled = context.filter(module => module.enabled)
-  return <div className="context-panel" key={state.selectedSessionId}>
-    {groupOrder.map(group => {
+  return <div className="context-panel">
+    {CONTEXT_GROUP_ORDER.map(group => {
       const members = enabled.filter(module => module.group === group)
       return members.length > 0 ? <ContextGroupRow key={group} group={group} members={members} /> : null
     })}

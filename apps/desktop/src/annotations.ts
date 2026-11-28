@@ -4,8 +4,6 @@ export interface CapturedAnnotation extends Omit<DraftAnnotation, 'id' | 'commen
   range: Range
 }
 
-export type { AnnotationJumpTarget }
-
 type AnnotationJumpTarget =
   | { kind: 'draft'; annotationId: string }
   | { kind: 'sent'; messageId: string; quote: string }
