@@ -1,5 +1,3 @@
-import type { PersistedView } from './viewPersistence'
-
 interface PaletteColor {
   id: string
   label: string
@@ -25,11 +23,10 @@ export function resolveAccentId(id: string | undefined): string {
 
 export const defaultAccentColor = 'blue' as const
 
-export function bubbleVariables(view: Pick<PersistedView, 'accentColor'>): Record<string, string> {
-  const chosen = palette.find(color => color.id === view.accentColor) ?? palette[0]
+export function bubbleVariables(accentColor: string): Record<string, string> {
+  const chosen = palette.find(color => color.id === accentColor) ?? palette[0]
   return {
     '--accent': chosen.solid,
-    '--accent-soft': `color-mix(in srgb, ${chosen.solid} 11%, var(--canvas))`,
     '--ink-on-accent': chosen.ink,
   }
 }

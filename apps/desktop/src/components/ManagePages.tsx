@@ -88,7 +88,7 @@ export function InstructionsPage() {
           <span>文件</span>
           <span className="editor-path">{saved?.path ?? (loading ? '读取中…' : '—')}</span>
         </div>
-        {error && <div className="form-error" role="alert" style={{ margin: '10px 14px 0' }}>{error}{!saved && <button type="button" className="quiet-button" onClick={() => setReload(value => value + 1)}>重新读取</button>}</div>}
+        {error && <div className="form-error" role="alert">{error}{!saved && <button type="button" className="quiet-button" onClick={() => setReload(value => value + 1)}>重新读取</button>}</div>}
         <textarea aria-label="自定义指令内容" className="input" value={text} spellCheck={false} disabled={loading || saving || !saved}
           onChange={event => setDrafts(current => ({ ...current, [key]: event.target.value }))} />
         <footer>

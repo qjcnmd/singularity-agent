@@ -8,7 +8,6 @@ import { workspaceRelativePath } from '../workspace'
 import { CopyButton } from './CopyButton'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
-import '../styles/edit-diff.css'
 
 type DiffLine = { kind: 'context' | 'added' | 'deleted'; number: number; text: string }
 type DiffHunk = { lines: DiffLine[] }

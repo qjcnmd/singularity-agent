@@ -16,8 +16,18 @@ import {
 } from '../src/identity.js'
 import type { DirectoryPickResult, RpcResponse } from '../src/protocol.generated.js'
 
-const configuredHome = process.env[HOME_ENV_VAR]
-const home = resolve(configuredHome?.trim() ? configuredHome : join(homedir(), DATA_DIR_NAME))
+function resolveHome(): string {
+  const raw = process.env[HOME_ENV_VAR]
+  if (raw !== undefined && raw.trim() !== '') {
+    if (!isAbsolute(raw)) {
+      throw new Error(`${HOME_ENV_VAR} must be an absolute path: ${raw}`)
+    }
+    return resolve(raw)
+  }
+  return resolve(join(homedir(), DATA_DIR_NAME))
+}
+
+const home = resolveHome()
 const userDataDir = join(app.getPath('appData'), APP_NAME, createHash('sha256').update(home.toLowerCase()).digest('hex').slice(0, 16))
 app.setPath('userData', userDataDir)
 const themeFile = join(userDataDir, 'theme')

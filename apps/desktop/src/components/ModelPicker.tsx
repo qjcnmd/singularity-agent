@@ -1,4 +1,3 @@
-import '../styles/model-picker.css'
 import { EffortSlider } from './EffortSlider'
 import { ExpandChevron } from './ExpandChevron'
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'

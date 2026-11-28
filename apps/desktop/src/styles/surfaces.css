@@ -4,6 +4,7 @@
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+    transition-delay: 0s !important;
   }
   /* 上面的时长会让每个元素的每次尺寸变化都变成过渡，紧接着读取仍得到旧值；mermaid 排版要读到新尺寸。 */
   .mermaid-stage * { transition: none !important; }
@@ -11,7 +12,7 @@
 
 @keyframes fade-in { from { opacity: 0; } }
 
-.context-menu { z-index: 100; min-width: 160px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow: auto; padding: 5px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--raised); box-shadow: var(--shadow-floating); animation: menu-enter var(--spring-dur) var(--spring); }
+.context-menu { min-width: 160px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow: auto; padding: 5px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--raised); box-shadow: var(--shadow-floating); animation: menu-enter var(--spring-dur) var(--spring); }
 .context-menu button { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; text-align: left; background: transparent; color: var(--ink); border-radius: 7px; font-size: 13.5px; cursor: pointer; }
 .context-menu button:hover, .context-menu button:focus-visible { background: var(--selected); }
 .context-menu, .protocol-dropdown {
@@ -54,11 +55,6 @@
 }
 .picker-disclosure > div { overflow: hidden; background: var(--raised); border-radius: 12px; box-shadow: inset 0 0 0 1px var(--line-strong), var(--shadow-floating); }
 @keyframes menu-enter { from { opacity: 0; transform: translateY(-4px) scale(.96); } to { opacity: 1; transform: none; } }
-
-@media (prefers-reduced-motion: reduce) {
-  .activity-step, .reasoning-summary, .content-disclosure, .picker-disclosure, .expand-chevron { transition: none !important; }
-  .context-menu { animation: none; }
-}
 
 .code-token { color: var(--shiki-light); }
 [data-theme=dark] .code-token { color: var(--shiki-dark); }

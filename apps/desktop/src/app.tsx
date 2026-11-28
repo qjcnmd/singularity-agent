@@ -20,7 +20,7 @@ export function App() {
   const state = useAppStore(['theme', 'messageFontSize', 'accentColor', 'sidebarCollapsed', 'sidebarWidth', 'fileTabs', 'filePanelWidth'])
   const [, setViewportWidth] = useState(() => window.innerWidth)
   const filePanelOpen = state.fileTabs.length > 0
-  const variables = bubbleVariables(state)
+  const variables = bubbleVariables(state.accentColor)
   useLayoutEffect(() => {
     document.documentElement.dataset.theme = state.theme
     void window.desktop.setTheme(state.theme)

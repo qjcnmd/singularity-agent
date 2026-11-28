@@ -9,7 +9,7 @@ dialog.sg-settings-modal { background: var(--canvas); width: min(880px, calc(100
 .settings-modal-title { margin: 0 0 12px 10px; font-size: 15px; font-weight: 600; color: var(--ink); }
 .settings-nav { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
 .settings-nav .selection-slider { left: 0; right: 0; }
-.settings-nav-item { position: relative; z-index: 1; display: flex; align-items: center; height: 32px; padding: 0 11px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-soft); font-size: 13px; font-weight: 400; text-align: left; cursor: pointer; transition: background 120ms, color var(--smooth-dur) var(--smooth); }
+.settings-nav-item { position: relative; z-index: 1; display: flex; align-items: center; height: 32px; padding: 0 11px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-soft); font-size: 13px; font-weight: 400; text-align: left; cursor: pointer; transition: background var(--dur-fast), color var(--smooth-dur) var(--smooth); }
 .settings-nav-item:not(.is-selected):hover { background: var(--soft-fill); color: var(--ink); }
 .settings-nav-item.is-selected { color: var(--ink); font-weight: 500; }
 .settings-main { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
@@ -46,20 +46,19 @@ dialog.sg-settings-modal { background: var(--canvas); width: min(880px, calc(100
 .settings-add:hover:not(:disabled) { background: var(--surface-hover); }
 .settings-add:disabled { color: var(--ink-faint); cursor: default; }
 .segmented { display: flex; padding: 2px; border-radius: 9px; background: var(--surface-muted); }
-.segmented button { height: 26px; padding: 0 12px; border: 0; border-radius: 7px; background: none; color: var(--ink-soft); font-size: 12.5px; cursor: pointer; transition: background 120ms, color 120ms; }
+.segmented button { height: 26px; padding: 0 12px; border: 0; border-radius: 7px; background: none; color: var(--ink-soft); font-size: 12.5px; cursor: pointer; transition: background var(--dur-fast), color var(--dur-fast); }
 .segmented button[aria-checked=true] { background: var(--canvas); color: var(--ink); box-shadow: 0 1px 2px rgb(0 0 0 / 12%); }
 .accent-swatches { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-.accent-swatch { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; background: var(--swatch); box-shadow: inset 0 0 0 1px rgb(0 0 0 / 12%); cursor: pointer; transition: transform 120ms, box-shadow 140ms; }
+.accent-swatch { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; background: var(--swatch); box-shadow: inset 0 0 0 1px rgb(0 0 0 / 12%); cursor: pointer; transition: transform var(--dur-fast), box-shadow 140ms; }
 .accent-swatch:hover { transform: scale(1.1); }
 .accent-swatch[aria-checked=true] { box-shadow: inset 0 0 0 1px rgb(0 0 0 / 15%), 0 0 0 2px var(--card), 0 0 0 4px var(--accent); }
 .stepper { display: flex; align-items: center; gap: 6px; color: var(--ink-faint); }
 .stepper .input { width: 64px; text-align: center; }
 
 .sg-provider-list { display: grid; gap: 10px; }
-.sg-add-card-btn { display: flex; align-items: center; gap: 8px; width: 100%; height: 42px; margin-top: 10px; padding: 0 14px; border: 1px dashed var(--line-strong); border-radius: 14px; background: transparent; color: var(--accent-ink); font-weight: 400; cursor: pointer; transition: background 120ms, border-color 120ms; }
+.sg-add-card-btn { display: flex; align-items: center; gap: 8px; width: 100%; height: 42px; margin-top: 10px; padding: 0 14px; border: 1px dashed var(--line-strong); border-radius: 14px; background: transparent; color: var(--accent-ink); font-weight: 400; cursor: pointer; transition: background var(--dur-fast), border-color var(--dur-fast); }
 .sg-add-card-btn:hover:not(:disabled) { background: var(--soft-fill); border-color: var(--accent); }
-.sg-row-card { border-radius: 14px; background: var(--card); border: 1px solid var(--line-strong); box-shadow: 0 1px 2px rgb(0 0 0 / 3.5%), 0 6px 20px -12px rgb(0 0 0 / 10%); overflow: hidden; }
-[data-theme=dark] .sg-row-card { border-color: var(--line); box-shadow: 0 2px 10px -3px rgb(0 0 0 / 45%); }
+.sg-row-card { border-radius: 14px; background: var(--card); border: 1px solid var(--card-border); box-shadow: var(--shadow-card); overflow: hidden; }
 .sg-row-head { display: flex; align-items: center; gap: 6px; padding: 4px 10px 4px 6px; }
 .sg-provider-toggle:hover { background: var(--surface-hover); }
 .row-card-title { flex: 1; min-width: 0; display: grid; gap: 1px; }
@@ -92,9 +91,9 @@ dialog.mcp-editor-modal .mcp-editor-scroll { max-height: calc(100vh - 220px); }
 .model-reasoning-options legend { margin-bottom: 6px; color: var(--ink-soft); font-size: 12.5px; font-weight: 400; }
 .reasoning-options-grid { display: flex; flex-wrap: wrap; gap: 6px; }
 .reasoning-option { height: 30px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--card); cursor: pointer; font-size: 13px; transition: border-color 140ms, background 140ms, color 140ms, transform var(--spring-dur) var(--spring); }
-.reasoning-option:active { transform: scale(.94); transition-duration: 80ms; }
+.reasoning-option:active { transform: scale(.94); transition-duration: var(--dur-press); }
 .reasoning-option[aria-pressed="true"] { border-color: var(--accent); background: var(--accent); color: var(--ink-on-accent); }
-.candidate-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 14px; cursor: pointer; transition: border-color 120ms, background 120ms; }
+.candidate-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 14px; cursor: pointer; transition: border-color var(--dur-fast), background var(--dur-fast); }
 .candidate-row.checked { border-color: var(--accent); background: var(--accent-soft); }
 .candidate-row input { accent-color: var(--accent); width: 16px; height: 16px; }
 .candidate-row span { flex: 1; display: grid; }
@@ -130,4 +129,4 @@ dialog.mcp-editor-modal .mcp-editor-scroll { max-height: calc(100vh - 220px); }
 .confirm-body footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
 .sg-model-config-error { display: grid; justify-items: start; gap: 10px; margin-bottom: 16px; padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface-muted); }
 .sg-model-config-error details { width: 100%; }
-.sg-model-config-error pre { max-height: 160px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.sg-model-config-error pre { max-height: 160px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }

@@ -1,5 +1,4 @@
-.activity-card.question-card { margin: 10px 0 0; border-radius: 16px; background: var(--card); border: 1px solid var(--line-strong); box-shadow: 0 1px 2px rgb(0 0 0 / 3.5%), 0 6px 20px -12px rgb(0 0 0 / 10%); overflow: hidden; }
-[data-theme=dark] .activity-card.question-card { border-color: var(--line); box-shadow: 0 2px 10px -3px rgb(0 0 0 / 45%); }
+.activity-card.question-card { margin: 10px 0 0; border-radius: 16px; background: var(--card); border: 1px solid var(--card-border); box-shadow: var(--shadow-card); overflow: hidden; }
 .question-card .activity-card-header { display: flex; width: 100%; max-width: none; min-height: 36px; margin: 0; padding: 6px 12px; border-radius: 0; }
 .question-card .activity-card-title { flex: 1; }
 .question-waiting-dot { width: 8px; height: 8px; margin: 3px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); flex: none; }
@@ -12,7 +11,7 @@
 .question-panel-body { border: 0; margin: -2px; padding: 2px; min-width: 0; min-height: 0; max-height: min(320px, 44vh); overflow-y: auto; }
 .question-list { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--fill-subtle); }
 .question-options { display: grid; }
-.question-answer-row { display: flex; align-items: baseline; gap: 9px; width: 100%; padding: 7px 10px; border: 0; border-top: 1px solid var(--line); background: transparent; color: var(--ink); font: inherit; line-height: 1.45; cursor: pointer; text-align: left; transition: background 120ms; }
+.question-answer-row { display: flex; align-items: baseline; gap: 9px; width: 100%; padding: 7px 10px; border: 0; border-top: 1px solid var(--line); background: transparent; color: var(--ink); font: inherit; line-height: 1.45; cursor: pointer; text-align: left; transition: background var(--dur-fast); }
 .question-options > .question-answer-row:first-child,
 .question-list > .question-custom-answer:first-child { border-top: 0; }
 .question-answer-row:hover { background: var(--soft-fill); }

@@ -43,7 +43,7 @@ export const ContextPanel = memo(function ContextPanel() {
     void appStore.transport.rpc('session.context', { sessionId }).catch(error => {
       if (!cancelled) setFailure({ sessionId, message: error instanceof Error ? error.message : String(error) })
     })
-    return () => { cancelled = false }
+    return () => { cancelled = true }
   }, [missing, sessionId, phase, selection?.provider, selection?.model, selection?.reasoning, attempt])
   if (!context) {
     if (failure?.sessionId === sessionId) return <p className="detail-empty form-error" role="alert">{failure.message}
