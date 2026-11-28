@@ -7,10 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use super::registry::{WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME};
 use super::{ToolExecution, error_result};
-
-pub(crate) const WEB_SEARCH_TOOL_NAME: &str = "web_search";
-pub(crate) const WEB_FETCH_TOOL_NAME: &str = "web_fetch";
 
 const MAX_QUERY_CHARS: usize = 128;
 const DEFAULT_SEARCH_COUNT: u8 = 10;

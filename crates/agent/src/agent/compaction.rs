@@ -86,11 +86,13 @@ impl RequestContext {
                 context::clear_idle_tool_results(writer)?;
                 let data = writer.data();
                 let entries = context::resolve_context_entries(data);
-                let tokens = context::input_tokens(data, &entries, (&target.0, &target.1), overhead_tokens);
+                let cleared = context::cleared_tool_result_ids(data);
+                let tokens =
+                    context::input_tokens(data, &entries, (&target.0, &target.1), overhead_tokens, &cleared);
                 if allow_auto_compact && tokens >= trigger {
                     return Ok(None);
                 }
-                Ok(Some(context::PreparedContext::new(data, &entries, tokens)))
+                Ok(Some(context::PreparedContext::new(data, &entries, tokens, &cleared)))
             })
         })
         .await
@@ -269,11 +271,8 @@ fn emit_failure(
         CompactionMode::Manual => {
             let message = error.to_string();
             let id = item_id.unwrap_or_else(crate::session::new_entry_id);
-            emit_status(on_event, id.clone(), TurnStatus::Failed, Some(message.clone()));
-            AgentError::Compaction {
-                item_id: id,
-                source: Box::new(AgentError::InvalidCompaction(message)),
-            }
+            emit_status(on_event, id.clone(), TurnStatus::Failed, Some(message));
+            AgentError::Compaction { item_id: id, source: Box::new(error) }
         }
         CompactionMode::Auto | CompactionMode::Overflow { .. } => {
             if let Some(message_id) = item_id {

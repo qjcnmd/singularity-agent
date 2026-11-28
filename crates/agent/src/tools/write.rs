@@ -4,8 +4,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::edit::{file_lock_key, format_diff_result, read_opened_text_file, with_file_lock};
-use super::registry::{ABORTED_MESSAGE, ToolExecution, error_result};
+use super::file_ops::{file_lock_key, format_diff_result, read_opened_text_file, with_file_lock};
+use super::registry::{ABORTED_MESSAGE, ToolExecution, WRITE_TOOL_NAME, error_result};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,7 +16,7 @@ pub(crate) struct WriteArgs {
 
 pub(crate) fn spec() -> app_core::ToolDefinition {
     app_core::ToolDefinition {
-        name: "write".into(),
+        name: WRITE_TOOL_NAME.into(),
         description: "Create a new UTF-8 text file or overwrite an existing text file with full content. Automatically creates missing parent directories and writes atomically. Prefer edit for targeted changes to existing files.".into(),
         parameters_schema: json!({
             "type": "object",

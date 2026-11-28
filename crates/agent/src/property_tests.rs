@@ -283,7 +283,7 @@ proptest! {
             assert_balanced_tool_calls(&project_messages(kept, &cleared_before));
 
             let model = ModelConfigurationSnapshot { max_context_tokens: 4_000, max_output_tokens: 512 };
-            let total_input = input_tokens(data, &active_before, ("p", "m"), 400);
+            let total_input = input_tokens(data, &active_before, ("p", "m"), 400, &cleared_before);
             let overflow = (round.retain_tokens == 0 && total_input >= 2_400).then_some(total_input);
             match plan_compaction_step(data, round.retain_tokens, ("p", "m"), 400, 300, model, overflow) {
                 Ok(Some(step)) => {
@@ -369,7 +369,9 @@ proptest! {
         mgr.append_message_with_id("a1", with_thinking, Some(obs), None).expect("append a1");
         plain_mgr.append_message_with_id("a1", without_thinking, None, None).expect("append plain a1");
 
-        let before_u2 = input_tokens(mgr.data(), &resolve_context_entries(mgr.data()), ("pa", "ma"), 300);
+        let empty_cleared = HashSet::new();
+        let before_u2 =
+            input_tokens(mgr.data(), &resolve_context_entries(mgr.data()), ("pa", "ma"), 300, &empty_cleared);
         prop_assert!(before_u2 >= reported_total, "calibrated estimate must adopt real usage");
 
         mgr.append_record(LedgerRecord::OperationStarted).expect("append turn boundary");
@@ -378,18 +380,19 @@ proptest! {
 
         let active = resolve_context_entries(mgr.data());
         let plain_active = resolve_context_entries(plain_mgr.data());
-        let calibrated = input_tokens(mgr.data(), &active, ("pa", "ma"), 300);
+        let calibrated = input_tokens(mgr.data(), &active, ("pa", "ma"), 300, &empty_cleared);
         prop_assert!(calibrated > before_u2, "new user tail must increase calibrated estimate");
-        prop_assert!(input_tokens(mgr.data(), &active, ("pa", "ma"), reported_total) > calibrated);
+        prop_assert!(input_tokens(mgr.data(), &active, ("pa", "ma"), reported_total, &empty_cleared) > calibrated);
         prop_assert_eq!(
-            input_tokens(mgr.data(), &active, ("pb", "mb"), 300),
-            input_tokens(plain_mgr.data(), &plain_active, ("pb", "mb"), 300),
+            input_tokens(mgr.data(), &active, ("pb", "mb"), 300, &empty_cleared),
+            input_tokens(plain_mgr.data(), &plain_active, ("pb", "mb"), 300, &empty_cleared),
             "foreign provider/model must not count source thinking blocks"
         );
 
         let cp = CompactionEntry { summary: "s".into(), first_kept_entry_id: Some("u2".into()) };
         mgr.append_compaction_with_id("cp", cp).expect("append compaction");
-        let after_cp = input_tokens(mgr.data(), &resolve_context_entries(mgr.data()), ("pa", "ma"), 300);
+        let after_cp =
+            input_tokens(mgr.data(), &resolve_context_entries(mgr.data()), ("pa", "ma"), 300, &empty_cleared);
         prop_assert!(after_cp < reported_total && after_cp > 300, "checkpoint must truncate stale usage");
     }
 

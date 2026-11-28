@@ -346,7 +346,7 @@ impl SessionData {
         &self.header_timestamp
     }
 
-    pub fn cwd(&self) -> &Path {
+    pub(crate) fn cwd(&self) -> &Path {
         &self.cwd
     }
 

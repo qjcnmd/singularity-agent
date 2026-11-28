@@ -3,7 +3,10 @@ use std::num::NonZeroU64;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::tools::registry::{ToolExecution, error_result};
+use crate::tools::registry::{
+    BASH_TOOL_NAME, TASK_LIST_TOOL_NAME, TASK_OUTPUT_TOOL_NAME, TASK_STOP_TOOL_NAME, ToolExecution,
+    error_result,
+};
 
 pub(super) const MAX_WAIT_MS: u64 = 30_000;
 pub(super) const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -50,7 +53,7 @@ pub(crate) struct TaskListArgs {}
 
 pub(crate) fn spec() -> app_core::ToolDefinition {
     app_core::ToolDefinition {
-        name: "bash".to_string(),
+        name: BASH_TOOL_NAME.to_string(),
         description: format!(
             "Execute a Bash command in the current working directory (Git Bash on Windows). Use POSIX syntax; `2>nul` creates a file named nul. Returns stdout and stderr; output over {} keeps the beginning and end with the middle omitted, and the full output is saved to a file. Independent commands may run in parallel; send dependent commands in order. Each command starts exactly once. yield_time_ms controls how long to wait before returning a task ID for a still-running command (0 to 30000 ms, default 10000); use 0 to return immediately. Use task_list, task_output and task_stop to manage background commands. Background completion automatically delivers status and new output. Continue independent work; if none remains, give a brief status message and finish this response; you will resume on completion. Do not poll, sleep, or repeatedly read logs to wait. timeout_ms optionally limits total execution time, including time spent in the background; without it there is no total time limit. Stopping a task terminates its entire process tree. No interactive stdin or PTY is available.",
             crate::tools::registry::command_cap_summary()
@@ -71,7 +74,7 @@ pub(crate) fn spec() -> app_core::ToolDefinition {
 
 pub(crate) fn task_list_spec() -> app_core::ToolDefinition {
     app_core::ToolDefinition {
-        name: "task_list".to_string(),
+        name: TASK_LIST_TOOL_NAME.to_string(),
         description: "List this session's background commands, including saved commands from earlier runs. Commands left running in saved history are interrupted; they are not restarted. Completion notifies you automatically; do not repeatedly poll.".to_string(),
         parameters_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
     }
@@ -79,7 +82,7 @@ pub(crate) fn task_list_spec() -> app_core::ToolDefinition {
 
 pub(crate) fn task_output_spec() -> app_core::ToolDefinition {
     app_core::ToolDefinition {
-        name: "task_output".to_string(),
+        name: TASK_OUTPUT_TOOL_NAME.to_string(),
         description: "Inspect a background command when its current output helps you act now. Returns immediately with status and only output not already delivered by bash, task_output or a completion notice. No cursor or waiting is needed. Completion delivers new output automatically; do not poll. Use read on the full-output file to revisit earlier text.".to_string(),
         parameters_schema: json!({
             "type": "object",
@@ -93,7 +96,7 @@ pub(crate) fn task_output_spec() -> app_core::ToolDefinition {
 
 pub(crate) fn task_stop_spec() -> app_core::ToolDefinition {
     app_core::ToolDefinition {
-        name: "task_stop".to_string(),
+        name: TASK_STOP_TOOL_NAME.to_string(),
         description: "Stop this background command and all descendants, then wait for cleanup. Stopping an already finished command returns its existing result.".to_string(),
         parameters_schema: json!({
             "type": "object", "properties": { "task_id": { "type": "string" } },

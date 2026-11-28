@@ -175,7 +175,7 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
     collector.push(
         BASH,
         ContextGroup::Tools,
-        "bash",
+        &bash.0.name,
         "在工作目录执行命令".into(),
         estimate_tool_tokens([&bash.0]),
         true,
@@ -196,7 +196,6 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
     let optional_tools = [
         (
             EDIT,
-            "edit",
             "精确替换文本文件内容",
             tools::edit_tool(),
             Some(
@@ -205,37 +204,34 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
         ),
         (
             WRITE,
-            "write",
             "创建或覆盖写入文本文件",
             tools::write_tool(),
             Some("Use write to create new text files or replace an entire file."),
         ),
-        (READ, "read", "读取文本文件", tools::read_tool(), Some("Use read for text files.")),
-        (GREP, "grep", "在工作区搜索文件内容", tools::grep_tool(), None),
-        (GLOB, "glob", "按通配符查找工作区文件", tools::glob_tool(), None),
+        (READ, "读取文本文件", tools::read_tool(), Some("Use read for text files.")),
+        (GREP, "在工作区搜索文件内容", tools::grep_tool(), None),
+        (GLOB, "按通配符查找工作区文件", tools::glob_tool(), None),
         (
             VIEW_IMAGE,
-            "view_image",
             "查看磁盘上的图片文件",
             tools::view_image_tool(),
             Some("Use view_image for image files."),
         ),
         (
             TODO,
-            "todo",
             "管理多步骤任务待办清单",
             tools::todo_tool(),
             Some(
                 "Use todo to track progress on complex multi-step tasks (3+ steps); skip it for simple tasks.",
             ),
         ),
-        (QUESTION, "ask_user_question", "向用户提问", tools::question_tool(), None),
+        (QUESTION, "向用户提问", tools::question_tool(), None),
     ];
     let mut grep_enabled = false;
     let mut glob_enabled = false;
-    for (id, label, detail, tool, guideline) in optional_tools {
+    for (id, detail, tool, guideline) in optional_tools {
         let tokens = estimate_tool_tokens([&tool.0]);
-        if collector.push(id, ContextGroup::Tools, label, detail.into(), tokens, false) {
+        if collector.push(id, ContextGroup::Tools, &tool.0.name, detail.into(), tokens, false) {
             if id == GREP {
                 grep_enabled = true;
             } else if id == GLOB {
@@ -255,7 +251,7 @@ pub(crate) fn assemble(inputs: ModuleInputs<'_>) -> Assembly {
             WEB,
             ContextGroup::Tools,
             "web_*",
-            "web_search、web_fetch：联网搜索网页与抓取网页正文".into(),
+            format!("{}、{}：联网搜索网页与抓取网页正文", search_schema.name, fetch_schema.name),
             web_tokens,
             false,
         ) {

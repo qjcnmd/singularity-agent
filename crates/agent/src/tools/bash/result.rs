@@ -3,7 +3,9 @@ use std::io::{Read, Seek, SeekFrom};
 
 use protocol::{BackgroundTask, BackgroundTaskState, CommandOutputSnapshot};
 
-use crate::tools::output::{COMMAND_HEAD_BYTES, count_lines, format_head_tail_slice, format_spill_head_tail};
+use crate::tools::output::{
+    COMMAND_HEAD_BYTES, format_head_tail_slice, format_spill_head_tail, format_spill_note,
+};
 use crate::tools::registry::{COMMAND_MAX_BYTES, COMMAND_MAX_LINES, ToolDisplay, ToolExecution};
 
 pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> String {
@@ -15,12 +17,7 @@ pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> String
     } else if cursor >= retained_start {
         let offset = usize::try_from(cursor - retained_start).unwrap_or(0);
         let offset = output.text.ceil_char_boundary(offset.min(output.text.len()));
-        let unread = &output.text[offset..];
-        let body = if unread.len() <= COMMAND_MAX_BYTES && count_lines(unread) <= COMMAND_MAX_LINES {
-            unread.to_string()
-        } else {
-            format_head_tail_slice(unread)
-        };
+        let body = format_head_tail_slice(&output.text[offset..]);
         format!("Output bytes {cursor}–{}\n\n{body}", output.total_bytes)
     } else if let Some(head_raw) =
         output.full_output.as_deref().and_then(|path| read_spill_head(path, cursor))
@@ -52,10 +49,8 @@ pub(super) fn output_text(output: &CommandOutputSnapshot, cursor: u64) -> String
         result.push('\n');
         result.push_str(super::exec::OUTPUT_TRUNCATED_BACKGROUND_NOTE);
     }
-    if let Some(error) = &output.file_error {
-        let _ = write!(result, "\nFull output could not be saved: {error}");
-    } else if let Some(path) = &output.full_output {
-        let _ = write!(result, "\nFull output: {path}");
+    if let Some(note) = format_spill_note(output.full_output.as_deref(), output.file_error.as_deref()) {
+        let _ = write!(result, "\n{note}");
     }
     result
 }

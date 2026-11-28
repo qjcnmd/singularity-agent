@@ -6,11 +6,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
+use super::registry::{MCP_CALL_TOOL_NAME, MCP_SCHEMA_TOOL_NAME};
 use super::{ToolExecution, error_result};
 use crate::image::InputImage;
-
-pub(crate) const MCP_SCHEMA_TOOL_NAME: &str = "mcp_schema";
-pub(crate) const MCP_CALL_TOOL_NAME: &str = "mcp_call";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -142,13 +140,7 @@ pub(super) async fn execute(
             }
             Err(error) => error_result(error.to_string()),
         };
-        let mut output = super::output::CaptureState::new(output_directory);
-        output.ingest(&execution.content);
-        let (content, note) = output.finish();
-        execution.content = content;
-        if let Some(note) = note {
-            let _ = write!(execution.content, "\n\n{note}");
-        }
+        execution.content = super::output::format_head_tail_bounded(&execution.content, &output_directory);
         execution
     })
     .await

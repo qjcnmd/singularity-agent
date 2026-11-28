@@ -23,7 +23,7 @@ pub enum SessionError {
     Context {
         message: String,
         #[source]
-        source: Box<SessionError>,
+        source: Box<Self>,
     },
     #[error("{0}")]
     InvalidSession(String),

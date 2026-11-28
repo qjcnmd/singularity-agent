@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::registry::{ABORTED_MESSAGE, ToolExecution, error_result};
+use super::registry::{ABORTED_MESSAGE, ToolExecution, VIEW_IMAGE_TOOL_NAME, error_result};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,7 +15,7 @@ pub(crate) struct ViewImageArgs {
 
 pub(crate) fn spec() -> app_core::ToolDefinition {
     app_core::ToolDefinition {
-        name: "view_image".to_string(),
+        name: VIEW_IMAGE_TOOL_NAME.to_string(),
         description: "View an image file (PNG, JPEG, WebP, GIF first frame, BMP). The image is returned as visual input, not text.".to_string(),
         parameters_schema: json!({
             "type": "object",
