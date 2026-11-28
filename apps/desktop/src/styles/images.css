@@ -9,7 +9,7 @@
 .timeline-user .file-chip { background: color-mix(in srgb, currentColor 14%, transparent); color: inherit; }
 .file-chip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-chip-remove { display: grid; place-items: center; width: 18px; height: 18px; margin-right: -4px; padding: 0; border: 0; border-radius: 50%; background: none; color: var(--ink-faint); cursor: pointer; }
-.file-chip-remove:hover { background: rgb(0 0 0 / 7%); color: var(--ink); }
+.file-chip-remove:hover { background: var(--soft-fill-hover); color: var(--ink); }
 .composer-card > .image-list { gap: 8px; margin: 0; padding: 0; }
 .message-body + .image-list { margin-top: 12px; }
 .timeline-user .file-list:not(:empty) + .message-body:not(:has(.user-text:empty)) { margin-top: 8px; }

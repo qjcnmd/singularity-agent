@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { appStore } from '../appStore'
 import type { McpConnectionStatus, McpServerInput, McpServerState } from '../protocol'
 import { errorMessage } from '../rpcClient'
-import { Dialog } from './Dialog'
+import { ConfirmDialog, Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 
@@ -175,15 +175,19 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
         }
       }} />}
     </Dialog>
-    <Dialog open={removing !== null} onClose={closeRemoving} labelledBy="mcp-remove-title" className="confirm-modal">
-      <header className="modal-header"><h2 id="mcp-remove-title">删除 MCP</h2></header>
-      <div className="confirm-body"><p>删除“{removing?.serverId}”的配置？</p>{mutationError && <p role="alert" className="form-error">{mutationError}</p>}<footer>
-        <button type="button" className="secondary-button" disabled={busy} onClick={closeRemoving}>取消</button>
-        <button type="button" className="danger-button" disabled={busy} onClick={() => {
-          if (removing) void mutate(() => appStore.transport.rpc('mcp.remove', { serverId: removing.serverId, workspaceRoot })).then(saved => { if (saved) { setMutationError(null); setRemoving(null) } })
-        }}>删除</button>
-      </footer></div>
-    </Dialog>
+    <ConfirmDialog
+      open={removing !== null}
+      onClose={closeRemoving}
+      onConfirm={() => {
+        if (removing) void mutate(() => appStore.transport.rpc('mcp.remove', { serverId: removing.serverId, workspaceRoot })).then(saved => { if (saved) { setMutationError(null); setRemoving(null) } })
+      }}
+      title="删除 MCP"
+      message={`删除“${removing?.serverId ?? ''}”的配置？`}
+      confirmLabel="删除"
+      danger
+      pending={busy}
+      error={mutationError}
+    />
   </section>
 }
 

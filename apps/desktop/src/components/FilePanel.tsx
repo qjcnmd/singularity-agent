@@ -63,23 +63,29 @@ export function FilePanel() {
   const shown = loaded?.document
   const shownChanges = loaded?.error ? undefined : (loaded?.changes ?? active?.initialChanges)
 
+  const activeId = active?.id
+  const activeMode = active?.mode
+  const activeCwd = active?.cwd
+  const activePath = active?.path
+  const activeOpened = active?.opened
+
   useEffect(() => {
-    if (!active) return
+    if (activeId === undefined || activeMode === undefined || activeCwd === undefined || activePath === undefined) return
     let current = true
-    const update = (patch: Loaded) => setDocuments(all => ({ ...all, [active.id]: { ...all[active.id], ...patch } }))
-    if (active.mode === 'changes') {
-      void appStore.transport.rpc('session.changedFiles', { workspaceRoot: active.cwd, includeDiffs: true }).then(
+    const update = (patch: Loaded) => setDocuments(all => ({ ...all, [activeId]: { ...all[activeId], ...patch } }))
+    if (activeMode === 'changes') {
+      void appStore.transport.rpc('session.changedFiles', { workspaceRoot: activeCwd, includeDiffs: true }).then(
         changes => { if (current) update({ changes, error: undefined }) },
         error => { if (current) update({ changes: undefined, error: errorMessage(error) }) },
       )
     } else {
-      void appStore.transport.rpc('file.read', { cwd: active.cwd, path: active.path }).then(
+      void appStore.transport.rpc('file.read', { cwd: activeCwd, path: activePath }).then(
         document => { if (current) update({ document, error: undefined }) },
         error => { if (current) update({ document: undefined, error: errorMessage(error) }) },
       )
     }
     return () => { current = false }
-  }, [active?.id, active?.opened, attempt, refreshKey])
+  }, [activeId, activeMode, activeCwd, activePath, activeOpened, attempt, refreshKey])
 
   useEffect(() => {
     const openIds = new Set(state.fileTabs.map(tab => tab.id))

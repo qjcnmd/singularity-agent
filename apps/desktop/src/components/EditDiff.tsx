@@ -185,13 +185,26 @@ export function TurnChangesCard({ edits, cwd, itemKey, onOpenChanges, onOpenFile
 }
 
 function Hunk({ hunk, language }: { hunk: DiffHunk; language: string }) {
-  const oldTokens = useCodeTokens(hunk.lines.filter(line => line.kind !== 'added').map(line => line.text).join('\n'), language)
-  const newTokens = useCodeTokens(hunk.lines.filter(line => line.kind !== 'deleted').map(line => line.text).join('\n'), language)
-  let oldIndex = 0
-  let newIndex = 0
-  return <div className="edit-hunk">{hunk.lines.map((line, index) => {
-    if (line.kind === 'context') oldIndex++
-    const tokens = line.kind === 'deleted' ? oldTokens?.[oldIndex++] : newTokens?.[newIndex++]
+  const { oldText, newText, indexed } = useMemo(() => {
+    const oldLines: string[] = []
+    const newLines: string[] = []
+    const entries: Array<{ line: DiffLine; tokenSource: 'old' | 'new'; tokenIndex: number }> = []
+    for (const line of hunk.lines) {
+      if (line.kind === 'deleted') {
+        entries.push({ line, tokenSource: 'old', tokenIndex: oldLines.length })
+        oldLines.push(line.text)
+      } else {
+        if (line.kind === 'context') oldLines.push(line.text)
+        entries.push({ line, tokenSource: 'new', tokenIndex: newLines.length })
+        newLines.push(line.text)
+      }
+    }
+    return { oldText: oldLines.join('\n'), newText: newLines.join('\n'), indexed: entries }
+  }, [hunk.lines])
+  const oldTokens = useCodeTokens(oldText, language)
+  const newTokens = useCodeTokens(newText, language)
+  return <div className="edit-hunk">{indexed.map(({ line, tokenSource, tokenIndex }, index) => {
+    const tokens = tokenSource === 'old' ? oldTokens?.[tokenIndex] : newTokens?.[tokenIndex]
     return <div key={index} className={`edit-line edit-line-${line.kind}`}>
       <span className="edit-line-number" aria-label={`${line.kind === 'deleted' ? '删除的原' : line.kind === 'added' ? '新增的' : ''}行 ${line.number}`}>{line.number}</span>
       <code>{tokens ? <CodeTokens tokens={tokens} /> : line.text || '\u00a0'}</code>

@@ -5,6 +5,7 @@ const thumbSize = 24
 const thumbInset = 2
 const edge = thumbSize / 2 + thumbInset
 const sliderSpring = { type: 'spring', stiffness: 420, damping: 30, mass: 0.8 } as const
+const instantTransition = { duration: 0 } as const
 const clamp = (value: number) => Math.min(1, Math.max(0, value))
 const along = (ratio: number) => `calc((100% - ${edge * 2}px) * ${ratio} + ${edge}px)`
 
@@ -15,7 +16,7 @@ export function EffortSlider({ variants, selectedIndex, onCommit }: {
 }) {
   const last = Math.max(1, variants.length - 1)
   const reduced = useReducedMotion()
-  const transition = reduced ? { duration: 0 } : sliderSpring
+  const transition = reduced ? instantTransition : sliderSpring
   const track = useRef<HTMLDivElement>(null)
   const drag = useRef<{ grabOffset: number } | null>(null)
   const ratio = useMotionValue(selectedIndex / last)
@@ -36,7 +37,7 @@ export function EffortSlider({ variants, selectedIndex, onCommit }: {
   useMotionValueEvent(ratio, 'change', value => setLiveIndex(Math.round(clamp(value) * last)))
   useEffect(() => {
     if (!drag.current) animate(ratio, selectedIndex / last, transition)
-  }, [selectedIndex, last, ratio, reduced])
+  }, [selectedIndex, last, ratio, transition])
 
   const fillX = useTransform([ratio, travel], ([r, t]: number[]) => (r - 1) * t)
   const thumbX = useTransform([ratio, travel], ([r, t]: number[]) => r * t)

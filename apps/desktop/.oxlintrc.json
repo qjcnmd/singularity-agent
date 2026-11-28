@@ -23,12 +23,9 @@
     "react/rules-of-hooks": "error",
     "react/jsx-key": "error",
     "react/jsx-no-duplicate-props": "error",
-    "react-hooks/exhaustive-deps": "off",
-    "react/exhaustive-effect-dependencies": "off",
+    "react-hooks/exhaustive-deps": "error",
     "react/set-state-in-effect": "off",
-    "react/refs": "off",
-    "react/immutability": "off",
-    "react/purity": "off"
+    "react/refs": "off"
   },
   "overrides": [
     {

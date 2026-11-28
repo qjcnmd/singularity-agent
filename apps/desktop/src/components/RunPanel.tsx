@@ -36,24 +36,18 @@ export function RunPanel({ overlay = false }: { overlay?: boolean }) {
   const factsCount = state.session?.facts.length ?? 0
   const lastTurnStatus = state.session?.facts.at(-1)?.status ?? ''
   const summaryRevision = sessionId ? state.liveSessions[sessionId]?.summaryRevision ?? 0 : 0
-  const [changedFiles, setChangedFiles] = useState<ChangedFile[]>([])
-  const openCount = useRef(0)
-  const prevOpen = useRef(backgroundOpen)
-  if (backgroundOpen && !prevOpen.current) openCount.current += 1
-  prevOpen.current = backgroundOpen
-  const openTrigger = openCount.current
+  const scopeKey = cwd && sessionId && factsCount > 0 ? `${sessionId}\0${cwd}` : ''
+  const [changedFilesState, setChangedFilesState] = useState<{ key: string; files: ChangedFile[] }>({ key: '', files: [] })
+  const changedFiles = changedFilesState.key === scopeKey ? changedFilesState.files : []
   useEffect(() => {
-    if (!cwd || !sessionId || factsCount === 0) {
-      setChangedFiles([])
-      return
-    }
+    if (!backgroundOpen || !scopeKey || !cwd) return
     let active = true
     void appStore.transport.rpc('session.changedFiles', { workspaceRoot: cwd }).then(
-      files => { if (active) setChangedFiles(files) },
-      () => { if (active) setChangedFiles([]) },
+      files => { if (active) setChangedFilesState({ key: scopeKey, files }) },
+      () => { if (active) setChangedFilesState({ key: scopeKey, files: [] }) },
     )
     return () => { active = false }
-  }, [cwd, sessionId, factsCount, lastTurnStatus, phase, summaryRevision, openTrigger])
+  }, [backgroundOpen, scopeKey, cwd, factsCount, lastTurnStatus, phase, summaryRevision])
   const container = useRef<HTMLDivElement>(null)
   const opener = useRef<HTMLButtonElement>(null)
   const reduced = useReducedMotion()

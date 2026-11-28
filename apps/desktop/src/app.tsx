@@ -67,14 +67,19 @@ const MainContent = memo(function MainContent({ filePanelOpen }: { filePanelOpen
   const state = useAppStore(['selectedSessionId', 'selectedWorkspaceRoot', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'backgroundOpen', 'actionErrors', 'actionErrorOrigin'])
   const facts = state.session?.facts
   const runtime = state.session?.runtime
-  const failure = runtime?.failure
-  const pendingQuestion = runtime?.pendingQuestion
+  const hasRuntime = runtime !== undefined
+  const failure = runtime?.failure ?? null
+  const pendingQuestion = runtime?.pendingQuestion ?? null
   const pendingMessages = runtime?.pendingMessages
   const failureFromRuntime = failure?.source === 'turn'
   const historyRows = useMemo(() => buildHistoryRows(facts, failureFromRuntime), [facts, failureFromRuntime])
   const items = useMemo(
-    () => buildTimeline(historyRows, facts, runtime),
-    [historyRows, facts, failure, pendingQuestion, pendingMessages],
+    () => buildTimeline(
+      historyRows,
+      facts,
+      hasRuntime ? { failure, pendingQuestion, pendingMessages: pendingMessages ?? [] } : undefined,
+    ),
+    [historyRows, facts, hasRuntime, failure, pendingQuestion, pendingMessages],
   )
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspace = state.bootstrap?.workspaces.find(workspace => workspaceKey(workspace.root) === state.selectedWorkspaceRoot)
