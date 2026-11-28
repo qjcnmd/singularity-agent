@@ -618,3 +618,121 @@ async fn git_diff_and_rewind_invariants() {
     );
     restarted.shutdown().await;
 }
+
+#[tokio::test]
+async fn session_cache_lru_eviction_invariants() {
+    let env = TestEnv::new("lru-eviction");
+    let server = MockModelServer::start().await;
+    let ws = env.workspace_str();
+
+    let busy_gate = Arc::new(Notify::new());
+    server.enqueue(ScriptedResponse::sse_gated(
+        messages_text_sse(None, "BUSY_SESSION_ANSWER", 60, 0, 15, "end_turn"),
+        Arc::clone(&busy_gate),
+    ));
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(
+        None,
+        "OLDEST_SESSION_ANSWER",
+        60,
+        0,
+        15,
+        "end_turn",
+    )));
+    server.set_fallback(|_, _| {
+        ScriptedResponse::sse(messages_text_sse(None, "IDLE_SESSION_OK", 40, 0, 10, "end_turn"))
+    });
+
+    let mut client = BackendClient::spawn(&env.home).await;
+    client
+        .setup_workspace_and_provider(&ws, "local", "messages", &server.base_url, "demo", 64000, 4096)
+        .await;
+
+    // Start the busy session first so it is the oldest entry in SessionCache and must not be evicted while running.
+    let busy_id = client
+        .start_session(&ws, "local", "demo", None, "BUSY_SESSION_PROMPT", vec![], vec![])
+        .await;
+    server.wait_for_request_count(1).await;
+
+    let oldest_id = client
+        .start_session(&ws, "local", "demo", None, "OLDEST_SESSION_PROMPT", vec![], vec![])
+        .await;
+    let oldest_settled = client.wait_settled(&oldest_id).await;
+    assert_eq!(oldest_settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+    let oldest_before = client.rpc_ok("session.read", json!({ "sessionId": oldest_id })).await;
+    assert!(
+        oldest_before.get("context").is_some_and(|v| !v.is_null()),
+        "active cached session should retain loaded context before eviction"
+    );
+    let oldest_turns_before = oldest_before.pointer("/history/turns").cloned().expect("oldest turns");
+    let rev_before = oldest_before.get("revision").and_then(Value::as_u64).expect("oldest revision");
+
+    // Create 16 additional idle sessions (18 total > 16 cache capacity) to force LRU eviction of oldest_id.
+    let mut all_ids = vec![busy_id.clone(), oldest_id.clone()];
+    for idx in 0..16 {
+        let prompt = format!("IDLE_SESSION_PROMPT_{idx}");
+        let id = client.start_session(&ws, "local", "demo", None, &prompt, vec![], vec![]).await;
+        let settled = client.wait_settled(&id).await;
+        assert_eq!(settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+        let _ = client.drain_events();
+        all_ids.push(id);
+    }
+
+    // Busy session must remain intact in cache and complete cleanly once unblocked.
+    let busy_running = client.rpc_ok("session.read", json!({ "sessionId": busy_id })).await;
+    assert_eq!(
+        busy_running.pointer("/runtime/phase").and_then(Value::as_str),
+        Some("running"),
+        "busy session must not be evicted while actively running"
+    );
+    busy_gate.notify_one();
+    let busy_settled = client.wait_settled(&busy_id).await;
+    assert_eq!(busy_settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+    let busy_done = client.rpc_ok("session.read", json!({ "sessionId": busy_id })).await;
+    assert!(busy_done.to_string().contains("BUSY_SESSION_ANSWER"));
+
+    // Evicted oldest idle session must reopen cleanly from disk with full history and monotonic revision.
+    let oldest_reopened = client.rpc_ok("session.read", json!({ "sessionId": oldest_id })).await;
+    assert!(
+        oldest_reopened.get("context").is_some_and(Value::is_null),
+        "evicted idle session must reopen cold from disk with lazily deferred context"
+    );
+    assert_eq!(
+        oldest_reopened.pointer("/history/turns"),
+        Some(&oldest_turns_before),
+        "reopened evicted session must preserve full persisted history"
+    );
+    let rev_reopened = oldest_reopened.get("revision").and_then(Value::as_u64).expect("reopened revision");
+    assert!(
+        rev_reopened >= rev_before,
+        "reopened session revision must be monotonic ({rev_reopened} < {rev_before})"
+    );
+
+    client.submit(&oldest_id, "OLDEST_FOLLOWUP_PROMPT").await;
+    let followup_settled = client.wait_settled(&oldest_id).await;
+    assert_eq!(followup_settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+    let oldest_after = client.rpc_ok("session.read", json!({ "sessionId": oldest_id })).await;
+    assert_eq!(
+        oldest_after.pointer("/history/turns").and_then(Value::as_array).map(Vec::len),
+        Some(2),
+        "reopened session must support follow-up turns seamlessly"
+    );
+    let rev_after = oldest_after.get("revision").and_then(Value::as_u64).expect("after revision");
+    assert!(
+        rev_after > rev_reopened,
+        "follow-up turn must advance session revision monotonically ({rev_after} <= {rev_reopened})"
+    );
+
+    let bootstrap = client.rpc_ok("app.bootstrap", json!({})).await;
+    let listed_count = bootstrap
+        .get("sessionsByWorkspace")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|map| map.values())
+        .filter_map(Value::as_array)
+        .flatten()
+        .count();
+    assert_eq!(listed_count, all_ids.len(), "bootstrap must retain all 18 sessions");
+
+    server.assert_no_protocol_violations();
+    client.shutdown().await;
+}

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::harness::{
     BackendClient, DEFAULT_TIMEOUT, MockModelServer, ScriptedResponse, TINY_PNG_DATA_URL, TestEnv,
-    find_tool_result, messages_text_sse, messages_tools_sse, write_test_mcp_script,
+    find_tool_result, messages_text_sse, messages_tools_sse, responses_sse, write_test_mcp_script,
 };
 
 const COMPACT_CONTEXT_WINDOW: u32 = 20_000;
@@ -517,6 +517,215 @@ async fn idle_tool_result_clearing_app_server_invariants() {
             .and_then(Value::as_array)
             .is_some_and(|imgs| !imgs.is_empty()),
         "session.read must preserve original image attachment for UI display: {ui_image}"
+    );
+
+    server.assert_no_protocol_violations();
+    restarted.shutdown().await;
+}
+
+fn is_responses_compaction_request(body: &Value) -> bool {
+    let Some(last) = body.get("input").and_then(Value::as_array).and_then(|items| items.last()) else {
+        return false;
+    };
+    if last.get("type").and_then(Value::as_str) != Some("message")
+        || last.get("role").and_then(Value::as_str) != Some("user")
+    {
+        return false;
+    }
+    match last.get("content") {
+        Some(Value::String(text)) => !text.contains(USER_TURN_TAG),
+        Some(Value::Array(parts)) => parts
+            .last()
+            .and_then(|part| part.get("text").and_then(Value::as_str))
+            .is_some_and(|text| !text.contains(USER_TURN_TAG)),
+        _ => false,
+    }
+}
+
+#[tokio::test]
+async fn responses_protocol_compaction_invariants() {
+    let env = TestEnv::new("responses-compaction");
+    let server = MockModelServer::start().await;
+    let ws = env.workspace_str();
+
+    let large_notes =
+        format!("RESP_TOOL_OUTPUT_MARKER\n{}", "responses_note_payload_0123456789abcdef\n".repeat(420));
+    std::fs::write(env.workspace.join("notes.txt"), large_notes).expect("write notes.txt");
+
+    server.enqueue(ScriptedResponse::sse(responses_sse(
+        Some(("round 1 tool plan", "enc_r1_tool")),
+        None,
+        vec![("resp_call_1", "read", json!({ "path": "notes.txt" }))],
+        1200,
+        0,
+        80,
+        false,
+    )));
+    server.enqueue(ScriptedResponse::sse(responses_sse(
+        Some(("round 1 synthesis", "enc_r1_done")),
+        Some("RESP_ROUND_1_ANSWER"),
+        vec![],
+        6500,
+        400,
+        60,
+        false,
+    )));
+    server.enqueue(ScriptedResponse::sse(responses_sse(
+        Some(("round 2 reasoning", "enc_r2")),
+        Some("RESP_TAIL_ANSWER_2"),
+        vec![],
+        9800,
+        800,
+        50,
+        false,
+    )));
+    server.enqueue(ScriptedResponse::sse(responses_sse(
+        Some(("compacting prefix", "enc_compact")),
+        Some("RESP_CHECKPOINT_SUMMARY_MARKER: condensed round 1 tool investigation."),
+        vec![],
+        7000,
+        400,
+        40,
+        false,
+    )));
+    server.enqueue(ScriptedResponse::sse(responses_sse(
+        None,
+        Some("RESP_POST_COMPACT_ANSWER"),
+        vec![],
+        3800,
+        200,
+        30,
+        false,
+    )));
+    server.enqueue(ScriptedResponse::sse(responses_sse(
+        None,
+        Some("RESP_POST_RESTART_ANSWER"),
+        vec![],
+        4100,
+        200,
+        30,
+        false,
+    )));
+
+    let mut client = BackendClient::spawn(&env.home).await;
+    client
+        .setup_workspace_and_provider(
+            &ws,
+            "resp-local",
+            "responses",
+            &server.base_url,
+            "resp-model",
+            COMPACT_CONTEXT_WINDOW,
+            2048,
+        )
+        .await;
+
+    let session_id = client
+        .start_session(
+            &ws,
+            "resp-local",
+            "resp-model",
+            Some("high"),
+            &format!("{USER_TURN_TAG} RESP_ORIGIN_ROUND_1"),
+            vec![],
+            vec![],
+        )
+        .await;
+    let s1 = client.wait_settled(&session_id).await;
+    assert_eq!(s1.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+
+    let tail_prompt = format!("{USER_TURN_TAG} RESP_TAIL_TURN_2: {}", "tail_segment_".repeat(950));
+    client.submit(&session_id, &tail_prompt).await;
+    let s2 = client.wait_settled(&session_id).await;
+    assert_eq!(s2.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+
+    client.rpc_ok("session.compact", json!({ "sessionId": session_id })).await;
+    let compact_settled = client.wait_settled(&session_id).await;
+    assert!(
+        compact_settled.pointer("/payload/failure").is_none_or(Value::is_null),
+        "manual Responses compaction must succeed without failure: {compact_settled}"
+    );
+
+    client.submit(&session_id, &format!("{USER_TURN_TAG} RESP_POST_COMPACT_TURN_3")).await;
+    let s3 = client.wait_settled(&session_id).await;
+    assert_eq!(s3.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+
+    let reqs = server.model_requests();
+    assert_eq!(reqs.len(), 5, "expected 2 tool-turn + 1 tail + 1 compaction + 1 post-compact requests");
+    for (idx, req) in reqs.iter().enumerate() {
+        assert!(req.path.ends_with("/responses"), "req #{idx} must target /responses: {}", req.path);
+        assert_eq!(
+            req.body.get("prompt_cache_key").and_then(Value::as_str),
+            Some(session_id.as_str()),
+            "req #{idx} must set prompt_cache_key to session_id"
+        );
+    }
+
+    let compact_req = &reqs[3].body;
+    assert!(
+        is_responses_compaction_request(compact_req),
+        "req #3 must be a Responses compaction request"
+    );
+    let compact_text = compact_req.to_string();
+    assert!(
+        compact_text.contains("RESP_ORIGIN_ROUND_1")
+            && compact_text.contains("RESP_TOOL_OUTPUT_MARKER")
+            && compact_text.contains("enc_r1_tool"),
+        "Responses compaction request must replay encrypted reasoning and tool results from compacted prefix"
+    );
+
+    let post_compact_req = &reqs[4].body;
+    assert!(
+        !is_responses_compaction_request(post_compact_req),
+        "req #4 must be normal post-compaction generation"
+    );
+    let post_compact_text = post_compact_req.to_string();
+    assert!(
+        post_compact_text.contains("RESP_CHECKPOINT_SUMMARY_MARKER")
+            && post_compact_text.contains("RESP_TAIL_TURN_2")
+            && post_compact_text.contains("RESP_TAIL_ANSWER_2")
+            && post_compact_text.contains("enc_r2"),
+        "post-compaction Responses request must project checkpoint and retained tail verbatim"
+    );
+    assert!(
+        !post_compact_text.contains("RESP_ORIGIN_ROUND_1")
+            && !post_compact_text.contains("RESP_TOOL_OUTPUT_MARKER"),
+        "compacted prefix must not reappear after Responses compaction"
+    );
+
+    server.assert_no_protocol_violations();
+    client.shutdown().await;
+
+    let mut restarted = BackendClient::spawn(&env.home).await;
+    let history = restarted.rpc_ok("session.read", json!({ "sessionId": session_id })).await;
+    let history_text = history.to_string();
+    assert!(
+        history_text.contains("RESP_ORIGIN_ROUND_1")
+            && history_text.contains("RESP_CHECKPOINT_SUMMARY_MARKER")
+            && history_text.contains("RESP_POST_COMPACT_ANSWER"),
+        "restarted session.read must preserve full history and compaction checkpoint"
+    );
+
+    restarted.submit(&session_id, &format!("{USER_TURN_TAG} RESP_POST_RESTART_TURN_4")).await;
+    let s4 = restarted.wait_settled(&session_id).await;
+    assert_eq!(s4.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+
+    let all_reqs = server.model_requests();
+    assert_eq!(all_reqs.len(), 6, "post-restart turn must send one Responses request");
+    let restart_req = &all_reqs[5];
+    assert!(restart_req.path.ends_with("/responses"));
+    assert_eq!(
+        restart_req.body.get("prompt_cache_key").and_then(Value::as_str),
+        Some(session_id.as_str()),
+        "post-restart Responses request must keep prompt_cache_key == session_id"
+    );
+    let restart_text = restart_req.body.to_string();
+    assert!(
+        restart_text.contains("RESP_CHECKPOINT_SUMMARY_MARKER")
+            && restart_text.contains("RESP_TAIL_ANSWER_2")
+            && !restart_text.contains("RESP_ORIGIN_ROUND_1")
+            && !restart_text.contains("RESP_TOOL_OUTPUT_MARKER"),
+        "post-restart Responses generation must keep projecting persisted checkpoint and retained tail"
     );
 
     server.assert_no_protocol_violations();

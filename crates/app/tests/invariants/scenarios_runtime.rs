@@ -6,7 +6,7 @@ use tokio::sync::Notify;
 
 use crate::harness::{
     BackendClient, DEFAULT_TIMEOUT, MockModelServer, ScriptedResponse, TestEnv, find_tool_result,
-    messages_text_sse, messages_tools_sse, write_test_mcp_script,
+    messages_text_sse, messages_tools_sse, provider_config_json, responses_sse, write_test_mcp_script,
 };
 
 #[tokio::test]
@@ -564,4 +564,213 @@ async fn web_tools_http_boundary_invariants() {
 
     model_server.assert_no_protocol_violations();
     client.shutdown().await;
+}
+
+fn provider_ids(catalog: &Value) -> Vec<&str> {
+    catalog
+        .pointer("/catalog/providers")
+        .and_then(Value::as_array)
+        .expect("providers array")
+        .iter()
+        .filter_map(|p| p.get("providerId").and_then(Value::as_str))
+        .collect()
+}
+
+fn mcp_server_ids(list: &Value) -> Vec<&str> {
+    list.as_array()
+        .expect("mcp list array")
+        .iter()
+        .filter_map(|e| e.pointer("/server/serverId").and_then(Value::as_str))
+        .collect()
+}
+
+#[tokio::test]
+async fn model_remove_provider_invariants() {
+    let env = TestEnv::new("model-remove-provider");
+    let server = MockModelServer::start().await;
+    let ws = env.workspace_str();
+    server.enqueue(ScriptedResponse::sse(responses_sse(
+        None,
+        Some("SECONDARY_OK"),
+        vec![],
+        80,
+        0,
+        15,
+        false,
+    )));
+
+    let mut client = BackendClient::spawn(&env.home).await;
+    client.rpc_ok("workspace.add", json!({ "root": ws })).await;
+    for (id, proto, model, key) in [
+        ("primary", "messages", "m-primary", "sk-primary-secret"),
+        ("secondary", "responses", "m-secondary", "sk-secondary-secret"),
+    ] {
+        let provider = provider_config_json(id, proto, id, &server.base_url, model, 64000, 4096);
+        client.rpc_ok("model.saveProvider", json!({ "provider": provider, "apiKey": key })).await;
+    }
+    let web_cfg = json!({ "baseUrl": "https://search.example.com/v1", "apiKey": "sk-web-secret" });
+    client.rpc_ok("model.saveWebSearch", web_cfg).await;
+
+    let before = client.rpc_ok("model.read", json!({})).await;
+    assert_eq!(provider_ids(&before), vec!["primary", "secondary"]);
+    assert_eq!(
+        before.pointer("/catalog/webSearch/credentialConfigured").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let missing = client.rpc_err("model.removeProvider", json!({ "providerId": "missing" })).await;
+    assert!(!missing.is_empty(), "removing nonexistent provider must fail explicitly");
+
+    let after = client.rpc_ok("model.removeProvider", json!({ "providerId": "primary" })).await;
+    let after_text = after.to_string();
+    assert!(
+        !after_text.contains("sk-primary-secret")
+            && !after_text.contains("sk-secondary-secret")
+            && !after_text.contains("sk-web-secret"),
+        "model.removeProvider response must never leak credentials"
+    );
+    assert_eq!(provider_ids(&after), vec!["secondary"]);
+    assert_eq!(
+        after.pointer("/catalog/providers/0/credentialConfigured").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        after.pointer("/catalog/webSearch/credentialConfigured").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let disk: Value = serde_json::from_str(
+        &std::fs::read_to_string(env.home.join("config.json")).expect("read config.json"),
+    )
+    .expect("parse config.json");
+    assert!(disk.pointer("/providers/primary").is_none());
+    assert!(disk.pointer("/providers/secondary").is_some());
+    assert_eq!(disk.pointer("/web_search/api_key").and_then(Value::as_str), Some("sk-web-secret"));
+
+    let sid = client
+        .start_session(&ws, "secondary", "m-secondary", None, "use remaining", vec![], vec![])
+        .await;
+    assert_eq!(
+        client.wait_settled(&sid).await.pointer("/summary/status").and_then(Value::as_str),
+        Some("completed")
+    );
+    let sel_err = client
+        .rpc_err(
+            "session.updateSettings",
+            json!({ "sessionId": sid, "selection": { "provider": "primary", "model": "m-primary", "reasoning": null } }),
+        )
+        .await;
+    assert!(!sel_err.is_empty(), "selecting removed provider must be rejected");
+
+    server.assert_no_protocol_violations();
+    client.shutdown().await;
+
+    let mut restarted = BackendClient::spawn(&env.home).await;
+    let boot = restarted.rpc_ok("app.bootstrap", json!({})).await;
+    assert!(boot.pointer("/models/error").is_none_or(Value::is_null));
+    let reread = restarted.rpc_ok("model.read", json!({})).await;
+    assert_eq!(provider_ids(&reread), vec!["secondary"]);
+    assert_eq!(
+        reread.pointer("/catalog/webSearch/credentialConfigured").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let emptied = restarted.rpc_ok("model.removeProvider", json!({ "providerId": "secondary" })).await;
+    assert!(provider_ids(&emptied).is_empty());
+    assert_eq!(
+        emptied.pointer("/catalog/webSearch/credentialConfigured").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        restarted
+            .rpc_ok("app.bootstrap", json!({}))
+            .await
+            .pointer("/models/error")
+            .is_none_or(Value::is_null)
+    );
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_remove_live_connection_invariants() {
+    let env = TestEnv::new("mcp-remove");
+    let server = MockModelServer::start().await;
+    let ws = env.workspace_str();
+    let mcp_script = write_test_mcp_script(&env.home);
+
+    server.enqueue(ScriptedResponse::sse(messages_tools_sse(
+        None,
+        vec![("c_ping", "mcp_call", json!({ "server": "probe", "tool": "ping", "arguments": {} }))],
+        100,
+        25,
+        "tool_use",
+    )));
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "MCP_PING_OK", 140, 0, 20, "end_turn")));
+    server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "POST_REMOVE_OK", 100, 0, 20, "end_turn")));
+
+    let mut client = BackendClient::spawn(&env.home).await;
+    client
+        .setup_workspace_and_provider(&ws, "local", "messages", &server.base_url, "demo", 64000, 4096)
+        .await;
+    client.register_test_mcp(&ws, &mcp_script).await;
+    let keep_cfg = json!({
+        "serverId": "keep", "startupTimeoutSec": 20, "toolTimeoutSec": 20,
+        "transport": { "type": "stdio", "command": "node", "args": [mcp_script.to_string_lossy()], "cwd": ws, "env": {} }
+    });
+    client.rpc_ok("mcp.save", json!({ "workspaceRoot": ws, "server": keep_cfg })).await;
+
+    let s1 = client.start_session(&ws, "local", "demo", None, "connect mcp", vec![], vec![]).await;
+    assert_eq!(
+        client.wait_settled(&s1).await.pointer("/summary/status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert!(server.model_requests()[1].body.to_string().contains("PONG"));
+
+    let before_list = client.rpc_ok("mcp.list", json!({ "workspaceRoot": ws })).await;
+    let probe = before_list
+        .as_array()
+        .expect("mcp.list array")
+        .iter()
+        .find(|e| e.pointer("/server/serverId").and_then(Value::as_str) == Some("probe"))
+        .expect("probe entry");
+    assert_eq!(probe.get("status").and_then(Value::as_str), Some("connected"));
+
+    let missing = client.rpc_err("mcp.remove", json!({ "workspaceRoot": ws, "serverId": "missing" })).await;
+    assert!(!missing.is_empty(), "removing nonexistent MCP server must fail explicitly");
+
+    let removed = client.rpc_ok("mcp.remove", json!({ "workspaceRoot": ws, "serverId": "probe" })).await;
+    assert_eq!(mcp_server_ids(&removed), vec!["keep"]);
+    let after = client.rpc_ok("mcp.list", json!({ "workspaceRoot": ws })).await;
+    assert_eq!(mcp_server_ids(&after), vec!["keep"]);
+
+    let disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(env.home.join("mcp.json")).expect("read mcp.json"))
+            .expect("parse mcp.json");
+    assert!(disk.pointer("/mcpServers/probe").is_none());
+    assert!(disk.pointer("/mcpServers/keep").is_some());
+
+    let s2 = client.start_session(&ws, "local", "demo", None, "post remove", vec![], vec![]).await;
+    assert_eq!(
+        client.wait_settled(&s2).await.pointer("/summary/status").and_then(Value::as_str),
+        Some("completed")
+    );
+    let s2_sys = server
+        .model_requests()
+        .last()
+        .expect("post-remove req")
+        .body
+        .get("system")
+        .map(Value::to_string)
+        .unwrap_or_default();
+    assert!(s2_sys.contains("MCP server keep:") && !s2_sys.contains("MCP server probe:"));
+
+    server.assert_no_protocol_violations();
+    client.shutdown().await;
+
+    let mut restarted = BackendClient::spawn(&env.home).await;
+    let restarted_list = restarted.rpc_ok("mcp.list", json!({ "workspaceRoot": ws })).await;
+    assert_eq!(mcp_server_ids(&restarted_list), vec!["keep"]);
+    let final_list = restarted.rpc_ok("mcp.remove", json!({ "workspaceRoot": ws, "serverId": "keep" })).await;
+    assert!(mcp_server_ids(&final_list).is_empty());
+    restarted.shutdown().await;
 }
