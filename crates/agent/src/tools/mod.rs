@@ -17,6 +17,7 @@ mod write;
 pub use bash::{BashTaskUpdate, BashTasks};
 #[cfg(test)]
 pub(crate) use edit::execute as edit_execute;
+pub use file_ops::FileReadTracker;
 pub(crate) use mcp::{call_spec as mcp_call_schema, schema_spec as mcp_schema_schema};
 pub(crate) use output::FULL_OUTPUT_PREFIX;
 #[cfg(test)]

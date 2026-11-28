@@ -1,12 +1,12 @@
-use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::file_ops::{format_diff_result, read_opened_text_file, with_file_lock};
+use super::file_ops::{FileReadTracker, format_diff_result, read_opened_text_file};
 use super::registry::{ABORTED_MESSAGE, EDIT_TOOL_NAME, ToolExecution, error_result};
 
 #[derive(Debug, Deserialize)]
@@ -35,12 +35,8 @@ pub(crate) fn spec() -> model::ToolDefinition {
                     "type": "array", "minItems": 1,
                     "items": {
                         "type": "object",
-                        "properties": {
-                            "old_text": { "type": "string", "minLength": 1 },
-                            "new_text": { "type": "string" }
-                        },
-                        "required": ["old_text", "new_text"],
-                        "additionalProperties": false
+                        "properties": { "old_text": { "type": "string", "minLength": 1 }, "new_text": { "type": "string" } },
+                        "required": ["old_text", "new_text"], "additionalProperties": false
                     }
                 }
             },
@@ -54,6 +50,7 @@ pub(crate) async fn execute(
     args: EditArgs,
     cwd: PathBuf,
     output_directory: PathBuf,
+    file_reads: Arc<FileReadTracker>,
     signal: CancellationToken,
 ) -> ToolExecution {
     if signal.is_cancelled() {
@@ -63,34 +60,40 @@ pub(crate) async fn execute(
         return error_result("edits must contain at least one replacement");
     }
     let target = cwd.join(&args.path);
-    let target = match tokio::task::spawn_blocking(move || target.canonicalize())
-        .await
-        .expect("tool worker completes while the runtime is running")
-    {
-        Ok(target) => target,
-        Err(error) => return error_result(format!("Could not edit {}: {error}", args.path)),
-    };
-    let key = app_core::workspace_key(&target);
-    with_file_lock(key, signal, move |signal| execute_locked(&args, &target, &output_directory, signal)).await
+    tokio::task::spawn_blocking(move || {
+        execute_locked(&args, &target, &output_directory, &file_reads, &signal).unwrap_or_else(error_result)
+    })
+    .await
+    .expect("tool worker completes while the runtime is running")
 }
 
 fn execute_locked(
     args: &EditArgs,
-    target: &Path,
+    raw_target: &Path,
     output_directory: &Path,
+    file_reads: &FileReadTracker,
     signal: &CancellationToken,
 ) -> Result<ToolExecution, String> {
     if signal.is_cancelled() {
         return Err(ABORTED_MESSAGE.into());
     }
-    let file = File::open(target).map_err(|error| format!("Could not read {}: {error}", args.path))?;
+    let target = raw_target
+        .canonicalize()
+        .map_err(|error| format!("Could not edit {}: {error}", args.path))?;
+    let key = app_core::workspace_key(&target);
+    let file = File::open(&target).map_err(|error| format!("Could not read {}: {error}", args.path))?;
+    let metadata = file.metadata().map_err(|error| format!("Could not inspect {}: {error}", args.path))?;
+    file_reads.verify_unchanged(&key, &metadata, &args.path, "edit")?;
     let content = read_opened_text_file(file, &args.path)?;
     let (view, updated) = apply_edits(&content, &args.path, &args.edits)?;
     if signal.is_cancelled() {
         return Err(ABORTED_MESSAGE.into());
     }
-    app_core::write_bytes_atomic(target, updated.as_bytes())
+    app_core::write_bytes_atomic(&target, updated.as_bytes())
         .map_err(|error| format!("Could not write {}: {error}", args.path))?;
+    if let Ok(updated_meta) = std::fs::metadata(&target) {
+        file_reads.record_metadata(key, &updated_meta);
+    }
     Ok(format_diff_result("Edited", &args.path, &view, &updated, output_directory))
 }
 
@@ -104,7 +107,7 @@ fn apply_edits(content: &str, display_path: &str, edits: &[Replacement]) -> Resu
         .collect();
     let source_offset = |offset| offset + removed.partition_point(|removed| *removed < offset);
     let mut matches = Vec::with_capacity(edits.len());
-    let mut cached_lines: Option<Vec<LineSpan<'_>>> = None;
+    let mut cache = MatchCache::default();
     for (index, edit) in edits.iter().enumerate() {
         if edit.new_text.contains('\0') {
             return Err(format!("edits[{index}].new_text must not contain NUL bytes"));
@@ -113,7 +116,7 @@ fn apply_edits(content: &str, display_path: &str, edits: &[Replacement]) -> Resu
         if old.is_empty() {
             return Err(format!("edits[{index}].old_text must not be empty"));
         }
-        let plan = find_unique_match(&view, &old, index, display_path, &mut cached_lines)?;
+        let plan = find_unique_match(&view, &old, index, display_path, &mut cache)?;
         matches.push((source_offset(plan.start), source_offset(plan.end), index, plan.reindent));
     }
     matches.sort_unstable_by_key(|(start, end, index, _)| (*start, *end, *index));
@@ -134,7 +137,12 @@ fn apply_edits(content: &str, display_path: &str, edits: &[Replacement]) -> Resu
         updated.push_str(&source[cursor..start]);
         let region = &source[start..end];
         let raw_replacement = edits[index].new_text.replace("\r\n", "\n");
-        let replacement = apply_reindent(&raw_replacement, &reindent, index, display_path)?;
+        let replacement = match &reindent {
+            Some((old_indent, file_indent)) => {
+                reindent_replacement(&raw_replacement, old_indent, file_indent)
+            }
+            None => raw_replacement,
+        };
         let ending = if region.contains("\r\n") || (!region.contains('\n') && source.contains("\r\n")) {
             "\r\n"
         } else {
@@ -150,16 +158,10 @@ fn apply_edits(content: &str, display_path: &str, edits: &[Replacement]) -> Resu
     Ok((view, updated))
 }
 
-enum ReindentPlan {
-    None,
-    Uniform { old_indent: String, file_indent: String },
-    Mapped(Option<HashMap<String, String>>),
-}
-
 struct MatchPlan {
     start: usize,
     end: usize,
-    reindent: ReindentPlan,
+    reindent: Option<(String, String)>,
 }
 
 struct LineSpan<'a> {
@@ -169,12 +171,6 @@ struct LineSpan<'a> {
     has_nl: bool,
 }
 
-#[derive(Clone, Copy)]
-enum LineMatchMode {
-    IndentFlexible,
-    Trimmed,
-}
-
 fn ambiguous_error(index: usize, path: &str, mode_label: Option<&str>) -> String {
     let mode = mode_label.map_or(String::new(), |label| format!(" ({label})"));
     format!(
@@ -182,12 +178,39 @@ fn ambiguous_error(index: usize, path: &str, mode_label: Option<&str>) -> String
     )
 }
 
+struct NormalizedView {
+    norm: String,
+    byte_start: Vec<usize>,
+    byte_end: Vec<usize>,
+}
+
+#[derive(Default)]
+struct MatchCache<'a> {
+    lines: Option<Vec<LineSpan<'a>>>,
+    norm_ws: Option<NormalizedView>,
+    norm_unicode: Option<NormalizedView>,
+}
+
+impl MatchCache<'_> {
+    fn normalized(&mut self, view: &str, unicode: bool) -> &NormalizedView {
+        let slot = if unicode {
+            &mut self.norm_unicode
+        } else {
+            &mut self.norm_ws
+        };
+        slot.get_or_insert_with(|| {
+            let (norm, byte_start, byte_end) = normalize_with_map(view, unicode);
+            NormalizedView { norm, byte_start, byte_end }
+        })
+    }
+}
+
 fn find_unique_match<'a>(
     view: &'a str,
     old: &str,
     index: usize,
     path: &str,
-    cached_lines: &mut Option<Vec<LineSpan<'a>>>,
+    cache: &mut MatchCache<'a>,
 ) -> Result<MatchPlan, String> {
     if let Some(start) = view.find(old) {
         let next = start + old.chars().next().expect("old text is nonempty").len_utf8();
@@ -197,34 +220,31 @@ fn find_unique_match<'a>(
         return Ok(MatchPlan {
             start,
             end: start + old.len(),
-            reindent: ReindentPlan::None,
+            reindent: None,
         });
     }
     if !old.chars().any(|ch| !ch.is_whitespace()) {
-        return Err(not_found_error(view, old, index, path, cached_lines));
+        return Err(not_found_error(view, old, index, path, &mut cache.lines));
     }
     for (unicode, label) in [
         (false, "ignoring trailing whitespace"),
         (true, "normalizing Unicode punctuation/spaces"),
     ] {
-        if let Some(plan) = find_normalized_unique(view, old, unicode, label, index, path)? {
+        let normalized = cache.normalized(view, unicode);
+        if let Some(plan) = find_normalized_unique(view, normalized, old, unicode, label, index, path)? {
             return Ok(plan);
         }
     }
-    let lines = cached_lines.get_or_insert_with(|| split_line_spans(view));
-    for (mode, label) in [
-        (LineMatchMode::IndentFlexible, "ignoring outer indentation"),
-        (LineMatchMode::Trimmed, "ignoring line indentation"),
-    ] {
-        if let Some(plan) = find_line_block_unique(lines, old, mode, label, index, path)? {
-            return Ok(plan);
-        }
+    let lines = cache.lines.get_or_insert_with(|| split_line_spans(view));
+    if let Some(plan) = find_line_block_unique(lines, old, "ignoring outer indentation", index, path)? {
+        return Ok(plan);
     }
-    Err(not_found_error(view, old, index, path, cached_lines))
+    Err(not_found_error(view, old, index, path, &mut cache.lines))
 }
 
 fn find_normalized_unique(
     view: &str,
+    normalized: &NormalizedView,
     old: &str,
     unicode: bool,
     mode_label: &str,
@@ -241,7 +261,8 @@ fn find_normalized_unique(
             .next()
             .and_then(|segment| segment.chars().next_back())
             .is_some_and(|ch| matches!(normalize_char(ch, unicode), ' ' | '\t'));
-    let (norm_view, byte_start, byte_end) = normalize_with_map(view, unicode);
+    let (norm_view, byte_start, byte_end) =
+        (normalized.norm.as_str(), &normalized.byte_start, &normalized.byte_end);
     let mut matched: Option<MatchPlan> = None;
     let mut offset = 0usize;
     while let Some(rel) = norm_view[offset..].find(&norm_old) {
@@ -265,7 +286,7 @@ fn find_normalized_unique(
         matched = Some(MatchPlan {
             start: byte_start[ns],
             end: orig_end,
-            reindent: ReindentPlan::None,
+            reindent: None,
         });
     }
     Ok(matched)
@@ -341,20 +362,13 @@ fn split_line_spans(view: &str) -> Vec<LineSpan<'_>> {
     spans
 }
 
-fn normalize_line(line: &str, mode: LineMatchMode, base_indent: &str) -> String {
-    if matches!(mode, LineMatchMode::IndentFlexible) && line.trim().is_empty() {
+fn normalize_line(line: &str, base_indent: &str) -> String {
+    if line.trim().is_empty() {
         return String::new();
     }
-    let slice = match mode {
-        LineMatchMode::IndentFlexible => line.strip_prefix(base_indent).unwrap_or(line),
-        LineMatchMode::Trimmed => line,
-    };
+    let slice = line.strip_prefix(base_indent).unwrap_or(line);
     let mapped: String = slice.chars().map(|ch| normalize_char(ch, true)).collect();
-    let trimmed = mapped.trim_end_matches([' ', '\t']);
-    match mode {
-        LineMatchMode::IndentFlexible => trimmed.to_string(),
-        LineMatchMode::Trimmed => trimmed.trim_start_matches([' ', '\t']).to_string(),
-    }
+    mapped.trim_end_matches([' ', '\t']).to_string()
 }
 
 fn leading_indent(line: &str) -> &str {
@@ -373,52 +387,9 @@ fn common_indent<'a>(lines: impl Iterator<Item = &'a str>) -> &'a str {
     common.unwrap_or("")
 }
 
-fn has_mixed_indent<'a>(indents: impl Iterator<Item = &'a str>) -> bool {
-    let (mut has_space, mut has_tab) = (false, false);
-    for indent in indents {
-        has_space |= indent.contains(' ');
-        has_tab |= indent.contains('\t');
-        if has_space && has_tab {
-            return true;
-        }
-    }
-    false
-}
-
-fn build_indent_map(old_lines: &[&str], window: &[LineSpan<'_>]) -> Option<HashMap<String, String>> {
-    let mut map = HashMap::new();
-    for (old_line, span) in old_lines.iter().zip(window) {
-        if old_line.trim().is_empty() {
-            continue;
-        }
-        let (old_ind, file_ind) = (leading_indent(old_line), leading_indent(span.text));
-        match map.get(old_ind) {
-            Some(existing) if existing != file_ind => return None,
-            Some(_) => {}
-            None => {
-                map.insert(old_ind.to_string(), file_ind.to_string());
-            }
-        }
-    }
-    if has_mixed_indent(map.keys().map(String::as_str)) || has_mixed_indent(map.values().map(String::as_str))
-    {
-        return None;
-    }
-    let mut ordered: Vec<(&str, &str)> = map.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    ordered.sort_by_key(|(old_ind, _)| old_ind.len());
-    for pair in ordered.windows(2) {
-        let ((o1, f1), (o2, f2)) = (pair[0], pair[1]);
-        if o1.len() == o2.len() || f1.len() >= f2.len() {
-            return None;
-        }
-    }
-    Some(map)
-}
-
 fn find_line_block_unique(
     lines: &[LineSpan<'_>],
     old: &str,
-    mode: LineMatchMode,
     mode_label: &str,
     index: usize,
     path: &str,
@@ -429,7 +400,7 @@ fn find_line_block_unique(
         return Ok(None);
     }
     let old_indent = common_indent(old_lines.iter().copied());
-    let old_norm: Vec<String> = old_lines.iter().map(|line| normalize_line(line, mode, old_indent)).collect();
+    let old_norm: Vec<String> = old_lines.iter().map(|line| normalize_line(line, old_indent)).collect();
     let mut matched: Option<MatchPlan> = None;
     for window in lines.windows(old_lines.len()) {
         let last = window.last().expect("nonempty window");
@@ -440,7 +411,7 @@ fn find_line_block_unique(
         if !window
             .iter()
             .zip(&old_norm)
-            .all(|(span, expected)| normalize_line(span.text, mode, file_indent) == *expected)
+            .all(|(span, expected)| normalize_line(span.text, file_indent) == *expected)
         {
             continue;
         }
@@ -449,57 +420,10 @@ fn find_line_block_unique(
         }
         let start = window.first().expect("nonempty window").start;
         let end = last.end + usize::from(old_has_nl);
-        let reindent = match mode {
-            LineMatchMode::IndentFlexible if file_indent != old_indent => ReindentPlan::Uniform {
-                old_indent: old_indent.to_string(),
-                file_indent: file_indent.to_string(),
-            },
-            LineMatchMode::IndentFlexible => ReindentPlan::None,
-            LineMatchMode::Trimmed => ReindentPlan::Mapped(build_indent_map(&old_lines, window)),
-        };
+        let reindent = (file_indent != old_indent).then(|| (old_indent.to_string(), file_indent.to_string()));
         matched = Some(MatchPlan { start, end, reindent });
     }
     Ok(matched)
-}
-
-fn apply_reindent(
-    replacement: &str,
-    plan: &ReindentPlan,
-    index: usize,
-    path: &str,
-) -> Result<String, String> {
-    match plan {
-        ReindentPlan::None => Ok(replacement.to_string()),
-        ReindentPlan::Uniform { old_indent, file_indent } => {
-            Ok(reindent_replacement(replacement, old_indent, file_indent))
-        }
-        ReindentPlan::Mapped(map) => {
-            if replacement.is_empty() {
-                return Ok(String::new());
-            }
-            let err = || {
-                format!(
-                    "edits[{index}] matched ignoring indentation in {path}, but replacement indentation cannot be uniquely derived; read the exact indentation and retry."
-                )
-            };
-            let Some(map) = map else {
-                return Err(err());
-            };
-            let mut lines = Vec::new();
-            for line in replacement.split('\n') {
-                if line.trim().is_empty() {
-                    lines.push(line.to_string());
-                    continue;
-                }
-                let ind = leading_indent(line);
-                let Some(mapped) = map.get(ind) else {
-                    return Err(err());
-                };
-                lines.push(format!("{mapped}{}", &line[ind.len()..]));
-            }
-            Ok(lines.join("\n"))
-        }
-    }
 }
 
 fn reindent_replacement(replacement: &str, old_indent: &str, file_indent: &str) -> String {
@@ -532,16 +456,12 @@ fn not_found_error<'a>(
     path: &str,
     cached_lines: &mut Option<Vec<LineSpan<'a>>>,
 ) -> String {
-    let anchor = old
-        .split('\n')
-        .map(|line| normalize_line(line, LineMatchMode::Trimmed, ""))
-        .find(|line| !line.is_empty());
-    if let Some(anchor) = anchor {
+    if let Some(anchor) = old.split('\n').map(str::trim).find(|line| !line.is_empty()) {
         let lines = cached_lines.get_or_insert_with(|| split_line_spans(view));
         let hits: Vec<String> = lines
             .iter()
             .enumerate()
-            .filter(|(_, span)| normalize_line(span.text, LineMatchMode::Trimmed, "") == anchor)
+            .filter(|(_, span)| span.text.trim() == anchor)
             .take(3)
             .map(|(idx, _)| (idx + 1).to_string())
             .collect();

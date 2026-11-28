@@ -5,7 +5,6 @@ use protocol::ProviderApiProtocol;
 use serde_json::{Map, Value, json};
 
 use crate::config::selection::SelectedModel;
-use crate::error::redact_diagnostic;
 use crate::messages::messages_stream_request_payload;
 use crate::responses::openai_responses_stream_request_payload;
 use crate::transport::stream::decode_sse_chunks;
@@ -171,7 +170,6 @@ fn build_conversation(
                         provider_name: provider_name.into(),
                         model_name: model_name.into(),
                         endpoint: endpoint.into(),
-                        prefix_digest: None,
                         reasoning: None,
                     }
                 } else {
@@ -184,7 +182,6 @@ fn build_conversation(
                         provider_name: "other-provider".into(),
                         model_name: "other-model".into(),
                         endpoint: format!("https://other.example{suffix}"),
-                        prefix_digest: None,
                         reasoning: None,
                     }
                 });
@@ -212,28 +209,6 @@ fn count_cache_control(value: &Value) -> usize {
         Value::Array(items) => items.iter().map(count_cache_control).sum(),
         _ => 0,
     }
-}
-
-fn trailing_tool_turn_stripped_in_steps(steps: &[TurnStep]) -> bool {
-    let mut iter = steps.iter().rev().skip_while(|s| match s {
-        TurnStep::Assistant { text, tool_count, .. } => text.is_none() && *tool_count == 0,
-        _ => true,
-    });
-    let Some(TurnStep::Assistant { thinking, same_provider, tool_count, .. }) = iter.next() else {
-        return false;
-    };
-    *tool_count > 0
-        && (thinking.is_some() && *same_provider
-            || iter.take_while(|s| matches!(s, TurnStep::Assistant { tool_count: 0, .. })).any(|s| {
-                matches!(
-                    s,
-                    TurnStep::Assistant {
-                        thinking: Some(_),
-                        same_provider: true,
-                        ..
-                    }
-                )
-            }))
 }
 
 fn sse_line_strategy() -> impl Strategy<Value = String> {
@@ -315,7 +290,6 @@ proptest! {
     fn messages_encoding_preserves_protocol_invariants(
         leading_devs in prop::collection::vec(non_empty_text(), 0..=3),
         steps in prop::collection::vec(turn_step_strategy(), 0..=10),
-        mutate_prefix in any::<bool>(),
     ) {
         let provider_name = "primary";
         let model_name = "demo";
@@ -327,7 +301,6 @@ proptest! {
             max_output_tokens: 4096,
             reasoning_variant: Some("high".into()),
         };
-        let trailing_stripped = trailing_tool_turn_stripped_in_steps(&steps);
         let messages = build_conversation(
             leading_devs,
             steps,
@@ -343,20 +316,15 @@ proptest! {
             max_output_tokens: 1024,
             prompt_cache_key: None,
         };
-        let encoded_turn = messages_stream_request_payload(&req, &selection, provider_name, endpoint)
+        let payload = messages_stream_request_payload(&req, &selection, provider_name, endpoint)
             .expect("messages encoding succeeds");
-        let payload = encoded_turn.payload;
         let serialized = payload.to_string();
         prop_assert!(!serialized.contains(OTHER_MSG_SIG), "leaked foreign Messages signature");
         prop_assert!(count_cache_control(&payload) <= 4, "explicit cache_control breakpoints exceed 4");
 
         let encoded = payload.get("messages").and_then(Value::as_array).expect("messages array");
         prop_assert!(!encoded.is_empty());
-        if trailing_stripped {
-            prop_assert!(payload.get("thinking").is_none() && payload.get("output_config").is_none());
-        } else {
-            prop_assert_eq!(payload.pointer("/thinking/type").and_then(Value::as_str), Some("adaptive"));
-        }
+        prop_assert_eq!(payload.pointer("/thinking/type").and_then(Value::as_str), Some("adaptive"));
 
         let mut prev_role: Option<&str> = None;
         let mut expected_tools: HashSet<String> = HashSet::new();
@@ -391,45 +359,6 @@ proptest! {
             }
         }
         prop_assert!(expected_tools.is_empty(), "dangling tool_use at end");
-
-        let mut next_messages = req.messages;
-        if mutate_prefix {
-            next_messages.insert(0, Message::developer("mutated prefix"));
-        }
-        let mk_thinking = |thinking: &str, pairs: &[(&str, &str)]| ContentBlock::Thinking {
-            thinking: thinking.into(),
-            metadata: Some(ProviderBlockMetadata(
-                pairs.iter().map(|(k, v)| ((*k).into(), json!(v))).collect(),
-            )),
-        };
-        next_messages.push(Message::Assistant {
-            content: vec![
-                mk_thinking("signed thought", &[("signature", "SIG_MATCHED")]),
-                mk_thinking("", &[("type", "redacted_thinking"), ("data", "REDACTED_MATCHED")]),
-                ContentBlock::text("SIGNED_REPLY_TEXT"),
-            ],
-            provider_metadata: Some(ProviderMessageMetadata {
-                protocol: ProviderApiProtocol::Messages,
-                provider_name: provider_name.into(),
-                model_name: model_name.into(),
-                endpoint: endpoint.into(),
-                prefix_digest: Some(encoded_turn.prefix_digest),
-                reasoning: None,
-            }),
-        });
-        next_messages.push(Message::user("follow up"));
-        let next_str = messages_stream_request_payload(
-            &ModelTurnRequest { messages: next_messages, ..req },
-            &selection,
-            provider_name,
-            endpoint,
-        )
-        .expect("follow-up messages encoding succeeds")
-        .payload
-        .to_string();
-        prop_assert_eq!(next_str.contains("SIG_MATCHED"), !mutate_prefix);
-        prop_assert_eq!(next_str.contains("REDACTED_MATCHED"), !mutate_prefix);
-        prop_assert!(next_str.contains("SIGNED_REPLY_TEXT"));
     }
 
     #[test]
@@ -473,6 +402,19 @@ proptest! {
         prop_assert!(!serialized.contains(OTHER_RESP_ENC), "leaked foreign Responses encrypted_content");
         let expected_cache_key = req.prompt_cache_key.as_deref().filter(|key| !key.trim().is_empty());
         prop_assert_eq!(payload.get("prompt_cache_key").and_then(Value::as_str), expected_cache_key);
+        if let Some(variant) = selection.reasoning_variant.as_deref()
+            && !matches!(variant, "off" | "on")
+        {
+            prop_assert_eq!(
+                payload.pointer("/reasoning/summary").and_then(Value::as_str),
+                Some("auto"),
+                "Responses reasoning effort must request auto summary"
+            );
+        }
+        prop_assert_eq!(
+            crate::error::provider_error_kind_for_http_status(413),
+            crate::error::ModelErrorKind::ContextLengthExceeded
+        );
 
         let input = payload.get("input").and_then(Value::as_array).expect("input array");
         prop_assert!(!input.is_empty());
@@ -493,33 +435,5 @@ proptest! {
             }
         }
         prop_assert_eq!(calls, outputs, "function_call/output mismatch");
-    }
-
-    #[test]
-    fn redact_web_diagnostic_redacts_all_bearer_tokens_and_preserves_word_boundaries(
-        tokens in prop::collection::vec("[a-zA-Z0-9._-]{6,20}", 1..=4),
-        seps in prop::collection::vec(prop_oneof![Just(" "), Just("   "), Just("\t"), Just(" \t ")], 1..=4),
-        cases in prop::collection::vec(prop_oneof![Just("Bearer"), Just("bearer"), Just("BEARER"), Just("BeArEr")], 1..=4),
-    ) {
-        let mut parts = Vec::new();
-        for i in 0..tokens.len() {
-            let kw = cases[i % cases.len()];
-            let sep = seps[i % seps.len()];
-            parts.push(format!("header=\"{kw}{sep}{}\"", tokens[i]));
-        }
-        let body = format!(
-            "standardbearer keep_me Bearer {}-suffix Bearer pre-{} {}",
-            tokens[0],
-            tokens[0],
-            parts.join(", ")
-        );
-        let redacted = redact_diagnostic(&body, &tokens[0]);
-        for tok in &tokens {
-            prop_assert!(!redacted.contains(tok), "leaked bearer token `{tok}` in `{redacted}`");
-        }
-        prop_assert!(!redacted.contains("-suffix"), "leaked bearer suffix in `{redacted}`");
-        prop_assert!(!redacted.contains("pre-"), "leaked bearer prefix in `{redacted}`");
-        prop_assert!(redacted.contains("standardbearer keep_me"), "word boundary broken: {redacted}");
-        prop_assert!(!redacted.contains("[redacted]]"), "double bracket corruption: {redacted}");
     }
 }

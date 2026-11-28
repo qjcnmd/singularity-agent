@@ -83,10 +83,17 @@ const MainContent = memo(function MainContent({ filePanelOpen }: { filePanelOpen
   )
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspace = state.bootstrap?.workspaces.find(workspace => workspaceKey(workspace.root) === state.selectedWorkspaceRoot)
-  const workspaceSessions = appStore.sessions()
-  const sessionTitle = state.session === null ? '' : sessionTitles(workspaceSessions)(
-    workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.summary,
-  )
+  const selectedSummary = state.session?.summary
+  const workspaceSessions = state.selectedWorkspaceRoot === null
+    ? undefined
+    : state.bootstrap?.sessionsByWorkspace[state.selectedWorkspaceRoot]
+  const sessionTitle = useMemo(() => {
+    if (!selectedSummary) return ''
+    const list = workspaceSessions ?? []
+    return sessionTitles(list)(
+      list.find((session) => session.threadId === state.selectedSessionId) ?? selectedSummary,
+    )
+  }, [workspaceSessions, state.selectedSessionId, selectedSummary])
   const sessionMetrics = state.selectedSessionId ? formatSessionMetrics(state.session?.runtime.modelUsage) : ''
   const reducedMotion = useReducedMotion()
   const visibleError = state.actionErrorOrigin !== null && !hasInlineActionError(state.actionErrorOrigin)

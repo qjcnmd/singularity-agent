@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -6,8 +7,9 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use super::file_ops::FileReadTracker;
 use super::registry::{
-    ABORTED_MESSAGE, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, READ_TOOL_NAME, ToolExecution,
+    ABORTED_MESSAGE, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, READ_TOOL_NAME, ToolDisplay, ToolExecution,
     default_cap_summary, default_max_kb, error_result,
 };
 
@@ -23,7 +25,7 @@ pub(crate) fn spec() -> model::ToolDefinition {
     model::ToolDefinition {
         name: READ_TOOL_NAME.to_string(),
         description: format!(
-            "Read a text file. Text output is limited to {} (whichever is hit first). Use the returned offset to continue with unread lines. A line larger than {}KB is explicitly marked incomplete; use bash to read that line in byte ranges.",
+            "Read a text file. Each output line is prefixed with its 1-indexed line number (e.g. \"1| ...\"). Text output is limited to {} (whichever is hit first). Use the returned offset to continue with unread lines. A line larger than {}KB is explicitly marked incomplete; use bash to read that line in byte ranges.",
             default_cap_summary(),
             default_max_kb()
         ),
@@ -40,7 +42,12 @@ pub(crate) fn spec() -> model::ToolDefinition {
     }
 }
 
-pub(crate) fn execute(args: &ReadArgs, cwd: &Path, signal: &CancellationToken) -> ToolExecution {
+pub(crate) fn execute(
+    args: &ReadArgs,
+    cwd: &Path,
+    file_reads: &FileReadTracker,
+    signal: &CancellationToken,
+) -> ToolExecution {
     if signal.is_cancelled() {
         return error_result(ABORTED_MESSAGE);
     }
@@ -49,6 +56,8 @@ pub(crate) fn execute(args: &ReadArgs, cwd: &Path, signal: &CancellationToken) -
         Ok(file) => file,
         Err(error) => return error_result(format!("Could not read file: {}. {error}", args.path)),
     };
+    let metadata = file.metadata().ok();
+    let canonical_key = full_path.canonicalize().ok().map(|path| app_core::workspace_key(&path));
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     match reader.fill_buf() {
         Ok(bytes) if looks_like_image(bytes) => {
@@ -60,7 +69,13 @@ pub(crate) fn execute(args: &ReadArgs, cwd: &Path, signal: &CancellationToken) -
         Ok(_) => {}
         Err(error) => return error_result(format!("Could not read file: {}. {error}", args.path)),
     }
-    execute_reader(&args.path, args.offset, args.limit, &mut reader, signal)
+    let execution = execute_reader(&args.path, args.offset, args.limit, &mut reader, signal);
+    if !execution.is_error
+        && let (Some(key), Some(metadata)) = (canonical_key, metadata.as_ref())
+    {
+        file_reads.record_metadata(key, metadata);
+    }
+    execution
 }
 
 fn looks_like_image(bytes: &[u8]) -> bool {
@@ -131,12 +146,20 @@ fn execute_reader(
         if signal.is_cancelled() {
             return error_result(ABORTED_MESSAGE);
         }
+        let line_slice = if line_number == 0 {
+            app_core::strip_utf8_bom_bytes(&line)
+        } else {
+            &line
+        };
         line_number += 1;
-        let text = String::from_utf8_lossy(&line);
-        let next_bytes = state.selected_bytes + text.len() + usize::from(!state.selected.is_empty());
+        let text = String::from_utf8_lossy(line_slice);
+        let prefix_len = line_number.ilog10() as usize + 3;
+        let next_bytes =
+            state.selected_bytes + prefix_len + text.len() + usize::from(!state.selected.is_empty());
         if next_bytes > DEFAULT_MAX_BYTES {
             if state.selected.is_empty() {
-                let prefix = &text[..text.floor_char_boundary(DEFAULT_MAX_BYTES)];
+                let text_budget = DEFAULT_MAX_BYTES.saturating_sub(prefix_len);
+                let prefix = &text[..text.floor_char_boundary(text_budget)];
                 state.selected.push(format!("{prefix}…[truncated]"));
                 state.incomplete_line = true;
             }
@@ -163,8 +186,14 @@ fn execute_reader(
             "Offset {start_line_display} is beyond end of file ({line_number} lines total)"
         ));
     }
-    let output_text = render_read_output(start_line_display, &state);
-    ToolExecution::text(output_text).with_read_source(read_source(start_line_display, &state))
+    let (llm_output, display_output) = render_read_output(start_line_display, &state);
+    let mut execution =
+        ToolExecution::text(llm_output).with_read_source(read_source(start_line_display, &state));
+    execution.display = Some(Box::new(ToolDisplay {
+        output: display_output,
+        background_task_id: None,
+    }));
+    execution
 }
 
 fn read_line_bytes(reader: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>> {
@@ -195,20 +224,30 @@ struct ReadState {
     incomplete_line: bool,
 }
 
-fn render_read_output(start_line_display: usize, state: &ReadState) -> String {
-    let selected_content = state.selected.join("\n");
+fn render_read_output(start_line_display: usize, state: &ReadState) -> (String, String) {
+    let display_body = state.selected.join("\n");
+    let mut numbered_body = String::with_capacity(display_body.len() + state.selected.len() * 6);
+    for (index, line) in state.selected.iter().enumerate() {
+        if index > 0 {
+            numbered_body.push('\n');
+        }
+        let line_no = start_line_display + index;
+        let _ = write!(numbered_body, "{line_no}| {line}");
+    }
     if state.selected_truncated && !state.selected.is_empty() {
         let end_line_display = start_line_display + (state.selected.len() - 1);
         let next_offset = end_line_display + 1;
-        if state.incomplete_line {
-            return format!(
-                "{selected_content}\n\n[Line {start_line_display} exceeds {}KB; only its prefix is shown. Use bash to read this line in byte ranges. For following lines use offset={next_offset}.]",
+        let footer = if state.incomplete_line {
+            format!(
+                "[Line {start_line_display} exceeds {}KB; only its prefix is shown. Use bash to read this line in byte ranges. For following lines use offset={next_offset}.]",
                 default_max_kb()
-            );
-        }
-        return format!(
-            "{selected_content}\n\n[Showing lines {start_line_display}-{end_line_display}. File continues; use offset={next_offset} to continue.]"
-        );
+            )
+        } else {
+            format!(
+                "[Showing lines {start_line_display}-{end_line_display}. File continues; use offset={next_offset} to continue.]"
+            )
+        };
+        return (format!("{numbered_body}\n\n{footer}"), format!("{display_body}\n\n{footer}"));
     }
-    selected_content
+    (numbered_body, display_body)
 }

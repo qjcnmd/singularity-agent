@@ -1,7 +1,7 @@
 use crate::McpError;
 use protocol::{McpServerInput, McpTransportConfig};
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path};
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,184 +98,49 @@ impl ServerConfig {
         Ok(())
     }
 
-    pub(crate) fn redact(&self, error: String) -> String {
-        let mut values: Vec<Cow<'_, str>> = Vec::new();
+    pub(crate) fn redact(&self, mut error: String) -> String {
+        const SECRET_KEYS: &[&str] = &["token", "secret", "key", "pass", "auth", "cookie", "credential"];
+        let mut needles: Vec<String> = Vec::new();
         match &self.transport {
-            McpTransportConfig::Stdio { args, env, .. } => {
-                for (name, value) in env {
-                    if is_secret_name(name) {
-                        collect_secret_value(value, &mut values);
-                    }
-                }
-                collect_arg_secrets(args, &mut values);
-            }
             McpTransportConfig::Http { url, headers } => {
                 if let Ok(parsed) = reqwest::Url::parse(url) {
-                    collect_parsed_url_secrets(&parsed, &mut values);
-                } else {
-                    values.push(Cow::Borrowed(url.as_str()));
+                    if !parsed.username().is_empty() {
+                        needles.push(parsed.username().to_owned());
+                    }
+                    if let Some(password) = parsed.password().filter(|v| !v.is_empty()) {
+                        needles.push(password.to_owned());
+                    }
+                    if let Some(query) = parsed.query().filter(|v| !v.is_empty()) {
+                        needles.push(query.to_owned());
+                    }
+                } else if !url.is_empty() {
+                    needles.push(url.clone());
                 }
-                for (name, value) in headers {
-                    if is_secret_name(name) {
-                        collect_secret_value(value, &mut values);
+                for value in headers.values() {
+                    let trimmed = value.trim();
+                    if !trimmed.is_empty() {
+                        needles.push(trimmed.to_owned());
+                    }
+                }
+            }
+            McpTransportConfig::Stdio { env, .. } => {
+                for (name, value) in env {
+                    let lower = name.to_ascii_lowercase();
+                    let trimmed = value.trim();
+                    if !trimmed.is_empty() && SECRET_KEYS.iter().any(|s| lower.contains(s)) {
+                        needles.push(trimmed.to_owned());
                     }
                 }
             }
         }
-        replace_non_overlapping(error, values)
-    }
-}
-
-fn collect_secret_value<'a>(value: &'a str, values: &mut Vec<Cow<'a, str>>) {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-    values.push(Cow::Borrowed(trimmed));
-    if let Some((scheme, rest)) = trimmed.split_once(' ')
-        && ["bearer", "basic", "token"].iter().any(|s| scheme.eq_ignore_ascii_case(s))
-        && !rest.trim().is_empty()
-    {
-        values.push(Cow::Borrowed(rest.trim()));
-    }
-}
-
-fn collect_parsed_url_secrets(parsed: &reqwest::Url, values: &mut Vec<Cow<'_, str>>) {
-    if !parsed.username().is_empty() {
-        values.push(Cow::Owned(parsed.username().to_owned()));
-    }
-    if let Some(password) = parsed.password().filter(|value| !value.is_empty()) {
-        values.push(Cow::Owned(password.to_owned()));
-    }
-    if let Some(query) = parsed.query().filter(|value| !value.is_empty()) {
-        values.push(Cow::Owned(query.to_owned()));
-    }
-    for (key, value) in parsed.query_pairs() {
-        if is_secret_name(&key) && !value.is_empty() {
-            values.push(Cow::Owned(value.into_owned()));
+        needles.retain(|needle| needle.len() >= 2);
+        needles.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        needles.dedup();
+        for needle in &needles {
+            error = error.replace(needle, "[redacted]");
         }
+        error
     }
-}
-
-fn collect_arg_secrets<'a>(args: &'a [String], values: &mut Vec<Cow<'a, str>>) {
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].as_str();
-        if let Some(parsed) = parse_url_candidate(arg) {
-            collect_parsed_url_secrets(&parsed, values);
-            index += 1;
-            continue;
-        }
-        let url_candidate = if let Some((key, value)) = arg.split_once('=') {
-            let name = key.trim_start_matches('-');
-            if !name.is_empty() && is_secret_name(name) {
-                collect_secret_value(value, values);
-            }
-            Some(value)
-        } else if arg.starts_with('-') && is_secret_name(arg.trim_start_matches('-')) {
-            if let Some(next) = args.get(index + 1).filter(|v| !v.is_empty() && !v.starts_with('-')) {
-                collect_secret_value(next.as_str(), values);
-                index += 1;
-                Some(next.as_str())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some(parsed) = url_candidate.and_then(parse_url_candidate) {
-            collect_parsed_url_secrets(&parsed, values);
-        }
-        index += 1;
-    }
-}
-
-fn parse_url_candidate(candidate: &str) -> Option<reqwest::Url> {
-    candidate.contains("://").then(|| reqwest::Url::parse(candidate).ok()).flatten()
-}
-
-fn replace_non_overlapping(error: String, mut values: Vec<Cow<'_, str>>) -> String {
-    values.retain(|value| value.len() >= 2);
-    if values.is_empty() {
-        return error;
-    }
-    values.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-    values.dedup();
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    for value in &values {
-        let needle = value.as_ref();
-        for (start, _) in error.match_indices(needle) {
-            let end = start + needle.len();
-            if !spans
-                .iter()
-                .any(|&(existing_start, existing_end)| start < existing_end && end > existing_start)
-            {
-                spans.push((start, end));
-            }
-        }
-    }
-    if spans.is_empty() {
-        return error;
-    }
-    spans.sort_unstable_by_key(|&(start, _)| start);
-    let mut redacted = String::with_capacity(error.len());
-    let mut cursor = 0;
-    for (start, end) in spans {
-        redacted.push_str(&error[cursor..start]);
-        redacted.push_str("[redacted]");
-        cursor = end;
-    }
-    redacted.push_str(&error[cursor..]);
-    redacted
-}
-
-const SECRET_SUBSTRINGS: &[&[u8]] = &[
-    b"token",
-    b"secret",
-    b"password",
-    b"passwd",
-    b"credential",
-    b"cookie",
-    b"bearer",
-    b"authorization",
-    b"apikey",
-];
-
-const SECRET_WORDS: &[&[u8]] = &[b"auth", b"key", b"keys", b"pass", b"pat", b"jwt"];
-
-fn is_secret_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    if SECRET_SUBSTRINGS
-        .iter()
-        .any(|needle| bytes.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle)))
-    {
-        return true;
-    }
-    let mut i = 0;
-    while i < bytes.len() {
-        if !bytes[i].is_ascii_alphanumeric() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
-            let split_camel = bytes[i].is_ascii_uppercase()
-                && (bytes[i - 1].is_ascii_lowercase()
-                    || bytes[i - 1].is_ascii_digit()
-                    || (bytes[i - 1].is_ascii_uppercase()
-                        && bytes.get(i + 1).is_some_and(u8::is_ascii_lowercase)));
-            if split_camel {
-                break;
-            }
-            i += 1;
-        }
-        let word = &bytes[start..i];
-        if SECRET_WORDS.iter().any(|secret| word.eq_ignore_ascii_case(secret)) {
-            return true;
-        }
-    }
-    false
 }
 
 pub(crate) fn read(home: &Path) -> Result<Configuration, McpError> {

@@ -3,19 +3,20 @@ import { acceptExecutionEvent, finishTurn, readExecution, type SessionView } fro
 import type { SessionReadResult, SessionStartResult, SessionRuntime, StreamEnvelope, AppBootstrap, TurnEventEnvelope, ThreadSummary, ModelCatalogResult } from './protocol'
 
 export type LiveSessionState = Pick<SessionRuntime, 'phase' | 'failure'> & {
-  backgroundTasks: SessionReadResult['backgroundTasks']; revision: number; summaryRevision?: number
+  backgroundTasks: SessionReadResult['backgroundTasks']
+  revision: number
 }
 type LiveSessionUpdate = Pick<LiveSessionState, 'phase' | 'failure'> & Partial<SessionRuntime> & Partial<Pick<LiveSessionState, 'backgroundTasks'>>
 
 export interface SyncState {
   revision: number
-  modelCatalogRevision: number
   bootstrap: AppBootstrap | null
   session: SessionView | null
   liveSessions: Record<string, LiveSessionState>
 }
+
 export const initialSyncState = (): SyncState => ({
-  revision: 0, modelCatalogRevision: 0, bootstrap: null, session: null, liveSessions: {},
+  revision: 0, bootstrap: null, session: null, liveSessions: {},
 })
 
 function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionUpdate, revision: number, event?: TurnEventEnvelope): SyncState {
@@ -23,14 +24,17 @@ function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSe
   if (previous && revision <= previous.revision) return state
   const selected = state.session?.summary.threadId === sessionId ? state.session : null
   const { backgroundTasks = previous?.backgroundTasks ?? [], ...update } = incoming
-  const lifecycle: LiveSessionState = { revision, summaryRevision: previous?.summaryRevision, phase: update.phase, failure: update.failure, backgroundTasks }
+  const lifecycle: LiveSessionState = { revision, phase: update.phase, failure: update.failure, backgroundTasks }
   const liveSessions = { ...state.liveSessions, [sessionId]: lifecycle }
   if (selected === null) {
     return { ...state, liveSessions }
   }
   const runtime: SessionRuntime = { ...selected.runtime, ...update }
-  const session = { ...selected, runtime,
-    context: event?.method === 'context/loaded' ? event.params.context : selected.context }
+  const session = {
+    ...selected,
+    runtime,
+    context: event?.method === 'context/loaded' ? event.params.context : selected.context,
+  }
   return {
     ...state,
     liveSessions,
@@ -40,23 +44,13 @@ function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSe
 
 function acceptBootstrap(state: SyncState, bootstrap: AppBootstrap): SyncState {
   if (state.bootstrap !== null && bootstrap.revision < state.bootstrap.revision) return state
-  const sessionsByWorkspace = { ...bootstrap.sessionsByWorkspace }
-  for (const [workspaceRoot, sessions] of Object.entries(state.bootstrap?.sessionsByWorkspace ?? {})) {
-    const incoming = sessionsByWorkspace[workspaceRoot] ?? []
-    const newer = sessions.filter(session => (state.liveSessions[session.threadId]?.summaryRevision ?? 0) > bootstrap.revision)
-    if (newer.length > 0) sessionsByWorkspace[workspaceRoot] = sortSessions([
-      ...newer, ...incoming.filter(item => !newer.some(session => session.threadId === item.threadId)),
-    ])
-  }
-  bootstrap = { ...bootstrap, sessionsByWorkspace,
-    modelCatalog: state.bootstrap && state.modelCatalogRevision > bootstrap.revision ? state.bootstrap.modelCatalog : bootstrap.modelCatalog }
   const summary = Object.values(bootstrap.sessionsByWorkspace).flat().find(item => item.threadId === state.session?.summary.threadId)
   return { ...state, bootstrap, session: state.session && summary ? { ...state.session, summary } : state.session }
 }
 
 export function acceptModelCatalog(state: SyncState, result: ModelCatalogResult): SyncState {
-  if (!state.bootstrap || result.revision < Math.max(state.modelCatalogRevision, state.bootstrap.revision)) return state
-  return { ...state, modelCatalogRevision: result.revision, bootstrap: { ...state.bootstrap, modelCatalog: result.catalog } }
+  if (!state.bootstrap || result.revision < state.bootstrap.revision) return state
+  return { ...state, bootstrap: { ...state.bootstrap, modelCatalog: result.catalog } }
 }
 
 function sortSessions(sessions: ThreadSummary[]): ThreadSummary[] {
@@ -65,19 +59,20 @@ function sortSessions(sessions: ThreadSummary[]): ThreadSummary[] {
 
 function acceptSummary(state: SyncState, summary: ThreadSummary, revision: number): SyncState {
   const bootstrap = state.bootstrap
-  const previous = state.liveSessions[summary.threadId]
-  if (!bootstrap || revision <= Math.max(bootstrap.revision, previous?.summaryRevision ?? 0)) return state
+  if (!bootstrap || revision <= bootstrap.revision) return state
   const workspaceRoot = workspaceKey(summary.cwd)
   if (!(workspaceRoot in bootstrap.sessionsByWorkspace)) return state
   const sessions = bootstrap.sessionsByWorkspace[workspaceRoot] ?? []
-  return { ...state,
-    liveSessions: { ...state.liveSessions, [summary.threadId]: {
-      ...(previous ?? { phase: 'idle', failure: null, backgroundTasks: [], revision: 0 }), summaryRevision: revision,
-    } },
+  return {
+    ...state,
     session: state.session?.summary.threadId === summary.threadId ? { ...state.session, summary } : state.session,
-    bootstrap: { ...bootstrap, sessionsByWorkspace: { ...bootstrap.sessionsByWorkspace,
-      [workspaceRoot]: sortSessions([summary, ...sessions.filter(item => item.threadId !== summary.threadId)]),
-    } },
+    bootstrap: {
+      ...bootstrap,
+      sessionsByWorkspace: {
+        ...bootstrap.sessionsByWorkspace,
+        [workspaceRoot]: sortSessions([summary, ...sessions.filter(item => item.threadId !== summary.threadId)]),
+      },
+    },
   }
 }
 
@@ -110,40 +105,35 @@ export function pruneStaleSelection(
   }
 }
 
-export function resetBaseline(state: SyncState, bootstrap: AppBootstrap): SyncState {
-  const accepted = acceptBootstrap(state, bootstrap)
-  bootstrap = accepted.bootstrap!
-  const session = accepted.session
-  const liveSessions: SyncState['liveSessions'] = Object.fromEntries(Object.entries(bootstrap.sessionStates)
-    .map(([id, status]) => {
-      const previous = state.liveSessions[id]
-      const keepLive = previous !== undefined && previous.revision > bootstrap.revision
-      return [id, {
-        ...(keepLive ? previous : { revision: 0, ...status }),
-        summaryRevision: (previous?.summaryRevision ?? 0) > bootstrap.revision ? previous?.summaryRevision : undefined,
-        backgroundTasks: keepLive || id === session?.summary.threadId ? previous?.backgroundTasks ?? [] : [],
-      }]
-    }))
-  for (const [id, live] of Object.entries(state.liveSessions)) {
-    if (live.revision > bootstrap.revision && !(id in liveSessions)) liveSessions[id] = live
-  }
-  return {
-    revision: Math.max(state.revision, bootstrap.revision), modelCatalogRevision: Math.max(state.modelCatalogRevision, bootstrap.revision), bootstrap,
-    session, liveSessions,
-  }
+export function resetBaseline(bootstrap: AppBootstrap): SyncState {
+  const liveSessions: SyncState['liveSessions'] = Object.fromEntries(
+    Object.entries(bootstrap.sessionStates).map(([id, status]) => [
+      id,
+      { revision: 0, ...status, backgroundTasks: [] },
+    ]),
+  )
+  return { revision: bootstrap.revision, bootstrap, session: null, liveSessions }
 }
 
 export function acceptSessionRead(state: SyncState, source: SessionReadResult): SyncState {
   const id = source.history.summary.threadId
   const previous = state.liveSessions[id]
-  if (state.session !== null && source.revision < Math.max(previous?.revision ?? 0, previous?.summaryRevision ?? 0)) return state
+  if (state.session !== null && source.revision < (previous?.revision ?? 0)) return state
   state = acceptSummary(state, source.history.summary, source.revision)
   const session = readExecution(source)
-  return { ...state, session, liveSessions: { ...state.liveSessions, [id]: {
-    phase: session.runtime.phase, failure: session.runtime.failure,
-    backgroundTasks: source.backgroundTasks, revision: source.revision,
-    summaryRevision: state.liveSessions[id]?.summaryRevision,
-  } } }
+  return {
+    ...state,
+    session,
+    liveSessions: {
+      ...state.liveSessions,
+      [id]: {
+        phase: session.runtime.phase,
+        failure: session.runtime.failure,
+        backgroundTasks: source.backgroundTasks,
+        revision: source.revision,
+      },
+    },
+  }
 }
 
 export function reduceStream(state: SyncState, frame: Exclude<StreamEnvelope, { type: 'ready' }>): SyncState {
@@ -182,9 +172,13 @@ export function reduceStream(state: SyncState, frame: Exclude<StreamEnvelope, { 
       const session = accepted.session
       const turn = session?.facts.at(-1)
       if (frame.payload.failure?.source === 'turn' && session?.summary.threadId === frame.sessionId && turn?.status === 'running') {
-        accepted = { ...accepted, session: { ...session,
-          facts: [...session.facts.slice(0, -1), finishTurn(turn, 'failed')],
-        } }
+        accepted = {
+          ...accepted,
+          session: {
+            ...session,
+            facts: [...session.facts.slice(0, -1), finishTurn(turn, 'failed')],
+          },
+        }
       }
       return acceptSummary(accepted, frame.summary, frame.revision)
     }

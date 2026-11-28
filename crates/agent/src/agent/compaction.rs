@@ -69,7 +69,7 @@ impl RequestContext {
     }
 
     pub(super) async fn prepare_before_request(
-        &self,
+        &mut self,
         allow_auto_compact: bool,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
@@ -77,13 +77,28 @@ impl RequestContext {
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
+        let had_definitions = self.definitions.is_some();
+        if had_definitions {
+            let idle_cleared = tokio::task::spawn_blocking({
+                let session = std::sync::Arc::clone(&self.session);
+                move || -> Result<bool> {
+                    with_writer(&session, |writer| Ok(context::clear_idle_tool_results(writer)?))
+                }
+            })
+            .await
+            .expect("idle tool clearing completes while the runtime is running")?;
+            if idle_cleared {
+                self.prefix_cache.invalidate();
+                self.definitions = None;
+            }
+        }
+        self.ensure_definitions(on_event, cancellation).await?;
         let target = self.model_identity();
         let overhead_tokens = self.request_definitions().estimated_tokens;
         let session = std::sync::Arc::clone(&self.session);
         let trigger = self.trigger_tokens();
         let prepared = tokio::task::spawn_blocking(move || -> Result<Option<context::PreparedContext>> {
             with_writer(&session, |writer| {
-                context::clear_idle_tool_results(writer)?;
                 let data = writer.data();
                 let entries = context::resolve_context_entries(data);
                 let cleared = context::cleared_tool_result_ids(data);
@@ -143,7 +158,7 @@ impl RequestContext {
     }
 
     pub(super) async fn compact_now(
-        &self,
+        &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
         mode: CompactionMode,
@@ -239,6 +254,8 @@ impl RequestContext {
 
         match step_result {
             Ok(summary) => {
+                self.prefix_cache.invalidate();
+                self.definitions = None;
                 on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
                     item: HistoryItem::Compaction { id: item_id, summary },
                 }));

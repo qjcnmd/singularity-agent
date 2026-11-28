@@ -1,10 +1,12 @@
 use std::cmp::Reverse;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use globset::{GlobBuilder, GlobMatcher};
-use ignore::WalkBuilder;
+use ignore::{ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
 use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -70,6 +72,7 @@ pub(crate) fn spec() -> model::ToolDefinition {
 
 pub(super) struct CompiledGlob {
     pub(super) matcher: GlobMatcher,
+    pub(super) static_prefix: Vec<String>,
     pub(super) include_hidden: bool,
 }
 
@@ -99,7 +102,30 @@ pub(super) fn compile_glob(raw_pattern: &str) -> Result<CompiledGlob, ToolExecut
         .build()
         .map_err(|error| error_result(format!("Invalid glob pattern: {error}")))?
         .compile_matcher();
-    Ok(CompiledGlob { matcher, include_hidden })
+    let static_prefix = if has_sep {
+        extract_static_prefix(&effective)
+    } else {
+        Vec::new()
+    };
+    Ok(CompiledGlob { matcher, static_prefix, include_hidden })
+}
+
+fn extract_static_prefix(pattern: &str) -> Vec<String> {
+    let segments: Vec<&str> = pattern.split('/').collect();
+    if segments.len() < 2 || segments.contains(&"..") {
+        return Vec::new();
+    }
+    segments[..segments.len() - 1]
+        .iter()
+        .take_while(|segment| {
+            !segment.is_empty() && **segment != "." && !segment.contains(['*', '?', '[', ']', '{', '}'])
+        })
+        .map(|segment| (*segment).to_owned())
+        .collect()
+}
+
+pub(super) fn walker_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |count| count.get().clamp(2, 8))
 }
 
 pub(super) fn pattern_targets_hidden(pattern: &str) -> bool {
@@ -148,7 +174,13 @@ pub(super) fn format_display_path(path: &Path, cwd: &Path) -> String {
     }
 }
 
-pub(super) fn build_walker(root: &Path, include_hidden: bool, sort_by_name: bool) -> WalkBuilder {
+pub(super) fn build_walker(
+    root: &Path,
+    include_hidden: bool,
+    sort_by_name: bool,
+    static_prefix: &[String],
+) -> WalkBuilder {
+    let prefix = static_prefix.to_vec();
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(!include_hidden)
@@ -158,7 +190,19 @@ pub(super) fn build_walker(root: &Path, include_hidden: bool, sort_by_name: bool
         .require_git(false)
         .ignore(true)
         .follow_links(false)
-        .filter_entry(|entry| !is_git_dir_name(entry.file_name()));
+        .filter_entry(move |entry| {
+            if is_git_dir_name(entry.file_name()) {
+                return false;
+            }
+            let depth = entry.depth();
+            if depth > 0 && depth <= prefix.len() {
+                if !entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                    return false;
+                }
+                return entry.file_name().to_str() == Some(prefix[depth - 1].as_str());
+            }
+            true
+        });
     if sort_by_name {
         builder.sort_by_file_name(Ord::cmp);
     }
@@ -186,41 +230,30 @@ pub(crate) fn execute(args: &GlobArgs, cwd: &Path, signal: &CancellationToken) -
         return error_result(format!("Path is not a directory: {shown}"));
     }
 
-    let mut matches: Vec<(SystemTime, String)> = Vec::new();
-    let mut hit_collect_cap = false;
-
-    for entry in build_walker(&search_root, compiled.include_hidden, false).build() {
-        if signal.is_cancelled() {
-            return error_result(ABORTED_MESSAGE);
-        }
-        let Ok(entry) = entry else {
-            continue;
-        };
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(&search_root) else {
-            continue;
-        };
-        let rel_slash = rel.to_string_lossy().replace('\\', "/");
-        if !compiled.matcher.is_match(&rel_slash) {
-            continue;
-        }
-        let mtime = entry
-            .metadata()
-            .ok()
-            .and_then(|meta| meta.modified().ok())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let display = format_display_path(entry.path(), cwd);
-        matches.push((mtime, display));
-        if matches.len() >= MAX_COLLECT_MATCHES {
-            hit_collect_cap = true;
-            break;
-        }
-    }
+    let shared_matches = Mutex::new(Vec::<(SystemTime, String)>::new());
+    let collected = AtomicUsize::new(0);
+    let hit_collect_cap = AtomicBool::new(false);
+    let mut builder = GlobVisitorBuilder {
+        walk_root: &search_root,
+        cwd,
+        matcher: &compiled.matcher,
+        signal,
+        shared_matches: &shared_matches,
+        collected: &collected,
+        hit_collect_cap: &hit_collect_cap,
+    };
+    build_walker(&search_root, compiled.include_hidden, false, &compiled.static_prefix)
+        .threads(walker_threads())
+        .build_parallel()
+        .visit(&mut builder);
 
     if signal.is_cancelled() {
         return error_result(ABORTED_MESSAGE);
+    }
+    let mut matches = shared_matches.into_inner().expect("glob results mutex poisoned");
+    let hit_collect_cap = hit_collect_cap.load(Ordering::Relaxed);
+    if matches.len() > MAX_COLLECT_MATCHES {
+        matches.truncate(MAX_COLLECT_MATCHES);
     }
     if matches.is_empty() {
         return ToolExecution::text("No files found.");
@@ -267,4 +300,86 @@ pub(crate) fn execute(args: &GlobArgs, cwd: &Path, signal: &CancellationToken) -
     }
 
     ToolExecution::text(output)
+}
+
+struct GlobVisitorBuilder<'a> {
+    walk_root: &'a Path,
+    cwd: &'a Path,
+    matcher: &'a GlobMatcher,
+    signal: &'a CancellationToken,
+    shared_matches: &'a Mutex<Vec<(SystemTime, String)>>,
+    collected: &'a AtomicUsize,
+    hit_collect_cap: &'a AtomicBool,
+}
+
+impl<'s> ParallelVisitorBuilder<'s> for GlobVisitorBuilder<'s> {
+    fn build(&mut self) -> Box<dyn ParallelVisitor + 's> {
+        Box::new(GlobVisitor {
+            walk_root: self.walk_root,
+            cwd: self.cwd,
+            matcher: self.matcher,
+            signal: self.signal,
+            shared_matches: self.shared_matches,
+            collected: self.collected,
+            hit_collect_cap: self.hit_collect_cap,
+            local: Vec::new(),
+        })
+    }
+}
+
+struct GlobVisitor<'a> {
+    walk_root: &'a Path,
+    cwd: &'a Path,
+    matcher: &'a GlobMatcher,
+    signal: &'a CancellationToken,
+    shared_matches: &'a Mutex<Vec<(SystemTime, String)>>,
+    collected: &'a AtomicUsize,
+    hit_collect_cap: &'a AtomicBool,
+    local: Vec<(SystemTime, String)>,
+}
+
+impl Drop for GlobVisitor<'_> {
+    fn drop(&mut self) {
+        if !self.local.is_empty() {
+            self.shared_matches.lock().expect("glob results mutex poisoned").append(&mut self.local);
+        }
+    }
+}
+
+impl ParallelVisitor for GlobVisitor<'_> {
+    fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> WalkState {
+        if self.signal.is_cancelled() || self.hit_collect_cap.load(Ordering::Relaxed) {
+            return WalkState::Quit;
+        }
+        let Ok(entry) = entry else {
+            return WalkState::Continue;
+        };
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            return WalkState::Continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(self.walk_root) else {
+            return WalkState::Continue;
+        };
+        let rel_slash = rel.to_string_lossy().replace('\\', "/");
+        if !self.matcher.is_match(&rel_slash) {
+            return WalkState::Continue;
+        }
+        let prev = self.collected.fetch_add(1, Ordering::Relaxed);
+        if prev >= MAX_COLLECT_MATCHES {
+            self.hit_collect_cap.store(true, Ordering::Relaxed);
+            return WalkState::Quit;
+        }
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let display = format_display_path(entry.path(), self.cwd);
+        self.local.push((mtime, display));
+        if prev + 1 >= MAX_COLLECT_MATCHES {
+            self.hit_collect_cap.store(true, Ordering::Relaxed);
+            return WalkState::Quit;
+        }
+        WalkState::Continue
+    }
 }

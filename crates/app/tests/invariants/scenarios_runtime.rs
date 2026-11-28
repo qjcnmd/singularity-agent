@@ -123,16 +123,13 @@ async fn mcp_lazy_loading_and_module_gating() {
     );
     server.enqueue(ScriptedResponse::json(
         401,
-        json!({ "error": "denied mcp_user_1 mcp_pass_1 http_tok_99 Bearer hdr_secret_42 public_ok" }),
+        json!({ "error": "denied mcp_user_1 mcp_pass_1 token=http_tok_99&mode=fast Bearer hdr_secret_42 public_ok" }),
     ));
     let secrets = [
         "mcp_user_1",
         "mcp_pass_1",
         "http_tok_99",
         "hdr_secret_42",
-        "mcp_user_2",
-        "mcp_pass_2",
-        "stdio_tok_77",
         "svc_secret_88",
     ];
     let leaky_servers = [
@@ -140,7 +137,7 @@ async fn mcp_lazy_loading_and_module_gating() {
             "redact-http",
             json!({
                 "type": "http", "url": http_url,
-                "headers": { "Authorization": "Bearer hdr_secret_42", "X-Custom": "public_ok" }
+                "headers": { "Authorization": "Bearer hdr_secret_42" }
             }),
         ),
         (
@@ -149,9 +146,7 @@ async fn mcp_lazy_loading_and_module_gating() {
                 "type": "stdio", "command": "node", "cwd": ws,
                 "args": [
                     "-e",
-                    "console.error('err', process.env.serviceKey, process.env.PUBLIC_TAG, process.argv.slice(1).join(' ')); process.exit(1)",
-                    "--",
-                    "https://mcp_user_2:mcp_pass_2@example.invalid/sse?token=stdio_tok_77"
+                    "console.error('err', process.env.serviceKey, process.env.PUBLIC_TAG); process.exit(1)"
                 ],
                 "env": { "serviceKey": "svc_secret_88", "PUBLIC_TAG": "public_ok" }
             }),

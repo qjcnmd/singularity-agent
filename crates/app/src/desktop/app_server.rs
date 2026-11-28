@@ -100,8 +100,8 @@ impl AppServer {
         })
     }
 
-    pub(crate) fn set_focused_session(&self, epoch: u64, session_id: Option<String>) {
-        self.hub.set_focused_session(epoch, session_id);
+    pub(crate) fn set_focused_session(&self, session_id: Option<String>) {
+        self.hub.set_focused_session(session_id);
     }
 
     pub(crate) fn revision(&self) -> u64 {
@@ -129,7 +129,9 @@ impl AppServer {
         server: protocol::McpServerInput,
     ) -> Result<Vec<protocol::McpServerState>, RpcError> {
         let cwd = self.scope_directory(workspace_root)?;
-        self.mcp.save(server, &cwd).map_err(RpcError::new)
+        let result = self.mcp.save(server, &cwd).map_err(RpcError::new)?;
+        self.invalidate_session_prefixes();
+        Ok(result)
     }
 
     pub(crate) fn mcp_remove(
@@ -138,7 +140,9 @@ impl AppServer {
         server_id: &str,
     ) -> Result<Vec<protocol::McpServerState>, RpcError> {
         let cwd = self.scope_directory(workspace_root)?;
-        self.mcp.remove(server_id, &cwd).map_err(RpcError::new)
+        let result = self.mcp.remove(server_id, &cwd).map_err(RpcError::new)?;
+        self.invalidate_session_prefixes();
+        Ok(result)
     }
 
     pub(crate) async fn mcp_reconnect(
@@ -151,7 +155,16 @@ impl AppServer {
         let cwd = tokio::task::spawn_blocking(move || app.scope_directory(workspace_root.as_deref()))
             .await
             .expect("RPC worker completes while the backend is running")?;
-        self.mcp.reconnect(server_id, &cwd, shutdown).await.map_err(RpcError::new)
+        let result = self.mcp.reconnect(server_id, &cwd, shutdown).await.map_err(RpcError::new)?;
+        self.invalidate_session_prefixes();
+        Ok(result)
+    }
+
+    fn invalidate_session_prefixes(&self) {
+        let sessions = self.lock_sessions();
+        for (_, conversation) in sessions.conversations() {
+            conversation.invalidate_prefix();
+        }
     }
 
     pub(crate) fn save_provider(
@@ -179,7 +192,9 @@ impl AppServer {
         base_url: &str,
         api_key: Option<&str>,
     ) -> Result<protocol::ModelCatalogResult, RpcError> {
-        self.update_models(|models| models.save_web_search(base_url, api_key))
+        let result = self.update_models(|models| models.save_web_search(base_url, api_key))?;
+        self.invalidate_session_prefixes();
+        Ok(result)
     }
 
     fn update_models(
@@ -234,50 +249,64 @@ impl AppServer {
             skill_expansion,
         )
         .map_err(RpcError::new)?;
-        let mut sessions = self.lock_sessions();
         let workspace = self.workspace(&params.workspace_root)?;
         let thread = self
             .catalog
             .create_thread(&workspace.root, params.selection, params.disabled_modules)
             .map_err(catalog_error)?;
-        let conversation = self.insert_conversation(&mut sessions, thread);
+        let thread_id = thread.data().session_id().to_owned();
+        let conversation = {
+            let mut sessions = self.lock_sessions();
+            if let Err(error) = self.workspace(&params.workspace_root) {
+                drop(sessions);
+                drop(thread);
+                let _ = self.catalog.delete(&thread_id);
+                return Err(error);
+            }
+            self.insert_conversation(&mut sessions, thread)
+        };
         conversation.start(input).map_err(conversation_error)?;
         Ok(conversation.start_result())
     }
 
-    pub(crate) fn read_session(
-        &self,
-        session_id: &str,
-        focus_epoch: u64,
-    ) -> Result<SessionReadResult, RpcError> {
-        let conversation = {
-            let mut sessions = self.lock_sessions();
-            self.open_conversation(&mut sessions, session_id, false)?
-        };
-        self.set_focused_session(focus_epoch, Some(session_id.to_owned()));
+    pub(crate) fn read_session(&self, session_id: &str) -> Result<SessionReadResult, RpcError> {
+        let conversation = self.open_conversation(session_id, false)?;
         conversation.read().map_err(catalog_error)
     }
 
     pub(super) fn open_conversation(
         &self,
-        sessions: &mut SessionCache,
         session_id: &str,
         require_workspace: bool,
     ) -> Result<Arc<Conversation>, RpcError> {
-        if sessions.is_deleting(session_id) {
-            return Err(session_busy());
-        }
-        if let Some(conversation) = sessions.get(session_id) {
-            if require_workspace {
-                self.workspace(&conversation.cwd)?;
+        {
+            let mut sessions = self.lock_sessions();
+            if sessions.is_deleting(session_id) {
+                return Err(session_busy());
             }
-            return Ok(conversation);
+            if let Some(conversation) = sessions.get(session_id) {
+                drop(sessions);
+                if require_workspace {
+                    self.workspace(&conversation.cwd)?;
+                }
+                return Ok(conversation);
+            }
         }
         let thread = self.catalog.open_session(session_id).map_err(catalog_error)?;
         if require_workspace {
             self.workspace(&thread.data().cwd_string())?;
         }
-        Ok(self.insert_conversation(sessions, thread))
+        let mut sessions = self.lock_sessions();
+        if sessions.is_deleting(session_id) {
+            return Err(session_busy());
+        }
+        if let Some(existing) = sessions.get(session_id) {
+            return Ok(existing);
+        }
+        if require_workspace {
+            self.workspace(&thread.data().cwd_string())?;
+        }
+        Ok(self.insert_conversation(&mut sessions, thread))
     }
 
     fn insert_conversation(

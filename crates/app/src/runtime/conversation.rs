@@ -5,13 +5,14 @@ mod state;
 mod turn;
 mod view;
 
-use self::state::{ConversationState, TurnControls, TurnLifecycle};
+use self::state::{ConversationState, TurnLifecycle};
 
 use std::sync::{Arc, Mutex};
 
 use agent::agent::QueuedInput;
 use agent::session::{SessionMetadata, SessionWriter, lock_writer};
 use protocol::SessionPhase;
+use tokio_util::sync::CancellationToken;
 
 use crate::desktop::stream_hub::StreamHub;
 
@@ -32,11 +33,15 @@ pub(crate) struct Conversation {
     mcp: Arc<mcp::McpManager>,
     writer: SessionWriter,
     bash_tasks: Arc<agent::tools::BashTasks>,
+    file_reads: Arc<agent::tools::FileReadTracker>,
+    prefix_cache: Arc<agent::agent::PrefixCache>,
 }
 
 struct Operation {
     source: protocol::SessionOperation,
-    controls: Arc<TurnControls>,
+    turn_id: String,
+    token: CancellationToken,
+    questions: Arc<agent::agent::UserQuestions>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -89,12 +94,14 @@ impl Conversation {
                     state: ConversationState {
                         model,
                         turn: TurnLifecycle::Idle,
+                        compacting: false,
+                        user_stopped: false,
+                        questions: Arc::new(agent::agent::UserQuestions::default()),
                         steering_inbox: inbox,
                         last_context_window: context_window,
                         auto_resume: true,
                         closing: false,
-                        inspect_cancels: Vec::new(),
-                        next_inspect_id: 0,
+                        inspect_cancel: CancellationToken::new(),
                     },
                 }),
                 hub,
@@ -104,6 +111,8 @@ impl Conversation {
                 mcp,
                 writer,
                 bash_tasks,
+                file_reads: Arc::new(agent::tools::FileReadTracker::default()),
+                prefix_cache: Arc::new(agent::agent::PrefixCache::default()),
             }
         })
     }
@@ -118,7 +127,7 @@ impl Conversation {
     }
 
     pub(super) fn phase(&self) -> SessionPhase {
-        self.lock_inner().state.turn.phase()
+        self.lock_inner().state.phase()
     }
 
     pub(crate) fn image_data(&self, image_id: &str) -> Result<String, crate::runtime::CatalogError> {
@@ -151,9 +160,10 @@ impl Conversation {
         item_id: &str,
         answers: Vec<protocol::UserQuestionAnswer>,
     ) -> Result<(), ConversationError> {
-        match &self.lock_inner().state.turn {
-            TurnLifecycle::Running(controls) if !controls.cancellation().is_cancelled() => {
-                controls.questions.answer(item_id, answers).map_err(ConversationError::Message)
+        let inner = self.lock_inner();
+        match &inner.state.turn {
+            TurnLifecycle::Running(token) if !token.is_cancelled() => {
+                inner.state.questions.answer(item_id, answers).map_err(ConversationError::Message)
             }
             _ => Err(ConversationError::Message("该任务已停止等待回答。".into())),
         }
@@ -161,10 +171,11 @@ impl Conversation {
 
     pub(crate) fn abort(&self) -> Result<(), ConversationError> {
         let mut inner = self.lock_inner();
-        let TurnLifecycle::Running(controls) = &inner.state.turn else {
+        let TurnLifecycle::Running(token) = &inner.state.turn else {
             return Err(ConversationError::Busy);
         };
-        controls.accept_cancel()?;
+        token.cancel();
+        inner.state.user_stopped = true;
         inner.state.steering_inbox.lock().expect("turn inbox lock poisoned").cancel();
         inner.state.auto_resume = false;
         self.publish_changed(&mut inner);
@@ -183,6 +194,10 @@ impl Conversation {
         lock_writer(&self.writer).append_metadata(SessionMetadata::ThreadName { name: name.to_string() })?;
         self.publish_summary(&mut inner);
         Ok(())
+    }
+
+    pub(crate) fn invalidate_prefix(&self) {
+        self.prefix_cache.invalidate();
     }
 
     pub(crate) fn update_settings(
@@ -204,6 +219,7 @@ impl Conversation {
             .append_metadata(SessionMetadata::ThreadSettings { selection: selection.clone() })?;
         inner.state.model = selection.clone();
         inner.state.last_context_window = Some(context_window);
+        self.prefix_cache.invalidate();
         self.publish_changed(&mut inner);
         Ok(())
     }

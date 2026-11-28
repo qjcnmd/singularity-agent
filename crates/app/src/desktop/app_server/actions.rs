@@ -19,8 +19,7 @@ impl AppServer {
 
     pub(crate) fn submit(&self, params: protocol::SessionTextParams) -> Result<(), RpcError> {
         let (_, input) = self.parse_session_input(&params.session_id, params.message)?;
-        let mut sessions = self.lock_sessions();
-        let conversation = self.open_conversation(&mut sessions, &params.session_id, true)?;
+        let conversation = self.open_conversation(&params.session_id, true)?;
         conversation.start(input).map_err(conversation_error)
     }
 
@@ -44,10 +43,7 @@ impl AppServer {
         session_id: &str,
         apply: impl FnOnce(&Arc<Conversation>) -> Result<(), RpcError>,
     ) -> Result<(), RpcError> {
-        let conversation = {
-            let mut sessions = self.lock_sessions();
-            self.open_conversation(&mut sessions, session_id, false)?
-        };
+        let conversation = self.open_conversation(session_id, false)?;
         apply(&conversation)
     }
 
@@ -61,18 +57,14 @@ impl AppServer {
         }
         let app = Arc::clone(self);
         let id = session_id.to_string();
-        let conversation = tokio::task::spawn_blocking(move || {
-            let mut sessions = app.lock_sessions();
-            app.open_conversation(&mut sessions, &id, true)
-        })
-        .await
-        .expect("conversation lookup completes while the backend is running")?;
+        let conversation = tokio::task::spawn_blocking(move || app.open_conversation(&id, true))
+            .await
+            .expect("conversation lookup completes while the backend is running")?;
         conversation.inspect_context(shutdown).await.map_err(conversation_error)
     }
 
     pub(crate) fn compact(&self, session_id: &str) -> Result<(), RpcError> {
-        let mut sessions = self.lock_sessions();
-        let conversation = self.open_conversation(&mut sessions, session_id, true)?;
+        let conversation = self.open_conversation(session_id, true)?;
         conversation.compact().map_err(conversation_error)
     }
 
@@ -125,8 +117,7 @@ impl AppServer {
         let app = Arc::clone(self);
         let id = session_id.to_owned();
         let tasks = tokio::task::spawn_blocking(move || {
-            let mut sessions = app.lock_sessions();
-            Ok::<_, RpcError>(Arc::clone(app.open_conversation(&mut sessions, &id, false)?.bash_tasks()))
+            Ok::<_, RpcError>(Arc::clone(app.open_conversation(&id, false)?.bash_tasks()))
         })
         .await
         .expect("background task lookup completes while the backend is running")?;
@@ -138,7 +129,7 @@ impl AppServer {
         params: &protocol::SessionChangedFilesParams,
     ) -> Result<Vec<ChangedFile>, RpcError> {
         let workspace = self.workspace(&params.workspace_root)?;
-        git_diff::changed_files(Path::new(&workspace.root), params.include_diffs).map_err(RpcError::new)
+        git_diff::changed_files(Path::new(&workspace.root)).map_err(RpcError::new)
     }
 
     pub(crate) fn file_diff(
@@ -158,10 +149,7 @@ impl AppServer {
     ) -> Result<SessionReadResult, RpcError> {
         let (cwd, input) = self.parse_session_input(&params.session_id, params.message)?;
         app_core::load_agent_instructions(Path::new(&cwd), &self.home).map_err(RpcError::new)?;
-        let conversation = {
-            let mut sessions = self.lock_sessions();
-            self.open_conversation(&mut sessions, &params.session_id, true)?
-        };
+        let conversation = self.open_conversation(&params.session_id, true)?;
         conversation
             .rewind(&params.message_id, input)
             .map(|read| *read)
@@ -173,10 +161,7 @@ impl AppServer {
         session_id: &str,
         input: protocol::MessageInput,
     ) -> Result<(String, UserInput), RpcError> {
-        let conversation = {
-            let mut sessions = self.lock_sessions();
-            self.open_conversation(&mut sessions, session_id, true)?
-        };
+        let conversation = self.open_conversation(session_id, true)?;
         let skill_expansion =
             agent::agent::SkillExpansion::from_disabled_modules(&conversation.disabled_modules);
         let parsed = UserInput::from_uploads(

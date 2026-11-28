@@ -333,7 +333,7 @@ async fn context_pressure_and_overflow_invariants() {
     server.enqueue(ScriptedResponse::sse(messages_text_sse(
         None,
         "AUTO_COMPACTION_FAIL_STILL_COMPLETED",
-        1000,
+        baseline_input,
         0,
         20,
         "end_turn",
@@ -363,6 +363,19 @@ async fn context_pressure_and_overflow_invariants() {
         !is_compaction_request(&post_pressure_slice[1].body)
             && post_pressure_slice[1].body.to_string().contains("AUTO_PRESSURE_TRIGGER"),
         "main generation request must proceed immediately after automatic compaction failure"
+    );
+
+    let reqs_before_auto_ok = server.model_requests().len();
+    let ok_trigger = format!("{USER_TURN_TAG} AUTO_PRESSURE_OK: {}", "y".repeat(pressure_ascii_bytes));
+    restarted.submit(&session_id, &ok_trigger).await;
+    let s_auto_ok = restarted.wait_settled(&session_id).await;
+    assert_eq!(s_auto_ok.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+    let auto_ok_reqs = &server.model_requests()[reqs_before_auto_ok..];
+    assert!(
+        auto_ok_reqs.len() == 2
+            && is_compaction_request(&auto_ok_reqs[0].body)
+            && auto_ok_reqs[1].body.to_string().contains("AUTO_PRESSURE_OK"),
+        "successful auto-compaction must reload definitions and complete generation cleanly"
     );
 
     server.assert_no_protocol_violations();

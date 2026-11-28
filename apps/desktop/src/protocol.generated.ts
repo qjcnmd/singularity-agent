@@ -8,7 +8,7 @@ export type BackgroundTaskState = { "status": "running" } | { "status": "exited"
 
 export type BackgroundTaskUpdate = { phase: SessionPhase, task: VisibleBackgroundTask, };
 
-export type ChangedFile = { path: string, added: number, deleted: number, status: ChangedFileStatus, diff?: string, };
+export type ChangedFile = { path: string, added: number, deleted: number, status: ChangedFileStatus, };
 
 export type ChangedFileStatus = "added" | "modified" | "deleted";
 
@@ -90,7 +90,7 @@ export type RpcError = { message: string, };
 
 export type RpcResponse = { "type": "success", result: JsonValue, } | { "type": "error", error: RpcError, };
 
-export type SessionChangedFilesParams = { workspaceRoot: string, includeDiffs?: boolean, };
+export type SessionChangedFilesParams = { workspaceRoot: string, };
 
 export type SessionFailure = { source: SessionOperation, error: TurnErrorDetail, };
 

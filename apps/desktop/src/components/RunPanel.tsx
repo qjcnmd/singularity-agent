@@ -35,7 +35,7 @@ export function RunPanel({ overlay = false }: { overlay?: boolean }) {
   const cwd = state.session?.summary.cwd
   const factsCount = state.session?.facts.length ?? 0
   const lastTurnStatus = state.session?.facts.at(-1)?.status ?? ''
-  const summaryRevision = sessionId ? state.liveSessions[sessionId]?.summaryRevision ?? 0 : 0
+  const updatedAt = state.session?.summary.updatedAt ?? ''
   const scopeKey = cwd && sessionId && factsCount > 0 ? `${sessionId}\0${cwd}` : ''
   const [changedFilesState, setChangedFilesState] = useState<{ key: string; files: ChangedFile[] }>({ key: '', files: [] })
   const changedFiles = changedFilesState.key === scopeKey ? changedFilesState.files : []
@@ -47,7 +47,7 @@ export function RunPanel({ overlay = false }: { overlay?: boolean }) {
       () => { if (active) setChangedFilesState({ key: scopeKey, files: [] }) },
     )
     return () => { active = false }
-  }, [backgroundOpen, scopeKey, cwd, factsCount, lastTurnStatus, phase, summaryRevision])
+  }, [backgroundOpen, scopeKey, cwd, factsCount, lastTurnStatus, phase, updatedAt])
   const container = useRef<HTMLDivElement>(null)
   const opener = useRef<HTMLButtonElement>(null)
   const reduced = useReducedMotion()
@@ -164,7 +164,7 @@ function RunPanelBody({ changedFiles }: { changedFiles: ChangedFile[] }) {
             type="button"
             className="run-row run-row-action"
             onClick={() => {
-              appStore.openChangedFiles(cwd, undefined, changedFiles)
+              appStore.openChangedFiles(cwd)
             }}
           >
             <strong>Changes</strong>

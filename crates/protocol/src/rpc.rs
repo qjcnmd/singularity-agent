@@ -209,9 +209,6 @@ pub struct UpdateSettingsParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionChangedFilesParams {
     pub workspace_root: String,
-    #[serde(default)]
-    #[cfg_attr(feature = "typescript", ts(as = "Option<bool>", optional))]
-    pub include_diffs: bool,
 }
 
 #[derive(Debug, Deserialize)]

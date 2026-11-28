@@ -7,10 +7,9 @@ use std::sync::Arc;
 pub(super) async fn handle(
     app: &Arc<AppServer>,
     request: RpcRequest,
-    request_seq: u64,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<Box<RawValue>, RpcError> {
-    dispatch(Arc::clone(app), request, request_seq, shutdown)
+    dispatch(Arc::clone(app), request, shutdown)
         .await
         .inspect_err(|error| tracing::warn!(error = %error.message, "RPC request failed"))
 }
@@ -18,7 +17,6 @@ pub(super) async fn handle(
 async fn dispatch(
     app: Arc<AppServer>,
     request: RpcRequest,
-    request_seq: u64,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<Box<RawValue>, RpcError> {
     match request {
@@ -76,10 +74,11 @@ async fn dispatch(
         }
         RpcRequest::SessionStart(params) => blocking(move || app.start_session(params)).await,
         RpcRequest::SessionRead(params) => {
-            blocking(move || app.read_session(&params.session_id, request_seq)).await
+            app.set_focused_session(Some(params.session_id.clone()));
+            blocking(move || app.read_session(&params.session_id)).await
         }
         RpcRequest::SessionFocus(params) => {
-            app.set_focused_session(request_seq, params.session_id);
+            app.set_focused_session(params.session_id);
             Ok(value(()))
         }
         RpcRequest::SessionImageRead(params) => {

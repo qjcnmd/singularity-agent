@@ -28,12 +28,6 @@ struct Entry {
     done: watch::Sender<Option<Result<(), CompletionError>>>,
 }
 
-#[derive(Default, Clone, Copy)]
-struct OutputDelivery {
-    end: u64,
-    terminal: bool,
-}
-
 enum CompletionError {
     Cleanup(String),
     Store(String),
@@ -49,7 +43,7 @@ impl CompletionError {
 
 pub struct BashTasks {
     entries: Mutex<BTreeMap<String, Arc<Entry>>>,
-    delivered: Mutex<BTreeMap<String, OutputDelivery>>,
+    recorded: Mutex<BTreeMap<String, BackgroundTask>>,
     on_update: Arc<dyn Fn(BashTaskUpdate) + Send + Sync>,
     writer: crate::session::SessionWriter,
     inbox: crate::agent::SteeringInboxHandle,
@@ -71,13 +65,19 @@ impl BashTasks {
         inbox: crate::agent::SteeringInboxHandle,
         on_update: Arc<dyn Fn(BashTaskUpdate) + Send + Sync>,
     ) -> Arc<Self> {
+        let recorded = with_writer(&writer, |writer| load_recorded_tasks(writer.data().entries()));
         Arc::new(Self {
             entries: Mutex::new(BTreeMap::new()),
-            delivered: Mutex::new(BTreeMap::new()),
+            recorded: Mutex::new(recorded),
             on_update,
             writer,
             inbox,
         })
+    }
+
+    pub fn reload_recorded(&self) {
+        let snapshot = with_writer(&self.writer, |writer| load_recorded_tasks(writer.data().entries()));
+        *self.recorded.lock().expect("bash task recorded lock") = snapshot;
     }
 
     pub fn list(&self) -> Vec<BackgroundTask> {
@@ -85,16 +85,9 @@ impl BashTasks {
     }
 
     fn project_tasks<T>(&self, project: impl Fn(&BackgroundTask, &BackgroundTaskState) -> T) -> Vec<T> {
-        with_writer(&self.writer, |writer| {
-            let entries = self.entries.lock().expect("bash task entries lock");
-            let mut tasks = BTreeMap::new();
-            for record in writer.data().entries() {
-                if let Some(task) = recorded_task(record) {
-                    tasks.insert(&task.task_id, task);
-                }
-            }
-            tasks.into_values().map(|task| current_task(task, &entries, &project)).collect()
-        })
+        let recorded = self.recorded.lock().expect("bash task recorded lock");
+        let entries = self.entries.lock().expect("bash task entries lock");
+        recorded.values().map(|task| current_task(task, &entries, &project)).collect()
     }
 
     pub fn is_busy(&self) -> bool {
@@ -132,41 +125,19 @@ impl BashTasks {
         self.take_output(task_id).unwrap_or_else(error_result)
     }
 
-    pub(crate) fn prepare_completion_message(
-        &self,
-        task_id: &str,
-    ) -> Result<Option<(String, u64, bool)>, String> {
-        let delivered = self.delivered.lock().expect("bash output delivery lock");
+    pub(crate) fn completion_message(&self, task_id: &str) -> Result<String, String> {
         let task = self.task(task_id)?;
-        let position = delivered.get(task_id).copied().unwrap_or_default();
-        if position.terminal {
-            return Ok(None);
-        }
-        let content = format!(
+        Ok(format!(
             "<background-task>\nCommand: {}\nTask {}: {}\n{}\n</background-task>",
             task.command,
             task.task_id,
             state_text(&task.state),
-            output_text(&task.model_output, position.end),
-        );
-        Ok(Some((content, task.model_output.total_bytes, !task.state.is_running())))
-    }
-
-    pub(crate) fn confirm_delivered(&self, task_id: &str, end: u64, terminal: bool) {
-        let mut delivered = self.delivered.lock().expect("bash output delivery lock");
-        let position = delivered.entry(task_id.to_owned()).or_default();
-        position.end = position.end.max(end);
-        position.terminal |= terminal;
+            output_text(&task.model_output),
+        ))
     }
 
     fn take_output(&self, task_id: &str) -> Result<ToolExecution, String> {
-        let mut delivered = self.delivered.lock().expect("bash output delivery lock");
-        let task = self.task(task_id)?;
-        let position = delivered.entry(task_id.to_owned()).or_default();
-        let result = task_result(&task, Some(position.end), true);
-        position.end = task.model_output.total_bytes;
-        position.terminal = !task.state.is_running();
-        Ok(result)
+        Ok(task_result(&self.task(task_id)?, true))
     }
 
     pub async fn stop(self: &Arc<Self>, task_id: &str) -> Result<(), String> {
@@ -175,7 +146,7 @@ impl BashTasks {
 
     pub(crate) async fn tool_stop(self: &Arc<Self>, task_id: &str) -> ToolExecution {
         match self.stop_task(task_id).await {
-            Ok(task) => task_result(&task, None, false),
+            Ok(task) => task_result(&task, false),
             Err(error) => error_result(error),
         }
     }
@@ -273,7 +244,12 @@ impl BashTasks {
         let started_task_id = task_id.clone();
         let started_entry = Arc::clone(&entry);
         let started = crate::session::with_writer_async(&self.writer, move |writer| {
-            writer.append_record(LedgerRecord::BackgroundTaskUpdated { task: started_task })?;
+            writer.append_record(LedgerRecord::BackgroundTaskUpdated { task: started_task.clone() })?;
+            manager
+                .recorded
+                .lock()
+                .expect("bash task recorded lock")
+                .insert(started_task_id.clone(), started_task);
             manager
                 .entries
                 .lock()
@@ -317,18 +293,12 @@ impl BashTasks {
     }
 
     fn task(&self, task_id: &str) -> Result<BackgroundTask, String> {
-        with_writer(&self.writer, |writer| {
-            let entries = self.entries.lock().expect("bash task entries lock");
-            writer
-                .data()
-                .entries()
-                .iter()
-                .rev()
-                .filter_map(recorded_task)
-                .find(|task| task.task_id == task_id)
-                .map(|task| current_task(task, &entries, clone_task))
-                .ok_or_else(|| format!("Unknown background task: {task_id}"))
-        })
+        let recorded = self.recorded.lock().expect("bash task recorded lock");
+        let entries = self.entries.lock().expect("bash task entries lock");
+        recorded
+            .get(task_id)
+            .map(|task| current_task(task, &entries, clone_task))
+            .ok_or_else(|| format!("Unknown background task: {task_id}"))
     }
 
     async fn run_background(self: Arc<Self>, entry: Arc<Entry>, mut process: Process) {
@@ -364,6 +334,10 @@ impl BashTasks {
         };
         match saved {
             Ok(_) => {
+                self.recorded
+                    .lock()
+                    .expect("bash task recorded lock")
+                    .insert(task_id.clone(), task.clone());
                 if matches!(
                     task.state,
                     BackgroundTaskState::Exited { .. } | BackgroundTaskState::Failed { .. }
@@ -401,6 +375,16 @@ async fn wait_done(done: &mut watch::Receiver<Option<Result<(), CompletionError>
             break;
         }
     }
+}
+
+fn load_recorded_tasks(entries: &[SessionEntry]) -> BTreeMap<String, BackgroundTask> {
+    let mut tasks = BTreeMap::new();
+    for record in entries {
+        if let Some(task) = recorded_task(record) {
+            tasks.insert(task.task_id.clone(), task.clone());
+        }
+    }
+    tasks
 }
 
 fn recorded_task(entry: &SessionEntry) -> Option<&BackgroundTask> {

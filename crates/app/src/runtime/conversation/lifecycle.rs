@@ -1,27 +1,35 @@
 use std::sync::Arc;
 
 use super::activity::Activity;
-use super::state::{TurnControls, TurnLifecycle};
+use super::state::TurnLifecycle;
 use super::{Conversation, ConversationError, ConversationInner, Operation};
-use agent::agent::{QueuedInput, SteeringInbox, UserInput};
+use agent::agent::{QueuedInput, SteeringInbox, UserInput, UserQuestions};
 use agent::session::lock_writer;
 use protocol::{SessionFailure, SessionOperation, SessionPhase, StreamEvent, TurnStatus};
+use tokio_util::sync::CancellationToken;
 
 impl Conversation {
     fn begin_operation(&self, inner: &mut ConversationInner, source: SessionOperation) -> Operation {
-        let controls = Arc::new(TurnControls::new(uuid::Uuid::new_v4().to_string()));
-        controls.set_compacting(source == SessionOperation::Compaction);
-        inner.state.turn = TurnLifecycle::Running(Arc::clone(&controls));
-        inner.view.begin((source == SessionOperation::Turn).then(|| controls.turn_id.clone()));
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let token = CancellationToken::new();
+        let questions = Arc::new(UserQuestions::default());
+        inner.state.turn = TurnLifecycle::Running(token.clone());
+        inner.state.compacting = source == SessionOperation::Compaction;
+        inner.state.user_stopped = false;
+        inner.state.questions = Arc::clone(&questions);
+        inner.view.begin((source == SessionOperation::Turn).then(|| turn_id.clone()));
         self.publish_changed(inner);
-        Operation { source, controls }
+        Operation { source, turn_id, token, questions }
     }
 
     async fn execute(self: &Arc<Self>, operation: Operation) {
         let mut emit = |event| self.on_event(event);
         let result = match operation.source {
-            SessionOperation::Turn => self.run_single_turn(&operation.controls, &mut emit).await,
-            SessionOperation::Compaction => self.compact_thread(&operation.controls, &mut emit).await,
+            SessionOperation::Turn => {
+                self.run_single_turn(&operation.turn_id, &operation.token, &operation.questions, &mut emit)
+                    .await
+            }
+            SessionOperation::Compaction => self.compact_thread(&operation.token, &mut emit).await,
         };
         self.settle(operation.source, result);
     }
@@ -37,6 +45,8 @@ impl Conversation {
             inner.view.failure = failure;
         }
         inner.view.activity = Activity::default();
+        inner.state.compacting = false;
+        inner.state.user_stopped = false;
         inner.state.turn = TurnLifecycle::Idle;
         let (context_usage, summary) = {
             let writer = lock_writer(&self.writer);
@@ -67,7 +77,7 @@ impl Conversation {
         if inner.state.closing {
             return Err(ConversationError::Busy);
         }
-        let start = match inner.state.turn.phase() {
+        let start = match inner.state.phase() {
             SessionPhase::Idle => true,
             SessionPhase::Running | SessionPhase::Compacting => false,
             SessionPhase::Stopping => return Err(ConversationError::Busy),
@@ -186,6 +196,8 @@ impl Conversation {
             (usage, context_usage, history)
         };
         inner.view.reset(usage);
+        self.file_reads.clear();
+        self.bash_tasks.reload_recorded();
         let history = match history {
             Ok(history) => history,
             Err(error) => {

@@ -71,15 +71,15 @@ impl ModelClient {
             ProviderApiProtocol::Messages => {
                 let endpoint = endpoint(&self.config.base_url, "/messages");
                 messages_stream_request_payload(request, selection, provider_name, &endpoint)
-                    .map(|enc| (endpoint, enc.payload, Some(enc.prefix_digest)))
+                    .map(|payload| (endpoint, payload))
             }
             ProviderApiProtocol::Responses => {
                 let endpoint = endpoint(&self.config.base_url, "/responses");
                 openai_responses_stream_request_payload(request, selection, provider_name, &endpoint)
-                    .map(|payload| (endpoint, payload, None))
+                    .map(|payload| (endpoint, payload))
             }
         };
-        let (endpoint, payload, prefix_digest) = match encoded {
+        let (endpoint, payload) = match encoded {
             Ok(encoded) => encoded,
             Err(error) => {
                 return ModelTurnResponse::failed(
@@ -99,16 +99,8 @@ impl ModelClient {
         };
         match selection.protocol {
             ProviderApiProtocol::Messages => {
-                read_messages_sse_stream(
-                    cancellation,
-                    response,
-                    on_event,
-                    &self.config,
-                    selection,
-                    &endpoint,
-                    prefix_digest,
-                )
-                .await
+                read_messages_sse_stream(cancellation, response, on_event, &self.config, selection, &endpoint)
+                    .await
             }
             ProviderApiProtocol::Responses => {
                 read_responses_sse_stream(

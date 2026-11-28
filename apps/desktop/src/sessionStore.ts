@@ -45,7 +45,6 @@ export interface AppState extends PersistedView, SyncState {
   actionErrors: Readonly<Record<string, ActionError>>
   actionErrorOrigin: string | null
   settingsOpen: boolean
-  contextPreviewVersion: number
   fileTabs: readonly FileTab[]
   activeFileTab: string | null
 }
@@ -64,7 +63,6 @@ export class SessionStore {
     actionErrors: {},
     actionErrorOrigin: null,
     settingsOpen: false,
-    contextPreviewVersion: 0,
     fileTabs: [],
     activeFileTab: null,
   }
@@ -215,18 +213,15 @@ export class SessionStore {
 
   resync(): Promise<void> {
     if (this.resyncing !== null) return this.resyncing
-    const showLoading = this.state.bootstrap === null || this.state.bootstrapLoad.status === 'error'
-    if (showLoading) this.patch({ bootstrapLoad: { status: 'loading', error: null } })
+    this.patch({ bootstrapLoad: { status: 'loading', error: null } })
     this.resyncing = (async () => {
       try {
         const bootstrap = await this.transport.rpc('app.bootstrap', {})
-        this.applySync(resetBaseline(this.state, bootstrap))
+        this.applySync(resetBaseline(bootstrap))
         const { selectedSessionId } = this.state
         if (selectedSessionId !== null) {
           await this.readSession(selectedSessionId)
-          if (this.state.bootstrapLoad.status !== 'idle') {
-            this.patch({ bootstrapLoad: { status: 'idle', error: null } })
-          }
+          this.patch({ bootstrapLoad: { status: 'idle', error: null } })
         } else {
           this.patch({
             session: null,
@@ -298,15 +293,10 @@ export class SessionStore {
 
   protected applySync(state: SyncState, progress = false): void {
     if (state === this.state) return
-    const { revision, modelCatalogRevision, bootstrap, session, liveSessions } = state
-    const patch: Partial<AppState> = { revision, modelCatalogRevision, bootstrap, session, liveSessions }
+    const { revision, bootstrap, session, liveSessions } = state
+    const patch: Partial<AppState> = { revision, bootstrap, session, liveSessions }
     let selectionDropped = false
     if (bootstrap !== null && bootstrap !== this.state.bootstrap) {
-      const prevWeb = this.state.bootstrap?.modelCatalog.webSearch
-      const nextWeb = bootstrap.modelCatalog.webSearch
-      if (prevWeb && (prevWeb.credentialConfigured !== nextWeb.credentialConfigured || prevWeb.baseUrl !== nextWeb.baseUrl)) {
-        patch.contextPreviewVersion = this.state.contextPreviewVersion + 1
-      }
       const pruned = pruneStaleSelection(bootstrap, { ...this.state, session, liveSessions })
       patch.liveSessions = pruned.liveSessions
       patch.session = pruned.session

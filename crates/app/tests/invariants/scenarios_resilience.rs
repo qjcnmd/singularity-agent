@@ -367,6 +367,7 @@ async fn git_diff_and_rewind_invariants() {
     server.enqueue(ScriptedResponse::sse(messages_tools_sse(
         None,
         vec![
+            ("r_tracked", "read", json!({ "path": "tracked.txt" })),
             ("w_tracked", "write", json!({ "path": "tracked.txt", "content": "v2\n" })),
             ("w_extra", "write", json!({ "path": "extra.txt", "content": "extra\n" })),
             ("w_noop", "write", json!({ "path": "tracked.txt", "content": "v2\n" })),
@@ -406,7 +407,10 @@ async fn git_diff_and_rewind_invariants() {
     let turn2_items = turns[1].get("items").and_then(Value::as_array).expect("turn 2 items");
     let created_flags: Vec<(&str, Option<bool>)> = turn2_items
         .iter()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("tool"))
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("tool")
+                && item.get("name").and_then(Value::as_str) == Some("write")
+        })
         .map(|item| {
             (
                 item.pointer("/args/path").and_then(Value::as_str).unwrap_or_default(),
@@ -447,36 +451,15 @@ async fn git_diff_and_rewind_invariants() {
     assert!(changed_paths.contains(&"extra.txt"), "changedFiles: {changed_paths:?}");
     assert!(changed_paths.contains(&"mv_old.txt"), "split mv must include deletion: {changed_paths:?}");
     assert!(changed_paths.contains(&"mv_new.txt"), "split mv must include addition: {changed_paths:?}");
-    assert!(
-        changed_items.iter().all(|f| f.get("diff").is_none()),
-        "lightweight changedFiles must omit inline diffs: {changed_items:?}"
-    );
-
-    let changed_with_diffs = client
-        .rpc_ok("session.changedFiles", json!({ "workspaceRoot": ws, "includeDiffs": true }))
-        .await;
-    let diff_items = changed_with_diffs.as_array().expect("changed files with diffs");
-    let tracked_batch = diff_items
-        .iter()
-        .find(|f| f.get("path").and_then(Value::as_str) == Some("tracked.txt"))
-        .and_then(|f| f.get("diff").and_then(Value::as_str))
-        .unwrap_or_default();
-    assert!(
-        tracked_batch.contains("-v1") && tracked_batch.contains("+v2"),
-        "batch tracked diff mismatch under diff.noprefix/relative: {tracked_batch}"
-    );
-    let extra_batch = diff_items
-        .iter()
-        .find(|f| f.get("path").and_then(Value::as_str) == Some("extra.txt"))
-        .and_then(|f| f.get("diff").and_then(Value::as_str))
-        .unwrap_or_default();
-    assert!(extra_batch.contains("+extra"), "batch untracked diff mismatch: {extra_batch}");
-    let mv_old_entry = diff_items
+    let mv_old_entry = changed_items
         .iter()
         .find(|f| f.get("path").and_then(Value::as_str) == Some("mv_old.txt"))
-        .expect("mv_old.txt batch entry");
+        .expect("mv_old.txt entry");
     assert_eq!(mv_old_entry.get("status").and_then(Value::as_str), Some("deleted"));
-    assert!(mv_old_entry.get("diff").and_then(Value::as_str).unwrap_or_default().contains("-old1"));
+    let mv_old_diff = client
+        .rpc_ok("session.fileDiff", json!({ "workspaceRoot": ws, "path": "mv_old.txt" }))
+        .await;
+    assert!(mv_old_diff.get("output").and_then(Value::as_str).unwrap_or_default().contains("-old1"));
 
     let bracket_diff = client
         .rpc_ok("session.fileDiff", json!({ "workspaceRoot": ws, "path": "src/[id]/page.ts" }))
@@ -496,14 +479,17 @@ async fn git_diff_and_rewind_invariants() {
     run_git(&unborn_dir, &["add", "am.txt"]);
     std::fs::write(unborn_dir.join("am.txt"), "staged\nworktree\n").expect("edit am.txt");
     client.rpc_ok("workspace.add", json!({ "root": unborn_ws })).await;
-    let unborn_changed = client
-        .rpc_ok("session.changedFiles", json!({ "workspaceRoot": unborn_ws, "includeDiffs": true }))
+    let unborn_changed = client.rpc_ok("session.changedFiles", json!({ "workspaceRoot": unborn_ws })).await;
+    assert!(
+        unborn_changed
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|f| f.get("path").and_then(Value::as_str) == Some("am.txt"))),
+        "unborn AM file must appear in changedFiles: {unborn_changed}"
+    );
+    let unborn_diff = client
+        .rpc_ok("session.fileDiff", json!({ "workspaceRoot": unborn_ws, "path": "am.txt" }))
         .await;
-    let am_diff = unborn_changed
-        .as_array()
-        .and_then(|arr| arr.iter().find(|f| f.get("path").and_then(Value::as_str) == Some("am.txt")))
-        .and_then(|f| f.get("diff").and_then(Value::as_str))
-        .unwrap_or_default();
+    let am_diff = unborn_diff.get("output").and_then(Value::as_str).unwrap_or_default();
     assert!(
         am_diff.contains("+staged") && am_diff.contains("+worktree"),
         "unborn AM file must reflect working tree content: {am_diff}"

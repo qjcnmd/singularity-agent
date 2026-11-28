@@ -17,9 +17,6 @@ pub struct ChangedFile {
     pub added: u32,
     pub deleted: u32,
     pub status: ChangedFileStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub diff: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

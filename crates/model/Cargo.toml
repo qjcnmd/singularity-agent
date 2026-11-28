@@ -16,7 +16,6 @@ reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 app_core = { path = "../core" }
 protocol = { path = "../protocol" }
 time.workspace = true

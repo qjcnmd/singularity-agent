@@ -95,7 +95,7 @@ pub(crate) fn lookup_tools(
     Ok(resolved)
 }
 
-pub(crate) fn execute_schema(tools: &[McpTool]) -> ToolExecution {
+pub(crate) fn execute_schema(tools: &[McpTool], output_directory: &std::path::Path) -> ToolExecution {
     let sections: Vec<String> = tools
         .iter()
         .map(|tool| {
@@ -109,7 +109,8 @@ pub(crate) fn execute_schema(tools: &[McpTool]) -> ToolExecution {
             format!("Tool: {}\nDescription: {description}\nInput schema:\n{schema}", tool.name)
         })
         .collect();
-    ToolExecution::text(sections.join("\n\n---\n\n"))
+    let joined = sections.join("\n\n---\n\n");
+    ToolExecution::text(super::output::format_head_bounded(&joined, output_directory))
 }
 
 pub(super) async fn execute(

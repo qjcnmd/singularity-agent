@@ -519,13 +519,50 @@ async fn builtin_workspace_tools_and_attachments() {
             ("call_r_ok", "read", json!({ "path": "notes/demo.txt" })),
             ("call_r_bin", "read", json!({ "path": "bin.dat" })),
             ("call_r_zero", "read", json!({ "path": "notes/demo.txt", "limit": 0 })),
+            (
+                "call_edit_unread",
+                "edit",
+                json!({
+                    "path": "attached.txt",
+                    "edits": [{ "old_text": "ATTACHED_FILE_BODY", "new_text": "SHOULD_FAIL" }]
+                }),
+            ),
             ("call_grep_dir", "grep", json!({ "pattern": "NEEDLE_TOKEN" })),
+            (
+                "call_grep_files",
+                "grep",
+                json!({ "pattern": "NEEDLE_TOKEN", "output_mode": "files_with_matches" }),
+            ),
+            (
+                "call_grep_ml",
+                "grep",
+                json!({ "pattern": "line one\\nline TWO", "path": "notes/demo.txt" }),
+            ),
             (
                 "call_grep_crlf",
                 "grep",
                 json!({ "pattern": "^ANCHOR_CRLF_LINE$", "path": "src/crlf.txt" }),
             ),
             ("call_glob_rs", "glob", json!({ "pattern": "*.rs" })),
+            ("call_b_w", "write", json!({ "path": "barrier.txt", "content": "STAGE_ONE" })),
+            (
+                "call_b_sh1",
+                "bash",
+                json!({ "command": "cat barrier.txt", "description": "read stage one" }),
+            ),
+            (
+                "call_b_e",
+                "edit",
+                json!({
+                    "path": "barrier.txt",
+                    "edits": [{ "old_text": "STAGE_ONE", "new_text": "STAGE_TWO" }]
+                }),
+            ),
+            (
+                "call_b_sh2",
+                "bash",
+                json!({ "command": "cat barrier.txt", "description": "read stage two" }),
+            ),
             (
                 "call_todo",
                 "todo",
@@ -599,10 +636,33 @@ async fn builtin_workspace_tools_and_attachments() {
     let reqs = server.model_requests();
     let final_req = &reqs.last().expect("final request").body;
     let final_text = final_req.to_string();
-    assert!(final_text.contains("line TWO edited"), "read result must reach model");
+    assert!(final_text.contains("2| line TWO edited"), "numbered read result must reach model");
     assert!(final_text.contains("BASH_OK"), "head+tail bash truncation must preserve opening output");
     assert!(final_text.contains("call_r_bin"), "binary read result must be paired");
     assert!(final_text.contains("call_r_zero"), "limit=0 read result must be paired");
+
+    let unread_res = find_tool_result(final_req, "call_edit_unread");
+    assert_eq!(
+        unread_res.get("is_error").and_then(Value::as_bool),
+        Some(true),
+        "editing an unread existing file must be rejected: {unread_res}"
+    );
+    assert!(
+        find_tool_result(final_req, "call_b_sh1").to_string().contains("STAGE_ONE"),
+        "concurrency barrier must run write before subsequent bash"
+    );
+    assert!(
+        find_tool_result(final_req, "call_b_sh2").to_string().contains("STAGE_TWO"),
+        "concurrency barrier must run edit before subsequent bash"
+    );
+    assert!(
+        find_tool_result(final_req, "call_grep_ml").to_string().contains("line TWO edited"),
+        "multiline grep must match across newlines"
+    );
+    assert!(
+        find_tool_result(final_req, "call_grep_files").to_string().contains("src/match.rs"),
+        "files_with_matches mode must list matching files"
+    );
 
     let todo_res = find_tool_result(final_req, "call_todo");
     assert_ne!(todo_res.get("is_error").and_then(Value::as_bool), Some(true), "todo tool must succeed");

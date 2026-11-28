@@ -26,11 +26,10 @@ pub(crate) async fn read_messages_sse_stream(
     config: &ProviderConfig,
     selection: &SelectedModel,
     endpoint: &str,
-    prefix_digest: Option<String>,
 ) -> ModelTurnResponse {
     let mut decoder = MessagesSseDecoder::new(on_event, &config.api_key);
     let result = read_sse_stream(cancellation, response, &mut decoder).await;
-    decoder.finish(result, config, selection, endpoint, prefix_digest)
+    decoder.finish(result, config, selection, endpoint)
 }
 
 enum MessagesBlock {
@@ -301,7 +300,6 @@ impl<'a> MessagesSseDecoder<'a> {
         config: &ProviderConfig,
         selection: &SelectedModel,
         endpoint: &str,
-        prefix_digest: Option<String>,
     ) -> ModelTurnResponse {
         let stop_reason = result.and_then(|()| {
             if !self.completed {
@@ -395,7 +393,6 @@ impl<'a> MessagesSseDecoder<'a> {
             provider_name: config.provider_name.clone(),
             model_name: selection.model_name.clone(),
             endpoint: endpoint.into(),
-            prefix_digest,
             reasoning: selection.reasoning_variant.clone(),
         });
         finalize_provider_response(ModelTurnResponse {

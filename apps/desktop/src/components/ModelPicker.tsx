@@ -1,6 +1,6 @@
 import { EffortSlider } from './EffortSlider'
 import { ExpandChevron } from './ExpandChevron'
-import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { Check } from 'lucide-react'
 import { usePopoverFocus, focusableElements, navigateList } from '../interactions'
 import { sortReasoningVariants, selectedModel } from '../models'
@@ -37,8 +37,6 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
     node.style.bottom = `${window.innerHeight - rect.top + 8}px`
   }
   const [previewIndex, setPreviewIndex] = useState<number | null>(null)
-  const committing = useRef(false)
-  const queuedEffort = useRef<number | null>(null)
   const catalog = state.bootstrap?.modelCatalog
   const currentChoice = selectedModel(catalog, selection)
   const variants = sortReasoningVariants(currentChoice?.model.reasoningVariants)
@@ -46,9 +44,8 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
   const resolvedIndex = variants.findIndex((variant) => variant === resolvedEffort)
   const sliderIndex = previewIndex ?? Math.max(0, resolvedIndex)
   useEffect(() => {
-    if (!committing.current) setPreviewIndex(null)
+    setPreviewIndex(null)
   }, [selection, open])
-  useLayoutEffect(() => () => { queuedEffort.current = null }, [])
   const sessionId = state.selectedSessionId
   const origin = actionOrigin.session(sessionId)
   const pending = state.pendingActions.has(pendingKey('session.updateSettings', origin))
@@ -64,24 +61,16 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
 
   const chooseEffort = async (position: number) => {
     const index = Math.round(position)
+    const variant = variants[index]
+    if (currentChoice === undefined || variant === undefined) return
     setPreviewIndex(index)
-    queuedEffort.current = index
-    if (committing.current || currentChoice === undefined) return
-    committing.current = true
     try {
-      while (queuedEffort.current !== null) {
-        const next = queuedEffort.current
-        queuedEffort.current = null
-        const variant = variants[next]
-        if (variant === undefined) break
-        const nextSelection = { provider: currentChoice.provider.providerId, model: currentChoice.model.modelId, reasoning: variant }
-        if (!await appStore.updateSettings(nextSelection)) {
-          queuedEffort.current = null
-          break
-        }
-      }
+      await appStore.updateSettings({
+        provider: currentChoice.provider.providerId,
+        model: currentChoice.model.modelId,
+        reasoning: variant,
+      })
     } finally {
-      committing.current = false
       setPreviewIndex(null)
     }
   }
@@ -141,7 +130,7 @@ function ModelPickerControls({ state, selection }: ModelPickerProps & {
             ))}
           </div>
           {variants.length > 0 && <div className="sg-divider" />}
-          {variants.length > 0 && <fieldset className="effort-field" disabled={(pending && !committing.current) || (variants.length === 1 && resolvedIndex === 0)}>
+          {variants.length > 0 && <fieldset className="effort-field" disabled={pending || (variants.length === 1 && resolvedIndex === 0)}>
             <EffortSlider variants={variants} selectedIndex={sliderIndex} onCommit={index => { void chooseEffort(index) }} />
           </fieldset>}
 

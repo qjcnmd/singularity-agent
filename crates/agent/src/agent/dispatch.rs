@@ -44,10 +44,12 @@ impl Agent {
         let (progress, mut updates) = mpsc::channel::<(String, String)>(32);
         let signal = cancellation.child_token();
         let mut save_error = None;
+        let mut mutating_in_flight = false;
         loop {
-            while save_error.is_none() && workers.len() < MAX_PARALLEL_TOOLS {
+            while save_error.is_none() && !mutating_in_flight && workers.len() < MAX_PARALLEL_TOOLS {
                 let Some((_, _, next)) = pending.peek() else { break };
-                if matches!(next, Ok(PreparedTool::Question(_))) && !workers.is_empty() {
+                let is_barrier = matches!(next, Ok(tool) if !tool.is_read_only());
+                if is_barrier && !workers.is_empty() {
                     break;
                 }
                 let (item_id, call, tool) = pending.next().expect("pending tool exists");
@@ -87,11 +89,15 @@ impl Agent {
                     }
                     continue;
                 }
+                if is_barrier {
+                    mutating_in_flight = true;
+                }
                 let context = crate::tools::ToolContext {
                     cwd: cwd.clone(),
                     output_directory: output_directory.clone(),
                     signal: signal.clone(),
                     bash_tasks: Arc::clone(&self.bash_tasks),
+                    file_reads: Arc::clone(&self.file_reads),
                 };
                 let progress = progress.clone();
                 workers.spawn(async move {
@@ -128,6 +134,9 @@ impl Agent {
                         .expect("tool worker completes while the runtime is running");
                     while let Ok((item_id, partial_result)) = updates.try_recv() {
                         on_event(AgentEvent::Turn(TurnEvent::ToolOutput { item_id, output: partial_result }));
+                    }
+                    if workers.is_empty() {
+                        mutating_in_flight = false;
                     }
                     if save_error.is_none()
                         && let Err(error) = self.finish_tool(item_id, call_id, execution, on_event).await

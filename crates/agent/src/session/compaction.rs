@@ -5,8 +5,8 @@ use model::{ContentBlock, Message, ModelConfigurationSnapshot};
 
 use super::context::{
     ContextEntry, cleared_tool_result_ids, context_entry, context_token_estimate_for,
-    frame_compacted_summary, latest_reply_usage, message_content_mut, message_token_estimate,
-    message_with_captions_tokens, project_messages, resolve_context_entries,
+    frame_compacted_summary, message_content_mut, message_token_estimate, message_with_captions_tokens,
+    project_messages, resolve_context_entries,
 };
 use super::format::SessionEntry;
 use super::manager::SessionData;
@@ -92,11 +92,6 @@ pub(crate) struct PlannedCompactionStep {
     pub(crate) image_directory: std::path::PathBuf,
 }
 
-fn scale_u64(value: u64, num: u64, den: u64, ceil: bool) -> u64 {
-    let (prod, d) = (u128::from(value) * u128::from(num), u128::from(den));
-    u64::try_from(if ceil { prod.div_ceil(d) } else { prod / d }).unwrap_or(u64::MAX)
-}
-
 fn compaction_input_limit(
     model: ModelConfigurationSnapshot,
     definition_tokens: u64,
@@ -138,15 +133,7 @@ pub(crate) fn plan_compaction_step(
     let empty_summary = message_token_estimate(&frame_compacted_summary(""));
     let limit = compaction_input_limit(model, definition_tokens, instruction_tokens, overflow_input_tokens)
         .ok_or(NO_HEADROOM)?;
-    let full_est =
-        definition_tokens.saturating_add(context_token_estimate_for(&active, data, Some(identity), &cleared));
-    let calibrated = latest_reply_usage(data, &active, definition_tokens, &cleared)
-        .filter(|&(p, m, real)| (p, m) == identity && real > 0 && full_est > 0)
-        .map(|(_, _, real)| real);
-    let max_base = limit.saturating_sub(instruction_tokens);
-    let max_prefix = calibrated
-        .map_or(max_base, |real| scale_u64(max_base, full_est, real, false))
-        .saturating_sub(definition_tokens);
+    let max_prefix = limit.saturating_sub(definition_tokens).saturating_sub(instruction_tokens);
     if max_prefix <= empty_summary {
         return Err(NO_HEADROOM);
     }
@@ -163,14 +150,14 @@ pub(crate) fn plan_compaction_step(
             return Err(NO_HEADROOM);
         }
     }
-    let base = definition_tokens.saturating_add(projected);
-    let scaled = calibrated.map_or(base, |real| scale_u64(base, real, full_est, true));
     Ok(Some(PlannedCompactionStep {
         session_id: data.session_id().to_owned(),
         messages,
         first_kept_entry_id,
         raw_prefix_tokens,
-        estimated_request_input: scaled.saturating_add(instruction_tokens),
+        estimated_request_input: definition_tokens
+            .saturating_add(projected)
+            .saturating_add(instruction_tokens),
         image_directory,
     }))
 }
@@ -261,7 +248,7 @@ fn fold_oversized_messages(messages: &mut [Message], max_tokens: u64) -> u64 {
         let keep = total_text.saturating_sub(current - max_tokens);
         for text in texts {
             let tokens = estimate_tokens_of(text);
-            let cap = scale_u64(tokens, keep, total_text, false);
+            let cap = tokens.saturating_mul(keep) / total_text;
             if tokens > cap {
                 trim_text_to_tokens(text, cap);
             }
@@ -272,21 +259,47 @@ fn fold_oversized_messages(messages: &mut [Message], max_tokens: u64) -> u64 {
 
 fn trim_text_to_tokens(text: &mut String, max_tokens: u64) {
     const MARKER: &str = "\n...[truncated for compaction]...\n";
-    let (budget, suffix) = max_tokens
-        .checked_sub(estimate_tokens_of(MARKER) + 1)
-        .map_or((max_tokens, ""), |b| (b + 1, MARKER));
-    let mut len = text
-        .floor_char_boundary(usize::try_from(budget.saturating_mul(4)).unwrap_or(text.len()).min(text.len()));
-    while len > 0 {
-        let est = estimate_tokens_of(&text[..len]);
-        if est <= budget {
+    let marker_tokens = estimate_tokens_of(MARKER);
+    if max_tokens <= marker_tokens + 2 {
+        let head_len = take_prefix_for_tokens(text, max_tokens).len();
+        text.truncate(head_len);
+        return;
+    }
+    let budget = max_tokens - marker_tokens;
+    let head_budget = budget / 3;
+    let tail_budget = budget - head_budget;
+    let head = take_prefix_for_tokens(text, head_budget);
+    let tail = take_suffix_for_tokens(text, tail_budget);
+    if head.len() + tail.len() >= text.len() {
+        return;
+    }
+    *text = format!("{head}{MARKER}{tail}");
+}
+
+fn take_prefix_for_tokens(text: &str, max_tokens: u64) -> &str {
+    let limit = max_tokens.saturating_mul(4);
+    let (mut quarters, mut end) = (0u64, 0usize);
+    for (idx, ch) in text.char_indices() {
+        let cost = if ch.is_ascii() { 1 } else { 4 };
+        if quarters + cost > limit {
             break;
         }
-        let next = usize::try_from(scale_u64(u64::try_from(len).unwrap_or(u64::MAX), budget, est, false))
-            .unwrap_or(0)
-            .min(len - 1);
-        len = text.floor_char_boundary(next);
+        quarters += cost;
+        end = idx + ch.len_utf8();
     }
-    text.truncate(len);
-    text.push_str(suffix);
+    &text[..end]
+}
+
+fn take_suffix_for_tokens(text: &str, max_tokens: u64) -> &str {
+    let limit = max_tokens.saturating_mul(4);
+    let (mut quarters, mut start) = (0u64, text.len());
+    for (idx, ch) in text.char_indices().rev() {
+        let cost = if ch.is_ascii() { 1 } else { 4 };
+        if quarters + cost > limit {
+            break;
+        }
+        quarters += cost;
+        start = idx;
+    }
+    &text[start..]
 }

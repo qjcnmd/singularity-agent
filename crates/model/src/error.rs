@@ -67,15 +67,21 @@ impl ProviderError {
 }
 
 const PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
+const PROVIDER_CONTEXT_WINDOW_EXCEEDED_CODE: &str = "context_window_exceeded";
 const PROVIDER_RATE_LIMIT_EXCEEDED_CODE: &str = "rate_limit_exceeded";
 const PROVIDER_SERVER_ERROR_CODE: &str = "server_error";
 const PROVIDER_INSUFFICIENT_QUOTA_CODE: &str = "insufficient_quota";
 const INVALID_REQUEST_OVERFLOW_PATTERNS: &[&str] = &[
     "prompt is too long",
+    "input is too long",
+    "request too large",
     "maximum context length",
     "exceed context limit",
+    "exceeds context length",
     "exceeds the context window",
+    "context window exceeded",
     "context_length_exceeded",
+    "context_window_exceeded",
     "too many tokens",
 ];
 pub(crate) const MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS: usize = 256;
@@ -134,7 +140,9 @@ pub(crate) fn apply_provider_error_body(error: &mut ProviderError, body: &[u8], 
 
 fn provider_error_kind_for_fields(fields: &ProviderErrorBodyFields) -> Option<ModelErrorKind> {
     match fields.code.as_deref() {
-        Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE) => return Some(ModelErrorKind::ContextLengthExceeded),
+        Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE | PROVIDER_CONTEXT_WINDOW_EXCEEDED_CODE) => {
+            return Some(ModelErrorKind::ContextLengthExceeded);
+        }
         Some(PROVIDER_RATE_LIMIT_EXCEEDED_CODE | PROVIDER_SERVER_ERROR_CODE) => {
             return Some(ModelErrorKind::Temporary);
         }
@@ -146,7 +154,7 @@ fn provider_error_kind_for_fields(fields: &ProviderErrorBodyFields) -> Option<Mo
             Some(ModelErrorKind::Temporary)
         }
         Some(PROVIDER_INSUFFICIENT_QUOTA_CODE) => Some(ModelErrorKind::Other),
-        Some("invalid_request_error") => fields.message.as_deref().and_then(|message| {
+        Some("invalid_request_error") | None => fields.message.as_deref().and_then(|message| {
             let lower = message.to_ascii_lowercase();
             INVALID_REQUEST_OVERFLOW_PATTERNS
                 .iter()
@@ -160,6 +168,7 @@ fn provider_error_kind_for_fields(fields: &ProviderErrorBodyFields) -> Option<Mo
 pub(crate) fn provider_error_kind_for_http_status(status: u16) -> ModelErrorKind {
     match status {
         408 | 409 | 429 => ModelErrorKind::Temporary,
+        413 => ModelErrorKind::ContextLengthExceeded,
         status if (500..=599).contains(&status) => ModelErrorKind::Temporary,
         _ => ModelErrorKind::Other,
     }
@@ -192,58 +201,11 @@ pub(crate) fn bounded_provider_error_diagnostic(text: &str) -> String {
 }
 
 pub(crate) fn redact_diagnostic(text: &str, api_key: &str) -> String {
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    if !api_key.is_empty() {
-        for (start, _) in text.match_indices(api_key) {
-            spans.push((start, start + api_key.len()));
-        }
+    if api_key.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(api_key, "[redacted]")
     }
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i + 6 < bytes.len() {
-        if bytes[i..i + 6].eq_ignore_ascii_case(b"bearer") && bytes[i + 6].is_ascii_whitespace() {
-            let word_start =
-                text[..i].chars().next_back().is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
-            if word_start {
-                let mut token_start = i + 6;
-                while token_start < bytes.len() && bytes[token_start].is_ascii_whitespace() {
-                    token_start += 1;
-                }
-                let token_end = text[token_start..]
-                    .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '}' | ']' | ';'))
-                    .map_or(text.len(), |offset| token_start + offset);
-                if token_end > token_start {
-                    spans.push((token_start, token_end));
-                    i = token_end;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-    if spans.is_empty() {
-        return text.to_string();
-    }
-    spans.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
-    for (start, end) in spans {
-        if let Some((_, prev_end)) = merged.last_mut()
-            && start < *prev_end
-        {
-            *prev_end = (*prev_end).max(end);
-        } else {
-            merged.push((start, end));
-        }
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0usize;
-    for (start, end) in merged {
-        out.push_str(&text[cursor..start]);
-        out.push_str("[redacted]");
-        cursor = end;
-    }
-    out.push_str(&text[cursor..]);
-    out
 }
 
 pub(crate) fn bounded_redacted_diagnostic(text: &str, api_key: &str) -> String {

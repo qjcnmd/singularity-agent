@@ -10,7 +10,8 @@
     "start": "electron .",
     "prepare:runtime": "node desktop/prepare.mjs",
     "package": "electron-builder --config electron-builder.json --win --dir",
-    "test:e2e": "node e2e/smoke.mjs"
+    "test:unit": "node --test e2e/unit.test.mjs",
+    "test:e2e": "node --test e2e/unit.test.mjs && node e2e/smoke.mjs"
   },
   "dependencies": {
     "@shikijs/core": "4.4.3",

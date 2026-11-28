@@ -31,7 +31,7 @@ impl Conversation {
     }
 
     fn publish_background_task(&self, inner: &mut ConversationInner, task: protocol::VisibleBackgroundTask) {
-        let phase = inner.state.turn.phase();
+        let phase = inner.state.phase();
         self.publish(
             inner,
             StreamEvent::BackgroundTaskUpdated {
@@ -69,6 +69,8 @@ impl Conversation {
     }
 
     pub(crate) fn clear_closing(&self) {
-        self.lock_inner().state.closing = false;
+        let mut inner = self.lock_inner();
+        inner.state.closing = false;
+        inner.state.inspect_cancel = tokio_util::sync::CancellationToken::new();
     }
 }

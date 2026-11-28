@@ -53,7 +53,6 @@ pub(crate) async fn run(
         })?;
         writer_tx.send(ready).await.map_err(|_| "desktop pipe writer closed".to_string())?;
         let mut pending_write: Option<Vec<u8>> = None;
-        let mut next_request_seq = 0u64;
         loop {
             tokio::select! {
                 biased;
@@ -61,13 +60,11 @@ pub(crate) async fn run(
                     let Some(line) = line.map_err(|e| format!("read desktop pipe: {e}"))? else { break };
                     let call: Request = serde_json::from_str(&line)
                         .map_err(|e| format!("invalid desktop pipe envelope: {e}"))?;
-                    next_request_seq += 1;
-                    let request_seq = next_request_seq;
                     let app = Arc::clone(&app);
                     let shutdown = shutdown.clone();
                     requests.spawn(async move {
                         let response = match serde_json::from_str::<RpcRequest>(call.request.get()) {
-                            Ok(request) => rpc::handle(&app, request, request_seq, &shutdown).await,
+                            Ok(request) => rpc::handle(&app, request, &shutdown).await,
                             Err(error) => Err(RpcError::new(error)),
                         };
                         let response = match response {

@@ -2,92 +2,64 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::Mutex;
 
 use similar::{ChangeTag, TextDiff};
-use tokio_util::sync::CancellationToken;
 
-use super::registry::{
-    ABORTED_MESSAGE, COMMAND_MAX_BYTES, COMMAND_MAX_LINES, ToolDisplay, ToolExecution, error_result,
-};
+use super::registry::{COMMAND_MAX_BYTES, COMMAND_MAX_LINES, ToolDisplay, ToolExecution};
 
 const MAX_EDIT_FILE_BYTES: u64 = 20 * 1024 * 1024;
 
-static FILE_EDITS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
 
-pub(super) fn file_lock_key(path: &Path) -> std::io::Result<String> {
-    let mut missing = Vec::new();
-    let mut skip_parents = 0usize;
-    let mut cursor = path;
-    loop {
-        if skip_parents == 0
-            && let Ok(mut full) = cursor.canonicalize()
-        {
-            for component in missing.into_iter().rev() {
-                full.push(component);
-            }
-            return Ok(app_core::workspace_key(&full));
+impl FileStamp {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
         }
-        match cursor.components().next_back() {
-            Some(std::path::Component::CurDir) => {}
-            Some(std::path::Component::ParentDir) => skip_parents += 1,
-            Some(std::path::Component::Normal(name)) => {
-                if let Some(remaining) = skip_parents.checked_sub(1) {
-                    skip_parents = remaining;
-                } else {
-                    missing.push(name.to_os_string());
-                }
-            }
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("cannot resolve parent directory for {}", path.display()),
-                ));
-            }
-        }
-        let parent = cursor.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("cannot resolve parent directory for {}", path.display()),
-            )
-        })?;
-        cursor = if parent.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            parent
-        };
     }
 }
 
-pub(super) async fn with_file_lock<F>(key: String, signal: CancellationToken, work: F) -> ToolExecution
-where
-    F: FnOnce(&CancellationToken) -> Result<ToolExecution, String> + Send + 'static,
-{
-    let lock = {
-        let mut files = FILE_EDITS.lock().expect("file edit registry lock poisoned");
-        let lock = files.get(&key).and_then(Weak::upgrade).unwrap_or_default();
-        files.insert(key, Arc::downgrade(&lock));
-        lock
-    };
-    let result = tokio::select! {
-        biased;
-        () = signal.cancelled() => error_result(ABORTED_MESSAGE),
-        guard = Arc::clone(&lock).lock_owned() => {
-            tokio::task::spawn_blocking(move || {
-                let _guard = guard;
-                work(&signal).unwrap_or_else(error_result)
-            })
-            .await
-            .expect("tool worker completes while the runtime is running")
+#[derive(Debug, Default)]
+pub struct FileReadTracker {
+    stamps: Mutex<HashMap<String, FileStamp>>,
+}
+
+impl FileReadTracker {
+    pub(crate) fn record_metadata(&self, key: String, metadata: &std::fs::Metadata) {
+        self.stamps
+            .lock()
+            .expect("file read tracker lock poisoned")
+            .insert(key, FileStamp::from_metadata(metadata));
+    }
+
+    pub(crate) fn verify_unchanged(
+        &self,
+        key: &str,
+        metadata: &std::fs::Metadata,
+        display_path: &str,
+        verb: &str,
+    ) -> Result<(), String> {
+        let recorded = self.stamps.lock().expect("file read tracker lock poisoned").get(key).copied();
+        match recorded {
+            None => Err(format!(
+                "Cannot {verb} {display_path}: file has not been read in this session yet. Call read first."
+            )),
+            Some(previous) if previous != FileStamp::from_metadata(metadata) => Err(format!(
+                "Cannot {verb} {display_path}: file was modified on disk since it was last read. Call read again before continuing."
+            )),
+            Some(_) => Ok(()),
         }
-    };
-    drop(lock);
-    FILE_EDITS
-        .lock()
-        .expect("file edit registry lock poisoned")
-        .retain(|_, lock| lock.strong_count() > 0);
-    result
+    }
+
+    pub fn clear(&self) {
+        self.stamps.lock().expect("file read tracker lock poisoned").clear();
+    }
 }
 
 pub(super) fn read_opened_text_file(file: File, display_path: &str) -> Result<String, String> {

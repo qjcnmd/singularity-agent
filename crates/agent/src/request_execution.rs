@@ -135,9 +135,7 @@ pub(crate) async fn execute_request(
             return Ok((response, id, saved_at));
         };
         if retry {
-            let delay = error
-                .retry_after
-                .unwrap_or_else(|| std::time::Duration::from_millis(2_000 * 2u64.pow(attempt - 1)));
+            let delay = error.retry_after.unwrap_or_else(|| retry_backoff_delay(attempt));
             tracing::warn!(
                 provider = provider_name,
                 model = model_name,
@@ -179,4 +177,13 @@ pub(crate) async fn execute_request(
         });
     }
     unreachable!("the last attempt returns its response or error")
+}
+
+fn retry_backoff_delay(attempt: u32) -> Duration {
+    let base_ms = 2_000u64.saturating_mul(2u64.pow(attempt.saturating_sub(1)));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| u64::from(duration.subsec_nanos()));
+    let jitter_ms = nanos % (base_ms / 4).max(1);
+    Duration::from_millis(base_ms + jitter_ms)
 }

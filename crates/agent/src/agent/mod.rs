@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use self::inbox::{QueuedInput, SkillExpansion, SteeringInbox, SteeringInboxHandle, UserInput};
 pub use self::questions::UserQuestions;
+pub use self::request::PrefixCache;
 pub use crate::image::InputImage;
 use protocol::TurnEvent;
 
@@ -81,9 +82,11 @@ pub struct RequestContext {
     registry: ToolRegistrySnapshot,
     mcp: Arc<mcp::McpManager>,
     definitions: Option<request::RequestDefinitions>,
+    prefix_cache: Arc<PrefixCache>,
     provider: ModelClient,
     models: Arc<model::ModelConfigManager>,
     config: AgentConfig,
+    preloaded_instructions: bool,
 }
 
 impl std::fmt::Debug for RequestContext {
@@ -102,15 +105,19 @@ impl RequestContext {
         config: AgentConfig,
         session: SessionWriter,
         mcp: Arc<mcp::McpManager>,
+        prefix_cache: Arc<PrefixCache>,
+        preloaded_instructions: bool,
     ) -> Self {
         Self {
             session,
             registry: ToolRegistrySnapshot::default(),
             mcp,
             definitions: None,
+            prefix_cache,
             provider,
             models,
             config,
+            preloaded_instructions,
         }
     }
 
@@ -127,6 +134,7 @@ impl RequestContext {
 pub struct Agent {
     requests: RequestContext,
     bash_tasks: Arc<crate::tools::BashTasks>,
+    file_reads: Arc<crate::tools::FileReadTracker>,
     questions: Arc<UserQuestions>,
     inbox: SteeringInboxHandle,
 }
@@ -136,8 +144,15 @@ impl Agent {
         inbox: SteeringInboxHandle,
         questions: Arc<UserQuestions>,
         bash_tasks: Arc<crate::tools::BashTasks>,
+        file_reads: Arc<crate::tools::FileReadTracker>,
     ) -> Self {
-        Self { requests, bash_tasks, questions, inbox }
+        Self {
+            requests,
+            bash_tasks,
+            file_reads,
+            questions,
+            inbox,
+        }
     }
 
     pub async fn run(
@@ -222,18 +237,14 @@ impl Agent {
             QueuedInputKind::Background { task_id } => {
                 let tasks = Arc::clone(&self.bash_tasks);
                 let id = task_id.clone();
-                if let Some((text, end, terminal)) =
-                    tokio::task::spawn_blocking(move || tasks.prepare_completion_message(&id))
-                        .await
-                        .expect("bash completion lookup completes while the runtime is running")
-                        .map_err(std::io::Error::other)?
-                {
-                    let message = Message::Notification {
-                        content: vec![model::ContentBlock::text(text)],
-                    };
-                    self.append_message(&request.message_id, message, None, &[]).await?;
-                    self.bash_tasks.confirm_delivered(task_id, end, terminal);
-                }
+                let text = tokio::task::spawn_blocking(move || tasks.completion_message(&id))
+                    .await
+                    .expect("bash completion lookup completes while the runtime is running")
+                    .map_err(std::io::Error::other)?;
+                let message = Message::Notification {
+                    content: vec![model::ContentBlock::text(text)],
+                };
+                self.append_message(&request.message_id, message, None, &[]).await?;
                 lock_inbox(&self.inbox).confirm_saved(&request.message_id);
                 return Ok(());
             }

@@ -10,10 +10,10 @@ use crate::tools::registry::{COMMAND_MAX_BYTES, COMMAND_MAX_LINES, WEB_MAX_BYTES
 pub(crate) const FULL_OUTPUT_PREFIX: &str = "Full output: ";
 const FULL_OUTPUT_ERROR_PREFIX: &str = "Full output could not be saved: ";
 
-pub(super) const COMMAND_HEAD_LINES: usize = COMMAND_MAX_LINES / 2;
-pub(super) const COMMAND_TAIL_LINES: usize = COMMAND_MAX_LINES - COMMAND_HEAD_LINES;
-pub(super) const COMMAND_HEAD_BYTES: usize = COMMAND_MAX_BYTES / 2;
-pub(super) const COMMAND_TAIL_BYTES: usize = COMMAND_MAX_BYTES - COMMAND_HEAD_BYTES;
+const COMMAND_HEAD_LINES: usize = COMMAND_MAX_LINES / 2;
+const COMMAND_TAIL_LINES: usize = COMMAND_MAX_LINES - COMMAND_HEAD_LINES;
+const COMMAND_HEAD_BYTES: usize = COMMAND_MAX_BYTES / 2;
+const COMMAND_TAIL_BYTES: usize = COMMAND_MAX_BYTES - COMMAND_HEAD_BYTES;
 const INTERNAL_TAIL_MAX_BYTES: usize = COMMAND_MAX_BYTES * 2;
 
 pub(super) fn format_spill_note(path: Option<&str>, error: Option<&str>) -> Option<String> {
@@ -33,16 +33,21 @@ fn spill_note_from_result(result: Result<&SpillWriter, &io::Error>) -> String {
 
 struct SpillWriter {
     path: PathBuf,
-    file: std::fs::File,
+    file: io::BufWriter<std::fs::File>,
 }
 
 impl SpillWriter {
     fn create(root: &Path, initial: &str) -> io::Result<Self> {
         std::fs::create_dir_all(root)?;
         let path = root.join(format!("{}.log", Uuid::new_v4()));
-        let mut file = std::fs::File::create_new(&path)?;
+        let mut file = io::BufWriter::with_capacity(16 * 1024, std::fs::File::create_new(&path)?);
         file.write_all(initial.as_bytes())?;
+        file.flush()?;
         Ok(Self { path, file })
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
     }
 }
 
@@ -61,8 +66,16 @@ pub(crate) struct CaptureState {
 
 impl CaptureState {
     pub(super) fn persist(&mut self) {
-        if self.spill.is_none() {
-            self.spill = Some(SpillWriter::create(&self.directory, &self.tail));
+        match &mut self.spill {
+            None => {
+                self.spill = Some(SpillWriter::create(&self.directory, &self.tail));
+            }
+            Some(Ok(spill)) => {
+                if let Err(error) = spill.flush() {
+                    self.spill = Some(Err(error));
+                }
+            }
+            Some(Err(_)) => {}
         }
     }
 
@@ -115,6 +128,11 @@ impl CaptureState {
             })
         {
             return None;
+        }
+        if let Some(Ok(spill)) = &mut self.spill
+            && let Err(error) = spill.flush()
+        {
+            self.spill = Some(Err(error));
         }
         self.last_progress = Some((now, self.total_bytes));
         Some(self.display_output())
@@ -186,7 +204,12 @@ impl CaptureState {
         }
     }
 
-    pub(crate) fn finish(self) -> (String, Option<String>) {
+    pub(crate) fn finish(mut self) -> (String, Option<String>) {
+        if let Some(Ok(spill)) = &mut self.spill
+            && let Err(error) = spill.flush()
+        {
+            self.spill = Some(Err(error));
+        }
         let note = self.spill_note();
         let content = if self.is_truncated() {
             self.final_output()
@@ -228,7 +251,7 @@ impl CaptureState {
         }
         let head = self.head_truncation();
         let tail = truncate_lines(&self.tail, true, COMMAND_TAIL_LINES, COMMAND_TAIL_BYTES);
-        format_head_tail_parts(&head, &tail, self.total_bytes as u64, Some(self.total_lines()))
+        format_head_tail_parts(&head, &tail, self.total_bytes as u64, self.total_lines())
     }
 }
 
@@ -256,42 +279,26 @@ pub(super) fn format_size(bytes: u64) -> String {
     }
 }
 
-fn head_tail_marker(
-    head: &Truncation,
-    tail: &Truncation,
-    total_bytes: u64,
-    total_lines: Option<usize>,
-) -> String {
+fn head_tail_marker(head: &Truncation, tail: &Truncation, total_bytes: u64, total_lines: usize) -> String {
     let omitted_bytes = total_bytes
         .saturating_sub(head.content.len() as u64)
         .saturating_sub(tail.content.len() as u64);
-    match total_lines {
-        Some(total_lines) => {
-            let omitted_lines = total_lines.saturating_sub(head.output_lines + tail.output_lines);
-            if !head.partial_line && !tail.partial_line && omitted_lines > 0 {
-                let tail_start = total_lines.saturating_sub(tail.output_lines) + 1;
-                format!(
-                    "[... {omitted_lines} lines ({}) omitted; showing lines 1-{} and {tail_start}-{total_lines} of {total_lines} ...]",
-                    format_size(omitted_bytes),
-                    head.output_lines,
-                )
-            } else {
-                format!(
-                    "[... {} omitted; showing first {} and last {} of {} ({total_lines} lines) ...]",
-                    format_size(omitted_bytes),
-                    format_size(head.content.len() as u64),
-                    format_size(tail.content.len() as u64),
-                    format_size(total_bytes),
-                )
-            }
-        }
-        None => format!(
-            "[... {} omitted; showing first {} and last {} of {} ...]",
+    let omitted_lines = total_lines.saturating_sub(head.output_lines + tail.output_lines);
+    if !head.partial_line && !tail.partial_line && omitted_lines > 0 {
+        let tail_start = total_lines.saturating_sub(tail.output_lines) + 1;
+        format!(
+            "[... {omitted_lines} lines ({}) omitted; showing lines 1-{} and {tail_start}-{total_lines} of {total_lines} ...]",
+            format_size(omitted_bytes),
+            head.output_lines,
+        )
+    } else {
+        format!(
+            "[... {} omitted; showing first {} and last {} of {} ({total_lines} lines) ...]",
             format_size(omitted_bytes),
             format_size(head.content.len() as u64),
             format_size(tail.content.len() as u64),
             format_size(total_bytes),
-        ),
+        )
     }
 }
 
@@ -299,7 +306,7 @@ fn format_head_tail_parts(
     head: &Truncation,
     tail: &Truncation,
     total_bytes: u64,
-    total_lines: Option<usize>,
+    total_lines: usize,
 ) -> String {
     let marker = head_tail_marker(head, tail, total_bytes, total_lines);
     format!("{}\n\n{marker}\n\n{}", head.content, tail.content)
@@ -312,16 +319,12 @@ pub(super) fn format_diff_head_tail(summary: &str, patch: &str, output_directory
         return full_diff;
     }
     let spill_note = spill_note_from_result(SpillWriter::create(output_directory, &full_diff).as_ref());
-    let body = format_head_tail_slice(patch);
+    let body = if patch.len() <= COMMAND_MAX_BYTES && total_lines <= COMMAND_MAX_LINES {
+        patch.to_string()
+    } else {
+        format_head_tail_truncated(patch, total_lines)
+    };
     format!("{summary}{body}\n\n{spill_note}")
-}
-
-pub(super) fn format_head_tail_slice(content: &str) -> String {
-    let total_lines = count_lines(content);
-    if content.len() <= COMMAND_MAX_BYTES && total_lines <= COMMAND_MAX_LINES {
-        return content.to_string();
-    }
-    format_head_tail_truncated(content, total_lines)
 }
 
 pub(super) fn format_head_tail_bounded(content: &str, output_directory: &Path) -> String {
@@ -337,13 +340,7 @@ pub(super) fn format_head_tail_bounded(content: &str, output_directory: &Path) -
 fn format_head_tail_truncated(content: &str, total_lines: usize) -> String {
     let head = truncate_lines(content, false, COMMAND_HEAD_LINES, COMMAND_HEAD_BYTES);
     let tail = truncate_lines(content, true, COMMAND_TAIL_LINES, COMMAND_TAIL_BYTES);
-    format_head_tail_parts(&head, &tail, content.len() as u64, Some(total_lines))
-}
-
-pub(super) fn format_spill_head_tail(head_raw: &str, tail_raw: &str, total_unread_bytes: u64) -> String {
-    let head = truncate_lines(head_raw, false, COMMAND_HEAD_LINES, COMMAND_HEAD_BYTES);
-    let tail = truncate_lines(tail_raw, true, COMMAND_TAIL_LINES, COMMAND_TAIL_BYTES);
-    format_head_tail_parts(&head, &tail, total_unread_bytes, None)
+    format_head_tail_parts(&head, &tail, content.len() as u64, total_lines)
 }
 
 fn count_lines(content: &str) -> usize {

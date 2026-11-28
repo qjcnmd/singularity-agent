@@ -7,7 +7,7 @@ import { selectedModel } from './models'
 import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, clampFilePanelWidth, type PersistedView } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { emptyDraft, hasDraftContent, imageUpload, type Draft, type DraftAnnotation } from './drafts'
-import type { ChangedFile, ImageAttachment, MessageAnnotation, ModelSelection, ProviderConfigurationInput, RpcMethod, RpcParams, UserQuestionAnswer, ViewportAnchor } from './protocol'
+import type { ImageAttachment, MessageAnnotation, ModelSelection, ProviderConfigurationInput, RpcMethod, RpcParams, UserQuestionAnswer, ViewportAnchor } from './protocol'
 import { selectedSessionPhase } from './sessionState'
 import { acceptModelCatalog } from './sync'
 
@@ -289,10 +289,6 @@ class AppStore extends SessionStore {
     this.patch({ settingsOpen })
   }
 
-  invalidateContextPreview(): void {
-    this.patch({ contextPreviewVersion: this.state.contextPreviewVersion + 1 })
-  }
-
   setSidebarWidth(sidebarWidth: number): void {
     this.saveView({ sidebarWidth: clampSidebarWidth(sidebarWidth) }, true)
   }
@@ -387,8 +383,8 @@ class AppStore extends SessionStore {
     this.patch(this.state.settingsOpen ? { ...next, settingsOpen: false } : next)
   }
 
-  openChangedFiles(cwd: string, focusPath?: string, initialFiles?: ChangedFile[]): void {
-    const next = openChangedFilesTab(this.state, cwd, focusPath, initialFiles)
+  openChangedFiles(cwd: string, focusPath?: string): void {
+    const next = openChangedFilesTab(this.state, cwd, focusPath)
     this.patch(this.state.settingsOpen ? { ...next, settingsOpen: false } : next)
   }
 

@@ -62,7 +62,7 @@ pub(crate) fn openai_responses_stream_request_payload(
     match reasoning.enabled {
         Some(true) => {
             if let Some(effort) = reasoning.effort {
-                payload["reasoning"] = json!({"effort": effort});
+                payload["reasoning"] = json!({"effort": effort, "summary": "auto"});
             }
         }
         Some(false) => {
@@ -181,12 +181,7 @@ pub(crate) fn parse_openai_responses_response(
                     metadata: Some(block_metadata(item, &["summary"])),
                 }
             }
-            _ => {
-                return Err(provider_response_validation_error(
-                    "provider Responses payload contained an unsupported output item",
-                    &["responses_output_item_unsupported"],
-                ));
-            }
+            _ => continue,
         };
         content.push(block);
     }
@@ -195,7 +190,6 @@ pub(crate) fn parse_openai_responses_response(
         provider_name: config.provider_name.clone(),
         model_name: model_name.into(),
         endpoint: endpoint.into(),
-        prefix_digest: None,
         reasoning,
     });
     Ok(finalize_provider_response(ModelTurnResponse {

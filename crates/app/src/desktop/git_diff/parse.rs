@@ -5,136 +5,6 @@ use protocol::{ChangedFile, ChangedFileStatus};
 const MAX_DIFF_BYTES: usize = 200 * 1024;
 const MAX_DIFF_LINES: usize = 2_000;
 
-pub(super) struct DiffSection {
-    git_header: String,
-    rename_to: Option<String>,
-    minus_path: Option<String>,
-    plus_path: Option<String>,
-    status: ChangedFileStatus,
-    is_binary: bool,
-    in_hunks: bool,
-    added: u32,
-    deleted: u32,
-    hunk_lines: usize,
-    hunk_buf: String,
-    hunk_truncated: bool,
-}
-
-impl Default for DiffSection {
-    fn default() -> Self {
-        Self {
-            git_header: String::new(),
-            rename_to: None,
-            minus_path: None,
-            plus_path: None,
-            status: ChangedFileStatus::Modified,
-            is_binary: false,
-            in_hunks: false,
-            added: 0,
-            deleted: 0,
-            hunk_lines: 0,
-            hunk_buf: String::new(),
-            hunk_truncated: false,
-        }
-    }
-}
-
-impl DiffSection {
-    pub(super) fn new(git_header: String) -> Self {
-        Self { git_header, ..Self::default() }
-    }
-
-    pub(super) fn push_line(&mut self, line: &str, capture_text: bool) {
-        if !self.in_hunks {
-            if line.starts_with("@@ ") {
-                self.in_hunks = true;
-            } else {
-                if line.starts_with("new file mode ") {
-                    self.status = ChangedFileStatus::Added;
-                } else if line.starts_with("deleted file mode ") {
-                    self.status = ChangedFileStatus::Deleted;
-                } else if let Some(rest) =
-                    line.strip_prefix("rename to ").or_else(|| line.strip_prefix("copy to "))
-                {
-                    self.rename_to = Some(unquote_git_path(rest));
-                } else if let Some(rest) = line.strip_prefix("--- ") {
-                    self.minus_path = parse_patch_path(rest, "a/");
-                } else if let Some(rest) = line.strip_prefix("+++ ") {
-                    self.plus_path = parse_patch_path(rest, "b/");
-                } else if (line.starts_with("Binary files ") && line.ends_with(" differ"))
-                    || line == "GIT binary patch"
-                {
-                    self.is_binary = true;
-                }
-                return;
-            }
-        }
-        if line.starts_with('+') {
-            self.added = self.added.saturating_add(1);
-        } else if line.starts_with('-') {
-            self.deleted = self.deleted.saturating_add(1);
-        }
-        if capture_text && !self.hunk_truncated {
-            if self.hunk_lines >= MAX_DIFF_LINES || self.hunk_buf.len() + line.len() + 1 > MAX_DIFF_BYTES {
-                self.hunk_truncated = true;
-            } else {
-                self.hunk_buf.push_str(line);
-                self.hunk_buf.push('\n');
-                self.hunk_lines += 1;
-            }
-        }
-    }
-
-    fn target_path(&self) -> Option<String> {
-        self.rename_to
-            .clone()
-            .or_else(|| self.plus_path.clone())
-            .or_else(|| self.minus_path.clone())
-            .or_else(|| parse_diff_git_header(&self.git_header))
-    }
-
-    fn into_formatted(self, allow_diff: bool) -> (ChangedFileStatus, u32, u32, Option<String>) {
-        if !allow_diff {
-            return (self.status, self.added, self.deleted, None);
-        }
-        let text = if self.is_binary {
-            "二进制文件已变更，暂不支持文本差异对比。".to_owned()
-        } else if !self.in_hunks {
-            "无文本内容差异（空文件或文件模式变更）。".to_owned()
-        } else {
-            let mut out = format!("+{} -{}\n{}", self.added, self.deleted, self.hunk_buf);
-            if self.hunk_truncated {
-                out.push_str("[Diff truncated]\n");
-            }
-            out
-        };
-        (self.status, self.added, self.deleted, Some(text))
-    }
-}
-
-pub(super) fn commit_section(
-    section: DiffSection,
-    files: &mut BTreeMap<String, ChangedFile>,
-    remaining_budget: &mut usize,
-) {
-    let Some(raw_path) = section.target_path() else {
-        return;
-    };
-    let rel = raw_path.replace('\\', "/");
-    if rel.is_empty() {
-        return;
-    }
-    let (status, added, deleted, formatted) = section.into_formatted(*remaining_budget > 0);
-    let diff = match formatted {
-        Some(text) if text.len() <= *remaining_budget => {
-            *remaining_budget -= text.len();
-            Some(text)
-        }
-        _ => None,
-    };
-    files.insert(rel.clone(), ChangedFile { path: rel, added, deleted, status, diff });
-}
-
 pub(super) fn parse_raw_numstat(out: &[u8], files: &mut BTreeMap<String, ChangedFile>) {
     let parse_count = |s: &str| s.parse::<u64>().ok().map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
     let mut parts = out.split(|&b| b == 0);
@@ -165,16 +35,7 @@ pub(super) fn parse_raw_numstat(out: &[u8], files: &mut BTreeMap<String, Changed
                 b'D' => ChangedFileStatus::Deleted,
                 _ => ChangedFileStatus::Modified,
             };
-            files.insert(
-                rel.clone(),
-                ChangedFile {
-                    path: rel,
-                    added: 0,
-                    deleted: 0,
-                    status,
-                    diff: None,
-                },
-            );
+            files.insert(rel.clone(), ChangedFile { path: rel, added: 0, deleted: 0, status });
             continue;
         }
         let text = String::from_utf8_lossy(chunk);
@@ -244,93 +105,46 @@ pub(super) fn format_git_diff(raw: &str) -> String {
     if raw.trim().is_empty() {
         return "该文件当前无改动。".to_owned();
     }
-    let mut section = DiffSection::default();
+    let (mut in_hunks, mut is_binary, mut truncated) = (false, false, false);
+    let (mut added, mut deleted, mut hunk_lines) = (0u32, 0u32, 0usize);
+    let mut hunk_buf = String::new();
     for line in raw.lines() {
-        section.push_line(line, true);
-    }
-    section.into_formatted(true).3.unwrap_or_default()
-}
-
-fn parse_patch_path(raw: &str, strip: &str) -> Option<String> {
-    let trimmed = raw.strip_suffix('\t').unwrap_or(raw);
-    if trimmed == "/dev/null" {
-        return None;
-    }
-    unquote_git_path(trimmed).strip_prefix(strip).map(str::to_owned)
-}
-
-fn parse_diff_git_header(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("diff --git ")?;
-    if rest.starts_with('"') {
-        let mut escaped = false;
-        let mut first_end = None;
-        for (idx, ch) in rest.char_indices().skip(1) {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                first_end = Some(idx + 1);
-                break;
+        if !in_hunks {
+            if line.starts_with("@@ ") {
+                in_hunks = true;
+            } else {
+                if (line.starts_with("Binary files ") && line.ends_with(" differ"))
+                    || line == "GIT binary patch"
+                {
+                    is_binary = true;
+                }
+                continue;
             }
         }
-        let tail = rest[first_end?..].trim_start();
-        return unquote_git_path(tail).strip_prefix("b/").map(str::to_owned);
-    }
-    let inner = rest.strip_prefix("a/")?;
-    if inner.len() >= 3 && (inner.len() - 3).is_multiple_of(2) {
-        let half = (inner.len() - 3) / 2;
-        if inner.is_char_boundary(half)
-            && inner.is_char_boundary(half + 3)
-            && &inner[half..half + 3] == " b/"
-            && inner[..half] == inner[half + 3..]
-        {
-            return Some(inner[..half].to_owned());
+        if line.starts_with('+') {
+            added = added.saturating_add(1);
+        } else if line.starts_with('-') {
+            deleted = deleted.saturating_add(1);
         }
-    }
-    inner.rsplit_once(" b/").map(|(_, right)| unquote_git_path(right))
-}
-
-fn unquote_git_path(raw: &str) -> String {
-    let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
-        return raw.to_owned();
-    };
-    let bytes = inner.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'n' => {
-                    out.push(b'\n');
-                    i += 2;
-                }
-                b'r' => {
-                    out.push(b'\r');
-                    i += 2;
-                }
-                b't' => {
-                    out.push(b'\t');
-                    i += 2;
-                }
-                b'0'..=b'7' if i + 3 < bytes.len() => {
-                    if let Ok(val) = u8::from_str_radix(&inner[i + 1..i + 4], 8) {
-                        out.push(val);
-                        i += 4;
-                    } else {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
-                }
-                other => {
-                    out.push(other);
-                    i += 2;
-                }
+        if !truncated {
+            if hunk_lines >= MAX_DIFF_LINES || hunk_buf.len() + line.len() + 1 > MAX_DIFF_BYTES {
+                truncated = true;
+            } else {
+                hunk_buf.push_str(line);
+                hunk_buf.push('\n');
+                hunk_lines += 1;
             }
-        } else {
-            out.push(bytes[i]);
-            i += 1;
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    if is_binary {
+        "二进制文件已变更，暂不支持文本差异对比。".to_owned()
+    } else if !in_hunks {
+        "无文本内容差异（空文件或文件模式变更）。".to_owned()
+    } else {
+        let mut out = format!("+{added} -{deleted}\n{hunk_buf}");
+        if truncated {
+            out.push_str("[Diff truncated]\n");
+        }
+        out
+    }
 }

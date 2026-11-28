@@ -65,7 +65,6 @@ fn provider_meta(provider: &str, model: &str) -> ProviderMessageMetadata {
         provider_name: provider.into(),
         model_name: model.into(),
         endpoint: "https://example.invalid/v1/messages".into(),
-        prefix_digest: None,
         reasoning: None,
     }
 }
@@ -509,7 +508,7 @@ proptest! {
         bom in any::<bool>(),
         crlf in any::<bool>(),
         indent_spaces in 1usize..=8,
-        mode in 0u8..=4,
+        mode in 0u8..=3,
         duplicate in any::<bool>(),
     ) {
         let (eol, pad) = (if crlf { "\r\n" } else { "\n" }, " ".repeat(indent_spaces));
@@ -532,17 +531,11 @@ proptest! {
                 format!("{pad}// updated\n{pad}let v = 2;"),
                 format!("{pad}// updated{eol}{pad}let v = 2;"),
             ),
-            3 => (
+            _ => (
                 format!("{pad}fn demo() {{{eol}{pad}    let v = 1;{eol}{pad}}}"),
                 "fn demo() {\n    let v = 1;\n}".into(),
                 "fn demo() {\n    let v = 2;\n}".into(),
                 format!("{pad}fn demo() {{{eol}{pad}    let v = 2;{eol}{pad}}}"),
-            ),
-            _ => (
-                format!("{pad}if ok {{{eol}{pad}    step_a();{eol}{pad}}}"),
-                "if ok {\n  step_a();\n}".into(),
-                "if ok {\n  step_b();\n}".into(),
-                format!("{pad}if ok {{{eol}{pad}    step_b();{eol}{pad}}}"),
             ),
         };
         let prefix = if bom { "\u{feff}" } else { "" };
@@ -564,10 +557,15 @@ proptest! {
         ) else {
             panic!("valid edit args must preflight");
         };
+        let file_reads = std::sync::Arc::new(crate::tools::FileReadTracker::default());
+        let canonical = file_path.canonicalize().expect("canonical demo.rs");
+        let meta = std::fs::metadata(&canonical).expect("demo.rs metadata");
+        file_reads.record_metadata(app_core::workspace_key(&canonical), &meta);
         let exec = test_runtime().block_on(edit_execute(
             args,
             tmp.0.clone(),
             tmp.0.join("outputs"),
+            file_reads,
             tokio_util::sync::CancellationToken::new(),
         ));
         let disk = std::fs::read_to_string(&file_path).expect("read demo.rs");

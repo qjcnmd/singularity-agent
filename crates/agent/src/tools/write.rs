@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::file_ops::{file_lock_key, format_diff_result, read_opened_text_file, with_file_lock};
+use super::file_ops::{FileReadTracker, format_diff_result, read_opened_text_file};
 use super::registry::{ABORTED_MESSAGE, ToolExecution, WRITE_TOOL_NAME, error_result};
 
 #[derive(Debug, Deserialize)]
@@ -17,7 +18,7 @@ pub(crate) struct WriteArgs {
 pub(crate) fn spec() -> model::ToolDefinition {
     model::ToolDefinition {
         name: WRITE_TOOL_NAME.into(),
-        description: "Create a new UTF-8 text file or overwrite an existing text file with full content. Automatically creates missing parent directories and writes atomically. Prefer edit for targeted changes to existing files.".into(),
+        description: "Create a new UTF-8 text file or overwrite an existing text file with full content. Automatically creates missing parent directories and writes atomically. Read an existing file first before overwriting it; prefer edit for targeted changes to existing files.".into(),
         parameters_schema: json!({
             "type": "object",
             "properties": {
@@ -34,6 +35,7 @@ pub(crate) async fn execute(
     args: WriteArgs,
     cwd: PathBuf,
     output_directory: PathBuf,
+    file_reads: Arc<FileReadTracker>,
     signal: CancellationToken,
 ) -> ToolExecution {
     if signal.is_cancelled() {
@@ -46,28 +48,38 @@ pub(crate) async fn execute(
         return error_result("write only supports UTF-8 text content without NUL bytes");
     }
     let target = cwd.join(&args.path);
-    let key_target = target.clone();
-    let key = match tokio::task::spawn_blocking(move || file_lock_key(&key_target))
-        .await
-        .expect("tool worker completes while the runtime is running")
-    {
-        Ok(key) => key,
-        Err(error) => return error_result(format!("Could not write {}: {error}", args.path)),
-    };
-    with_file_lock(key, signal, move |signal| execute_locked(&args, &target, &output_directory, signal)).await
+    tokio::task::spawn_blocking(move || {
+        execute_locked(&args, &target, &output_directory, &file_reads, &signal).unwrap_or_else(error_result)
+    })
+    .await
+    .expect("tool worker completes while the runtime is running")
 }
 
 fn execute_locked(
     args: &WriteArgs,
     target: &Path,
     output_directory: &Path,
+    file_reads: &FileReadTracker,
     signal: &CancellationToken,
 ) -> Result<ToolExecution, String> {
     if signal.is_cancelled() {
         return Err(ABORTED_MESSAGE.into());
     }
     let (before, existed) = match std::fs::File::open(target) {
-        Ok(file) => (read_opened_text_file(file, &args.path)?, true),
+        Ok(file) => {
+            let metadata =
+                file.metadata().map_err(|error| format!("Could not inspect {}: {error}", args.path))?;
+            let canonical = target
+                .canonicalize()
+                .map_err(|error| format!("Could not inspect {}: {error}", args.path))?;
+            file_reads.verify_unchanged(
+                &app_core::workspace_key(&canonical),
+                &metadata,
+                &args.path,
+                "overwrite",
+            )?;
+            (read_opened_text_file(file, &args.path)?, true)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
         Err(error) => return Err(format!("Could not inspect {}: {error}", args.path)),
     };
@@ -93,6 +105,11 @@ fn execute_locked(
     }
     app_core::write_bytes_atomic(target, content.as_bytes())
         .map_err(|error| format!("Could not write {}: {error}", args.path))?;
+    if let Ok(updated_meta) = std::fs::metadata(target)
+        && let Ok(canonical) = target.canonicalize()
+    {
+        file_reads.record_metadata(app_core::workspace_key(&canonical), &updated_meta);
+    }
     let verb = if existed { "Wrote" } else { "Created" };
     let mut execution = format_diff_result(verb, &args.path, &before, &content, output_directory);
     execution.file_created = Some(!existed);

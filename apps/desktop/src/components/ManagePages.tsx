@@ -68,7 +68,6 @@ export function InstructionsPage() {
       setDocuments(current => ({ ...current, [key]: document }))
       setDrafts(current => { const next = { ...current }; delete next[key]; return next })
       setShowSaved(true)
-      appStore.invalidateContextPreview()
     } catch (error) { setError(errorMessage(error)) }
     finally { setSaving(false) }
   }
@@ -120,7 +119,6 @@ function SkillsList({ root }: { root: string | null }) {
     if (loading || root === null) return
     setLoading(true)
     setReload(value => value + 1)
-    appStore.invalidateContextPreview()
   }
   useEffect(() => {
     let active = true

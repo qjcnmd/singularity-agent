@@ -11,6 +11,7 @@ import { ExpandChevron } from './ExpandChevron'
 type Loaded = { document?: TextDocument; changes?: ChangedFile[]; error?: string }
 
 const isMarkdown = (path: string) => ['md', 'markdown'].includes(pathExtension(path))
+const MUTATING_TOOLS = new Set(['edit', 'write', 'bash', 'task_output', 'task_stop', 'mcp_call'])
 
 function workspaceRefreshKey(state: Pick<AppState, 'bootstrap' | 'liveSessions' | 'session'>, tab: FileTab | null): string {
   if (!tab) return ''
@@ -19,12 +20,12 @@ function workspaceRefreshKey(state: Pick<AppState, 'bootstrap' | 'liveSessions' 
   const sessionKeys = sessions.map(item => {
     const live = state.liveSessions[item.threadId]
     const tasks = live?.backgroundTasks.map(task => `${task.taskId}:${task.state.status}`).join(',') ?? ''
-    return `${item.threadId}:${item.updatedAt}:${item.status ?? ''}:${live?.phase ?? ''}:${live?.summaryRevision ?? ''}:${tasks}`
+    return `${item.threadId}:${item.updatedAt}:${item.status ?? ''}:${live?.phase ?? ''}:${tasks}`
   }).join('|')
   const current = state.session && workspaceKey(state.session.summary.cwd) === wsKey ? state.session : null
   const lastTurn = current?.facts.at(-1)
   const completedTools = lastTurn?.items.reduce(
-    (count, item) => count + (item.type === 'tool' && item.status === 'completed' ? 1 : 0),
+    (count, item) => count + (item.type === 'tool' && item.status === 'completed' && MUTATING_TOOLS.has(item.name) ? 1 : 0),
     0,
   ) ?? 0
   return `${sessionKeys}#${current?.summary.threadId ?? ''}:${current?.facts.length ?? ''}:${lastTurn?.status ?? ''}:${completedTools}`
@@ -61,7 +62,7 @@ export function FilePanel() {
   const refreshKey = workspaceRefreshKey(state, active)
   const loaded = active ? documents[active.id] : undefined
   const shown = loaded?.document
-  const shownChanges = loaded?.error ? undefined : (loaded?.changes ?? active?.initialChanges)
+  const shownChanges = loaded?.error ? undefined : loaded?.changes
 
   const activeId = active?.id
   const activeMode = active?.mode
@@ -74,7 +75,7 @@ export function FilePanel() {
     let current = true
     const update = (patch: Loaded) => setDocuments(all => ({ ...all, [activeId]: { ...all[activeId], ...patch } }))
     if (activeMode === 'changes') {
-      void appStore.transport.rpc('session.changedFiles', { workspaceRoot: activeCwd, includeDiffs: true }).then(
+      void appStore.transport.rpc('session.changedFiles', { workspaceRoot: activeCwd }).then(
         changes => { if (current) update({ changes, error: undefined }) },
         error => { if (current) update({ changes: undefined, error: errorMessage(error) }) },
       )
@@ -232,9 +233,7 @@ function ChangedFilesView({ files, workspaceRoot, refreshToken, focusPath, focus
               <ExpandChevron expanded={isOpen} size={12} />
             </button>
             {isOpen && (
-              file.diff !== undefined
-                ? <div className="changes-inline-diff"><EditDiff path={file.path} output={file.diff} bare /></div>
-                : <LazyInlineFileDiff workspaceRoot={workspaceRoot} path={file.path} refreshToken={refreshToken} />
+              <InlineFileDiff workspaceRoot={workspaceRoot} path={file.path} refreshToken={refreshToken} />
             )}
           </section>
         )
@@ -243,7 +242,7 @@ function ChangedFilesView({ files, workspaceRoot, refreshToken, focusPath, focus
   )
 }
 
-function LazyInlineFileDiff({ workspaceRoot, path, refreshToken }: {
+function InlineFileDiff({ workspaceRoot, path, refreshToken }: {
   workspaceRoot: string
   path: string
   refreshToken: string
@@ -261,9 +260,9 @@ function LazyInlineFileDiff({ workspaceRoot, path, refreshToken }: {
     return () => { active = false }
   }, [workspaceRoot, path, refreshToken, retry])
 
+  if (!state.diff && !state.error) return null
   return (
     <div className="changes-inline-diff">
-      {!state.diff && !state.error && <p className="changes-inline-status" role="status">读取差异中…</p>}
       {state.error && (
         <p className="changes-inline-status form-error" role="alert">
           {state.error}

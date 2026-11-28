@@ -21,25 +21,22 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
   const [expanded, setExpanded] = useState<string | null>(null)
   const [editor, setEditor] = useState<McpServerInput | 'new' | null>(null)
   const [removing, setRemoving] = useState<McpServerInput | null>(null)
-  const epoch = useRef(0)
-  const loadRevision = useRef(0)
-  const reconnectRevisions = useRef<Map<string, number>>(new Map())
+  const requestId = useRef(0)
 
   const load = useCallback(async () => {
-    const ep = epoch.current
-    const version = ++loadRevision.current
+    const id = ++requestId.current
     try {
       const servers = await appStore.transport.rpc('mcp.list', { workspaceRoot })
-      if (ep === epoch.current && version === loadRevision.current) {
+      if (id === requestId.current) {
         setLoadError(null)
         setServers(servers)
       }
     } catch (error) {
-      if (ep === epoch.current && version === loadRevision.current) {
+      if (id === requestId.current) {
         setLoadError(errorMessage(error, '读取 MCP 配置失败。'))
       }
     } finally {
-      if (ep === epoch.current && version === loadRevision.current) setLoading(false)
+      if (id === requestId.current) setLoading(false)
     }
   }, [workspaceRoot])
 
@@ -48,11 +45,8 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
     setLoadError(null)
     setMutationError(null)
     void load()
-    const revisions = reconnectRevisions.current
     return () => {
-      epoch.current += 1
-      loadRevision.current += 1
-      revisions.clear()
+      requestId.current += 1
     }
   }, [load])
 
@@ -66,21 +60,17 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
   }, [busy, loading, loadError, reconnecting, hasConnecting, servers, load])
 
   async function reconnect(serverId: string) {
-    const ep = epoch.current
-    loadRevision.current += 1
-    const version = (reconnectRevisions.current.get(serverId) ?? 0) + 1
-    reconnectRevisions.current.set(serverId, version)
+    const id = ++requestId.current
     setReconnecting(count => count + 1)
     setServers(current => current.map(state => state.server.serverId === serverId
       ? { ...state, status: 'connecting', error: null, tools: [] } : state))
     try {
       const result = await appStore.transport.rpc('mcp.reconnect', { serverId, workspaceRoot })
-      appStore.invalidateContextPreview()
-      if (ep === epoch.current && reconnectRevisions.current.get(serverId) === version) {
+      if (id === requestId.current) {
         setServers(current => current.map(state => state.server.serverId === serverId ? result : state))
       }
     } catch (error) {
-      if (ep === epoch.current && reconnectRevisions.current.get(serverId) === version) {
+      if (id === requestId.current) {
         setServers(current => current.map(state => state.server.serverId === serverId
           ? { ...state, status: 'failed', error: errorMessage(error, '连接 MCP 失败。'), tools: [] } : state))
       }
@@ -93,25 +83,18 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
     if (busy) return false
     setBusy(true)
     setMutationError(null)
-    const startEpoch = epoch.current
-    loadRevision.current += 1
+    const id = ++requestId.current
     try {
       const servers = await action()
-      appStore.invalidateContextPreview()
-      if (startEpoch !== epoch.current) return false
-      epoch.current += 1
-      loadRevision.current += 1
-      reconnectRevisions.current.clear()
+      if (id !== requestId.current) return false
       setLoadError(null)
       setServers(servers)
       setLoading(false)
       return true
-    }
-    catch (error) {
-      if (startEpoch === epoch.current) setMutationError(errorMessage(error, '保存 MCP 配置失败。'))
+    } catch (error) {
+      if (id === requestId.current) setMutationError(errorMessage(error, '保存 MCP 配置失败。'))
       return false
-    }
-    finally { setBusy(false) }
+    } finally { setBusy(false) }
   }
 
   async function retryLoad() {

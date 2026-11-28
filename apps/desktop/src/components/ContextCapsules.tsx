@@ -15,7 +15,7 @@ type ModuleQuery =
   | { status: 'ready'; modules: ContextModule[] }
   | { status: 'error'; message: string }
 
-function useContextModules(workspaceRoot: string | null, ready: boolean, previewVersion: number) {
+function useContextModules(workspaceRoot: string | null, ready: boolean, settingsOpen: boolean, webSearchKey: string) {
   const [query, setQuery] = useState<ModuleQuery>({ status: 'idle' })
   const [reload, setReload] = useState(0)
   useLayoutEffect(() => {
@@ -23,6 +23,7 @@ function useContextModules(workspaceRoot: string | null, ready: boolean, preview
       setQuery({ status: 'idle' })
       return
     }
+    if (settingsOpen) return
     setQuery({ status: 'loading' })
     let active = true
     void appStore.transport.rpc('context.preview', { workspaceRoot }).then(
@@ -30,13 +31,13 @@ function useContextModules(workspaceRoot: string | null, ready: boolean, preview
       error => { if (active) setQuery({ status: 'error', message: errorMessage(error) }) },
     )
     return () => { active = false }
-  }, [workspaceRoot, ready, previewVersion, reload])
+  }, [workspaceRoot, ready, settingsOpen, webSearchKey, reload])
   return { query, retry: () => setReload(value => value + 1) }
 }
 
 const groupTitles: Record<ContextGroup, string> = { instructions: '指令', tools: '工具', skills: '技能', mcp: 'MCP' }
 
-const capsulesFields = ['drafts', 'bootstrap', 'selectedWorkspaceRoot', 'pendingActions', 'contextPreviewVersion'] as const
+const capsulesFields = ['drafts', 'bootstrap', 'selectedWorkspaceRoot', 'pendingActions', 'settingsOpen'] as const
 
 function sameDisabledModules(previous: string[] | undefined, next: string[] | undefined): boolean {
   const left = previous ?? []
@@ -53,13 +54,15 @@ function sameCapsulesState(
   return previous.selectedWorkspaceRoot === next.selectedWorkspaceRoot
     && Object.is(previous.bootstrap, next.bootstrap)
     && Object.is(previous.pendingActions, next.pendingActions)
-    && previous.contextPreviewVersion === next.contextPreviewVersion
+    && previous.settingsOpen === next.settingsOpen
     && sameDisabledModules(prevModules, nextModules)
 }
 
 export const ContextCapsules = memo(function ContextCapsules() {
   const state = useAppStore(capsulesFields, sameCapsulesState)
-  const { query, retry } = useContextModules(state.selectedWorkspaceRoot, state.bootstrap !== null, state.contextPreviewVersion)
+  const webSearch = state.bootstrap?.modelCatalog.webSearch
+  const webSearchKey = webSearch ? `${webSearch.credentialConfigured}:${webSearch.baseUrl}` : ''
+  const { query, retry } = useContextModules(state.selectedWorkspaceRoot, state.bootstrap !== null, state.settingsOpen, webSearchKey)
   const disabled = new Set(appStore.inputDraft().disabledModules)
   return <div className="context-capsules">
     <ProjectCapsule state={state} />

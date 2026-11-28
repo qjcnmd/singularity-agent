@@ -1,25 +1,19 @@
 mod parse;
 
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 
 use protocol::{ChangedFile, ChangedFileStatus};
 
-use self::parse::{
-    DiffSection, commit_section, count_lines_in_bytes, format_git_diff, format_untracked_bytes,
-    parse_raw_numstat,
-};
+use self::parse::{count_lines_in_bytes, format_git_diff, format_untracked_bytes, parse_raw_numstat};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const MAX_BATCH_DIFF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_UNTRACKED_BYTES: usize = 1024 * 1024;
-const MAX_STDERR_BYTES: u64 = 4 * 1024;
 const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-const EMPTY_TREE_SHA256: &str = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
 
 const DIFF_COMMON_ARGS: &[&str] = &[
     "--literal-pathspecs",
@@ -54,7 +48,7 @@ enum DiffAttempt<T> {
     UnbornHead,
 }
 
-pub(crate) fn changed_files(cwd: &Path, include_diffs: bool) -> io::Result<Vec<ChangedFile>> {
+pub(crate) fn changed_files(cwd: &Path) -> io::Result<Vec<ChangedFile>> {
     let Some(git) = git_binary() else {
         return Ok(Vec::new());
     };
@@ -62,11 +56,8 @@ pub(crate) fn changed_files(cwd: &Path, include_diffs: bool) -> io::Result<Vec<C
         return Ok(Vec::new());
     };
     let mut files = BTreeMap::<String, ChangedFile>::new();
-    let mut remaining_budget = if include_diffs { MAX_BATCH_DIFF_BYTES } else { 0 };
 
-    if include_diffs {
-        apply_batch_diffs(git, cwd, &mut files, &mut remaining_budget)?;
-    } else if let Some(raw_numstat) =
+    if let Some(raw_numstat) =
         run_git_diff_with_empty_tree_fallback(git, cwd, DIFF_SUMMARY_ARGS, &["--", "."])?
     {
         parse_raw_numstat(&raw_numstat, &mut files);
@@ -80,22 +71,10 @@ pub(crate) fn changed_files(cwd: &Path, include_diffs: bool) -> io::Result<Vec<C
         if rel.is_empty() || contains_path(&files, &rel) {
             continue;
         }
-        let Ok(Some((bytes, truncated_file))) = read_regular_bounded(&cwd.join(&rel), MAX_UNTRACKED_BYTES)
-        else {
+        let Ok(Some((bytes, _))) = read_regular_bounded(&cwd.join(&rel), MAX_UNTRACKED_BYTES) else {
             continue;
         };
         let added = count_lines_in_bytes(&bytes);
-        let diff = if remaining_budget > 0 {
-            let formatted = format_untracked_bytes(&bytes, truncated_file);
-            if formatted.len() <= remaining_budget {
-                remaining_budget -= formatted.len();
-                Some(formatted)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         files.insert(
             rel.clone(),
             ChangedFile {
@@ -103,7 +82,6 @@ pub(crate) fn changed_files(cwd: &Path, include_diffs: bool) -> io::Result<Vec<C
                 added,
                 deleted: 0,
                 status: ChangedFileStatus::Added,
-                diff,
             },
         );
     }
@@ -120,7 +98,7 @@ pub(crate) fn file_diff(cwd: &Path, rel_path: &str) -> io::Result<String> {
         SingleDiff::Empty => {}
     }
     #[cfg(windows)]
-    if let Ok(listed) = changed_files(cwd, false) {
+    if let Ok(listed) = changed_files(cwd) {
         let target = rel_path.to_lowercase();
         if let Some(matched) = listed.into_iter().find(|f| f.path.to_lowercase() == target)
             && matched.path != rel_path
@@ -172,16 +150,6 @@ fn contains_path(files: &BTreeMap<String, ChangedFile>, rel: &str) -> bool {
     }
 }
 
-fn empty_tree_oid(git: &Path, cwd: &Path) -> &'static str {
-    if let Ok(out) = run_git(git, cwd, &["rev-parse", "--show-object-format"])
-        && out.status.success()
-        && String::from_utf8_lossy(&out.stdout).trim().eq_ignore_ascii_case("sha256")
-    {
-        return EMPTY_TREE_SHA256;
-    }
-    EMPTY_TREE_SHA1
-}
-
 fn git_binary() -> Option<&'static Path> {
     if let Some(path) = GIT_BINARY.get() {
         return Some(path.as_path());
@@ -227,7 +195,7 @@ fn resolve_direct_git(found: PathBuf) -> PathBuf {
     found
 }
 
-fn git_command(git: &Path, cwd: &Path, args: &[&str]) -> Command {
+fn run_git(git: &Path, cwd: &Path, args: &[&str]) -> io::Result<Output> {
     let mut cmd = Command::new(git);
     cmd.current_dir(cwd)
         .args(args)
@@ -242,11 +210,7 @@ fn git_command(git: &Path, cwd: &Path, args: &[&str]) -> Command {
         use std::os::windows::process::CommandExt as _;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd
-}
-
-fn run_git(git: &Path, cwd: &Path, args: &[&str]) -> io::Result<Output> {
-    git_command(git, cwd, args).output()
+    cmd.output()
 }
 
 fn ls_untracked(git: &Path, cwd: &Path, target: &str) -> io::Result<Option<Vec<u8>>> {
@@ -301,98 +265,11 @@ fn run_git_diff_with_empty_tree_fallback(
     match run_with_base("HEAD")? {
         DiffAttempt::Ok(out) => Ok(Some(out)),
         DiffAttempt::NotGitRepo => Ok(None),
-        DiffAttempt::UnbornHead => match run_with_base(empty_tree_oid(git, cwd))? {
+        DiffAttempt::UnbornHead => match run_with_base(EMPTY_TREE_SHA1)? {
             DiffAttempt::Ok(out) => Ok(Some(out)),
             DiffAttempt::NotGitRepo => Ok(None),
             DiffAttempt::UnbornHead => Ok(Some(Vec::new())),
         },
-    }
-}
-
-fn apply_batch_diffs(
-    git: &Path,
-    cwd: &Path,
-    files: &mut BTreeMap<String, ChangedFile>,
-    remaining_budget: &mut usize,
-) -> io::Result<()> {
-    match stream_batch_diffs(git, cwd, "HEAD", files, remaining_budget)? {
-        DiffAttempt::Ok(()) | DiffAttempt::NotGitRepo => Ok(()),
-        DiffAttempt::UnbornHead => {
-            let empty = empty_tree_oid(git, cwd);
-            let _ = stream_batch_diffs(git, cwd, empty, files, remaining_budget)?;
-            Ok(())
-        }
-    }
-}
-
-fn stream_batch_diffs(
-    git: &Path,
-    cwd: &Path,
-    base: &str,
-    files: &mut BTreeMap<String, ChangedFile>,
-    remaining_budget: &mut usize,
-) -> io::Result<DiffAttempt<()>> {
-    let args: Vec<&str> = DIFF_COMMON_ARGS
-        .iter()
-        .copied()
-        .chain(DIFF_PATCH_ARGS.iter().copied())
-        .chain([base, "--", "."])
-        .collect();
-    let mut child = git_command(git, cwd, &args).spawn()?;
-    let stdout = child.stdout.take().expect("git diff stdout piped");
-    let stderr = child.stderr.take().expect("git diff stderr piped");
-
-    let (read_res, stderr_text) = std::thread::scope(|scope| {
-        let stderr_handle = scope.spawn(move || {
-            let mut reader = stderr;
-            let mut buf = Vec::new();
-            let _ = reader.by_ref().take(MAX_STDERR_BYTES).read_to_end(&mut buf);
-            let _ = io::copy(&mut reader, &mut io::sink());
-            String::from_utf8_lossy(&buf).into_owned()
-        });
-
-        let mut reader = BufReader::with_capacity(64 * 1024, stdout);
-        let mut raw_line = Vec::new();
-        let mut current: Option<DiffSection> = None;
-        let read_res: io::Result<()> = loop {
-            raw_line.clear();
-            match reader.read_until(b'\n', &mut raw_line) {
-                Ok(0) => {
-                    if let Some(section) = current.take() {
-                        commit_section(section, files, remaining_budget);
-                    }
-                    break Ok(());
-                }
-                Ok(_) => {
-                    while matches!(raw_line.last(), Some(b'\n' | b'\r')) {
-                        raw_line.pop();
-                    }
-                    let line = String::from_utf8_lossy(&raw_line);
-                    if line.starts_with("diff --git ") {
-                        if let Some(section) = current.take() {
-                            commit_section(section, files, remaining_budget);
-                        }
-                        current = Some(DiffSection::new(line.into_owned()));
-                    } else if let Some(section) = current.as_mut() {
-                        section.push_line(&line, *remaining_budget > 0);
-                    }
-                }
-                Err(error) => break Err(error),
-            }
-        };
-        let stderr_text = stderr_handle.join().unwrap_or_default();
-        (read_res, stderr_text)
-    });
-
-    let status = child.wait()?;
-    read_res?;
-    if status.success() {
-        return Ok(DiffAttempt::Ok(()));
-    }
-    match classify_diff_stderr(&stderr_text) {
-        Some(DiffAttempt::NotGitRepo) => Ok(DiffAttempt::NotGitRepo),
-        Some(DiffAttempt::UnbornHead) => Ok(DiffAttempt::UnbornHead),
-        _ => Err(io::Error::other(format!("git diff 失败：{}", stderr_text.trim()))),
     }
 }
 

@@ -1,36 +1,37 @@
 use std::sync::Arc;
 
-use agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, RequestContext};
+use agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, RequestContext, UserQuestions};
 use agent::session::{LedgerRecord, lock_writer, with_writer_async};
 use model::ModelClient;
 
 use protocol::{TurnErrorDetail, TurnEvent, TurnStatus};
 use tokio_util::sync::CancellationToken;
 
-use super::state::TurnControls;
 use super::{Conversation, ConversationError};
 
 impl Conversation {
     pub(super) async fn run_single_turn(
         self: &Arc<Self>,
-        controls: &Arc<TurnControls>,
+        turn_id: &str,
+        token: &CancellationToken,
+        questions: &Arc<UserQuestions>,
         sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<TurnStatus, TurnErrorDetail> {
         let conversation = Arc::clone(self);
-        let preparing = Arc::clone(controls);
-        let prepared = tokio::task::spawn_blocking(move || conversation.prepare_turn(&preparing))
-            .await
-            .expect("turn preparation completes while the runtime is running");
+        let prep_turn_id = turn_id.to_owned();
+        let prep_token = token.clone();
+        let prep_questions = Arc::clone(questions);
+        let prepared = tokio::task::spawn_blocking(move || {
+            conversation.prepare_turn(&prep_turn_id, &prep_token, &prep_questions)
+        })
+        .await
+        .expect("turn preparation completes while the runtime is running");
         let ReadyTurn { mut agent, started_at, context_window } = match prepared {
             Ok(PreparedTurn::Ready(ready)) => *ready,
-            Ok(PreparedTurn::Cancelled) => {
-                controls.finish_cancel();
-                return Ok(TurnStatus::Interrupted);
-            }
-            Err(error) => return finish_preparation_error(controls, error),
+            Ok(PreparedTurn::Cancelled) => return Ok(TurnStatus::Interrupted),
+            Err(error) => return self.finish_preparation_error(error),
         };
         self.lock_inner().state.last_context_window = Some(context_window);
-        let turn_id = controls.turn_id.clone();
         sink(AgentEvent::Turn(TurnEvent::TurnStarted { started_at }));
 
         let run_result = {
@@ -46,20 +47,20 @@ impl Conversation {
                         item,
                         protocol::HistoryItem::CompactionResult { status: TurnStatus::Running, .. }
                     );
-                    controls.set_compacting(active);
+                    self.set_compacting(active);
                     sink(event);
                     sink(AgentEvent::SessionStateChanged);
                 }
-                AgentEvent::Turn(TurnEvent::MessageDiscarded { .. }) if controls.is_compacting() => {
-                    controls.set_compacting(false);
+                AgentEvent::Turn(TurnEvent::MessageDiscarded { .. }) if self.is_compacting() => {
+                    self.set_compacting(false);
                     sink(event);
                     sink(AgentEvent::SessionStateChanged);
                 }
                 _ => sink(event),
             };
-            agent.run(&mut on_event, controls.cancellation()).await
+            agent.run(&mut on_event, token).await
         };
-        let cancel_accepted = controls.finish_cancel();
+        let cancel_accepted = self.lock_inner().state.user_stopped;
         let (turn_status, error) = match run_result {
             Ok(()) if cancel_accepted => (TurnStatus::Interrupted, None),
             Ok(()) => (TurnStatus::Completed, None),
@@ -72,7 +73,7 @@ impl Conversation {
             }
         };
         let record = LedgerRecord::OperationFinished {
-            turn_id: turn_id.clone(),
+            turn_id: turn_id.to_owned(),
             outcome: turn_status,
             error: error.clone(),
             user_stopped: cancel_accepted,
@@ -108,7 +109,7 @@ impl Conversation {
 
     pub(super) async fn compact_thread(
         self: &Arc<Self>,
-        controls: &TurnControls,
+        token: &CancellationToken,
         sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<TurnStatus, TurnErrorDetail> {
         let conversation = Arc::clone(self);
@@ -117,10 +118,10 @@ impl Conversation {
             .expect("compaction preparation completes while the runtime is running");
         let mut requests = match prepared {
             Ok(requests) => requests,
-            Err(error) => return finish_preparation_error(controls, error),
+            Err(error) => return self.finish_preparation_error(error),
         };
-        let result = requests.compact_manual(sink, controls.cancellation()).await;
-        let cancelled = controls.finish_cancel();
+        let result = requests.compact_manual(sink, token).await;
+        let cancelled = self.lock_inner().state.user_stopped;
         match result {
             Ok(()) if cancelled => Ok(TurnStatus::Interrupted),
             Ok(()) => Ok(TurnStatus::Completed),
@@ -131,20 +132,46 @@ impl Conversation {
         }
     }
 
-    fn prepare_turn(&self, controls: &TurnControls) -> Result<PreparedTurn, TurnErrorDetail> {
-        if controls.cancellation().is_cancelled() {
+    fn set_compacting(&self, active: bool) {
+        self.lock_inner().state.compacting = active;
+    }
+
+    fn is_compacting(&self) -> bool {
+        self.lock_inner().state.compacting
+    }
+
+    fn finish_preparation_error(&self, error: TurnErrorDetail) -> Result<TurnStatus, TurnErrorDetail> {
+        if self.lock_inner().state.user_stopped {
+            Ok(TurnStatus::Interrupted)
+        } else {
+            Err(error)
+        }
+    }
+
+    fn prepare_turn(
+        &self,
+        turn_id: &str,
+        token: &CancellationToken,
+        questions: &Arc<UserQuestions>,
+    ) -> Result<PreparedTurn, TurnErrorDetail> {
+        if token.is_cancelled() {
             return Ok(PreparedTurn::Cancelled);
         }
         let inbox = Arc::clone(&self.lock_inner().state.steering_inbox);
         let context = self.prepare_request_context()?;
         let context_window = context.context_window();
-        let agent = Agent::new(context, inbox, Arc::clone(&controls.questions), Arc::clone(&self.bash_tasks));
-        if controls.cancellation().is_cancelled() {
+        let agent = Agent::new(
+            context,
+            inbox,
+            Arc::clone(questions),
+            Arc::clone(&self.bash_tasks),
+            Arc::clone(&self.file_reads),
+        );
+        if token.is_cancelled() {
             return Ok(PreparedTurn::Cancelled);
         }
         let mut writer = lock_writer(&self.writer);
-        let started_at =
-            writer.append_operation_started(controls.turn_id.clone()).map_err(preparation_error)?;
+        let started_at = writer.append_operation_started(turn_id.to_owned()).map_err(preparation_error)?;
         Ok(PreparedTurn::Ready(Box::new(ReadyTurn { agent, started_at, context_window })))
     }
 
@@ -152,38 +179,38 @@ impl Conversation {
         self: &Arc<Self>,
         shutdown: &CancellationToken,
     ) -> Result<(), ConversationError> {
-        let (cancel, mut cancel_guard) = {
-            let mut inner = self.lock_inner();
+        let cancel = {
+            let inner = self.lock_inner();
             if shutdown.is_cancelled() || inner.state.turn.is_busy() || inner.view.context.is_some() {
                 return Ok(());
             }
             if inner.state.closing {
                 return Err(ConversationError::Busy);
             }
-            let cancel = shutdown.child_token();
-            let id = inner.state.register_inspect_cancel(cancel.clone());
-            (cancel, InspectCancelGuard { conversation: self, id: Some(id) })
+            inner.state.inspect_cancel.clone()
         };
         let conversation = Arc::clone(self);
-        let result = async {
-            let config = tokio::task::spawn_blocking(move || conversation.load_agent_config())
-                .await
-                .expect("context preparation completes while the runtime is running")
-                .map_err(ConversationError::Message)?;
-            Ok::<_, ConversationError>(
-                agent::agent::modules::inspect(
-                    std::path::Path::new(&self.cwd),
-                    &config,
-                    Arc::clone(&self.models),
-                    &self.mcp,
-                    &cancel,
+        let result = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Ok(()),
+            result = async {
+                let config = tokio::task::spawn_blocking(move || conversation.load_agent_config())
+                    .await
+                    .expect("context preparation completes while the runtime is running")
+                    .map_err(ConversationError::Message)?;
+                Ok::<_, ConversationError>(
+                    agent::agent::modules::inspect(
+                        std::path::Path::new(&self.cwd),
+                        &config,
+                        Arc::clone(&self.models),
+                        &self.mcp,
+                        &cancel,
+                    )
+                    .await?,
                 )
-                .await?,
-            )
-        }
-        .await;
+            } => result,
+        };
         let mut inner = self.lock_inner();
-        cancel_guard.remove_locked(&mut inner.state);
         if shutdown.is_cancelled() || inner.state.turn.is_busy() || inner.view.context.is_some() {
             return Ok(());
         }
@@ -207,35 +234,27 @@ impl Conversation {
     fn prepare_request_context(&self) -> Result<RequestContext, TurnErrorDetail> {
         let selection = self.model();
         let provider = ModelClient::new(&self.models, &selection).map_err(preparation_error)?;
-        let config = self.load_agent_config().map_err(preparation_error)?;
+        let (config, preloaded) = if self.prefix_cache.is_locked() {
+            (
+                AgentConfig {
+                    instruction_home: self.home.clone(),
+                    initial_instructions: Vec::new(),
+                    disabled_modules: self.disabled_modules.clone(),
+                },
+                false,
+            )
+        } else {
+            (self.load_agent_config().map_err(preparation_error)?, true)
+        };
         Ok(RequestContext::new(
             provider,
             Arc::clone(&self.models),
             config,
             Arc::clone(&self.writer),
             Arc::clone(&self.mcp),
+            Arc::clone(&self.prefix_cache),
+            preloaded,
         ))
-    }
-}
-
-struct InspectCancelGuard<'a> {
-    conversation: &'a Conversation,
-    id: Option<u64>,
-}
-
-impl InspectCancelGuard<'_> {
-    fn remove_locked(&mut self, state: &mut super::state::ConversationState) {
-        if let Some(id) = self.id.take() {
-            state.remove_inspect_cancel(id);
-        }
-    }
-}
-
-impl Drop for InspectCancelGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(id) = self.id.take() {
-            self.conversation.lock_inner().state.remove_inspect_cancel(id);
-        }
     }
 }
 
@@ -248,17 +267,6 @@ struct ReadyTurn {
 enum PreparedTurn {
     Ready(Box<ReadyTurn>),
     Cancelled,
-}
-
-fn finish_preparation_error(
-    controls: &TurnControls,
-    error: TurnErrorDetail,
-) -> Result<TurnStatus, TurnErrorDetail> {
-    if controls.finish_cancel() {
-        Ok(TurnStatus::Interrupted)
-    } else {
-        Err(error)
-    }
 }
 
 fn preparation_error(error: impl std::fmt::Display) -> TurnErrorDetail {

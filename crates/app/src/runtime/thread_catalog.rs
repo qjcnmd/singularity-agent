@@ -1,4 +1,7 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use agent::session::{
     SessionData, SessionError, SessionManager, scan_session_entries, session_images_directory,
@@ -11,13 +14,28 @@ use crate::runtime::history::ThreadSummaryScan;
 
 pub(crate) const SESSIONS_DIR_NAME: &str = "sessions";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+struct CachedSummary {
+    stamp: FileStamp,
+    summary: ThreadSummary,
+}
+
 pub(crate) struct ThreadCatalog {
     sessions_dir: PathBuf,
+    summary_cache: Mutex<HashMap<String, CachedSummary>>,
 }
 
 impl ThreadCatalog {
     pub(crate) fn new(sessions_dir: PathBuf) -> Self {
-        Self { sessions_dir }
+        Self {
+            sessions_dir,
+            summary_cache: Mutex::new(HashMap::new()),
+        }
     }
 
     pub(crate) fn create_thread(
@@ -39,12 +57,17 @@ impl ThreadCatalog {
     pub(crate) fn list_threads(&self) -> Result<Vec<ThreadSummary>, CatalogError> {
         let entries = match std::fs::read_dir(&self.sessions_dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.summary_cache.lock().expect("thread summary cache lock poisoned").clear();
+                return Ok(Vec::new());
+            }
             Err(source) => {
                 return Err(CatalogError::Io { path: self.sessions_dir.clone(), source });
             }
         };
         let mut threads = Vec::new();
+        let mut seen = HashSet::new();
+        let mut updates = Vec::new();
         for entry in entries {
             let entry =
                 entry.map_err(|source| CatalogError::Io { path: self.sessions_dir.clone(), source })?;
@@ -56,15 +79,49 @@ impl ThreadCatalog {
                 continue;
             };
             let path = checked_session_path(&self.sessions_dir, thread_id)?;
+            let stamp = match entry.metadata() {
+                Ok(meta) => Some(FileStamp {
+                    modified: meta.modified().ok(),
+                    len: meta.len(),
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => None,
+            };
+            if let Some(stamp) = stamp
+                && let Some(cached) = self
+                    .summary_cache
+                    .lock()
+                    .expect("thread summary cache lock poisoned")
+                    .get(thread_id)
+                    .filter(|cached| cached.stamp == stamp)
+                    .map(|cached| cached.summary.clone())
+            {
+                seen.insert(thread_id.to_owned());
+                threads.push(cached);
+                continue;
+            }
             let mut summary = ThreadSummaryScan::default();
             match scan_session_entries(&path, thread_id, |entry| summary.observe(&entry))
                 .map_err(|error| CatalogError::session(thread_id, &path, error))
             {
                 Ok((cwd, created_at)) => {
-                    threads.push(summary.finish(thread_id, app_core::display_path(&cwd), created_at));
+                    let finished = summary.finish(thread_id, app_core::display_path(&cwd), created_at);
+                    seen.insert(thread_id.to_owned());
+                    if let Some(stamp) = stamp {
+                        updates
+                            .push((thread_id.to_owned(), CachedSummary { stamp, summary: finished.clone() }));
+                    }
+                    threads.push(finished);
                 }
                 Err(CatalogError::NotFound(_)) => {}
                 Err(error) => return Err(error),
+            }
+        }
+        {
+            let mut cache = self.summary_cache.lock().expect("thread summary cache lock poisoned");
+            cache.retain(|id, _| seen.contains(id));
+            for (id, entry) in updates {
+                cache.insert(id, entry);
             }
         }
         threads.sort_by(|left, right| {
@@ -92,7 +149,10 @@ impl ThreadCatalog {
                 return Err(CatalogError::Io { path: directory, source });
             }
         }
-        std::fs::remove_file(&path).map_err(|error| CatalogError::session(thread_id, &path, error.into()))
+        let removed = std::fs::remove_file(&path)
+            .map_err(|error| CatalogError::session(thread_id, &path, error.into()));
+        self.summary_cache.lock().expect("thread summary cache lock poisoned").remove(thread_id);
+        removed
     }
 
     fn session_error(&self, thread_id: &str, source: SessionError) -> CatalogError {

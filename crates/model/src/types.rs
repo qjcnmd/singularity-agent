@@ -31,8 +31,6 @@ pub struct ProviderMessageMetadata {
     pub model_name: String,
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefix_digest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
 }
 

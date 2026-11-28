@@ -68,19 +68,21 @@ fn cleared_tool_result_message(message: &Message) -> Message {
     }
 }
 
-pub(crate) fn select_idle_clearable_entry_ids(session: &SessionData, now_iso: &str) -> Vec<String> {
+pub(crate) fn is_session_idle_cold(session: &SessionData, now_iso: &str) -> bool {
     let Some(last_generation) = session.entries().iter().rev().find(|entry| {
         entry.request_observation().is_some_and(|obs| {
             obs.status == protocol::ProviderAttemptStatus::Ok
                 && obs.purpose == protocol::RequestPurpose::Generation
         })
     }) else {
-        return Vec::new();
+        return false;
     };
-    let Some(elapsed_secs) = app_core::iso_elapsed_secs(last_generation.timestamp(), now_iso) else {
-        return Vec::new();
-    };
-    if elapsed_secs < IDLE_CLEAR_THRESHOLD_SECS {
+    app_core::iso_elapsed_secs(last_generation.timestamp(), now_iso)
+        .is_some_and(|elapsed| elapsed >= IDLE_CLEAR_THRESHOLD_SECS)
+}
+
+pub(crate) fn select_idle_clearable_entry_ids(session: &SessionData, now_iso: &str) -> Vec<String> {
+    if !is_session_idle_cold(session, now_iso) {
         return Vec::new();
     }
 
@@ -289,7 +291,7 @@ fn text_block_token_estimate(text: &str) -> u64 {
     estimate_tokens_of(text).saturating_add(CONTENT_BLOCK_OVERHEAD_TOKENS)
 }
 
-pub(super) fn latest_reply_usage<'a>(
+fn latest_reply_usage<'a>(
     session: &'a SessionData,
     entries: &[&SessionEntry],
     definition_tokens: u64,
@@ -327,17 +329,6 @@ pub(crate) fn input_tokens(
         return total;
     }
     context_token_estimate_for(entries, session, Some(identity), cleared).saturating_add(definition_tokens)
-}
-
-pub(crate) fn prepare_context(
-    session: &SessionData,
-    identity: (&str, &str),
-    definition_tokens: u64,
-) -> PreparedContext {
-    let entries = resolve_context_entries(session);
-    let cleared = cleared_tool_result_ids(session);
-    let tokens = input_tokens(session, &entries, identity, definition_tokens, &cleared);
-    PreparedContext::new(session, &entries, tokens, &cleared)
 }
 
 pub(crate) struct PreparedContext {

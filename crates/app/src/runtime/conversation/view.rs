@@ -38,7 +38,7 @@ impl ConversationView {
 impl Conversation {
     pub(crate) fn start_result(&self) -> protocol::SessionStartResult {
         let inner = self.lock_inner();
-        let phase = inner.state.turn.phase();
+        let phase = inner.state.phase();
         let writer = lock_writer(&self.writer);
         protocol::SessionStartResult {
             summary: crate::runtime::history::summarize_thread(writer.data()),
@@ -53,7 +53,7 @@ impl Conversation {
     pub(crate) fn status(&self) -> protocol::SessionStatus {
         let inner = self.lock_inner();
         protocol::SessionStatus {
-            phase: inner.state.turn.phase(),
+            phase: inner.state.phase(),
             failure: inner.view.failure.clone(),
         }
     }
@@ -73,12 +73,12 @@ impl Conversation {
         context_usage: Option<protocol::ContextUsage>,
     ) -> SessionRuntime {
         SessionRuntime {
-            phase: inner.state.turn.phase(),
+            phase: inner.state.phase(),
             selection: inner.state.model.clone(),
             context_usage,
             model_usage: inner.view.usage.has_metrics().then(|| inner.view.usage.clone()),
             pending_question: match &inner.state.turn {
-                TurnLifecycle::Running(controls) => controls.questions.pending(),
+                TurnLifecycle::Running(_) => inner.state.questions.pending(),
                 TurnLifecycle::Idle => None,
             },
             pending_messages: inner
@@ -194,7 +194,7 @@ impl Conversation {
             }
             _ => {}
         }
-        let phase = inner.state.turn.phase();
+        let phase = inner.state.phase();
         if phase != SessionPhase::Idle {
             inner.view.activity.apply(&event);
         }

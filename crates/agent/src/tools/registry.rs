@@ -114,6 +114,7 @@ pub(crate) struct ToolContext {
     pub output_directory: std::path::PathBuf,
     pub signal: CancellationToken,
     pub bash_tasks: Arc<bash::BashTasks>,
+    pub file_reads: Arc<super::FileReadTracker>,
 }
 
 pub(crate) enum PreparedTool {
@@ -137,6 +138,28 @@ pub(crate) enum PreparedTool {
 }
 
 impl PreparedTool {
+    pub(crate) const fn is_read_only(&self) -> bool {
+        match self {
+            Self::Read(_)
+            | Self::Grep(_)
+            | Self::Glob(_)
+            | Self::ViewImage(_)
+            | Self::Skill(_, _)
+            | Self::TaskList
+            | Self::McpSchema(_)
+            | Self::WebSearch(_, _)
+            | Self::WebFetch(_, _) => true,
+            Self::Edit(_)
+            | Self::Write(_)
+            | Self::Todo(_)
+            | Self::Question(_)
+            | Self::Bash(_)
+            | Self::TaskOutput(_)
+            | Self::TaskStop(_)
+            | Self::Mcp(_, _) => false,
+        }
+    }
+
     pub(crate) async fn execute<F: Future<Output = ()> + Send>(
         self,
         context: ToolContext,
@@ -147,12 +170,16 @@ impl PreparedTool {
             output_directory,
             signal,
             bash_tasks,
+            file_reads,
         } = context;
         match self {
-            Self::Edit(args) => Box::pin(edit::execute(args, cwd, output_directory, signal)).await,
-            Self::Write(args) => Box::pin(write::execute(args, cwd, output_directory, signal)).await,
+            Self::Edit(args) => {
+                Box::pin(edit::execute(args, cwd, output_directory, file_reads, signal)).await
+            }
+            Self::Write(args) => {
+                Box::pin(write::execute(args, cwd, output_directory, file_reads, signal)).await
+            }
             Self::Todo(args) => todo::execute(&args),
-            Self::McpSchema(tools) => mcp::execute_schema(&tools),
             Self::Mcp(tool, args) => Box::pin(mcp::execute(tool, args, output_directory, &signal)).await,
             Self::WebSearch(args, access) => {
                 Box::pin(web::execute_search(args, access, output_directory, &signal)).await
@@ -170,14 +197,16 @@ impl PreparedTool {
             | Self::Grep(_)
             | Self::Glob(_)
             | Self::ViewImage(_)
-            | Self::Skill(_, _) => tokio::task::spawn_blocking(move || match self {
+            | Self::Skill(_, _)
+            | Self::McpSchema(_) => tokio::task::spawn_blocking(move || match self {
                 Self::TaskList => bash_tasks.tool_list(),
                 Self::TaskOutput(args) => bash_tasks.output(&args.task_id, &signal),
-                Self::Read(args) => read::execute(&args, &cwd, &signal),
+                Self::Read(args) => read::execute(&args, &cwd, &file_reads, &signal),
                 Self::Grep(args) => grep::execute(&args, &cwd, &signal),
                 Self::Glob(args) => glob::execute(&args, &cwd, &signal),
                 Self::ViewImage(args) => view_image::execute(&args, &cwd, &signal),
                 Self::Skill(args, catalog) => skill::execute(&args, &catalog),
+                Self::McpSchema(tools) => mcp::execute_schema(&tools, &output_directory),
                 _ => unreachable!("non-blocking tool handled above"),
             })
             .await
@@ -253,7 +282,7 @@ pub(crate) fn todo_tool() -> BuiltinTool {
     })
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct ToolRegistrySnapshot {
     tools: Vec<BuiltinTool>,
     mcp_servers: BTreeMap<String, Vec<McpTool>>,

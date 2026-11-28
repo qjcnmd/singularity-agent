@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use super::format::{
 #[derive(Debug)]
 pub struct SessionManager {
     pub(super) data: SessionData,
+    writer: Option<BufWriter<std::fs::File>>,
     append_error: Option<Arc<std::io::Error>>,
 }
 
@@ -76,6 +78,7 @@ impl SessionManager {
                 session_id: header.id,
                 header_timestamp: header.timestamp,
             },
+            writer: Some(BufWriter::new(handle)),
             append_error: None,
         })
     }
@@ -85,7 +88,7 @@ impl SessionManager {
         if let Some(offset) = repair {
             repair_tail(path, offset)?;
         }
-        Ok(Self { data, append_error: None })
+        Ok(Self { data, writer: None, append_error: None })
     }
 }
 
@@ -288,11 +291,14 @@ impl SessionManager {
             serde_json::to_writer(&mut bytes, entry)?;
             bytes.push(b'\n');
         }
+        // Release any open append handle before atomic rename on Windows.
+        self.writer = None;
         app_core::write_bytes_atomic(&self.data.file, &bytes)?;
 
         self.data.entries.truncate(cut_idx);
         self.data.entries.extend(preserved);
         self.append_error = None;
+        cleanup_orphaned_attachments(&self.data);
         Ok(())
     }
 
@@ -322,14 +328,77 @@ impl SessionManager {
         let timestamp = entry.timestamp().to_string();
         let mut bytes = serde_json::to_vec(&entry)?;
         bytes.push(b'\n');
-        let mut handle = OpenOptions::new().append(true).open(&self.data.file)?;
-        handle.write_all(&bytes).map_err(|error| {
+        let writer = match &mut self.writer {
+            Some(writer) => writer,
+            None => {
+                let handle = OpenOptions::new().append(true).open(&self.data.file)?;
+                self.writer.insert(BufWriter::new(handle))
+            }
+        };
+        if let Err(error) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
+            self.writer = None;
             let error = Arc::new(error);
             self.append_error = Some(Arc::clone(&error));
-            SessionError::Io(std::io::Error::new(error.kind(), error))
-        })?;
+            return Err(SessionError::Io(std::io::Error::new(error.kind(), error)));
+        }
         self.data.entries.push(entry);
         Ok(timestamp)
+    }
+}
+
+fn cleanup_orphaned_attachments(data: &SessionData) {
+    let mut kept_images = HashSet::new();
+    let mut kept_outputs = HashSet::new();
+    for entry in &data.entries {
+        match entry {
+            SessionEntry::Message { message, display, .. } => {
+                for image in message.images() {
+                    kept_images.insert(image.id.clone());
+                }
+                collect_output_names(&message.content_text(), &mut kept_outputs);
+                if let Some(MessageDisplay::Tool { output: Some(output), .. }) = display {
+                    collect_output_names(output, &mut kept_outputs);
+                }
+            }
+            SessionEntry::Record {
+                record: LedgerRecord::BackgroundTaskUpdated { task },
+                ..
+            } => {
+                if let Some(path) = task.model_output.full_output.as_deref()
+                    && let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str())
+                {
+                    kept_outputs.insert(name.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    remove_unreferenced_files(&data.image_directory(), &kept_images);
+    remove_unreferenced_files(&data.output_directory(), &kept_outputs);
+}
+
+fn collect_output_names(text: &str, kept: &mut HashSet<String>) {
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix(crate::tools::FULL_OUTPUT_PREFIX)
+            && let Some(name) = Path::new(path.trim()).file_name().and_then(|name| name.to_str())
+        {
+            kept.insert(name.to_owned());
+        }
+    }
+}
+
+fn remove_unreferenced_files(directory: &Path, kept: &HashSet<String>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !kept.contains(name) && path.is_file() {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 

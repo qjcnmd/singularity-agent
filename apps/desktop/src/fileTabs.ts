@@ -1,11 +1,9 @@
-import type { ChangedFile } from './protocol'
 import { pathBaseName, resolveFileUrl, workspaceKey } from './workspace'
 
 export interface FileTab {
   id: string; path: string; cwd: string; title: string
   mode: 'file' | 'changes'
   focusPath?: string
-  initialChanges?: ChangedFile[]
   opened: number
 }
 
@@ -17,7 +15,7 @@ export interface FileTabState {
 function upsertFileTab(state: FileTabState, tab: FileTab): FileTabState {
   const fileTabs = state.fileTabs.some(item => item.id === tab.id)
     ? state.fileTabs.map(item => item.id === tab.id
-      ? { ...item, focusPath: tab.focusPath, initialChanges: tab.initialChanges ?? item.initialChanges, opened: item.opened + 1 }
+      ? { ...item, focusPath: tab.focusPath, opened: item.opened + 1 }
       : item)
     : [...state.fileTabs, tab]
   return { fileTabs, activeFileTab: tab.id }
@@ -39,10 +37,9 @@ export function openChangedFilesTab(
   state: FileTabState,
   cwd: string,
   focusPath?: string,
-  initialChanges?: ChangedFile[],
 ): FileTabState {
   const id = `changes:${workspaceKey(cwd)}`
-  return upsertFileTab(state, { id, path: cwd, cwd, title: 'Changes', mode: 'changes', focusPath, initialChanges, opened: 0 })
+  return upsertFileTab(state, { id, path: cwd, cwd, title: 'Changes', mode: 'changes', focusPath, opened: 0 })
 }
 
 export function filterFileTabs(
