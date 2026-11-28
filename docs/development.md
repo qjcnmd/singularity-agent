@@ -104,7 +104,7 @@ cargo test --workspace --locked
 # 2. 桌面端 Electron + Playwright 冒烟测试（先完成前端构建、cargo build -p app --locked 与 prepare:runtime）
 npm --prefix apps/desktop run test:e2e
 
-# 3. 指定打包产物运行完整 4 条 E2E（--exe）或快速打包冒烟（--packaged）
+# 3. 指定打包产物运行完整 5 段 E2E（--exe）或快速打包冒烟（--packaged）
 node apps/desktop/e2e/smoke.mjs --exe=<打包目录>/Singularity.exe
 node apps/desktop/e2e/smoke.mjs --packaged=<打包目录>/Singularity.exe
 ```
