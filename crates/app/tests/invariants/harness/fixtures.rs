@@ -4,6 +4,20 @@ use serde_json::{Value, json};
 
 pub const TINY_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
+pub fn find_tool_result<'a>(body: &'a Value, call_id: &str) -> &'a Value {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .expect("messages array")
+        .iter()
+        .filter_map(|msg| msg.get("content").and_then(Value::as_array))
+        .flatten()
+        .find(|block| {
+            block.get("type").and_then(Value::as_str) == Some("tool_result")
+                && block.get("tool_use_id").and_then(Value::as_str) == Some(call_id)
+        })
+        .unwrap_or_else(|| panic!("missing tool_result for {call_id}"))
+}
+
 fn sse_data(payload: &Value) -> String {
     format!("data: {payload}\n\n")
 }

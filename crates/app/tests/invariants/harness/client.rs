@@ -11,6 +11,29 @@ use tokio::sync::{mpsc, oneshot};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 
+pub fn provider_config_json(
+    provider_id: &str,
+    protocol: &str,
+    display_name: &str,
+    base_url: &str,
+    model_id: &str,
+    max_context_tokens: u32,
+    max_output_tokens: u32,
+) -> Value {
+    json!({
+        "apiProtocol": protocol,
+        "providerId": provider_id,
+        "displayName": display_name,
+        "baseUrl": base_url,
+        "models": [{
+            "modelId": model_id,
+            "maxContextTokens": max_context_tokens,
+            "maxOutputTokens": max_output_tokens,
+            "reasoningVariants": ["off", "low", "high"]
+        }]
+    })
+}
+
 pub struct TestEnv {
     root: PathBuf,
     pub home: PathBuf,
@@ -241,18 +264,15 @@ impl BackendClient {
         self.rpc_ok(
             "model.saveProvider",
             json!({
-                "provider": {
-                    "apiProtocol": protocol,
-                    "providerId": provider_id,
-                    "displayName": provider_id,
-                    "baseUrl": base_url,
-                    "models": [{
-                        "modelId": model_id,
-                        "maxContextTokens": max_context_tokens,
-                        "maxOutputTokens": max_output_tokens,
-                        "reasoningVariants": ["off", "low", "high"]
-                    }]
-                },
+                "provider": provider_config_json(
+                    provider_id,
+                    protocol,
+                    provider_id,
+                    base_url,
+                    model_id,
+                    max_context_tokens,
+                    max_output_tokens,
+                ),
                 "apiKey": "test-secret-key"
             }),
         )

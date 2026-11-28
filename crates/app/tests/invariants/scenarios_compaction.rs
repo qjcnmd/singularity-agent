@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::harness::{
     BackendClient, DEFAULT_TIMEOUT, MockModelServer, ScriptedResponse, TINY_PNG_DATA_URL, TestEnv,
-    messages_text_sse, messages_tools_sse, write_test_mcp_script,
+    find_tool_result, messages_text_sse, messages_tools_sse, write_test_mcp_script,
 };
 
 const COMPACT_CONTEXT_WINDOW: u32 = 20_000;
@@ -34,18 +34,6 @@ fn is_compaction_request(body: &Value) -> bool {
         .get("text")
         .and_then(Value::as_str)
         .is_some_and(|text| !text.contains(USER_TURN_TAG))
-}
-
-fn find_messages_tool_result<'a>(body: &'a Value, call_id: &str) -> Option<&'a Value> {
-    body.get("messages")
-        .and_then(Value::as_array)?
-        .iter()
-        .filter_map(|msg| msg.get("content").and_then(Value::as_array))
-        .flatten()
-        .find(|block| {
-            block.get("type").and_then(Value::as_str) == Some("tool_result")
-                && block.get("tool_use_id").and_then(Value::as_str) == Some(call_id)
-        })
 }
 
 fn tool_result_text(block: &Value) -> String {
@@ -464,8 +452,7 @@ async fn idle_tool_result_clearing_app_server_invariants() {
     assert_eq!(reqs.len(), reqs_before_resume + 1);
     let resumed_body = &reqs.last().expect("resumed request").body;
 
-    let cleared_large = find_messages_tool_result(resumed_body, "call_old_large")
-        .expect("large tool_result in model request");
+    let cleared_large = find_tool_result(resumed_body, "call_old_large");
     let cleared_large_text = tool_result_text(cleared_large);
     assert!(
         !cleared_large_text.contains("LLLLLLLLLLLLLLLL"),
@@ -484,8 +471,7 @@ async fn idle_tool_result_clearing_app_server_invariants() {
         "preserved spill path must point to real output file on disk: {spill_path}"
     );
 
-    let cleared_img = find_messages_tool_result(resumed_body, "call_old_image")
-        .expect("image tool_result in model request");
+    let cleared_img = find_tool_result(resumed_body, "call_old_image");
     assert!(
         !cleared_img.to_string().contains("\"type\":\"image\""),
         "cleared image tool result must omit old image blocks from model request: {cleared_img}"
@@ -495,8 +481,7 @@ async fn idle_tool_result_clearing_app_server_invariants() {
         "cleared image tool result must replace original payload: {cleared_img}"
     );
 
-    let recent_read =
-        find_messages_tool_result(resumed_body, "call_keep_4").expect("recent read tool_result in request");
+    let recent_read = find_tool_result(resumed_body, "call_keep_4");
     assert!(
         tool_result_text(recent_read).contains("RECENT_READ_PRESERVED_MARKER"),
         "recent protected tool results must stay intact after idle gap"

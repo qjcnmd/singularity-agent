@@ -4,31 +4,9 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 
 use crate::harness::{
-    BackendClient, MockModelServer, ScriptedResponse, TINY_PNG_DATA_URL, TestEnv, messages_text_sse,
-    messages_tools_sse, responses_sse,
+    BackendClient, MockModelServer, ScriptedResponse, TINY_PNG_DATA_URL, TestEnv, find_tool_result,
+    messages_text_sse, messages_tools_sse, provider_config_json, responses_sse,
 };
-
-fn provider_config_json(
-    provider_id: &str,
-    protocol: &str,
-    display_name: &str,
-    base_url: &str,
-    model_id: &str,
-    max_context_tokens: u32,
-) -> Value {
-    json!({
-        "apiProtocol": protocol,
-        "providerId": provider_id,
-        "displayName": display_name,
-        "baseUrl": base_url,
-        "models": [{
-            "modelId": model_id,
-            "maxContextTokens": max_context_tokens,
-            "maxOutputTokens": 4096,
-            "reasoningVariants": ["off", "high"]
-        }]
-    })
-}
 
 #[tokio::test]
 async fn workspace_config_and_single_instance_lock() {
@@ -95,7 +73,7 @@ async fn workspace_config_and_single_instance_lock() {
         .rpc_ok(
             "model.saveProvider",
             json!({
-                "provider": provider_config_json("local", "messages", "Local", &server.base_url, "alpha-model", 32000),
+                "provider": provider_config_json("local", "messages", "Local", &server.base_url, "alpha-model", 32000, 4096),
                 "apiKey": "sk-super-secret-value"
             }),
         )
@@ -113,7 +91,7 @@ async fn workspace_config_and_single_instance_lock() {
         .rpc_ok(
             "model.saveProvider",
             json!({
-                "provider": provider_config_json("local", "messages", "Local Renamed", &server.base_url, "alpha-model", 64000)
+                "provider": provider_config_json("local", "messages", "Local Renamed", &server.base_url, "alpha-model", 64000, 4096)
             }),
         )
         .await;
@@ -140,7 +118,7 @@ async fn workspace_config_and_single_instance_lock() {
             .rpc_err(
                 "model.saveProvider",
                 json!({
-                    "provider": provider_config_json("local", "messages", "Local Cross Origin", cross_origin, "alpha-model", 64000)
+                    "provider": provider_config_json("local", "messages", "Local Cross Origin", cross_origin, "alpha-model", 64000, 4096)
                 }),
             )
             .await;
@@ -398,7 +376,7 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
             .rpc_ok(
                 "model.saveProvider",
                 json!({
-                    "provider": provider_config_json(id, protocol, id, &server.base_url, model, 64000),
+                    "provider": provider_config_json(id, protocol, id, &server.base_url, model, 64000, 4096),
                     "apiKey": "test-secret-key"
                 }),
             )
@@ -489,20 +467,6 @@ async fn dual_protocol_roundtrip_and_restart_persistence() {
 
     server.assert_no_protocol_violations();
     client.shutdown().await;
-}
-
-fn find_tool_result<'a>(body: &'a Value, call_id: &str) -> &'a Value {
-    body.get("messages")
-        .and_then(Value::as_array)
-        .expect("messages array")
-        .iter()
-        .filter_map(|msg| msg.get("content").and_then(Value::as_array))
-        .flatten()
-        .find(|block| {
-            block.get("type").and_then(Value::as_str) == Some("tool_result")
-                && block.get("tool_use_id").and_then(Value::as_str) == Some(call_id)
-        })
-        .unwrap_or_else(|| panic!("missing tool_result for {call_id}"))
 }
 
 #[tokio::test]

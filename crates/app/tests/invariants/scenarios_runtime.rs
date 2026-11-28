@@ -5,8 +5,8 @@ use serde_json::{Value, json};
 use tokio::sync::Notify;
 
 use crate::harness::{
-    BackendClient, DEFAULT_TIMEOUT, MockModelServer, ScriptedResponse, TestEnv, messages_text_sse,
-    messages_tools_sse, write_test_mcp_script,
+    BackendClient, DEFAULT_TIMEOUT, MockModelServer, ScriptedResponse, TestEnv, find_tool_result,
+    messages_text_sse, messages_tools_sse, write_test_mcp_script,
 };
 
 #[tokio::test]
@@ -528,37 +528,23 @@ async fn web_tools_http_boundary_invariants() {
 
     let model_reqs = model_server.model_requests();
     let final_req = &model_reqs.last().expect("final model req").body;
-    let find_result = |call_id: &str| {
-        final_req
-            .get("messages")
-            .and_then(Value::as_array)
-            .expect("messages")
-            .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_array))
-            .flatten()
-            .find(|b| {
-                b.get("type").and_then(Value::as_str) == Some("tool_result")
-                    && b.get("tool_use_id").and_then(Value::as_str) == Some(call_id)
-            })
-            .unwrap_or_else(|| panic!("missing tool_result {call_id}"))
-    };
 
-    let search_ok = find_result("c_search_ok");
+    let search_ok = find_tool_result(final_req, "c_search_ok");
     assert_ne!(search_ok.get("is_error").and_then(Value::as_bool), Some(true));
     assert!(search_ok.to_string().contains("WEB_SEARCH_RESULT_MARKER"));
 
-    let fetch_ok = find_result("c_fetch_ok");
+    let fetch_ok = find_tool_result(final_req, "c_fetch_ok");
     assert_ne!(fetch_ok.get("is_error").and_then(Value::as_bool), Some(true));
     assert!(fetch_ok.to_string().contains("WEB_FETCH_CONTENT_MARKER"));
 
-    let fetch_redir = find_result("c_fetch_redir");
+    let fetch_redir = find_tool_result(final_req, "c_fetch_redir");
     assert_eq!(fetch_redir.get("is_error").and_then(Value::as_bool), Some(true));
     assert!(
         fetch_redir.to_string().contains("302"),
         "302 redirect must be rejected as an error without following: {fetch_redir}"
     );
 
-    let search_err = find_result("c_search_err");
+    let search_err = find_tool_result(final_req, "c_search_err");
     assert_eq!(search_err.get("is_error").and_then(Value::as_bool), Some(true));
     let err_text = search_err.to_string();
     assert!(

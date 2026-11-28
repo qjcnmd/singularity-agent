@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -7,6 +8,16 @@ use crate::harness::{
     BackendClient, DEFAULT_TIMEOUT, MockModelServer, ScriptedResponse, TINY_PNG_DATA_URL, TestEnv,
     messages_text_sse, messages_tools_sse,
 };
+
+fn run_git(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "core.autocrlf=false"])
+        .args(args)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed");
+}
 
 #[tokio::test]
 async fn stream_fault_recovery_and_truncation_invariants() {
@@ -341,23 +352,15 @@ async fn git_diff_and_rewind_invariants() {
     std::fs::write(&mv_old, "old1\nold2\nold3\nold4\n").expect("write mv_old baseline");
     std::fs::write(&bracket_file, "export const id = 1\n").expect("write [id] baseline");
     std::fs::write(&plain_i_file, "export const i = 1\n").expect("write i baseline");
-    let run_git = |args: &[&str]| {
-        let status = std::process::Command::new("git")
-            .current_dir(&env.workspace)
-            .args(args)
-            .status()
-            .expect("run git");
-        assert!(status.success(), "git {args:?} failed");
-    };
-    run_git(&["init", "-q"]);
-    run_git(&["config", "user.email", "test@example.invalid"]);
-    run_git(&["config", "user.name", "Test"]);
-    run_git(&["add", "-A"]);
-    run_git(&["commit", "-q", "-m", "baseline"]);
+    run_git(&env.workspace, &["init", "-q"]);
+    run_git(&env.workspace, &["config", "user.email", "test@example.invalid"]);
+    run_git(&env.workspace, &["config", "user.name", "Test"]);
+    run_git(&env.workspace, &["add", "-A"]);
+    run_git(&env.workspace, &["commit", "-q", "-m", "baseline"]);
     // Hostile user git config must not break batch diff parsing or path matching.
-    run_git(&["config", "diff.noprefix", "true"]);
-    run_git(&["config", "diff.mnemonicPrefix", "true"]);
-    run_git(&["config", "diff.relative", "true"]);
+    run_git(&env.workspace, &["config", "diff.noprefix", "true"]);
+    run_git(&env.workspace, &["config", "diff.mnemonicPrefix", "true"]);
+    run_git(&env.workspace, &["config", "diff.relative", "true"]);
 
     server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "NON_GIT_OK", 40, 0, 10, "end_turn")));
     server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "TURN_1_BASELINE", 60, 0, 15, "end_turn")));
@@ -431,7 +434,7 @@ async fn git_diff_and_rewind_invariants() {
         .to_string();
 
     // Exercise git mv + full rewrite and glob-like bracket filenames under hostile diff config.
-    run_git(&["mv", "mv_old.txt", "mv_new.txt"]);
+    run_git(&env.workspace, &["mv", "mv_old.txt", "mv_new.txt"]);
     std::fs::write(&mv_new, "completely\ndifferent\nrewritten\nbody\nnow\n").expect("rewrite mv_new");
     std::fs::write(&bracket_file, "export const id = 2\n").expect("modify [id]");
     std::fs::write(&plain_i_file, "export const i = 2\n").expect("modify i");
@@ -488,17 +491,9 @@ async fn git_diff_and_rewind_invariants() {
     let unborn_dir = env.home.join("unborn_git");
     std::fs::create_dir_all(&unborn_dir).expect("mkdir unborn");
     let unborn_ws = app_core::display_path(&unborn_dir);
-    let run_unborn_git = |args: &[&str]| {
-        let status = std::process::Command::new("git")
-            .current_dir(&unborn_dir)
-            .args(args)
-            .status()
-            .expect("run unborn git");
-        assert!(status.success(), "unborn git {args:?} failed");
-    };
-    run_unborn_git(&["init", "-q"]);
+    run_git(&unborn_dir, &["init", "-q"]);
     std::fs::write(unborn_dir.join("am.txt"), "staged\n").expect("write staged am.txt");
-    run_unborn_git(&["add", "am.txt"]);
+    run_git(&unborn_dir, &["add", "am.txt"]);
     std::fs::write(unborn_dir.join("am.txt"), "staged\nworktree\n").expect("edit am.txt");
     client.rpc_ok("workspace.add", json!({ "root": unborn_ws })).await;
     let unborn_changed = client
