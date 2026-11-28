@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Run an ephemeral local Codex CLI review with file redirection, hang/stall recovery, and .reviews/ archiving.
 #>
@@ -16,6 +16,8 @@ param(
     [switch]$AllowWebSearch,
 
     [switch]$DeletePrompt,
+
+    [switch]$NoRubric,
 
     [ValidateRange(30, 3600)]
     [int]$StallSeconds = 480,
@@ -113,6 +115,16 @@ function Get-WorkspaceSnapshot([string]$RepoRoot) {
     }
 }
 
+function Get-ReviewRubricText([string]$RepoRoot, [int]$ReviewRound) {
+    if (-not $RepoRoot) { return '' }
+    $path = Join-Path $RepoRoot '.agents\skills\wf-dev\review-rubric.md'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return '' }
+    $text = [System.IO.File]::ReadAllText($path, $utf8).Replace("`r`n", "`n").Trim()
+    $parts = $text -split '<!-- ROUND_2_ONLY -->', 2
+    if ($ReviewRound -ge 2 -and $parts.Count -gt 1) { return ($parts[0].TrimEnd() + "`n`n" + $parts[1].TrimStart()) }
+    return $parts[0].TrimEnd()
+}
+
 function Resolve-ReviewMetadata([string]$LogFile, [string]$ExplicitModel, [string]$ExplicitEffort) {
     $model = $ExplicitModel
     $effort = $ExplicitEffort
@@ -188,12 +200,18 @@ if (-not (Test-Path -LiteralPath $PromptFile -PathType Leaf)) {
 $resolvedPrompt = (Resolve-Path -LiteralPath $PromptFile).ProviderPath
 $promptText = [System.IO.File]::ReadAllText($resolvedPrompt, $utf8)
 $runId = [guid]::NewGuid().ToString('N')
+$composedPromptFile = Join-Path $env:TEMP "codex-review-$runId.prompt.md"
 $outFile = Join-Path $env:TEMP "codex-review-$runId.md"
 $stdoutFile = Join-Path $env:TEMP "codex-review-$runId.out"
 $logFile = Join-Path $env:TEMP "codex-review-$runId.log"
 
 $repoRoot = Get-RepoRoot
 $archiveBase = if ($repoRoot) { $repoRoot } else { (Get-Location).ProviderPath }
+$rubricText = if ($NoRubric) { '' } else { Get-ReviewRubricText $repoRoot $Round }
+if ($rubricText -and $promptText -notmatch '## 固定审查准则') {
+    $promptText = $promptText.TrimEnd() + "`n`n" + $rubricText + "`n"
+}
+[System.IO.File]::WriteAllText($composedPromptFile, $promptText, $utf8)
 $before = Get-WorkspaceSnapshot $repoRoot
 $proc = $null; $stopwatch = $null; $startedAt = $null; $attempted = $false
 $exitCode = $null; $recovered = $false; $stalled = $false; $workspaceChanged = $null
@@ -222,7 +240,7 @@ try {
     $attempted = $true
     $proc = Start-Process -FilePath $inv.FilePath -ArgumentList $argLine `
         -WorkingDirectory (Get-Location).ProviderPath `
-        -RedirectStandardInput $resolvedPrompt -RedirectStandardOutput $stdoutFile -RedirectStandardError $logFile `
+        -RedirectStandardInput $composedPromptFile -RedirectStandardOutput $stdoutFile -RedirectStandardError $logFile `
         -NoNewWindow -PassThru
     $null = $proc.Handle # Ensure ExitCode stays populated on Windows PowerShell 5.1.
 
@@ -304,7 +322,7 @@ try {
         }
     }
 
-    $cleanup = @($outFile, $stdoutFile, $logFile)
+    $cleanup = @($outFile, $stdoutFile, $logFile, $composedPromptFile)
     if ($DeletePrompt) { $cleanup += $resolvedPrompt }
     foreach ($f in $cleanup) {
         if (Test-Path -LiteralPath $f -PathType Leaf) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
