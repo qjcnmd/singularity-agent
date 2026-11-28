@@ -93,6 +93,8 @@ impl Conversation {
                         last_context_window: context_window,
                         auto_resume: true,
                         closing: false,
+                        inspect_cancels: Vec::new(),
+                        next_inspect_id: 0,
                     },
                 }),
                 hub,
@@ -108,11 +110,6 @@ impl Conversation {
 
     pub(crate) fn model(&self) -> protocol::ModelSelection {
         self.lock_inner().state.model.clone()
-    }
-
-    pub(crate) fn has_active_work(&self) -> bool {
-        let inner = self.lock_inner();
-        inner.state.closing || inner.state.has_work(&self.bash_tasks)
     }
 
     pub(crate) fn can_evict(&self) -> bool {

@@ -152,8 +152,8 @@ impl Conversation {
         self: &Arc<Self>,
         shutdown: &CancellationToken,
     ) -> Result<(), ConversationError> {
-        {
-            let inner = self.lock_inner();
+        let (cancel, mut cancel_guard) = {
+            let mut inner = self.lock_inner();
             if shutdown.is_cancelled()
                 || inner.state.closing
                 || inner.state.turn.is_busy()
@@ -161,7 +161,10 @@ impl Conversation {
             {
                 return Ok(());
             }
-        }
+            let cancel = shutdown.child_token();
+            let id = inner.state.register_inspect_cancel(cancel.clone());
+            (cancel, InspectCancelGuard { conversation: self, id: Some(id) })
+        };
         let conversation = Arc::clone(self);
         let result = async {
             let config = tokio::task::spawn_blocking(move || conversation.load_agent_config())
@@ -174,14 +177,15 @@ impl Conversation {
                     &config,
                     Arc::clone(&self.models),
                     &self.mcp,
-                    shutdown,
+                    &cancel,
                 )
                 .await?,
             )
         }
         .await;
         let mut inner = self.lock_inner();
-        if shutdown.is_cancelled()
+        cancel_guard.remove_locked(&mut inner.state);
+        if cancel.is_cancelled()
             || inner.state.closing
             || inner.state.turn.is_busy()
             || inner.view.context.is_some()
@@ -213,6 +217,27 @@ impl Conversation {
             Arc::clone(&self.writer),
             Arc::clone(&self.mcp),
         ))
+    }
+}
+
+struct InspectCancelGuard<'a> {
+    conversation: &'a Conversation,
+    id: Option<u64>,
+}
+
+impl InspectCancelGuard<'_> {
+    fn remove_locked(&mut self, state: &mut super::state::ConversationState) {
+        if let Some(id) = self.id.take() {
+            state.remove_inspect_cancel(id);
+        }
+    }
+}
+
+impl Drop for InspectCancelGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.conversation.lock_inner().state.remove_inspect_cancel(id);
+        }
     }
 }
 

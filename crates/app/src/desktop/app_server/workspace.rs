@@ -59,24 +59,29 @@ impl AppServer {
             let belongs = |conversation: &std::sync::Arc<crate::runtime::Conversation>| {
                 app_core::same_saved_path(&conversation.cwd, &workspace.root)
             };
-            if sessions
-                .conversations()
-                .any(|(_, conversation)| belongs(conversation) && conversation.has_active_work())
-            {
-                return Err(RpcError::new(format!(
-                    "项目 {} 仍有运行中的任务、后台命令或待处理输入。",
-                    workspace.root
-                )));
-            }
-            app.workspaces.remove(&workspace.root).map_err(RpcError::new)?;
-            sessions.retain(|_, conversation| {
-                if belongs(conversation) {
-                    conversation.mark_closing();
-                    false
-                } else {
-                    true
+            let mut marked: Vec<std::sync::Arc<crate::runtime::Conversation>> = Vec::new();
+            for (_, conversation) in sessions.conversations() {
+                if !belongs(conversation) {
+                    continue;
                 }
-            });
+                if !conversation.try_mark_closing_if_idle() {
+                    for conversation in marked {
+                        conversation.clear_closing();
+                    }
+                    return Err(RpcError::new(format!(
+                        "项目 {} 仍有运行中的任务、后台命令或待处理输入。",
+                        workspace.root
+                    )));
+                }
+                marked.push(std::sync::Arc::clone(conversation));
+            }
+            if let Err(error) = app.workspaces.remove(&workspace.root) {
+                for conversation in marked {
+                    conversation.clear_closing();
+                }
+                return Err(RpcError::new(error));
+            }
+            sessions.retain(|_, conversation| !belongs(conversation));
             let close = app.mcp.disconnect_directory(Path::new(&workspace.root));
             drop(sessions);
             app.publish_app_snapshot();

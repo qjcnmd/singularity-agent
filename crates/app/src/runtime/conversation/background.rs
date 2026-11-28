@@ -55,8 +55,17 @@ impl Conversation {
         });
     }
 
+    pub(crate) fn try_mark_closing_if_idle(&self) -> bool {
+        let mut inner = self.lock_inner();
+        if inner.state.closing || inner.state.has_work(&self.bash_tasks) {
+            return false;
+        }
+        inner.state.mark_closing();
+        true
+    }
+
     pub(crate) fn mark_closing(&self) {
-        self.lock_inner().state.closing = true;
+        self.lock_inner().state.mark_closing();
     }
 
     pub(crate) fn clear_closing(&self) {

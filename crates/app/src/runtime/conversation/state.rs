@@ -71,9 +71,29 @@ pub(super) struct ConversationState {
     pub(super) last_context_window: Option<u64>,
     pub(super) auto_resume: bool,
     pub(super) closing: bool,
+    pub(super) inspect_cancels: Vec<(u64, CancellationToken)>,
+    pub(super) next_inspect_id: u64,
 }
 
 impl ConversationState {
+    pub(super) fn register_inspect_cancel(&mut self, cancel: CancellationToken) -> u64 {
+        self.next_inspect_id += 1;
+        let id = self.next_inspect_id;
+        self.inspect_cancels.push((id, cancel));
+        id
+    }
+
+    pub(super) fn remove_inspect_cancel(&mut self, id: u64) {
+        self.inspect_cancels.retain(|(entry_id, _)| *entry_id != id);
+    }
+
+    pub(super) fn mark_closing(&mut self) {
+        self.closing = true;
+        for (_, cancel) in self.inspect_cancels.drain(..) {
+            cancel.cancel();
+        }
+    }
+
     pub(super) fn has_work(&self, bash_tasks: &agent::tools::BashTasks) -> bool {
         self.turn.is_busy() || bash_tasks.is_busy() || self.has_active_inbox()
     }
