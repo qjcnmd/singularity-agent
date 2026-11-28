@@ -3,9 +3,9 @@ import { motion, useReducedMotion } from 'motion/react'
 import { appStore, useAppStore } from '../appStore'
 import type { SkillMetadata, TextDocument } from '../protocol'
 import { workspaceName } from '../copy'
+import { errorMessage } from '../rpcClient'
 import { workspaceKey } from '../workspace'
-import { McpSettings } from './McpSettings'
-import { CodeView, MarkdownDocumentView } from './FilePanel'
+import { CodeView, MarkdownDocumentView } from './DocumentView'
 import { smooth } from '../motion'
 import { ArrowLeft, CircleCheck, ChevronRight, RefreshCw, Search } from 'lucide-react'
 
@@ -50,7 +50,7 @@ export function InstructionsPage() {
     setError(null)
     void appStore.transport.rpc('instructions.read', { workspaceRoot: effectiveTarget }).then(document => {
       if (active) setDocuments(current => ({ ...current, [key]: document }))
-    }).catch(error => { if (active) setError(error instanceof Error ? error.message : String(error)) })
+    }).catch(error => { if (active) setError(errorMessage(error)) })
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [effectiveTarget, key, reload])
@@ -69,7 +69,7 @@ export function InstructionsPage() {
       setDrafts(current => { const next = { ...current }; delete next[key]; return next })
       setShowSaved(true)
       appStore.invalidateContextPreview()
-    } catch (error) { setError(error instanceof Error ? error.message : String(error)) }
+    } catch (error) { setError(errorMessage(error)) }
     finally { setSaving(false) }
   }
   return <PageFrame title="自定义指令">
@@ -88,7 +88,7 @@ export function InstructionsPage() {
           <span>文件</span>
           <span className="editor-path">{saved?.path ?? (loading ? '读取中…' : '—')}</span>
         </div>
-        {error && <div className="form-error" role="alert" style={{ margin: '10px 14px 0' }}>{error}{!saved && <button type="button" className="quiet-button" onClick={() => setReload(value => value + 1)}>重新读取</button>}</div>}
+        {error && <div className="form-error" role="alert">{error}{!saved && <button type="button" className="quiet-button" onClick={() => setReload(value => value + 1)}>重新读取</button>}</div>}
         <textarea aria-label="自定义指令内容" className="input" value={text} spellCheck={false} disabled={loading || saving || !saved}
           onChange={event => setDrafts(current => ({ ...current, [key]: event.target.value }))} />
         <footer>
@@ -128,7 +128,7 @@ function SkillsList({ root }: { root: string | null }) {
     setLoading(root !== null)
     if (root !== null) void appStore.transport.rpc('skills.list', { workspaceRoot: root }).then(catalog => {
       if (active) setSkills(catalog.skills)
-    }).catch(error => { if (active) setError(error instanceof Error ? error.message : String(error)) })
+    }).catch(error => { if (active) setError(errorMessage(error)) })
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [root, reload])
@@ -172,7 +172,7 @@ function SkillDetail({ skill, workspaceRoot, onBack }: { skill: SkillMetadata; w
     setError(null)
     void appStore.transport.rpc('file.read', { cwd: workspaceRoot, path: skill.path }).then(
       loaded => { if (active) setDocument(loaded) },
-      reason => { if (active) setError(reason instanceof Error ? reason.message : String(reason)) },
+      reason => { if (active) setError(errorMessage(reason)) },
     ).finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [workspaceRoot, skill.path, attempt])
@@ -223,9 +223,4 @@ function SkillCard({ skill, onOpen }: { skill: SkillMetadata; onOpen: () => void
     </span>
     <ChevronRight size={14} className="skill-row-chev" aria-hidden="true" />
   </button>
-}
-
-export function McpPage() {
-  const { selectedWorkspaceRoot } = useAppStore(['selectedWorkspaceRoot'])
-  return <PageFrame title="MCP"><McpSettings workspaceRoot={selectedWorkspaceRoot} /></PageFrame>
 }

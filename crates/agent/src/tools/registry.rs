@@ -3,8 +3,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use ::mcp::McpTool;
-use app_core::ToolDefinition;
 use app_core::skills::SkillCatalog;
+use model::ToolDefinition;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +20,39 @@ use super::todo;
 use super::view_image;
 use super::web;
 use super::write;
+
+pub(crate) const BASH_TOOL_NAME: &str = "bash";
+pub(crate) const TASK_LIST_TOOL_NAME: &str = "task_list";
+pub(crate) const TASK_OUTPUT_TOOL_NAME: &str = "task_output";
+pub(crate) const TASK_STOP_TOOL_NAME: &str = "task_stop";
+pub(crate) const READ_TOOL_NAME: &str = "read";
+pub(crate) const GREP_TOOL_NAME: &str = "grep";
+pub(crate) const GLOB_TOOL_NAME: &str = "glob";
+pub(crate) const EDIT_TOOL_NAME: &str = "edit";
+pub(crate) const WRITE_TOOL_NAME: &str = "write";
+pub(crate) const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
+pub(crate) const TODO_TOOL_NAME: &str = "todo";
+pub(crate) const QUESTION_TOOL_NAME: &str = "ask_user_question";
+pub(crate) const SKILL_TOOL_NAME: &str = "skill";
+pub(crate) const WEB_SEARCH_TOOL_NAME: &str = "web_search";
+pub(crate) const WEB_FETCH_TOOL_NAME: &str = "web_fetch";
+pub(crate) const MCP_SCHEMA_TOOL_NAME: &str = "mcp_schema";
+pub(crate) const MCP_CALL_TOOL_NAME: &str = "mcp_call";
+
+pub(crate) fn is_clearable_tool(name: &str) -> bool {
+    matches!(
+        name,
+        READ_TOOL_NAME
+            | BASH_TOOL_NAME
+            | TASK_OUTPUT_TOOL_NAME
+            | WEB_SEARCH_TOOL_NAME
+            | WEB_FETCH_TOOL_NAME
+            | MCP_SCHEMA_TOOL_NAME
+            | MCP_CALL_TOOL_NAME
+            | GREP_TOOL_NAME
+            | GLOB_TOOL_NAME
+    )
+}
 
 pub(crate) const DEFAULT_MAX_LINES: usize = 2000;
 pub(crate) const DEFAULT_MAX_BYTES: usize = 50 * 1024;
@@ -265,30 +298,30 @@ impl ToolRegistrySnapshot {
 
     pub(crate) fn preflight(&self, name: &str, args: &Value) -> Result<PreparedTool, ToolExecution> {
         if !self.mcp_servers.is_empty() {
-            if name == mcp::MCP_SCHEMA_TOOL_NAME {
+            if name == MCP_SCHEMA_TOOL_NAME {
                 let args: mcp::McpSchemaArgs = deserialize_args_or_error(args)?;
                 let tools = mcp::lookup_tools(&self.mcp_servers, &args.server, &args.tools)?;
                 return Ok(PreparedTool::McpSchema(tools));
             }
-            if name == mcp::MCP_CALL_TOOL_NAME {
+            if name == MCP_CALL_TOOL_NAME {
                 let args: mcp::McpCallArgs = deserialize_args_or_error(args)?;
                 let tool = mcp::lookup_tool(&self.mcp_servers, &args.server, &args.tool)?;
                 return Ok(PreparedTool::Mcp(tool.clone(), args.arguments));
             }
         }
         if let Some(access) = &self.web {
-            if name == web::WEB_SEARCH_TOOL_NAME {
+            if name == WEB_SEARCH_TOOL_NAME {
                 return deserialize_args_or_error::<web::WebSearchArgs>(args)?
                     .validate()
                     .map(|args| PreparedTool::WebSearch(args, Arc::clone(access)));
             }
-            if name == web::WEB_FETCH_TOOL_NAME {
+            if name == WEB_FETCH_TOOL_NAME {
                 return deserialize_args_or_error::<web::WebFetchArgs>(args)?
                     .validate()
                     .map(|args| PreparedTool::WebFetch(args, Arc::clone(access)));
             }
         }
-        if name == "skill"
+        if name == SKILL_TOOL_NAME
             && let Some(catalog) = &self.skills
         {
             return deserialize_args_or_error(args)

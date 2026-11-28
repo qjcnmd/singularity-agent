@@ -10,13 +10,13 @@ use super::client::DEFAULT_TIMEOUT;
 use super::protocol_checks::{check_messages_request_invariants, check_responses_request_invariants};
 
 #[derive(Debug, Clone)]
-pub struct CapturedRequest {
-    pub path: String,
-    pub authorization: Option<String>,
-    pub body: Value,
+pub(crate) struct CapturedRequest {
+    pub(crate) path: String,
+    pub(crate) authorization: Option<String>,
+    pub(crate) body: Value,
 }
 
-pub enum ScriptedResponse {
+pub(crate) enum ScriptedResponse {
     Json {
         status: u16,
         headers: Vec<(String, String)>,
@@ -30,11 +30,11 @@ pub enum ScriptedResponse {
 }
 
 impl ScriptedResponse {
-    pub fn json(status: u16, body: Value) -> Self {
+    pub(crate) fn json(status: u16, body: Value) -> Self {
         Self::Json { status, headers: Vec::new(), body }
     }
 
-    pub fn json_with_headers(status: u16, headers: Vec<(&str, &str)>, body: Value) -> Self {
+    pub(crate) fn json_with_headers(status: u16, headers: Vec<(&str, &str)>, body: Value) -> Self {
         Self::Json {
             status,
             headers: headers.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -42,7 +42,7 @@ impl ScriptedResponse {
         }
     }
 
-    pub fn sse(events: Vec<String>) -> Self {
+    pub(crate) fn sse(events: Vec<String>) -> Self {
         Self::Sse {
             events,
             gate_after_first: None,
@@ -50,7 +50,7 @@ impl ScriptedResponse {
         }
     }
 
-    pub fn sse_gated(events: Vec<String>, gate: Arc<Notify>) -> Self {
+    pub(crate) fn sse_gated(events: Vec<String>, gate: Arc<Notify>) -> Self {
         Self::Sse {
             events,
             gate_after_first: Some(gate),
@@ -58,7 +58,7 @@ impl ScriptedResponse {
         }
     }
 
-    pub fn sse_truncated_drop(events: Vec<String>) -> Self {
+    pub(crate) fn sse_truncated_drop(events: Vec<String>) -> Self {
         Self::Sse {
             events,
             gate_after_first: None,
@@ -78,14 +78,14 @@ struct ServerState {
     violations: Vec<String>,
 }
 
-pub struct MockModelServer {
-    pub base_url: String,
+pub(crate) struct MockModelServer {
+    pub(crate) base_url: String,
     state: Arc<Mutex<ServerState>>,
     handle: tokio::task::JoinHandle<()>,
 }
 
 impl MockModelServer {
-    pub async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let state = Arc::new(Mutex::new(ServerState {
@@ -115,30 +115,30 @@ impl MockModelServer {
         }
     }
 
-    pub fn origin_url(&self) -> String {
+    pub(crate) fn origin_url(&self) -> String {
         self.base_url.trim_end_matches("/v1").to_string()
     }
 
-    pub fn set_models(&self, models: Vec<&str>) {
+    pub(crate) fn set_models(&self, models: Vec<&str>) {
         self.state.lock().expect("state lock").models = models.into_iter().map(str::to_string).collect();
     }
 
-    pub fn enqueue(&self, response: ScriptedResponse) {
+    pub(crate) fn enqueue(&self, response: ScriptedResponse) {
         self.state.lock().expect("state lock").queue.push_back(response);
     }
 
-    pub fn set_fallback(
+    pub(crate) fn set_fallback(
         &self,
         responder: impl Fn(&CapturedRequest, usize) -> ScriptedResponse + Send + Sync + 'static,
     ) {
         self.state.lock().expect("state lock").fallback = Some(Arc::new(responder));
     }
 
-    pub fn all_requests(&self) -> Vec<CapturedRequest> {
+    pub(crate) fn all_requests(&self) -> Vec<CapturedRequest> {
         self.state.lock().expect("state lock").requests.clone()
     }
 
-    pub fn model_requests(&self) -> Vec<CapturedRequest> {
+    pub(crate) fn model_requests(&self) -> Vec<CapturedRequest> {
         self.state
             .lock()
             .expect("state lock")
@@ -149,7 +149,7 @@ impl MockModelServer {
             .collect()
     }
 
-    pub fn assert_no_protocol_violations(&self) {
+    pub(crate) fn assert_no_protocol_violations(&self) {
         let violations = self.state.lock().expect("state lock").violations.clone();
         assert!(
             violations.is_empty(),
@@ -158,7 +158,7 @@ impl MockModelServer {
         );
     }
 
-    pub async fn wait_for_request_count(&self, expected: usize) {
+    pub(crate) async fn wait_for_request_count(&self, expected: usize) {
         let notify = Arc::clone(&self.state.lock().expect("state lock").request_notify);
         let deadline = tokio::time::Instant::now() + DEFAULT_TIMEOUT;
         loop {

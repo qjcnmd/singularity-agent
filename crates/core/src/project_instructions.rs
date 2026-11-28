@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub(crate) const PROJECT_INSTRUCTIONS_FILE_NAME: &str = "AGENTS.md";
+pub const PROJECT_INSTRUCTIONS_FILE_NAME: &str = "AGENTS.md";
 
 pub fn load_agent_instructions(cwd: &Path, home: &Path) -> Result<Vec<InstructionFile>, String> {
     let cwd = crate::canonicalize_workspace(cwd)?;
@@ -40,7 +40,7 @@ pub fn load_agent_instructions(cwd: &Path, home: &Path) -> Result<Vec<Instructio
                 ));
             }
         };
-        let stripped = content.strip_prefix('\u{feff}').unwrap_or(&content);
+        let stripped = crate::strip_utf8_bom(&content);
         if !stripped.trim().is_empty() {
             let content = if stripped.len() == content.len() {
                 content

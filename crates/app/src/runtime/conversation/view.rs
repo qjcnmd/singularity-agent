@@ -1,5 +1,5 @@
 use super::activity::Activity;
-use super::{Conversation, TurnLifecycle};
+use super::{Conversation, ConversationInner, TurnLifecycle};
 use agent::agent::AgentEvent;
 use agent::session::lock_writer;
 use protocol::{
@@ -37,43 +37,52 @@ impl ConversationView {
 }
 impl Conversation {
     pub(crate) fn start_result(&self) -> protocol::SessionStartResult {
-        let view = self.lock_view();
-        let phase = self.phase();
+        let inner = self.lock_inner();
+        let phase = inner.state.turn.phase();
         let writer = lock_writer(&self.writer);
         protocol::SessionStartResult {
             summary: crate::runtime::history::summarize_thread(writer.data()),
-            status: protocol::SessionStatus { phase, failure: view.failure.clone() },
-            revision: view.last_event_revision,
+            status: protocol::SessionStatus {
+                phase,
+                failure: inner.view.failure.clone(),
+            },
+            revision: inner.view.last_event_revision,
         }
     }
 
     pub(crate) fn status(&self) -> protocol::SessionStatus {
-        let view = self.lock_view();
+        let inner = self.lock_inner();
         protocol::SessionStatus {
-            phase: self.phase(),
-            failure: view.failure.clone(),
+            phase: inner.state.turn.phase(),
+            failure: inner.view.failure.clone(),
         }
     }
 
-    pub(super) fn lock_view(&self) -> std::sync::MutexGuard<'_, ConversationView> {
-        self.view.lock().expect("conversation view lock poisoned")
+    pub(super) fn runtime(&self, inner: &ConversationInner) -> SessionRuntime {
+        let context_usage = crate::runtime::history::context_usage(
+            lock_writer(&self.writer).data().entries(),
+            &inner.state.model,
+            inner.state.last_context_window,
+        );
+        self.runtime_with_context_usage(inner, context_usage)
     }
-    pub(super) fn runtime(&self, view: &ConversationView) -> SessionRuntime {
-        let state = self.lock_state();
+
+    pub(super) fn runtime_with_context_usage(
+        &self,
+        inner: &ConversationInner,
+        context_usage: Option<protocol::ContextUsage>,
+    ) -> SessionRuntime {
         SessionRuntime {
-            phase: state.turn.phase(),
-            selection: state.model.clone(),
-            context_usage: crate::runtime::history::context_usage(
-                lock_writer(&self.writer).data().entries(),
-                &state.model,
-                state.last_context_window,
-            ),
-            model_usage: view.usage.has_metrics().then(|| view.usage.clone()),
-            pending_question: match &state.turn {
+            phase: inner.state.turn.phase(),
+            selection: inner.state.model.clone(),
+            context_usage,
+            model_usage: inner.view.usage.has_metrics().then(|| inner.view.usage.clone()),
+            pending_question: match &inner.state.turn {
                 TurnLifecycle::Running(controls) => controls.questions.pending(),
                 TurnLifecycle::Idle => None,
             },
-            pending_messages: state
+            pending_messages: inner
+                .state
                 .steering_inbox
                 .lock()
                 .expect("turn inbox lock poisoned")
@@ -89,80 +98,91 @@ impl Conversation {
                     })
                 })
                 .collect(),
-            failure: view.failure.clone(),
+            failure: inner.view.failure.clone(),
         }
     }
+
     pub(crate) fn read(&self) -> Result<SessionReadResult, crate::runtime::CatalogError> {
-        let view = self.lock_view();
-        self.read_locked(&view)
+        let inner = self.lock_inner();
+        let (context_usage, history) = {
+            let writer = lock_writer(&self.writer);
+            let data = writer.data();
+            let context_usage = crate::runtime::history::context_usage(
+                data.entries(),
+                &inner.state.model,
+                inner.state.last_context_window,
+            );
+            let history = crate::runtime::history::read_thread_history(data).map_err(|source| {
+                crate::runtime::CatalogError::Session { path: data.path().to_path_buf(), source }
+            })?;
+            (context_usage, history)
+        };
+        Ok(self.finish_read(&inner, context_usage, history))
     }
-    pub(super) fn read_locked(
+
+    pub(super) fn finish_read(
         &self,
-        view: &ConversationView,
-    ) -> Result<SessionReadResult, crate::runtime::CatalogError> {
-        let runtime = self.runtime(view);
+        inner: &ConversationInner,
+        context_usage: Option<protocol::ContextUsage>,
+        mut history: protocol::ThreadHistory,
+    ) -> SessionReadResult {
         let background_tasks = self.bash_tasks.list().into_iter().map(Into::into).collect();
-        let writer = lock_writer(&self.writer);
-        let mut history = crate::runtime::history::read_thread_history(writer.data()).map_err(|source| {
-            crate::runtime::CatalogError::Session {
-                path: writer.data().path().to_path_buf(),
-                source,
-            }
-        })?;
-        view.activity.merge(&mut history);
-        Ok(SessionReadResult {
-            revision: view.last_event_revision,
+        let runtime = self.runtime_with_context_usage(inner, context_usage);
+        inner.view.activity.merge(&mut history);
+        SessionReadResult {
+            revision: inner.view.last_event_revision,
             history,
             runtime,
             background_tasks,
-            context: view.context.clone(),
-        })
-    }
-    pub(super) fn publish(&self, view: &mut ConversationView, event: StreamEvent) {
-        view.last_event_revision = self.hub.emit(event);
+            context: inner.view.context.clone(),
+        }
     }
 
-    pub(super) fn publish_changed(&self, view: &mut ConversationView) {
-        let payload = self.runtime(view);
+    pub(super) fn publish(&self, inner: &mut ConversationInner, event: StreamEvent) {
+        inner.view.last_event_revision = self.hub.emit(event);
+    }
+
+    pub(super) fn publish_changed(&self, inner: &mut ConversationInner) {
+        let payload = self.runtime(inner);
         self.publish(
-            view,
+            inner,
             StreamEvent::SessionChanged {
                 session_id: self.thread_id.clone(),
                 payload,
             },
         );
     }
-    pub(super) fn summary(&self) -> protocol::ThreadSummary {
-        let writer = lock_writer(&self.writer);
-        crate::runtime::history::summarize_thread(writer.data())
+
+    pub(super) fn publish_summary(&self, inner: &mut ConversationInner) {
+        let summary = crate::runtime::history::summarize_thread(lock_writer(&self.writer).data());
+        self.publish(inner, StreamEvent::SessionSummaryChanged { summary });
     }
-    pub(super) fn publish_summary(&self, view: &mut ConversationView) {
-        self.publish(view, StreamEvent::SessionSummaryChanged { summary: self.summary() });
-    }
+
     pub(super) fn on_event(&self, event: AgentEvent) {
-        let mut view = self.lock_view();
+        let mut inner = self.lock_inner();
         match event {
-            AgentEvent::SessionStateChanged => self.publish_changed(&mut view),
+            AgentEvent::SessionStateChanged => self.publish_changed(&mut inner),
             AgentEvent::ProviderAttempt { observation } => {
-                crate::runtime::history::accumulate_request_usage(&mut view.usage, &observation);
-                self.publish_changed(&mut view);
+                crate::runtime::history::accumulate_request_usage(&mut inner.view.usage, &observation);
+                self.publish_changed(&mut inner);
             }
-            AgentEvent::Turn(event) => self.publish_event(&mut view, event),
+            AgentEvent::Turn(event) => self.publish_event(&mut inner, event),
         }
     }
-    pub(super) fn publish_event(&self, view: &mut ConversationView, mut event: TurnEvent) {
+
+    pub(super) fn publish_event(&self, inner: &mut ConversationInner, mut event: TurnEvent) {
         match &mut event {
             TurnEvent::MessageFinished { items, .. } => {
-                agent::message::attach_usage(items, &view.usage);
+                agent::message::attach_usage(items, &inner.view.usage);
             }
             TurnEvent::TurnCompleted { stats, .. } | TurnEvent::TurnFailed { stats, .. } => {
-                *stats = Some(view.usage.clone());
+                *stats = Some(inner.view.usage.clone());
             }
             _ => {}
         }
         match &event {
             TurnEvent::ContextLoaded { context } => {
-                view.context = Some(context.clone());
+                inner.view.context = Some(context.clone());
             }
             TurnEvent::ItemUpdated {
                 item:
@@ -170,20 +190,20 @@ impl Conversation {
                         role: protocol::HistoryMessageRole::User, ..
                     },
             } => {
-                self.publish_summary(view);
+                self.publish_summary(inner);
             }
             _ => {}
         }
-        let phase = self.phase();
+        let phase = inner.state.turn.phase();
         if phase != SessionPhase::Idle {
-            view.activity.apply(&event);
+            inner.view.activity.apply(&event);
         }
         self.publish(
-            view,
+            inner,
             StreamEvent::TurnEvent {
                 session_id: self.thread_id.clone(),
                 payload: Box::new(TurnEventEnvelope {
-                    turn_id: view.activity.turn_id(),
+                    turn_id: inner.view.activity.turn_id(),
                     event,
                     phase,
                 }),

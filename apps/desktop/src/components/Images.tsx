@@ -2,6 +2,8 @@ import { useEffect, useId, useRef, useState, type ClipboardEvent, type DragEvent
 import { FileText, X } from 'lucide-react'
 import type { ImageAttachment } from '../protocol'
 import { appStore } from '../appStore'
+import { errorMessage } from '../rpcClient'
+import { pathBaseName } from '../workspace'
 import { Dialog } from './Dialog'
 
 export function useAttachmentInput(addImages: (images: File[]) => void, addFiles: (paths: string[]) => void, disabled = false) {
@@ -48,7 +50,7 @@ export function DraftImages({ images, remove }: { images: File[]; remove: (index
 
 export function FileChips({ files, remove }: { files: string[]; remove?: (index: number) => void }) {
   return <div className="file-list">{files.map((path, index) => <span key={path} className="file-chip" title={path}>
-    <FileText size={14} strokeWidth={1.7} aria-hidden="true" /><span className="file-chip-name">{path.split(/[\\/]/).at(-1)}</span>
+    <FileText size={14} strokeWidth={1.7} aria-hidden="true" /><span className="file-chip-name">{pathBaseName(path)}</span>
     {remove && <button type="button" className="file-chip-remove" aria-label={`移除附件 ${path}`} onClick={() => remove(index)}><X size={12} /></button>}
   </span>)}</div>
 }
@@ -68,7 +70,7 @@ function SavedImage({ sessionId, image }: { sessionId: string; image: ImageAttac
       setError(null)
       void appStore.transport.rpc('session.imageRead', { sessionId, imageId: image.id }).then(
         url => { if (active) setUrl(url) },
-        error => { if (active) setError(error instanceof Error ? error.message : String(error)) },
+        error => { if (active) setError(errorMessage(error)) },
       )
     }
     const element = tile.current!

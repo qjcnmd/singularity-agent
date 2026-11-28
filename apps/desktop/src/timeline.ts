@@ -9,7 +9,7 @@ type TerminalItem = { type: 'terminal'; status: 'failed' | 'interrupted'; text: 
 type TypingItem = { type: 'typing' }
 type TurnStatsItem = { type: 'stats'; at: string }
 export type TurnFileEdit = { path: string; added: number; deleted: number; created: boolean }
-export type TurnChangesItem = { type: 'turn_changes'; edits: TurnFileEdit[] }
+type TurnChangesItem = { type: 'turn_changes'; edits: TurnFileEdit[] }
 export type ActivityRowItem =
   | Extract<HistoryItem, { type: 'thinking' | 'tool' | 'compaction' | 'compaction_result' }>
   | ToolGroup
@@ -162,6 +162,11 @@ export function formatSessionMetrics(stats: SessionModelUsage | null | undefined
   return parts.join(' · ')
 }
 
+export function parseDiffSummary(line: string): { added: number; deleted: number } | null {
+  const counts = /^\+(\d+) -(\d+)$/.exec(line)
+  return counts ? { added: Number(counts[1]), deleted: Number(counts[2]) } : null
+}
+
 function extractTurnEdits(items: HistoryItem[]): TurnFileEdit[] {
   const edits: TurnFileEdit[] = []
   for (const item of items) {
@@ -175,9 +180,9 @@ function extractTurnEdits(items: HistoryItem[]): TurnFileEdit[] {
     const output = item.result?.output ?? ''
     const firstNewline = output.indexOf('\n')
     const summaryLine = firstNewline >= 0 ? output.slice(0, firstNewline) : output
-    const counts = /^\+(\d+) -(\d+)$/.exec(summaryLine)
-    const added = counts ? Number(counts[1]) : 0
-    const deleted = counts ? Number(counts[2]) : 0
+    const counts = parseDiffSummary(summaryLine)
+    const added = counts?.added ?? 0
+    const deleted = counts?.deleted ?? 0
     const created = item.result?.fileCreated === true
     if (!created && added === 0 && deleted === 0) continue
     edits.push({ path: rawPath, added, deleted, created })
@@ -314,4 +319,78 @@ export function toolDisplay(item: ToolItem, tasks: VisibleBackgroundTask[] = [])
     durationMs: 'durationMs' in task.state ? task.state.durationMs : undefined,
   } } : item
   return { status, shown }
+}
+
+export function summarizeActivity(rows: ActivityGroup['rows'], tasks: VisibleBackgroundTask[] | undefined) {
+  let stepCount = 0
+  let failedToolCount = 0
+  let runningKind: ActivityRowItem['type'] | null = null
+  let hasTyping = false
+  let turnFailed = false
+  let hasInterrupted = false
+  let hasCompleted = false
+  let terminalText: string | null = null
+  for (const { item } of rows) {
+    if (item.type === 'typing') {
+      hasTyping = true
+      continue
+    }
+    if (item.type === 'terminal') {
+      if (item.status === 'failed') turnFailed = true
+      else { hasInterrupted = true; terminalText = item.text }
+      continue
+    }
+    if (item.type === 'tool_group') {
+      stepCount += item.rows.length
+      for (const sub of item.rows) {
+        const status = toolDisplay(sub.item, tasks).status
+        if (status === 'running') runningKind = 'tool_group'
+        else if (status === 'failed') failedToolCount += 1
+        else if (status === 'interrupted') hasInterrupted = true
+        else if (status === 'completed') hasCompleted = true
+      }
+      continue
+    }
+    stepCount += 1
+    const status: ToolStatus = item.type === 'tool'
+      ? toolDisplay(item, tasks).status
+      : item.type === 'compaction'
+        ? 'completed'
+        : item.status
+    if (status === 'running') runningKind = item.type
+    else if (status === 'failed') {
+      if (item.type === 'tool') failedToolCount += 1
+      else turnFailed = true
+    } else if (status === 'interrupted') hasInterrupted = true
+    else if (status === 'completed') hasCompleted = true
+  }
+  const status: ToolStatus = runningKind !== null || hasTyping ? 'running'
+    : turnFailed ? 'failed'
+    : terminalText !== null ? 'interrupted'
+    : hasInterrupted ? 'interrupted'
+    : hasCompleted || failedToolCount > 0 ? 'completed'
+    : 'pending'
+  let label: string
+  if (runningKind !== null) {
+    if (stepCount === 1 && runningKind === 'thinking') label = '思考中'
+    else if (stepCount === 1 && runningKind === 'compaction_result') label = compactionText.running
+    else if (runningKind === 'thinking') label = `思考中 · 共 ${stepCount} 步`
+    else label = `执行中 · 共 ${stepCount} 步`
+  } else if (hasTyping) {
+    label = stepCount > 0 ? `等待回复 · 共 ${stepCount} 步` : '等待模型回复…'
+  } else if (status === 'failed') {
+    label = stepCount > 0 ? `执行失败 · ${stepCount} 个步骤` : '执行失败'
+  } else if (status === 'interrupted') {
+    const title = terminalText ?? '已中断'
+    label = stepCount > 0 ? `${title} · ${stepCount} 个步骤` : title
+  } else if (status === 'completed') {
+    label = failedToolCount > 0
+      ? `已完成 ${stepCount} 个步骤 · ${failedToolCount} 步失败`
+      : stepCount === 1 && rows[0]?.item.type === 'thinking'
+        ? '思考过程'
+        : `已完成 ${stepCount} 个步骤`
+  } else {
+    label = `等待执行 · ${stepCount} 个步骤`
+  }
+  return { status, label, stepCount }
 }

@@ -3,16 +3,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use protocol::{
-    ModelConfigurationInput, ProviderConfigurationInput, RedactedModelCatalog, RedactedProvider,
-    RedactedWebSearchConfig,
+    ModelConfigurationInput, ModelSelection, ProviderApiProtocol, ProviderConfigurationInput,
+    RedactedModelCatalog, RedactedProvider, RedactedWebSearchConfig,
 };
 
-use super::{
-    ModelSelection, ProviderApiProtocol, ProviderConfig, ProviderError, SelectedModel, UserConfigFile,
-    UserConfigModel, UserConfigProvider, UserConfigWebSearch, configuration_error, read_user_config_file,
-    resolve_model_definition, resolve_model_selection, validate_api_key, validate_base_url,
-    validate_identifier, write_user_config_file,
+use super::selection::{ProviderConfig, SelectedModel, resolve_model_definition, resolve_model_selection};
+use super::user::{
+    UserConfigFile, UserConfigModel, UserConfigProvider, UserConfigWebSearch, read_user_config_file,
+    write_user_config_file,
 };
+use super::{configuration_error, validate_api_key, validate_base_url, validate_identifier};
+use crate::error::ProviderError;
 use crate::web::{DEFAULT_WEB_SEARCH_BASE_URL, WebSearchAccess};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +74,11 @@ impl ModelConfigManager {
         api_protocol: ProviderApiProtocol,
         base_url: &str,
         api_key: Option<&str>,
+        cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<Vec<String>, ProviderError> {
+        if cancellation.is_cancelled() {
+            return Err(crate::transport::http::provider_cancelled_error());
+        }
         let normalized_url = crate::provider::canonical_base_url(base_url);
         let target_url = validate_base_url(normalized_url)?;
         let api_key = match api_key {
@@ -96,7 +101,7 @@ impl ModelConfigManager {
                 .expect("model credential lookup completes while the backend is running")?
             }
         };
-        super::discovery::discover(normalized_url, &api_key, api_protocol).await
+        super::discovery::discover(normalized_url, &api_key, api_protocol, cancellation).await
     }
 
     pub fn open(directory: PathBuf) -> Self {

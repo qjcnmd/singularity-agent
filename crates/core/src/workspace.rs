@@ -2,17 +2,17 @@ use std::path::{Path, PathBuf};
 
 use crate::display_path;
 
-pub fn saved_path_key(path: &str) -> String {
-    path.to_lowercase()
-}
-
 pub fn workspace_key(path: &Path) -> String {
     let normalized: PathBuf = path.components().collect();
-    display_path(&normalized).to_lowercase()
+    let mut key = display_path(&normalized).to_lowercase();
+    if key.starts_with("//") && key.len() > 2 && key.ends_with('/') {
+        key.pop();
+    }
+    key
 }
 
 pub fn same_saved_path(left: &str, right: &str) -> bool {
-    saved_path_key(left) == saved_path_key(right)
+    workspace_key(Path::new(left)) == workspace_key(Path::new(right))
 }
 
 pub fn canonicalize_workspace(path: impl AsRef<Path>) -> Result<PathBuf, String> {

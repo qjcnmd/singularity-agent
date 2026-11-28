@@ -2,6 +2,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { ArrowDown } from 'lucide-react'
 import { appStore, useAppStore, type AppState } from '../appStore'
+import { hasRunningBackgroundTask } from '../sessionState'
 import { type TimelineRow } from '../timeline'
 import { TimelineItem } from './TimelineItem'
 import { useConversationAnnotations } from './Annotations'
@@ -10,11 +11,6 @@ import { defaultAnchor } from '../viewPersistence'
 interface Props {
   state: Pick<AppState, 'selectedSessionId' | 'session' | 'sessionLoad' | 'bootstrap'>
   items: TimelineRow[]
-}
-
-function hasRunningBackgroundTask(liveSessions: AppState['liveSessions'], sessionId: string | null): boolean {
-  if (sessionId === null) return false
-  return liveSessions[sessionId]?.backgroundTasks.some(task => task.state.status === 'running') ?? false
 }
 
 export function Conversation({ state, items }: Props) {
@@ -38,7 +34,11 @@ export function Conversation({ state, items }: Props) {
   const reduced = useReducedMotion()
   const disclosurePause = useRef(0)
   const disclosureTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const followLatest = () => {
+  const [awayFromLatest, setAwayFromLatest] = useState(false)
+  const updateScrollState = useCallback((node: HTMLDivElement) => {
+    setAwayFromLatest(node.scrollHeight - node.clientHeight - node.scrollTop >= 32)
+  }, [])
+  const followLatest = useCallback(() => {
     const node = viewport.current
     if (!node || frame.current || performance.now() < disclosurePause.current) return
     let previous = performance.now()
@@ -53,7 +53,7 @@ export function Conversation({ state, items }: Props) {
       else { frame.current = 0; updateScrollState(node) }
     }
     frame.current = requestAnimationFrame(follow)
-  }
+  }, [reduced, updateScrollState])
   useLayoutEffect(() => () => {
     cancelAnimationFrame(frame.current)
     frame.current = 0
@@ -61,8 +61,6 @@ export function Conversation({ state, items }: Props) {
     if (disclosureTimer.current) clearTimeout(disclosureTimer.current)
     disclosurePause.current = 0
   }, [sessionId, cancelAnchorScan])
-  const [awayFromLatest, setAwayFromLatest] = useState(false)
-  const updateScrollState = (node: HTMLDivElement) => setAwayFromLatest(node.scrollHeight - node.clientHeight - node.scrollTop >= 32)
 
   useLayoutEffect(() => {
     const node = viewport.current
@@ -92,7 +90,7 @@ export function Conversation({ state, items }: Props) {
     observer.observe(node)
     if (documentNode.current !== null) observer.observe(documentNode.current)
     return () => { observer.disconnect(); cancelAnimationFrame(frame.current); frame.current = 0 }
-  }, [itemIdentity, sessionId, state.session?.runtime.phase])
+  }, [itemIdentity, sessionId, state.session?.runtime.phase, followLatest, updateScrollState])
 
   const saveReadingPosition = (node: HTMLDivElement, element: HTMLElement) => {
     const anchorElement = element.closest<HTMLElement>('.activity-card') ?? element
@@ -125,7 +123,7 @@ export function Conversation({ state, items }: Props) {
       if (node.scrollHeight - node.clientHeight - node.scrollTop < 32) { appStore.setViewportAnchor(defaultAnchor()); followLatest() }
       updateScrollState(node)
     }, 400)
-  }, [cancelAnchorScan])
+  }, [cancelAnchorScan, followLatest, updateScrollState])
 
   const scheduleAnchorScan = useCallback((node: HTMLDivElement) => {
     const revision = appStore.viewportAnchorRevision

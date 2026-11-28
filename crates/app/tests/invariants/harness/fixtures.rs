@@ -2,13 +2,27 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-pub const TINY_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+pub(crate) const TINY_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+pub(crate) fn find_tool_result<'a>(body: &'a Value, call_id: &str) -> &'a Value {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .expect("messages array")
+        .iter()
+        .filter_map(|msg| msg.get("content").and_then(Value::as_array))
+        .flatten()
+        .find(|block| {
+            block.get("type").and_then(Value::as_str) == Some("tool_result")
+                && block.get("tool_use_id").and_then(Value::as_str) == Some(call_id)
+        })
+        .unwrap_or_else(|| panic!("missing tool_result for {call_id}"))
+}
 
 fn sse_data(payload: &Value) -> String {
     format!("data: {payload}\n\n")
 }
 
-pub fn messages_text_sse(
+pub(crate) fn messages_text_sse(
     thinking: Option<(&str, &str)>,
     text: &str,
     input_tokens: u64,
@@ -68,7 +82,7 @@ pub fn messages_text_sse(
     events
 }
 
-pub fn messages_tools_sse(
+pub(crate) fn messages_tools_sse(
     preface: Option<&str>,
     calls: Vec<(&str, &str, Value)>,
     input_tokens: u64,
@@ -119,7 +133,7 @@ pub fn messages_tools_sse(
     events
 }
 
-pub fn responses_sse(
+pub(crate) fn responses_sse(
     thinking: Option<(&str, &str)>,
     text: Option<&str>,
     calls: Vec<(&str, &str, Value)>,
@@ -190,9 +204,10 @@ pub fn responses_sse(
     events
 }
 
-pub fn write_test_mcp_script(dir: &Path) -> PathBuf {
+pub(crate) fn write_test_mcp_script(dir: &Path) -> PathBuf {
     let script = dir.join("test_mcp_server.mjs");
     let source = r#"
+import { writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 const tools = [
@@ -239,6 +254,16 @@ function send(msg) {
 }
 
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+function markExit() {
+  if (process.env.TEST_MCP_EXIT_FILE) {
+    try { writeFileSync(process.env.TEST_MCP_EXIT_FILE, String(process.pid)); } catch {}
+  }
+}
+rl.on('close', () => {
+  markExit();
+  process.exit(0);
+});
+process.on('exit', markExit);
 rl.on('line', async (line) => {
   if (!line.trim()) return;
   let req;

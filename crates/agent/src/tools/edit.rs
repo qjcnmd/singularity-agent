@@ -1,96 +1,13 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
-use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
-
-const MAX_EDIT_FILE_BYTES: u64 = 20 * 1024 * 1024;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::json;
-use similar::{ChangeTag, TextDiff};
 use tokio_util::sync::CancellationToken;
 
-use super::registry::{
-    ABORTED_MESSAGE, COMMAND_MAX_BYTES, COMMAND_MAX_LINES, ToolDisplay, ToolExecution, error_result,
-};
-
-static FILE_EDITS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-pub(super) fn file_lock_key(path: &Path) -> std::io::Result<String> {
-    let mut missing = Vec::new();
-    let mut skip_parents = 0usize;
-    let mut cursor = path;
-    loop {
-        if skip_parents == 0
-            && let Ok(mut full) = cursor.canonicalize()
-        {
-            for component in missing.into_iter().rev() {
-                full.push(component);
-            }
-            return Ok(app_core::workspace_key(&full));
-        }
-        match cursor.components().next_back() {
-            Some(Component::CurDir) => {}
-            Some(Component::ParentDir) => skip_parents += 1,
-            Some(Component::Normal(name)) => {
-                if let Some(remaining) = skip_parents.checked_sub(1) {
-                    skip_parents = remaining;
-                } else {
-                    missing.push(name.to_os_string());
-                }
-            }
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("cannot resolve parent directory for {}", path.display()),
-                ));
-            }
-        }
-        let parent = cursor.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("cannot resolve parent directory for {}", path.display()),
-            )
-        })?;
-        cursor = if parent.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            parent
-        };
-    }
-}
-
-pub(super) async fn with_file_lock<F>(key: String, signal: CancellationToken, work: F) -> ToolExecution
-where
-    F: FnOnce(&CancellationToken) -> Result<ToolExecution, String> + Send + 'static,
-{
-    let lock = {
-        let mut files = FILE_EDITS.lock().expect("file edit registry lock poisoned");
-        let lock = files.get(&key).and_then(Weak::upgrade).unwrap_or_default();
-        files.insert(key, Arc::downgrade(&lock));
-        lock
-    };
-    let result = tokio::select! {
-        biased;
-        () = signal.cancelled() => error_result(ABORTED_MESSAGE),
-        guard = Arc::clone(&lock).lock_owned() => {
-            tokio::task::spawn_blocking(move || {
-                let _guard = guard;
-                work(&signal).unwrap_or_else(error_result)
-            })
-            .await
-            .expect("tool worker completes while the runtime is running")
-        }
-    };
-    drop(lock);
-    FILE_EDITS
-        .lock()
-        .expect("file edit registry lock poisoned")
-        .retain(|_, lock| lock.strong_count() > 0);
-    result
-}
+use super::file_ops::{format_diff_result, read_opened_text_file, with_file_lock};
+use super::registry::{ABORTED_MESSAGE, EDIT_TOOL_NAME, ToolExecution, error_result};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -106,9 +23,9 @@ struct Replacement {
     new_text: String,
 }
 
-pub(crate) fn spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
-        name: "edit".into(),
+pub(crate) fn spec() -> model::ToolDefinition {
+    model::ToolDefinition {
+        name: EDIT_TOOL_NAME.into(),
         description: "Edit an existing UTF-8 text file using one or more replacements. Exact match runs first; if it misses, matching falls back to ignoring trailing whitespace, common Unicode quote/dash/space variants, or line indentation differences. Each old_text must be nonempty and match uniquely in the original file; edits must not overlap. All replacements are checked before writing once. Read the relevant content first. LF and CRLF match equivalently. Use an empty new_text to delete text. Keep enough context to identify each location. Combine independent changes to one file in a single call; do not issue dependent edits concurrently.".into(),
         parameters_schema: json!({
             "type": "object",
@@ -157,33 +74,6 @@ pub(crate) async fn execute(
     with_file_lock(key, signal, move |signal| execute_locked(&args, &target, &output_directory, signal)).await
 }
 
-pub(super) fn read_opened_text_file(file: File, display_path: &str) -> Result<String, String> {
-    let metadata = file.metadata().map_err(|error| format!("Could not inspect {display_path}: {error}"))?;
-    if !metadata.is_file() {
-        return Err(format!("{display_path} is not a regular file"));
-    }
-    if metadata.len() > MAX_EDIT_FILE_BYTES {
-        return Err(format!("{display_path} exceeds the 20 MB text file limit"));
-    }
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
-    let head = reader.fill_buf().map_err(|error| format!("Could not read {display_path}: {error}"))?;
-    if head.contains(&0) {
-        return Err(format!("{display_path} is a binary file, not UTF-8 text"));
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).expect("file size is at most 20 MiB"));
-    reader
-        .take(MAX_EDIT_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("Could not read {display_path}: {error}"))?;
-    if bytes.len() as u64 > MAX_EDIT_FILE_BYTES {
-        return Err(format!("{display_path} exceeds the 20 MB text file limit"));
-    }
-    if bytes.contains(&0) {
-        return Err(format!("{display_path} is a binary file, not UTF-8 text"));
-    }
-    String::from_utf8(bytes).map_err(|error| format!("Could not read {display_path} as UTF-8 text: {error}"))
-}
-
 fn execute_locked(
     args: &EditArgs,
     target: &Path,
@@ -205,7 +95,7 @@ fn execute_locked(
 }
 
 fn apply_edits(content: &str, display_path: &str, edits: &[Replacement]) -> Result<(String, String), String> {
-    let source = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let source = app_core::strip_utf8_bom(content);
     let view = source.replace("\r\n", "\n");
     let removed: Vec<_> = source
         .match_indices("\r\n")
@@ -663,42 +553,4 @@ fn not_found_error<'a>(
         }
     }
     format!("edits[{index}].old_text was not found in {path}. Read the current text and retry.")
-}
-
-pub(crate) fn format_diff_result(
-    verb: &str,
-    path: &str,
-    before: &str,
-    after: &str,
-    output_directory: &Path,
-) -> ToolExecution {
-    let before = before.strip_prefix('\u{feff}').unwrap_or(before).replace("\r\n", "\n");
-    let after = after.strip_prefix('\u{feff}').unwrap_or(after).replace("\r\n", "\n");
-    let diff = TextDiff::from_lines(&before, &after);
-    let (mut added, mut deleted) = (0, 0);
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Insert => added += 1,
-            ChangeTag::Delete => deleted += 1,
-            ChangeTag::Equal => {}
-        }
-    }
-    let patch = diff.unified_diff().context_radius(2).to_string();
-    let summary = format!("+{added} -{deleted}\n");
-    let mut display_output = summary.clone();
-    for (index, line) in patch.lines().enumerate() {
-        if index >= COMMAND_MAX_LINES || display_output.len() + line.len() + 1 > COMMAND_MAX_BYTES {
-            display_output.push_str("[Diff truncated]\n");
-            break;
-        }
-        display_output.push_str(line);
-        display_output.push('\n');
-    }
-    let llm_diff = super::output::format_diff_head_tail(&summary, &patch, output_directory);
-    let mut execution = ToolExecution::text(format!("{verb} {path}.\n{llm_diff}"));
-    execution.display = Some(Box::new(ToolDisplay {
-        output: display_output,
-        background_task_id: None,
-    }));
-    execution
 }

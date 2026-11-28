@@ -1,7 +1,10 @@
-import type { SessionPhase, ToolStatus, TurnStatus, Workspace } from './protocol'
+import type { ContextGroup, SessionPhase, ToolStatus, TurnStatus, Workspace } from './protocol'
+import { pathBaseName } from './workspace'
+
+export const CONTEXT_GROUP_ORDER = ['instructions', 'tools', 'skills', 'mcp'] as const satisfies readonly ContextGroup[]
 
 export function workspaceName(workspace: Workspace): string {
-  return workspace.root.slice(workspace.root.lastIndexOf('/') + 1) || workspace.root
+  return pathBaseName(workspace.root)
 }
 
 export const factStatusText: Record<ToolStatus | TurnStatus, string> = {

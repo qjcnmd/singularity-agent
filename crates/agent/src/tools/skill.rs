@@ -2,7 +2,7 @@ use app_core::skills::SkillCatalog;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::registry::{ToolExecution, error_result};
+use super::registry::{SKILL_TOOL_NAME, ToolExecution, error_result};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -10,9 +10,9 @@ pub(crate) struct SkillArgs {
     pub(crate) name: String,
 }
 
-pub(crate) fn spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
-        name: "skill".to_string(),
+pub(crate) fn spec() -> model::ToolDefinition {
+    model::ToolDefinition {
+        name: SKILL_TOOL_NAME.to_string(),
         description: "Load the complete instructions of an available skill by name. The result includes the skill's base directory, from which its relative resources are resolved.".to_string(),
         parameters_schema: json!({
             "type": "object",

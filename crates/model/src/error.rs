@@ -53,6 +53,10 @@ impl ProviderError {
         Self::new(kind, message)
     }
 
+    pub fn is_cancelled(&self) -> bool {
+        self.kind == ModelErrorKind::Cancelled
+    }
+
     pub fn is_context_overflow(&self) -> bool {
         self.kind == ModelErrorKind::ContextLengthExceeded
     }

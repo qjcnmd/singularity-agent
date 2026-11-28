@@ -34,10 +34,18 @@ fn parse_retry_after_value(value: &str) -> Option<Duration> {
     (!remaining.is_zero()).then_some(remaining)
 }
 
-/// 模型调用与目录查询共用 ring；reqwest 的无默认加密实现模式要求先安装 provider。
+/// 模型调用、目录查询与联网工具共用的基础 HTTP 客户端构造器：
+/// 安装 ring TLS provider、禁用重定向并统一 User-Agent。
+#[expect(
+    clippy::disallowed_methods,
+    reason = "canonical model HTTP builder enforcing ring TLS, Policy::none(), and USER_AGENT"
+)]
 pub(crate) fn client_builder() -> reqwest::ClientBuilder {
     let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
+        // reqwest 跨源重定向时只移除预定义的鉴权头。
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(app_core::identity::USER_AGENT)
 }
 
 const PROVIDER_CONNECT_TIMEOUT_SECONDS: u64 = 30;
@@ -48,12 +56,9 @@ pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
         return Ok(client.clone());
     }
     let client = client_builder()
-        // reqwest 跨源重定向时只移除预定义的鉴权头。
-        .redirect(reqwest::redirect::Policy::none())
         .no_gzip()
         .connect_timeout(Duration::from_secs(PROVIDER_CONNECT_TIMEOUT_SECONDS))
         .read_timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
-        .user_agent(app_core::identity::USER_AGENT)
         .build()
         .map_err(provider_transport_error)?;
     Ok(CLIENT.get_or_init(|| client).clone())
@@ -146,9 +151,10 @@ pub(crate) fn provider_cancelled_error() -> ProviderError {
     ProviderError::new(ModelErrorKind::Cancelled, "provider request cancelled")
 }
 
-pub(crate) async fn provider_future<F, T>(
+pub(crate) async fn provider_future_with<F, T>(
     cancellation: &CancellationToken,
     future: F,
+    map_error: impl FnOnce(reqwest::Error) -> ProviderError,
 ) -> Result<T, ProviderError>
 where
     F: Future<Output = Result<T, reqwest::Error>>,
@@ -159,7 +165,16 @@ where
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(provider_cancelled_error()),
-        result = future => result
-            .map_err(provider_transport_error),
+        result = future => result.map_err(map_error),
     }
+}
+
+pub(crate) async fn provider_future<F, T>(
+    cancellation: &CancellationToken,
+    future: F,
+) -> Result<T, ProviderError>
+where
+    F: Future<Output = Result<T, reqwest::Error>>,
+{
+    provider_future_with(cancellation, future, provider_transport_error).await
 }

@@ -1,9 +1,9 @@
-.composer-region { position: relative; z-index: 4; width: 100%; max-width: 840px; margin: 0 auto; padding: 0 24px 16px; }
+.composer-region { position: relative; z-index: var(--z-content-overlay); width: 100%; max-width: 840px; margin: 0 auto; padding: 0 24px 16px; }
 .app-main .composer-region { position: absolute; width: auto; left: 0; right: var(--panel-space); bottom: 0; padding-top: 18px; transition: right var(--smooth-dur) var(--smooth); }
 .composer-region:has(.context-capsules) { display: flex; flex-direction: column; max-height: calc(100% - 16px); }
 .composer-region:has(.context-capsules) > .composer-candidate-anchor { flex: none; }
 .composer-card { position: relative; padding: 12px 12px 10px 16px; border-radius: 24px;
-  background: color-mix(in srgb, var(--glass-base) 92%, transparent); backdrop-filter: blur(30px) saturate(180%); -webkit-backdrop-filter: blur(30px) saturate(180%);
+  background: color-mix(in srgb, var(--raised) 92%, transparent); backdrop-filter: blur(30px) saturate(180%); -webkit-backdrop-filter: blur(30px) saturate(180%);
   box-shadow: 0 0 0 .5px var(--glass-ring), var(--glass-drop); transition: box-shadow 160ms; }
 .composer-card:focus-within { --glass-ring: var(--glass-ring-focus); }
 .composer-card textarea { display: block; width: 100%; min-height: 24px; max-height: 200px; border: 0; outline: 0; resize: none; background: transparent; font: 14.5px/1.55 var(--font-sans); field-sizing: content; }
@@ -11,9 +11,9 @@
 .composer-actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
 
 
-.attach-button { display: grid; place-items: center; flex: none; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--ink-soft); cursor: pointer; transition: background 120ms, color 120ms, transform var(--spring-dur) var(--spring); }
+.attach-button { display: grid; place-items: center; flex: none; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--ink-soft); cursor: pointer; transition: background var(--dur-fast), color var(--dur-fast), transform var(--spring-dur) var(--spring); }
 .attach-button:hover:not(:disabled) { background: var(--surface-hover); color: var(--ink); }
-.attach-button:active:not(:disabled) { transform: scale(.94); transition-duration: 80ms; }
+.attach-button:active:not(:disabled) { transform: scale(.94); transition-duration: var(--dur-press); }
 .attach-button:disabled { opacity: .45; cursor: default; }
 
 .send-button { position: relative; display: grid; place-items: center; flex: none; width: 40px; height: 40px; padding: 0; border: 0; border-radius: 50%; background: transparent; cursor: pointer; }
@@ -32,8 +32,7 @@
 .send-button.is-idle .send-button-core { background: var(--fill); color: var(--ink-faint); }
 .send-button.is-busy .send-button-core { background: var(--fill); color: var(--ink-soft); }
 .send-button:hover:not([aria-disabled="true"]) .send-button-core { transform: scale(1.05); filter: brightness(1.06); }
-.send-button:active:not([aria-disabled="true"]) .send-button-core { transform: scale(.93); transition-duration: 80ms; }
-@media (prefers-reduced-motion: reduce) { .send-ring-track, .send-ring-arc, .send-button-core { transition: none !important; } }
+.send-button:active:not([aria-disabled="true"]) .send-button-core { transform: scale(.93); transition-duration: var(--dur-press); }
 
 .composer-candidates { position: relative; max-height: 264px; overflow-y: auto; padding: 5px; border: 1px solid var(--line-strong); border-radius: 14px; background: color-mix(in srgb, var(--raised) 92%, transparent); backdrop-filter: blur(24px) saturate(170%); box-shadow: var(--shadow-floating); }
 .composer-candidate-anchor > .picker-disclosure > div { overflow: visible; background: none; box-shadow: none; }
@@ -49,7 +48,7 @@
 
 
 .composer-candidate-anchor { position: relative; }
-.composer-candidate-anchor > .picker-disclosure { position: absolute; bottom: 8px; left: 0; right: 0; z-index: 8; }
+.composer-candidate-anchor > .picker-disclosure { position: absolute; bottom: 8px; left: 0; right: 0; z-index: var(--z-popover); }
 .composer-card textarea:focus-visible { outline: none; }
 
 .context-capsules { display: flex; flex-direction: column; min-height: 0; margin: 0 0 12px 4px; }
@@ -60,31 +59,30 @@
 .capsule-total { margin: 2px 4px 0; color: var(--ink-faint); font-size: 11.5px; font-variant-numeric: tabular-nums; }
 .capsule-status { margin: 0 0 12px 4px; color: var(--ink-faint); font-size: 12.5px; }
 .capsule { display: inline-flex; align-items: center; gap: 7px; height: 30px; max-width: 190px; padding: 0 11px; border: 0; border-radius: 999px; background: var(--soft-fill);
-  color: var(--ink-faint); font-size: 12.5px; cursor: pointer; transition: background 120ms, color 120ms, transform var(--spring-dur) var(--spring); }
+  color: var(--ink-faint); font-size: 12.5px; cursor: pointer; transition: background var(--dur-fast), color var(--dur-fast), transform var(--spring-dur) var(--spring); }
 .capsule.is-on { color: var(--ink); }
 .capsule:hover:not([aria-disabled=true]) { background: var(--soft-fill-hover); }
-.capsule:active:not([aria-disabled=true]) { transform: scale(.96); transition-duration: 80ms; }
+.capsule:active:not([aria-disabled=true]) { transform: scale(.96); transition-duration: var(--dur-press); }
 .capsule[aria-disabled=true] { cursor: default; }
 .capsule-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .capsule-tokens { flex: none; color: var(--ink-faint); font-size: 11px; font-variant-numeric: tabular-nums; }
 .capsule-icon { flex: none; width: 14px; height: 14px; }
 .capsule-icon .dot { fill: var(--ink-faint); transform-origin: 8px 8px; transition: transform 200ms ease, opacity 160ms; }
 .capsule-icon .ring { fill: none; stroke: var(--accent); stroke-width: 1.4; opacity: 0; transform-origin: 8px 8px; transform: scale(.6); transition: opacity 160ms, transform var(--spring-dur) var(--spring); }
-.capsule-icon .tick { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 8; stroke-dashoffset: 8; transition: stroke-dashoffset 120ms; }
+.capsule-icon .tick { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 8; stroke-dashoffset: 8; transition: stroke-dashoffset var(--dur-fast); }
 .capsule.is-on .dot { transform: scale(2.4); opacity: 0; }
 .capsule.is-on .ring { opacity: 1; transform: none; }
 .capsule.is-on .tick { stroke-dashoffset: 0; transition: stroke-dashoffset 220ms ease 70ms; }
-@media (prefers-reduced-motion: reduce) { .capsule, .capsule-icon * { transition: none !important; } }
 
 .project-capsule { position: relative; flex: none; align-self: flex-start; margin: 0 0 12px; }
 .project-trigger { color: var(--ink); anchor-name: --project-capsule; }
 .project-trigger .expand-chevron { transform: rotate(-90deg); }
 .project-trigger .expand-chevron.is-open { transform: rotate(90deg); }
-.project-menu { position: fixed; position-anchor: --project-capsule; bottom: calc(anchor(top) + 6px); left: anchor(center); translate: -50% 0; position-try-fallbacks: flip-block; z-index: 10; width: max-content; min-width: anchor-size(width); max-width: 280px; }
+.project-menu { position: fixed; position-anchor: --project-capsule; bottom: calc(anchor(top) + 6px); left: anchor(center); translate: -50% 0; position-try-fallbacks: flip-block; z-index: var(--z-menu); width: max-content; min-width: anchor-size(width); max-width: 280px; }
 .project-menu .content-disclosure { border-radius: 10px; background: var(--raised); }
 .project-menu .content-disclosure.is-open { box-shadow: 0 2px 8px rgb(0 0 0 / 6%); }
 .project-options { display: grid; padding: 5px; max-height: 240px; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; }
-.project-options button { display: flex; align-items: center; gap: 7px; height: 32px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--ink-soft); font-size: 12.5px; text-align: left; white-space: nowrap; cursor: pointer; transition: background 120ms; }
+.project-options button { display: flex; align-items: center; gap: 7px; height: 32px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--ink-soft); font-size: 12.5px; text-align: left; white-space: nowrap; cursor: pointer; transition: background var(--dur-fast); }
 .project-options button:hover { background: var(--surface-hover); color: var(--ink); }
 .project-options button[aria-pressed=true] { color: var(--ink); }
 .project-options button > span:first-of-type { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }

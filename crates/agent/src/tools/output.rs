@@ -7,11 +7,29 @@ use uuid::Uuid;
 
 use crate::tools::registry::{COMMAND_MAX_BYTES, COMMAND_MAX_LINES, WEB_MAX_BYTES, WEB_MAX_LINES};
 
+pub(crate) const FULL_OUTPUT_PREFIX: &str = "Full output: ";
+const FULL_OUTPUT_ERROR_PREFIX: &str = "Full output could not be saved: ";
+
 pub(super) const COMMAND_HEAD_LINES: usize = COMMAND_MAX_LINES / 2;
 pub(super) const COMMAND_TAIL_LINES: usize = COMMAND_MAX_LINES - COMMAND_HEAD_LINES;
 pub(super) const COMMAND_HEAD_BYTES: usize = COMMAND_MAX_BYTES / 2;
 pub(super) const COMMAND_TAIL_BYTES: usize = COMMAND_MAX_BYTES - COMMAND_HEAD_BYTES;
 const INTERNAL_TAIL_MAX_BYTES: usize = COMMAND_MAX_BYTES * 2;
+
+pub(super) fn format_spill_note(path: Option<&str>, error: Option<&str>) -> Option<String> {
+    if let Some(error) = error {
+        Some(format!("{FULL_OUTPUT_ERROR_PREFIX}{error}"))
+    } else {
+        path.map(|path| format!("{FULL_OUTPUT_PREFIX}{path}"))
+    }
+}
+
+fn spill_note_from_result(result: Result<&SpillWriter, &io::Error>) -> String {
+    match result {
+        Ok(spill) => format!("{FULL_OUTPUT_PREFIX}{}", spill.path.display()),
+        Err(error) => format!("{FULL_OUTPUT_ERROR_PREFIX}{error}"),
+    }
+}
 
 struct SpillWriter {
     path: PathBuf,
@@ -179,10 +197,7 @@ impl CaptureState {
     }
 
     fn spill_note(&self) -> Option<String> {
-        self.spill.as_ref().map(|spill| match spill {
-            Ok(spill) => format!("Full output: {}", spill.path.display()),
-            Err(error) => format!("Full output could not be saved: {error}"),
-        })
+        self.spill.as_ref().map(|spill| spill_note_from_result(spill.as_ref()))
     }
 
     fn head_truncation(&self) -> Truncation {
@@ -296,10 +311,7 @@ pub(super) fn format_diff_head_tail(summary: &str, patch: &str, output_directory
     if total_lines <= COMMAND_MAX_LINES && full_diff.len() <= COMMAND_MAX_BYTES {
         return full_diff;
     }
-    let spill_note = match SpillWriter::create(output_directory, &full_diff) {
-        Ok(spill) => format!("Full output: {}", spill.path.display()),
-        Err(error) => format!("Full output could not be saved: {error}"),
-    };
+    let spill_note = spill_note_from_result(SpillWriter::create(output_directory, &full_diff).as_ref());
     let body = format_head_tail_slice(patch);
     format!("{summary}{body}\n\n{spill_note}")
 }
@@ -309,6 +321,20 @@ pub(super) fn format_head_tail_slice(content: &str) -> String {
     if content.len() <= COMMAND_MAX_BYTES && total_lines <= COMMAND_MAX_LINES {
         return content.to_string();
     }
+    format_head_tail_truncated(content, total_lines)
+}
+
+pub(super) fn format_head_tail_bounded(content: &str, output_directory: &Path) -> String {
+    let total_lines = count_lines(content);
+    if content.len() <= COMMAND_MAX_BYTES && total_lines <= COMMAND_MAX_LINES {
+        return content.to_string();
+    }
+    let body = format_head_tail_truncated(content, total_lines);
+    let spill_note = spill_note_from_result(SpillWriter::create(output_directory, content).as_ref());
+    format!("{body}\n\n{spill_note}")
+}
+
+fn format_head_tail_truncated(content: &str, total_lines: usize) -> String {
     let head = truncate_lines(content, false, COMMAND_HEAD_LINES, COMMAND_HEAD_BYTES);
     let tail = truncate_lines(content, true, COMMAND_TAIL_LINES, COMMAND_TAIL_BYTES);
     format_head_tail_parts(&head, &tail, content.len() as u64, Some(total_lines))
@@ -320,7 +346,7 @@ pub(super) fn format_spill_head_tail(head_raw: &str, tail_raw: &str, total_unrea
     format_head_tail_parts(&head, &tail, total_unread_bytes, None)
 }
 
-pub(super) fn count_lines(content: &str) -> usize {
+fn count_lines(content: &str) -> usize {
     if content.is_empty() {
         return 0;
     }
@@ -378,7 +404,7 @@ fn truncate_string_to_bytes_from_end(line: &str, max_bytes: usize) -> String {
 }
 
 pub(crate) fn format_head_bounded(content: &str, output_directory: &Path) -> String {
-    let total_lines = content.lines().count();
+    let total_lines = count_lines(content);
     if total_lines <= WEB_MAX_LINES && content.len() <= WEB_MAX_BYTES {
         return content.to_string();
     }
@@ -386,10 +412,7 @@ pub(crate) fn format_head_bounded(content: &str, output_directory: &Path) -> Str
     if !head.partial_line && head.output_lines >= total_lines {
         return head.content;
     }
-    let spill_note = match SpillWriter::create(output_directory, content) {
-        Ok(spill) => format!("Full output: {}", spill.path.display()),
-        Err(error) => format!("Full output could not be saved: {error}"),
-    };
+    let spill_note = spill_note_from_result(SpillWriter::create(output_directory, content).as_ref());
     let summary = if head.partial_line {
         format!(
             "[Showing the first {} of output (line 1 of {total_lines}). Use read to inspect the full output.]",

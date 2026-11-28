@@ -1,25 +1,20 @@
 import { LoaderCircle } from 'lucide-react'
 import { memo, useId, useState } from 'react'
-import { actionOrigin, appStore, pendingKey, useAppStore, type ActionError, type AppState } from '../appStore'
+import { actionOrigin, appStore, pendingKey, useAppStore, type ActionError } from '../appStore'
 import type { VisibleBackgroundTask } from '../protocol'
+import { sessionBackgroundTasks } from '../sessionState'
 import { CommandOutput } from './CommandOutput'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 
 const fields = ['selectedSessionId', 'liveSessions', 'pendingActions', 'actionErrors'] as const
-type BackgroundState = Pick<AppState, typeof fields[number]>
-const emptyTasks: VisibleBackgroundTask[] = []
-function selectedTasks(state: BackgroundState): VisibleBackgroundTask[] {
-  const id = state.selectedSessionId
-  if (id === null) return emptyTasks
-  return state.liveSessions[id]?.backgroundTasks ?? emptyTasks
-}
 
 export const BackgroundTasks = memo(function BackgroundTasks() {
   const state = useAppStore(fields, (previous, next) => previous.selectedSessionId === next.selectedSessionId
-    && selectedTasks(previous) === selectedTasks(next) && previous.pendingActions === next.pendingActions
+    && sessionBackgroundTasks(previous.liveSessions, previous.selectedSessionId) === sessionBackgroundTasks(next.liveSessions, next.selectedSessionId)
+    && previous.pendingActions === next.pendingActions
     && previous.actionErrors === next.actionErrors)
-  const tasks = selectedTasks(state).filter(task => task.state.status === 'running')
+  const tasks = sessionBackgroundTasks(state.liveSessions, state.selectedSessionId).filter(task => task.state.status === 'running')
   const sessionId = state.selectedSessionId
   if (sessionId === null || tasks.length === 0) return null
   return <section aria-label="后台命令">

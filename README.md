@@ -20,7 +20,7 @@ Rust 后端采用单向依赖 `app → agent → {model, mcp} → {app_core, pro
 | `crates/core/` (`app_core`) | 产品身份常量、数据根目录定位、工作区路径规范化、分层 `AGENTS.md` 与 `SKILL.md` 加载、原子写盘与 Token 估算 |
 | `crates/model/` | `config.json` 读写脱敏、独立联网工具客户端（`web.rs`）、协议无关 `ModelClient`、SSE 切帧与 Messages / Responses 双协议编解码 |
 | `crates/mcp/` | `mcp.json` 校验与多路径凭据脱敏、按 `(directory, server)` 复用的 `McpManager` 连接池与 rmcp 客户端 |
-| `crates/agent/` | Agent 主循环、模块化上下文组装、并发工具调度、JSONL v1 会话日志、分段压缩与内置工具集（含 `bash`/`read`/`edit`/`write`/`view_image`/`web_*`/`skill`/`ask_user_question`/`mcp_*`） |
+| `crates/agent/` | Agent 主循环、模块化上下文组装、并发工具调度、JSONL v1 会话日志、单轮折叠压缩与内置工具集（含 `bash`/`read`/`grep`/`glob`/`edit`/`write`/`todo`/`view_image`/`web_*`/`skill`/`ask_user_question`/`mcp_*`） |
 | `crates/app/` | `Singularity.exe` 入口、滚动诊断日志、stdio JSON-RPC 传输与 `StreamHub` 事件中心、项目只读 Git 差异查询、`AppServer` 会话与工作区协调、`Conversation` 状态机与后端黑盒不变量测试 |
 | `apps/desktop/` | Electron 主进程/预加载桥接、React 桌面工作台界面与 Playwright 端到端冒烟套件 |
 

@@ -1,7 +1,7 @@
 import { X } from 'lucide-react'
 import { useState, type FormEvent } from 'react'
 import type { ProviderApiProtocol, ProviderConfigurationInput } from '../protocol'
-import { capacityConfigurationError, formatCapacityInput, parseCapacity, reasoningOptionsFor } from '../modelConfiguration'
+import { capacityConfigurationError, formatCapacityInput, parseCapacity, reasoningOptionsFor } from '../models'
 import { Dialog } from './Dialog'
 
 function ReasoningOptions({ options, selected, onChange }: {

@@ -43,13 +43,36 @@ export function loadPersisted(): PersistedView {
     viewportAnchors: {},
   }
   try {
-    const stored = JSON.parse(localStorage.getItem(VIEW_STORAGE_KEY) ?? 'null') as Partial<PersistedView> | null
-    if (!stored) return fallback
+    const raw: unknown = JSON.parse(localStorage.getItem(VIEW_STORAGE_KEY) ?? 'null')
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fallback
+    const stored = raw as Partial<PersistedView>
     return {
-      ...fallback,
-      ...stored,
-      accentColor: resolveAccentId(stored.accentColor),
+      theme: stored.theme === 'dark' || stored.theme === 'light' ? stored.theme : fallback.theme,
+      messageFontSize: typeof stored.messageFontSize === 'number'
+        ? normalizeMessageFontSize(stored.messageFontSize)
+        : fallback.messageFontSize,
+      accentColor: resolveAccentId(typeof stored.accentColor === 'string' ? stored.accentColor : undefined),
+      selectedWorkspaceRoot: typeof stored.selectedWorkspaceRoot === 'string' || stored.selectedWorkspaceRoot === null
+        ? stored.selectedWorkspaceRoot
+        : fallback.selectedWorkspaceRoot,
+      selectedSessionId: typeof stored.selectedSessionId === 'string' || stored.selectedSessionId === null
+        ? stored.selectedSessionId
+        : fallback.selectedSessionId,
+      sidebarWidth: typeof stored.sidebarWidth === 'number' && Number.isFinite(stored.sidebarWidth)
+        ? clampSidebarWidth(stored.sidebarWidth)
+        : fallback.sidebarWidth,
+      filePanelWidth: typeof stored.filePanelWidth === 'number' && Number.isFinite(stored.filePanelWidth)
+        ? clampFilePanelWidth(stored.filePanelWidth)
+        : fallback.filePanelWidth,
+      sidebarCollapsed: typeof stored.sidebarCollapsed === 'boolean' ? stored.sidebarCollapsed : fallback.sidebarCollapsed,
+      sidebarView: stored.sidebarView && typeof stored.sidebarView === 'object' && Array.isArray(stored.sidebarView.collapsed)
+        ? { collapsed: stored.sidebarView.collapsed.filter((item): item is string => typeof item === 'string') }
+        : fallback.sidebarView,
+      backgroundOpen: typeof stored.backgroundOpen === 'boolean' ? stored.backgroundOpen : fallback.backgroundOpen,
       stepsDefaultExpanded: typeof stored.stepsDefaultExpanded === 'boolean' ? stored.stepsDefaultExpanded : fallback.stepsDefaultExpanded,
+      viewportAnchors: stored.viewportAnchors && typeof stored.viewportAnchors === 'object' && !Array.isArray(stored.viewportAnchors)
+        ? stored.viewportAnchors
+        : fallback.viewportAnchors,
     }
   } catch {
     return fallback

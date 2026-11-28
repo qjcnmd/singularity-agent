@@ -115,14 +115,14 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
 
+      - name: Check workspace architecture and identity parity
+        run: pwsh -File scripts/check.ps1 -Scope arch -Check
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Export TypeScript protocol bindings
-        run: cargo run -p protocol --features typescript --example export_types --locked
-
       - name: Verify TypeScript protocol bindings are up to date
-        run: git diff --ignore-cr-at-eol --exit-code -- apps/desktop/src/protocol.generated.ts
+        run: cargo run -p protocol --features typescript --example export_types --locked -- --check
 
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings

@@ -14,9 +14,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96.0"
 license = "MIT"
+publish = false
 repository = "https://github.com/qjcnmd/singularity-agent"
 
 [workspace.lints.rust]
+unreachable_pub = "warn"
 unsafe_code = "forbid"
 unsafe_op_in_unsafe_fn = "deny"
 
@@ -29,19 +31,29 @@ await_holding_refcell_ref = "deny"
 cast_possible_truncation = "warn"
 correctness = { level = "deny", priority = -1 }
 dbg_macro = "deny"
+disallowed_methods = "deny"
 format_collect = "deny"
 format_push_string = "deny"
+implicit_clone = "deny"
+inefficient_to_string = "deny"
+large_futures = "deny"
+manual_let_else = "deny"
 match_wildcard_for_single_variants = "deny"
 needless_collect = "deny"
+needless_pass_by_value = "deny"
+perf = { level = "deny", priority = -1 }
 print_stdout = "deny"
 redundant_clone = "deny"
 redundant_closure_for_method_calls = "deny"
 return_self_not_must_use = "warn"
+semicolon_if_nothing_returned = "deny"
+suspicious = { level = "deny", priority = -1 }
 todo = "deny"
 trivially_copy_pass_by_ref = "deny"
 unimplemented = "deny"
 uninlined_format_args = "deny"
 unwrap_used = "deny"
+use_self = "deny"
 wildcard_imports = "deny"
 
 [workspace.dependencies]

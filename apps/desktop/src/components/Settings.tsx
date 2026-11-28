@@ -7,11 +7,12 @@ import { smooth } from '../motion'
 import type { RedactedProvider } from '../protocol'
 import { messageFontSize } from '../viewPersistence'
 import { ProviderEditor } from './ProviderEditor'
-import { Dialog } from './Dialog'
+import { ConfirmDialog, Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 import { SelectionSlider } from './SelectionSlider'
-import { InstructionsPage, McpPage, PageFrame, SkillsPage } from './ManagePages'
+import { InstructionsPage, PageFrame, SkillsPage } from './ManagePages'
+import { McpSettings } from './McpSettings'
 
 type SettingsTab = 'appearance' | 'models' | 'web-search' | 'instructions' | 'skills' | 'mcp'
 type ProviderEditorState = null | 'new' | RedactedProvider
@@ -26,7 +27,7 @@ const settingsTabs: ReadonlyArray<{ id: SettingsTab; label: string }> = [
 ]
 
 export function Settings() {
-  const { settingsOpen, pendingActions } = useAppStore(['settingsOpen', 'pendingActions'])
+  const { settingsOpen, pendingActions, selectedWorkspaceRoot } = useAppStore(['settingsOpen', 'pendingActions', 'selectedWorkspaceRoot'])
   const [tab, setTab] = useState<SettingsTab>('appearance')
   const navRef = useRef<HTMLElement>(null)
   const reduced = useReducedMotion()
@@ -76,7 +77,7 @@ export function Settings() {
               {tab === 'web-search' && <WebSearchSection />}
               {tab === 'instructions' && <InstructionsPage />}
               {tab === 'skills' && <SkillsPage />}
-              {tab === 'mcp' && <McpPage />}
+              {tab === 'mcp' && <PageFrame title="MCP"><McpSettings workspaceRoot={selectedWorkspaceRoot} /></PageFrame>}
             </motion.div>
           </div>
         </div>
@@ -269,17 +270,17 @@ function ModelsSection() {
         {editor !== 'new' && <button type="button" className="settings-row settings-add" disabled={unreadable || busy} onClick={() => openEditor('new')}>添加提供方</button>}
         <Disclosure open={editor === 'new'}><div><ProviderEditor key={editorVersion} state={state} active={editor === 'new'} onDone={() => setEditor(null)} /></div></Disclosure>
       </div>
-      <Dialog open={removing !== null} onClose={() => { if (!busy) setRemoving(null) }} labelledBy="remove-provider-title" className="confirm-modal">
-        <header className="modal-header"><h2 id="remove-provider-title">删除提供方</h2></header>
-        <div className="confirm-body">
-          <p>删除“{removing?.displayName || removing?.providerId}”及其模型和 API 密钥？</p>
-          {removing && state.actionErrors[actionOrigin.inline('model.removeProvider', removing.providerId)] && <p role="alert" className="form-error">{state.actionErrors[actionOrigin.inline('model.removeProvider', removing.providerId)].message}</p>}
-          <footer>
-            <button type="button" className="secondary-button" data-autofocus disabled={busy} onClick={() => setRemoving(null)}>取消</button>
-            <button type="button" className="danger-button" disabled={busy} onClick={() => void removeProvider()}>删除</button>
-          </footer>
-        </div>
-      </Dialog>
+      <ConfirmDialog
+        open={removing !== null}
+        onClose={() => setRemoving(null)}
+        onConfirm={() => void removeProvider()}
+        title="删除提供方"
+        message={`删除“${removing?.displayName || removing?.providerId || ''}”及其模型和 API 密钥？`}
+        confirmLabel="删除"
+        danger
+        pending={busy}
+        error={removing ? state.actionErrors[actionOrigin.inline('model.removeProvider', removing.providerId)]?.message : null}
+      />
     </PageFrame>
   )
 }

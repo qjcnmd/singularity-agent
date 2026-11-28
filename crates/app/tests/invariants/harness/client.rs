@@ -9,16 +9,39 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 
-pub struct TestEnv {
+pub(crate) fn provider_config_json(
+    provider_id: &str,
+    protocol: &str,
+    display_name: &str,
+    base_url: &str,
+    model_id: &str,
+    max_context_tokens: u32,
+    max_output_tokens: u32,
+) -> Value {
+    json!({
+        "apiProtocol": protocol,
+        "providerId": provider_id,
+        "displayName": display_name,
+        "baseUrl": base_url,
+        "models": [{
+            "modelId": model_id,
+            "maxContextTokens": max_context_tokens,
+            "maxOutputTokens": max_output_tokens,
+            "reasoningVariants": ["off", "low", "high"]
+        }]
+    })
+}
+
+pub(crate) struct TestEnv {
     root: PathBuf,
-    pub home: PathBuf,
-    pub workspace: PathBuf,
+    pub(crate) home: PathBuf,
+    pub(crate) workspace: PathBuf,
 }
 
 impl TestEnv {
-    pub fn new(label: &str) -> Self {
+    pub(crate) fn new(label: &str) -> Self {
         let unique = uuid::Uuid::new_v4();
         let root = std::env::temp_dir().join(format!("singularity-test-{label}-{unique}"));
         let home = root.join("home");
@@ -30,7 +53,7 @@ impl TestEnv {
         Self { root, home, workspace }
     }
 
-    pub fn workspace_str(&self) -> String {
+    pub(crate) fn workspace_str(&self) -> String {
         let raw = self.workspace.to_string_lossy();
         raw.strip_prefix(r"\\?\").unwrap_or(&raw).replace('\\', "/")
     }
@@ -47,7 +70,7 @@ impl Drop for TestEnv {
     }
 }
 
-pub struct BackendClient {
+pub(crate) struct BackendClient {
     child: Child,
     stdin: Option<ChildStdin>,
     next_id: u64,
@@ -58,7 +81,7 @@ pub struct BackendClient {
 }
 
 impl BackendClient {
-    pub async fn spawn(home: &Path) -> Self {
+    pub(crate) async fn spawn(home: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_singularity"))
             .env("SINGULARITY_HOME", home)
             .env("SINGULARITY_LOG", "warn")
@@ -125,11 +148,11 @@ impl BackendClient {
         client
     }
 
-    pub fn stderr_text(&self) -> String {
+    pub(crate) fn stderr_text(&self) -> String {
         self.stderr.lock().expect("stderr lock").clone()
     }
 
-    pub async fn rpc_raw(&mut self, method: &str, params: Value) -> Value {
+    pub(crate) async fn rpc_raw(&mut self, method: &str, params: Value) -> Value {
         self.next_id += 1;
         let id = self.next_id;
         let (tx, rx) = oneshot::channel();
@@ -152,7 +175,7 @@ impl BackendClient {
             .unwrap_or_else(|_| panic!("RPC {method} channel closed; stderr:\n{}", self.stderr_text()))
     }
 
-    pub async fn rpc_ok(&mut self, method: &str, params: Value) -> Value {
+    pub(crate) async fn rpc_ok(&mut self, method: &str, params: Value) -> Value {
         let response = self.rpc_raw(method, params).await;
         assert_eq!(
             response.get("type").and_then(Value::as_str),
@@ -163,7 +186,7 @@ impl BackendClient {
         response.get("result").cloned().unwrap_or(Value::Null)
     }
 
-    pub async fn rpc_err(&mut self, method: &str, params: Value) -> String {
+    pub(crate) async fn rpc_err(&mut self, method: &str, params: Value) -> String {
         let response = self.rpc_raw(method, params).await;
         assert_eq!(
             response.get("type").and_then(Value::as_str),
@@ -173,18 +196,22 @@ impl BackendClient {
         response.pointer("/error/message").and_then(Value::as_str).unwrap_or_default().to_string()
     }
 
-    pub fn take_buffered_events(&mut self) -> Vec<Value> {
+    pub(crate) fn take_buffered_events(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.buffered_events)
     }
 
-    pub fn drain_events(&mut self) -> Vec<Value> {
+    pub(crate) fn drain_events(&mut self) -> Vec<Value> {
         while let Ok(frame) = self.events_rx.try_recv() {
             self.buffered_events.push(frame);
         }
         std::mem::take(&mut self.buffered_events)
     }
 
-    pub async fn wait_event(&mut self, timeout: Duration, mut pred: impl FnMut(&Value) -> bool) -> Value {
+    pub(crate) async fn wait_event(
+        &mut self,
+        timeout: Duration,
+        mut pred: impl FnMut(&Value) -> bool,
+    ) -> Value {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -208,7 +235,7 @@ impl BackendClient {
         }
     }
 
-    pub async fn wait_settled(&mut self, session_id: &str) -> Value {
+    pub(crate) async fn wait_settled(&mut self, session_id: &str) -> Value {
         self.wait_event(DEFAULT_TIMEOUT, |frame| {
             frame.get("type").and_then(Value::as_str) == Some("session_settled")
                 && frame.get("sessionId").and_then(Value::as_str) == Some(session_id)
@@ -216,7 +243,7 @@ impl BackendClient {
         .await
     }
 
-    pub async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(mut self) {
         drop(self.stdin.take());
         let status = tokio::time::timeout(DEFAULT_TIMEOUT, self.child.wait())
             .await
@@ -226,7 +253,7 @@ impl BackendClient {
     }
 
     #[expect(clippy::too_many_arguments, reason = "test harness RPC builder helper")]
-    pub async fn setup_workspace_and_provider(
+    pub(crate) async fn setup_workspace_and_provider(
         &mut self,
         workspace: &str,
         provider_id: &str,
@@ -241,18 +268,15 @@ impl BackendClient {
         self.rpc_ok(
             "model.saveProvider",
             json!({
-                "provider": {
-                    "apiProtocol": protocol,
-                    "providerId": provider_id,
-                    "displayName": provider_id,
-                    "baseUrl": base_url,
-                    "models": [{
-                        "modelId": model_id,
-                        "maxContextTokens": max_context_tokens,
-                        "maxOutputTokens": max_output_tokens,
-                        "reasoningVariants": ["off", "low", "high"]
-                    }]
-                },
+                "provider": provider_config_json(
+                    provider_id,
+                    protocol,
+                    provider_id,
+                    base_url,
+                    model_id,
+                    max_context_tokens,
+                    max_output_tokens,
+                ),
                 "apiKey": "test-secret-key"
             }),
         )
@@ -261,7 +285,7 @@ impl BackendClient {
     }
 
     #[expect(clippy::too_many_arguments, reason = "test harness RPC builder helper")]
-    pub async fn start_session(
+    pub(crate) async fn start_session(
         &mut self,
         workspace: &str,
         provider: &str,
@@ -290,7 +314,7 @@ impl BackendClient {
         session_id
     }
 
-    pub async fn submit(&mut self, session_id: &str, text: &str) {
+    pub(crate) async fn submit(&mut self, session_id: &str, text: &str) {
         self.rpc_ok(
             "session.submit",
             json!({ "sessionId": session_id, "text": text, "images": [], "files": [] }),
@@ -298,7 +322,7 @@ impl BackendClient {
         .await;
     }
 
-    pub async fn register_test_mcp(&mut self, workspace: &str, script_path: &std::path::Path) {
+    pub(crate) async fn register_test_mcp(&mut self, workspace: &str, script_path: &std::path::Path) {
         self.rpc_ok(
             "mcp.save",
             json!({

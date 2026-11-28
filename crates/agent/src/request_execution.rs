@@ -6,7 +6,7 @@ use model::{
     ModelClient, ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse,
     ProviderStreamEvent,
 };
-use protocol::{ProviderAttemptStatus, RequestObservation, RequestPurpose, TurnEvent, TurnStatus};
+use protocol::{ProviderAttemptStatus, RequestObservation, RequestPurpose, TurnEvent};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -79,7 +79,7 @@ pub(crate) async fn execute_request(
                 .is_some_and(|e| e.is_retryable() && e.retry_after.is_none_or(|d| d <= MAX_RETRY_AFTER));
         let status = match &error {
             None => ProviderAttemptStatus::Ok,
-            Some(error) if error.kind == ModelErrorKind::Cancelled => ProviderAttemptStatus::Cancelled,
+            Some(error) if error.is_cancelled() => ProviderAttemptStatus::Cancelled,
             Some(_) => ProviderAttemptStatus::Error,
         };
         let provider_name = provider.provider_name();
@@ -93,11 +93,7 @@ pub(crate) async fn execute_request(
             decode_ms: first_token.map(|first| duration_millis(finished.duration_since(first))),
             usage: response.usage.clone(),
         };
-        let item_status = match status {
-            ProviderAttemptStatus::Ok => TurnStatus::Completed,
-            ProviderAttemptStatus::Cancelled => TurnStatus::Interrupted,
-            ProviderAttemptStatus::Error => TurnStatus::Failed,
-        };
+        let item_status = status.turn_status();
         let mut items = if purpose == RequestPurpose::Generation && error.is_some() && !retry {
             public_items(
                 &response.assistant_message,
@@ -159,7 +155,7 @@ pub(crate) async fn execute_request(
             }
             continue;
         }
-        if error.kind != ModelErrorKind::Cancelled {
+        if !error.is_cancelled() {
             tracing::warn!(
                 provider = provider_name,
                 model = model_name,
@@ -176,7 +172,7 @@ pub(crate) async fn execute_request(
             }
             on_event(AgentEvent::Turn(TurnEvent::MessageFinished { message_id: id, items }));
         }
-        return Err(if error.kind == ModelErrorKind::Cancelled {
+        return Err(if error.is_cancelled() {
             AgentError::Aborted
         } else {
             AgentError::Provider(error)

@@ -1,4 +1,15 @@
-import { useEffect, useLayoutEffect, useRef, type MouseEvent, type RefObject } from 'react'
+import { useEffect, useLayoutEffect, useRef, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type RefObject } from 'react'
+
+export function isPlainEnter(event: ReactKeyboardEvent): boolean {
+  return event.key === 'Enter'
+    && !event.shiftKey
+    && !event.nativeEvent.isComposing
+    && event.nativeEvent.keyCode !== 229
+}
+
+export function isCompactViewport(): boolean {
+  return window.matchMedia('(max-width: 760px)').matches
+}
 
 function hasTextSelection(): boolean {
   const selection = window.getSelection()
@@ -68,19 +79,39 @@ export function navigateList(key: string, buttons: HTMLElement[]): boolean {
   return true
 }
 
+interface DismissOnOutsideOptions {
+  capture?: boolean
+  ignore?: (event: Event) => boolean
+  onEscape?: (event: KeyboardEvent) => void
+  escapeCapture?: boolean
+}
+
 export function useDismissOnOutside(
-  container: RefObject<HTMLElement | null>, active: boolean, onClose: () => void,
+  container: RefObject<HTMLElement | null>,
+  active: boolean,
+  onClose: () => void,
+  options?: DismissOnOutsideOptions,
 ) {
-  const close = useRef(onClose)
-  close.current = onClose
+  const state = useRef({ onClose, options })
+  state.current = { onClose, options }
+  const capture = options?.capture ?? false
+  const hasEscape = options?.onEscape !== undefined
+  const escapeCapture = options?.escapeCapture ?? capture
   useEffect(() => {
     if (!active) return
     const outside = (event: Event) => {
-      if (event.target instanceof Node && !container.current?.contains(event.target)) close.current()
+      if (!(event.target instanceof Node) || container.current?.contains(event.target)) return
+      if (state.current.options?.ignore?.(event)) return
+      state.current.onClose()
     }
-    document.addEventListener('pointerdown', outside)
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') state.current.options?.onEscape?.(event)
+    }
+    document.addEventListener('pointerdown', outside, capture)
+    if (hasEscape) document.addEventListener('keydown', onKeyDown, escapeCapture)
     return () => {
-      document.removeEventListener('pointerdown', outside)
+      document.removeEventListener('pointerdown', outside, capture)
+      if (hasEscape) document.removeEventListener('keydown', onKeyDown, escapeCapture)
     }
-  }, [container, active])
+  }, [container, active, capture, hasEscape, escapeCapture])
 }

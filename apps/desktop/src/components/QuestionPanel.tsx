@@ -3,6 +3,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { smooth } from '../motion'
 import { ChevronLeft, ChevronRight, Pencil } from 'lucide-react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
+import { isPlainEnter } from '../interactions'
 import type { PendingQuestion, UserQuestionAnswer } from '../protocol'
 
 export function QuestionPanel({ request, headerMeta }: { request: PendingQuestion; headerMeta?: ReactNode }) {
@@ -104,7 +105,7 @@ export function QuestionPanel({ request, headerMeta }: { request: PendingQuestio
                     rows={1}
                     onChange={event => update({ text: event.target.value, selected: question.multiSelect ? answer.selected : [], skipped: false })}
                     onKeyDown={event => {
-                      if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) {
+                      if (isPlainEnter(event)) {
                         event.preventDefault()
                         if (answered && !disabled) advance()
                       }

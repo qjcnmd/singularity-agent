@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -7,6 +8,16 @@ use crate::harness::{
     BackendClient, DEFAULT_TIMEOUT, MockModelServer, ScriptedResponse, TINY_PNG_DATA_URL, TestEnv,
     messages_text_sse, messages_tools_sse,
 };
+
+fn run_git(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "core.autocrlf=false"])
+        .args(args)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed");
+}
 
 #[tokio::test]
 async fn stream_fault_recovery_and_truncation_invariants() {
@@ -341,23 +352,15 @@ async fn git_diff_and_rewind_invariants() {
     std::fs::write(&mv_old, "old1\nold2\nold3\nold4\n").expect("write mv_old baseline");
     std::fs::write(&bracket_file, "export const id = 1\n").expect("write [id] baseline");
     std::fs::write(&plain_i_file, "export const i = 1\n").expect("write i baseline");
-    let run_git = |args: &[&str]| {
-        let status = std::process::Command::new("git")
-            .current_dir(&env.workspace)
-            .args(args)
-            .status()
-            .expect("run git");
-        assert!(status.success(), "git {args:?} failed");
-    };
-    run_git(&["init", "-q"]);
-    run_git(&["config", "user.email", "test@example.invalid"]);
-    run_git(&["config", "user.name", "Test"]);
-    run_git(&["add", "-A"]);
-    run_git(&["commit", "-q", "-m", "baseline"]);
+    run_git(&env.workspace, &["init", "-q"]);
+    run_git(&env.workspace, &["config", "user.email", "test@example.invalid"]);
+    run_git(&env.workspace, &["config", "user.name", "Test"]);
+    run_git(&env.workspace, &["add", "-A"]);
+    run_git(&env.workspace, &["commit", "-q", "-m", "baseline"]);
     // Hostile user git config must not break batch diff parsing or path matching.
-    run_git(&["config", "diff.noprefix", "true"]);
-    run_git(&["config", "diff.mnemonicPrefix", "true"]);
-    run_git(&["config", "diff.relative", "true"]);
+    run_git(&env.workspace, &["config", "diff.noprefix", "true"]);
+    run_git(&env.workspace, &["config", "diff.mnemonicPrefix", "true"]);
+    run_git(&env.workspace, &["config", "diff.relative", "true"]);
 
     server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "NON_GIT_OK", 40, 0, 10, "end_turn")));
     server.enqueue(ScriptedResponse::sse(messages_text_sse(None, "TURN_1_BASELINE", 60, 0, 15, "end_turn")));
@@ -431,7 +434,7 @@ async fn git_diff_and_rewind_invariants() {
         .to_string();
 
     // Exercise git mv + full rewrite and glob-like bracket filenames under hostile diff config.
-    run_git(&["mv", "mv_old.txt", "mv_new.txt"]);
+    run_git(&env.workspace, &["mv", "mv_old.txt", "mv_new.txt"]);
     std::fs::write(&mv_new, "completely\ndifferent\nrewritten\nbody\nnow\n").expect("rewrite mv_new");
     std::fs::write(&bracket_file, "export const id = 2\n").expect("modify [id]");
     std::fs::write(&plain_i_file, "export const i = 2\n").expect("modify i");
@@ -488,17 +491,9 @@ async fn git_diff_and_rewind_invariants() {
     let unborn_dir = env.home.join("unborn_git");
     std::fs::create_dir_all(&unborn_dir).expect("mkdir unborn");
     let unborn_ws = app_core::display_path(&unborn_dir);
-    let run_unborn_git = |args: &[&str]| {
-        let status = std::process::Command::new("git")
-            .current_dir(&unborn_dir)
-            .args(args)
-            .status()
-            .expect("run unborn git");
-        assert!(status.success(), "unborn git {args:?} failed");
-    };
-    run_unborn_git(&["init", "-q"]);
+    run_git(&unborn_dir, &["init", "-q"]);
     std::fs::write(unborn_dir.join("am.txt"), "staged\n").expect("write staged am.txt");
-    run_unborn_git(&["add", "am.txt"]);
+    run_git(&unborn_dir, &["add", "am.txt"]);
     std::fs::write(unborn_dir.join("am.txt"), "staged\nworktree\n").expect("edit am.txt");
     client.rpc_ok("workspace.add", json!({ "root": unborn_ws })).await;
     let unborn_changed = client
@@ -622,4 +617,159 @@ async fn git_diff_and_rewind_invariants() {
         Some("Keep Title")
     );
     restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_cache_lru_eviction_invariants() {
+    let env = TestEnv::new("lru-eviction");
+    let server = MockModelServer::start().await;
+    let ws = env.workspace_str();
+
+    let busy_gate = Arc::new(Notify::new());
+    server.enqueue(ScriptedResponse::sse_gated(
+        messages_text_sse(None, "BUSY_SESSION_ANSWER", 60, 0, 15, "end_turn"),
+        Arc::clone(&busy_gate),
+    ));
+    server.set_fallback(|_, _| {
+        ScriptedResponse::sse(messages_text_sse(None, "IDLE_SESSION_OK", 40, 0, 10, "end_turn"))
+    });
+
+    let mut client = BackendClient::spawn(&env.home).await;
+    client
+        .setup_workspace_and_provider(&ws, "local", "messages", &server.base_url, "demo", 64000, 4096)
+        .await;
+
+    // Start the busy session first so it is the oldest entry in SessionCache and must not be evicted while running.
+    let busy_id = client
+        .start_session(&ws, "local", "demo", None, "BUSY_SESSION_PROMPT", vec![], vec![])
+        .await;
+    server.wait_for_request_count(1).await;
+
+    // Fill SessionCache to exact 16-slot capacity: 1 busy + 15 idle sessions.
+    let mut idle_ids = Vec::with_capacity(16);
+    let mut evicted_turns_before = Value::Null;
+    let mut evicted_rev_before = 0u64;
+    for idx in 0..15 {
+        let prompt = format!("IDLE_SESSION_PROMPT_{idx}");
+        let id = client.start_session(&ws, "local", "demo", None, &prompt, vec![], vec![]).await;
+        let settled = client.wait_settled(&id).await;
+        assert_eq!(settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+        let _ = client.drain_events();
+        if idx == 1 {
+            let before = client.rpc_ok("session.read", json!({ "sessionId": id })).await;
+            assert!(
+                before.get("context").is_some_and(|v| !v.is_null()),
+                "active cached session should retain loaded context before eviction"
+            );
+            evicted_turns_before = before.pointer("/history/turns").cloned().expect("idle[1] turns");
+            evicted_rev_before = before.get("revision").and_then(Value::as_u64).expect("idle[1] revision");
+        }
+        idle_ids.push(id);
+    }
+
+    let full_boot = client.rpc_ok("app.bootstrap", json!({})).await;
+    let full_states = full_boot.get("sessionStates").and_then(Value::as_object).expect("full sessionStates");
+    assert_eq!(full_states.len(), 16, "cache must hold all 16 sessions before overflow");
+    assert!(
+        full_states.contains_key(&busy_id)
+            && full_states.contains_key(&idle_ids[0])
+            && full_states.contains_key(&idle_ids[1])
+    );
+
+    // Refresh idle[0] so it becomes MRU while idle[1] becomes the LRU idle candidate.
+    let refreshed = client.rpc_ok("session.read", json!({ "sessionId": idle_ids[0] })).await;
+    assert!(
+        refreshed.get("context").is_some_and(|v| !v.is_null()),
+        "idle[0] must still be cached at cap 16"
+    );
+
+    // Insert 17th total session (1 busy + 16 idle) to trigger exact 16-slot LRU eviction.
+    let overflow_id = client
+        .start_session(&ws, "local", "demo", None, "IDLE_SESSION_PROMPT_15", vec![], vec![])
+        .await;
+    let overflow_settled = client.wait_settled(&overflow_id).await;
+    assert_eq!(overflow_settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+    let _ = client.drain_events();
+    idle_ids.push(overflow_id);
+
+    let after_boot = client.rpc_ok("app.bootstrap", json!({})).await;
+    let after_states = after_boot
+        .get("sessionStates")
+        .and_then(Value::as_object)
+        .expect("post-eviction sessionStates");
+    assert_eq!(after_states.len(), 16, "SessionCache must evict at exact capacity 16");
+    assert!(after_states.contains_key(&busy_id), "busy session must remain cached");
+    assert!(
+        after_states.contains_key(&idle_ids[0]),
+        "refreshed older session idle[0] must be retained (proves LRU, not FIFO)"
+    );
+    assert!(
+        !after_states.contains_key(&idle_ids[1]),
+        "un-refreshed LRU session idle[1] must be evicted at exact capacity 16"
+    );
+    let kept = client.rpc_ok("session.read", json!({ "sessionId": idle_ids[0] })).await;
+    assert!(
+        kept.get("context").is_some_and(|v| !v.is_null()),
+        "retained idle[0] must stay warm in cache"
+    );
+
+    // Busy session must remain intact in cache and complete cleanly once unblocked.
+    let busy_running = client.rpc_ok("session.read", json!({ "sessionId": busy_id })).await;
+    assert_eq!(
+        busy_running.pointer("/runtime/phase").and_then(Value::as_str),
+        Some("running"),
+        "busy session must not be evicted while actively running"
+    );
+    busy_gate.notify_one();
+    let busy_settled = client.wait_settled(&busy_id).await;
+    assert_eq!(busy_settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+    let busy_done = client.rpc_ok("session.read", json!({ "sessionId": busy_id })).await;
+    assert!(busy_done.to_string().contains("BUSY_SESSION_ANSWER"));
+
+    // Evicted LRU idle session must reopen cleanly from disk with full history and monotonic revision.
+    let evicted_id = &idle_ids[1];
+    let reopened = client.rpc_ok("session.read", json!({ "sessionId": evicted_id })).await;
+    assert!(
+        reopened.get("context").is_some_and(Value::is_null),
+        "evicted idle session must reopen cold from disk with lazily deferred context"
+    );
+    assert_eq!(
+        reopened.pointer("/history/turns"),
+        Some(&evicted_turns_before),
+        "reopened evicted session must preserve full persisted history"
+    );
+    let rev_reopened = reopened.get("revision").and_then(Value::as_u64).expect("reopened revision");
+    assert!(
+        rev_reopened >= evicted_rev_before,
+        "reopened session revision must be monotonic ({rev_reopened} < {evicted_rev_before})"
+    );
+
+    client.submit(evicted_id, "EVICTED_FOLLOWUP_PROMPT").await;
+    let followup_settled = client.wait_settled(evicted_id).await;
+    assert_eq!(followup_settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+    let reopened_after = client.rpc_ok("session.read", json!({ "sessionId": evicted_id })).await;
+    assert_eq!(
+        reopened_after.pointer("/history/turns").and_then(Value::as_array).map(Vec::len),
+        Some(2),
+        "reopened session must support follow-up turns seamlessly"
+    );
+    let rev_after = reopened_after.get("revision").and_then(Value::as_u64).expect("after revision");
+    assert!(
+        rev_after > rev_reopened,
+        "follow-up turn must advance session revision monotonically ({rev_after} <= {rev_reopened})"
+    );
+
+    let bootstrap = client.rpc_ok("app.bootstrap", json!({})).await;
+    let listed_count = bootstrap
+        .get("sessionsByWorkspace")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|map| map.values())
+        .filter_map(Value::as_array)
+        .flatten()
+        .count();
+    assert_eq!(listed_count, 1 + idle_ids.len(), "bootstrap must retain all 17 sessions");
+
+    server.assert_no_protocol_violations();
+    client.shutdown().await;
 }

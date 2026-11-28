@@ -7,11 +7,11 @@ mod manager;
 use format::Result;
 
 pub use crate::image::SavedImage;
-pub(crate) use format::tool_item_id;
 pub use format::{
-    CompactionEntry, LedgerRecord, MessageDisplay, SessionEntry, SessionError, SessionMetadata, text_item_id,
-    thinking_item_id,
+    CompactionEntry, LedgerRecord, MessageDisplay, SessionEntry, SessionError, SessionMetadata,
+    is_streaming_item_of,
 };
+pub(crate) use format::{text_item_id, thinking_item_id, tool_item_id};
 pub use manager::{SessionData, SessionManager, scan_session_entries};
 
 pub fn session_file_name(session_id: &str) -> String {

@@ -1,6 +1,31 @@
-import type { ThreadSummary } from './protocol'
+import type { ContextUsage, ThreadSummary, VisibleBackgroundTask } from './protocol'
 import type { LiveSessionState, SyncState } from './sync'
 import { interruptionText, phaseText, turnStatusText } from './copy'
+
+const emptyTasks: VisibleBackgroundTask[] = []
+
+export function sessionBackgroundTasks(
+  liveSessions: SyncState['liveSessions'],
+  sessionId: string | null | undefined,
+): VisibleBackgroundTask[] {
+  return sessionId ? liveSessions[sessionId]?.backgroundTasks ?? emptyTasks : emptyTasks
+}
+
+export function hasRunningBackgroundTask(
+  liveSessions: SyncState['liveSessions'],
+  sessionId: string | null | undefined,
+): boolean {
+  return sessionBackgroundTasks(liveSessions, sessionId).some(task => task.state.status === 'running')
+}
+
+export function contextUsageStats(usage: ContextUsage | null | undefined): {
+  percent: number
+  tone: '' | 'warning' | 'danger'
+} {
+  const percent = usage ? Math.min(100, Math.round(usage.used / usage.capacity * 100)) : 0
+  const tone = percent >= 90 ? 'danger' : percent >= 75 ? 'warning' : ''
+  return { percent, tone }
+}
 
 export function selectedSessionPhase(state: Pick<SyncState, 'session' | 'liveSessions'> & { selectedSessionId: string | null }) {
   return state.session?.runtime.phase

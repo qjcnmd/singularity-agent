@@ -58,7 +58,7 @@ impl SessionCache {
         let mut candidates: Vec<(u64, String)> = self
             .entries
             .iter()
-            .filter(|(_, (conversation, _))| conversation.can_evict())
+            .filter(|(_, (conversation, _))| Arc::strong_count(conversation) == 1 && conversation.can_evict())
             .map(|(id, (_, access))| (*access, id.clone()))
             .collect();
         candidates.sort_unstable_by_key(|(access, _)| *access);
@@ -74,7 +74,7 @@ pub(crate) struct AppServer {
     catalog: ThreadCatalog,
     workspaces: WorkspaceStore,
     models: Arc<ModelConfigManager>,
-    pub(super) mcp: Arc<mcp::McpManager>,
+    mcp: Arc<mcp::McpManager>,
     home: std::path::PathBuf,
     sessions: Mutex<SessionCache>,
 }
@@ -108,11 +108,50 @@ impl AppServer {
         self.hub.revision()
     }
 
-    pub(super) fn scope_directory(&self, workspace: Option<&str>) -> Result<std::path::PathBuf, RpcError> {
+    fn scope_directory(&self, workspace: Option<&str>) -> Result<std::path::PathBuf, RpcError> {
         workspace.map_or_else(
             || Ok(self.home.clone()),
             |id| self.workspace(id).map(|workspace| workspace.root.into()),
         )
+    }
+
+    pub(crate) fn mcp_list(
+        &self,
+        workspace_root: Option<&str>,
+    ) -> Result<Vec<protocol::McpServerState>, RpcError> {
+        let cwd = self.scope_directory(workspace_root)?;
+        self.mcp.list(&cwd).map_err(RpcError::new)
+    }
+
+    pub(crate) fn mcp_save(
+        &self,
+        workspace_root: Option<&str>,
+        server: protocol::McpServerInput,
+    ) -> Result<Vec<protocol::McpServerState>, RpcError> {
+        let cwd = self.scope_directory(workspace_root)?;
+        self.mcp.save(server, &cwd).map_err(RpcError::new)
+    }
+
+    pub(crate) fn mcp_remove(
+        &self,
+        workspace_root: Option<&str>,
+        server_id: &str,
+    ) -> Result<Vec<protocol::McpServerState>, RpcError> {
+        let cwd = self.scope_directory(workspace_root)?;
+        self.mcp.remove(server_id, &cwd).map_err(RpcError::new)
+    }
+
+    pub(crate) async fn mcp_reconnect(
+        self: &Arc<Self>,
+        workspace_root: Option<String>,
+        server_id: &str,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) -> Result<protocol::McpServerState, RpcError> {
+        let app = Arc::clone(self);
+        let cwd = tokio::task::spawn_blocking(move || app.scope_directory(workspace_root.as_deref()))
+            .await
+            .expect("RPC worker completes while the backend is running")?;
+        self.mcp.reconnect(server_id, &cwd, shutdown).await.map_err(RpcError::new)
     }
 
     pub(crate) fn save_provider(
@@ -165,11 +204,18 @@ impl AppServer {
         api_protocol: protocol::ProviderApiProtocol,
         base_url: &str,
         api_key: Option<&str>,
+        shutdown: &tokio_util::sync::CancellationToken,
     ) -> Result<Vec<String>, RpcError> {
         self.models
-            .discover_models(provider_id, api_protocol, base_url, api_key)
+            .discover_models(provider_id, api_protocol, base_url, api_key, shutdown)
             .await
-            .map_err(RpcError::new)
+            .map_err(|error| {
+                if error.is_cancelled() {
+                    RpcError::new("工作台正在退出。")
+                } else {
+                    RpcError::new(error)
+                }
+            })
     }
 
     pub(crate) fn start_session(

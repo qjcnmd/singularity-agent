@@ -1,10 +1,9 @@
-import '../styles/model-picker.css'
 import { EffortSlider } from './EffortSlider'
 import { ExpandChevron } from './ExpandChevron'
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import { Check } from 'lucide-react'
 import { usePopoverFocus, focusableElements, navigateList } from '../interactions'
-import { sortReasoningVariants, selectedModel } from '../modelChoices'
+import { sortReasoningVariants, selectedModel } from '../models'
 import type { ModelSelection, ModelConfigurationInput, RedactedProvider } from '../protocol'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 

@@ -46,11 +46,9 @@ impl IndexedTurn {
                         {
                             first_token_at = app_core::iso_minus_millis(timestamp, decode_ms);
                         }
-                        let status = match observation.as_ref().map(|observation| observation.status) {
-                            Some(protocol::ProviderAttemptStatus::Error) => TurnStatus::Failed,
-                            Some(protocol::ProviderAttemptStatus::Cancelled) => TurnStatus::Interrupted,
-                            _ => TurnStatus::Completed,
-                        };
+                        let status = observation
+                            .as_ref()
+                            .map_or(TurnStatus::Completed, |observation| observation.status.turn_status());
                         let mut public = agent::message::public_items(
                             message,
                             display.as_ref(),
@@ -174,14 +172,7 @@ pub(crate) fn context_usage(
 ) -> Option<protocol::ContextUsage> {
     let capacity = capacity.filter(|capacity| *capacity > 0)?;
     for entry in entries.iter().rev() {
-        if matches!(
-            entry,
-            SessionEntry::Compaction { .. }
-                | SessionEntry::Record {
-                    record: LedgerRecord::ToolResultsCleared { .. },
-                    ..
-                }
-        ) {
+        if entry.resets_context_usage() {
             return None;
         }
         let Some(request) = entry.request_observation() else {

@@ -18,7 +18,7 @@ pub struct EmptyParams {}
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BackgroundTaskParams {
     pub session_id: String,
     pub task_id: String,
@@ -26,27 +26,28 @@ pub struct BackgroundTaskParams {
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceAddParams {
     pub root: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceParams {
     pub workspace_root: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InstructionsReadParams {
     pub workspace_root: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InstructionsSaveParams {
     pub workspace_root: Option<String>,
     pub content: String,
@@ -54,6 +55,7 @@ pub struct InstructionsSaveParams {
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct FileReadParams {
     pub cwd: String,
     pub path: String,
@@ -61,7 +63,7 @@ pub struct FileReadParams {
 
 #[derive(Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderSaveParams {
     pub provider: ProviderConfigurationInput,
     #[cfg_attr(feature = "typescript", ts(optional))]
@@ -79,14 +81,14 @@ impl fmt::Debug for ProviderSaveParams {
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderParams {
     pub provider_id: String,
 }
 
 #[derive(Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WebSearchSaveParams {
     pub base_url: String,
     #[cfg_attr(feature = "typescript", ts(optional))]
@@ -104,7 +106,7 @@ impl fmt::Debug for WebSearchSaveParams {
 
 #[derive(Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiscoverModelsParams {
     pub provider_id: String,
     pub api_protocol: ProviderApiProtocol,
@@ -126,21 +128,21 @@ impl fmt::Debug for DiscoverModelsParams {
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionParams {
     pub session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionFocusParams {
     pub session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionStartParams {
     pub workspace_root: String,
     pub selection: ModelSelection,
@@ -180,7 +182,7 @@ pub struct SessionTextParams {
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionImageParams {
     pub session_id: String,
     pub image_id: String,
@@ -188,7 +190,7 @@ pub struct SessionImageParams {
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionRenameParams {
     pub session_id: String,
     pub name: String,
@@ -196,7 +198,7 @@ pub struct SessionRenameParams {
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateSettingsParams {
     pub session_id: String,
     pub selection: ModelSelection,
@@ -204,7 +206,7 @@ pub struct UpdateSettingsParams {
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionChangedFilesParams {
     pub workspace_root: String,
     #[serde(default)]
@@ -214,7 +216,7 @@ pub struct SessionChangedFilesParams {
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionFileDiffParams {
     pub workspace_root: String,
     pub path: String,

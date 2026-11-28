@@ -11,6 +11,10 @@ pub fn resolve_home() -> Result<PathBuf, String> {
             validated_root(base).map_err(|reason| format!("{HOME_ENV_VAR} {reason}: {}", base.display()))?;
         return Ok(path);
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "canonical OS home fallback when SINGULARITY_HOME is unset"
+    )]
     let base = std::env::home_dir().ok_or_else(|| {
         "cannot resolve the default data directory: system user profile is unavailable".to_string()
     })?;

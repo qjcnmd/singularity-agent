@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["typescript", "react", "unicorn", "oxc"],
+  "plugins": ["typescript", "react", "unicorn", "oxc", "import", "promise"],
   "categories": {
     "correctness": "error"
   },
@@ -14,18 +14,146 @@
         "ignoreRestSiblings": true
       }
     ],
+    "import/no-cycle": "error",
+    "import/no-duplicates": "error",
+    "import/no-self-import": "error",
+    "import/no-named-as-default": "error",
     "typescript/no-explicit-any": "error",
     "react/react-in-jsx-scope": "off",
     "react/rules-of-hooks": "error",
     "react/jsx-key": "error",
     "react/jsx-no-duplicate-props": "error",
-    "react-hooks/exhaustive-deps": "off",
-    "react/exhaustive-effect-dependencies": "off",
+    "react-hooks/exhaustive-deps": "error",
     "react/set-state-in-effect": "off",
-    "react/refs": "off",
-    "react/immutability": "off",
-    "react/purity": "off"
+    "react/refs": "off"
   },
+  "overrides": [
+    {
+      "files": ["desktop/**/*.ts", "desktop/**/*.cts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": [
+                  "../src/*",
+                  "../src/**",
+                  "!../src/identity.js",
+                  "!../src/protocol.generated.js"
+                ],
+                "message": "Electron desktop/ modules may only import ../src/identity.js or ../src/protocol.generated.js."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/**/*.ts", "src/**/*.tsx"],
+      "excludeFiles": ["src/protocol.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["./desktop", "./desktop/**", "../desktop", "../desktop/**", "../../desktop", "../../desktop/**"],
+                "message": "Renderer src/ modules must not import Electron desktop/ modules."
+              },
+              {
+                "group": [
+                  "./protocol.generated",
+                  "./protocol.generated.*",
+                  "../protocol.generated",
+                  "../protocol.generated.*",
+                  "**/protocol.generated",
+                  "**/protocol.generated.*"
+                ],
+                "message": "Import wire types through src/protocol.ts instead of protocol.generated directly."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/protocol.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["./desktop", "./desktop/**", "../desktop", "../desktop/**"],
+                "message": "Renderer src/ modules must not import Electron desktop/ modules."
+              },
+              {
+                "group": ["./components", "./components/**"],
+                "message": "Core src/ modules must not import UI components from ./components/."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/*.ts", "src/*.tsx"],
+      "excludeFiles": ["src/main.tsx", "src/app.tsx", "src/protocol.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["./desktop", "./desktop/**", "../desktop", "../desktop/**"],
+                "message": "Renderer src/ modules must not import Electron desktop/ modules."
+              },
+              {
+                "group": ["./protocol.generated", "./protocol.generated.*"],
+                "message": "Import wire types through src/protocol.ts instead of protocol.generated directly."
+              },
+              {
+                "group": ["./components", "./components/**"],
+                "message": "Core src/ modules must not import UI components from ./components/."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/components/**/*.ts", "src/components/**/*.tsx"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["./desktop", "./desktop/**", "../desktop", "../desktop/**", "../../desktop", "../../desktop/**"],
+                "message": "Renderer src/ modules must not import Electron desktop/ modules."
+              },
+              {
+                "group": [
+                  "./protocol.generated",
+                  "./protocol.generated.*",
+                  "../protocol.generated",
+                  "../protocol.generated.*",
+                  "**/protocol.generated",
+                  "**/protocol.generated.*"
+                ],
+                "message": "Import wire types through src/protocol.ts instead of protocol.generated directly."
+              },
+              {
+                "group": ["../styles/*.css", "../styles/**/*.css"],
+                "message": "Import stylesheets centrally in src/styles/app.css instead of components."
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
   "ignorePatterns": [
     "src/protocol.generated.ts",
     "dist/**",

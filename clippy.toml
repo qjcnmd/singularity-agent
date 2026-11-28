@@ -1,0 +1,5 @@
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "Use model::transport::http::client_builder (or mcp::client::connect_http) so rustls ring, Policy::none(), and USER_AGENT are enforced." },
+    { path = "reqwest::Client::builder", reason = "Use model::transport::http::client_builder (or mcp::client::connect_http) so rustls ring, Policy::none(), and USER_AGENT are enforced." },
+    { path = "std::env::home_dir", reason = "Use app_core::resolve_home to respect SINGULARITY_HOME isolation; only approved OS-home sites may opt out with #[expect]." },
+]

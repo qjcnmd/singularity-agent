@@ -2,7 +2,8 @@ import { Pencil, Plus, Trash2, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { appStore } from '../appStore'
 import type { McpConnectionStatus, McpServerInput, McpServerState } from '../protocol'
-import { Dialog } from './Dialog'
+import { errorMessage } from '../rpcClient'
+import { ConfirmDialog, Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 
@@ -35,7 +36,7 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
       }
     } catch (error) {
       if (ep === epoch.current && version === loadRevision.current) {
-        setLoadError(error instanceof Error ? error.message : '读取 MCP 配置失败。')
+        setLoadError(errorMessage(error, '读取 MCP 配置失败。'))
       }
     } finally {
       if (ep === epoch.current && version === loadRevision.current) setLoading(false)
@@ -81,7 +82,7 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
     } catch (error) {
       if (ep === epoch.current && reconnectRevisions.current.get(serverId) === version) {
         setServers(current => current.map(state => state.server.serverId === serverId
-          ? { ...state, status: 'failed', error: error instanceof Error ? error.message : '连接 MCP 失败。', tools: [] } : state))
+          ? { ...state, status: 'failed', error: errorMessage(error, '连接 MCP 失败。'), tools: [] } : state))
       }
     } finally {
       setReconnecting(count => Math.max(0, count - 1))
@@ -107,7 +108,7 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
       return true
     }
     catch (error) {
-      if (startEpoch === epoch.current) setMutationError(error instanceof Error ? error.message : '保存 MCP 配置失败。')
+      if (startEpoch === epoch.current) setMutationError(errorMessage(error, '保存 MCP 配置失败。'))
       return false
     }
     finally { setBusy(false) }
@@ -174,15 +175,19 @@ export function McpSettings({ workspaceRoot }: { workspaceRoot: string | null })
         }
       }} />}
     </Dialog>
-    <Dialog open={removing !== null} onClose={closeRemoving} labelledBy="mcp-remove-title" className="confirm-modal">
-      <header className="modal-header"><h2 id="mcp-remove-title">删除 MCP</h2></header>
-      <div className="confirm-body"><p>删除“{removing?.serverId}”的配置？</p>{mutationError && <p role="alert" className="form-error">{mutationError}</p>}<footer>
-        <button type="button" className="secondary-button" disabled={busy} onClick={closeRemoving}>取消</button>
-        <button type="button" className="danger-button" disabled={busy} onClick={() => {
-          if (removing) void mutate(() => appStore.transport.rpc('mcp.remove', { serverId: removing.serverId, workspaceRoot })).then(saved => { if (saved) { setMutationError(null); setRemoving(null) } })
-        }}>删除</button>
-      </footer></div>
-    </Dialog>
+    <ConfirmDialog
+      open={removing !== null}
+      onClose={closeRemoving}
+      onConfirm={() => {
+        if (removing) void mutate(() => appStore.transport.rpc('mcp.remove', { serverId: removing.serverId, workspaceRoot })).then(saved => { if (saved) { setMutationError(null); setRemoving(null) } })
+      }}
+      title="删除 MCP"
+      message={`删除“${removing?.serverId ?? ''}”的配置？`}
+      confirmLabel="删除"
+      danger
+      pending={busy}
+      error={mutationError}
+    />
   </section>
 }
 
@@ -214,7 +219,7 @@ function McpEditor({ server, busy, error, onSave, onCancel }: { server?: McpServ
         transport: type === 'stdio' ? { type, command: command.trim(), args: parsedArgs, cwd: cwd.trim() || null, env: stringMap(env, '环境变量') }
           : { type, url: url.trim(), headers: stringMap(headers, '请求头') },
       })
-    } catch (error) { setFailure(error instanceof Error ? error.message : '配置格式无效。') }
+    } catch (error) { setFailure(errorMessage(error, '配置格式无效。')) }
   }
 
   return <form className="sg-editor mcp-editor" onSubmit={event => void save(event)}>

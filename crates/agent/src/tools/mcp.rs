@@ -6,11 +6,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
+use super::registry::{MCP_CALL_TOOL_NAME, MCP_SCHEMA_TOOL_NAME};
 use super::{ToolExecution, error_result};
 use crate::image::InputImage;
-
-pub(crate) const MCP_SCHEMA_TOOL_NAME: &str = "mcp_schema";
-pub(crate) const MCP_CALL_TOOL_NAME: &str = "mcp_call";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,8 +26,8 @@ pub(crate) struct McpCallArgs {
     pub(crate) arguments: Map<String, Value>,
 }
 
-pub(crate) fn schema_spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn schema_spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: MCP_SCHEMA_TOOL_NAME.into(),
         description: "Inspect the full description and JSON input schema of one or more specific MCP tools on a server before invoking them via mcp_call. Only request the tools you need.".into(),
         parameters_schema: json!({
@@ -49,8 +47,8 @@ pub(crate) fn schema_spec() -> app_core::ToolDefinition {
     }
 }
 
-pub(crate) fn call_spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
+pub(crate) fn call_spec() -> model::ToolDefinition {
+    model::ToolDefinition {
         name: MCP_CALL_TOOL_NAME.into(),
         description: "Invoke an MCP tool by server ID and tool name. Call mcp_schema first if the tool takes arguments whose schema you have not yet inspected; tools marked (no args) can be called directly.".into(),
         parameters_schema: json!({
@@ -142,13 +140,7 @@ pub(super) async fn execute(
             }
             Err(error) => error_result(error.to_string()),
         };
-        let mut output = super::output::CaptureState::new(output_directory);
-        output.ingest(&execution.content);
-        let (content, note) = output.finish();
-        execution.content = content;
-        if let Some(note) = note {
-            let _ = write!(execution.content, "\n\n{note}");
-        }
+        execution.content = super::output::format_head_tail_bounded(&execution.content, &output_directory);
         execution
     })
     .await

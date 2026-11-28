@@ -39,6 +39,10 @@ pub(crate) fn read_text_file(resolved: &Path) -> Result<TextDocument, RpcError> 
 
 pub(crate) fn resolve_path(cwd: &str, path: &str) -> PathBuf {
     let path = path.trim();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "tilde expansion resolves against the OS user home directory"
+    )]
     if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"))
         && let Some(home) = std::env::home_dir()
     {

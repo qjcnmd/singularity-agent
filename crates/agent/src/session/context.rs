@@ -26,21 +26,6 @@ const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 const CONTENT_BLOCK_OVERHEAD_TOKENS: u64 = 4;
 const TOOL_RESULT_OVERHEAD_TOKENS: u64 = 4;
 
-fn is_clearable_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "read"
-            | "bash"
-            | "task_output"
-            | "web_search"
-            | "web_fetch"
-            | "mcp_schema"
-            | "mcp_call"
-            | "grep"
-            | "glob"
-    )
-}
-
 pub(crate) fn cleared_tool_result_ids(session: &SessionData) -> HashSet<&str> {
     let mut cleared = HashSet::new();
     for entry in session.entries() {
@@ -59,11 +44,13 @@ fn cleared_tool_result_placeholder(text: &str) -> String {
     match text
         .lines()
         .rev()
-        .find_map(|line| line.strip_prefix("Full output: "))
+        .find_map(|line| line.strip_prefix(crate::tools::FULL_OUTPUT_PREFIX))
         .map(str::trim)
         .filter(|path| !path.is_empty())
     {
-        Some(path) => format!("[Old tool result cleared after idle gap. Full output: {path}]"),
+        Some(path) => {
+            format!("[Old tool result cleared after idle gap. {}{path}]", crate::tools::FULL_OUTPUT_PREFIX)
+        }
         None => CLEARED_RESULT_PLACEHOLDER.to_string(),
     }
 }
@@ -118,7 +105,10 @@ pub(crate) fn select_idle_clearable_entry_ids(session: &SessionData, now_iso: &s
         }) = remaining.peek().copied()
         {
             remaining.next();
-            if call_names.get(tool_call_id.as_str()).is_some_and(|name| is_clearable_tool(name)) {
+            if call_names
+                .get(tool_call_id.as_str())
+                .is_some_and(|name| crate::tools::is_clearable_tool(name))
+            {
                 whitelist_results.push((id.as_str(), result));
             }
         }
@@ -193,7 +183,7 @@ pub(super) fn context_token_estimate_for(
         tokens = tokens.saturating_add(entry_token_estimate_for(entry, session, target, cleared));
         if let SessionEntry::Message { message, .. } = entry {
             calls = calls.saturating_add(message.tool_calls().count());
-            if message.tool_call_id().is_some() {
+            if matches!(message, Message::ToolResult { .. }) {
                 results = results.saturating_add(1);
             }
         }
@@ -309,16 +299,7 @@ pub(super) fn latest_reply_usage<'a>(
         .entries()
         .iter()
         .rev()
-        .take_while(|entry| {
-            !matches!(
-                entry,
-                SessionEntry::Compaction { .. }
-                    | SessionEntry::Record {
-                        record: LedgerRecord::ToolResultsCleared { .. },
-                        ..
-                    }
-            )
-        })
+        .take_while(|entry| !entry.resets_context_usage())
         .find(|entry| matches!(context_entry(entry), Some(ContextEntry::Message(Message::Assistant { .. }))));
     let Some(SessionEntry::Message { id, observation: Some(obs), .. }) = latest else {
         return None;
@@ -338,14 +319,14 @@ pub(crate) fn input_tokens(
     entries: &[&SessionEntry],
     identity: (&str, &str),
     definition_tokens: u64,
+    cleared: &HashSet<&str>,
 ) -> u64 {
-    let cleared = cleared_tool_result_ids(session);
-    if let Some((provider, model, total)) = latest_reply_usage(session, entries, definition_tokens, &cleared)
+    if let Some((provider, model, total)) = latest_reply_usage(session, entries, definition_tokens, cleared)
         && (provider, model) == identity
     {
         return total;
     }
-    context_token_estimate_for(entries, session, Some(identity), &cleared).saturating_add(definition_tokens)
+    context_token_estimate_for(entries, session, Some(identity), cleared).saturating_add(definition_tokens)
 }
 
 pub(crate) fn prepare_context(
@@ -354,8 +335,9 @@ pub(crate) fn prepare_context(
     definition_tokens: u64,
 ) -> PreparedContext {
     let entries = resolve_context_entries(session);
-    let tokens = input_tokens(session, &entries, identity, definition_tokens);
-    PreparedContext::new(session, &entries, tokens)
+    let cleared = cleared_tool_result_ids(session);
+    let tokens = input_tokens(session, &entries, identity, definition_tokens, &cleared);
+    PreparedContext::new(session, &entries, tokens, &cleared)
 }
 
 pub(crate) struct PreparedContext {
@@ -366,11 +348,15 @@ pub(crate) struct PreparedContext {
 }
 
 impl PreparedContext {
-    pub(crate) fn new(session: &SessionData, entries: &[&SessionEntry], input_tokens: u64) -> Self {
-        let cleared = cleared_tool_result_ids(session);
+    pub(crate) fn new(
+        session: &SessionData,
+        entries: &[&SessionEntry],
+        input_tokens: u64,
+        cleared: &HashSet<&str>,
+    ) -> Self {
         Self {
             session_id: session.session_id().to_owned(),
-            messages: project_messages(entries, &cleared),
+            messages: project_messages(entries, cleared),
             input_tokens,
             image_directory: session.image_directory(),
         }

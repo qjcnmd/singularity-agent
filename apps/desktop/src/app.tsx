@@ -9,6 +9,7 @@ import { Settings } from './components/Settings'
 import { Sidebar, SidebarToggle } from './components/Sidebar'
 import { RunPanel } from './components/RunPanel'
 import { hasInlineActionError, useAppStore, appStore } from './appStore'
+import { isCompactViewport } from './interactions'
 import { buildHistoryRows, buildTimeline, formatSessionMetrics } from './timeline'
 import { bubbleVariables } from './bubbleColors'
 import { clampFilePanelWidth } from './viewPersistence'
@@ -20,7 +21,7 @@ export function App() {
   const state = useAppStore(['theme', 'messageFontSize', 'accentColor', 'sidebarCollapsed', 'sidebarWidth', 'fileTabs', 'filePanelWidth'])
   const [, setViewportWidth] = useState(() => window.innerWidth)
   const filePanelOpen = state.fileTabs.length > 0
-  const variables = bubbleVariables(state)
+  const variables = bubbleVariables(state.accentColor)
   useLayoutEffect(() => {
     document.documentElement.dataset.theme = state.theme
     void window.desktop.setTheme(state.theme)
@@ -66,14 +67,19 @@ const MainContent = memo(function MainContent({ filePanelOpen }: { filePanelOpen
   const state = useAppStore(['selectedSessionId', 'selectedWorkspaceRoot', 'session', 'sessionLoad', 'bootstrapLoad', 'bootstrap', 'sidebarCollapsed', 'backgroundOpen', 'actionErrors', 'actionErrorOrigin'])
   const facts = state.session?.facts
   const runtime = state.session?.runtime
-  const failure = runtime?.failure
-  const pendingQuestion = runtime?.pendingQuestion
+  const hasRuntime = runtime !== undefined
+  const failure = runtime?.failure ?? null
+  const pendingQuestion = runtime?.pendingQuestion ?? null
   const pendingMessages = runtime?.pendingMessages
   const failureFromRuntime = failure?.source === 'turn'
   const historyRows = useMemo(() => buildHistoryRows(facts, failureFromRuntime), [facts, failureFromRuntime])
   const items = useMemo(
-    () => buildTimeline(historyRows, facts, runtime),
-    [historyRows, facts, failure, pendingQuestion, pendingMessages],
+    () => buildTimeline(
+      historyRows,
+      facts,
+      hasRuntime ? { failure, pendingQuestion, pendingMessages: pendingMessages ?? [] } : undefined,
+    ),
+    [historyRows, facts, hasRuntime, failure, pendingQuestion, pendingMessages],
   )
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspace = state.bootstrap?.workspaces.find(workspace => workspaceKey(workspace.root) === state.selectedWorkspaceRoot)
@@ -97,7 +103,7 @@ const MainContent = memo(function MainContent({ filePanelOpen }: { filePanelOpen
     <div
       className="main-column"
       onPointerDownCapture={() => {
-        if (!state.sidebarCollapsed && window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
+        if (!state.sidebarCollapsed && isCompactViewport()) appStore.toggleSidebar()
       }}
     >
       <header className="conversation-header">

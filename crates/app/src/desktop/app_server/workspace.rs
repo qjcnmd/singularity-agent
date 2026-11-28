@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use protocol::{AppBootstrap, RedactedModelCatalog, RpcError, ThreadSummary, Workspace};
 
@@ -26,8 +26,13 @@ impl AppServer {
             .map(|(id, conversation)| (id.to_owned(), conversation.status()))
             .collect();
         let sessions_by_workspace = group_threads(&workspaces, threads);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "AppBootstrap exposes the OS home path for UI ~ display shortening"
+        )]
+        let user_home = std::env::home_dir().and_then(|home| home.into_os_string().into_string().ok());
         Ok(AppBootstrap {
-            user_home: std::env::home_dir().and_then(|home| home.into_os_string().into_string().ok()),
+            user_home,
             session_states,
             revision,
             workspaces,
@@ -54,24 +59,32 @@ impl AppServer {
             let belongs = |conversation: &std::sync::Arc<crate::runtime::Conversation>| {
                 app_core::same_saved_path(&conversation.cwd, &workspace.root)
             };
-            if sessions
-                .conversations()
-                .any(|(_, conversation)| belongs(conversation) && conversation.has_active_work())
-            {
-                return Err(RpcError::new(format!(
-                    "项目 {} 仍有运行中的任务、后台命令或待处理输入。",
-                    workspace.root
-                )));
-            }
-            app.workspaces.remove(&workspace.root).map_err(RpcError::new)?;
-            sessions.retain(|_, conversation| {
-                if belongs(conversation) {
-                    conversation.mark_closing();
-                    false
-                } else {
-                    true
+            let mut marked: Vec<std::sync::Arc<crate::runtime::Conversation>> = Vec::new();
+            for (_, conversation) in sessions.conversations() {
+                if !belongs(conversation) {
+                    continue;
                 }
-            });
+                if !conversation.try_mark_closing_if_idle() {
+                    for conversation in marked {
+                        conversation.clear_closing();
+                    }
+                    return Err(RpcError::new(format!(
+                        "项目 {} 仍有运行中的任务、后台命令或待处理输入。",
+                        workspace.root
+                    )));
+                }
+                marked.push(std::sync::Arc::clone(conversation));
+            }
+            if let Err(error) = app.workspaces.remove(&workspace.root) {
+                for conversation in marked {
+                    conversation.clear_closing();
+                }
+                return Err(RpcError::new(error));
+            }
+            for conversation in &marked {
+                conversation.mark_closing();
+            }
+            sessions.retain(|_, conversation| !belongs(conversation));
             let close = app.mcp.disconnect_directory(Path::new(&workspace.root));
             drop(sessions);
             app.publish_app_snapshot();
@@ -126,9 +139,9 @@ impl AppServer {
         workspace_root: Option<&str>,
     ) -> Result<protocol::TextDocument, RpcError> {
         let dir = self.scope_directory(workspace_root)?;
-        let path = dir.join("AGENTS.md");
+        let path = dir.join(app_core::PROJECT_INSTRUCTIONS_FILE_NAME);
         let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
+            Ok(content) => app_core::strip_utf8_bom(&content).to_owned(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(RpcError::new(format!("{}: {error}", path.display()))),
         };
@@ -143,11 +156,8 @@ impl AppServer {
         workspace_root: Option<&str>,
         content: &str,
     ) -> Result<protocol::TextDocument, RpcError> {
-        let dir = match workspace_root {
-            Some(workspace_root) => PathBuf::from(self.workspace(workspace_root)?.root),
-            None => self.home.clone(),
-        };
-        let path = dir.join("AGENTS.md");
+        let dir = self.scope_directory(workspace_root)?;
+        let path = dir.join(app_core::PROJECT_INSTRUCTIONS_FILE_NAME);
         app_core::write_bytes_atomic(&path, content.as_bytes())
             .map_err(|error| RpcError::new(format!("{}: {error}", path.display())))?;
         Ok(protocol::TextDocument {
@@ -158,9 +168,7 @@ impl AppServer {
 
     pub(crate) fn read_text_file(&self, cwd: &str, path: &str) -> Result<protocol::TextDocument, RpcError> {
         let resolved = crate::desktop::file_view::resolve_path(cwd, path);
-        let mut document = crate::desktop::file_view::read_text_file(&resolved)?;
-        document.path = app_core::display_path(&resolved);
-        Ok(document)
+        crate::desktop::file_view::read_text_file(&resolved)
     }
 }
 
@@ -170,10 +178,10 @@ fn group_threads(
 ) -> BTreeMap<String, Vec<ThreadSummary>> {
     let mut grouped: BTreeMap<String, Vec<ThreadSummary>> = workspaces
         .iter()
-        .map(|workspace| (app_core::saved_path_key(&workspace.root), Vec::new()))
+        .map(|workspace| (app_core::workspace_key(Path::new(&workspace.root)), Vec::new()))
         .collect();
     for thread in threads {
-        if let Some(bucket) = grouped.get_mut(&app_core::saved_path_key(&thread.cwd)) {
+        if let Some(bucket) = grouped.get_mut(&app_core::workspace_key(Path::new(&thread.cwd))) {
             bucket.push(thread);
         }
     }

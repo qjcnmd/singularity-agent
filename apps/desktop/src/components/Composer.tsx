@@ -7,10 +7,11 @@ import { ModelPicker } from './ModelPicker'
 import { ContextCapsules } from './ContextCapsules'
 import { motion, useReducedMotion } from 'motion/react'
 import { inputTrigger, useSkillCandidates } from '../inputCandidates'
+import { isPlainEnter } from '../interactions'
 import { smooth } from '../motion'
 import { DraftImages, FileChips, useAttachmentInput } from './Images'
 import { DraftAnnotationsTray } from './Annotations'
-import { selectedSessionPhase } from '../sessionState'
+import { contextUsageStats, selectedSessionPhase } from '../sessionState'
 
 export const Composer = memo(ComposerView)
 
@@ -42,7 +43,7 @@ function ComposerView() {
   const candidateRetry = useRef<HTMLButtonElement>(null)
   const sessionOrigin = actionOrigin.session(sessionId)
   const contextUsage = state.session?.runtime.contextUsage
-  const percent = contextUsage ? Math.min(100, Math.round(contextUsage.used / contextUsage.capacity * 100)) : 0
+  const { percent, tone: ringTone } = contextUsageStats(contextUsage)
   useEffect(() => {
     setCaret(textarea.current?.selectionStart ?? draft.length)
   }, [draft, state.selectedSessionId, state.selectedWorkspaceRoot])
@@ -103,7 +104,6 @@ function ComposerView() {
     : null
   const actionTitle = usageTip ? `${actionLabel} · ${usageTip}` : actionLabel
   const sendMode = !showsStop && actionEnabled ? 'send' : compacting || stopping ? 'busy' : showsStop && actionEnabled ? 'stop' : 'idle'
-  const ringTone = percent >= 90 ? 'danger' : percent >= 75 ? 'warning' : ''
   const sendButton = (
     <button
       type="button"
@@ -169,7 +169,7 @@ function ComposerView() {
             {skills.status === 'ready' && skills.result.diagnostics.map(message => <p role="alert" key={message}>{message}</p>)}
             {skills.status === 'error' && (
               <div role="alert">
-                <strong>{skills.error.message}</strong>
+                <strong>{skills.message}</strong>
                 <button ref={candidateRetry} type="button" className="secondary-button" onClick={() => {
                   skills.retry()
                   textarea.current?.focus()
@@ -222,7 +222,7 @@ function ComposerView() {
               setSuggestionsOpen(false)
               return
             }
-            if (event.key === 'Enter' && !event.shiftKey) {
+            if (isPlainEnter(event)) {
               event.preventDefault()
               if (event.repeat) return
               if (showCandidateSurface && suggestions.length > 0) chooseSuggestion(suggestionIndex)

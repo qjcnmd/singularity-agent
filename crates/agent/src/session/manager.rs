@@ -346,7 +346,7 @@ impl SessionData {
         &self.header_timestamp
     }
 
-    pub fn cwd(&self) -> &Path {
+    pub(crate) fn cwd(&self) -> &Path {
         &self.cwd
     }
 
@@ -356,6 +356,11 @@ impl SessionData {
 
     pub fn entries(&self) -> &[SessionEntry] {
         &self.entries
+    }
+
+    pub fn latest_selection(&self) -> &protocol::ModelSelection {
+        latest_settings(&self.entries)
+            .expect("session creation and parsing require an initial model selection")
     }
 
     pub fn disabled_modules(&self) -> Vec<String> {

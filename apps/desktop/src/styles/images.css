@@ -9,12 +9,12 @@
 .timeline-user .file-chip { background: color-mix(in srgb, currentColor 14%, transparent); color: inherit; }
 .file-chip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-chip-remove { display: grid; place-items: center; width: 18px; height: 18px; margin-right: -4px; padding: 0; border: 0; border-radius: 50%; background: none; color: var(--ink-faint); cursor: pointer; }
-.file-chip-remove:hover { background: rgb(0 0 0 / 7%); color: var(--ink); }
+.file-chip-remove:hover { background: var(--soft-fill-hover); color: var(--ink); }
 .composer-card > .image-list { gap: 8px; margin: 0; padding: 0; }
 .message-body + .image-list { margin-top: 12px; }
 .timeline-user .file-list:not(:empty) + .message-body:not(:has(.user-text:empty)) { margin-top: 8px; }
 .image-tile { position: relative; margin: 0; }
-.image-preview { display: flex; align-items: center; justify-content: center; width: 150px; height: 110px; padding: 0; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; background: var(--surface); color: var(--ink-faint); font-size: 12px; }
+.image-preview { display: flex; align-items: center; justify-content: center; width: 150px; height: 110px; padding: 0; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; background: var(--canvas); color: var(--ink-faint); font-size: 12px; }
 .image-preview img { width: 100%; height: 100%; object-fit: cover; }
 .image-remove { position: absolute; top: 4px; right: 4px; display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%; background: rgb(0 0 0 / 55%); color: #fff; }
 .image-retry { font-size: 11px; }

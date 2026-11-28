@@ -16,7 +16,7 @@ impl McpError {
         Self("MCP 服务器不存在。".into())
     }
 
-    pub(crate) fn io(context: &str, source: std::io::Error) -> Self {
+    pub(crate) fn io(context: &str, source: &std::io::Error) -> Self {
         Self(format!("{context}：{source}"))
     }
 }

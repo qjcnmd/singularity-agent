@@ -9,7 +9,9 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::registry::{ABORTED_MESSAGE, DEFAULT_MAX_BYTES, ToolExecution, default_max_kb, error_result};
+use super::registry::{
+    ABORTED_MESSAGE, DEFAULT_MAX_BYTES, GLOB_TOOL_NAME, ToolExecution, default_max_kb, error_result,
+};
 
 const DEFAULT_GLOB_LIMIT: usize = 100;
 const MAX_GLOB_LIMIT: usize = 1000;
@@ -35,9 +37,9 @@ impl GlobArgs {
     }
 }
 
-pub(crate) fn spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
-        name: "glob".to_string(),
+pub(crate) fn spec() -> model::ToolDefinition {
+    model::ToolDefinition {
+        name: GLOB_TOOL_NAME.to_string(),
         description: format!(
             "Find files matching a glob pattern, respecting .gitignore and skipping .git. Patterns without path separators match filenames at any depth (e.g. '*.rs'). Results are sorted by newest modification time first, capped at {DEFAULT_GLOB_LIMIT} by default (max {MAX_GLOB_LIMIT}) and {}KB.",
             default_max_kb()
@@ -111,9 +113,12 @@ pub(super) enum SearchTarget {
     Ready(PathBuf, std::fs::Metadata),
 }
 
+fn is_git_dir_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|s| s.eq_ignore_ascii_case(".git"))
+}
+
 fn has_git_component(path: &Path) -> bool {
-    path.components()
-        .any(|component| component.as_os_str().to_str().is_some_and(|s| s.eq_ignore_ascii_case(".git")))
+    path.components().any(|component| is_git_dir_name(component.as_os_str()))
 }
 
 pub(super) fn inspect_search_target(path: Option<&str>, cwd: &Path) -> Result<SearchTarget, ToolExecution> {
@@ -153,7 +158,7 @@ pub(super) fn build_walker(root: &Path, include_hidden: bool, sort_by_name: bool
         .require_git(false)
         .ignore(true)
         .follow_links(false)
-        .filter_entry(|entry| entry.file_name() != ".git");
+        .filter_entry(|entry| !is_git_dir_name(entry.file_name()));
     if sort_by_name {
         builder.sort_by_file_name(Ord::cmp);
     }

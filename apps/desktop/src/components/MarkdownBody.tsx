@@ -4,11 +4,11 @@ import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import 'katex/dist/katex.min.css'
-import { CopyButton } from './components/CopyButton'
-import { MermaidDiagram } from './components/MermaidDiagram'
-import { CodeTokens, useCodeTokens } from './highlight'
-import { useSelectionGuard } from './interactions'
-import { appStore } from './appStore'
+import { appStore } from '../appStore'
+import { CodeTokens, useCodeTokens } from '../highlight'
+import { useSelectionGuard } from '../interactions'
+import { CopyButton } from './CopyButton'
+import { MermaidDiagram } from './MermaidDiagram'
 
 export function MarkdownBody({ text, streaming = false }: { text: string; streaming?: boolean }) {
   return <Streaming.Provider value={streaming}><RenderedMarkdown text={useStreamedText(text, streaming)} /></Streaming.Provider>
@@ -212,6 +212,7 @@ function StreamText({ children }: { children?: ReactNode }) {
     ? <StreamingText text={child} />
     : child)
 }
+
 const markdownComponents: Components = {
   pre: CodeBlock, table: MarkdownTable, a: MarkdownLink,
   code: InlineCode,

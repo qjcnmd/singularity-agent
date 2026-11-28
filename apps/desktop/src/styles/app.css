@@ -2,6 +2,7 @@
 @import './pages.css';
 @import './conversation.css';
 @import './composer.css';
+@import './model-picker.css';
 @import './settings.css';
 @import './mcp.css';
 @import './surfaces.css';
@@ -9,4 +10,5 @@
 @import './questions.css';
 @import './background-tasks.css';
 @import './files.css';
+@import './edit-diff.css';
 @import './annotations.css';

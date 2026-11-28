@@ -3,15 +3,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::{parse_openai_responses_response, summary_part_separator};
 use crate::config::selection::{ProviderConfig, SelectedModel};
-use crate::error::{
-    ModelErrorKind, ProviderError, bounded_provider_error_diagnostic, provider_embedded_error,
-    provider_error_fields,
-};
+use crate::error::{ProviderError, provider_embedded_error, provider_error_fields};
 use crate::provider::ProviderStreamEvent;
 use crate::transport::stream::{
-    SseStreamDecoder, provider_stream_malformed_error, provider_stream_unterminated_error, read_sse_stream,
+    SseStreamDecoder, embedded_stream_error, parse_sse_json_event, provider_stream_malformed_error,
+    provider_stream_unterminated_error, read_sse_stream, stream_premature_eof_error,
 };
 use crate::types::{Message, ModelTurnResponse};
+
+const MALFORMED_STREAM_MESSAGE: &str = "provider Responses stream was malformed";
 
 pub(crate) async fn read_responses_sse_stream(
     cancellation: &CancellationToken,
@@ -43,24 +43,13 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
     }
 
     fn frame_unterminated(&self) -> ProviderError {
-        provider_stream_unterminated_error("provider Responses stream was malformed", self.received_event)
+        provider_stream_unterminated_error(MALFORMED_STREAM_MESSAGE, self.received_event)
     }
 
     fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError> {
-        let mut payload = serde_json::from_slice::<Value>(data).map_err(|error| {
-            let detail = bounded_provider_error_diagnostic(&error.to_string());
-            ProviderError::diagnostic(
-                ModelErrorKind::Other,
-                "provider Responses stream was malformed",
-                &["event_data_invalid_json", detail.as_str()],
-            )
-        })?;
-        let payload_type = payload
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| provider_responses_stream_malformed_error("event_type_missing"))?;
+        let (payload_type, mut payload) = parse_sse_json_event(data, MALFORMED_STREAM_MESSAGE)?;
         let completed = payload_type == "response.completed";
-        match payload_type {
+        match payload_type.as_str() {
             "response.function_call_arguments.delta" => {
                 if payload.get("delta").and_then(Value::as_str).is_some_and(|text| !text.is_empty()) {
                     (self.on_event)(ProviderStreamEvent::ToolCallDelta);
@@ -132,11 +121,8 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                 self.terminal_response = Some(response);
             }
             "error" => {
-                let fields = provider_error_fields(
-                    payload.get("error").filter(|error| error.is_object()).unwrap_or(&payload),
-                );
-                return Err(provider_embedded_error(
-                    &fields,
+                return Err(embedded_stream_error(
+                    &payload,
                     "provider Responses stream returned an error",
                     self.api_key,
                 ));
@@ -186,10 +172,12 @@ impl<'a> ResponsesSseDecoder<'a> {
         endpoint: &str,
     ) -> ModelTurnResponse {
         let result = result.and_then(|()| {
-            let payload = self
-                .terminal_response
-                .take()
-                .ok_or_else(|| provider_responses_stream_terminal_missing_error(self.received_event))?;
+            let payload = self.terminal_response.take().ok_or_else(|| {
+                stream_premature_eof_error(
+                    "provider Responses stream did not contain a completed terminal",
+                    self.received_event,
+                )
+            })?;
             parse_openai_responses_response(
                 config,
                 payload,
@@ -209,14 +197,5 @@ impl<'a> ResponsesSseDecoder<'a> {
 }
 
 fn provider_responses_stream_malformed_error(reason: &'static str) -> ProviderError {
-    provider_stream_malformed_error("provider Responses stream was malformed", reason)
-}
-
-fn provider_responses_stream_terminal_missing_error(received_event: bool) -> ProviderError {
-    let kind = if received_event {
-        ModelErrorKind::Temporary
-    } else {
-        ModelErrorKind::Other
-    };
-    ProviderError::new(kind, "provider Responses stream did not contain a completed terminal")
+    provider_stream_malformed_error(MALFORMED_STREAM_MESSAGE, reason)
 }

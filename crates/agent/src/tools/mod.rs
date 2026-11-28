@@ -1,5 +1,6 @@
 mod bash;
 mod edit;
+mod file_ops;
 mod glob;
 mod grep;
 mod mcp;
@@ -17,9 +18,10 @@ pub use bash::{BashTaskUpdate, BashTasks};
 #[cfg(test)]
 pub(crate) use edit::execute as edit_execute;
 pub(crate) use mcp::{call_spec as mcp_call_schema, schema_spec as mcp_schema_schema};
+pub(crate) use output::FULL_OUTPUT_PREFIX;
 #[cfg(test)]
 pub(crate) use output::{CaptureState, format_head_bounded};
-pub(crate) use registry::{ABORTED_MESSAGE, ToolContext, ToolExecution, error_result};
+pub(crate) use registry::{ABORTED_MESSAGE, ToolContext, ToolExecution, error_result, is_clearable_tool};
 #[cfg(test)]
 pub(crate) use registry::{COMMAND_MAX_BYTES, COMMAND_MAX_LINES, WEB_MAX_BYTES, WEB_MAX_LINES};
 pub(crate) use registry::{

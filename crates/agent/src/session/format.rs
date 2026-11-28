@@ -23,7 +23,7 @@ pub enum SessionError {
     Context {
         message: String,
         #[source]
-        source: Box<SessionError>,
+        source: Box<Self>,
     },
     #[error("{0}")]
     InvalidSession(String),
@@ -155,13 +155,31 @@ impl SessionEntry {
             | Self::Record { id, .. } => id,
         }
     }
+
+    pub fn resets_context_usage(&self) -> bool {
+        matches!(
+            self,
+            Self::Compaction { .. }
+                | Self::Record {
+                    record: LedgerRecord::ToolResultsCleared { .. },
+                    ..
+                }
+        )
+    }
 }
 
-pub fn text_item_id(entry_id: &str, index: usize) -> String {
+pub fn is_streaming_item_of(item_id: &str, message_id: &str) -> bool {
+    item_id == message_id
+        || item_id
+            .strip_prefix(message_id)
+            .is_some_and(|suffix| suffix == ":text:0" || suffix == ":thinking:0")
+}
+
+pub(crate) fn text_item_id(entry_id: &str, index: usize) -> String {
     format!("{entry_id}:text:{index}")
 }
 
-pub fn thinking_item_id(entry_id: &str, index: usize) -> String {
+pub(crate) fn thinking_item_id(entry_id: &str, index: usize) -> String {
     format!("{entry_id}:thinking:{index}")
 }
 

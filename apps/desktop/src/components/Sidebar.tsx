@@ -6,8 +6,9 @@ import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '
 import type { ThreadSummary, Workspace } from '../protocol'
 import { sessionTitles } from '../sessionTitle'
 import { workspaceName } from '../copy'
+import { isCompactViewport } from '../interactions'
 import { sessionState } from '../sessionState'
-import { Dialog } from './Dialog'
+import { ConfirmDialog, Dialog } from './Dialog'
 import { Menu } from './Menu'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
@@ -117,7 +118,7 @@ function SidebarView() {
                 className="nav-item"
                 onClick={() => {
                   appStore.setSettingsOpen(true)
-                  if (window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
+                  if (isCompactViewport()) appStore.toggleSidebar()
                 }}
               >设置</button>
             </footer>
@@ -174,7 +175,7 @@ function SessionButton({
       <button ref={anchor} type="button" className="session-main" aria-haspopup="menu" aria-expanded={menuOpen}
         onKeyDown={event => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); setMenuOpen(true) } }} onClick={() => {
         appStore.selectSession(session.threadId)
-        if (window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
+        if (isCompactViewport()) appStore.toggleSidebar()
       }}>
         <span className={`session-status status-${statusClass}`} aria-hidden="true" />
         <span className="session-label">
@@ -231,14 +232,17 @@ function SidebarDialog({ state, onClose }: { state: Exclude<PendingDialog, { kin
     if (ok) onClose()
   }
   return (
-    <Dialog open onClose={close} labelledBy="confirm-title" className="confirm-modal">
-      <header className="modal-header"><h2 id="confirm-title">{title}</h2><button type="button" className="icon-button" data-autofocus disabled={busy} onClick={close} aria-label="关闭"><X size={18} /></button></header>
-      <div className="confirm-body">
-        <p>{message}</p>
-        {failure && <p className="form-error" role="alert">{failure.message}</p>}
-        <footer><button type="button" className="secondary-button" disabled={busy} onClick={close}>取消</button><button type="button" className="danger-button" disabled={busy} onClick={() => void confirm()}>{confirmLabel}</button></footer>
-      </div>
-    </Dialog>
+    <ConfirmDialog
+      open
+      onClose={close}
+      onConfirm={() => void confirm()}
+      title={title}
+      message={message}
+      confirmLabel={confirmLabel}
+      danger
+      pending={busy}
+      error={failure?.message}
+    />
   )
 }
 

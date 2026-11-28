@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type RefObje
 import { Check, MessageSquarePlus, MessageSquareText, Trash2, X } from 'lucide-react'
 import { appStore, useAppStore } from '../appStore'
 import type { DraftAnnotation } from '../drafts'
+import { isPlainEnter, useDismissOnOutside } from '../interactions'
 import type { MessageAnnotation } from '../protocol'
 import {
   captureSelectionAnnotation, clearAnnotationHighlights, enclosingEl, pointInRange, rangeLeadRect,
@@ -275,18 +276,15 @@ export function useConversationAnnotations({ sessionId, itemIdentity, surfaceRef
     inputRef.current.setSelectionRange(end, end)
   }, [editorKey, popoverMounted])
 
-  useEffect(() => {
-    if (!editor) return
-    const onOutside = (e: PointerEvent) => {
-      if ((e.target instanceof Node && popoverRef.current?.contains(e.target)) || (e.target instanceof Element && e.target.closest('.annotation-badge'))) return
-      dismissedOnPointerDownRef.current = true
-      setEditor(null)
-    }
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.preventDefault(); setEditor(null) } }
-    document.addEventListener('pointerdown', onOutside, true)
-    document.addEventListener('keydown', onKey)
-    return () => { document.removeEventListener('pointerdown', onOutside, true); document.removeEventListener('keydown', onKey) }
-  }, [editor])
+  useDismissOnOutside(popoverRef, Boolean(editor), () => {
+    dismissedOnPointerDownRef.current = true
+    setEditor(null)
+  }, {
+    capture: true,
+    escapeCapture: false,
+    ignore: event => event.target instanceof Element && Boolean(event.target.closest('.annotation-badge')),
+    onEscape: event => { event.preventDefault(); setEditor(null) },
+  })
 
   useEffect(() => subscribeAnnotationJump(target => {
     const doc = documentRef.current
@@ -367,7 +365,7 @@ export function useConversationAnnotations({ sessionId, itemIdentity, surfaceRef
         <div className="annotation-editor" style={popoverCoords.editorWidth ? { width: popoverCoords.editorWidth } : undefined}>
           <textarea ref={inputRef} className="annotation-input" rows={1} value={editor.comment} placeholder="添加可选批注…" aria-label="批注内容"
             onChange={e => { const v = e.target.value; setEditor(cur => (cur ? { ...cur, comment: v } : null)) }}
-            onKeyDown={e => { if (!e.nativeEvent.isComposing && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commitEditor() } }}
+            onKeyDown={e => { if (isPlainEnter(e)) { e.preventDefault(); commitEditor() } }}
           />
           {editor.mode === 'edit' && (
             <button type="button" className="annotation-action-button is-danger" aria-label="删除批注" title="删除批注"

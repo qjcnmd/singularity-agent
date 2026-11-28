@@ -2,37 +2,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequestPurpose {
-    Generation,
-    Compaction,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub total_tokens: u64,
-    /// None 为未上报；Some(0) 为明确上报零缓存用量。
-    pub cached_input_tokens: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RequestObservation {
-    pub purpose: RequestPurpose,
-    pub provider: String,
-    pub model: String,
-    pub status: crate::ProviderAttemptStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ttft_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decode_ms: Option<u64>,
-    pub usage: Option<ModelUsage>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ReadSource {

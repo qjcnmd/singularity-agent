@@ -13,6 +13,8 @@ use self::parse::{
     parse_raw_numstat,
 };
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const MAX_BATCH_DIFF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_UNTRACKED_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_BYTES: u64 = 4 * 1024;
@@ -238,7 +240,7 @@ fn git_command(git: &Path, cwd: &Path, args: &[&str]) -> Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
-        cmd.creation_flags(0x0800_0000);
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
 }

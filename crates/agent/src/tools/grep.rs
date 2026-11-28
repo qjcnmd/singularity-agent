@@ -12,7 +12,9 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::glob::{SearchTarget, build_walker, compile_glob, format_display_path, inspect_search_target};
-use super::registry::{ABORTED_MESSAGE, DEFAULT_MAX_BYTES, ToolExecution, default_max_kb, error_result};
+use super::registry::{
+    ABORTED_MESSAGE, DEFAULT_MAX_BYTES, GREP_TOOL_NAME, ToolExecution, default_max_kb, error_result,
+};
 
 const DEFAULT_GREP_LIMIT: usize = 100;
 const MAX_GREP_LIMIT: usize = 500;
@@ -45,9 +47,9 @@ impl GrepArgs {
     }
 }
 
-pub(crate) fn spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
-        name: "grep".to_string(),
+pub(crate) fn spec() -> model::ToolDefinition {
+    model::ToolDefinition {
+        name: GREP_TOOL_NAME.to_string(),
         description: format!(
             "Search file contents using regex or literal matching, respecting .gitignore and skipping binary files and .git. Returns 'path:line: content' (context lines use 'path-line- content' separated by '--'). Capped at {DEFAULT_GREP_LIMIT} matches by default (max {MAX_GREP_LIMIT}), {MAX_LINE_CHARS} chars per line, and {}KB total.",
             default_max_kb()

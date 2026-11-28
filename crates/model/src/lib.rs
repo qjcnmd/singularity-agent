@@ -21,6 +21,6 @@ pub use provider::ProviderStreamEvent;
 pub(crate) use types::ModelStopReason;
 pub use types::{
     ContentBlock, Message, ModelToolCall, ModelTurnRequest, ModelTurnResponse, ModelUsage,
-    ProviderBlockMetadata, ProviderMessageMetadata,
+    ProviderBlockMetadata, ProviderMessageMetadata, ToolDefinition, estimate_tool_tokens,
 };
 pub use web::{WebSearchAccess, validate_fetch_url};

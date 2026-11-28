@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use serde_json::json;
 
-use super::registry::{ToolExecution, error_result};
+use super::registry::{TODO_TOOL_NAME, ToolExecution, error_result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,9 +44,9 @@ impl TodoArgs {
     }
 }
 
-pub(crate) fn spec() -> app_core::ToolDefinition {
-    app_core::ToolDefinition {
-        name: "todo".to_string(),
+pub(crate) fn spec() -> model::ToolDefinition {
+    model::ToolDefinition {
+        name: TODO_TOOL_NAME.to_string(),
         description: "Maintain a concise checklist for complex multi-step tasks (3+ steps). Skip for simple or single-step work. Each call replaces the full list; pass an empty array [] to clear it. Keep at most one item in_progress at a time and update immediately when completing a step.".to_string(),
         parameters_schema: json!({
             "type": "object",

@@ -1,7 +1,11 @@
+use protocol::{ModelSelection, ProviderApiProtocol};
+
+use super::user::{UserConfigFile, UserConfigModel};
 use super::{
-    ModelSelection, ProviderApiProtocol, ProviderError, UserConfigFile, UserConfigModel, configuration_error,
-    validate_api_key, validate_base_url, validate_identifier, validate_reasoning_variants,
+    configuration_error, validate_api_key, validate_base_url, validate_identifier,
+    validate_reasoning_variants,
 };
+use crate::error::ProviderError;
 
 pub(crate) struct ProviderConfig {
     pub(crate) provider_name: String,

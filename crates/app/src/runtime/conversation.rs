@@ -1,6 +1,5 @@
 mod activity;
 mod background;
-mod compaction;
 mod lifecycle;
 mod state;
 mod turn;
@@ -16,17 +15,21 @@ use protocol::SessionPhase;
 
 use crate::desktop::stream_hub::StreamHub;
 
+struct ConversationInner {
+    view: view::ConversationView,
+    state: ConversationState,
+}
+
 pub(crate) struct Conversation {
     pub(crate) thread_id: String,
     pub(crate) cwd: String,
     pub(crate) disabled_modules: Vec<String>,
-    view: Mutex<view::ConversationView>,
+    inner: Mutex<ConversationInner>,
     hub: Arc<StreamHub>,
     changed: tokio::sync::Notify,
     home: std::path::PathBuf,
     models: Arc<model::ModelConfigManager>,
     mcp: Arc<mcp::McpManager>,
-    state: Mutex<ConversationState>,
     writer: SessionWriter,
     bash_tasks: Arc<agent::tools::BashTasks>,
 }
@@ -58,18 +61,7 @@ impl Conversation {
         hub: Arc<StreamHub>,
     ) -> Arc<Self> {
         let data = session.data();
-        let model = data
-            .entries()
-            .iter()
-            .rev()
-            .find_map(|entry| match entry {
-                agent::session::SessionEntry::Metadata {
-                    metadata: SessionMetadata::ThreadSettings { selection },
-                    ..
-                } => Some(selection.clone()),
-                _ => None,
-            })
-            .expect("session creation and parsing require an initial model selection");
+        let model = data.latest_selection().clone();
         let thread_id = data.session_id().to_owned();
         let cwd = data.cwd_string();
         let disabled_modules = data.disabled_modules();
@@ -92,20 +84,24 @@ impl Conversation {
                 thread_id,
                 cwd,
                 disabled_modules,
-                view: Mutex::new(view::ConversationView::new(usage, initial_revision)),
+                inner: Mutex::new(ConversationInner {
+                    view: view::ConversationView::new(usage, initial_revision),
+                    state: ConversationState {
+                        model,
+                        turn: TurnLifecycle::Idle,
+                        steering_inbox: inbox,
+                        last_context_window: context_window,
+                        auto_resume: true,
+                        closing: false,
+                        inspect_cancels: Vec::new(),
+                        next_inspect_id: 0,
+                    },
+                }),
                 hub,
                 changed: tokio::sync::Notify::new(),
                 home,
                 models,
                 mcp,
-                state: Mutex::new(ConversationState {
-                    model,
-                    turn: TurnLifecycle::Idle,
-                    steering_inbox: inbox,
-                    last_context_window: context_window,
-                    auto_resume: true,
-                    closing: false,
-                }),
                 writer,
                 bash_tasks,
             }
@@ -113,28 +109,22 @@ impl Conversation {
     }
 
     pub(crate) fn model(&self) -> protocol::ModelSelection {
-        self.lock_state().model.clone()
-    }
-
-    pub(crate) fn has_active_work(&self) -> bool {
-        let state = self.lock_state();
-        state.closing || state.has_work(&self.bash_tasks)
+        self.lock_inner().state.model.clone()
     }
 
     pub(crate) fn can_evict(&self) -> bool {
-        let view = self.lock_view();
-        let state = self.lock_state();
-        !state.closing && view.failure.is_none() && !state.has_work(&self.bash_tasks)
+        let inner = self.lock_inner();
+        !inner.state.closing && inner.view.failure.is_none() && !inner.state.has_work(&self.bash_tasks)
     }
 
     pub(super) fn phase(&self) -> SessionPhase {
-        self.lock_state().turn.phase()
+        self.lock_inner().state.turn.phase()
     }
 
     pub(crate) fn image_data(&self, image_id: &str) -> Result<String, crate::runtime::CatalogError> {
         let image = {
-            let state = self.lock_state();
-            let inbox = state.steering_inbox.lock().expect("turn inbox lock poisoned");
+            let inner = self.lock_inner();
+            let inbox = inner.state.steering_inbox.lock().expect("turn inbox lock poisoned");
             inbox
                 .pending()
                 .iter()
@@ -161,7 +151,7 @@ impl Conversation {
         item_id: &str,
         answers: Vec<protocol::UserQuestionAnswer>,
     ) -> Result<(), ConversationError> {
-        match &self.lock_state().turn {
+        match &self.lock_inner().state.turn {
             TurnLifecycle::Running(controls) if !controls.cancellation().is_cancelled() => {
                 controls.questions.answer(item_id, answers).map_err(ConversationError::Message)
             }
@@ -170,16 +160,14 @@ impl Conversation {
     }
 
     pub(crate) fn abort(&self) -> Result<(), ConversationError> {
-        let mut view = self.lock_view();
-        let mut state = self.lock_state();
-        let TurnLifecycle::Running(controls) = &state.turn else {
+        let mut inner = self.lock_inner();
+        let TurnLifecycle::Running(controls) = &inner.state.turn else {
             return Err(ConversationError::Busy);
         };
         controls.accept_cancel()?;
-        state.steering_inbox.lock().expect("turn inbox lock poisoned").cancel();
-        state.auto_resume = false;
-        drop(state);
-        self.publish_changed(&mut view);
+        inner.state.steering_inbox.lock().expect("turn inbox lock poisoned").cancel();
+        inner.state.auto_resume = false;
+        self.publish_changed(&mut inner);
         Ok(())
     }
 
@@ -188,9 +176,12 @@ impl Conversation {
         if name.is_empty() {
             return Err(ConversationError::Message("任务名称不能为空。".into()));
         }
-        let mut view = self.lock_view();
+        let mut inner = self.lock_inner();
+        if inner.state.closing {
+            return Err(ConversationError::Busy);
+        }
         lock_writer(&self.writer).append_metadata(SessionMetadata::ThreadName { name: name.to_string() })?;
-        self.publish_summary(&mut view);
+        self.publish_summary(&mut inner);
         Ok(())
     }
 
@@ -202,22 +193,22 @@ impl Conversation {
             .models
             .validate_selection(selection)
             .map_err(|error| ConversationError::Message(format!("invalid model selection: {error}")))?;
-        let mut view = self.lock_view();
-        let mut state = self.lock_state();
-        if &state.model == selection {
+        let mut inner = self.lock_inner();
+        if inner.state.closing {
+            return Err(ConversationError::Busy);
+        }
+        if &inner.state.model == selection {
             return Ok(());
         }
-        let mut writer = lock_writer(&self.writer);
-        writer.append_metadata(SessionMetadata::ThreadSettings { selection: selection.clone() })?;
-        state.model = selection.clone();
-        state.last_context_window = Some(context_window);
-        drop(writer);
-        drop(state);
-        self.publish_changed(&mut view);
+        lock_writer(&self.writer)
+            .append_metadata(SessionMetadata::ThreadSettings { selection: selection.clone() })?;
+        inner.state.model = selection.clone();
+        inner.state.last_context_window = Some(context_window);
+        self.publish_changed(&mut inner);
         Ok(())
     }
 
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, ConversationState> {
-        self.state.lock().expect("conversation state lock poisoned")
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, ConversationInner> {
+        self.inner.lock().expect("conversation inner lock poisoned")
     }
 }

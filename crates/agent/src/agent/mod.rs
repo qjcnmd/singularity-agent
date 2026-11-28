@@ -53,10 +53,7 @@ pub enum AgentError {
     #[error("{0}")]
     InvalidCompaction(String),
     #[error("{source}")]
-    Compaction {
-        item_id: String,
-        source: Box<AgentError>,
-    },
+    Compaction { item_id: String, source: Box<Self> },
 }
 
 impl AgentError {
@@ -99,14 +96,6 @@ impl std::fmt::Debug for RequestContext {
     }
 }
 impl RequestContext {
-    pub async fn inspect_context(
-        mut self,
-        cancellation: &CancellationToken,
-    ) -> Result<Vec<protocol::ContextModule>> {
-        let (_, context) = self.load_definitions(cancellation).await?;
-        Ok(context)
-    }
-
     pub fn new(
         provider: ModelClient,
         models: Arc<model::ModelConfigManager>,
@@ -249,7 +238,6 @@ impl Agent {
                 return Ok(());
             }
         };
-        let images: Vec<_> = input.images.iter().map(|image| image.attachment.clone()).collect();
         let model_text = input.model_text();
         let display_text = (model_text != input.text).then(|| input.text.clone());
         let display = (display_text.is_some() || !input.files.is_empty() || !input.annotations.is_empty())
@@ -259,23 +247,25 @@ impl Agent {
                 annotations: input.annotations.clone(),
             });
         let mut content = vec![model::ContentBlock::text(model_text)];
-        content.extend(images.iter().cloned().map(model::ContentBlock::Image));
+        content.extend(input.images.iter().map(|image| model::ContentBlock::Image(image.attachment.clone())));
         let message = Message::User { content };
+        let mut item = public_items(
+            &message,
+            display.as_ref(),
+            &request.message_id,
+            protocol::TurnStatus::Completed,
+            protocol::ToolStatus::Completed,
+            "",
+        )
+        .into_iter()
+        .next()
+        .expect("user input produces a history item");
         let saved_at = self.append_message(&request.message_id, message, display, &input.images).await?;
         lock_inbox(&self.inbox).confirm_saved(&request.message_id);
-        on_event(AgentEvent::Turn(TurnEvent::ItemUpdated {
-            item: protocol::HistoryItem::Message {
-                id: request.item_id(),
-                text: input.text.clone(),
-                at: Some(saved_at),
-                stats: None,
-                images,
-                files: input.files.clone(),
-                annotations: input.annotations.clone(),
-                role: protocol::HistoryMessageRole::User,
-                status: protocol::TurnStatus::Completed,
-            },
-        }));
+        if let protocol::HistoryItem::Message { at, .. } = &mut item {
+            *at = Some(saved_at);
+        }
+        on_event(AgentEvent::Turn(TurnEvent::ItemUpdated { item }));
         Ok(())
     }
 

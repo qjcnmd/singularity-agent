@@ -1,8 +1,9 @@
 import { memo, useId, useLayoutEffect, useRef, useState } from 'react'
 import { actionOrigin, appStore, pendingKey, useAppStore, type AppState } from '../appStore'
-import { formatTokenCount, workspaceName } from '../copy'
+import { CONTEXT_GROUP_ORDER, formatTokenCount, workspaceName } from '../copy'
 import { navigateList, useDismissOnOutside } from '../interactions'
 import type { ContextGroup, ContextModule } from '../protocol'
+import { errorMessage } from '../rpcClient'
 import { workspaceKey } from '../workspace'
 import { Plus } from 'lucide-react'
 import { Disclosure } from './Disclosure'
@@ -12,7 +13,7 @@ type ModuleQuery =
   | { status: 'idle' }
   | { status: 'loading' }
   | { status: 'ready'; modules: ContextModule[] }
-  | { status: 'error'; error: Error }
+  | { status: 'error'; message: string }
 
 function useContextModules(workspaceRoot: string | null, ready: boolean, previewVersion: number) {
   const [query, setQuery] = useState<ModuleQuery>({ status: 'idle' })
@@ -26,7 +27,7 @@ function useContextModules(workspaceRoot: string | null, ready: boolean, preview
     let active = true
     void appStore.transport.rpc('context.preview', { workspaceRoot }).then(
       modules => { if (active) setQuery({ status: 'ready', modules }) },
-      error => { if (active) setQuery({ status: 'error', error: error instanceof Error ? error : new Error(String(error)) }) },
+      error => { if (active) setQuery({ status: 'error', message: errorMessage(error) }) },
     )
     return () => { active = false }
   }, [workspaceRoot, ready, previewVersion, reload])
@@ -34,7 +35,6 @@ function useContextModules(workspaceRoot: string | null, ready: boolean, preview
 }
 
 const groupTitles: Record<ContextGroup, string> = { instructions: '指令', tools: '工具', skills: '技能', mcp: 'MCP' }
-const groupOrder: ContextGroup[] = ['instructions', 'tools', 'skills', 'mcp']
 
 const capsulesFields = ['drafts', 'bootstrap', 'selectedWorkspaceRoot', 'pendingActions', 'contextPreviewVersion'] as const
 
@@ -65,7 +65,7 @@ export const ContextCapsules = memo(function ContextCapsules() {
     <ProjectCapsule state={state} />
     <div className="context-module-list">
       {query.status === 'loading' && <p className="capsule-status" role="status">正在读取上下文…</p>}
-      {query.status === 'error' && <p className="capsule-status form-error" role="alert">{query.error.message}
+      {query.status === 'error' && <p className="capsule-status form-error" role="alert">{query.message}
         <button type="button" className="quiet-button" onClick={retry}>重试</button></p>}
       {query.status === 'ready' && <ModuleGroups modules={query.modules} disabled={disabled} />}
     </div>
@@ -75,7 +75,7 @@ export const ContextCapsules = memo(function ContextCapsules() {
 function ModuleGroups({ modules, disabled }: { modules: ContextModule[]; disabled: ReadonlySet<string> }) {
   const total = modules.filter(module => module.locked || !disabled.has(module.id)).reduce((sum, module) => sum + module.tokens, 0)
   return <>
-    {groupOrder.map(group => {
+    {CONTEXT_GROUP_ORDER.map(group => {
       const members = modules.filter(module => module.group === group)
       return members.length > 0 && <section className="capsule-group" key={group} aria-label={groupTitles[group]}>
         <h4>{groupTitles[group]}</h4>
