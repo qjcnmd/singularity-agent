@@ -667,7 +667,7 @@ async fn model_remove_provider_invariants() {
 
     let mut restarted = BackendClient::spawn(&env.home).await;
     let boot = restarted.rpc_ok("app.bootstrap", json!({})).await;
-    assert!(boot.pointer("/models/error").is_none_or(Value::is_null));
+    assert_eq!(boot.pointer("/modelCatalog/error"), Some(&Value::Null));
     let reread = restarted.rpc_ok("model.read", json!({})).await;
     assert_eq!(provider_ids(&reread), vec!["secondary"]);
     assert_eq!(
@@ -681,12 +681,9 @@ async fn model_remove_provider_invariants() {
         emptied.pointer("/catalog/webSearch/credentialConfigured").and_then(Value::as_bool),
         Some(true)
     );
-    assert!(
-        restarted
-            .rpc_ok("app.bootstrap", json!({}))
-            .await
-            .pointer("/models/error")
-            .is_none_or(Value::is_null)
+    assert_eq!(
+        restarted.rpc_ok("app.bootstrap", json!({})).await.pointer("/modelCatalog/error"),
+        Some(&Value::Null)
     );
     restarted.shutdown().await;
 }
@@ -697,6 +694,8 @@ async fn mcp_remove_live_connection_invariants() {
     let server = MockModelServer::start().await;
     let ws = env.workspace_str();
     let mcp_script = write_test_mcp_script(&env.home);
+    let probe_exit = env.home.join("probe-mcp.exited");
+    let keep_exit = env.home.join("keep-mcp.exited");
 
     server.enqueue(ScriptedResponse::sse(messages_tools_sse(
         None,
@@ -712,12 +711,16 @@ async fn mcp_remove_live_connection_invariants() {
     client
         .setup_workspace_and_provider(&ws, "local", "messages", &server.base_url, "demo", 64000, 4096)
         .await;
-    client.register_test_mcp(&ws, &mcp_script).await;
-    let keep_cfg = json!({
-        "serverId": "keep", "startupTimeoutSec": 20, "toolTimeoutSec": 20,
-        "transport": { "type": "stdio", "command": "node", "args": [mcp_script.to_string_lossy()], "cwd": ws, "env": {} }
-    });
-    client.rpc_ok("mcp.save", json!({ "workspaceRoot": ws, "server": keep_cfg })).await;
+    for (id, exit_file) in [("probe", &probe_exit), ("keep", &keep_exit)] {
+        let cfg = json!({
+            "serverId": id, "startupTimeoutSec": 20, "toolTimeoutSec": 20,
+            "transport": {
+                "type": "stdio", "command": "node", "args": [mcp_script.to_string_lossy()],
+                "cwd": ws, "env": { "TEST_MCP_EXIT_FILE": exit_file.to_string_lossy() }
+            }
+        });
+        client.rpc_ok("mcp.save", json!({ "workspaceRoot": ws, "server": cfg })).await;
+    }
 
     let s1 = client.start_session(&ws, "local", "demo", None, "connect mcp", vec![], vec![]).await;
     assert_eq!(
@@ -727,19 +730,28 @@ async fn mcp_remove_live_connection_invariants() {
     assert!(server.model_requests()[1].body.to_string().contains("PONG"));
 
     let before_list = client.rpc_ok("mcp.list", json!({ "workspaceRoot": ws })).await;
-    let probe = before_list
-        .as_array()
-        .expect("mcp.list array")
-        .iter()
-        .find(|e| e.pointer("/server/serverId").and_then(Value::as_str) == Some("probe"))
-        .expect("probe entry");
-    assert_eq!(probe.get("status").and_then(Value::as_str), Some("connected"));
+    for id in ["probe", "keep"] {
+        let entry = before_list
+            .as_array()
+            .expect("mcp.list array")
+            .iter()
+            .find(|e| e.pointer("/server/serverId").and_then(Value::as_str) == Some(id))
+            .expect("mcp.list entry");
+        assert_eq!(entry.get("status").and_then(Value::as_str), Some("connected"));
+    }
+    assert!(!probe_exit.exists() && !keep_exit.exists());
 
     let missing = client.rpc_err("mcp.remove", json!({ "workspaceRoot": ws, "serverId": "missing" })).await;
     assert!(!missing.is_empty(), "removing nonexistent MCP server must fail explicitly");
 
     let removed = client.rpc_ok("mcp.remove", json!({ "workspaceRoot": ws, "serverId": "probe" })).await;
     assert_eq!(mcp_server_ids(&removed), vec!["keep"]);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !probe_exit.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(probe_exit.exists(), "mcp.remove must terminate live probe child immediately");
+    assert!(!keep_exit.exists(), "mcp.remove(probe) must keep unrelated keep child alive");
     let after = client.rpc_ok("mcp.list", json!({ "workspaceRoot": ws })).await;
     assert_eq!(mcp_server_ids(&after), vec!["keep"]);
 

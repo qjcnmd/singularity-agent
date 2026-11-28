@@ -207,6 +207,7 @@ pub(crate) fn responses_sse(
 pub(crate) fn write_test_mcp_script(dir: &Path) -> PathBuf {
     let script = dir.join("test_mcp_server.mjs");
     let source = r#"
+import { writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 const tools = [
@@ -253,6 +254,16 @@ function send(msg) {
 }
 
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+function markExit() {
+  if (process.env.TEST_MCP_EXIT_FILE) {
+    try { writeFileSync(process.env.TEST_MCP_EXIT_FILE, String(process.pid)); } catch {}
+  }
+}
+rl.on('close', () => {
+  markExit();
+  process.exit(0);
+});
+process.on('exit', markExit);
 rl.on('line', async (line) => {
   if (!line.trim()) return;
   let req;

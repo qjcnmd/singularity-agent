@@ -630,14 +630,6 @@ async fn session_cache_lru_eviction_invariants() {
         messages_text_sse(None, "BUSY_SESSION_ANSWER", 60, 0, 15, "end_turn"),
         Arc::clone(&busy_gate),
     ));
-    server.enqueue(ScriptedResponse::sse(messages_text_sse(
-        None,
-        "OLDEST_SESSION_ANSWER",
-        60,
-        0,
-        15,
-        "end_turn",
-    )));
     server.set_fallback(|_, _| {
         ScriptedResponse::sse(messages_text_sse(None, "IDLE_SESSION_OK", 40, 0, 10, "end_turn"))
     });
@@ -653,29 +645,73 @@ async fn session_cache_lru_eviction_invariants() {
         .await;
     server.wait_for_request_count(1).await;
 
-    let oldest_id = client
-        .start_session(&ws, "local", "demo", None, "OLDEST_SESSION_PROMPT", vec![], vec![])
-        .await;
-    let oldest_settled = client.wait_settled(&oldest_id).await;
-    assert_eq!(oldest_settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
-    let oldest_before = client.rpc_ok("session.read", json!({ "sessionId": oldest_id })).await;
-    assert!(
-        oldest_before.get("context").is_some_and(|v| !v.is_null()),
-        "active cached session should retain loaded context before eviction"
-    );
-    let oldest_turns_before = oldest_before.pointer("/history/turns").cloned().expect("oldest turns");
-    let rev_before = oldest_before.get("revision").and_then(Value::as_u64).expect("oldest revision");
-
-    // Create 16 additional idle sessions (18 total > 16 cache capacity) to force LRU eviction of oldest_id.
-    let mut all_ids = vec![busy_id.clone(), oldest_id.clone()];
-    for idx in 0..16 {
+    // Fill SessionCache to exact 16-slot capacity: 1 busy + 15 idle sessions.
+    let mut idle_ids = Vec::with_capacity(16);
+    let mut evicted_turns_before = Value::Null;
+    let mut evicted_rev_before = 0u64;
+    for idx in 0..15 {
         let prompt = format!("IDLE_SESSION_PROMPT_{idx}");
         let id = client.start_session(&ws, "local", "demo", None, &prompt, vec![], vec![]).await;
         let settled = client.wait_settled(&id).await;
         assert_eq!(settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
         let _ = client.drain_events();
-        all_ids.push(id);
+        if idx == 1 {
+            let before = client.rpc_ok("session.read", json!({ "sessionId": id })).await;
+            assert!(
+                before.get("context").is_some_and(|v| !v.is_null()),
+                "active cached session should retain loaded context before eviction"
+            );
+            evicted_turns_before = before.pointer("/history/turns").cloned().expect("idle[1] turns");
+            evicted_rev_before = before.get("revision").and_then(Value::as_u64).expect("idle[1] revision");
+        }
+        idle_ids.push(id);
     }
+
+    let full_boot = client.rpc_ok("app.bootstrap", json!({})).await;
+    let full_states = full_boot.get("sessionStates").and_then(Value::as_object).expect("full sessionStates");
+    assert_eq!(full_states.len(), 16, "cache must hold all 16 sessions before overflow");
+    assert!(
+        full_states.contains_key(&busy_id)
+            && full_states.contains_key(&idle_ids[0])
+            && full_states.contains_key(&idle_ids[1])
+    );
+
+    // Refresh idle[0] so it becomes MRU while idle[1] becomes the LRU idle candidate.
+    let refreshed = client.rpc_ok("session.read", json!({ "sessionId": idle_ids[0] })).await;
+    assert!(
+        refreshed.get("context").is_some_and(|v| !v.is_null()),
+        "idle[0] must still be cached at cap 16"
+    );
+
+    // Insert 17th total session (1 busy + 16 idle) to trigger exact 16-slot LRU eviction.
+    let overflow_id = client
+        .start_session(&ws, "local", "demo", None, "IDLE_SESSION_PROMPT_15", vec![], vec![])
+        .await;
+    let overflow_settled = client.wait_settled(&overflow_id).await;
+    assert_eq!(overflow_settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
+    let _ = client.drain_events();
+    idle_ids.push(overflow_id);
+
+    let after_boot = client.rpc_ok("app.bootstrap", json!({})).await;
+    let after_states = after_boot
+        .get("sessionStates")
+        .and_then(Value::as_object)
+        .expect("post-eviction sessionStates");
+    assert_eq!(after_states.len(), 16, "SessionCache must evict at exact capacity 16");
+    assert!(after_states.contains_key(&busy_id), "busy session must remain cached");
+    assert!(
+        after_states.contains_key(&idle_ids[0]),
+        "refreshed older session idle[0] must be retained (proves LRU, not FIFO)"
+    );
+    assert!(
+        !after_states.contains_key(&idle_ids[1]),
+        "un-refreshed LRU session idle[1] must be evicted at exact capacity 16"
+    );
+    let kept = client.rpc_ok("session.read", json!({ "sessionId": idle_ids[0] })).await;
+    assert!(
+        kept.get("context").is_some_and(|v| !v.is_null()),
+        "retained idle[0] must stay warm in cache"
+    );
 
     // Busy session must remain intact in cache and complete cleanly once unblocked.
     let busy_running = client.rpc_ok("session.read", json!({ "sessionId": busy_id })).await;
@@ -690,33 +726,34 @@ async fn session_cache_lru_eviction_invariants() {
     let busy_done = client.rpc_ok("session.read", json!({ "sessionId": busy_id })).await;
     assert!(busy_done.to_string().contains("BUSY_SESSION_ANSWER"));
 
-    // Evicted oldest idle session must reopen cleanly from disk with full history and monotonic revision.
-    let oldest_reopened = client.rpc_ok("session.read", json!({ "sessionId": oldest_id })).await;
+    // Evicted LRU idle session must reopen cleanly from disk with full history and monotonic revision.
+    let evicted_id = &idle_ids[1];
+    let reopened = client.rpc_ok("session.read", json!({ "sessionId": evicted_id })).await;
     assert!(
-        oldest_reopened.get("context").is_some_and(Value::is_null),
+        reopened.get("context").is_some_and(Value::is_null),
         "evicted idle session must reopen cold from disk with lazily deferred context"
     );
     assert_eq!(
-        oldest_reopened.pointer("/history/turns"),
-        Some(&oldest_turns_before),
+        reopened.pointer("/history/turns"),
+        Some(&evicted_turns_before),
         "reopened evicted session must preserve full persisted history"
     );
-    let rev_reopened = oldest_reopened.get("revision").and_then(Value::as_u64).expect("reopened revision");
+    let rev_reopened = reopened.get("revision").and_then(Value::as_u64).expect("reopened revision");
     assert!(
-        rev_reopened >= rev_before,
-        "reopened session revision must be monotonic ({rev_reopened} < {rev_before})"
+        rev_reopened >= evicted_rev_before,
+        "reopened session revision must be monotonic ({rev_reopened} < {evicted_rev_before})"
     );
 
-    client.submit(&oldest_id, "OLDEST_FOLLOWUP_PROMPT").await;
-    let followup_settled = client.wait_settled(&oldest_id).await;
+    client.submit(evicted_id, "EVICTED_FOLLOWUP_PROMPT").await;
+    let followup_settled = client.wait_settled(evicted_id).await;
     assert_eq!(followup_settled.pointer("/summary/status").and_then(Value::as_str), Some("completed"));
-    let oldest_after = client.rpc_ok("session.read", json!({ "sessionId": oldest_id })).await;
+    let reopened_after = client.rpc_ok("session.read", json!({ "sessionId": evicted_id })).await;
     assert_eq!(
-        oldest_after.pointer("/history/turns").and_then(Value::as_array).map(Vec::len),
+        reopened_after.pointer("/history/turns").and_then(Value::as_array).map(Vec::len),
         Some(2),
         "reopened session must support follow-up turns seamlessly"
     );
-    let rev_after = oldest_after.get("revision").and_then(Value::as_u64).expect("after revision");
+    let rev_after = reopened_after.get("revision").and_then(Value::as_u64).expect("after revision");
     assert!(
         rev_after > rev_reopened,
         "follow-up turn must advance session revision monotonically ({rev_after} <= {rev_reopened})"
@@ -731,7 +768,7 @@ async fn session_cache_lru_eviction_invariants() {
         .filter_map(Value::as_array)
         .flatten()
         .count();
-    assert_eq!(listed_count, all_ids.len(), "bootstrap must retain all 18 sessions");
+    assert_eq!(listed_count, 1 + idle_ids.len(), "bootstrap must retain all 17 sessions");
 
     server.assert_no_protocol_violations();
     client.shutdown().await;
